@@ -19,6 +19,9 @@ elisac.elisalib/
     frontend_tokens.elisa      token model
     frontend_lexer*.elisa      lexer: core, tokens, strings, cursor,
                                comments, numbers, identifiers
+    frontend_parser.elisa      region-inferred parser
+    frontend_parser_tokens.elisa
+                               parser AST/token model
   vendor/elisacore_std/      VENDORED copy of Elisa-core's stdlib (see drift guard)
 test/
   fixtures/                  parity fixtures (lexer entry + token-model cases)
@@ -30,7 +33,10 @@ scripts/
 
 - **Lexer: complete + parity-locked** against the stage0 Go lexer (token-kind
   FNV checksum). Builds standalone with stage0.
-- **Parser / semantic: not yet written.** Next milestones.
+- **Parser: active region-inferred implementation.** The older parser
+  prototypes have been removed; `frontend_parser.elisa` is the single parser
+  source.
+- **Semantic: not yet written.** Next milestone after parser parity.
 
 ## Single source of truth
 
@@ -48,7 +54,8 @@ Two guards keep stage1 honest while stage0 still exists:
 ```sh
 export ELISA_CORE="/path/to/Elisa-core"          # if not the sibling default
 scripts/check_runtime_drift.sh                    # runtime in sync?
-"$ELISA_CORE/bin/elisacore" -emit semantic test/fixtures/frontend_lexer.elisa
+~/.elisac/elisac -emit semantic test/fixtures/frontend_lexer.elisa
+~/.elisac/elisac -emit semantic elisac.elisalib/src/frontend/frontend_parser.elisa
 ```
 
 ## TODO
@@ -58,4 +65,4 @@ scripts/check_runtime_drift.sh                    # runtime in sync?
       repo's CI can compare without reaching into Elisa-core's Go test internals.
 - [ ] Retire the originals in Elisa-core (`Code/frontend_elisacore/`) and rewire
       the 5 in-tree Go consumers once cross-repo parity is green.
-- [ ] Parser (frontend layer 2), then name resolution + typecheck.
+- [ ] Parser parity, then name resolution + typecheck.
