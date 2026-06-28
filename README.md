@@ -12,19 +12,17 @@ replaces it.
 ## Layout
 
 ```
-elisac.elisalib/
-  manifest.json              library manifest
-  src/frontend/              the self-hosted frontend
-    elisacore_frontend.elisa   entry (includes runtime + tokens + lexer)
-    frontend_tokens.elisa      token model
-    frontend_lexer*.elisa      lexer: core, tokens, strings, cursor,
-                               comments, numbers, identifiers
-    frontend_parser.elisa      region-inferred parser
-    frontend_parser_tokens.elisa
-                               parser AST/token model
-  vendor/elisacore_std/      VENDORED copy of Elisa-core's stdlib (see drift guard)
+src/frontend/                the self-hosted frontend
+  elisacore_frontend.elisa   entry (includes runtime + tokens + lexer)
+  frontend_tokens.elisa      token model
+  frontend_lexer*.elisa      lexer: core, tokens, strings, cursor,
+                             comments, numbers, identifiers
+  frontend_parser.elisa      region-inferred parser
+  frontend_parser_tokens.elisa
+                             parser AST/token model
+elisacore_std/               VENDORED copy of Elisa-core's stdlib (see drift guard)
 test/
-  fixtures/                  parity fixtures (lexer entry + token-model cases)
+  fixtures/lexer/            parity fixtures (lexer entry + token-model cases)
 scripts/
   check_runtime_drift.sh     fails if vendored runtime != Elisa-core canonical
 ```
@@ -54,8 +52,8 @@ Two guards keep stage1 honest while stage0 still exists:
 ```sh
 export ELISA_CORE="/path/to/Elisa-core"          # if not the sibling default
 scripts/check_runtime_drift.sh                    # runtime in sync?
-~/.elisac/elisac -emit semantic test/fixtures/frontend_lexer.elisa
-~/.elisac/elisac -emit semantic elisac.elisalib/src/frontend/frontend_parser.elisa
+~/.elisac/elisac -emit semantic test/fixtures/lexer/frontend_lexer.elisa
+~/.elisac/elisac -emit semantic src/frontend/frontend_parser.elisa
 ```
 
 ## TODO

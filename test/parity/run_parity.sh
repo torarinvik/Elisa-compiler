@@ -16,8 +16,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/bin/elisacore}"
 
-FIXTURE="$REPO_ROOT/test/fixtures/frontend_lexer.elisa"
-SHIMS="$REPO_ROOT/test/fixtures/frontend_lexer_runtime_shims.c"
+FIXTURE="$REPO_ROOT/test/fixtures/lexer/frontend_lexer.elisa"
 
 for tool in "$ELISACORE_BIN" clang; do
 	command -v "$tool" >/dev/null 2>&1 || [[ -x "$tool" ]] || { echo "error: missing $tool" >&2; exit 2; }
@@ -50,7 +49,7 @@ int main(int argc, char **argv) {
 }
 EOF
 
-CFLAGS=(-O0 -I "$WORK" "$WORK/harness.c" "$SHIMS" "$WORK/frontend_lexer.o" -o "$WORK/harness")
+CFLAGS=(-O0 -I "$WORK" "$WORK/harness.c" "$WORK/frontend_lexer.o" -o "$WORK/harness")
 [[ "$(uname -s)" == "Darwin" ]] && CFLAGS=(-Wl,-undefined,dynamic_lookup "${CFLAGS[@]}")
 clang "${CFLAGS[@]}"
 

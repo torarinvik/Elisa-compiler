@@ -2,7 +2,7 @@
 # Single-source-of-truth guard for the VENDORED Elisa runtime.
 #
 # The stage1 frontend in this repo vendors Elisa-core's stdlib under
-# elisac.elisalib/vendor/elisacore_std/. Vendoring risks silent drift, so this
+# elisacore_std/. Vendoring risks silent drift, so this
 # script diffs the vendored copy against the canonical copy in Elisa-core and
 # fails (exit 1) on any difference. Run it in CI and before any frontend work.
 #
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-VENDORED="$REPO_ROOT/elisac.elisalib/vendor/elisacore_std"
+VENDORED="$REPO_ROOT/elisacore_std"
 
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 CANONICAL="$ELISA_CORE/compiler/runtime/elisacore_std"
