@@ -76,6 +76,11 @@ if [[ ${#corpus[@]} -eq 0 ]]; then
 	mk numbers.elisa      'x <- 0xff\ny <- 1.5\nz <- 1e3\n'
 	mk strings.elisa      'msg <- "hello world"\n'
 	mk ranges.elisa       'for i in 1 ..= 4:\n    pass\n'
+	mk appended_ops.elisa 'x |> f; y => { z }\n'
+	mk float_edges.elisa  'a <- .5\nb <- 1.\nc <- 1.f32\nd <- 1.e3\n'
+	mk block_comment.elisa 'def f:\n    """doc\nspanning"""\n    g()\n'
+	mk line_directive.elisa '#line 12 included.elisa\nvalue <- 1\n'
+	mk aliases.elisa      'size_of(Header) align_of(Header) offset_of(Header, count) value is Pattern\n'
 	# Keyword coverage incl. 8-char keywords (continue/offsetof) that the old
 	# hand-rolled fast-path mis-filtered, and `aligned` which must stay an ident.
 	mk keywords.elisa     'def f:\n    if true:\n        continue\n    x <- offsetof\n    aligned <- 1\n    return x\n'
