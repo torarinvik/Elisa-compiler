@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Cross-repo lexer parity: stage1 (this repo's Elisa lexer) vs stage0 (Elisa-core).
 #
-# For each corpus file we compute two token-kind checksums and require they match:
-#   * stage1: the self-hosted Elisa lexer, compiled into a tiny Elisa checksum
-#     harness generated per corpus file.
-#   * stage0: `elisacore -emit tokens <file>` (the Go lexer oracle), JSON .checksum.
+# For each corpus file we compute token-kind and full-token checksums and require they match:
+#   * stage1: the self-hosted Elisa lexer, compiled once into a native checksum
+#     harness.
+#   * stage0: a tiny Go oracle that imports Elisa-core's lexer package.
 #
 # Inputs must be STANDALONE .elisa files (no `include` directives): the Elisa
 # harness lexes raw file bytes, while `-emit tokens` lexes include-expanded
@@ -19,12 +19,17 @@ ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/bin/elisacore}"
 
 FIXTURE="$REPO_ROOT/test/fixtures/lexer/frontend_lexer.elisa"
 
-for tool in "$ELISACORE_BIN" clang go od wc; do
+for tool in "$ELISACORE_BIN" clang go; do
 	command -v "$tool" >/dev/null 2>&1 || [[ -x "$tool" ]] || { echo "error: missing $tool" >&2; exit 2; }
 done
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+if [[ "${PARITY_KEEP_WORK:-0}" == "1" ]]; then
+	echo "parity workdir: $WORK" >&2
+	trap 'echo "parity workdir kept: '"$WORK"'" >&2' EXIT INT TERM HUP
+else
+	trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+fi
 
 cat > "$WORK/stage0_full_tokens.go" <<'EOF'
 package main
@@ -70,10 +75,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(3)
 	}
-	tokens := lexer.New(os.Args[1], source).Tokenize()
-	kindHash := mix(offset, uint64(len(tokens)))
-	fullHash := mix(offset, uint64(len(tokens)))
-	for _, token := range tokens {
+	l := lexer.New(os.Args[1], source)
+	kindHash := offset
+	fullHash := offset
+	for {
+		token := l.NextToken()
 		code := kindCode(token.Kind)
 		kindHash = mix(kindHash, code)
 		fullHash = mix(fullHash, code)
@@ -81,53 +87,83 @@ func main() {
 		fullHash = mix(fullHash, uint64(token.Pos.Col))
 		fullHash = hashString(fullHash, token.Text)
 		fullHash = hashString(fullHash, token.Suffix)
+		if token.Kind == lexer.TOKEN_EOF {
+			break
+		}
 	}
 	fmt.Printf("%d %d\n", kindHash, fullHash)
 }
 EOF
 (cd "$ELISA_CORE/compiler" && go build -o "$WORK/stage0_full_tokens" "$WORK/stage0_full_tokens.go")
 
-stage1_checksum() {
-	local file="$1"
-	local name="$2"
-	local source_len
-	local bytes
-	local array_len
-	local harness
-	local obj
-	local exe
-
-	source_len="$(wc -c < "$file" | tr -d '[:space:]')"
-	bytes="$(od -An -v -tu1 "$file" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//; s/ /, /g')"
-	if [[ -z "$bytes" ]]; then
-		bytes="0"
-		array_len=1
-	else
-		array_len="$source_len"
-	fi
-
-	harness="$WORK/stage1_${name}.elisa"
-	obj="$WORK/stage1_${name}.o"
-	exe="$WORK/stage1_${name}"
-	cat > "$harness" <<EOF
+cat > "$WORK/stage1_lexer_harness.elisa" <<EOF
 include "$FIXTURE"
 
-def main() -> int:
-    can Console.Write, Memory.Allocate, Console.Format, Abort.Panic:
-        bytes: u8[$array_len] = [$bytes]
-        kind_checksum: u64 = frontend_lexer_token_checksum_with_len(&bytes[0], $source_len)
-        full_checksum: u64 = frontend_lexer_token_full_checksum_with_len(&bytes[0], $source_len)
-        printr(kind_checksum)
-        printr(" ")
-        print(full_checksum)
-        return 0
+def stage1_lexer_checksums(source: u8&, source_len: usize, kind_out: mutable u64&, full_out: mutable u64&):
+    checksums: FrontendLexerChecksums = frontend_lexer_stream_checksums_with_len(source, source_len) can Memory.Allocate, Abort.Panic
+    kind_out[0] <- checksums.kind
+    full_out[0] <- checksums.full
+
+
+export func stage1_lexer_checksums_export(source: u8&, source_len: usize, kind_out: mutable u64&, full_out: mutable u64&) -> void = stage1_lexer_checksums
 EOF
 
-	"$ELISACORE_BIN" -emit obj -O0 -o "$obj" "$harness" >/dev/null
-	local link_flags=(-O0 "$obj" -o "$exe")
-	[[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
-	clang "${link_flags[@]}"
-	"$exe"
+"$ELISACORE_BIN" -emit header -o "$WORK/stage1_lexer_harness.h" "$WORK/stage1_lexer_harness.elisa" >/dev/null
+"$ELISACORE_BIN" -emit obj -O2 -o "$WORK/stage1_lexer_harness.o" "$WORK/stage1_lexer_harness.elisa" >/dev/null
+
+cat > "$WORK/stage1_lexer_harness.c" <<'EOF'
+#include "stage1_lexer_harness.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static uint8_t *slurp(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n < 0) { fclose(f); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    uint8_t *buf = (uint8_t *)malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        fclose(f);
+        free(buf);
+        return NULL;
+    }
+    fclose(f);
+    buf[n] = 0;
+    *out_len = (size_t)n;
+    return buf;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <file>\n", argv[0]);
+        return 2;
+    }
+    size_t source_len = 0;
+    uint8_t *source = slurp(argv[1], &source_len);
+    if (!source) {
+        fprintf(stderr, "read failed: %s\n", argv[1]);
+        return 3;
+    }
+    uint64_t kind = 0;
+    uint64_t full = 0;
+    stage1_lexer_checksums_export(source, source_len, &kind, &full);
+    printf("%llu %llu\n", (unsigned long long)kind, (unsigned long long)full);
+    free(source);
+    return 0;
+}
+EOF
+
+stage1_link_flags=(-O2 -I "$WORK" "$WORK/stage1_lexer_harness.c" "$WORK/stage1_lexer_harness.o" -o "$WORK/stage1_lexer_harness")
+[[ "$(uname -s)" == "Darwin" ]] && stage1_link_flags=(-Wl,-undefined,dynamic_lookup "${stage1_link_flags[@]}")
+clang "${stage1_link_flags[@]}"
+
+stage1_checksum() {
+	local file="$1"
+	"$WORK/stage1_lexer_harness" "$file"
 }
 
 # Corpus: caller-supplied files, else a built-in standalone set.
@@ -152,9 +188,8 @@ if [[ ${#corpus[@]} -eq 0 ]]; then
 fi
 
 fail=0
-case_index=0
 for file in "${corpus[@]}"; do
-	stage1="$(stage1_checksum "$file" "$case_index")"
+	stage1="$(stage1_checksum "$file")"
 	stage0="$("$WORK/stage0_full_tokens" "$file")"
 	if [[ "$stage1" == "$stage0" && -n "$stage0" ]]; then
 		printf 'OK    %-20s %s\n' "$(basename "$file")" "$stage0"
@@ -162,7 +197,6 @@ for file in "${corpus[@]}"; do
 		printf 'DRIFT %-20s stage1=%s stage0=%s\n' "$(basename "$file")" "$stage1" "$stage0"
 		fail=1
 	fi
-	case_index=$((case_index + 1))
 done
 
 [[ $fail -eq 0 ]] && echo "lexer parity: stage1 == stage0" || { echo "LEXER PARITY FAILED" >&2; exit 1; }
