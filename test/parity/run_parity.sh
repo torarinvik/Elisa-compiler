@@ -2,7 +2,8 @@
 # Cross-repo lexer parity: stage1 (this repo's Elisa lexer) vs stage0 (Elisa-core).
 #
 # For each corpus file we compute two token-kind checksums and require they match:
-#   * stage1: the self-hosted Elisa lexer, compiled to a native checksum harness.
+#   * stage1: the self-hosted Elisa lexer, compiled into a tiny Elisa checksum
+#     harness generated per corpus file.
 #   * stage0: `elisacore -emit tokens <file>` (the Go lexer oracle), JSON .checksum.
 #
 # Inputs must be STANDALONE .elisa files (no `include` directives): the Elisa
@@ -18,40 +19,52 @@ ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/bin/elisacore}"
 
 FIXTURE="$REPO_ROOT/test/fixtures/lexer/frontend_lexer.elisa"
 
-for tool in "$ELISACORE_BIN" clang; do
+for tool in "$ELISACORE_BIN" clang od wc; do
 	command -v "$tool" >/dev/null 2>&1 || [[ -x "$tool" ]] || { echo "error: missing $tool" >&2; exit 2; }
 done
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-echo "building stage1 lexer harness…"
-"$ELISACORE_BIN" -emit header -o "$WORK/frontend_lexer.h" "$FIXTURE"
-"$ELISACORE_BIN" -emit obj -O0 -o "$WORK/frontend_lexer.o" "$FIXTURE"
+stage1_checksum() {
+	local file="$1"
+	local name="$2"
+	local source_len
+	local bytes
+	local array_len
+	local harness
+	local obj
+	local exe
 
-cat > "$WORK/harness.c" <<'EOF'
-#include "frontend_lexer.h"
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-static uint8_t *slurp(const char *path) {
-    FILE *f = fopen(path, "rb"); if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    uint8_t *b = malloc((size_t)n + 1);
-    if (fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
-    fclose(f); b[n] = 0; return b;
-}
-int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <file>\n", argv[0]); return 2; }
-    uint8_t *src = slurp(argv[1]); if (!src) { fprintf(stderr, "read failed\n"); return 3; }
-    printf("%llu\n", (unsigned long long)frontend_lexer_token_checksum(src));
-    free(src); return 0;
-}
+	source_len="$(wc -c < "$file" | tr -d '[:space:]')"
+	bytes="$(od -An -v -tu1 "$file" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//; s/ /, /g')"
+	if [[ -z "$bytes" ]]; then
+		bytes="0"
+		array_len=1
+	else
+		array_len="$source_len"
+	fi
+
+	harness="$WORK/stage1_${name}.elisa"
+	obj="$WORK/stage1_${name}.o"
+	exe="$WORK/stage1_${name}"
+	cat > "$harness" <<EOF
+include "$FIXTURE"
+
+def main() -> int:
+    can Console.Write, Memory.Allocate, Console.Format, Abort.Panic:
+        bytes: u8[$array_len] = [$bytes]
+        checksum: u64 = frontend_lexer_token_checksum_with_len(&bytes[0], $source_len)
+        print(checksum)
+        return 0
 EOF
 
-CFLAGS=(-O0 -I "$WORK" "$WORK/harness.c" "$WORK/frontend_lexer.o" -o "$WORK/harness")
-[[ "$(uname -s)" == "Darwin" ]] && CFLAGS=(-Wl,-undefined,dynamic_lookup "${CFLAGS[@]}")
-clang "${CFLAGS[@]}"
+	"$ELISACORE_BIN" -emit obj -O0 -o "$obj" "$harness" >/dev/null
+	local link_flags=(-O0 "$obj" -o "$exe")
+	[[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
+	clang "${link_flags[@]}"
+	"$exe"
+}
 
 # Corpus: caller-supplied files, else a built-in standalone set.
 corpus=("$@")
@@ -69,8 +82,9 @@ if [[ ${#corpus[@]} -eq 0 ]]; then
 fi
 
 fail=0
+case_index=0
 for file in "${corpus[@]}"; do
-	stage1="$("$WORK/harness" "$file")"
+	stage1="$(stage1_checksum "$file" "$case_index")"
 	stage0="$("$ELISACORE_BIN" -emit tokens "$file" | sed -n 's/.*"checksum": *\([0-9]*\).*/\1/p')"
 	if [[ "$stage1" == "$stage0" && -n "$stage0" ]]; then
 		printf 'OK    %-20s %s\n' "$(basename "$file")" "$stage0"
@@ -78,6 +92,7 @@ for file in "${corpus[@]}"; do
 		printf 'DRIFT %-20s stage1=%s stage0=%s\n' "$(basename "$file")" "$stage1" "$stage0"
 		fail=1
 	fi
+	case_index=$((case_index + 1))
 done
 
 [[ $fail -eq 0 ]] && echo "lexer parity: stage1 == stage0" || { echo "LEXER PARITY FAILED" >&2; exit 1; }
