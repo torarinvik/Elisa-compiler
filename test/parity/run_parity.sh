@@ -19,12 +19,73 @@ ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/bin/elisacore}"
 
 FIXTURE="$REPO_ROOT/test/fixtures/lexer/frontend_lexer.elisa"
 
-for tool in "$ELISACORE_BIN" clang od wc; do
+for tool in "$ELISACORE_BIN" clang go od wc; do
 	command -v "$tool" >/dev/null 2>&1 || [[ -x "$tool" ]] || { echo "error: missing $tool" >&2; exit 2; }
 done
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+
+cat > "$WORK/stage0_full_tokens.go" <<'EOF'
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"elisacore/src/lexer"
+)
+
+const offset uint64 = 1469598103934665603
+const prime uint64 = 1099511628211
+
+func mix(hash uint64, value uint64) uint64 {
+	return (hash ^ value) * prime
+}
+
+func hashString(hash uint64, value string) uint64 {
+	hash = mix(hash, uint64(len(value)))
+	for i := 0; i < len(value); i++ {
+		hash = mix(hash, uint64(value[i]))
+	}
+	return hash
+}
+
+func kindCode(kind lexer.TokenKind) uint64 {
+	switch kind {
+	case lexer.TOKEN_RANGE_LE:
+		return 109
+	default:
+		return uint64(kind) + 1
+	}
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: stage0_full_tokens <file>")
+		os.Exit(2)
+	}
+	source, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
+	tokens := lexer.New(os.Args[1], source).Tokenize()
+	kindHash := mix(offset, uint64(len(tokens)))
+	fullHash := mix(offset, uint64(len(tokens)))
+	for _, token := range tokens {
+		code := kindCode(token.Kind)
+		kindHash = mix(kindHash, code)
+		fullHash = mix(fullHash, code)
+		fullHash = mix(fullHash, uint64(token.Pos.Line))
+		fullHash = mix(fullHash, uint64(token.Pos.Col))
+		fullHash = hashString(fullHash, token.Text)
+		fullHash = hashString(fullHash, token.Suffix)
+	}
+	fmt.Printf("%d %d\n", kindHash, fullHash)
+}
+EOF
+(cd "$ELISA_CORE/compiler" && go build -o "$WORK/stage0_full_tokens" "$WORK/stage0_full_tokens.go")
 
 stage1_checksum() {
 	local file="$1"
@@ -54,8 +115,11 @@ include "$FIXTURE"
 def main() -> int:
     can Console.Write, Memory.Allocate, Console.Format, Abort.Panic:
         bytes: u8[$array_len] = [$bytes]
-        checksum: u64 = frontend_lexer_token_checksum_with_len(&bytes[0], $source_len)
-        print(checksum)
+        kind_checksum: u64 = frontend_lexer_token_checksum_with_len(&bytes[0], $source_len)
+        full_checksum: u64 = frontend_lexer_token_full_checksum_with_len(&bytes[0], $source_len)
+        printr(kind_checksum)
+        printr(" ")
+        print(full_checksum)
         return 0
 EOF
 
@@ -75,6 +139,7 @@ if [[ ${#corpus[@]} -eq 0 ]]; then
 	mk aligned.elisa      'def f(aligned: i64) -> i64:\n    return aligned\n'
 	mk numbers.elisa      'x <- 0xff\ny <- 1.5\nz <- 1e3\n'
 	mk strings.elisa      'msg <- "hello world"\n'
+	mk escaped_literals.elisa 'msg <- "a\\n\\x41"\nch <- '"'"'\\n'"'"'\n'
 	mk ranges.elisa       'for i in 1 ..= 4:\n    pass\n'
 	mk appended_ops.elisa 'x |> f; y => { z }\n'
 	mk float_edges.elisa  'a <- .5\nb <- 1.\nc <- 1.f32\nd <- 1.e3\n'
@@ -90,7 +155,7 @@ fail=0
 case_index=0
 for file in "${corpus[@]}"; do
 	stage1="$(stage1_checksum "$file" "$case_index")"
-	stage0="$("$ELISACORE_BIN" -emit tokens "$file" | sed -n 's/.*"checksum": *\([0-9]*\).*/\1/p')"
+	stage0="$("$WORK/stage0_full_tokens" "$file")"
 	if [[ "$stage1" == "$stage0" && -n "$stage0" ]]; then
 		printf 'OK    %-20s %s\n' "$(basename "$file")" "$stage0"
 	else
