@@ -188,6 +188,23 @@ module Parser:
             if Lexer::text_or_empty(cur, parser.source) != "can":
                 return
             parser.advance()                           # consume `can`
+
+            # Bracketed form `can[E1, E2]`: the effect set is delimited by `[...]`, so
+            # consume exactly the balanced brackets and stop — the following comma (if any)
+            # is a parameter separator, not part of the grant.
+            if parser.peek() == TokenKind.LBracket:
+                parser.advance()
+                bdepth: mutable int = 1
+                while bdepth > 0 and parser.peek() != TokenKind.Eof:
+                    bk: TokenKind = parser.advance().kind
+                    if bk == TokenKind.LBracket:
+                        bdepth <- bdepth + 1
+                    elif bk == TokenKind.RBracket:
+                        bdepth <- bdepth - 1
+                return
+
+            # Bare list form `can E1, E2`: the commas belong to the grant, so scan stops
+            # only at a depth-0 closing bracket, line break, or block colon.
             depth: mutable int = 0
             while parser.peek() != TokenKind.Eof:
                 k: TokenKind = parser.peek()
@@ -241,10 +258,16 @@ module Parser:
                     # `get EXPR else <recovery>` recovery form (contextual keyword): the
                     # guarded expression is the value; the `else` clause is a fallback
                     # expression or a control-flow statement (`else return null`).
-                    if Lexer::text_or_empty(tok, parser.source) == "get":
+                    head_text: sview = Lexer::text_or_empty(tok, parser.source)
+                    if head_text == "get":
                         return parser.get_expr()
+                    # `move EXPR` ownership transfer — the moved value is the expression;
+                    # the move marker is consumed but not modeled.
+                    if head_text == "move":
+                        parser.advance()
+                        return parser.unary_expr()
                     parser.advance()
-                    return parser.emit_expr(Ast::Expr.Ident(Lexer::text_or_empty(tok, parser.source)))
+                    return parser.emit_expr(Ast::Expr.Ident(head_text))
 
                 TokenKind.True:
                     parser.advance()
@@ -457,10 +480,17 @@ module Parser:
             # as `i in (0 ..< (n+1))`.
             elif kind == TokenKind.Range or kind == TokenKind.RangeLt or kind == TokenKind.RangeGt or kind == TokenKind.RangeLe:
                 return 4
-            elif kind == TokenKind.Plus or kind == TokenKind.Minus:
+            # Bitwise or/xor/and-equivalent: pipe and caret (bitwise `&` is omitted — it
+            # collides with postfix `T&` ref and prefix `&x` address-of).
+            elif kind == TokenKind.Pipe or kind == TokenKind.Caret:
                 return 5
-            elif kind == TokenKind.Star or kind == TokenKind.Slash or kind == TokenKind.Percent:
+            elif kind == TokenKind.Plus or kind == TokenKind.Minus:
                 return 6
+            elif kind == TokenKind.Star or kind == TokenKind.Slash or kind == TokenKind.Percent:
+                return 7
+            # Shifts bind tightest among the binaries.
+            elif kind == TokenKind.LShift or kind == TokenKind.RShift:
+                return 8
             else:
                 return 0
 
@@ -1046,9 +1076,32 @@ module Parser:
                 TokenKind.Export:
                     return parser.extern_decl()
 
+                TokenKind.Error:
+                    return parser.error_type_decl()
+
                 _:
                     parser.error_at(Ast::ParseErrorKind.ExpectedDeclaration, parser.cursor())
                     return null
+
+
+        # `error Name:` error-type declaration with an indented body of variants/fields.
+        # The body is skipped; the name is recorded as an Alias node.
+        def error_type_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.expect(TokenKind.Error)
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            parser.skip_decl_header_clauses()
+            if parser.peek() == TokenKind.Colon and parser.peek_at(1) == TokenKind.Newline:
+                parser.advance()
+                parser.expect(TokenKind.Newline)
+                if parser.accept(TokenKind.Indent):
+                    depth: mutable int = 1
+                    while depth > 0 and parser.peek() != TokenKind.Eof:
+                        k: TokenKind = parser.advance().kind
+                        if k == TokenKind.Indent:
+                            depth <- depth + 1
+                        elif k == TokenKind.Dedent:
+                            depth <- depth - 1
+            return parser.emit_decl(Ast::Decl.Alias(Lexer::text_or_empty(name_tok, parser.source), parser.emit_expr(Ast::Expr.Invalid), tok.line))
 
 
         # `extern <signature>` / `extern <Name>` (FFI import or opaque type) and
@@ -1058,7 +1111,9 @@ module Parser:
         def extern_decl(parser: mutable Parser&) -> Ast::Decl?:
             tok: Token = parser.advance()              # `extern` / `export`
             parser.skip_decl_header_clauses()          # to the block colon or end of line
-            if parser.peek() == TokenKind.Colon:
+            # Only `extern:` / `export:` followed by a newline opens an indented block;
+            # a typed `extern name: T` stops at the colon (skip the rest of the line).
+            if parser.peek() == TokenKind.Colon and parser.peek_at(1) == TokenKind.Newline:
                 parser.advance()
                 if parser.accept(TokenKind.Newline) and parser.accept(TokenKind.Indent):
                     depth: mutable int = 1
@@ -1068,12 +1123,27 @@ module Parser:
                             depth <- depth + 1
                         elif k == TokenKind.Dedent:
                             depth <- depth - 1
+            else:
+                # Typed `extern name: T` (or any single-line extern): consume the
+                # remainder of the line (the `: T`) so it isn't reparsed.
+                while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                    parser.advance()
             return parser.emit_decl(Ast::Decl.Invalid)
 
 
         def func_decl(parser: mutable Parser&) -> Ast::Decl?:
             tok: Token = parser.expect(TokenKind.Def)
             name_tok: Token = parser.expect(TokenKind.Ident)
+
+            # Optional generic/region params `[T]`, `[K, V]`, `[@r]` between name and `(`.
+            if parser.accept(TokenKind.LBracket):
+                gp_depth: mutable int = 1
+                while gp_depth > 0 and parser.peek() != TokenKind.Eof:
+                    gk: TokenKind = parser.advance().kind
+                    if gk == TokenKind.LBracket:
+                        gp_depth <- gp_depth + 1
+                    elif gk == TokenKind.RBracket:
+                        gp_depth <- gp_depth - 1
 
             params_start: usize = parser.params.count
             if parser.accept(TokenKind.LParen):
