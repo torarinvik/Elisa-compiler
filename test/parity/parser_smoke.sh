@@ -37,30 +37,58 @@ cat > "$WORK/driver.c" <<'EOF'
 #include "parser_smoke.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-int main(void) {
-    const char *src =
-        "def add(a: int, b: int) -> int:\n"
-        "    sum: int = a\n"
-        "    sum <- sum\n"
-        "    if a:\n"
-        "        return a\n"
-        "    elif b:\n"
-        "        return b\n"
-        "    else:\n"
-        "        return sum\n"
-        "\n"
-        "struct Point:\n"
-        "    x: int\n"
-        "    y: int\n"
-        "\n"
-        "enum Color:\n"
-        "    Red\n"
-        "    Green(shade: int)\n";
-    size_t n = 0; while (src[n]) n++;
-    uint64_t decls = 0, errors = 0;
-    smoke_parse_export((uint8_t *)src, n, &decls, &errors);
-    printf("%llu %llu\n", (unsigned long long)decls, (unsigned long long)errors);
+static uint8_t *slurp(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *b = (uint8_t *)malloc((size_t)n + 1);
+    if (!b) { fclose(f); return NULL; }
+    if (fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
+    fclose(f); b[n] = 0; *out_len = (size_t)n; return b;
+}
+
+int main(int argc, char **argv) {
+    /* No args: the focused fixture (asserted decls/errors). */
+    if (argc < 2) {
+        const char *src =
+            "def add(a: int, b: int) -> int:\n"
+            "    sum: int = a\n"
+            "    sum <- sum\n"
+            "    if a:\n"
+            "        return a\n"
+            "    elif b:\n"
+            "        return b\n"
+            "    else:\n"
+            "        return sum\n"
+            "\n"
+            "struct Point:\n"
+            "    x: int\n"
+            "    y: int\n"
+            "\n"
+            "enum Color:\n"
+            "    Red\n"
+            "    Green(shade: int)\n";
+        size_t n = 0; while (src[n]) n++;
+        uint64_t decls = 0, errors = 0;
+        smoke_parse_export((uint8_t *)src, n, &decls, &errors);
+        printf("%llu %llu\n", (unsigned long long)decls, (unsigned long long)errors);
+        return 0;
+    }
+    /* With file args: parse each and print "<total_errors> <file_count>" — the
+       self-parse check (the stage1 frontend must parse its own source cleanly). */
+    uint64_t total_errors = 0; int files = 0;
+    for (int i = 1; i < argc; i++) {
+        size_t n = 0; uint8_t *s = slurp(argv[i], &n);
+        if (!s) { fprintf(stderr, "read failed: %s\n", argv[i]); return 3; }
+        uint64_t d = 0, e = 0;
+        smoke_parse_export(s, n, &d, &e);
+        if (e) fprintf(stderr, "  %s: %llu errors\n", argv[i], (unsigned long long)e);
+        total_errors += e; files++;
+        free(s);
+    }
+    printf("%llu %d\n", (unsigned long long)total_errors, files);
     return 0;
 }
 EOF
@@ -84,3 +112,19 @@ if [[ "$got_decls" != "$EXPECT_DECLS" || "$got_errors" != "$EXPECT_ERRORS" ]]; t
 fi
 
 echo "parser smoke OK: decls=$got_decls errors=$got_errors" >&2
+
+# Self-parse: the stage1 frontend must parse its OWN source (the whole lexer +
+# parser) with zero parse errors. This is the dogfooding regression guard — any
+# grammar regression that breaks a real frontend file fails here.
+FRONTEND_FILES=()
+for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa; do
+	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
+done
+if [[ ${#FRONTEND_FILES[@]} -gt 0 ]]; then
+	read -r self_errors self_files < <("$WORK/run" "${FRONTEND_FILES[@]}")
+	if [[ "$self_errors" != "0" ]]; then
+		echo "parser self-parse FAILED: $self_errors parse errors across $self_files frontend files (want 0)" >&2
+		exit 1
+	fi
+	echo "parser self-parse OK: 0 errors across $self_files frontend files" >&2
+fi
