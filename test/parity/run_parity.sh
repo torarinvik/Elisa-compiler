@@ -160,7 +160,11 @@ int main(int argc, char **argv) {
 EOF
 
 stage1_link_flags=(-O2 -I "$WORK" "$WORK/stage1_lexer_harness.c" "$WORK/stage1_lexer_harness.o" -o "$WORK/stage1_lexer_harness")
+# Elisa codegen emits non-PIC objects: macOS needs dynamic_lookup for the runtime
+# symbols, Linux must link -no-pie (else GNU ld: "failed to set dynamic section
+# sizes"). Mirrors elisac's own native linker (native_exec.go).
 [[ "$(uname -s)" == "Darwin" ]] && stage1_link_flags=(-Wl,-undefined,dynamic_lookup "${stage1_link_flags[@]}")
+[[ "$(uname -s)" == "Linux" ]] && stage1_link_flags=(-no-pie "${stage1_link_flags[@]}")
 clang "${stage1_link_flags[@]}"
 
 stage1_checksum() {

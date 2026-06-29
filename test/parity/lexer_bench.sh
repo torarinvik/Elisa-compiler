@@ -111,7 +111,9 @@ EOF
 "$ELISACORE_BIN" -emit obj -O2 -o "$WORK/bench_harness.o" "$WORK/bench_harness.elisa" >/dev/null
 
 link_flags=(-O2 -I "$WORK" "$WORK/bench_driver.c" "$WORK/bench_harness.o" -o "$WORK/bench")
+# See run_parity.sh: non-PIC Elisa objects need dynamic_lookup on macOS, -no-pie on Linux.
 [[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
+[[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")
 clang "${link_flags[@]}"
 
 echo "lexer bench: input=$(basename "$INPUT") ($(wc -l <"$INPUT" | tr -d ' ') lines), iters=$ITERS" >&2
