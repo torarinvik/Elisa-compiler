@@ -128,3 +128,19 @@ if [[ ${#FRONTEND_FILES[@]} -gt 0 ]]; then
 	fi
 	echo "parser self-parse OK: 0 errors across $self_files frontend files" >&2
 fi
+
+# Stdlib parse: the stage1 parser must also parse the whole vendored standard
+# library with zero errors. Together with the self-parse above this guards the
+# full parser grammar against regressions on real, idiomatic Elisa source.
+STD_FILES=()
+for f in "$REPO_ROOT"/elisacore_std/*.elisa; do
+	[[ -f "$f" ]] && STD_FILES+=("$f")
+done
+if [[ ${#STD_FILES[@]} -gt 0 ]]; then
+	read -r std_errors std_files < <("$WORK/run" "${STD_FILES[@]}")
+	if [[ "$std_errors" != "0" ]]; then
+		echo "parser stdlib-parse FAILED: $std_errors parse errors across $std_files stdlib files (want 0)" >&2
+		exit 1
+	fi
+	echo "parser stdlib-parse OK: 0 errors across $std_files stdlib files" >&2
+fi
