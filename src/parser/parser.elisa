@@ -56,6 +56,22 @@ module Parser:
             return parser.cursor().kind
 
 
+        # Lookahead by `offset` tokens without advancing. Out-of-range reads as Eof,
+        # so callers never index past the token stream.
+        def peek_at(parser: Parser&, offset: usize) -> TokenKind:
+            idx: usize = parser.position + offset
+            if idx >= parser.tokens.count:
+                return TokenKind.Eof
+            return parser.tokens[idx].kind
+
+
+        # Consume a run of layout Newlines. Blank lines and statement terminators
+        # collapse here so block/decl loops only ever see real grammar tokens.
+        def skip_newlines(parser: mutable Parser&) -> void:
+            while parser.peek() == TokenKind.Newline:
+                parser.advance()
+
+
         def advance(parser: mutable Parser&) -> Token:
             tok: Token = parser.cursor()
             if parser.position < parser.tokens.count:
@@ -109,22 +125,52 @@ module Parser:
             return decl
 
 
-        # Parse statements until a block terminator: Dedent/Eof always, and Else too when
-        # stop_on_else (an if-then arm). Returns a range into parser.nodes.
-        def stmt_block(parser: mutable Parser&, stop_on_else: bool) -> Ast::NodeRange:
+        # Pack a staged child-handle list contiguously into the flat `nodes` store and
+        # return its range. Recursive descent appends a parent's children interleaved
+        # with its grandchildren, so child lists are first collected into a small local
+        # buffer, then committed here in one contiguous block — keeping every NodeRange
+        # a valid [start, end) slice over the flat store (data-oriented final layout).
+        def commit_nodes(parser: mutable Parser&, items: darray[Ast::Node]) -> Ast::NodeRange:
             start: usize = parser.nodes.count
-            while true:
-                k: TokenKind = parser.peek()
-                if k == TokenKind.Eof or k == TokenKind.Dedent:
-                    break
-                if stop_on_else and k == TokenKind.Else:
-                    break
-                stmt_handle: Ast::Stmt? = parser.stmt()
-                if stmt_handle is stmt:
-                    parser.nodes.push(stmt)
-                else:
-                    break
+            for item in items:
+                parser.nodes.push(item)
             return Ast::NodeRange(start, parser.nodes.count)
+
+
+        # Parse a `:`-introduced statement block and return a range into parser.nodes.
+        # Two layouts are accepted, matching the lexer's token model:
+        #   inline    `: <stmt> NEWLINE`
+        #   indented  `: NEWLINE INDENT (<stmt> NEWLINE)* DEDENT`
+        # The opening Colon and all layout tokens (Newline/Indent/Dedent) are consumed
+        # here, so statement parsers never see layout noise.
+        def parse_block(parser: mutable Parser&) -> Ast::NodeRange:
+            parser.expect(TokenKind.Colon)
+            items: mutable darray[Ast::Node] = []
+
+            # Inline single-statement block: `if cond: return x`.
+            if parser.peek() != TokenKind.Newline:
+                if parser.stmt() is inline_stmt:
+                    items.push(inline_stmt)
+                parser.accept(TokenKind.Newline)
+                return parser.commit_nodes(items)
+
+            # Indented block.
+            parser.expect(TokenKind.Newline)
+            parser.expect(TokenKind.Indent)
+
+            while true:
+                parser.skip_newlines()
+                k: TokenKind = parser.peek()
+                if k == TokenKind.Dedent or k == TokenKind.Eof:
+                    break
+                if parser.stmt() is body_stmt:
+                    items.push(body_stmt)
+                    parser.accept(TokenKind.Newline)
+                else:
+                    parser.advance()   # error recovery: never spin on a bad token
+
+            parser.expect(TokenKind.Dedent)
+            return parser.commit_nodes(items)
 
 
         # ============================================================
@@ -181,26 +227,35 @@ module Parser:
 
                 if kind == TokenKind.LParen:
                     parser.advance()
-                    args_start: usize = parser.nodes.count
+                    arg_items: mutable darray[Ast::Node] = []
 
                     if parser.peek() != TokenKind.RParen:
                         arg_handle: mutable Ast::Expr? = parser.expr()
                         if arg_handle is parsed_arg:
-                            parser.nodes.push(parsed_arg)
+                            arg_items.push(parsed_arg)
 
                         while parser.accept(TokenKind.Comma):
                             arg_handle <- parser.expr()
                             if arg_handle is parsed_arg:
-                                parser.nodes.push(parsed_arg)
+                                arg_items.push(parsed_arg)
 
                     parser.expect(TokenKind.RParen)
-                    args: Ast::NodeRange = Ast::NodeRange(args_start, parser.nodes.count)
+                    args: Ast::NodeRange = parser.commit_nodes(arg_items)
                     active <- parser.emit_expr(Ast::Expr.Call(active, args, tok.line))
 
-                elif kind == TokenKind.Dot:
+                elif kind == TokenKind.Dot or kind == TokenKind.Scope:
+                    # `.` member access and `::` module-path access share Field nodes;
+                    # the latter lets type names like `Ast::Expr` parse uniformly.
                     parser.advance()
                     field_tok: Token = parser.expect(TokenKind.Ident)
                     active <- parser.emit_expr(Ast::Expr.Field(active, Lexer::text_or_empty(field_tok, parser.source), tok.line))
+
+                elif kind == TokenKind.Ampersand or kind == TokenKind.Question:
+                    # Postfix type operators: `T&` (reference) and `T?` (optional).
+                    # Modeled as unary nodes so type-position expressions parse without
+                    # a separate type grammar.
+                    op: TokenKind = parser.advance().kind
+                    active <- parser.emit_expr(Ast::Expr.Unary(op, active, tok.line))
 
                 elif kind == TokenKind.LBracket:
                     parser.advance()
@@ -278,12 +333,12 @@ module Parser:
 
         def array_literal(parser: mutable Parser&) -> Ast::Expr?:
             tok: Token = parser.expect(TokenKind.LBracket)
-            elements_start: usize = parser.nodes.count
+            elem_items: mutable darray[Ast::Node] = []
 
             if parser.peek() != TokenKind.RBracket:
                 elem_handle: mutable Ast::Expr? = parser.expr()
                 if elem_handle is elem:
-                    parser.nodes.push(elem)
+                    elem_items.push(elem)
 
                 while parser.accept(TokenKind.Comma):
                     if parser.peek() == TokenKind.RBracket:
@@ -291,10 +346,10 @@ module Parser:
 
                     elem_handle <- parser.expr()
                     if elem_handle is elem:
-                        parser.nodes.push(elem)
+                        elem_items.push(elem)
 
             parser.expect(TokenKind.RBracket)
-            elements: Ast::NodeRange = Ast::NodeRange(elements_start, parser.nodes.count)
+            elements: Ast::NodeRange = parser.commit_nodes(elem_items)
             return parser.emit_expr(Ast::Expr.Array(elements, tok.line))
 
 
@@ -325,25 +380,57 @@ module Parser:
                     return parser.emit_stmt(Ast::Stmt.Continue("", tok.line))
 
                 _:
-                    expr_handle: Ast::Expr? = parser.expr()
-                    if expr_handle is expr:
-                        return parser.emit_stmt(Ast::Stmt.Expr(expr, tok.line))
-                    else:
-                        return null
+                    # `IDENT :` introduces a local binding (`x: T` / `x: T = v`).
+                    if kind == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
+                        return parser.var_decl_stmt()
+
+                    # Otherwise an expression statement or an assignment `target <- value`.
+                    target: Ast::Expr = get parser.expr() else return null
+                    if parser.peek() == TokenKind.LArrow:
+                        parser.advance()
+                        value: Ast::Expr = get parser.expr() else return null
+                        return parser.emit_stmt(Ast::Stmt.Assign(target, value, tok.line))
+                    return parser.emit_stmt(Ast::Stmt.Expr(target, tok.line))
+
+
+        def var_decl_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            parser.expect(TokenKind.Colon)
+            type_expr: Ast::Expr = get parser.expr() else return null
+
+            # `value` is non-optional in the AST; an uninitialized binding records Invalid.
+            value: mutable Ast::Expr = parser.emit_expr(Ast::Expr.Invalid)
+            if parser.accept(TokenKind.Assign):
+                if parser.expr() is parsed_value:
+                    value <- parsed_value
+
+            return parser.emit_stmt(Ast::Stmt.VarDecl(Lexer::text_or_empty(name_tok, parser.source), type_expr, value, name_tok.line))
 
 
         def if_stmt(parser: mutable Parser&) -> Ast::Stmt?:
-            tok: Token = parser.expect(TokenKind.If)
+            return parser.if_tail(parser.expect(TokenKind.If))
+
+
+        # Shared tail for `if` and `elif`: parse `<cond> <block>` then an optional
+        # `elif`/`else` continuation. An `elif` chain desugars into a nested If stored
+        # as the single statement of the parent's else_body — no separate elif node.
+        def if_tail(parser: mutable Parser&, tok: Token) -> Ast::Stmt?:
             condition: Ast::Expr = get parser.expr() else return null
-
-            parser.expect(TokenKind.Colon)
-
-            then_body: Ast::NodeRange = parser.stmt_block(true)
+            then_body: Ast::NodeRange = parser.parse_block()
 
             else_body: mutable Ast::NodeRange = Ast::NodeRange{start: 0, count: 0}
-            if parser.accept(TokenKind.Else):
-                parser.expect(TokenKind.Colon)
-                else_body <- parser.stmt_block(false)
+            parser.skip_newlines()
+            if parser.peek() == TokenKind.Elif:
+                elif_tok: Token = parser.advance()
+                # Build the nested if first (its own children commit during the call),
+                # then stage+commit it so the range stays a clean single-element slice.
+                else_items: mutable darray[Ast::Node] = []
+                if parser.if_tail(elif_tok) is nested_if:
+                    else_items.push(nested_if)
+                else_body <- parser.commit_nodes(else_items)
+            elif parser.peek() == TokenKind.Else:
+                parser.advance()
+                else_body <- parser.parse_block()
 
             return parser.emit_stmt(Ast::Stmt.If(condition, then_body, else_body, tok.line))
 
@@ -351,10 +438,7 @@ module Parser:
         def while_stmt(parser: mutable Parser&) -> Ast::Stmt?:
             tok: Token = parser.expect(TokenKind.While)
             condition: Ast::Expr = get parser.expr() else return null
-
-            parser.expect(TokenKind.Colon)
-
-            body: Ast::NodeRange = parser.stmt_block(false)
+            body: Ast::NodeRange = parser.parse_block()
             return parser.emit_stmt(Ast::Stmt.While(condition, body, tok.line))
 
 
@@ -400,12 +484,15 @@ module Parser:
             params_start: usize = parser.params.count
             if parser.accept(TokenKind.LParen):
                 while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof:
+                    # Legacy leading `mutable name:` form; the canonical `name: mutable T&`
+                    # form is captured by the type expression itself.
+                    leading_mutable: bool = parser.accept(TokenKind.Mutable)
                     param_name: Token = parser.expect(TokenKind.Ident)
                     parser.expect(TokenKind.Colon)
                     type_expr: Ast::Expr? = parser.expr()
 
                     if type_expr is param_type:
-                        param: Ast::ParamDecl = Ast::ParamDecl{name: Lexer::text_or_empty(param_name, parser.source), type_expr: param_type, is_mutable: false}
+                        param: Ast::ParamDecl = Ast::ParamDecl{name: Lexer::text_or_empty(param_name, parser.source), type_expr: param_type, is_mutable: leading_mutable}
                         parser.params.push(param)
 
                     if not parser.accept(TokenKind.Comma):
@@ -420,11 +507,75 @@ module Parser:
                     return_type <- parsed_return_type
 
             body: mutable Ast::NodeRange = Ast::NodeRange{start: 0, count: 0}
-            if parser.accept(TokenKind.Colon):
-                body <- parser.stmt_block(false)
+            if parser.peek() == TokenKind.Colon:
+                body <- parser.parse_block()
 
             params: Ast::NodeRange = Ast::NodeRange(params_start, parser.params.count)
             return parser.emit_decl(Ast::Decl.Func(Lexer::text_or_empty(name_tok, parser.source), params, return_type, body, tok.line))
+
+
+        # Parse the indented body of a struct: `(IDENT : <type> NEWLINE)*`.
+        # Non-field forms (e.g. `pass`, `bitset:`) are skipped token-by-token so an
+        # unrecognized member never derails the surrounding declaration.
+        def struct_member_block(parser: mutable Parser&) -> void:
+            parser.expect(TokenKind.Colon)
+            parser.expect(TokenKind.Newline)
+            parser.expect(TokenKind.Indent)
+
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                parser.skip_newlines()
+                if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                    break
+                if parser.peek() != TokenKind.Ident:
+                    parser.advance()
+                    continue
+
+                member_name: Token = parser.expect(TokenKind.Ident)
+                parser.expect(TokenKind.Colon)
+                if parser.expr() is member_type:
+                    member: Ast::StructMember = Ast::StructMember{name: Lexer::text_or_empty(member_name, parser.source), type_expr: member_type}
+                    parser.members.push(member)
+                parser.accept(TokenKind.Newline)
+
+            parser.expect(TokenKind.Dedent)
+
+
+        # Parse the indented body of an enum: `(IDENT [ ( <field>, ... ) ] NEWLINE)*`.
+        def enum_variant_block(parser: mutable Parser&) -> void:
+            parser.expect(TokenKind.Colon)
+            parser.expect(TokenKind.Newline)
+            parser.expect(TokenKind.Indent)
+
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                parser.skip_newlines()
+                if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                    break
+                if parser.peek() != TokenKind.Ident:
+                    parser.advance()
+                    continue
+
+                variant_name: Token = parser.expect(TokenKind.Ident)
+                field_items: mutable darray[Ast::Node] = []
+
+                if parser.accept(TokenKind.LParen):
+                    while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof:
+                        # Payload fields are `name: type`; the name is recorded structurally
+                        # by position, so only the type expression is kept as the field node.
+                        if parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
+                            parser.advance()
+                            parser.advance()
+                        if parser.expr() is parsed_field:
+                            field_items.push(parsed_field)
+                        if not parser.accept(TokenKind.Comma):
+                            break
+                    parser.expect(TokenKind.RParen)
+
+                fields: Ast::NodeRange = parser.commit_nodes(field_items)
+                variant: Ast::EnumVariant = Ast::EnumVariant{name: Lexer::text_or_empty(variant_name, parser.source), fields: fields}
+                parser.variants.push(variant)
+                parser.accept(TokenKind.Newline)
+
+            parser.expect(TokenKind.Dedent)
 
 
         def struct_decl(parser: mutable Parser&) -> Ast::Decl?:
@@ -432,18 +583,8 @@ module Parser:
             name_tok: Token = parser.expect(TokenKind.Ident)
 
             members_start: usize = parser.members.count
-            if parser.accept(TokenKind.Colon):
-                while parser.peek() == TokenKind.Ident:
-                    member_name: Token = parser.expect(TokenKind.Ident)
-                    parser.expect(TokenKind.Colon)
-                    type_expr: Ast::Expr? = parser.expr()
-
-                    if type_expr is member_type:
-                        member: Ast::StructMember = Ast::StructMember{name: Lexer::text_or_empty(member_name, parser.source), type_expr: member_type}
-                        parser.members.push(member)
-
-                    if not parser.accept(TokenKind.Newline):
-                        break
+            if parser.peek() == TokenKind.Colon:
+                parser.struct_member_block()
 
             members: Ast::NodeRange = Ast::NodeRange(members_start, parser.members.count)
             return parser.emit_decl(Ast::Decl.Struct(Lexer::text_or_empty(name_tok, parser.source), members, tok.line))
@@ -454,28 +595,8 @@ module Parser:
             name_tok: Token = parser.expect(TokenKind.Ident)
 
             variants_start: usize = parser.variants.count
-            if parser.accept(TokenKind.Colon):
-                while parser.peek() == TokenKind.Ident:
-                    variant_name: Token = parser.expect(TokenKind.Ident)
-                    fields_start: usize = parser.nodes.count
-
-                    if parser.accept(TokenKind.LParen):
-                        while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof:
-                            field_handle: Ast::Expr? = parser.expr()
-                            if field_handle is parsed_field:
-                                parser.nodes.push(parsed_field)
-
-                            if not parser.accept(TokenKind.Comma):
-                                break
-
-                        parser.expect(TokenKind.RParen)
-
-                    fields: Ast::NodeRange = Ast::NodeRange(fields_start, parser.nodes.count)
-                    variant: Ast::EnumVariant = Ast::EnumVariant{name: Lexer::text_or_empty(variant_name, parser.source), fields: fields}
-                    parser.variants.push(variant)
-
-                    if not parser.accept(TokenKind.Newline):
-                        break
+            if parser.peek() == TokenKind.Colon:
+                parser.enum_variant_block()
 
             variants: Ast::NodeRange = Ast::NodeRange(variants_start, parser.variants.count)
             return parser.emit_decl(Ast::Decl.Enum(Lexer::text_or_empty(name_tok, parser.source), variants, tok.line))
@@ -506,16 +627,19 @@ module Parser:
             # inferred auto-region, threaded into every helper call and adopted by the caller
             # on return (region-polymorphic return). No explicit Arena, no `@r`.
             parser: mutable Parser = Parser(source, tokens)
-            file_decls_start: usize = parser.nodes.count
+            top_items: mutable darray[Ast::Node] = []
 
-            while parser.peek() != TokenKind.Eof:
+            while true:
+                parser.skip_newlines()
+                if parser.peek() == TokenKind.Eof:
+                    break
                 decl_handle: Ast::Decl? = parser.decl()
                 if decl_handle is decl:
-                    parser.nodes.push(decl)
+                    top_items.push(decl)
                 else:
                     parser.advance()
 
-            file_decls: Ast::NodeRange = Ast::NodeRange(file_decls_start, parser.nodes.count)
+            file_decls: Ast::NodeRange = parser.commit_nodes(top_items)
             return Ast::File{
                 top_decls: file_decls,
                 errors: parser.errors,
