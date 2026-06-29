@@ -15,12 +15,14 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
-ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/bin/elisacore}"
+
+# Always run against a freshly built compiler (sets ELISACORE_BIN).
+source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
 FIXTURE="$REPO_ROOT/test/fixtures/lexer/frontend_lexer.elisa"
 
-for tool in "$ELISACORE_BIN" clang go; do
-	command -v "$tool" >/dev/null 2>&1 || [[ -x "$tool" ]] || { echo "error: missing $tool" >&2; exit 2; }
+for tool in clang go; do
+	command -v "$tool" >/dev/null 2>&1 || { echo "error: missing $tool" >&2; exit 2; }
 done
 
 WORK="$(mktemp -d)"

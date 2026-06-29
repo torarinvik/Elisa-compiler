@@ -11,14 +11,15 @@
 # the hot per-char/per-token helpers (advance_char, read_type_suffix, the
 # unicode-width helpers). Re-run this before adding or removing those.
 #
-# Point ELISACORE_BIN at a current compiler build (same as run_parity.sh — the
-# $ELISA_CORE/bin/elisacore default can be stale and will fail to parse). E.g.:
-#   ELISACORE_BIN="$HOME/.elisac/elisac" test/parity/lexer_bench.sh
+# By default this builds the latest compiler from source (via resolve_elisac.sh)
+# so the numbers always reflect current HEAD. Set ELISACORE_BIN to bench a
+# specific prebuilt binary instead.
 #
 # Usage:
-#   ELISACORE_BIN=... test/parity/lexer_bench.sh                 # default input + iters
-#   ELISACORE_BIN=... ITERS=8000 test/parity/lexer_bench.sh      # more iterations
-#   ELISACORE_BIN=... test/parity/lexer_bench.sh path/to/input.elisa
+#   test/parity/lexer_bench.sh                 # build latest, default input + iters
+#   ITERS=8000 test/parity/lexer_bench.sh      # more iterations
+#   test/parity/lexer_bench.sh path/to/input.elisa
+#   ELISACORE_BIN=/path/to/elisac test/parity/lexer_bench.sh   # pin a binary
 #
 # Output (stderr), three runs after a warmup:
 #   <seconds> s  <MB/s>  (checksum <n>)
@@ -26,7 +27,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
-ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/bin/elisacore}"
+
+# Always bench a freshly built compiler (sets ELISACORE_BIN).
+source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
 FIXTURE="$REPO_ROOT/test/fixtures/lexer/frontend_lexer.elisa"
 # A large, realistic Elisa source. The generated lowered frontend is ideal: big
@@ -35,9 +38,7 @@ FIXTURE="$REPO_ROOT/test/fixtures/lexer/frontend_lexer.elisa"
 INPUT="${1:-$REPO_ROOT/src/frontend/elisacore_frontend.lowered.elisa}"
 ITERS="${ITERS:-4000}"
 
-for tool in "$ELISACORE_BIN" clang; do
-	command -v "$tool" >/dev/null 2>&1 || [[ -x "$tool" ]] || { echo "error: missing $tool" >&2; exit 2; }
-done
+command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; exit 2; }
 [[ -f "$INPUT" ]] || { echo "error: input not found: $INPUT" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
