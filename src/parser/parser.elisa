@@ -325,12 +325,38 @@ module Parser:
                         if parser.peek() != TokenKind.RBracket:
                             parser.expr()
 
+                    # Multi-arg subscript / generic type args (`dict[K, V]`, `Map[A, B, C]`):
+                    # consume the remaining comma-separated args (kept only as the first index
+                    # until a dedicated generic-application node exists).
+                    while parser.accept(TokenKind.Comma):
+                        if parser.peek() == TokenKind.RBracket:
+                            break
+                        parser.expr()
+
                     parser.expect(TokenKind.RBracket)
 
                     if index_handle is parsed_index:
                         active <- parser.emit_expr(Ast::Expr.Index(active, parsed_index, tok.line))
                     else:
                         active <- parser.emit_expr(Ast::Expr.Index(active, parser.emit_expr(Ast::Expr.Invalid), tok.line))
+
+                elif kind == TokenKind.LBrace:
+                    # Brace construction `Name{field: value, ...}` (Elisa has no brace
+                    # blocks, so `{` after a value is always construction). Modeled as a
+                    # Call on the type expression, with the field values as arguments.
+                    parser.advance()
+                    field_items: mutable darray[Ast::Node] = []
+                    while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof:
+                        if parser.expr() is field_key:
+                            field_items.push(field_key)
+                        if parser.accept(TokenKind.Colon):
+                            if parser.expr() is field_val:
+                                field_items.push(field_val)
+                        if not parser.accept(TokenKind.Comma):
+                            break
+                    parser.expect(TokenKind.RBrace)
+                    ctor_args: Ast::NodeRange = parser.commit_nodes(field_items)
+                    active <- parser.emit_expr(Ast::Expr.Call(active, ctor_args, tok.line))
 
                 else:
                     break
@@ -468,6 +494,9 @@ module Parser:
                 TokenKind.Return:
                     return parser.return_stmt()
 
+                TokenKind.Match:
+                    return parser.match_stmt()
+
                 TokenKind.Break:
                     parser.advance()
                     return parser.emit_stmt(Ast::Stmt.Break("", tok.line))
@@ -489,23 +518,39 @@ module Parser:
                     return parser.prefixed_block_stmt()
 
                 _:
-                    # `can …:` / `trusted …:` effect blocks (contextual keywords).
+                    # Contextual-keyword statements (the lexer emits these as identifiers).
                     if kind == TokenKind.Ident:
                         head: sview = Lexer::text_or_empty(tok, parser.source)
                         if head == "can" or head == "trusted":
                             return parser.prefixed_block_stmt()
+                        if head == "for":
+                            return parser.for_stmt()
 
                     # `IDENT :` introduces a local binding (`x: T` / `x: T = v`).
                     if kind == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
                         return parser.var_decl_stmt()
 
-                    # Otherwise an expression statement or an assignment `target <- value`.
+                    # Otherwise an expression statement, or an assignment/binding
+                    # (`target <- value` reassignment, or `target = value`).
                     target: Ast::Expr = get parser.expr() else return null
-                    if parser.peek() == TokenKind.LArrow:
+                    if parser.peek() == TokenKind.LArrow or parser.peek() == TokenKind.Assign:
                         parser.advance()
                         value: Ast::Expr = get parser.expr() else return null
                         return parser.emit_stmt(Ast::Stmt.Assign(target, value, tok.line))
                     return parser.emit_stmt(Ast::Stmt.Expr(target, tok.line))
+
+
+        # `for VAR [, VAR]* in ITER: <block>` (contextual `for`; the lexer emits it as an
+        # identifier). Extra loop vars (`for k, v in ...`) are recorded only as the first.
+        def for_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.advance()              # consume the `for` identifier
+            var_tok: Token = parser.expect(TokenKind.Ident)
+            while parser.accept(TokenKind.Comma):
+                parser.accept(TokenKind.Ident)
+            parser.expect(TokenKind.In)
+            iter_expr: Ast::Expr = get parser.expr() else return null
+            body: Ast::NodeRange = parser.parse_block()
+            return parser.emit_stmt(Ast::Stmt.For(Lexer::text_or_empty(var_tok, parser.source), iter_expr, body, tok.line))
 
 
         def var_decl_stmt(parser: mutable Parser&) -> Ast::Stmt?:
@@ -593,6 +638,52 @@ module Parser:
                 value <- parser.expr()
 
             return parser.emit_stmt(Ast::Stmt.Return(value, tok.line))
+
+
+        # `match EXPR:` with indented `PATTERN: <block>` arms. Patterns (literals,
+        # `_`, `A.B(x)`, ranges, comma-lists, guards) are skipped to the arm's block
+        # colon — pattern structure isn't modeled yet. All arm bodies are collected into
+        # one contiguous Block (arm grouping is erased until a Stmt.Match node exists),
+        # which still captures every body statement so nested code parses.
+        def match_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.expect(TokenKind.Match)
+            parser.expr()                              # scrutinee (consumed)
+            parser.expect(TokenKind.Colon)
+            parser.expect(TokenKind.Newline)
+            parser.expect(TokenKind.Indent)
+
+            bodies_start: usize = parser.nodes.count
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                parser.skip_newlines()
+                if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                    break
+
+                # Skip the arm pattern up to its (paren/bracket/brace-balanced) block colon.
+                depth: mutable int = 0
+                while parser.peek() != TokenKind.Eof:
+                    k: TokenKind = parser.peek()
+                    if k == TokenKind.LParen or k == TokenKind.LBracket or k == TokenKind.LBrace:
+                        depth <- depth + 1
+                        parser.advance()
+                    elif k == TokenKind.RParen or k == TokenKind.RBracket or k == TokenKind.RBrace:
+                        depth <- depth - 1
+                        parser.advance()
+                    elif depth == 0 and (k == TokenKind.Colon or k == TokenKind.Newline):
+                        break
+                    else:
+                        parser.advance()
+
+                if parser.peek() != TokenKind.Colon:
+                    parser.advance()                   # malformed arm; don't spin
+                    continue
+
+                # parse_block consumes the arm's `: <body>` and commits its statements
+                # contiguously into parser.nodes, so they fold into the combined range.
+                parser.parse_block()
+
+            parser.expect(TokenKind.Dedent)
+            bodies: Ast::NodeRange = Ast::NodeRange(bodies_start, parser.nodes.count)
+            return parser.emit_stmt(Ast::Stmt.Block(bodies, tok.line))
 
 
         # ============================================================
