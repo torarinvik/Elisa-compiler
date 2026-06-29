@@ -188,6 +188,19 @@ module Parser:
                     parser.advance()
                     return parser.emit_expr(Ast::Expr.IntLit(0))
 
+                TokenKind.HexLit:
+                    # Literal value evaluation is deferred; the node records the form only.
+                    parser.advance()
+                    return parser.emit_expr(Ast::Expr.IntLit(0))
+
+                TokenKind.FloatLit:
+                    parser.advance()
+                    return parser.emit_expr(Ast::Expr.FloatLit(Lexer::text_or_empty(tok, parser.source)))
+
+                TokenKind.CharLit:
+                    parser.advance()
+                    return parser.emit_expr(Ast::Expr.CharLit(Lexer::text_or_empty(tok, parser.source)))
+
                 TokenKind.StringLit:
                     parser.advance()
                     return parser.emit_expr(Ast::Expr.StringLit(Lexer::text_or_empty(tok, parser.source)))
@@ -204,6 +217,25 @@ module Parser:
                     parser.advance()
                     return parser.emit_expr(Ast::Expr.BoolLit(false))
 
+                TokenKind.Null:
+                    # No dedicated Null node yet; record the keyword as a leaf identifier.
+                    parser.advance()
+                    return parser.emit_expr(Ast::Expr.Ident(Lexer::text_or_empty(tok, parser.source)))
+
+                TokenKind.Zeroed:
+                    parser.advance()
+                    return parser.emit_expr(Ast::Expr.Ident(Lexer::text_or_empty(tok, parser.source)))
+
+                TokenKind.New:
+                    # `new [region] Type(...)`: skip the keyword and optional region
+                    # bracket, then parse the constructor expression as the value.
+                    parser.advance()
+                    if parser.accept(TokenKind.LBracket):
+                        while parser.peek() != TokenKind.RBracket and parser.peek() != TokenKind.Eof:
+                            parser.advance()
+                        parser.accept(TokenKind.RBracket)
+                    return parser.postfix_expr()
+
                 TokenKind.LParen:
                     parser.advance()
                     paren_expr: Ast::Expr? = parser.expr()
@@ -215,6 +247,7 @@ module Parser:
 
                 _:
                     parser.error_at(Ast::ParseErrorKind.UnexpectedToken, tok)
+                    parser.advance()   # consume the offending token so callers don't re-error on it
                     return null
 
 
@@ -260,10 +293,20 @@ module Parser:
                 elif kind == TokenKind.LBracket:
                     parser.advance()
                     index_handle: Ast::Expr? = parser.expr()
+
+                    # Slice form `a[lo:hi]` (and open-ended variants): consume the `:`
+                    # and the optional high bound. Modeled as an Index on the low bound
+                    # until a dedicated Slice node exists.
+                    if parser.accept(TokenKind.Colon):
+                        if parser.peek() != TokenKind.RBracket:
+                            parser.expr()
+
                     parser.expect(TokenKind.RBracket)
 
                     if index_handle is parsed_index:
                         active <- parser.emit_expr(Ast::Expr.Index(active, parsed_index, tok.line))
+                    else:
+                        active <- parser.emit_expr(Ast::Expr.Index(active, parser.emit_expr(Ast::Expr.Invalid), tok.line))
 
                 else:
                     break
@@ -379,7 +422,25 @@ module Parser:
                     parser.advance()
                     return parser.emit_stmt(Ast::Stmt.Continue("", tok.line))
 
+                TokenKind.With:
+                    return parser.prefixed_block_stmt()
+
+                TokenKind.Region:
+                    return parser.prefixed_block_stmt()
+
+                TokenKind.Try:
+                    return parser.prefixed_block_stmt()
+
+                TokenKind.Catch:
+                    return parser.prefixed_block_stmt()
+
                 _:
+                    # `can …:` / `trusted …:` effect blocks (contextual keywords).
+                    if kind == TokenKind.Ident:
+                        head: sview = Lexer::text_or_empty(tok, parser.source)
+                        if head == "can" or head == "trusted":
+                            return parser.prefixed_block_stmt()
+
                     # `IDENT :` introduces a local binding (`x: T` / `x: T = v`).
                     if kind == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
                         return parser.var_decl_stmt()
@@ -405,6 +466,34 @@ module Parser:
                     value <- parsed_value
 
             return parser.emit_stmt(Ast::Stmt.VarDecl(Lexer::text_or_empty(name_tok, parser.source), type_expr, value, name_tok.line))
+
+
+        # A statement whose prefix clause is not yet modeled but which introduces a
+        # `:`-block (e.g. `can Mem.Allocate:`, `region scratch:`, `try:`). Skip the
+        # prefix tokens up to a paren-balanced top-level `:`, then parse the block.
+        # A prefix with no block (e.g. `region scratch(1024)`) degrades to an empty
+        # statement so the line is consumed without cascading errors.
+        def prefixed_block_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            line: u32 = parser.cursor().line
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof:
+                k: TokenKind = parser.peek()
+                if k == TokenKind.LParen or k == TokenKind.LBracket:
+                    depth <- depth + 1
+                    parser.advance()
+                elif k == TokenKind.RParen or k == TokenKind.RBracket:
+                    depth <- depth - 1
+                    parser.advance()
+                elif depth == 0 and (k == TokenKind.Colon or k == TokenKind.Newline):
+                    break
+                else:
+                    parser.advance()
+
+            if parser.peek() != TokenKind.Colon:
+                return parser.emit_stmt(Ast::Stmt.Expr(parser.emit_expr(Ast::Expr.Invalid), line))
+
+            body: Ast::NodeRange = parser.parse_block()
+            return parser.emit_stmt(Ast::Stmt.Block(body, line))
 
 
         def if_stmt(parser: mutable Parser&) -> Ast::Stmt?:
@@ -456,6 +545,98 @@ module Parser:
         # Declaration parsing
         # ============================================================
 
+        # Parse one declaration unit into `out`. A single keyword decl appends one
+        # node; `module`/visibility sections (`public:`/`private:`) append their
+        # flattened children. `module`/`include`/`public`/`private` are contextual
+        # keywords (the lexer emits them as identifiers), matched here by text.
+        # Consume any leading `@name` / `@name(args)` decorators before a declaration
+        # (e.g. `@inline(always)`, `@hot`). Decorator semantics are not yet modeled;
+        # they are skipped so the decorated declaration parses cleanly.
+        def skip_decorators(parser: mutable Parser&) -> void:
+            while parser.peek() == TokenKind.At:
+                parser.advance()                   # `@`
+                parser.accept(TokenKind.Ident)
+                if parser.accept(TokenKind.LParen):
+                    depth: mutable int = 1
+                    while depth > 0 and parser.peek() != TokenKind.Eof:
+                        k: TokenKind = parser.advance().kind
+                        if k == TokenKind.LParen:
+                            depth <- depth + 1
+                        elif k == TokenKind.RParen:
+                            depth <- depth - 1
+                parser.skip_newlines()
+
+
+        def parse_decl_unit(parser: mutable Parser&, out: mutable darray[Ast::Node]&) -> void:
+            parser.skip_decorators()
+            if parser.peek() == TokenKind.Ident:
+                cur: Token = parser.cursor()
+                text: sview = Lexer::text_or_empty(cur, parser.source)
+                if text == "module":
+                    if parser.module_decl() is mod:
+                        out.push(mod)
+                    return
+                if text == "include":
+                    if parser.include_decl() is inc:
+                        out.push(inc)
+                    return
+                if text == "public" or text == "private":
+                    parser.visibility_section(out)
+                    return
+
+            if parser.decl() is d:
+                out.push(d)
+            else:
+                parser.advance()
+
+
+        # An indented `public:` / `private:` block. Visibility is a layout grouping
+        # only here; members are flattened into the enclosing declaration list.
+        def visibility_section(parser: mutable Parser&, out: mutable darray[Ast::Node]&) -> void:
+            parser.advance()                       # consume the public/private identifier
+            parser.expect(TokenKind.Colon)
+            parser.expect(TokenKind.Newline)
+            parser.expect(TokenKind.Indent)
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                parser.skip_newlines()
+                if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                    break
+                before: usize = parser.position
+                parser.parse_decl_unit(out)
+                if parser.position == before:      # never spin on an unrecognized token
+                    parser.advance()
+            parser.expect(TokenKind.Dedent)
+
+
+        def module_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()          # consume the `module` identifier
+            name_tok: Token = parser.expect(TokenKind.Ident)
+
+            body_items: mutable darray[Ast::Node] = []
+            if parser.peek() == TokenKind.Colon:
+                parser.expect(TokenKind.Colon)
+                parser.expect(TokenKind.Newline)
+                parser.expect(TokenKind.Indent)
+                while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                    parser.skip_newlines()
+                    if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                        break
+                    before: usize = parser.position
+                    parser.parse_decl_unit(body_items)
+                    if parser.position == before:
+                        parser.advance()
+                parser.expect(TokenKind.Dedent)
+
+            body: Ast::NodeRange = parser.commit_nodes(body_items)
+            return parser.emit_decl(Ast::Decl.Module(Lexer::text_or_empty(name_tok, parser.source), body, tok.line))
+
+
+        def include_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()          # consume the `include` identifier
+            path_tok: Token = parser.expect(TokenKind.StringLit)
+            return parser.emit_decl(Ast::Decl.Import(Lexer::text_or_empty(path_tok, parser.source), tok.line))
+
+
         def decl(parser: mutable Parser&) -> Ast::Decl?:
             kind: TokenKind = parser.peek()
 
@@ -470,6 +651,9 @@ module Parser:
                     return parser.enum_decl()
 
                 TokenKind.Const:
+                    return parser.const_decl()
+
+                TokenKind.Global:
                     return parser.const_decl()
 
                 _:
@@ -602,18 +786,34 @@ module Parser:
             return parser.emit_decl(Ast::Decl.Enum(Lexer::text_or_empty(name_tok, parser.source), variants, tok.line))
 
 
+        # Handles `const`/`global` value bindings plus the `const enum`/`const struct`/
+        # `const module` qualified forms. Both type and initializer are optional:
+        # `const X = 1`, `const X: T = 1`, and `global buf: T` all parse.
         def const_decl(parser: mutable Parser&) -> Ast::Decl?:
-            tok: Token = parser.expect(TokenKind.Const)
+            tok: Token = parser.advance()          # consume `const` or `global`
+
+            # Qualified declarations: `const enum`, `const struct`, `const module`.
+            if parser.peek() == TokenKind.Enum:
+                return parser.enum_decl()
+            if parser.peek() == TokenKind.Struct:
+                return parser.struct_decl()
+            cur: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(cur, parser.source) == "module":
+                return parser.module_decl()
+
             name_tok: Token = parser.expect(TokenKind.Ident)
-            parser.expect(TokenKind.Colon)
-            type_expr: Ast::Expr? = parser.expr()
-            parser.expect(TokenKind.Assign)
-            value: Ast::Expr? = parser.expr()
 
-            if type_expr is parsed_type and value is parsed_value:
-                return parser.emit_decl(Ast::Decl.Const(Lexer::text_or_empty(name_tok, parser.source), parsed_type, parsed_value, tok.line))
+            type_expr: mutable Ast::Expr = parser.emit_expr(Ast::Expr.Invalid)
+            if parser.accept(TokenKind.Colon):
+                if parser.expr() is parsed_type:
+                    type_expr <- parsed_type
 
-            return null
+            value: mutable Ast::Expr = parser.emit_expr(Ast::Expr.Invalid)
+            if parser.accept(TokenKind.Assign):
+                if parser.expr() is parsed_value:
+                    value <- parsed_value
+
+            return parser.emit_decl(Ast::Decl.Const(Lexer::text_or_empty(name_tok, parser.source), type_expr, value, tok.line))
 
     public:
         # ============================================================
@@ -633,10 +833,9 @@ module Parser:
                 parser.skip_newlines()
                 if parser.peek() == TokenKind.Eof:
                     break
-                decl_handle: Ast::Decl? = parser.decl()
-                if decl_handle is decl:
-                    top_items.push(decl)
-                else:
+                before: usize = parser.position
+                parser.parse_decl_unit(top_items)
+                if parser.position == before:      # guarantee forward progress
                     parser.advance()
 
             file_decls: Ast::NodeRange = parser.commit_nodes(top_items)
