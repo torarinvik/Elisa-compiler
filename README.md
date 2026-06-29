@@ -12,14 +12,16 @@ replaces it.
 ## Layout
 
 ```
-src/frontend/                the self-hosted frontend
-  elisacore_frontend.elisa   entry (includes runtime + tokens + lexer)
-  frontend_tokens.elisa      token model
-  frontend_lexer*.elisa      lexer: core, tokens, strings, cursor,
+src/
+  elisacore_frontend.elisa   entry (includes runtime + lexer)
+  lexer/                     the self-hosted lexer
+    lexer.elisa              module hub (includes the parts below)
+    tokens.elisa             token model
+    lexer_*.elisa            lexer parts: core, tokens, strings, cursor,
                              comments, numbers, identifiers
-  frontend_parser.elisa      region-inferred parser
-  frontend_parser_tokens.elisa
-                             parser AST/token model
+  parser/                    region-inferred parser
+    parser.elisa             parser
+    parser_tokens.elisa      parser AST/token model
 elisacore_std/               VENDORED copy of Elisa-core's stdlib (see drift guard)
 test/
   fixtures/lexer/            parity fixtures (lexer entry + token-model cases)
@@ -32,7 +34,7 @@ scripts/
 - **Lexer: complete + parity-locked** against the stage0 Go lexer (token-kind
   FNV checksum). Builds standalone with stage0.
 - **Parser: active region-inferred implementation.** The older parser
-  prototypes have been removed; `frontend_parser.elisa` is the single parser
+  prototypes have been removed; `src/parser/parser.elisa` is the single parser
   source.
 - **Semantic: not yet written.** Next milestone after parser parity.
 
@@ -53,7 +55,7 @@ Two guards keep stage1 honest while stage0 still exists:
 export ELISA_CORE="/path/to/Elisa-core"          # if not the sibling default
 scripts/check_runtime_drift.sh                    # runtime in sync?
 ~/.elisac/elisac -emit semantic test/fixtures/lexer/frontend_lexer.elisa
-~/.elisac/elisac -emit semantic src/frontend/frontend_parser.elisa
+~/.elisac/elisac -emit semantic src/parser/parser.elisa
 ```
 
 ## TODO

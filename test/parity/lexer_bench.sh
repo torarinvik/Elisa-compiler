@@ -32,10 +32,10 @@ ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
 FIXTURE="$REPO_ROOT/test/fixtures/lexer/frontend_lexer.elisa"
-# A large, realistic Elisa source. The generated lowered frontend is ideal: big
-# and full of real tokens. The stream lexer only reads bytes, so semantics are
+# A large, realistic Elisa source (throughput is size-normalized, so any sizable
+# real file works). The stream lexer only reads bytes, so semantics are
 # irrelevant. Override by passing a path as $1.
-INPUT="${1:-$REPO_ROOT/src/frontend/elisacore_frontend.lowered.elisa}"
+INPUT="${1:-$REPO_ROOT/elisacore_std/collections.elisa}"
 ITERS="${ITERS:-4000}"
 
 command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; exit 2; }
