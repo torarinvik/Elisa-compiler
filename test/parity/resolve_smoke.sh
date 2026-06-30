@@ -113,6 +113,41 @@ int main(int argc, char **argv) {
         "        return helper(rv)\n"
         "    return helper(node as int)\n"
         "\n"
+        /* Pattern forms the frontend doesn't use itself (so unexercised by self-parse) —
+           covered here by crafted arms. Each binds names that are USED in the arm body, so
+           if the pattern fell back to `Other` (no bindings gathered) the uses would become
+           unresolved and the total would exceed 1. Keeping the total at 1 proves the
+           struct/tuple/or/type-binder patterns are structurally decomposed.
+           struct_pat: `Foo{a, b: c}` binds `a` (shorthand) and `c` (labeled subpattern).
+           tuple_pat: `x, y` binds both tuple elements.
+           binder_pat: `Statement s` (category arm) binds `s`.
+           or_pat: `A(p) | B(p)` binds `p` in each alternative; used in the body. */
+        "def struct_pat(node: int) -> int:\n"
+        "    match node:\n"
+        "        Shape{a, b: c}:\n"
+        "            return helper(a) + helper(c)\n"
+        "        _:\n"
+        "            return 0\n"
+        "\n"
+        "def tuple_pat(node: int) -> int:\n"
+        "    match node:\n"
+        "        x, y:\n"
+        "            return helper(x) + helper(y)\n"
+        "\n"
+        "def binder_pat(node: int) -> int:\n"
+        "    match node:\n"
+        "        Statement s:\n"
+        "            return helper(s)\n"
+        "        _:\n"
+        "            return 0\n"
+        "\n"
+        "def or_pat(node: int) -> int:\n"
+        "    match node:\n"
+        "        Stmt.A(p) | Stmt.B(p):\n"
+        "            return helper(p)\n"
+        "        _:\n"
+        "            return 0\n"
+        "\n"
         "def main(a: int) -> int:\n"
         "    y: int = helper(a)\n"
         "    return y + undefined_thing\n";
