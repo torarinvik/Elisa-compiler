@@ -64,7 +64,10 @@ int main(int argc, char **argv) {
        refine() exercises `is` refinement bindings (bare `m`, variant `Stmt.Return(rv,
        ln)`) and an `as` cast: the bound names are used in the bodies and must resolve,
        and the `is`/`as` right operands (a binding target and a type) must NOT be
-       counted as value references. */
+       counted as value references.
+       has_match() exercises a quantifier `any x in items where x == needle`: the
+       bound `x` is used in the `where` clause and must resolve (before quantifiers
+       were modeled, `any` parsed as a bare ident and `x` was unresolved). */
     const char *src =
         "def helper(x: int) -> int:\n"
         "    return x\n"
@@ -81,6 +84,9 @@ int main(int argc, char **argv) {
         "    for k, v in pairs:\n"
         "        total <- total + helper(k) + helper(v)\n"
         "    return total\n"
+        "\n"
+        "def has_match(items: int, needle: int) -> bool:\n"
+        "    return any x in items where x == needle\n"
         "\n"
         "def refine(node: int) -> int:\n"
         "    if helper(node) is m:\n"
