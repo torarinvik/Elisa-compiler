@@ -47,9 +47,9 @@ int main(void) {
         "def add(b: int) -> int:\n"
         "    return b\n";
     size_t n = 0; while (src[n]) n++;
-    uint64_t syms = 0, dups = 0;
-    sema_smoke_export((uint8_t *)src, n, &syms, &dups);
-    printf("%llu %llu\n", (unsigned long long)syms, (unsigned long long)dups);
+    uint64_t syms = 0, dups = 0, stmts = 0;
+    sema_smoke_export((uint8_t *)src, n, &syms, &dups, &stmts);
+    printf("%llu %llu %llu\n", (unsigned long long)syms, (unsigned long long)dups, (unsigned long long)stmts);
     return 0;
 }
 EOF
@@ -62,11 +62,13 @@ link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/sema_smoke.o" -o "$WORK/run")
 [[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")
 clang "${link_flags[@]}"
 
-read -r got_syms got_dups < <("$WORK/run")
+read -r got_syms got_dups got_stmts < <("$WORK/run")
 
-if [[ "$got_syms" != "6" || "$got_dups" != "1" ]]; then
-	echo "sema smoke FAILED: symbols=$got_syms (want 6), duplicates=$got_dups (want 1)" >&2
+# 6 symbols, 1 duplicate, 3 statements (one `return` in each of add/helper/add) —
+# the statement count exercises the typed `stmts` store across the region-poly return.
+if [[ "$got_syms" != "6" || "$got_dups" != "1" || "$got_stmts" != "3" ]]; then
+	echo "sema smoke FAILED: symbols=$got_syms (want 6), duplicates=$got_dups (want 1), statements=$got_stmts (want 3)" >&2
 	exit 1
 fi
 
-echo "sema smoke OK: symbols=$got_syms duplicates=$got_dups" >&2
+echo "sema smoke OK: symbols=$got_syms duplicates=$got_dups statements=$got_stmts" >&2
