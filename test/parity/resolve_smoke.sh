@@ -162,6 +162,19 @@ int main(int argc, char **argv) {
     size_t n = 0; while (src[n]) n++;
     uint64_t unresolved = 0;
     resolve_smoke_export((uint8_t *)src, n, &unresolved);
+
+    /* Diagnostics-layer position check: the checker must report the UndefinedName
+       diagnostic at the right source line. `missing` is undefined on line 2. */
+    const char *dsrc = "def f(a: int) -> int:\n    return missing\n";
+    size_t dn = 0; while (dsrc[dn]) dn++;
+    uint64_t dcount = 0; uint32_t dline = 0;
+    diag_probe_export((uint8_t *)dsrc, dn, &dcount, &dline);
+    if (dcount != 1 || dline != 2) {
+        fprintf(stderr, "diag probe FAILED: count=%llu line=%u (want count=1 line=2)\n",
+                (unsigned long long)dcount, dline);
+        return 4;
+    }
+
     printf("%llu\n", (unsigned long long)unresolved);
     return 0;
 }
