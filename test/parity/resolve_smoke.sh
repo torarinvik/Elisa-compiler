@@ -24,8 +24,35 @@ cat > "$WORK/driver.c" <<'EOF'
 #include "resolve_smoke.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-int main(void) {
+static uint8_t *slurp(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *b = (uint8_t *)malloc((size_t)n + 1);
+    if (!b) { fclose(f); return NULL; }
+    if (fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
+    fclose(f); b[n] = 0; *out_len = (size_t)n; return b;
+}
+
+int main(int argc, char **argv) {
+    /* With file args: resolve each file and print "<total_unresolved> <file_count>"
+       (per-file counts to stderr) — the self-resolve diagnostic. */
+    if (argc >= 2) {
+        uint64_t total = 0; int files = 0;
+        for (int i = 1; i < argc; i++) {
+            size_t n = 0; uint8_t *s = slurp(argv[i], &n);
+            if (!s) { fprintf(stderr, "read failed: %s\n", argv[i]); return 3; }
+            uint64_t u = 0;
+            resolve_smoke_export(s, n, &u);
+            fprintf(stderr, "  %s: %llu unresolved\n", argv[i], (unsigned long long)u);
+            total += u; files++;
+            free(s);
+        }
+        printf("%llu %d\n", (unsigned long long)total, files);
+        return 0;
+    }
     /* helper (global), a (param), y (local) all resolve; undefined_thing does not.
        classify() exercises match-arm PATTERN bindings: `val` (a Variant field
        subpattern) and `other` (a bare binding) are used in their arm bodies, so they
@@ -87,3 +114,22 @@ if [[ "$got" != "1" ]]; then
 	exit 1
 fi
 echo "resolve smoke OK: unresolved=1" >&2
+
+# Self-resolve diagnostic: run the resolver over the frontend's OWN source and
+# report per-file unresolved counts. This is the dogfooding measurement that drives
+# the remaining resolver work to zero. It is GATING only on a budget ceiling (set
+# RESOLVE_SELF_MAX, default unlimited) so it surfaces regressions without blocking
+# while unmodeled binders (comprehensions/quantifiers, prefix-clause `catch e`)
+# still produce known false-positives.
+FRONTEND_FILES=()
+for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/sema/*.elisa; do
+	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
+done
+if [[ ${#FRONTEND_FILES[@]} -gt 0 ]]; then
+	read -r self_unresolved self_files < <("$WORK/run" "${FRONTEND_FILES[@]}")
+	echo "resolve self-resolve: $self_unresolved unresolved across $self_files frontend files" >&2
+	if [[ -n "${RESOLVE_SELF_MAX:-}" && "$self_unresolved" -gt "$RESOLVE_SELF_MAX" ]]; then
+		echo "resolve self-resolve FAILED: $self_unresolved > RESOLVE_SELF_MAX=$RESOLVE_SELF_MAX" >&2
+		exit 1
+	fi
+fi
