@@ -33,7 +33,11 @@ int main(void) {
        two spurious unresolved refs — keeping the total at 1 proves the fix.
        pairs_use() exercises a destructuring `for k, v in ...` loop: both loop
        variables are used in the body, so both must resolve (before all loop vars
-       were recorded, `v` was a spurious unresolved ref). */
+       were recorded, `v` was a spurious unresolved ref).
+       refine() exercises `is` refinement bindings (bare `m`, variant `Stmt.Return(rv,
+       ln)`) and an `as` cast: the bound names are used in the bodies and must resolve,
+       and the `is`/`as` right operands (a binding target and a type) must NOT be
+       counted as value references. */
     const char *src =
         "def helper(x: int) -> int:\n"
         "    return x\n"
@@ -50,6 +54,13 @@ int main(void) {
         "    for k, v in pairs:\n"
         "        total <- total + helper(k) + helper(v)\n"
         "    return total\n"
+        "\n"
+        "def refine(node: int) -> int:\n"
+        "    if helper(node) is m:\n"
+        "        return helper(m)\n"
+        "    if node is Stmt.Return(rv, ln):\n"
+        "        return helper(rv)\n"
+        "    return helper(node as int)\n"
         "\n"
         "def main(a: int) -> int:\n"
         "    y: int = helper(a)\n"
