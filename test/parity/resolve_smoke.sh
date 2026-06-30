@@ -149,7 +149,7 @@ echo "resolve smoke OK: unresolved=1" >&2
 # real references; they do not occur under the real include structure).
 # GATING on a budget ceiling (RESOLVE_SELF_MAX, default 5) to lock in the result.
 FRONTEND_FILES=()
-for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/sema/*.elisa; do
+for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/semantic/*.elisa; do
 	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
 done
 if [[ ${#FRONTEND_FILES[@]} -gt 0 ]]; then
