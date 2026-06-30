@@ -144,3 +144,35 @@ if [[ ${#STD_FILES[@]} -gt 0 ]]; then
 	fi
 	echo "parser stdlib-parse OK: 0 errors across $std_files stdlib files" >&2
 fi
+
+# Match-arm modeling: a 3-arm match must produce exactly 3 structural MatchArm
+# entries (guards Stmt.Match / MatchArm against silent flattening regressions).
+cat > "$WORK/arms.c" <<'EOF'
+#include "parser_smoke.h"
+#include <stdint.h>
+#include <stdio.h>
+int main(void) {
+    const char *src =
+        "def classify(ch: int) -> int:\n"
+        "    match ch:\n"
+        "        0:\n"
+        "            return 1\n"
+        "        1:\n"
+        "            return 2\n"
+        "        _:\n"
+        "            return 0\n";
+    size_t n = 0; while (src[n]) n++;
+    printf("%llu\n", (unsigned long long)smoke_match_arms_export((uint8_t *)src, n));
+    return 0;
+}
+EOF
+arms_flags=(-O2 -I "$WORK" "$WORK/arms.c" "$WORK/parser_smoke.o" -o "$WORK/arms")
+[[ "$(uname -s)" == "Darwin" ]] && arms_flags=(-Wl,-undefined,dynamic_lookup "${arms_flags[@]}")
+[[ "$(uname -s)" == "Linux" ]] && arms_flags=(-no-pie "${arms_flags[@]}")
+clang "${arms_flags[@]}"
+got_arms="$("$WORK/arms")"
+if [[ "$got_arms" != "3" ]]; then
+	echo "parser match-arms FAILED: got $got_arms arms (want 3)" >&2
+	exit 1
+fi
+echo "parser match-arms OK: 3 arms" >&2
