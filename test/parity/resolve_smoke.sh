@@ -26,10 +26,21 @@ cat > "$WORK/driver.c" <<'EOF'
 #include <stdio.h>
 
 int main(void) {
-    /* helper (global), a (param), y (local) all resolve; undefined_thing does not. */
+    /* helper (global), a (param), y (local) all resolve; undefined_thing does not.
+       classify() exercises match-arm PATTERN bindings: `val` (a Variant field
+       subpattern) and `other` (a bare binding) are used in their arm bodies, so they
+       must resolve. Before the resolver gathered pattern bindings these counted as
+       two spurious unresolved refs — keeping the total at 1 proves the fix. */
     const char *src =
         "def helper(x: int) -> int:\n"
         "    return x\n"
+        "\n"
+        "def classify(node: int) -> int:\n"
+        "    match node:\n"
+        "        Stmt.VarDecl(name, ty, val, ln):\n"
+        "            return helper(val)\n"
+        "        other:\n"
+        "            return helper(other)\n"
         "\n"
         "def main(a: int) -> int:\n"
         "    y: int = helper(a)\n"
