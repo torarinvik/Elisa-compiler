@@ -30,7 +30,10 @@ int main(void) {
        classify() exercises match-arm PATTERN bindings: `val` (a Variant field
        subpattern) and `other` (a bare binding) are used in their arm bodies, so they
        must resolve. Before the resolver gathered pattern bindings these counted as
-       two spurious unresolved refs — keeping the total at 1 proves the fix. */
+       two spurious unresolved refs — keeping the total at 1 proves the fix.
+       pairs_use() exercises a destructuring `for k, v in ...` loop: both loop
+       variables are used in the body, so both must resolve (before all loop vars
+       were recorded, `v` was a spurious unresolved ref). */
     const char *src =
         "def helper(x: int) -> int:\n"
         "    return x\n"
@@ -41,6 +44,12 @@ int main(void) {
         "            return helper(val)\n"
         "        other:\n"
         "            return helper(other)\n"
+        "\n"
+        "def pairs_use(pairs: int) -> int:\n"
+        "    total: int = 0\n"
+        "    for k, v in pairs:\n"
+        "        total <- total + helper(k) + helper(v)\n"
+        "    return total\n"
         "\n"
         "def main(a: int) -> int:\n"
         "    y: int = helper(a)\n"
