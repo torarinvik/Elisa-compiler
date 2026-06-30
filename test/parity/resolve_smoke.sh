@@ -67,7 +67,10 @@ int main(int argc, char **argv) {
        counted as value references.
        has_match() exercises a quantifier `any x in items where x == needle`: the
        bound `x` is used in the `where` clause and must resolve (before quantifiers
-       were modeled, `any` parsed as a bare ident and `x` was unresolved). */
+       were modeled, `any` parsed as a bare ident and `x` was unresolved).
+       recover() exercises prefix-clause bindings: a `catch` success arm `slot:`
+       binds the result and `error e:` binds the error; both are used in their arm
+       bodies and must resolve (before, the prefix was skipped and the binding lost). */
     const char *src =
         "def helper(x: int) -> int:\n"
         "    return x\n"
@@ -87,6 +90,14 @@ int main(int argc, char **argv) {
         "\n"
         "def has_match(items: int, needle: int) -> bool:\n"
         "    return any x in items where x == needle\n"
+        "\n"
+        "def recover(arg: int) -> int:\n"
+        "    catch helper(arg):\n"
+        "        slot:\n"
+        "            return helper(slot)\n"
+        "        error e:\n"
+        "            return helper(e)\n"
+        "    return arg\n"
         "\n"
         "def refine(node: int) -> int:\n"
         "    if helper(node) is m:\n"
