@@ -148,6 +148,14 @@ int main(int argc, char **argv) {
         "        _:\n"
         "            return 0\n"
         "\n"
+        /* extern declarations register the external name as a symbol. `ext_fn` is called
+           below; if the extern decl were dropped (the old placeholder behavior) the call
+           would be unresolved and the total would exceed 1. */
+        "extern ext_fn(x: int) -> int\n"
+        "\n"
+        "def use_extern(a: int) -> int:\n"
+        "    return ext_fn(a)\n"
+        "\n"
         "def main(a: int) -> int:\n"
         "    y: int = helper(a)\n"
         "    return y + undefined_thing\n";
