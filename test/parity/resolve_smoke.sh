@@ -25,6 +25,7 @@ cat > "$WORK/driver.c" <<'EOF'
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static uint8_t *slurp(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
@@ -189,6 +190,71 @@ int main(int argc, char **argv) {
         fprintf(stderr, "diag probe FAILED: count=%llu line=%u (want count=1 line=2)\n",
                 (unsigned long long)dcount, dline);
         return 4;
+    }
+
+    /* Duplicate-declaration check: the checker must report a DuplicateDecl at the
+       redefinition's line. `dup` is defined twice; the second def is on line 4, and
+       exactly one duplicate must be reported (guards add_symbol's duplicate path). */
+    const char *usrc =
+        "def dup(a: int) -> int:\n"
+        "    return a\n"
+        "\n"
+        "def dup(b: int) -> int:\n"
+        "    return b\n";
+    size_t un = 0; while (usrc[un]) un++;
+    uint64_t ucount = 0; uint32_t uline = 0;
+    dup_probe_export((uint8_t *)usrc, un, &ucount, &uline);
+    if (ucount != 1 || uline != 4) {
+        fprintf(stderr, "dup probe FAILED: count=%llu line=%u (want count=1 line=4)\n",
+                (unsigned long long)ucount, uline);
+        return 6;
+    }
+
+    /* Diagnostic wording/severity source-of-truth (diagnostic_message /
+       diagnostic_severity). No end-to-end probe reads these, so guard them here:
+       every kind's message must be non-empty, the two semantic kinds must be
+       worded distinctly with the expected prefix (catches an arm swap), and all
+       kinds are severity 1 (Error). */
+    {
+        char msg[6][128];
+        size_t mlen[6];
+        for (uint32_t k = 0; k < 6; k++) {
+            mlen[k] = (size_t)diag_message_probe_export(k, (uint8_t *)msg[k], sizeof(msg[k]) - 1);
+            msg[k][mlen[k]] = 0;
+            if (mlen[k] == 0) {
+                fprintf(stderr, "diag message probe FAILED: kind %u empty\n", k);
+                return 7;
+            }
+            if (diag_severity_probe_export(k) != 1) {
+                fprintf(stderr, "diag severity probe FAILED: kind %u not Error\n", k);
+                return 7;
+            }
+        }
+        if (strncmp(msg[0], "undefined name", 14) != 0) {
+            fprintf(stderr, "diag message probe FAILED: UndefinedName wording=%s\n", msg[0]);
+            return 7;
+        }
+        if (strncmp(msg[1], "duplicate declaration", 21) != 0) {
+            fprintf(stderr, "diag message probe FAILED: DuplicateDecl wording=%s\n", msg[1]);
+            return 7;
+        }
+    }
+
+    /* Syntax-error folding: a malformed source must surface syntax diagnostics
+       through check() (append_parse_errors folds them in; parse_error_kind maps
+       ParseErrorKind -> DiagnosticKind). A function header missing its `:`
+       yields (first) a SyntaxExpectedDeclaration finding (code 4). Asserting the
+       code guards the mapping; asserting count>=1 guards the folding. */
+    {
+        const char *ssrc = "def f(a: int) -> int\n    return a\n";
+        size_t sn = 0; while (ssrc[sn]) sn++;
+        uint64_t scount = 0; uint32_t skind = 0;
+        syntax_probe_export((uint8_t *)ssrc, sn, &scount, &skind);
+        if (scount < 1 || skind != 4) {
+            fprintf(stderr, "syntax probe FAILED: count=%llu first_kind=%u (want count>=1 first_kind=4)\n",
+                    (unsigned long long)scount, skind);
+            return 8;
+        }
     }
 
     /* Hash-index collision path: a manually-seeded name_primary slot must read back
