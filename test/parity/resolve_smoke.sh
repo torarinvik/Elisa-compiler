@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
        classify() exercises match-arm PATTERN bindings: `val` (a Variant field
        subpattern) and `other` (a bare binding) are used in their arm bodies, so they
        must resolve. Before the resolver gathered pattern bindings these counted as
-       two spurious unresolved refs — keeping the total at 2 proves the fix.
+       two spurious unresolved refs — keeping the total at 3 proves the fix.
        nested_mod exercises Decl.Module recursion: inside() calls the file-global
        helper (must resolve across the module boundary) and references
        undefined_in_module (must be caught — if resolve_decls treated Decl.Module as
@@ -172,6 +172,19 @@ int main(int argc, char **argv) {
         "module nested_mod:\n"
         "    def inside(a: int) -> int:\n"
         "        return helper(a) + undefined_in_module\n"
+        "\n"
+        /* build_pt exercises walk_expr's Construct case: the struct-literal field
+           VALUES are references that must be walked, but the field LABELS (x/y) and
+           the constructor type (Point, a declared struct) are not. `a` resolves
+           (param); `undefined_field` is deliberately undefined and must be caught
+           (if Construct skipped field values it would silently vanish). Point is
+           declared so its resolution is separate from the field-value walk. */
+        "struct Point:\n"
+        "    x: int\n"
+        "    y: int\n"
+        "\n"
+        "def build_pt(a: int) -> int:\n"
+        "    return Point{x: a, y: undefined_field}\n"
         "\n"
         "def main(a: int) -> int:\n"
         "    y: int = helper(a)\n"
@@ -280,11 +293,11 @@ link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/resolve_smoke.o" -o "$WORK/ru
 clang "${link_flags[@]}"
 
 got="$("$WORK/run")"
-if [[ "$got" != "2" ]]; then
-	echo "resolve smoke FAILED: unresolved=$got (want 2)" >&2
+if [[ "$got" != "3" ]]; then
+	echo "resolve smoke FAILED: unresolved=$got (want 3)" >&2
 	exit 1
 fi
-echo "resolve smoke OK: unresolved=2" >&2
+echo "resolve smoke OK: unresolved=3" >&2
 
 # Self-resolve diagnostic: run the resolver over the frontend's OWN source —
 # WHOLE-PROGRAM (all files concatenated into one combined symbol table), so
