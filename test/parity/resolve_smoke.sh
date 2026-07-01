@@ -64,7 +64,12 @@ int main(int argc, char **argv) {
        classify() exercises match-arm PATTERN bindings: `val` (a Variant field
        subpattern) and `other` (a bare binding) are used in their arm bodies, so they
        must resolve. Before the resolver gathered pattern bindings these counted as
-       two spurious unresolved refs — keeping the total at 1 proves the fix.
+       two spurious unresolved refs — keeping the total at 2 proves the fix.
+       nested_mod exercises Decl.Module recursion: inside() calls the file-global
+       helper (must resolve across the module boundary) and references
+       undefined_in_module (must be caught — if resolve_decls treated Decl.Module as
+       a no-op, this reference would never be walked at all, silently DECREASING the
+       total instead of correctly adding to it).
        pairs_use() exercises a destructuring `for k, v in ...` loop: both loop
        variables are used in the body, so both must resolve (before all loop vars
        were recorded, `v` was a spurious unresolved ref).
@@ -156,6 +161,17 @@ int main(int argc, char **argv) {
         "def use_extern(a: int) -> int:\n"
         "    return ext_fn(a)\n"
         "\n"
+        /* nested_mod exercises Decl.Module recursion in resolve_decls: a function body
+           INSIDE a module must still be walked. `helper` is a file-global, so calling
+           it here proves cross-module resolution works; `undefined_in_module` is
+           deliberately undefined and must be caught ONLY if the module's body is
+           actually recursed into (if Decl.Module were a no-op, this reference would
+           never be walked and would silently vanish from the count instead of adding
+           1 to it). */
+        "module nested_mod:\n"
+        "    def inside(a: int) -> int:\n"
+        "        return helper(a) + undefined_in_module\n"
+        "\n"
         "def main(a: int) -> int:\n"
         "    y: int = helper(a)\n"
         "    return y + undefined_thing\n";
@@ -175,6 +191,15 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* Hash-index collision path: a manually-seeded name_primary slot must read back
+       as occupied, and an untouched hash must not. Guards against `hash_occupied`
+       regressing to always-false, which would silently overwrite name_primary on a
+       real hash collision instead of routing to name_overflow (see symbols.elisa). */
+    if (hash_occupied_probe_export(0x1234) != 1 || hash_occupied_probe_empty_export(0x1234) != 0) {
+        fprintf(stderr, "hash_occupied probe FAILED\n");
+        return 5;
+    }
+
     printf("%llu\n", (unsigned long long)unresolved);
     return 0;
 }
@@ -189,11 +214,11 @@ link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/resolve_smoke.o" -o "$WORK/ru
 clang "${link_flags[@]}"
 
 got="$("$WORK/run")"
-if [[ "$got" != "1" ]]; then
-	echo "resolve smoke FAILED: unresolved=$got (want 1)" >&2
+if [[ "$got" != "2" ]]; then
+	echo "resolve smoke FAILED: unresolved=$got (want 2)" >&2
 	exit 1
 fi
-echo "resolve smoke OK: unresolved=1" >&2
+echo "resolve smoke OK: unresolved=2" >&2
 
 # Self-resolve diagnostic: run the resolver over the frontend's OWN source —
 # WHOLE-PROGRAM (all files concatenated into one combined symbol table), so
