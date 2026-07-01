@@ -1,0 +1,428 @@
+# Stage1 parser — statement parsing (`extend Parser: private:`). Covers `stmt` dispatch,
+# `for`/`if`/`while`/`return`, match statements and patterns. Split out of parser.elisa to
+# keep each part file under 600 lines; see parser.elisa for the module overview.
+
+extend Parser:
+    private:
+        # ============================================================
+        # Statement parsing
+        # ============================================================
+
+        def stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            kind: TokenKind = parser.peek()
+            tok: Token = parser.cursor()
+
+            match kind:
+                TokenKind.If:
+                    return parser.if_stmt()
+
+                TokenKind.While:
+                    return parser.while_stmt()
+
+                TokenKind.Return:
+                    return parser.return_stmt()
+
+                TokenKind.Match:
+                    return parser.match_stmt()
+
+                TokenKind.Break:
+                    parser.advance()
+                    # `break if COND` desugars to `if COND: break` (mirrors postfix
+                    # `return if`). A real If node is built so the guard's references are
+                    # resolved like any other condition.
+                    if parser.accept(TokenKind.If):
+                        cond: Ast::Expr = get parser.expr() else return null
+                        body: mutable darray[Ast::Stmt] = []
+                        body.push((Ast::Stmt.Break("", tok.line)))
+                        no_else: darray[Ast::Stmt] = []
+                        return (Ast::Stmt.If(cond, body, no_else, tok.line))
+                    return (Ast::Stmt.Break("", tok.line))
+
+                TokenKind.Continue:
+                    parser.advance()
+                    # `continue if COND` desugars to `if COND: continue`.
+                    if parser.accept(TokenKind.If):
+                        cond: Ast::Expr = get parser.expr() else return null
+                        body: mutable darray[Ast::Stmt] = []
+                        body.push((Ast::Stmt.Continue("", tok.line)))
+                        no_else: darray[Ast::Stmt] = []
+                        return (Ast::Stmt.If(cond, body, no_else, tok.line))
+                    else:
+                        return (Ast::Stmt.Continue("", tok.line))
+
+                TokenKind.Pass:
+                    parser.advance()
+                    return (Ast::Stmt.Expr((Ast::Expr.Invalid), tok.line))
+
+                TokenKind.With:
+                    return parser.prefixed_block_stmt()
+
+                TokenKind.Region:
+                    return parser.prefixed_block_stmt()
+
+                TokenKind.Try:
+                    return parser.prefixed_block_stmt()
+
+                TokenKind.Catch:
+                    return parser.prefixed_block_stmt()
+
+                TokenKind.In:
+                    return parser.prefixed_block_stmt()
+
+                TokenKind.Error:
+                    # `error e:` error-binding handler block (`try: … error e: …`).
+                    return parser.prefixed_block_stmt()
+
+                _:
+                    # `static if/elif/else COND:` compile-time conditional inside a body —
+                    # consumed as a prefix block (the condition is skipped to the colon).
+                    if kind == TokenKind.Static:
+                        n1: TokenKind = parser.peek_at(1)
+                        if n1 == TokenKind.If or n1 == TokenKind.Elif or n1 == TokenKind.Else:
+                            return parser.prefixed_block_stmt()
+                        else:    
+                            # `static <directive>` (e.g. `static error("…")`): consume the
+                            # `static` marker and parse the directive as a statement.
+                            parser.advance()
+                            return parser.stmt()
+
+                    # Contextual-keyword statements (the lexer emits these as identifiers).
+                    if kind == TokenKind.Ident:
+                        head: sview = Lexer::text_or_empty(tok, parser.source)
+                        # Effect/concurrency block openers (`can …:`, `nursery workers(n):`,
+                        # `pool …:`, `parallel …:`) — prefix consumed to the block colon.
+                        if head == "can" or head == "trusted" or head == "nursery" or head == "pool" or head == "parallel":
+                            return parser.prefixed_block_stmt()
+                        if head == "for":
+                            return parser.for_stmt()
+
+                    # `IDENT:` immediately followed by a newline is a labeled/arm block
+                    # (e.g. a `catch …:` block's `ok:` success arm), not a binding.
+                    if kind == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon and parser.peek_at(2) == TokenKind.Newline:
+                        return parser.prefixed_block_stmt()
+
+                    # `IDENT :` introduces a local binding (`x: T` / `x: T = v`).
+                    if kind == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
+                        return parser.var_decl_stmt()
+
+                    # Otherwise an expression statement, an assignment/binding
+                    # (`target <- value` / `target = value`), or a guarded return.
+                    target: Ast::Expr = get parser.expr() else return null
+                    if parser.peek() == TokenKind.LArrow or parser.peek() == TokenKind.Assign or isCompoundAssign(parser.peek()):
+                        parser.advance()
+                        value: Ast::Expr = get parser.expr() else return null
+                        return (Ast::Stmt.Assign(target, value, tok.line))
+                    else:
+                        # Postfix guarded return `VALUE return if COND` (== `if COND: return VALUE`).
+                        if parser.peek() == TokenKind.Return:
+                            parser.advance()
+                            if parser.accept(TokenKind.If):
+                                parser.expr()              # guard condition (consumed)
+                            return (Ast::Stmt.Return(target, tok.line))
+                        else:
+                            return (Ast::Stmt.Expr(target, tok.line))
+
+
+        # `for VAR [, VAR]* in ITER: <block>` (contextual `for`; the lexer emits it as an
+        # identifier). Every loop variable is recorded so destructuring loops bind them all.
+        def for_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.advance()              # consume the `for` identifier
+            vars_buf: mutable darray[sview] = []
+            var_tok: Token = parser.expect(TokenKind.Ident)
+            vars_buf.push(Lexer::text_or_empty(var_tok, parser.source))
+            
+            while parser.accept(TokenKind.Comma):
+                next_tok: Token = parser.expect(TokenKind.Ident)
+                vars_buf.push(Lexer::text_or_empty(next_tok, parser.source))
+
+            parser.expect(TokenKind.In)
+            iter_expr: Ast::Expr = get parser.expr() else return null
+            body: darray[Ast::Stmt] = parser.parse_block()
+            return (Ast::Stmt.For(vars_buf, iter_expr, body, tok.line))
+
+
+        def var_decl_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            parser.expect(TokenKind.Colon)
+            type_expr: Ast::Expr = get parser.expr() else return null
+
+            # `value` is non-optional in the AST; an uninitialized binding records Invalid.
+            value: mutable Ast::Expr = (Ast::Expr.Invalid)
+            if parser.accept(TokenKind.Assign):
+                if parser.expr() is parsed_value:
+                    value <- parsed_value
+
+            return (Ast::Stmt.VarDecl(Lexer::text_or_empty(name_tok, parser.source), type_expr, value, name_tok.line))
+
+
+        # A statement whose prefix clause is not yet modeled but which introduces a
+        # `:`-block (e.g. `can Mem.Allocate:`, `region scratch:`, `try:`). Skip the
+        # prefix tokens up to a paren-balanced top-level `:`, then parse the block.
+        # A prefix with no block (e.g. `region scratch(1024)`) degrades to an empty
+        # statement so the line is consumed without cascading errors.
+        def prefixed_block_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            line: u32 = parser.cursor().line
+
+            # Capture the name a binding-introducing prefix brings into scope:
+            # `error IDENT:` binds the error value; a `catch` success arm `IDENT:`
+            # (Ident-Colon-Newline) binds the result. Everything else binds nothing.
+            binding: mutable sview = ""
+            first_kind: TokenKind = parser.peek()
+            if first_kind == TokenKind.Error:
+                parser.advance()                       # `error`
+                if parser.peek() == TokenKind.Ident:
+                    etok: Token = parser.cursor()
+                    binding <- Lexer::text_or_empty(etok, parser.source)
+            elif first_kind == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon and parser.peek_at(2) == TokenKind.Newline:
+                ltok: Token = parser.cursor()
+                binding <- Lexer::text_or_empty(ltok, parser.source)
+
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof:
+                kind: TokenKind = parser.peek()
+                if kind in {TokenKind.LParen, TokenKind.LBracket}:
+                    depth <- depth + 1
+                    parser.advance()
+                elif kind in {TokenKind.RParen, TokenKind.RBracket}:
+                    depth <- depth - 1
+                    parser.advance()
+                elif depth == 0 and kind in {TokenKind.Colon, TokenKind.Newline}:
+                    break
+                else:
+                    parser.advance()
+
+            if parser.peek() != TokenKind.Colon:
+                return (Ast::Stmt.Expr((Ast::Expr.Invalid), line))
+
+            body: darray[Ast::Stmt] = parser.parse_block()
+            return (Ast::Stmt.Block(binding, body, line))
+
+
+        def if_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            return parser.if_tail(parser.expect(TokenKind.If))
+
+
+        # Shared tail for `if` and `elif`: parse `<cond> <block>` then an optional
+        # `elif`/`else` continuation. An `elif` chain desugars into a nested If stored
+        # as the single statement of the parent's else_body — no separate elif node.
+        def if_tail(parser: mutable Parser&, tok: Token) -> Ast::Stmt?:
+            condition: Ast::Expr = get parser.expr() else return null
+            then_body: darray[Ast::Stmt] = parser.parse_block()
+
+            else_body: mutable darray[Ast::Stmt] = []
+            parser.skip_newlines()
+
+            next_kind: TokenKind = parser.peek()
+            if next_kind == TokenKind.Elif:
+                elif_tok: Token = parser.advance()
+                # An `elif` chain desugars into a nested If as the single statement of the
+                # parent's else body.
+                if parser.if_tail(elif_tok) is nested_if:
+                    else_body.push(nested_if)
+            elif next_kind == TokenKind.Else:
+                parser.advance()
+                else_body <- parser.parse_block()
+
+            return (Ast::Stmt.If(condition, then_body, else_body, tok.line))
+
+
+        def while_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.expect(TokenKind.While)
+            condition: Ast::Expr = get parser.expr() else return null
+            body: darray[Ast::Stmt] = parser.parse_block()
+            return (Ast::Stmt.While(condition, body, tok.line))
+
+
+        def return_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.expect(TokenKind.Return)
+
+            # Bare postfix guard `return if COND` (== `if COND: return`). A bare return has
+            # no value, so an `if` right after `return` is unambiguously a guard (never a
+            # ternary). Desugar to a real If node so the guard's references resolve.
+            if parser.accept(TokenKind.If):
+                cond: Ast::Expr = get parser.expr() else return null
+                body: mutable darray[Ast::Stmt] = []
+                body.push((Ast::Stmt.Return(null, tok.line)))
+                no_else: darray[Ast::Stmt] = []
+                return (Ast::Stmt.If(cond, body, no_else, tok.line))
+            else:
+                value: mutable Ast::Expr? = null
+                if parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof:
+                    value <- parser.expr()
+
+                # Trailing guard `return VALUE if COND` (== `if COND: return VALUE`).
+                if parser.accept(TokenKind.If):
+                    vcond: Ast::Expr = get parser.expr() else return null
+                    vbody: mutable darray[Ast::Stmt] = []
+                    vbody.push((Ast::Stmt.Return(value, tok.line)))
+                    vno_else: darray[Ast::Stmt] = []
+                    return (Ast::Stmt.If(vcond, vbody, vno_else, tok.line))
+                else:
+                    return (Ast::Stmt.Return(value, tok.line))
+
+
+        # `match SCRUTINEE:` with indented `PATTERN: <block>` arms. The scrutinee and each
+        # arm's body are fully parsed; the pattern is captured as its raw source text
+        # (patterns are not yet decomposed into a Pattern AST). Each arm owns its body
+        # `darray[Stmt]`, and the arm list becomes the Match node's `arms` side-table.
+        # Build a source view over the byte span [start, end) via a synthetic span
+        # token (direct slicing of a raw u8& is not permitted here).
+        def span_view(parser: Parser&, start: usize, end: usize) -> sview:
+            span_tok: mutable Token = zeroed
+            span_tok.start <- start.u32()
+            span_tok.length <- (end - start).u32()
+            return Lexer::text_or_empty(span_tok, parser.source)
+
+
+        # Consume tokens up to an arm's block colon (paren/bracket/brace-balanced so
+        # `A.B(x)` / `{a, b}` stay whole) and return their raw source span. Used as the
+        # lossless fallback for pattern forms not yet structured.
+        def capture_pattern_span(parser: mutable Parser&) -> sview:
+            pat_start: usize = parser.cursor().start.usize()
+            pat_end: mutable usize = pat_start
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof:
+                kind: TokenKind = parser.peek()
+                break if depth == 0 and kind in {TokenKind.Colon, TokenKind.Newline}
+                    
+                if kind in {TokenKind.LParen, TokenKind.LBracket, TokenKind.LBrace}:
+                    depth <- depth + 1
+                elif kind in {TokenKind.RParen, TokenKind.RBracket, TokenKind.RBrace}:
+                    depth <- depth - 1
+                consumed: Token = parser.advance()
+                pat_end <- consumed.start.usize() + consumed.length.usize()
+
+            return parser.span_view(pat_start, pat_end)
+
+
+        # Parse one match-arm pattern. Three layers: a top-level comma list is a tuple
+        # pattern; each element may be an or-pattern (`A | B`); each alternative is a
+        # primary (wildcard, literal, bare binding, variant, struct, or category binder).
+        # Anything exotic is captured losslessly as `Other`, and parsing always halts at
+        # the arm's block colon so the parser never regresses.
+        def parse_pattern(parser: mutable Parser&) -> Ast::Pattern:
+            first: Ast::Pattern = parser.parse_pattern_or()
+            first return if parser.peek() != TokenKind.Comma
+                
+            elems: mutable darray[Ast::Pattern] = [first]
+            while parser.accept(TokenKind.Comma):
+                break if parser.peek() == TokenKind.Colon or parser.peek() == TokenKind.Newline
+                    
+                elems.push(parser.parse_pattern_or())
+            return (Ast::Pattern.Tuple(elems))
+
+
+        # An or-pattern `A | B | …` (or just a single primary when there is no `|`).
+        def parse_pattern_or(parser: mutable Parser&) -> Ast::Pattern:
+            first: Ast::Pattern = parser.parse_pattern_primary()
+            first return if parser.peek() != TokenKind.Pipe
+                
+            options: mutable darray[Ast::Pattern] = [first]
+            while parser.accept(TokenKind.Pipe):
+                options.push(parser.parse_pattern_primary())
+            return (Ast::Pattern.Or(options))
+
+
+        # A primary pattern: wildcard, literal, bare binding, (qualified) variant,
+        # struct pattern, or a category arm with a binder (`Type s`).
+        def parse_pattern_primary(parser: mutable Parser&) -> Ast::Pattern:
+            tok: Token = parser.cursor()
+            kind: TokenKind = parser.peek()
+
+            # Literal value patterns.
+            if kind in {TokenKind.IntLit, TokenKind.HexLit, TokenKind.FloatLit, TokenKind.StringLit, TokenKind.CharLit, TokenKind.True, TokenKind.False}:
+                parser.advance()
+                return (Ast::Pattern.Literal(Lexer::text_or_empty(tok, parser.source)))
+
+            # Identifier-headed: wildcard, bare binding, variant, struct, or type binder.
+            elif kind == TokenKind.Ident:
+                head: sview = Lexer::text_or_empty(tok, parser.source)
+                if head == "_":
+                    parser.advance()
+                    return (Ast::Pattern.Wildcard)
+
+                # Consume a (possibly module-qualified) path: Ident ((`.`|`::`) Ident)*.
+                path_start: usize = tok.start.usize()
+                last: Token = parser.advance()
+                path_end: mutable usize = last.start.usize() + last.length.usize()
+                dotted: mutable bool = false
+                while parser.peek() == TokenKind.Dot or parser.peek() == TokenKind.Scope:
+                    dotted <- true
+                    parser.advance()                   # `.` or `::`
+                    seg: Token = parser.advance()      # path segment
+                    path_end <- seg.start.usize() + seg.length.usize()
+                path: sview = parser.span_view(path_start, path_end)
+
+                # `Variant(field, …)` — field subpatterns are or-patterns (their own commas
+                # separate fields, so they must not be parsed as a tuple).
+                if parser.peek() == TokenKind.LParen:
+                    parser.advance()
+                    fields_buf: mutable darray[Ast::Pattern] = []
+                    while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof:
+                        fields_buf.push(parser.parse_pattern_or())
+                        if not parser.accept(TokenKind.Comma):
+                            break
+                    parser.expect(TokenKind.RParen)
+                    return (Ast::Pattern.Variant(path, fields_buf))
+
+                # `Type{a, b: sub}` — struct pattern. A labeled field (`name:`) keeps its
+                # subpattern; a shorthand field is parsed as a primary (bare name → Binding).
+                if parser.peek() == TokenKind.LBrace:
+                    parser.advance()
+                    struct_fields: mutable darray[Ast::Pattern] = []
+                    while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof:
+                        if parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
+                            parser.advance()           # field label (selector, not a binding)
+                            parser.advance()           # `:`
+                        struct_fields.push(parser.parse_pattern_or())
+                        if not parser.accept(TokenKind.Comma):
+                            break
+                    parser.expect(TokenKind.RBrace)
+                    return (Ast::Pattern.Struct(path, struct_fields))
+
+                # A category arm with a binder: `Type s` (two identifiers, no separator).
+                if parser.peek() == TokenKind.Ident:
+                    binder_tok: Token = parser.advance()
+                    return (Ast::Pattern.TypeBind(path, Lexer::text_or_empty(binder_tok, parser.source)))
+
+                # A dotted head with no fields is a bare enum constant; a single bare
+                # name binds the scrutinee.
+                if dotted:
+                    return (Ast::Pattern.Variant(path, []))
+                return (Ast::Pattern.Binding(path))
+            else:
+                # Anything else: keep the raw span, advancing to the block colon.
+                return (Ast::Pattern.Other(parser.capture_pattern_span()))
+
+
+        def match_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.expect(TokenKind.Match)
+            scrutinee: Ast::Expr = get parser.expr() else return null
+            parser.expect(TokenKind.Colon)
+            parser.expect(TokenKind.Newline)
+            parser.expect(TokenKind.Indent)
+
+            arms_buf: mutable darray[Ast::MatchArm] = []
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                parser.skip_newlines()
+                break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+                    
+
+                pattern: Ast::Pattern = parser.parse_pattern()
+
+                # If the pattern parse didn't land on the block colon (a guard or an
+                # exotic tail), drop the rest of the head losslessly so we don't spin.
+                if parser.peek() != TokenKind.Colon:
+                    parser.capture_pattern_span()
+                if parser.peek() != TokenKind.Colon:
+                    parser.advance()                   # malformed arm; don't spin
+                    continue
+
+                body: darray[Ast::Stmt] = parser.parse_block()
+                arms_buf.push(Ast::MatchArm{pattern: pattern, body: body})
+
+            parser.expect(TokenKind.Dedent)
+
+            return (Ast::Stmt.Match(scrutinee, arms_buf, tok.line))
+
+

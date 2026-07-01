@@ -1,0 +1,300 @@
+# Stage1 parser — declaration parsing, part 1 (`extend Parser: private:`). Covers
+# decorators, the declaration-unit dispatcher, modules/`using`/`include`, type aliases,
+# `impl`/named-block/`static if`/law/alias decls, and the top-level `decl` dispatcher.
+# Struct/enum/const declarations and the public `parse_file` entry point continue in
+# parser_types.elisa. Split out of parser.elisa to keep each part file under 600 lines.
+
+extend Parser:
+    private:
+        # ============================================================
+        # Declaration parsing
+        # ============================================================
+
+        # Parse one declaration unit into `out`. A single keyword decl appends one
+        # node; `module`/visibility sections (`public:`/`private:`) append their
+        # flattened children. `module`/`include`/`public`/`private` are contextual
+        # keywords (the lexer emits them as identifiers), matched here by text.
+        # Consume any leading `@name` / `@name(args)` decorators before a declaration
+        # (e.g. `@inline(always)`, `@hot`). Decorator semantics are not yet modeled;
+        # they are skipped so the decorated declaration parses cleanly.
+        def skip_decorators(parser: mutable Parser&) -> void:
+            while parser.peek() == TokenKind.At:
+                parser.advance()                   # `@`
+                parser.accept(TokenKind.Ident)
+                if parser.accept(TokenKind.LParen):
+                    depth: mutable int = 1
+                    while depth > 0 and parser.peek() != TokenKind.Eof:
+                        kind: TokenKind = parser.advance().kind
+                        if kind == TokenKind.LParen:
+                            depth <- depth + 1
+                        elif kind == TokenKind.RParen:
+                            depth <- depth - 1
+                parser.skip_newlines()
+
+
+        def parse_decl_unit(parser: mutable Parser&, out: mutable darray[Ast::Decl]&) -> void:
+            parser.skip_decorators()
+            if parser.peek() == TokenKind.Ident:
+                cur: Token = parser.cursor()
+                text: sview = Lexer::text_or_empty(cur, parser.source)
+                if text == "module":
+                    if parser.module_decl() is mod:
+                        out.push(mod)
+                    return
+                # `extend Foo:` shares the module body grammar; modeled as a Module node
+                # (member collection is identical — the canonical/duplicate checks the
+                # backend enforces aren't part of stage1's resolver).
+                if text == "extend":
+                    if parser.module_decl() is ext:
+                        out.push(ext)
+                    return
+                if text == "include":
+                    if parser.include_decl() is inc:
+                        out.push(inc)
+                    return
+                if text == "public" or text == "private":
+                    parser.visibility_section(out)
+                    return
+                if text == "type":
+                    if parser.type_alias_decl() is alias:
+                        out.push(alias)
+                    return
+                if text == "alias":
+                    if parser.alias_decl() is alias_node:
+                        out.push(alias_node)
+                    return
+                if text == "law":
+                    if parser.law_decl() is law_node:
+                        out.push(law_node)
+                    return
+                if text == "permission" or text == "effect" or text == "protocol":
+                    if parser.named_block_decl() is block_node:
+                        out.push(block_node)
+                    return
+                if text == "impl":
+                    parser.impl_decl(out)
+                    return
+                # Declaration modifiers (`affine struct …`, `affine enum …`): consume the
+                # modifier and parse the declaration it qualifies.
+                if text == "affine":
+                    parser.advance()
+                    parser.parse_decl_unit(out)
+                    return
+
+            # `static if/elif/else COND:` compile-time conditional declarations.
+            if parser.peek() == TokenKind.Static:
+                n1: TokenKind = parser.peek_at(1)
+                if n1 == TokenKind.If or n1 == TokenKind.Elif or n1 == TokenKind.Else:
+                    parser.static_if_decl(out)
+                    return
+
+            if parser.decl() is d:
+                out.push(d)
+            else:
+                parser.advance()
+
+
+        # `type Name = <target-type>` (optionally `type Name[params] = ...`). The target
+        # is parsed as an expression (type expressions reuse the expression grammar).
+        def type_alias_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()          # consume the `type` identifier
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            # Optional generic params `[..]` between the name and `=`.
+            if parser.accept(TokenKind.LBracket):
+                while parser.peek() != TokenKind.RBracket and parser.peek() != TokenKind.Eof:
+                    parser.advance()
+                parser.accept(TokenKind.RBracket)
+            parser.expect(TokenKind.Assign)
+            if parser.expr() is target:
+                return (Ast::Decl.Alias(Lexer::text_or_empty(name_tok, parser.source), target, tok.line))
+            return null
+
+
+        # `impl[params] Trait for Type:` (or inherent `impl Type:`) — a trait/inherent
+        # implementation block. The header (`[params] Trait for Type`) is skipped to the
+        # colon; the body's method declarations are flattened into `out` (the impl grouping
+        # is erased, but the `def`s are captured so their bodies parse).
+        def impl_decl(parser: mutable Parser&, out: mutable darray[Ast::Decl]&) -> void:
+            parser.advance()                           # consume the `impl` identifier
+            parser.skip_decl_header_clauses()
+            if parser.peek() == TokenKind.Colon:
+                parser.expect(TokenKind.Colon)
+                parser.expect(TokenKind.Newline)
+                parser.expect(TokenKind.Indent)
+                while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                    parser.skip_newlines()
+                    if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                        break
+                    before: usize = parser.position
+                    parser.parse_decl_unit(out)
+                    if parser.position == before:
+                        parser.advance()
+                parser.expect(TokenKind.Dedent)
+
+
+        # `permission Name:` / `effect Name:` / `protocol Name:` — a named declaration
+        # with an indented member block (capability sets, effect families, protocol
+        # method signatures). Header clauses + the whole indented body are skipped; the
+        # name is recorded as an Alias node. Returns null if there is no block.
+        def named_block_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()              # consume the contextual keyword
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            parser.skip_decl_header_clauses()
+            if parser.peek() == TokenKind.Colon:
+                parser.advance()
+                if parser.accept(TokenKind.Newline) and parser.accept(TokenKind.Indent):
+                    depth: mutable int = 1
+                    while depth > 0 and parser.peek() != TokenKind.Eof:
+                        kind: TokenKind = parser.advance().kind
+                        if kind == TokenKind.Indent:
+                            depth <- depth + 1
+                        elif kind == TokenKind.Dedent:
+                            depth <- depth - 1
+            return (Ast::Decl.Alias(Lexer::text_or_empty(name_tok, parser.source), (Ast::Expr.Invalid), tok.line))
+
+
+        # `static if/elif/else COND:` compile-time conditional declarations. All branch
+        # bodies are flattened into `out` (branch selection isn't evaluated yet); the
+        # `static elif`/`static else` continuation is consumed recursively.
+        def static_if_decl(parser: mutable Parser&, out: mutable darray[Ast::Decl]&) -> void:
+            parser.advance()                           # `static`
+            if parser.accept(TokenKind.If) or parser.accept(TokenKind.Elif):
+                parser.expr()                          # compile-time condition (consumed)
+            else:
+                parser.accept(TokenKind.Else)
+
+            if parser.peek() == TokenKind.Colon:
+                parser.expect(TokenKind.Colon)
+                parser.expect(TokenKind.Newline)
+                parser.expect(TokenKind.Indent)
+                while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                    parser.skip_newlines()
+                    if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                        break
+                    before: usize = parser.position
+                    parser.parse_decl_unit(out)
+                    if parser.position == before:
+                        parser.advance()
+                parser.expect(TokenKind.Dedent)
+
+            parser.skip_newlines()
+            if parser.peek() == TokenKind.Static:
+                n1: TokenKind = parser.peek_at(1)
+                if n1 in {TokenKind.Elif, TokenKind.Else}:
+                    parser.static_if_decl(out)
+
+
+        # `law Name(params) = <predicate>` algebraic/refinement law. The predicate uses
+        # quantifier syntax (`forall i in 0..<n: P`) not yet modeled; consume the whole
+        # (single-line) law to its terminating newline. An indented block body, if any,
+        # is then consumed too. Recorded as an Alias node.
+        def law_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()              # consume the `law` identifier
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof:
+                kind: TokenKind = parser.peek()
+                if kind in {TokenKind.LParen, TokenKind.LBracket, TokenKind.LBrace}:
+                    depth <- depth + 1
+                    parser.advance()
+                elif kind in {TokenKind.RParen, TokenKind.RBracket, TokenKind.RBrace}:
+                    depth <- depth - 1
+                    parser.advance()
+                elif depth == 0 and kind in {TokenKind.Newline, TokenKind.Dedent}:
+                    break
+                else:
+                    parser.advance()
+            return (Ast::Decl.Alias(Lexer::text_or_empty(name_tok, parser.source), (Ast::Expr.Invalid), tok.line))
+
+
+        # `alias Name = <effect-list>` / `alias Name = <type>` (effect-set / capability
+        # aliases). The RHS is a comma-separated list of dotted effect names; consume the
+        # whole line after `=` since the list/effect grammar isn't modeled yet.
+        def alias_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()              # consume the `alias` identifier
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            if parser.accept(TokenKind.Assign):
+                while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                    parser.advance()
+            return (Ast::Decl.Alias(Lexer::text_or_empty(name_tok, parser.source), (Ast::Expr.Invalid), tok.line))
+
+
+        # An indented `public:` / `private:` block. Visibility is a layout grouping
+        # only here; members are flattened into the enclosing declaration list.
+        def visibility_section(parser: mutable Parser&, out: mutable darray[Ast::Decl]&) -> void:
+            parser.advance()                       # consume the public/private identifier
+            parser.expect(TokenKind.Colon)
+            parser.expect(TokenKind.Newline)
+            parser.expect(TokenKind.Indent)
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                parser.skip_newlines()
+                if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                    break
+                before: usize = parser.position
+                parser.parse_decl_unit(out)
+                if parser.position == before:      # never spin on an unrecognized token
+                    parser.advance()
+            parser.expect(TokenKind.Dedent)
+
+
+        def module_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()          # consume the `module` identifier
+            name_tok: Token = parser.expect(TokenKind.Ident)
+
+            body_items: mutable darray[Ast::Decl] = []
+            if parser.peek() == TokenKind.Colon:
+                parser.expect(TokenKind.Colon)
+                parser.expect(TokenKind.Newline)
+                parser.expect(TokenKind.Indent)
+                while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
+                    parser.skip_newlines()
+                    if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                        break
+                    before: usize = parser.position
+                    parser.parse_decl_unit(body_items)
+                    if parser.position == before:
+                        parser.advance()
+                parser.expect(TokenKind.Dedent)
+
+            return (Ast::Decl.Module(Lexer::text_or_empty(name_tok, parser.source), body_items, tok.line))
+
+
+        def include_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()          # consume the `include` identifier
+            path_tok: Token = parser.expect(TokenKind.StringLit)
+            return (Ast::Decl.Import(Lexer::text_or_empty(path_tok, parser.source), tok.line))
+
+
+        def decl(parser: mutable Parser&) -> Ast::Decl?:
+            kind: TokenKind = parser.peek()
+
+            match kind:
+                TokenKind.Def:
+                    return parser.func_decl()
+
+                TokenKind.Struct:
+                    return parser.struct_decl()
+
+                TokenKind.Enum:
+                    return parser.enum_decl()
+
+                TokenKind.Const:
+                    return parser.const_decl()
+
+                TokenKind.Global:
+                    return parser.const_decl()
+
+                TokenKind.Extern:
+                    return parser.extern_decl()
+
+                TokenKind.Export:
+                    return parser.extern_decl()
+
+                TokenKind.Error:
+                    return parser.error_type_decl()
+
+                _:
+                    parser.error_at(Ast::ParseErrorKind.ExpectedDeclaration, parser.cursor())
+                    return null
+
+

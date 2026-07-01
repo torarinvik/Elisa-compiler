@@ -1,0 +1,209 @@
+# Stage1 parser — `module Parser` core: the Parser struct/constructor, token-consumption
+# helpers, block parsing, and the `can[...]` trailing-effect-grant scanner. This is the
+# canonical `module Parser:` declaration; parser_expr.elisa / parser_stmt.elisa /
+# parser_decl.elisa / parser_types.elisa each declare their own `extend Parser:` block
+# with its own visibility section — a file's membership is visible in the file itself
+# rather than encoded by this facade's include layout (see parser.elisa).
+#
+# Region-Inferred Allocation: there are no explicit `Arena&` parameters anywhere in the
+# parser. Every AST node, side-table darray, and error entry is allocated through idiomatic
+# Elisa region inference (docs/75) — the region is inferred from the call site and threaded
+# implicitly, all the way out to `parse_file`'s region-polymorphic return.
+#
+# The `Parser` struct itself intentionally carries almost no state: `source`/`tokens`/
+# `position` are the cursor over the token stream, and `errors` is the one accumulated
+# side table. AST nodes are NOT held here — each is constructed as a handle into the
+# unified Node store (docs/76/77) and wired directly into its parent's payload, so child
+# lists live on the nodes themselves rather than in any parser-owned collection.
+
+include "./parser_tokens.elisa"
+
+module Parser:
+    public:
+        struct Parser:
+            source: u8&
+            tokens: darray[Token]
+            position: mutable usize
+            errors: mutable darray[Ast::ParseError]
+
+
+        # ============================================================
+        # Region-polymorphic parser constructor
+        # No Arena& param; region inferred from allocation site
+        # ============================================================
+
+        def Parser(source: u8&, tokens: darray[Token]) -> Parser:
+            # Region is implicit; the empty error list is backed by the caller's inferred
+            # region, carried through this region-polymorphic builder's return.
+            return Parser{
+                source: source,
+                tokens: tokens,
+                position: 0,
+                errors: []            # region inferred
+            }
+
+    private:
+        # ============================================================
+        # Token consumption helpers
+        #
+        # Every part file (parser_expr.elisa / parser_stmt.elisa / parser_decl.elisa /
+        # parser_types.elisa) reads the token stream exclusively through this small set of
+        # helpers — `cursor`/`peek`/`peek_at` for lookahead, `advance`/`accept`/`expect` for
+        # consumption, and `error_at` for recording a located parse error without aborting
+        # the parse (recovery keeps scanning so one bad token doesn't cascade into losing
+        # every declaration after it). Nothing outside this file indexes `parser.tokens`
+        # directly, which keeps the EOF/out-of-range sentinel handling in exactly one place.
+        # ============================================================
+
+        def cursor(parser: Parser&) -> Token:
+            if parser.position >= parser.tokens.count:
+                zero: Token = zeroed
+                zero.kind <- TokenKind.Eof
+                return zero
+            else:
+                return parser.tokens[parser.position]
+
+
+        def peek(parser: Parser&) -> TokenKind:
+            return parser.cursor().kind
+
+
+        # Lookahead by `offset` tokens without advancing. Out-of-range reads as Eof,
+        # so callers never index past the token stream.
+        def peek_at(parser: Parser&, offset: usize) -> TokenKind:
+            idx: usize = parser.position + offset
+            if idx >= parser.tokens.count:
+                return TokenKind.Eof
+            else:    
+                return parser.tokens[idx].kind
+
+
+        # Consume a run of layout Newlines. Blank lines and statement terminators
+        # collapse here so block/decl loops only ever see real grammar tokens.
+        def skip_newlines(parser: mutable Parser&) -> void:
+            while parser.peek() == TokenKind.Newline:
+                parser.advance()
+
+
+        def advance(parser: mutable Parser&) -> Token:
+            tok: Token = parser.cursor()
+            if parser.position < parser.tokens.count:
+                parser.position <- parser.position + 1
+            return tok
+
+
+        def accept(parser: mutable Parser&, kind: TokenKind) -> bool:
+            if parser.peek() == kind:
+                parser.advance()
+                return true
+            else:
+                return false
+
+
+        def expect(parser: mutable Parser&, kind: TokenKind) -> Token:
+            tok: Token = parser.cursor()
+            if tok.kind != kind:
+                err: Ast::ParseError = Ast::ParseError{
+                    kind: Ast::ParseErrorKind.ExpectedToken,
+                    line: tok.line,
+                    column: tok.column,
+                    context: Lexer::text_or_empty(tok, parser.source)
+                }
+                parser.errors.push(err)
+            return parser.advance()
+
+
+        def error_at(parser: mutable Parser&, kind: Ast::ParseErrorKind, tok: Token) -> void:
+            err: Ast::ParseError = Ast::ParseError{
+                kind: kind,
+                line: tok.line,
+                column: tok.column,
+                context: Lexer::text_or_empty(tok, parser.source)
+            }
+            parser.errors.push(err)
+
+
+        # Parse a `:`-introduced statement block and return the block's statements as a
+        # `darray[Stmt]` — the side-table that hangs directly off the owning node's payload
+        # (docs/76). Two layouts are accepted, matching the lexer's token model:
+        #   inline    `: <stmt> NEWLINE`
+        #   indented  `: NEWLINE INDENT (<stmt> NEWLINE)* DEDENT`
+        # The opening Colon and all layout tokens (Newline/Indent/Dedent) are consumed
+        # here, so statement parsers never see layout noise.
+        def parse_block(parser: mutable Parser&) -> darray[Ast::Stmt]:
+            parser.expect(TokenKind.Colon)
+            items: mutable darray[Ast::Stmt] = []
+
+            # Inline single-statement block: `if cond: return x`.
+            if parser.peek() != TokenKind.Newline:
+                if parser.stmt() is inline_stmt:
+                    items.push(inline_stmt)
+                parser.skip_trailing_can()
+                parser.accept(TokenKind.Newline)
+                return items
+            else:
+                # Indented block.
+                parser.expect(TokenKind.Newline)
+                parser.expect(TokenKind.Indent)
+
+                while true:
+                    parser.skip_newlines()
+                    kind: TokenKind = parser.peek()
+                    break if kind in {TokenKind.Dedent, TokenKind.Eof}
+        
+                    if parser.stmt() is body_stmt:
+                        items.push(body_stmt)
+                        parser.skip_trailing_can()
+                        parser.accept(TokenKind.Newline)
+                    else:
+                        parser.advance()   # error recovery: never spin on a bad token
+
+                parser.expect(TokenKind.Dedent)
+                return items
+
+
+        # Consume a trailing inline effect grant `... can E1, E2` (no block colon) that
+        # follows an expression, e.g. `return f() can Memory.Allocate, Abort.Panic` or
+        # `print(x can Console.Write)`. The block form `can …:` is a statement handled
+        # elsewhere; this is the postfix modifier. The effect list's own commas are part
+        # of the grant, so the scan stops only at a depth-0 closing bracket, line break,
+        # or block colon — not at a comma.
+        def skip_trailing_can(parser: mutable Parser&) -> void:
+            return if parser.peek() != TokenKind.Ident
+                
+            cur: Token = parser.cursor()
+            return if Lexer::text_or_empty(cur, parser.source) != "can"
+                
+            parser.advance()                           # consume `can`
+
+            # Bracketed form `can[E1, E2]`: the effect set is delimited by `[...]`, so
+            # consume exactly the balanced brackets and stop — the following comma (if any)
+            # is a parameter separator, not part of the grant.
+            if parser.peek() == TokenKind.LBracket:
+                parser.advance()
+                bdepth: mutable int = 1
+                while bdepth > 0 and parser.peek() != TokenKind.Eof:
+                    bk: TokenKind = parser.advance().kind
+                    if bk == TokenKind.LBracket:
+                        bdepth <- bdepth + 1
+                    elif bk == TokenKind.RBracket:
+                        bdepth <- bdepth - 1
+                return
+
+            # Bare list form `can E1, E2`: the commas belong to the grant, so scan stops
+            # only at a depth-0 closing bracket, line break, or block colon.
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof:
+                kind: TokenKind = parser.peek()
+                if kind in {TokenKind.LParen, TokenKind.LBracket, TokenKind.LBrace}:
+                    depth <- depth + 1
+                    parser.advance()
+                elif kind in {TokenKind.RParen, TokenKind.RBracket, TokenKind.RBrace}:
+                    break if depth == 0
+                        
+                    depth <- depth - 1
+                    parser.advance()
+                elif depth == 0 and kind in {TokenKind.Newline, TokenKind.Dedent, TokenKind.Colon}:
+                    break
+                else:
+                    parser.advance()
