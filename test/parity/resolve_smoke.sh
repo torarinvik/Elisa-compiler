@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
         "        return helper(m)\n"
         "    if node is Stmt.Return(rv, ln):\n"
         "        return helper(rv)\n"
-        "    return helper(node as int)\n"
+        "    return helper(node.int())\n"
         "\n"
         /* Pattern forms the frontend doesn't use itself (so unexercised by self-parse) —
            covered here by crafted arms. Each binds names that are USED in the arm body, so

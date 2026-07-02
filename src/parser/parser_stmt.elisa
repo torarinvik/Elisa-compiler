@@ -93,6 +93,16 @@ extend Parser:
                         # `pool …:`, `parallel …:`) — prefix consumed to the block colon.
                         if head == "can" or head == "trusted" or head == "nursery" or head == "pool" or head == "parallel":
                             return parser.prefixed_block_stmt()
+                        # `lock MUTEX:` / `lock MUTEX as GUARD:` synchronized block. `lock`
+                        # is also a legal identifier, so only when a mutex name follows
+                        # (`lock = …` / `lock(…)` stay ordinary identifier uses).
+                        if head == "lock" and parser.peek_at(1) == TokenKind.Ident:
+                            return parser.prefixed_block_stmt()
+                        # `expect EXPR as PATTERN[:block]` / `expect let PATTERN = EXPR` —
+                        # pattern assertion; desugars to a one-arm Match (stage0's own
+                        # lowering) so the pattern's bindings resolve inside the block.
+                        if head == "expect" and tokenStartsValue(parser.peek_at(1)):
+                            return parser.expect_stmt()
                         if head == "for":
                             return parser.for_stmt()
                         # `region NAME(size):` / `region NAME:` scratch-region block.
@@ -290,6 +300,37 @@ extend Parser:
             return (Ast::Stmt.Contract(kind_text, pred, tok.line))
 
 
+        # `expect EXPR as PATTERN(S)` (with an optional `:` block) and the inverted
+        # `expect let PATTERN = EXPR` — assert EXPR matches PATTERN, binding its fields.
+        # Modeled as a one-arm Match on EXPR (exactly stage0's desugar, minus the
+        # synthesized wildcard-panic arm, which is runtime-only) so pattern bindings
+        # resolve in the block like any match arm's.
+        def expect_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.advance()              # `expect`
+
+            let_tok: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(let_tok, parser.source) == "let":
+                parser.advance()                       # `let`
+                let_pattern: Ast::Pattern = parser.parse_pattern()
+                if parser.peek() != TokenKind.Assign:
+                    parser.capture_pattern_span()      # exotic tail; consumed losslessly
+                parser.expect(TokenKind.Assign)
+                let_value: Ast::Expr = get parser.expr() else return null
+                let_body: darray[Ast::Stmt] = []
+                let_arms: darray[Ast::MatchArm] = [Ast::MatchArm{pattern: let_pattern, body: let_body}]
+                return (Ast::Stmt.Match(let_value, let_arms, tok.line))
+
+            value: Ast::Expr = get parser.expr() else return null
+            parser.expect(TokenKind.As)
+            pattern: Ast::Pattern = parser.parse_pattern()
+
+            body: mutable darray[Ast::Stmt] = []
+            if parser.peek() == TokenKind.Colon:
+                body <- parser.parse_block()
+            arms: darray[Ast::MatchArm] = [Ast::MatchArm{pattern: pattern, body: body}]
+            return (Ast::Stmt.Match(value, arms, tok.line))
+
+
         # A statement whose prefix clause is not yet modeled but which introduces a
         # `:`-block (e.g. `can Mem.Allocate:`, `region scratch:`, `try:`). Skip the
         # prefix tokens up to a paren-balanced top-level `:`, then parse the block.
@@ -376,6 +417,14 @@ extend Parser:
         # `elif`/`else` continuation. An `elif` chain desugars into a nested If stored
         # as the single statement of the parent's else_body — no separate elif node.
         def if_tail(parser: mutable Parser&, tok: Token) -> Ast::Stmt?:
+            # Optional branch-prediction hint `if likely COND:` / `if unlikely COND:`
+            # (contextual idents, also valid on `elif`). Only consumed when an operand
+            # follows, so a bool local literally named `likely` still works bare.
+            hint_tok: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident:
+                hint_text: sview = Lexer::text_or_empty(hint_tok, parser.source)
+                if (hint_text == "likely" or hint_text == "unlikely") and tokenStartsValue(parser.peek_at(1)):
+                    parser.advance()
             condition: Ast::Expr = get parser.expr() else return null
             then_body: darray[Ast::Stmt] = parser.parse_block()
 
@@ -420,6 +469,17 @@ extend Parser:
                 if parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof:
                     value <- parser.expr()
 
+                # Multi-value return `return a, b` (a named-tuple result type's value
+                # list) — collect the remaining values into a Tuple.
+                if parser.peek() == TokenKind.Comma:
+                    if value is first_value:
+                        ret_elems: mutable darray[Ast::Expr] = [first_value]
+                        while parser.accept(TokenKind.Comma):
+                            break if parser.peek() == TokenKind.Newline or parser.peek() == TokenKind.Eof
+                            if parser.expr() is re:
+                                ret_elems.push(re)
+                        value <- (Ast::Expr.Tuple(ret_elems, tok.line))
+
                 # Trailing guard `return VALUE if COND` (== `if COND: return VALUE`).
                 if parser.accept(TokenKind.If):
                     vcond: Ast::Expr = get parser.expr() else return null
@@ -453,8 +513,12 @@ extend Parser:
             depth: mutable int = 0
             while parser.peek() != TokenKind.Eof:
                 kind: TokenKind = parser.peek()
-                break if depth == 0 and kind in {TokenKind.Colon, TokenKind.Newline}
-                    
+                # Stop at the arm colon / end of line, and ALSO at an unbalanced
+                # closer — a `)`/`]`/`}` at depth 0 belongs to the enclosing
+                # construct (e.g. an exotic subpattern inside `Variant(...)`), and
+                # consuming it would unbalance the walk and eat past the pattern.
+                break if depth == 0 and kind in {TokenKind.Colon, TokenKind.Newline, TokenKind.RParen, TokenKind.RBracket, TokenKind.RBrace}
+
                 if kind in {TokenKind.LParen, TokenKind.LBracket, TokenKind.LBrace}:
                     depth <- depth + 1
                 elif kind in {TokenKind.RParen, TokenKind.RBracket, TokenKind.RBrace}:
@@ -513,6 +577,14 @@ extend Parser:
                     ebind: Token = parser.advance()
                     return (Ast::Pattern.TypeBind("error", Lexer::text_or_empty(ebind, parser.source)))
                 return (Ast::Pattern.Wildcard)
+
+            # `^name` pin pattern — compares against the VALUE of an existing binding
+            # instead of introducing a new one. No binding to register, so the pinned
+            # name is kept losslessly as an Other pattern.
+            elif kind == TokenKind.Caret and parser.peek_at(1) == TokenKind.Ident:
+                parser.advance()                       # `^`
+                pin_tok: Token = parser.advance()      # the pinned binding name
+                return (Ast::Pattern.Other(Lexer::text_or_empty(pin_tok, parser.source)))
 
             # Identifier-headed: wildcard, bare binding, variant, struct, or type binder.
             elif kind == TokenKind.Ident:
@@ -583,6 +655,11 @@ extend Parser:
         def match_stmt(parser: mutable Parser&) -> Ast::Stmt?:
             tok: Token = parser.expect(TokenKind.Match)
             scrutinee: Ast::Expr = get parser.expr() else return null
+            # Optional scrutinee alias `match EXPR as NAME:` — binds the matched value
+            # under NAME in the arms. The alias is a selector consumed here (expr()
+            # stops before `as`; see the reinterpret-target gate in binary_expr_at_level).
+            if parser.accept(TokenKind.As):
+                parser.expect(TokenKind.Ident)
             arms_buf: darray[Ast::MatchArm] = parser.parse_arm_block()
             return (Ast::Stmt.Match(scrutinee, arms_buf, tok.line))
 
@@ -594,6 +671,9 @@ extend Parser:
         def catch_stmt(parser: mutable Parser&) -> Ast::Stmt?:
             tok: Token = parser.expect(TokenKind.Catch)
             scrutinee: Ast::Expr = get parser.expr() else return null
+            # Optional alias `catch EXPR as NAME:` (mirrors match_stmt).
+            if parser.accept(TokenKind.As):
+                parser.expect(TokenKind.Ident)
             arms_buf: darray[Ast::MatchArm] = parser.parse_arm_block()
             return (Ast::Stmt.Match(scrutinee, arms_buf, tok.line))
 
