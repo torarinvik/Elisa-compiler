@@ -315,8 +315,8 @@ done
 if [[ ${#FRONTEND_FILES[@]} -gt 0 ]]; then
 	read -r self_unresolved self_files < <("$WORK/run" "${FRONTEND_FILES[@]}")
 	echo "resolve self-resolve: $self_unresolved unresolved across $self_files frontend files (whole-program)" >&2
-	if [[ "$self_unresolved" -gt "${RESOLVE_SELF_MAX:-5}" ]]; then
-		echo "resolve self-resolve FAILED: $self_unresolved > RESOLVE_SELF_MAX=${RESOLVE_SELF_MAX:-5}" >&2
+	if [[ "$self_unresolved" -gt "${RESOLVE_SELF_MAX:-0}" ]]; then
+		echo "resolve self-resolve FAILED: $self_unresolved > RESOLVE_SELF_MAX=${RESOLVE_SELF_MAX:-0}" >&2
 		exit 1
 	fi
 fi
