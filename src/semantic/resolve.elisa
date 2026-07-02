@@ -169,7 +169,7 @@ extend Semantic:
                         Stmt.VarDecl(name, type_expr, value, line):
                             bound.push(name)
                             gather_expr_bindings(value, bound)
-                        Stmt.Assign(target, value, line):
+                        Stmt.Assign(target, op, value, line):
                             # Multi-target unpack `a, b = …` (target is an Array literal)
                             # introduces its bare-ident targets as new locals.
                             if target is Expr.Array(elements, aline):
@@ -332,7 +332,7 @@ extend Semantic:
                             walk_expr(expr, table, bound)
                         Stmt.VarDecl(name, type_expr, value, line):
                             walk_expr(value, table, bound)
-                        Stmt.Assign(target, value, line):
+                        Stmt.Assign(target, op, value, line):
                             walk_expr(target, table, bound)
                             walk_expr(value, table, bound)
                         Stmt.If(cond, then_body, else_body, line):
@@ -367,6 +367,135 @@ extend Semantic:
 
 
         # Resolve references in every function declaration in `decls` (recursing modules).
+        # Whether a declared type spells mutability: the canonical `x: mutable T`/
+        # `p: mutable T&` form parses as a leading Unary(Mutable, ...) on the type expr.
+        def type_is_mutable(e: Ast::Expr) -> bool:
+            can Abort.Panic:
+                if e is Expr.Unary(op, operand, line):
+                    return op == TokenKind.Mutable
+                return false
+
+
+        # Record a function-body binding's mutability. Params feed this with their own
+        # flag; var-decls derive it from the declared type. Any OTHER binding form
+        # (for-loop vars, pattern bindings, block bindings, multi-assign targets, ...)
+        # goes to `skip` -- mutability of those isn't modeled yet, and a skipped name is
+        # never flagged (no false positives from unmodeled forms).
+        def note_binding(name: sview, is_mut: bool, immut: mutable darray[sview]&, mut_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if is_mut:
+                    mut_names.push(name)
+                else:
+                    immut.push(name)
+
+
+        # Gather binding mutability across a body (flattened, mirrors gather_locals).
+        def gather_mutability(stmts: darray[Ast::Stmt], immut: mutable darray[sview]&, mut_names: mutable darray[sview]&, skip: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for stmt in stmts:
+                    match stmt:
+                        Stmt.VarDecl(name, type_expr, value, line):
+                            note_binding(name, type_is_mutable(type_expr), immut, mut_names)
+                        Stmt.Assign(target, op, value, line):
+                            # Multi-target unpack introduces fresh locals -- unmodeled.
+                            if target is Expr.Array(elements, aline):
+                                for el in elements:
+                                    if el is Expr.Ident(nm, iline):
+                                        skip.push(nm)
+                        Stmt.For(bind, vars, iter, body, line):
+                            for v in vars:
+                                skip.push(v)
+                            gather_mutability(body, immut, mut_names, skip)
+                        Stmt.If(cond, then_body, else_body, line):
+                            gather_mutability(then_body, immut, mut_names, skip)
+                            gather_mutability(else_body, immut, mut_names, skip)
+                        Stmt.While(cond, body, line):
+                            gather_mutability(body, immut, mut_names, skip)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            if binding != "":
+                                skip.push(binding)
+                            gather_mutability(body, immut, mut_names, skip)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                gather_pattern(arm.pattern, skip)
+                                gather_mutability(arm.body, immut, mut_names, skip)
+                        Stmt.Expr(expr, line):
+                            pass
+                        Stmt.Return(value, line):
+                            pass
+                        Stmt.Contract(kind, expr, line):
+                            pass
+                        Stmt.Invalid:
+                            pass
+                        Stmt.Break(label, line):
+                            pass
+                        Stmt.Continue(label, line):
+                            pass
+
+
+        # Flag mutations (`<-` / compound assigns -- NOT `=`, which defines a new local)
+        # whose bare-ident target is a binding known to be immutable. A name that is
+        # skipped or ever declared mutable (e.g. a shadowing redeclaration) is not
+        # flagged -- unmodeled forms must never produce a false positive.
+        def check_assigns(stmts: darray[Ast::Stmt], table: mutable SymbolTable&, immut: darray[sview], mut_names: darray[sview], skip: darray[sview]) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for stmt in stmts:
+                    match stmt:
+                        Stmt.Assign(target, op, value, line):
+                            if op != TokenKind.Assign:
+                                if target is Expr.Ident(name, iline):
+                                    flagged: bool = (any i in immut where i == name) and not (any m in mut_names where m == name) and not (any s in skip where s == name)
+                                    if flagged:
+                                        table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignImmutable, name: name, line: line})
+                        Stmt.If(cond, then_body, else_body, line):
+                            check_assigns(then_body, table, immut, mut_names, skip)
+                            check_assigns(else_body, table, immut, mut_names, skip)
+                        Stmt.While(cond, body, line):
+                            check_assigns(body, table, immut, mut_names, skip)
+                        Stmt.For(bind, vars, iter, body, line):
+                            check_assigns(body, table, immut, mut_names, skip)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            check_assigns(body, table, immut, mut_names, skip)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                check_assigns(arm.body, table, immut, mut_names, skip)
+                        Stmt.Expr(expr, line):
+                            pass
+                        Stmt.VarDecl(name, type_expr, value, line):
+                            pass
+                        Stmt.Return(value, line):
+                            pass
+                        Stmt.Contract(kind, expr, line):
+                            pass
+                        Stmt.Invalid:
+                            pass
+                        Stmt.Break(label, line):
+                            pass
+                        Stmt.Continue(label, line):
+                            pass
+
+
+        # Signature + mutability checks for one function: duplicate parameter names,
+        # then assignment-to-immutable over the body.
+        def check_func(params: darray[Ast::ParamDecl], body: darray[Ast::Stmt], table: mutable SymbolTable&, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                seen: mutable darray[sview] = []
+                for p in params:
+                    if any s in seen where s == p.name:
+                        table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DuplicateParam, name: p.name, line: line})
+                    else:
+                        seen.push(p.name)
+
+                immut: mutable darray[sview] = []
+                mut_names: mutable darray[sview] = []
+                skip: mutable darray[sview] = []
+                for p in params:
+                    note_binding(p.name, p.is_mutable or type_is_mutable(p.type_expr), immut, mut_names)
+                gather_mutability(body, immut, mut_names, skip)
+                check_assigns(body, table, immut, mut_names, skip)
+
+
+        # Resolve references in every function declaration in `decls` (recursing modules).
         def resolve_decls(decls: darray[Ast::Decl], table: mutable SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for decl in decls:
@@ -375,6 +504,7 @@ extend Semantic:
                             bound: mutable darray[sview] = [p.name for p in params]
                             gather_locals(body, bound)
                             walk_stmts(body, table, bound)
+                            check_func(params, body, table, line)
                         Decl.Module(name, body, line):
                             resolve_decls(body, table)
                         _:
