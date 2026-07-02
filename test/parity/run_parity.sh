@@ -107,7 +107,7 @@ def stage1_lexer_checksums(source: u8&, source_len: usize, kind_out: mutable u64
     full_out[0] <- checksums.full
 
 
-export func stage1_lexer_checksums_export(source: u8&, source_len: usize, kind_out: mutable u64&, full_out: mutable u64&) -> void = stage1_lexer_checksums
+export fn stage1_lexer_checksums_export(source: u8&, source_len: usize, kind_out: mutable u64&, full_out: mutable u64&) -> void = stage1_lexer_checksums
 EOF
 
 "$ELISACORE_BIN" -emit header -o "$WORK/stage1_lexer_harness.h" "$WORK/stage1_lexer_harness.elisa" >/dev/null

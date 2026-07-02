@@ -58,7 +58,7 @@ def stage1_lexer_bench(source: u8&, source_len: usize, iters: u64) -> u64:
         return acc
 
 
-export func stage1_lexer_bench_export(source: u8&, source_len: usize, iters: u64) -> u64 = stage1_lexer_bench
+export fn stage1_lexer_bench_export(source: u8&, source_len: usize, iters: u64) -> u64 = stage1_lexer_bench
 EOF
 
 cat > "$WORK/bench_driver.c" <<'EOF'
