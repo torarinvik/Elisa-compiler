@@ -16,7 +16,8 @@ mkdir -p "$REPO_ROOT/build"
 "$ELISACORE_BIN" -emit obj -O2 -permissive -o "$REPO_ROOT/build/parse_report.o" "$REPO_ROOT/test/breadth/parse_report.elisa" >/dev/null 2>&1
 clang -O2 "$REPO_ROOT/build/parse_report.o" -o "$RPT" 2>/dev/null
 fail() { echo "duplicate-decl smoke FAIL: $1" >&2; exit 1; }
-dups() { "$RPT" | grep -c "duplicate declaration"; }
+# Both wordings: `duplicate declaration` (functions) and `duplicate type` (struct/enum).
+dups() { "$RPT" | grep -cE "duplicate declaration|duplicate type"; }
 
 # 1. identical-signature function redefinition MUST be flagged.
 n=$(printf 'def f(a: i64) -> i64:\n    return a\ndef f(b: i64) -> i64:\n    return b\n' | dups)
@@ -45,7 +46,7 @@ n=$(printf 'static if X:\n    def g() -> i64:\n        return 1\nstatic else:\n 
 # 6. 0 FP across the whole frontend + stdlib.
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -c "duplicate declaration" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "duplicate declaration|duplicate type" || true)
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t duplicate-declaration false positives across frontend+stdlib"
