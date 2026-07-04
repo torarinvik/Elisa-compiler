@@ -1,0 +1,312 @@
+extend Parser:
+    private:
+        # Max nested-expression depth. Deep enough that no real (or generated) code
+        # reaches it, ~10x below the ~20k stack-overflow threshold. A pathological
+        # `((((…))))` past this emits one diagnostic and unwinds instead of crashing.
+        const EXPR_DEPTH_LIMIT: u32 = 2000
+
+        # Depth-guarded entry point: every `parser.expr()` — including the recursive
+        # re-entry from a parenthesized/bracketed sub-expression — passes through here,
+        # so bounding `parser.depth` bounds the whole recursive-descent expression stack.
+        def expr(parser: mutable Parser&) -> Ast::Expr?:
+            parser.depth <- parser.depth + 1
+            if parser.depth > EXPR_DEPTH_LIMIT:
+                parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor())
+                parser.depth <- parser.depth - 1
+                return null
+            result: Ast::Expr? = parser.expr_body()
+            parser.depth <- parser.depth - 1
+            return result
+
+
+        def expr_body(parser: mutable Parser&) -> Ast::Expr?:
+            left: Ast::Expr = get parser.unary_expr()
+            value: mutable Ast::Expr = parser.binary_expr_at_level(left, 1)
+
+            # Projection query `EXPR for each|first VAR in ITER [where COND]` (e.g.
+            # `item * 2 for each item in items where item > 0`) — the value-projecting
+            # sibling of the leading-keyword query form. `for`/`each`/`first` are
+            # contextual idents, so probe by shape (for + each|first + VAR + in).
+            if parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) == TokenKind.Ident and parser.peek_at(3) == TokenKind.In:
+                proj_saved: usize = parser.position
+                proj_tok: Token = parser.cursor()
+                for_text: sview = Lexer::text_or_empty(proj_tok, parser.source)
+                parser.advance()
+                sel_tok: Token = parser.cursor()
+                sel_text: sview = Lexer::text_or_empty(sel_tok, parser.source)
+                parser.position <- proj_saved
+                if for_text == "for" and (sel_text == "each" or sel_text == "first"):
+                    parser.advance()                   # `for`
+                    parser.advance()                   # `each` / `first`
+                    pvar_tok: Token = parser.expect(TokenKind.Ident)
+                    parser.expect(TokenKind.In)
+                    piter_left: Ast::Expr = get parser.unary_expr() else return value
+                    piter: Ast::Expr = parser.binary_expr_at_level(piter_left, 1)
+                    pcond: mutable Ast::Expr = (Ast::Expr.Invalid)
+                    pwhere_tok: Token = parser.cursor()
+                    if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(pwhere_tok, parser.source) == "where":
+                        parser.advance()
+                        if parser.expr() is pc:
+                            pcond <- pc
+                    value <- (Ast::Expr.Comprehension(Lexer::text_or_empty(pvar_tok, parser.source), piter, pcond, value, proj_tok.line))
+
+            # Conditional expression `VALUE if COND else ALT` (Python-style ternary).
+            if parser.peek() == TokenKind.If:
+                if_tok: Token = parser.advance()       # `if`
+                cond: Ast::Expr = get parser.expr() else return value
+                alt: mutable Ast::Expr = (Ast::Expr.Invalid)
+                if parser.accept(TokenKind.Else):
+                    if parser.expr() is parsed_alt:
+                        alt <- parsed_alt
+                value <- (Ast::Expr.If(cond, value, alt, if_tok.line))
+
+            # Trailing inline effect grant (`expr can E1, E2`) — valid after any
+            # expression, including a call argument; consumed but not modeled.
+            parser.skip_trailing_can(false)
+            return value
+
+
+        # f-string desugar (mirrors stage0's parser_fstring.go): the FString token spans
+        # the RAW interior of `f"...{EXPR}..."`. Split it into literal chunks and embedded
+        # expression spans, sub-lex/sub-parse each `{EXPR}` over the SAME source buffer
+        # (absolute offsets, so views and LSP positions stay valid), and build
+        # `__fstr(chunk, expr, chunk, ...)`. Chunks are kept as their raw spans (stage1
+        # never materializes decoded text — it does no codegen, and resolution does not
+        # read chunk contents). A no-interpolation f-string collapses to a StringLit.
+        # A view over an arbitrary [start,end) span of the parser's source, built via a
+        # synthetic token (u8& slicing is not available here; text_or_empty is).
+        def fstring_span_view(parser: Parser&, tok: Token, span_start: usize, span_end: usize) -> sview:
+            pos: mutable LexerPosition = zeroed
+            pos.line <- tok.line.int()
+            pos.column <- tok.column.int()
+            span_tok: Token = Lexer::Token(TokenKind.StringLit, pos, span_start, span_end)
+            return Lexer::text_or_empty(span_tok, parser.source)
+
+
+        def fstring_expr(parser: mutable Parser&, tok: Token) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                lo: usize = tok.start.usize()
+                hi: usize = lo + tok.length.usize()
+                args: mutable darray[Ast::Expr] = []
+                chunk_start: mutable usize = lo
+                had_expr: mutable bool = false
+                i: mutable usize = lo
+                while i < hi:
+                    ch: char = parser.source[i].char()
+                    if ch == '{' and i + 1 < hi and parser.source[i + 1].char() == '{':
+                        i <- i + 2
+                        continue
+                    if ch == '}' and i + 1 < hi and parser.source[i + 1].char() == '}':
+                        i <- i + 2
+                        continue
+                    if ch == '\\':
+                        i <- i + 2
+                        continue
+                    if ch == '{':
+                        # Flush the pending literal chunk (raw span).
+                        if i > chunk_start:
+                            args.push((Ast::Expr.StringLit(parser.fstring_span_view(tok, chunk_start, i))))
+                        # Find the matching brace (string-aware, mirrors the lexer scan).
+                        j: mutable usize = i + 1
+                        depth: mutable usize = 1
+                        while j < hi and depth > 0:
+                            cj: char = parser.source[j].char()
+                            if cj == '{':
+                                depth <- depth + 1
+                            elif cj == '}':
+                                depth <- depth - 1
+                                if depth == 0:
+                                    break
+                            elif cj == '"':
+                                j <- j + 1
+                                while j < hi and parser.source[j].char() != '"':
+                                    if parser.source[j].char() == '\\':
+                                        j <- j + 1
+                                    j <- j + 1
+                            j <- j + 1
+                        # Sub-lex + sub-parse the embedded expression span.
+                        if j > i + 1:
+                            sub_tokens: darray[Token] = Lexer::frontend_tokenize_span("", parser.source, i + 1, j)
+                            sub: mutable Parser = Parser(parser.source, sub_tokens)
+                            if sub.expr() is part:
+                                args.push(part)
+                                had_expr <- true
+                            for se in sub.errors:
+                                parser.errors.push(se)
+                        else:
+                            parser.error_at(Ast::ParseErrorKind.ExpectedExpression, tok)
+                        i <- j + 1
+                        chunk_start <- i
+                        continue
+                    i <- i + 1
+                if hi > chunk_start:
+                    args.push((Ast::Expr.StringLit(parser.fstring_span_view(tok, chunk_start, hi))))
+                # No interpolation: the literal is just a string (possibly empty).
+                if not had_expr:
+                    if args.count == 1:
+                        return args[0]
+                    return (Ast::Expr.StringLit(sview("", 0, 0)))
+                names: darray[sview] = []
+                return (Ast::Expr.Call((Ast::Expr.Ident("__fstr", tok.line)), args, names, tok.line))
+
+
+        def array_literal(parser: mutable Parser&) -> Ast::Expr?:
+            tok: Token = parser.expect(TokenKind.LBracket)
+            elem_items: mutable darray[Ast::Expr] = []
+
+            if parser.peek() != TokenKind.RBracket:
+                # A leading `...` marks a spread element (`[...rest]`, `[a, ...rest]`) —
+                # splice the operand's elements. Modeled as a Unary(Ellipsis, expr) so the
+                # resolver walks the operand via the existing unary path.
+                lead_spread: bool = parser.accept(TokenKind.Ellipsis)
+                elem_handle: mutable Ast::Expr? = parser.expr()
+
+                # List comprehension `[BODY for VAR in ITER (if COND)?]` — detected when
+                # the first element is followed by the contextual `for`. ITER is parsed at
+                # the binary level (no ternary post-processing) so a trailing `if COND`
+                # reads as the filter, not a `ITER if … else …` conditional. Reuses the
+                # Comprehension node; the resolver binds VAR and walks iter/cond/body.
+                comp_for_tok: Token = parser.cursor()
+                if not lead_spread and parser.peek() == TokenKind.Ident and Lexer::text_or_empty(comp_for_tok, parser.source) == "for":
+                    if elem_handle is body:
+                        parser.advance()                       # `for`
+                        cvar_tok: Token = parser.expect(TokenKind.Ident)
+                        parser.expect(TokenKind.In)
+                        citer_left: Ast::Expr = get parser.unary_expr()
+                        citer: Ast::Expr = parser.binary_expr_at_level(citer_left, 1)
+                        ccond: mutable Ast::Expr = (Ast::Expr.Invalid)
+                        cfilter_tok: Token = parser.cursor()
+                        if parser.accept(TokenKind.If):
+                            if parser.expr() is c:
+                                ccond <- c
+                        elif parser.peek() == TokenKind.Ident and Lexer::text_or_empty(cfilter_tok, parser.source) == "where":
+                            parser.advance()
+                            if parser.expr() is c:
+                                ccond <- c
+                        parser.expect(TokenKind.RBracket)
+                        return (Ast::Expr.Comprehension(Lexer::text_or_empty(cvar_tok, parser.source), citer, ccond, body, tok.line))
+
+                if elem_handle is elem:
+                    if lead_spread:
+                        elem_items.push((Ast::Expr.Unary(TokenKind.Ellipsis, elem, tok.line)))
+                    else:
+                        elem_items.push(elem)
+
+                while parser.accept(TokenKind.Comma):
+                    break if parser.peek() == TokenKind.RBracket
+
+                    inner_spread: bool = parser.accept(TokenKind.Ellipsis)
+                    elem_handle <- parser.expr()
+                    if elem_handle is elem2:
+                        if inner_spread:
+                            elem_items.push((Ast::Expr.Unary(TokenKind.Ellipsis, elem2, tok.line)))
+                        else:
+                            elem_items.push(elem2)
+
+            parser.expect(TokenKind.RBracket)
+            return (Ast::Expr.Array(elem_items, tok.line))
+
+
+        # Set/dict literal: `{a, b}` is a SetLit, `{k: v, ...}` a DictLit. The form is
+        # decided by whether the first element is followed by `:`. The empty `{}` is an
+        # empty DictLit (the canonical empty-dict init).
+        def brace_literal(parser: mutable Parser&) -> Ast::Expr?:
+            tok: Token = parser.expect(TokenKind.LBrace)
+            if parser.peek() == TokenKind.RBrace:
+                parser.advance()
+                return (Ast::Expr.DictLit([], tok.line))
+
+            first: Ast::Expr = get parser.expr()
+
+            if parser.accept(TokenKind.Colon):
+                # Dict literal `{k: v, ...}` OR dict comprehension `{k: v for x in xs
+                # (where COND)?}` — same disambiguation as the list comprehension in
+                # `array_literal`: detected when the value is followed by `for`. The
+                # key/value pair is carried as a Tuple body (no dedicated dict-comp AST
+                # node yet) so the resolver can still walk both sides.
+                first_val: Ast::Expr = get parser.expr()
+
+                comp_for_tok: Token = parser.cursor()
+                if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(comp_for_tok, parser.source) == "for":
+                    parser.advance()                       # `for`
+                    cvar_tok: Token = parser.expect(TokenKind.Ident)
+                    parser.expect(TokenKind.In)
+                    citer_left: Ast::Expr = get parser.unary_expr()
+                    citer: Ast::Expr = parser.binary_expr_at_level(citer_left, 1)
+                    ccond: mutable Ast::Expr = (Ast::Expr.Invalid)
+                    cfilter_tok: Token = parser.cursor()
+                    if parser.accept(TokenKind.If):
+                        if parser.expr() is c:
+                            ccond <- c
+                    elif parser.peek() == TokenKind.Ident and Lexer::text_or_empty(cfilter_tok, parser.source) == "where":
+                        parser.advance()
+                        if parser.expr() is c:
+                            ccond <- c
+                    parser.expect(TokenKind.RBrace)
+                    pair: Ast::Expr = (Ast::Expr.Tuple([first, first_val], tok.line))
+                    return (Ast::Expr.Comprehension(Lexer::text_or_empty(cvar_tok, parser.source), citer, ccond, pair, tok.line))
+
+                entries: mutable darray[Ast::DictEntry] = [Ast::DictEntry{key: first, value: first_val}]
+
+                while parser.accept(TokenKind.Comma):
+                    break if parser.peek() == TokenKind.RBrace
+
+                    if parser.expr() is kind:
+                        parser.expect(TokenKind.Colon)
+                        if parser.expr() is v:
+                            entries.push(Ast::DictEntry{key: kind, value: v})
+
+                parser.expect(TokenKind.RBrace)
+                return (Ast::Expr.DictLit(entries, tok.line))
+
+            # Set comprehension `{BODY for VAR in ITER (where COND)?}` — same shape as
+            # the dict-comp branch above, minus the key/value split.
+            comp_for_tok2: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(comp_for_tok2, parser.source) == "for":
+                parser.advance()                       # `for`
+                svar_tok: Token = parser.expect(TokenKind.Ident)
+                parser.expect(TokenKind.In)
+                siter_left: Ast::Expr = get parser.unary_expr()
+                siter: Ast::Expr = parser.binary_expr_at_level(siter_left, 1)
+                scond: mutable Ast::Expr = (Ast::Expr.Invalid)
+                sfilter_tok: Token = parser.cursor()
+                if parser.accept(TokenKind.If):
+                    if parser.expr() is c:
+                        scond <- c
+                elif parser.peek() == TokenKind.Ident and Lexer::text_or_empty(sfilter_tok, parser.source) == "where":
+                    parser.advance()
+                    if parser.expr() is c:
+                        scond <- c
+                parser.expect(TokenKind.RBrace)
+                return (Ast::Expr.Comprehension(Lexer::text_or_empty(svar_tok, parser.source), siter, scond, first, tok.line))
+
+            # Set literal `{a, b, ...}`.
+            elements: mutable darray[Ast::Expr] = [first]
+            while parser.accept(TokenKind.Comma):
+                break if parser.peek() == TokenKind.RBrace
+
+                if parser.expr() is e:
+                    elements.push(e)
+            parser.expect(TokenKind.RBrace)
+            return (Ast::Expr.SetLit(elements, tok.line))
+
+
+# Whether `text` introduces a lambda: the canonical `fn` or a Unicode lambda letter —
+# the BMP letters Greek λ/Λ and the Latin lambda-with-stroke ƛ, plus the
+# supplementary-plane Mathematical-Alphanumeric lambda variants (all five styles,
+# small and capital; the lexer spans 4-byte identifier runes). MUST stay in lockstep
+# with stage0's isLambdaKeyword (compiler/src/parser). The removed `lambda` spelling
+# is not accepted (rejected like stage0).
+# Query-expression keywords (`KW VAR in ITER [where COND]`): quantifiers (any/all),
+# value folds (first/count/sum/product/min/max), and side-effect iteration (each).
+# MUST stay in lockstep with stage0's looksLikeQueryExpr keyword set.
+def is_query_keyword(text: sview) -> bool:
+    if text == "any" or text == "all" or text == "first" or text == "count":
+        return true
+    return text == "each" or text == "sum" or text == "product" or text == "min" or text == "max"
+
+
+def is_lambda_keyword(text: sview) -> bool:
+    if text == "fn" or text == "λ" or text == "Λ" or text == "ƛ":
+        return true
+    return text == "𝛌" or text == "𝜆" or text == "𝝀" or text == "𝝺" or text == "𝞴" or text == "𝚲" or text == "𝛬" or text == "𝜦" or text == "𝝠" or text == "𝞚"

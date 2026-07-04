@@ -1,0 +1,285 @@
+extend Parser:
+    private:
+        def postfix_expr(parser: mutable Parser&) -> Ast::Expr?:
+            active: mutable Ast::Expr = get parser.primary_expr() #unwrap or propagate null
+
+            while true:
+                kind: TokenKind = parser.peek()
+                tok: Token = parser.cursor()
+
+                if kind == TokenKind.LParen:
+                    # Call / paren construction. Each argument is either positional
+                    # (`expr`) or named (`label: expr` — an IDENT immediately followed
+                    # by `:`); `arg_names` runs parallel to `arg_items`, holding "" for
+                    # positional args and the label for named ones. Named and positional
+                    # may mix (`f(a, label: b)`), matching stage0's ArgNames side-table.
+                    parser.advance()
+                    arg_items: mutable darray[Ast::Expr] = []
+                    arg_names: mutable darray[sview] = []
+
+                    while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof:
+                        if parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
+                            label_tok: Token = parser.advance()    # arg label
+                            parser.advance()                       # `:`
+                            # A named argument requires an explicit value; the shorthand
+                            # pun `f(x:)` is a removed form (use `f(x: x)`).
+                            if parser.expr() is named_val:
+                                arg_items.push(parser.consume_removed_as_cast(named_val))
+                                arg_names.push(Lexer::text_or_empty(label_tok, parser.source))
+                        elif parser.expr() is positional_val:
+                            arg_items.push(parser.consume_removed_as_cast(positional_val))
+                            arg_names.push("")
+                        break if not parser.accept(TokenKind.Comma)
+
+                    parser.expect(TokenKind.RParen)
+                    active <- (Ast::Expr.Call(active, arg_items, arg_names, tok.line))
+
+                elif kind == TokenKind.Dot:
+                    # `.` is value member access: struct field, enum-variant selector,
+                    # or method target.
+                    parser.advance()
+                    field_tok: Token = parser.expect(TokenKind.Ident)
+                    active <- (Ast::Expr.Field(active, Lexer::text_or_empty(field_tok, parser.source), tok.line))
+
+                elif kind == TokenKind.Scope:
+                    # `::` is the namespace/type path operator (`Ast::Expr`,
+                    # `Semantic::check`) — kept distinct from `.` value member access.
+                    parser.advance()
+                    scope_tok: Token = parser.expect(TokenKind.Ident)
+                    active <- (Ast::Expr.Scope(active, Lexer::text_or_empty(scope_tok, parser.source), tok.line))
+
+                elif kind == TokenKind.Question:
+                    # Postfix type operator `T?` (optional). Modeled as a unary node.
+                    op: TokenKind = parser.advance().kind
+                    active <- (Ast::Expr.Unary(op, active, tok.line))
+
+                elif kind == TokenKind.Ampersand:
+                    # Postfix reference type `T&`/`T&&`/`T&&&`/… (ref-to-ref chains, e.g.
+                    # `static u8&&?`) — distinguished from infix bitwise-and by lookahead
+                    # PAST the whole run of consecutive `&`s: the run is postfix iff the
+                    # token right after it does not start a value (`)`, `,`, `:`, `=`,
+                    # newline, `?`, …). `a & b` / `a & &b` still fall through to the
+                    # binary-operator rule since a value follows.
+                    amp_run: mutable int = 1
+                    while parser.peek_at(amp_run) == TokenKind.Ampersand:
+                        amp_run <- amp_run + 1
+                    if tokenStartsValue(parser.peek_at(amp_run)):
+                        break
+                    i: mutable int = 0
+                    while i < amp_run:
+                        op: TokenKind = parser.advance().kind
+                        active <- (Ast::Expr.Unary(op, active, tok.line))
+                        i <- i + 1
+
+                elif kind == TokenKind.LBracket:
+                    parser.advance()
+
+                    # Optional low bound (absent in `a[:hi]` / `a[:]`).
+                    lo: mutable Ast::Expr = (Ast::Expr.Invalid)
+                    if parser.peek() != TokenKind.Colon and parser.peek() != TokenKind.RBracket:
+                        if parser.expr() is e:
+                            lo <- e
+                        # `@region` type suffix on a bracketed type argument
+                        # (`p.cast[T&? @scratch]`, `RegionNode[T& @owner]`) — a region
+                        # selector, not a value; consumed like the var-decl/param forms.
+                        if parser.accept(TokenKind.At):
+                            parser.accept(TokenKind.Ident)
+
+                    if parser.accept(TokenKind.Colon):
+                        # Slice `a[lo:hi]` (and open-ended variants): optional high bound.
+                        hi: mutable Ast::Expr = (Ast::Expr.Invalid)
+                        if parser.peek() != TokenKind.RBracket:
+                            if parser.expr() is e:
+                                hi <- e
+                        parser.expect(TokenKind.RBracket)
+                        active <- (Ast::Expr.Slice(active, lo, hi, tok.line))
+                    elif parser.peek() == TokenKind.Comma:
+                        # Multi-arg subscript / generic type application (`m[i, j]`,
+                        # `dict[K, V]`): the low bound is the first argument.
+                        index_args: mutable darray[Ast::Expr] = [lo]
+                        while parser.accept(TokenKind.Comma):
+                            if parser.peek() == TokenKind.RBracket:
+                                break
+                            if parser.expr() is a:
+                                index_args.push(a)
+                            # `@region` suffix on this argument (see the lo-bound case).
+                            if parser.accept(TokenKind.At):
+                                parser.accept(TokenKind.Ident)
+                        parser.expect(TokenKind.RBracket)
+                        active <- (Ast::Expr.IndexN(active, index_args, tok.line))
+                    else:
+                        # Single subscript `a[i]`.
+                        parser.expect(TokenKind.RBracket)
+                        active <- (Ast::Expr.Index(active, lo, tok.line))
+
+                elif kind == TokenKind.LBrace and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) == TokenKind.Assign:
+                    # Record update `base{field = value, ...}` — the `=` field separator
+                    # (vs `:` for construction) marks a copy-with-overrides. A bare `field`
+                    # puns to `field = field`.
+                    parser.advance()                       # `{`
+                    ru_fields: mutable darray[Ast::FieldInit] = []
+                    while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof:
+                        fname_tok: Token = parser.expect(TokenKind.Ident)
+                        fname: sview = Lexer::text_or_empty(fname_tok, parser.source)
+                        fvalue: mutable Ast::Expr = (Ast::Expr.Ident(fname, fname_tok.line))
+                        if parser.accept(TokenKind.Assign):
+                            if parser.expr() is provided:
+                                fvalue <- provided
+                        ru_fields.push(Ast::FieldInit{name: fname, value: fvalue})
+                        break if not parser.accept(TokenKind.Comma)
+                    parser.expect(TokenKind.RBrace)
+                    active <- (Ast::Expr.RecordUpdate(active, ru_fields, tok.line))
+
+                elif kind == TokenKind.LBrace:
+                    # Brace construction `Type{field: value, ...}` (Elisa has no brace
+                    # blocks, so `{` after a value is always construction). Modeled as a
+                    # Construct node: the type expression plus a FieldInit per field. A
+                    # labeled field (`name:` — an IDENT immediately followed by `:`) records
+                    # the label and value separately; a shorthand/positional field records
+                    # an empty label and the value expression (which carries the reference).
+                    parser.advance()
+                    field_inits: mutable darray[Ast::FieldInit] = []
+                    while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof:
+                        if parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
+                            label_tok: Token = parser.advance()    # field label
+                            parser.advance()                       # `:`
+                            if parser.expr() is field_val:
+                                field_inits.push(Ast::FieldInit{name: Lexer::text_or_empty(label_tok, parser.source), value: field_val})
+                        elif parser.expr() is field_val:
+                            field_inits.push(Ast::FieldInit{name: "", value: field_val})
+                        break if not parser.accept(TokenKind.Comma)
+                            
+                    parser.expect(TokenKind.RBrace)
+                    active <- (Ast::Expr.Construct(active, field_inits, tok.line))
+
+                else:
+                    break
+
+            return active
+
+
+        def unary_expr(parser: mutable Parser&) -> Ast::Expr?:
+            kind: TokenKind = parser.peek()
+            tok: Token = parser.cursor()
+
+            # Bare `&`/`!` as a type/cast-target leaf (the target in `x as &`, `x as !`):
+            # a `&`/`!` not followed by a value is the type marker itself, not a prefix op.
+            if (kind == TokenKind.Ampersand or kind == TokenKind.Bang) and not tokenStartsValue(parser.peek_at(1)):
+                parser.advance()
+                return (Ast::Expr.Ident(Lexer::text_or_empty(tok, parser.source), tok.line))
+
+            # Prefix operators: logical/bitwise-not (`not`/`!`/`~`), sign (`-`/`+`),
+            # address-of (`&x`), and type-position qualifiers (`mutable`/`static`/`heap`/
+            # `stack`). Parsing them all as prefix unary keeps value and type expressions
+            # uniform.
+            elif kind in {TokenKind.Not, TokenKind.Bang, TokenKind.Tilde, TokenKind.Minus, TokenKind.Plus, TokenKind.Ampersand, TokenKind.Mutable, TokenKind.Static, TokenKind.Heap, TokenKind.Stack, TokenKind.Tail}:
+                op: TokenKind = parser.advance().kind
+                operand_handle: Ast::Expr? = parser.unary_expr()
+
+                if operand_handle is operand:
+                    return (Ast::Expr.Unary(op, operand, tok.line))
+                else:
+                    return null
+            else:
+                return parser.postfix_expr()
+
+
+        # Compound assignment operators (`+=`, `-=`, `*=`, …, `<<=`, `>>=`, `?=`).
+        def isCompoundAssign(kind: TokenKind) -> bool:
+            return kind in {TokenKind.PlusEq, TokenKind.MinusEq, TokenKind.StarEq, TokenKind.SlashEq, TokenKind.PercentEq, TokenKind.CaretEq, TokenKind.PipeEq, TokenKind.AmpEq, TokenKind.LShiftEq, TokenKind.RShiftEq, TokenKind.QAssign}
+
+
+        # Whether a token can begin a value expression — used to disambiguate a postfix
+        # reference `T&` (NOT followed by a value) from infix bitwise-and `a & b` (IS).
+        def tokenStartsValue(kind: TokenKind) -> bool:
+            return kind in {TokenKind.Ident, TokenKind.IntLit, TokenKind.FloatLit, TokenKind.HexLit, TokenKind.StringLit, TokenKind.CharLit, TokenKind.True, TokenKind.False, TokenKind.Null, TokenKind.Zeroed, TokenKind.New, TokenKind.LParen, TokenKind.LBracket, TokenKind.LBrace, TokenKind.Sizeof, TokenKind.Alignof, TokenKind.Offsetof, TokenKind.Panic, TokenKind.Raise, TokenKind.Not, TokenKind.Bang, TokenKind.Tilde, TokenKind.Minus, TokenKind.Plus, TokenKind.Ampersand}
+
+
+        def precedence(kind: TokenKind) -> int:
+            # Function-type/result arrow `A -> B` (in type-position expressions like
+            # `fn(usize) -> i64`); binds loosest.
+            if kind in {TokenKind.Arrow,TokenKind.Or}:
+                return 1
+            elif kind == TokenKind.And:
+                return 2
+            # Membership (`x in coll`), refinement-test/binding (`v is Pattern`,
+            # `expr is name`), and the reinterpret-target form (`field as & <- v`)
+            # bind like a comparison. NOTE: the general `expr as T` cast was removed
+            # in stage0 (use `.cast[T]` / `T(expr)`) — binary_expr_at_level only
+            # consumes `as` before a bare `&`/`!` target leaf; every other `as` is
+            # left for its statement parser (expect-as, using-as, lock-as, …).
+            elif kind in {TokenKind.EqEq, TokenKind.BangEq, TokenKind.Lt, TokenKind.Gt, TokenKind.LtEq, TokenKind.GtEq, TokenKind.In, TokenKind.Is, TokenKind.As}:
+                return 3
+            # Range constructors (`a..b`, `a..<b`, `a..>b`, `a..=b`) bind tighter than
+            # membership/comparison but looser than arithmetic, so `i in 0..<n+1` groups
+            # as `i in (0 ..< (n+1))`.
+            elif kind in {TokenKind.Range, TokenKind.RangeLt, TokenKind.RangeGt, TokenKind.RangeLe}:
+                return 4
+            # Bitwise or/xor/and: pipe, caret, and ampersand. (Infix `&` is disambiguated
+            # from postfix `T&` ref by the value-start lookahead in postfix_expr.)
+            elif kind in {TokenKind.Pipe, TokenKind.Caret, TokenKind.Ampersand}:
+                return 5
+            elif kind in {TokenKind.Plus, TokenKind.Minus}:
+                return 6
+            elif kind in {TokenKind.Star, TokenKind.Slash, TokenKind.Percent}:
+                return 7
+            # Shifts bind tightest among the binaries.
+            elif kind in {TokenKind.LShift, TokenKind.RShift}:
+                return 8
+            else:
+                return 0
+
+
+        def binary_expr_at_level(parser: mutable Parser&, left: Ast::Expr, min_prec: int) -> Ast::Expr:
+            active: mutable Ast::Expr = left
+
+            while true:
+                kind: TokenKind = parser.peek()
+
+                # `as` is only an expression operator in the reinterpret-target form
+                # `field as & <- v` / `x as !` — i.e. followed by a bare `&`/`!` leaf
+                # (NOT starting a value). Any other `as` (expect-as, using-as, …)
+                # belongs to the enclosing statement parser: stop here.
+                if kind == TokenKind.As:
+                    as_next: TokenKind = parser.peek_at(1)
+                    if not ((as_next == TokenKind.Ampersand or as_next == TokenKind.Bang) and not tokenStartsValue(parser.peek_at(2))):
+                        break
+
+                # Compound `not in` — negated membership `x not in S` desugars to
+                # `not (x in S)` and binds like a comparison (precedence 3). `not` is
+                # otherwise prefix-only, so it is recognized here via one-token lookahead.
+                if kind == TokenKind.Not and parser.peek_at(1) == TokenKind.In:
+                    break if 3 < min_prec
+                    parser.advance()                       # `not`
+                    in_tok: Token = parser.advance()       # `in`
+                    neg_right: mutable Ast::Expr = get parser.unary_expr() else return active
+                    if 3 < precedence(parser.peek()):
+                        neg_right <- parser.binary_expr_at_level(neg_right, 4)
+                    member: Ast::Expr = (Ast::Expr.Binary(active, TokenKind.In, neg_right, in_tok.line))
+                    active <- (Ast::Expr.Unary(TokenKind.Not, member, in_tok.line))
+                else:
+                    prec: int = precedence(kind)
+                    break if prec < min_prec
+
+                    op: TokenKind = parser.advance().kind
+                    tok: Token = parser.cursor()
+
+                    right: mutable Ast::Expr = get parser.unary_expr() else return active
+
+                    next_prec: int = precedence(parser.peek())
+                    if prec < next_prec:
+                        right <- parser.binary_expr_at_level(right, prec + 1)
+
+                    # `EXPR is TARGET as NAME` — the explicit refinement-alias binder
+                    # (docs/80 §2; `is TARGET s` is the bare-binder sugar). Model the
+                    # `is` RHS as the alias ident so resolution binds NAME (the target
+                    # itself is never a value reference — walk_expr skips the is-RHS).
+                    if op == TokenKind.Is and parser.peek() == TokenKind.As and parser.peek_at(1) == TokenKind.Ident:
+                        parser.advance()                              # `as`
+                        alias_tok: Token = parser.advance()           # NAME
+                        right <- (Ast::Expr.Ident(Lexer::text_or_empty(alias_tok, parser.source), alias_tok.line))
+
+                    active <- (Ast::Expr.Binary(active, op, right, tok.line))
+
+            return active
+
