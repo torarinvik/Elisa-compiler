@@ -1,0 +1,251 @@
+extend Semantic:
+    private:
+        # Stage1 semantic layer — name resolution (internal helpers, module-private).
+        #
+        # Walks each function body's VALUE expressions and resolves every identifier reference
+        # against the names in scope: the function's parameters, its local bindings (var-decls,
+        # for-loop variables, match-arm pattern bindings, `is` refinements, comprehension
+        # variables, prefix-clause bindings), and the file's global symbol table. References
+        # that resolve to none of these are counted as unresolved. Type-position expressions
+        # (param/return/var-decl annotations) are deliberately NOT walked, so built-in type
+        # names don't register as unresolved.
+
+
+        # A name is in scope if it is a parameter/local (bound) or a global declaration. The
+        # global half is an O(1) index probe (`name_indexed`) rather than a scan of every
+        # symbol; `bound` (a function's locals) stays a linear scan since it is small.
+        # Max AST-walk recursion depth (see SymbolTable.walk_depth). Far above any
+        # real expression nesting, well below the stack-overflow threshold.
+        const WALK_DEPTH_LIMIT: u32 = 4000
+
+        def name_known(table: SymbolTable&, bound: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                return (any b in bound where b == name) or name_indexed(table, name)
+
+
+        # Record one param/local occurrence for tooling (the LSP's semantic-token
+        # highlighter reads these). `is_param` selects kind 1 (parameter) over 2
+        # (local). No effect on diagnostics — a pure side log.
+        def record_ref(table: mutable SymbolTable&, line: u32, name: sview, is_param: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table.ref_line.push(line)
+                table.ref_name.push(name)
+                kind: mutable u8 = 2
+                if is_param:
+                    kind <- 1
+                table.ref_kind.push(kind)
+
+
+        # Index of the innermost `bound` entry named `name`, else -1. Scans from
+        # the end so a later local correctly shadows an earlier param/local.
+        def bound_last_index(bound: darray[sview]&, name: sview) -> int:
+            can Abort.Panic:
+                i: mutable int = bound.count.int() - 1
+                while i >= 0:
+                    if bound[i.usize()] == name:
+                        return i
+                    i <- i - 1
+                return -1
+
+
+        # Collect the names a match-arm pattern binds: a bare `Binding`, the binder of a
+        # category arm (`Type s`), and any binding subpatterns nested inside variant,
+        # struct, tuple, or or-pattern fields. Wildcards/literals/paths bind nothing.
+        def gather_pattern(p: Ast::Pattern, bound: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match p:
+                    Pattern.Binding(name):
+                        bound.push(name)
+                    Pattern.TypeBind(type, binder):
+                        bound.push(binder)
+                    Pattern.Variant(path, fields):
+                        for f in fields:
+                            gather_pattern(f, bound)
+                    Pattern.Struct(path, fields):
+                        for f in fields:
+                            gather_pattern(f, bound)
+                    Pattern.Tuple(elems):
+                        for e in elems:
+                            gather_pattern(e, bound)
+                    Pattern.Or(options):
+                        for o in options:
+                            gather_pattern(o, bound)
+                    _:
+                        pass
+
+
+        # A refinement test `EXPR is TARGET` introduces bindings on its right side: a bare
+        # name (`x is mod`) binds that name; a variant form (`x is Variant(a, b)`) binds each
+        # field name. A qualified constant test (`x is Enum.Const`) binds nothing.
+        def gather_is_target(e: Ast::Expr, bound: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match e:
+                    Expr.Ident(name, line):
+                        bound.push(name)
+                    Expr.Call(func, args, arg_names, line):
+                        for a in args:
+                            gather_is_target(a, bound)
+                    _:
+                        pass
+
+
+        # Walk an expression collecting the bindings introduced by any `is` refinement test or
+        # comprehension inside it, so later uses of those names resolve. (`as` casts bind nothing.)
+        def gather_expr_bindings(e: Ast::Expr, bound: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match e:
+                    Expr.Binary(left, op, right, line):
+                        gather_expr_bindings(left, bound)
+                        if op == TokenKind.Is:
+                            gather_is_target(right, bound)
+                        else:
+                            gather_expr_bindings(right, bound)
+                    Expr.Call(func, args, arg_names, line):
+                        gather_expr_bindings(func, bound)
+                        for a in args:
+                            gather_expr_bindings(a, bound)
+                    Expr.Field(obj, field, line):
+                        gather_expr_bindings(obj, bound)
+                    Expr.Scope(base, name, line):
+                        gather_expr_bindings(base, bound)
+                    Expr.Index(obj, index, line):
+                        gather_expr_bindings(obj, bound)
+                        gather_expr_bindings(index, bound)
+                    Expr.Unary(op, operand, line):
+                        gather_expr_bindings(operand, bound)
+                    Expr.Paren(inner, line):
+                        gather_expr_bindings(inner, bound)
+                    Expr.Array(elements, line):
+                        for el in elements:
+                            gather_expr_bindings(el, bound)
+                    Expr.Tuple(elems, line):
+                        for el in elems:
+                            gather_expr_bindings(el, bound)
+                    Expr.Slice(obj, lo, hi, line):
+                        gather_expr_bindings(obj, bound)
+                        gather_expr_bindings(lo, bound)
+                        gather_expr_bindings(hi, bound)
+                    Expr.IndexN(obj, args, line):
+                        gather_expr_bindings(obj, bound)
+                        for a in args:
+                            gather_expr_bindings(a, bound)
+                    Expr.SetLit(elements, line):
+                        for el in elements:
+                            gather_expr_bindings(el, bound)
+                    Expr.DictLit(entries, line):
+                        for entry in entries:
+                            gather_expr_bindings(entry.key, bound)
+                            gather_expr_bindings(entry.value, bound)
+                    Expr.Construct(type, fields, line):
+                        for f in fields:
+                            gather_expr_bindings(f.value, bound)
+                    Expr.RecordUpdate(base, fields, line):
+                        gather_expr_bindings(base, bound)
+                        for f in fields:
+                            gather_expr_bindings(f.value, bound)
+                    Expr.If(cond, then_expr, else_expr, line):
+                        gather_expr_bindings(cond, bound)
+                        gather_expr_bindings(then_expr, bound)
+                        gather_expr_bindings(else_expr, bound)
+                    Expr.Comprehension(var, iter, cond, body, line):
+                        bound.push(var)
+                        gather_expr_bindings(iter, bound)
+                        gather_expr_bindings(cond, bound)
+                        gather_expr_bindings(body, bound)
+                    Expr.Lambda(params, body, line):
+                        # The lambda's params scope its body; add them to `bound` plus
+                        # any locals the body introduces (mirrors Comprehension's var —
+                        # over-permissive to the outer scope, but never a false unresolved).
+                        for p in params:
+                            bound.push(p)
+                        gather_locals(body, bound)
+                    Expr.Match(scrutinee, arms, line):
+                        # Match in expression position introduces its arms' pattern bindings
+                        # and any bindings inside arm bodies (mirrors Stmt.Match in gather_locals).
+                        gather_expr_bindings(scrutinee, bound)
+                        for arm in arms:
+                            gather_pattern(arm.pattern, bound)
+                            gather_locals(arm.body, bound)
+                    # Leaves and references bind nothing. Listed explicitly (no wildcard) so a
+                    # new Expr variant is a compile error rather than a silently-missed binding.
+                    Expr.Invalid:
+                        pass
+                    Expr.IntLit(value):
+                        pass
+                    Expr.FloatLit(text):
+                        pass
+                    Expr.StringLit(text):
+                        pass
+                    Expr.CharLit(text):
+                        pass
+                    Expr.BoolLit(value):
+                        pass
+                    Expr.Ident(name, line):
+                        pass
+                    Expr.ShorthandMember(parts, line):
+                        pass
+
+
+        # Gather the names a function binds: var-decl names, for-loop variables, match-arm
+        # pattern bindings, `is`/comprehension bindings, and prefix-clause bindings across the
+        # body (block scoping is flattened — a first pass accepts forward references).
+        def gather_locals(stmts: darray[Ast::Stmt], bound: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for stmt in stmts:
+                    match stmt:
+                        Stmt.Expr(expr, line):
+                            gather_expr_bindings(expr, bound)
+                        Stmt.VarDecl(name, type_expr, value, line):
+                            bound.push(name)
+                            gather_expr_bindings(value, bound)
+                        Stmt.Assign(target, op, value, line):
+                            # Multi-target unpack `a, b = …` (target is an Array literal)
+                            # introduces its bare-ident targets as new locals; a single
+                            # bare-ident `x = …` DEFINES a local too (incl. the `_`
+                            # discard). `<-` targets are already-declared names, so
+                            # registering them again is harmless.
+                            if target is Expr.Array(elements, aline):
+                                for el in elements:
+                                    if el is Expr.Ident(nm, iline):
+                                        bound.push(nm)
+                            if target is Expr.Ident(single_nm, sline):
+                                bound.push(single_nm)
+                            gather_expr_bindings(target, bound)
+                            gather_expr_bindings(value, bound)
+                        Stmt.For(bind, vars, iter, body, line):
+                            bound.extend(vars)
+                            gather_expr_bindings(iter, bound)
+                            gather_locals(body, bound)
+                        Stmt.If(cond, then_body, else_body, line):
+                            gather_expr_bindings(cond, bound)
+                            gather_locals(then_body, bound)
+                            gather_locals(else_body, bound)
+                        Stmt.While(cond, body, line):
+                            gather_expr_bindings(cond, bound)
+                            gather_locals(body, bound)
+                        Stmt.Return(value, line):
+                            if value is v:
+                                gather_expr_bindings(v, bound)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            if binding != "":
+                                bound.push(binding)
+                            gather_locals(body, bound)
+                        Stmt.Match(scrutinee, arms, line):
+                            gather_expr_bindings(scrutinee, bound)
+                            for arm in arms:
+                                gather_pattern(arm.pattern, bound)
+                                gather_locals(arm.body, bound)
+                        Stmt.Contract(kind, expr, line):
+                            # An `ensure` predicate may reference the function's `result`.
+                            if kind == "ensure" or kind == "ensures":
+                                bound.push("result")
+                            gather_expr_bindings(expr, bound)
+                        # These introduce no bindings. Explicit (no wildcard) so a new Stmt
+                        # variant forces a decision here.
+                        Stmt.Invalid:
+                            pass
+                        Stmt.Break(label, line):
+                            pass
+                        Stmt.Continue(label, line):
+                            pass
+

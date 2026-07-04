@@ -1,0 +1,238 @@
+extend Semantic:
+    private:
+        # Check a direct call `name(args...)` against the declared arity of `name`'s
+        # Func symbol(s). Conservative by design -- flags ONLY when the callee name is
+        # known, every symbol with that name is a Func, and the argument count fits
+        # none of their [required, total] ranges. Any shadowing local, non-Func symbol
+        # (extern/const/struct/builtin), labeled argument, or unknown name skips the
+        # check, so an unmodeled call shape can never produce a false positive.
+        def check_call_arity(table: mutable SymbolTable&, fname: sview, argc: usize, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                found_func: mutable bool = false
+                fits: mutable bool = false
+                func_count: mutable u32 = 0
+                only_min: mutable u32 = 0
+                only_max: mutable u32 = 0
+                for s in table.symbols:
+                    if s.name == fname:
+                        if s.kind == SymbolKind.Func:
+                            found_func <- true
+                            func_count <- func_count + 1
+                            only_min <- s.arity_min
+                            only_max <- s.arity_max
+                            if argc.u32() >= s.arity_min and argc.u32() <= s.arity_max:
+                                fits <- true
+                        else:
+                            # A non-Func symbol shares the name (constructor, extern,
+                            # builtin, ...) -- callable shapes we don't model; skip.
+                            fits <- true
+                if found_func and not fits:
+                    # When exactly one declaration and no defaults (min == max), the
+                    # expected count is unambiguous — report it (stage0 parity). With
+                    # overloads or defaults, keep the generic message. `expected` = "n"
+                    # marks the enriched form for diagnostic_message.
+                    if func_count == 1 and only_min == only_max:
+                        table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArityMismatch, name: fname, line: line, expected: "n", actual: "", n1: only_max, n2: argc.u32()})
+                    else:
+                        table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArityMismatch, name: fname, line: line, expected: "", actual: ""})
+
+
+        # Resolve every identifier in a value expression, recursing into children. Field names
+        # (`obj.field`) are member selectors, not references, so only the object is walked.
+        #
+        # Depth-guarded wrapper: every recursive re-entry (Call/Field/Index/Binary/…
+        # inside `walk_expr_inner` calls `walk_expr`) passes through here, so a
+        # pathologically deep AST (`a.b.b.b…` built by the postfix LOOP, which the
+        # parser's own depth guard never sees) stops at WALK_DEPTH_LIMIT instead of
+        # overflowing the stack. WALK_DEPTH_LIMIT is far above any real expression's
+        # depth and well below the observed overflow threshold.
+        def walk_expr(e: Ast::Expr, table: mutable SymbolTable&, bound: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table.walk_depth <- table.walk_depth + 1
+                if table.walk_depth <= WALK_DEPTH_LIMIT:
+                    walk_expr_inner(e, table, bound)
+                table.walk_depth <- table.walk_depth - 1
+
+
+        def walk_expr_inner(e: Ast::Expr, table: mutable SymbolTable&, bound: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match e:
+                    Expr.Ident(name, line):
+                        if not name_known(table, bound, name):
+                            table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UndefinedName, name: name, line: line, expected: "", actual: ""})
+                        else:
+                            # A resolved reference to a param/local: log it for
+                            # tooling (globals are left to the symbol table).
+                            ridx: int = bound_last_index(bound, name)
+                            if ridx >= 0:
+                                record_ref(table, line, name, ridx.usize() < table.current_param_count)
+                    Expr.Call(func, args, arg_names, line):
+                        # `arg_names` are field/parameter labels (selectors), not value
+                        # references — walk only the argument values.
+                        walk_expr(func, table, bound)
+                        for arg in args:
+                            walk_expr(arg, table, bound)
+                        # Arity check for a direct unshadowed call: `f(a, b)` with a bare
+                        # callee name that is not a local/param. UFCS (`recv.f(a)`),
+                        # qualified (`Mod::f(...)`), specialized (`f[T](...)`), and
+                        # labeled-argument calls are skipped (shapes not modeled).
+                        if func is Expr.Ident(fname, fline):
+                            labeled: bool = any n in arg_names where n != ""
+                            shadowed: bool = any b in bound where b == fname
+                            if not labeled and not shadowed:
+                                check_call_arity(table, fname, args.count, line)
+                        # Enum-constructor arity: `Enum.Variant(v1, …)` must supply
+                        # exactly the declared payload count (labels allowed — the
+                        # count is positional either way).
+                        if func is Expr.Field(cobj, cfield, cline):
+                            if cobj is Expr.Ident(cename, celine):
+                                cshadowed: bool = any b in bound where b == cename
+                                if not cshadowed and is_enum_name(table, cename):
+                                    cvi: int = enum_variant_index(table, cename, cfield)
+                                    if cvi >= 0 and args.count.u32() != table.enum_variant_arity[cvi.usize()]:
+                                        table.diagnostics.push(Diagnostic{kind: DiagnosticKind.VariantArity, name: cfield, line: line, expected: cename, actual: "", n1: table.enum_variant_arity[cvi.usize()], n2: args.count.u32()})
+                    Expr.Field(obj, field, line):
+                        walk_expr(obj, table, bound)
+                        # `Enum.Variant` in value position: when the object is a bare
+                        # unshadowed enum-type name, the member must be a variant.
+                        if obj is Expr.Ident(ename, eline):
+                            shadowed: bool = any b in bound where b == ename
+                            if not shadowed and is_enum_name(table, ename):
+                                if not enum_has_variant(table, ename, field):
+                                    table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownVariant, name: field, line: line, expected: "", actual: ""})
+                    Expr.Scope(base, name, line):
+                        # `base::name` is a namespace/type path; the leading name is
+                        # resolved like any reference, `::name` is a selector.
+                        walk_expr(base, table, bound)
+                    Expr.Index(obj, index, line):
+                        walk_expr(obj, table, bound)
+                        walk_expr(index, table, bound)
+                    Expr.Binary(left, op, right, line):
+                        walk_expr(left, table, bound)
+                        # The right operand of `is` (a refinement target/binding) and `as`
+                        # (a type) is not a value reference, so it isn't resolved here.
+                        if op != TokenKind.Is and op != TokenKind.As:
+                            walk_expr(right, table, bound)
+                    Expr.Unary(op, operand, line):
+                        walk_expr(operand, table, bound)
+                    Expr.Paren(inner, line):
+                        walk_expr(inner, table, bound)
+                    Expr.Array(elements, line):
+                        for el in elements:
+                            walk_expr(el, table, bound)
+                    Expr.Tuple(elems, line):
+                        for el in elems:
+                            walk_expr(el, table, bound)
+                    Expr.Slice(obj, lo, hi, line):
+                        walk_expr(obj, table, bound)
+                        walk_expr(lo, table, bound)
+                        walk_expr(hi, table, bound)
+                    Expr.IndexN(obj, args, line):
+                        walk_expr(obj, table, bound)
+                        for a in args:
+                            walk_expr(a, table, bound)
+                    Expr.SetLit(elements, line):
+                        for el in elements:
+                            walk_expr(el, table, bound)
+                    Expr.DictLit(entries, line):
+                        for entry in entries:
+                            walk_expr(entry.key, table, bound)
+                            walk_expr(entry.value, table, bound)
+                    Expr.Construct(type, fields, line):
+                        # The type is the constructor (resolves as a type/global); each
+                        # field's value is a reference, but the field label is not.
+                        walk_expr(type, table, bound)
+                        for f in fields:
+                            walk_expr(f.value, table, bound)
+                        # Field checks on a construction whose type is a bare identifier
+                        # naming a struct with a known closed field set. Positional
+                        # (unlabeled) fields are skipped — they carry no label to check.
+                        sname: sview = construct_type_name(type)
+                        if sname != "" and struct_is_registered(table, sname):
+                            seen_labels: mutable darray[sview] = []
+                            any_positional: mutable bool = false
+                            for f in fields:
+                                if f.name == "":
+                                    any_positional <- true
+                                    continue
+                                # UnknownField: a labeled field the struct does not declare.
+                                if not struct_has_field(table, sname, f.name):
+                                    table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownField, name: f.name, line: line, expected: sname, actual: ""})
+                                # DuplicateFieldInit: the same label given twice.
+                                if any s in seen_labels where s == f.name:
+                                    table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DuplicateFieldInit, name: f.name, line: line, expected: sname, actual: ""})
+                                else:
+                                    seen_labels.push(f.name)
+                            # MissingField: in PURE by-label mode (>=1 label, no positional
+                            # field — positional fills fields in order, so we cannot tell
+                            # which are covered), every REQUIRED field must be present.
+                            if not any_positional and seen_labels.count > 0:
+                                ri: mutable usize = 0
+                                while ri < table.struct_field_owner.count:
+                                    if table.struct_field_owner[ri] == sname and table.struct_field_required[ri]:
+                                        fld: sview = table.struct_field_name[ri]
+                                        if not any s in seen_labels where s == fld:
+                                            table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MissingField, name: fld, line: line, expected: sname, actual: ""})
+                                    ri <- ri + 1
+                    Expr.RecordUpdate(base, fields, line):
+                        # `base` is a value reference; each override value is a reference,
+                        # the field label is a selector.
+                        walk_expr(base, table, bound)
+                        for f in fields:
+                            walk_expr(f.value, table, bound)
+                    Expr.If(cond, then_expr, else_expr, line):
+                        walk_expr(cond, table, bound)
+                        walk_expr(then_expr, table, bound)
+                        walk_expr(else_expr, table, bound)
+                    Expr.Comprehension(var, iter, cond, body, line):
+                        # The iterable is resolved in the OUTER scope (the loop variable
+                        # is not visible there); cond/body see `var` via an extended copy.
+                        walk_expr(iter, table, bound)
+                        comp_scope: mutable darray[sview] = []
+                        for b in bound:
+                            comp_scope.push(b)
+                        comp_scope.push(var)
+                        walk_expr(cond, table, comp_scope)
+                        walk_expr(body, table, comp_scope)
+                    Expr.Lambda(params, body, line):
+                        # The lambda's params + its body's own locals scope the body
+                        # (flattened INSIDE the lambda — bodies are small).
+                        lam_scope: mutable darray[sview] = []
+                        for b in bound:
+                            lam_scope.push(b)
+                        for lp in params:
+                            lam_scope.push(lp)
+                        gather_locals(body, lam_scope)
+                        walk_stmts(body, table, lam_scope)
+                    Expr.Match(scrutinee, arms, line):
+                        # Match in expression position: each arm's pattern bindings (and
+                        # the arm body's own locals, flattened) scope that arm only.
+                        walk_expr(scrutinee, table, bound)
+                        for arm in arms:
+                            check_pattern_variants(arm.pattern, table, line)
+                            arm_scope: mutable darray[sview] = []
+                            for b in bound:
+                                arm_scope.push(b)
+                            gather_pattern(arm.pattern, arm_scope)
+                            gather_locals(arm.body, arm_scope)
+                            walk_stmts(arm.body, table, arm_scope)
+                    # Literal/invalid leaves reference nothing. Listed explicitly (no
+                    # wildcard) so a new Expr variant is a compile error here, not a silent
+                    # resolution gap.
+                    Expr.Invalid:
+                        pass
+                    Expr.IntLit(value):
+                        pass
+                    Expr.FloatLit(text):
+                        pass
+                    Expr.StringLit(text):
+                        pass
+                    Expr.CharLit(text):
+                        pass
+                    Expr.BoolLit(value):
+                        pass
+                    Expr.ShorthandMember(parts, line):
+                        # `.Variant` parts are enum selectors inferred from context, not
+                        # value references — nothing to resolve.
+                        pass
+
