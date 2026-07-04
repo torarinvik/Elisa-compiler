@@ -1,0 +1,171 @@
+extend Parser:
+    private:
+
+        # Skip the clauses between a struct/enum name and its `:` block opener — generic
+        # params (`[@owner]`), parent (`is Node`), backing type (`of u8`), and layout
+        # (`layout(handle: u32)`, `repr(...)`). Their structure isn't modeled yet; skipping
+        # to the block colon (paren/bracket-balanced) lets the body parse cleanly.
+        def skip_decl_header_clauses(parser: mutable Parser&) -> void:
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof:
+                kind: TokenKind = parser.peek()
+                if kind == TokenKind.LParen or kind == TokenKind.LBracket:
+                    depth <- depth + 1
+                    parser.advance()
+                elif kind == TokenKind.RParen or kind == TokenKind.RBracket:
+                    depth <- depth - 1
+                    parser.advance()
+                elif depth == 0 and (kind == TokenKind.Colon or kind == TokenKind.Newline):
+                    break
+                else:
+                    parser.advance()
+
+
+        # Consume the trailing signature clauses of a function signature line, capturing
+        # effect-grant names and returning them. Effect grants (`can[...]` / bare
+        # `can E1, E2`) are structured; error sets (`raises …`) and contracts
+        # (`requires`/`ensures`) are consumed without modeling. Bracket/paren depth is
+        # tracked so a clause expression's inner `:`/newline never ends the loop early;
+        # the loop stops at the top-level block `:` or the line break.
+        def parse_signature_clauses(parser: mutable Parser&, effects: mutable darray[sview]&) -> void:
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof:
+                kind: TokenKind = parser.peek()
+                cur: Token = parser.cursor()
+                if kind == TokenKind.LParen or kind == TokenKind.LBracket:
+                    depth <- depth + 1
+                    parser.advance()
+                elif kind == TokenKind.RParen or kind == TokenKind.RBracket:
+                    depth <- depth - 1
+                    parser.advance()
+                elif depth == 0 and (kind == TokenKind.Colon or kind == TokenKind.Newline or kind == TokenKind.Assign):
+                    # Stop at the block `:`, the line break, or a top-level `=` — the
+                    # `=` opens an expression-bodied function (`-> T = EXPR`), which
+                    # func_decl consumes; it must not be eaten as a signature clause.
+                    break
+                elif depth == 0 and kind == TokenKind.Ident and Lexer::text_or_empty(cur, parser.source) == "can":
+                    # Reuse the canonical trailing-`can` consumer so a bare `can E1, E2`
+                    # after `)` (no return type) is captured with the same rules.
+                    parser.skip_trailing_can(false)
+                    for e in parser.captured_effects:
+                        effects.push(e)
+                else:
+                    parser.advance()
+
+
+        # Read a dotted identifier path (`Family` or `Family.Member`) starting at the
+        # current Ident and return its whole-span source text.
+        def parse_dotted_name(parser: mutable Parser&) -> sview:
+            start_tok: Token = parser.cursor()
+            start: usize = start_tok.start.usize()
+            end: mutable usize = (start_tok.start + start_tok.length).usize()
+            parser.advance()                              # first Ident
+            while parser.peek() == TokenKind.Dot and parser.peek_at(1) == TokenKind.Ident:
+                parser.advance()                          # `.`
+                member: Token = parser.advance()          # member Ident
+                end <- (member.start + member.length).usize()
+            return parser.span_view(start, end)
+
+
+        def struct_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.cursor()
+            # Optional single-use discipline modifier (struct-only in stage0): `linear`
+            # = must be consumed exactly once before scope exit; `affine` = may be used
+            # at most once but silently dropped. Contextual keywords, so matched by
+            # text on the leading Ident before the `struct` keyword itself.
+            affinity: mutable sview = ""
+            head: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(head, parser.source) == "linear":
+                affinity <- "linear"
+                parser.advance()
+            elif parser.peek() == TokenKind.Ident and Lexer::text_or_empty(head, parser.source) == "affine":
+                affinity <- "affine"
+                parser.advance()
+
+            parser.expect(TokenKind.Struct)
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            parser.skip_decl_header_clauses()
+
+            members: mutable darray[Ast::StructMember] = []
+            if parser.peek() == TokenKind.Colon:
+                members <- parser.struct_member_block()
+
+            return (Ast::Decl.Struct(Lexer::text_or_empty(name_tok, parser.source), members, affinity, tok.line))
+
+
+        def enum_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.expect(TokenKind.Enum)
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            parser.skip_decl_header_clauses()
+
+            variants: mutable darray[Ast::EnumVariant] = []
+            if parser.peek() == TokenKind.Colon:
+                variants <- parser.enum_variant_block()
+
+            return (Ast::Decl.Enum(Lexer::text_or_empty(name_tok, parser.source), variants, tok.line))
+
+
+        # Handles `const`/`global` value bindings plus the `const enum`/`const struct`/
+        # `const module` qualified forms. Both type and initializer are optional:
+        # `const X = 1`, `const X: T = 1`, and `global buf: T` all parse.
+        def const_decl(parser: mutable Parser&) -> Ast::Decl?:
+            tok: Token = parser.advance()          # consume `const` or `global`
+            # A plain `const` is immutable; a `global` (with or without `mutable`) may be
+            # written. Recorded so the resolver can reject `<-` on an immutable const.
+            is_global: bool = Lexer::text_or_empty(tok, parser.source) == "global"
+
+            # Qualified declarations: `const enum`, `const struct`, `const module`.
+            if parser.peek() == TokenKind.Enum:
+                return parser.enum_decl()
+            if parser.peek() == TokenKind.Struct:
+                return parser.struct_decl()
+            cur: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(cur, parser.source) == "module":
+                return parser.module_decl()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(cur, parser.source) == "extend":
+                return parser.module_decl()
+
+            # `global mutable NAME: T = ...` — mutable globals.
+            parser.accept(TokenKind.Mutable)
+
+            name_tok: Token = parser.expect(TokenKind.Ident)
+
+            type_expr: mutable Ast::Expr = (Ast::Expr.Invalid)
+            if parser.accept(TokenKind.Colon):
+                if parser.expr() is parsed_type:
+                    type_expr <- parsed_type
+
+            value: mutable Ast::Expr = (Ast::Expr.Invalid)
+            if parser.accept(TokenKind.Assign):
+                if parser.expr() is parsed_value:
+                    value <- parsed_value
+
+            return (Ast::Decl.Const(Lexer::text_or_empty(name_tok, parser.source), type_expr, value, is_global, tok.line))
+
+    public:
+        # ============================================================
+        # Region-polymorphic file parsing entry point
+        # No Arena& param; region inferred from call site
+        # Returns owned Ast::File with all AST nodes in inferred region
+        # ============================================================
+
+        def parse_file(source: u8&, tokens: darray[Token]) -> Ast::File:
+            # Region is fully inferred: the parser's stores are backed by this function's
+            # inferred auto-region, threaded into every helper call and adopted by the caller
+            # on return (region-polymorphic return). No explicit Arena, no `@r`.
+            parser: mutable Parser = Parser(source, tokens)
+            top_items: mutable darray[Ast::Decl] = []
+
+            while true:
+                parser.skip_newlines()
+                if parser.peek() == TokenKind.Eof:
+                    break
+                before: usize = parser.position
+                parser.parse_decl_unit(top_items)
+                if parser.position == before:      # guarantee forward progress
+                    parser.advance()
+
+            return Ast::File{
+                top_decls: top_items,
+                errors: parser.errors
+            }
