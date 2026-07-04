@@ -51,12 +51,27 @@ echo "$out" | grep -q "struct literal 'Point' field 'x' is specified more than o
 out=$(printf "${P2}def e() -> Point:\n    return Point{x: 1, y: 2}\n" | "$RPT")
 echo "$out" | grep -q "more than once" && fail "false positive on distinct fields: $out"
 
-# 8. the whole frontend + stdlib must produce ZERO findings for either check.
+# 8. a by-label construction omitting a REQUIRED field MUST be flagged (MissingField).
+out=$(printf "${P2}def mf() -> Point:\n    return Point{x: 1}\n" | "$RPT")
+echo "$out" | grep -q "struct literal 'Point' is missing field 'y'" || fail "missing required field not flagged: $out"
+
+# 9. empty `{}` and positional construction bail (no missing-field report).
+out=$(printf "${P2}def em() -> Point:\n    return Point{}\n" | "$RPT")
+echo "$out" | grep -q "is missing field" && fail "false positive on empty construction: $out"
+out=$(printf "${P2}def po() -> Point:\n    return Point{1, 2}\n" | "$RPT")
+echo "$out" | grep -q "is missing field" && fail "false positive on positional construction: $out"
+
+# 10. optional (`z?: T`) and defaulted (`w: T = v`) fields are omittable — NOT missing.
+POM='struct Q:\n    x: i64\n    y: i64 = 5\n    z?: i64\n\n'
+out=$(printf "${POM}def op() -> Q:\n    return Q{x: 1}\n" | "$RPT")
+echo "$out" | grep -q "is missing field" && fail "false positive on omittable (default/optional) fields: $out"
+
+# 11. the whole frontend + stdlib must produce ZERO findings for any of the three checks.
 n=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "has no field|more than once" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "has no field|more than once|is missing field" || true)
   n=$((n + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$n" -eq 0 ] || fail "$n struct-literal field false positives across frontend+stdlib"
 
-echo "unknown-field smoke OK: flags undeclared + duplicate labels, silent on valid/positional/non-struct/generic, 0 false positives across frontend+stdlib"
+echo "unknown-field smoke OK: flags undeclared/duplicate/missing labels, silent on valid/positional/empty/generic/omittable, 0 false positives across frontend+stdlib"
