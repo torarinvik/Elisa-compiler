@@ -1,0 +1,287 @@
+extend Parser:
+    private:
+        # Distinguish the `guard COND else …` statement from a local named `guard`
+        # (`guard: T = …`, `guard.field <- …`). Scan the rest of the line, tracking
+        # bracket depth; it is a guard statement iff a top-level `else` appears before
+        # the line ends (mirrors stage0 looksLikeGuardStmt).
+        def looks_like_guard_stmt(parser: Parser&) -> bool:
+            depth: mutable int = 0
+            i: mutable usize = 1
+            while true:
+                k: TokenKind = parser.peek_at(i)
+                if k == TokenKind.Eof or k == TokenKind.Newline:
+                    return false
+                if k == TokenKind.LParen or k == TokenKind.LBracket:
+                    depth <- depth + 1
+                elif k == TokenKind.RParen or k == TokenKind.RBracket:
+                    if depth > 0:
+                        depth <- depth - 1
+                elif k == TokenKind.Else:
+                    if depth == 0:
+                        return true
+                i <- i + 1
+            return false
+
+
+        # `guard COND else STMT` / `guard COND else: BLOCK` — an early-exit guard whose
+        # else-branch runs when COND is false. Desugared to `if not COND: <else>` so the
+        # condition and the else body both resolve like any other if. (Contextual
+        # keyword — the lexer emits `guard` as an identifier.)
+        def guard_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.advance()              # `guard`
+            cond: Ast::Expr = get parser.expr()
+            parser.expect(TokenKind.Else)
+            neg: Ast::Expr = (Ast::Expr.Unary(TokenKind.Not, cond, tok.line))
+            then_body: mutable darray[Ast::Stmt] = []
+            if parser.peek() == TokenKind.Colon:
+                then_body <- parser.parse_block()
+            elif parser.stmt() is else_stmt:
+                then_body.push(else_stmt)
+            no_else: darray[Ast::Stmt] = []
+            return (Ast::Stmt.If(neg, then_body, no_else, tok.line))
+
+
+        def var_decl_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            name_tok: Token = parser.expect(TokenKind.Ident)
+            parser.expect(TokenKind.Colon)
+            type_expr: Ast::Expr = get parser.expr()
+
+            # Optional `@region` binding annotation (`x: T @scratch = …`) pinning the
+            # local to a named region. The region name is a region selector, not a value
+            # reference, so it is consumed and discarded.
+            if parser.accept(TokenKind.At):
+                parser.accept(TokenKind.Ident)
+
+            # `value` is non-optional in the AST; an uninitialized binding records Invalid.
+            value: mutable Ast::Expr = (Ast::Expr.Invalid)
+            if parser.accept(TokenKind.Assign):
+                if parser.expr() is parsed_value:
+                    value <- parsed_value
+            value <- parser.consume_removed_as_cast(value)
+
+            # Optional-binding recovery tail `NAME: T = EXPR else <stmt>` (the desugared
+            # `get`): if the RHS is empty, run the else statement (typically `return …`).
+            # The else branch isn't modeled on VarDecl; parse it so the line is consumed.
+            if parser.accept(TokenKind.Else):
+                if parser.peek() == TokenKind.Colon:
+                    parser.parse_block()
+                else:
+                    parser.stmt()
+
+            return (Ast::Stmt.VarDecl(Lexer::text_or_empty(name_tok, parser.source), type_expr, value, name_tok.line))
+
+
+        # `requires E` / `ensure E` / `decreases E` / `invariant E` / `changes PATH` —
+        # a design-by-contract leading body statement. The keyword is contextual; the
+        # dispatcher has already confirmed an operand follows on the same line.
+        def contract_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.advance()              # consume the contract keyword
+            kind_text: sview = Lexer::text_or_empty(tok, parser.source)
+            pred: mutable Ast::Expr = get parser.expr()
+            # `ensure GUARD => POST` / `ensure GUARD implies POST` — an implication
+            # postcondition (docs/118-B: conditional progress contracts). Fold to
+            # `(not GUARD) or POST` so BOTH sides name-resolve; the stage1 frontend does
+            # not discharge contracts, so the desugaring only needs to be resolvable and
+            # to match the shape stage0's parser produces for differential parity.
+            impl_tok: Token = parser.cursor()
+            is_implies_kw: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(impl_tok, parser.source) == "implies"
+            if parser.peek() == TokenKind.FatArrow or is_implies_kw:
+                arrow_tok: Token = parser.advance()    # `=>` or `implies`
+                consequent: Ast::Expr = get parser.expr()
+                neg_guard: Ast::Expr = (Ast::Expr.Unary(TokenKind.Not, pred, arrow_tok.line))
+                pred <- (Ast::Expr.Binary(neg_guard, TokenKind.Or, consequent, arrow_tok.line))
+            return (Ast::Stmt.Contract(kind_text, pred, tok.line))
+
+
+        # `expect EXPR as PATTERN(S)` (with an optional `:` block) and the inverted
+        # `expect let PATTERN = EXPR` — assert EXPR matches PATTERN, binding its fields.
+        # Modeled as a one-arm Match on EXPR (exactly stage0's desugar, minus the
+        # synthesized wildcard-panic arm, which is runtime-only) so pattern bindings
+        # resolve in the block like any match arm's.
+        def expect_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.advance()              # `expect`
+
+            let_tok: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(let_tok, parser.source) == "let":
+                parser.advance()                       # `let`
+                let_pattern: Ast::Pattern = parser.parse_pattern()
+                if parser.peek() != TokenKind.Assign:
+                    parser.capture_pattern_span()      # exotic tail; consumed losslessly
+                parser.expect(TokenKind.Assign)
+                let_value: Ast::Expr = get parser.expr()
+                let_body: darray[Ast::Stmt] = []
+                let_arms: darray[Ast::MatchArm] = [Ast::MatchArm{pattern: let_pattern, body: let_body}]
+                return (Ast::Stmt.Match(let_value, let_arms, tok.line))
+
+            value: Ast::Expr = get parser.expr()
+            parser.expect(TokenKind.As)
+            pattern: Ast::Pattern = parser.parse_pattern()
+
+            body: mutable darray[Ast::Stmt] = []
+            if parser.peek() == TokenKind.Colon:
+                body <- parser.parse_block()
+            arms: darray[Ast::MatchArm] = [Ast::MatchArm{pattern: pattern, body: body}]
+            return (Ast::Stmt.Match(value, arms, tok.line))
+
+
+        # A statement whose prefix clause is not yet modeled but which introduces a
+        # `:`-block (e.g. `can Mem.Allocate:`, `region scratch:`, `try:`). Skip the
+        # prefix tokens up to a paren-balanced top-level `:`, then parse the block.
+        # A prefix with no block (e.g. `region scratch(1024)`) degrades to an empty
+        # statement so the line is consumed without cascading errors.
+        def prefixed_block_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            line: u32 = parser.cursor().line
+
+            # Classify the clause category from the leading token so region/effect
+            # passes can dispatch structurally. Keyword-token prefixes map to their
+            # spelling; contextual-keyword prefixes (`can`, `region`, …) are Idents
+            # and carry their text directly; a bare `slot:` success arm is "arm".
+            first_kind: TokenKind = parser.peek()
+            first_tok: Token = parser.cursor()
+            block_kind: mutable sview = ""
+            is_arm: bool = first_kind == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon and parser.peek_at(2) == TokenKind.Newline
+            if is_arm:
+                block_kind <- "arm"
+            elif first_kind == TokenKind.With:
+                block_kind <- "with"
+            elif first_kind == TokenKind.Region:
+                block_kind <- "region"
+            elif first_kind == TokenKind.Try:
+                block_kind <- "try"
+            elif first_kind == TokenKind.Catch:
+                block_kind <- "catch"
+            elif first_kind == TokenKind.In:
+                block_kind <- "in"
+            elif first_kind == TokenKind.Error:
+                block_kind <- "error"
+            elif first_kind == TokenKind.Static:
+                block_kind <- "static"
+            elif first_kind == TokenKind.Ident:
+                block_kind <- Lexer::text_or_empty(first_tok, parser.source)
+
+            # Capture the name a binding-introducing prefix brings into scope:
+            # `error IDENT:` binds the error value; a success arm `IDENT:` binds the
+            # result. Everything else binds nothing.
+            binding: mutable sview = ""
+            if first_kind == TokenKind.Error:
+                parser.advance()                       # `error`
+                if parser.peek() == TokenKind.Ident:
+                    etok: Token = parser.cursor()
+                    binding <- Lexer::text_or_empty(etok, parser.source)
+            elif is_arm:
+                binding <- Lexer::text_or_empty(first_tok, parser.source)
+
+            # Collect the prefix's identifier tokens (in order) up to the block colon:
+            # granted effect names (`can Mem.Allocate:`) or a region name
+            # (`region scratch(…):`). The leading clause keyword and the arm binding are
+            # already captured above, so skip identifiers at position 0.
+            clause: mutable darray[sview] = []
+            depth: mutable int = 0
+            first: mutable bool = true
+            while parser.peek() != TokenKind.Eof:
+                kind: TokenKind = parser.peek()
+                if kind in {TokenKind.LParen, TokenKind.LBracket}:
+                    depth <- depth + 1
+                    parser.advance()
+                elif kind in {TokenKind.RParen, TokenKind.RBracket}:
+                    depth <- depth - 1
+                    parser.advance()
+                elif depth == 0 and kind in {TokenKind.Colon, TokenKind.Newline}:
+                    break
+                else:
+                    if depth == 0 and kind == TokenKind.Ident and not first:
+                        idtok: Token = parser.cursor()
+                        clause.push(Lexer::text_or_empty(idtok, parser.source))
+                    first <- false
+                    parser.advance()
+
+            if parser.peek() != TokenKind.Colon:
+                return (Ast::Stmt.Expr((Ast::Expr.Invalid), line))
+
+            body: darray[Ast::Stmt] = parser.parse_block()
+            return (Ast::Stmt.Block(block_kind, clause, binding, body, line))
+
+
+        def if_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            return parser.if_tail(parser.expect(TokenKind.If))
+
+
+        # Shared tail for `if` and `elif`: parse `<cond> <block>` then an optional
+        # `elif`/`else` continuation. An `elif` chain desugars into a nested If stored
+        # as the single statement of the parent's else_body — no separate elif node.
+        def if_tail(parser: mutable Parser&, tok: Token) -> Ast::Stmt?:
+            # Optional branch-prediction hint `if likely COND:` / `if unlikely COND:`
+            # (contextual idents, also valid on `elif`). Only consumed when an operand
+            # follows, so a bool local literally named `likely` still works bare.
+            hint_tok: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident:
+                hint_text: sview = Lexer::text_or_empty(hint_tok, parser.source)
+                if (hint_text == "likely" or hint_text == "unlikely") and tokenStartsValue(parser.peek_at(1)):
+                    parser.advance()
+            condition: Ast::Expr = get parser.expr()
+            then_body: darray[Ast::Stmt] = parser.parse_block()
+
+            else_body: mutable darray[Ast::Stmt] = []
+            parser.skip_newlines()
+
+            next_kind: TokenKind = parser.peek()
+            if next_kind == TokenKind.Elif:
+                elif_tok: Token = parser.advance()
+                # An `elif` chain desugars into a nested If as the single statement of the
+                # parent's else body.
+                if parser.if_tail(elif_tok) is nested_if:
+                    else_body.push(nested_if)
+            elif next_kind == TokenKind.Else:
+                parser.advance()
+                else_body <- parser.parse_block()
+
+            return (Ast::Stmt.If(condition, then_body, else_body, tok.line))
+
+
+        def while_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.expect(TokenKind.While)
+            condition: Ast::Expr = get parser.expr()
+            body: darray[Ast::Stmt] = parser.parse_block()
+            return (Ast::Stmt.While(condition, body, tok.line))
+
+
+        def return_stmt(parser: mutable Parser&) -> Ast::Stmt?:
+            tok: Token = parser.expect(TokenKind.Return)
+
+            # Bare postfix guard `return if COND` (== `if COND: return`). A bare return has
+            # no value, so an `if` right after `return` is unambiguously a guard (never a
+            # ternary). Desugar to a real If node so the guard's references resolve.
+            if parser.accept(TokenKind.If):
+                cond: Ast::Expr = get parser.expr()
+                body: mutable darray[Ast::Stmt] = []
+                body.push((Ast::Stmt.Return(null, tok.line)))
+                no_else: darray[Ast::Stmt] = []
+                return (Ast::Stmt.If(cond, body, no_else, tok.line))
+            else:
+                value: mutable Ast::Expr? = null
+                if parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof:
+                    value <- parser.expr()
+                if value is v_present:
+                    _ = parser.consume_removed_as_cast(v_present)
+
+                # Multi-value return `return a, b` (a named-tuple result type's value
+                # list) — collect the remaining values into a Tuple.
+                if parser.peek() == TokenKind.Comma:
+                    if value is first_value:
+                        ret_elems: mutable darray[Ast::Expr] = [first_value]
+                        while parser.accept(TokenKind.Comma):
+                            break if parser.peek() == TokenKind.Newline or parser.peek() == TokenKind.Eof
+                            if parser.expr() is re:
+                                ret_elems.push(re)
+                        value <- (Ast::Expr.Tuple(ret_elems, tok.line))
+
+                # Trailing guard `return VALUE if COND` (== `if COND: return VALUE`).
+                if parser.accept(TokenKind.If):
+                    vcond: Ast::Expr = get parser.expr()
+                    vbody: mutable darray[Ast::Stmt] = []
+                    vbody.push((Ast::Stmt.Return(value, tok.line)))
+                    vno_else: darray[Ast::Stmt] = []
+                    return (Ast::Stmt.If(vcond, vbody, vno_else, tok.line))
+                else:
+                    return (Ast::Stmt.Return(value, tok.line))
+
