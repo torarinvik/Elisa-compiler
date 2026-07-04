@@ -66,13 +66,12 @@ extend Semantic:
                     index_name(table, n)
 
 
-        # Append a symbol; if its name already appears, count it and record a located
-        # DuplicateDecl diagnostic at the redefinition's line.
+        # Append a symbol into the (flat, whole-program) resolution index. Duplicate
+        # DIAGNOSTICS are NOT raised here — a flat index conflates overloads, reopened
+        # modules, and cross-module names; duplicate detection is done per-scope by
+        # check_scope_duplicates instead. This just makes every declared name resolvable.
         def add_symbol(table: mutable SymbolTable&, name: sview, kind: SymbolKind, line: u32, arity_min: u32 = 0, arity_max: u32 = 0) -> void:
             can Memory.Allocate, Abort.Panic:
-                if name_indexed(table, name):
-                    table.duplicates <- table.duplicates + 1
-                    table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DuplicateDecl, name: name, line: line, expected: "", actual: ""})
                 table.symbols.push(Symbol{name: name, kind: kind, line: line, arity_min: arity_min, arity_max: arity_max})
                 index_name(table, name)
 
@@ -115,11 +114,185 @@ extend Semantic:
                             pass
 
 
+        # Conservative structural equality over the small set of type-expression forms
+        # that appear in signatures (`i64`, `Mod::T`, `darray[T]`, `mutable T&`, …).
+        # Any form not modeled here compares UNequal — so two signatures are only ever
+        # judged identical when we are certain, keeping overloads (judged distinct) from
+        # being flagged as duplicates.
+        def same_type_expr(a: Ast::Expr, b: Ast::Expr) -> bool:
+            can Abort.Panic:
+                result: mutable bool = false
+                match a:
+                    Ast::Expr.Ident(an, aline):
+                        match b:
+                            Ast::Expr.Ident(bn, bline):
+                                result <- an == bn
+                            _:
+                                pass
+                    Ast::Expr.Scope(abase, aname, aline):
+                        match b:
+                            Ast::Expr.Scope(bbase, bname, bline):
+                                result <- aname == bname and same_type_expr(abase, bbase)
+                            _:
+                                pass
+                    Ast::Expr.Index(aobj, aidx, aline):
+                        match b:
+                            Ast::Expr.Index(bobj, bidx, bline):
+                                result <- same_type_expr(aobj, bobj) and same_type_expr(aidx, bidx)
+                            _:
+                                pass
+                    Ast::Expr.Unary(aop, aoperand, aline):
+                        match b:
+                            Ast::Expr.Unary(bop, boperand, bline):
+                                result <- aop == bop and same_type_expr(aoperand, boperand)
+                            _:
+                                pass
+                    Ast::Expr.Paren(ainner, aline):
+                        match b:
+                            Ast::Expr.Paren(binner, bline):
+                                result <- same_type_expr(ainner, binner)
+                            _:
+                                pass
+                    _:
+                        pass
+                return result
+
+
+        # Two parameter lists have identical types (names/mutability/defaults ignored —
+        # they are not part of a function's signature for overload purposes).
+        def same_params(pa: darray[Ast::ParamDecl]&, pb: darray[Ast::ParamDecl]&) -> bool:
+            can Abort.Panic:
+                if pa.count != pb.count:
+                    return false
+                i: mutable usize = 0
+                while i < pa.count:
+                    if not same_type_expr(pa[i].type_expr, pb[i].type_expr):
+                        return false
+                    i <- i + 1
+                return true
+
+
+        # Optional return-type equality (both absent == equal; one absent == unequal).
+        def same_ret_type(a: Ast::Expr?, b: Ast::Expr?) -> bool:
+            can Abort.Panic:
+                result: mutable bool = false
+                if a is av:
+                    if b is bv:
+                        result <- same_type_expr(av, bv)
+                else:
+                    if not (b is bv2):
+                        result <- true
+                return result
+
+
+        # Whether two Func decls share a signature (params + return type). Same name +
+        # same signature == a real duplicate; a different signature is a legal overload.
+        def func_decls_same_sig(a: Ast::Decl, b: Ast::Decl) -> bool:
+            can Abort.Panic:
+                result: mutable bool = false
+                match a:
+                    Ast::Decl.Func(an, ap, art, abody, aeff, adec, aline):
+                        match b:
+                            Ast::Decl.Func(bn, bp, brt, bbody, beff, bdec, bline):
+                                result <- same_params(ap, bp) and same_ret_type(art, brt)
+                            _:
+                                pass
+                    _:
+                        pass
+                return result
+
+
+        # Duplicate-detection category of a decl: 1 = TYPE namespace (struct/enum — these
+        # cannot overload or reopen), 2 = FUNCTION namespace (overloadable by signature),
+        # 0 = skipped. Const/Alias/Module/Import/Extern/Law are skipped: they legitimately
+        # repeat via `static if` conditional branches, module reopening, associated-type
+        # aliases, extern forward decls, or imports — none of which stage1 can currently
+        # distinguish from a true redefinition, so flagging them would be a false positive.
+        def decl_dup_category(d: Ast::Decl) -> int:
+            can Abort.Panic:
+                result: mutable int = 0
+                match d:
+                    Ast::Decl.Struct(name, members, affinity, line):
+                        result <- 1
+                    Ast::Decl.Enum(name, variants, line):
+                        result <- 1
+                    Ast::Decl.Func(name, params, return_type, body, effects, decorators, line):
+                        result <- 2
+                    _:
+                        pass
+                return result
+
+
+        # Declared name of a decl (empty for Invalid).
+        def decl_dup_name(d: Ast::Decl) -> sview:
+            can Abort.Panic:
+                result: mutable sview = ""
+                match d:
+                    Ast::Decl.Struct(name, members, affinity, line):
+                        result <- name
+                    Ast::Decl.Enum(name, variants, line):
+                        result <- name
+                    Ast::Decl.Func(name, params, return_type, body, effects, decorators, line):
+                        result <- name
+                    _:
+                        pass
+                return result
+
+
+        # Source line of a decl (0 for Invalid).
+        def decl_dup_line(d: Ast::Decl) -> u32:
+            can Abort.Panic:
+                result: mutable u32 = 0
+                match d:
+                    Ast::Decl.Struct(name, members, affinity, line):
+                        result <- line
+                    Ast::Decl.Enum(name, variants, line):
+                        result <- line
+                    Ast::Decl.Func(name, params, return_type, body, effects, decorators, line):
+                        result <- line
+                    _:
+                        pass
+                return result
+
+
+        # Per-scope duplicate detection over ONE declaration list (top-level, or a single
+        # module body). Only compares decls WITHIN this scope, so a name reused across
+        # different modules (`Lexer::get` vs `Parser::get`) never collides. A type
+        # redeclaration is always a duplicate; two same-named functions are a duplicate
+        # only when their signatures match (an overload is not). Reported at the second
+        # occurrence's line.
+        def check_scope_duplicates(decls: darray[Ast::Decl]&, table: mutable SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                i: mutable usize = 0
+                while i < decls.count:
+                    di: Ast::Decl = decls[i]
+                    icat: int = decl_dup_category(di)
+                    iname: sview = decl_dup_name(di)
+                    if icat != 0 and iname != "":
+                        j: mutable usize = 0
+                        is_dup: mutable bool = false
+                        while j < i:
+                            dj: Ast::Decl = decls[j]
+                            if not is_dup and decl_dup_category(dj) == icat and decl_dup_name(dj) == iname:
+                                if icat == 1:
+                                    is_dup <- true
+                                elif func_decls_same_sig(di, dj):
+                                    is_dup <- true
+                            j <- j + 1
+                        if is_dup:
+                            table.duplicates <- table.duplicates + 1
+                            table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DuplicateDecl, name: iname, line: decl_dup_line(di), expected: "", actual: ""})
+                    i <- i + 1
+
+
         # Collect the declarations in `decls` into `table`, recursing into module bodies. The
         # element type is Decl, so the match handles exactly Decl's variants directly — no Node
         # subtype-narrowing and no wildcard category arm.
         def collect_range(decls: darray[Ast::Decl], table: mutable SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
+                # Duplicate detection is PER-SCOPE (this decl list only); name resolution's
+                # global index is built separately by add_symbol below.
+                check_scope_duplicates(decls, table)
                 for decl in decls:
                     match decl:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
@@ -192,6 +365,12 @@ extend Semantic:
                             table.add_symbol(name, SymbolKind.Extern, line)
                         Decl.Module(name, body, line):
                             table.add_symbol(name, SymbolKind.Module, line)
+                            collect_range(body, table)
+                        Decl.Scoped(body, line):
+                            # A static-if branch or impl body: an isolated scope. Register
+                            # its decls for resolution, but its own duplicate detection runs
+                            # in isolation, so same-name decls in sibling scopes (other
+                            # branches / other impls) never collide.
                             collect_range(body, table)
                         Decl.Invalid:
                             pass
