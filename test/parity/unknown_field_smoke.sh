@@ -43,12 +43,20 @@ echo "$out" | grep -q "has no field" && fail "false positive on non-struct type:
 out=$(printf "struct Box:\n    v: i64\n\ndef m() -> i64:\n    b = Box[i64]{bad: 1}\n    return 0\n" | "$RPT")
 echo "$out" | grep -q "has no field" && fail "false positive on generic type expr: $out"
 
-# 6. the whole frontend + stdlib must produce ZERO findings (all compile on stage0).
+# 6. a field label given twice MUST be flagged (DuplicateFieldInit, same code path).
+out=$(printf "${P2}def d() -> Point:\n    return Point{x: 1, x: 2, y: 3}\n" | "$RPT")
+echo "$out" | grep -q "struct literal 'Point' field 'x' is specified more than once" || fail "duplicate field label not flagged: $out"
+
+# 7. a valid all-distinct construction must NOT be flagged as duplicate.
+out=$(printf "${P2}def e() -> Point:\n    return Point{x: 1, y: 2}\n" | "$RPT")
+echo "$out" | grep -q "more than once" && fail "false positive on distinct fields: $out"
+
+# 8. the whole frontend + stdlib must produce ZERO findings for either check.
 n=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -c "has no field" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "has no field|more than once" || true)
   n=$((n + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
-[ "$n" -eq 0 ] || fail "$n unknown-field false positives across frontend+stdlib"
+[ "$n" -eq 0 ] || fail "$n struct-literal field false positives across frontend+stdlib"
 
-echo "unknown-field smoke OK: flags an undeclared labeled field, silent on valid/positional/non-struct/generic, 0 false positives across frontend+stdlib"
+echo "unknown-field smoke OK: flags undeclared + duplicate labels, silent on valid/positional/non-struct/generic, 0 false positives across frontend+stdlib"
