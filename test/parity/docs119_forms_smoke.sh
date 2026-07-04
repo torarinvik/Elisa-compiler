@@ -32,6 +32,9 @@ perr() { printf "$1" | "$RPT" | head -1 | awk '{print $2}'; }
 # 5. rebind parses.
 [ "$(perr 'def f(p: mutable i64, v: i64) -> i64:\n    rebind p, applied: i64 =\n        p + v, v\n    return p + applied\n')" = "0" ] || fail "rebind has parse errors"
 
+# 5b. a typed loop accumulator `|acc: u64 = 0|` parses.
+[ "$(perr 'def f(xs: darray[i64]) -> u64:\n    s: u64 =\n        for x in xs |acc: u64 = 0| -> acc:\n            acc <- acc + 1\n    return s\n')" = "0" ] || fail "typed accumulator has parse errors"
+
 # 6. a bitwise `|` in an iterable is NOT misread as a header.
 [ "$(perr 'def f(a: i64, b: i64) -> i64:\n    s: mutable i64 = 0\n    for x in 0..<(a | b):\n        s <- s + x\n    return s\n')" = "0" ] || fail "bitwise | in iterable misread as header"
 
