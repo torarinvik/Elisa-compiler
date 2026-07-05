@@ -35,6 +35,13 @@ perr() { printf "$1" | "$RPT" | head -1 | awk '{print $2}'; }
 # 5b. a typed loop accumulator `|acc: u64 = 0|` parses.
 [ "$(perr 'def f(xs: darray[i64]) -> u64:\n    s: u64 =\n        for x in xs |acc: u64 = 0| -> acc:\n            acc <- acc + 1\n    return s\n')" = "0" ] || fail "typed accumulator has parse errors"
 
+# 5c. a captured value block `x: T = |caps|` NEWLINE INDENT … parses (docs/119 §6
+#     applied to value blocks — the header licenses outer-mutable mutation, E4).
+[ "$(perr 'def f(t: mutable i64) -> i64:\n    v: i64 = |t|\n        t <- t + 1\n        t\n    return v\n')" = "0" ] || fail "captured value block has parse errors"
+
+# 5d. two captures + tuple-bind form parses.
+[ "$(perr 'def f(a: mutable i64, b: mutable i64) -> i64:\n    x, y = |a, b|\n        a <- a + 1\n        b <- b + 1\n        a, b\n    return x + y\n')" = "0" ] || fail "multi-capture tuple value block has parse errors"
+
 # 6. a bitwise `|` in an iterable is NOT misread as a header.
 [ "$(perr 'def f(a: i64, b: i64) -> i64:\n    s: mutable i64 = 0\n    for x in 0..<(a | b):\n        s <- s + x\n    return s\n')" = "0" ] || fail "bitwise | in iterable misread as header"
 
