@@ -18,42 +18,63 @@ extend Parser:
         # (e.g. `@inline(always)`, `@hot`, `@test`), recording each bare decorator name
         # into `parser.pending_decorators` (cleared in place first) for the declaration
         # that follows to pick up. Arguments are consumed but not modeled.
+        # Consume a balanced `(...)` decorator-argument group, entered just past the
+        # opening `(`. Arguments are not modeled — only balanced, so nested parens
+        # close correctly (`depth` is loop-local, seeded to the one open paren).
+        def skip_decorator_args(parser: mutable Parser&) -> void:
+            while depth > 0 and parser.peek() != TokenKind.Eof |depth = 1|:
+                depth <- match parser.advance().kind:
+                    TokenKind.LParen: depth + 1
+                    TokenKind.RParen: depth - 1
+                    _: depth
+
+        # Record one `@name` / `@dotted.name` decorator plus its optional `(...)`
+        # arguments. A no-op unless the cursor is on an identifier.
+        def parse_one_decorator(parser: mutable Parser&) -> void:
+            return if parser.peek() != TokenKind.Ident
+            parser.pending_decorators.push(parser.parse_dotted_name())
+            if parser.accept(TokenKind.LParen):
+                parser.skip_decorator_args()
+
         def parse_decorators(parser: mutable Parser&) -> void:
             parser.pending_decorators.truncate(0)
             while parser.peek() == TokenKind.At:
                 parser.advance()                   # `@`
-                # Bracketed attribute-list form `@[a, b, c]` — equivalent to writing each
-                # `@a`/`@b`/`@c` on its own line; each name is recorded as a decorator (an
-                # attribute may carry its own `(...)` args, e.g. `@[align(64), packed]`).
+                # Bracketed list `@[a, b(x), c]` is equivalent to writing each `@a` /
+                # `@b(x)` / `@c` on its own line; anything else is a single decorator.
                 if parser.accept(TokenKind.LBracket):
                     while parser.peek() != TokenKind.RBracket and parser.peek() != TokenKind.Eof:
-                        if parser.peek() == TokenKind.Ident:
-                            parser.pending_decorators.push(parser.parse_dotted_name())
-                            if parser.accept(TokenKind.LParen):
-                                d2: mutable int = 1
-                                while d2 > 0 and parser.peek() != TokenKind.Eof:
-                                    k2: TokenKind = parser.advance().kind
-                                    d2 <- match k2:
-                                        TokenKind.LParen: d2 + 1
-                                        TokenKind.RParen: d2 - 1
-                                        _: d2
-                        if not parser.accept(TokenKind.Comma):
-                            break
+                        parser.parse_one_decorator()
+                        break if not parser.accept(TokenKind.Comma)
                     parser.accept(TokenKind.RBracket)
-                    parser.skip_newlines()
                 else:
-                    if parser.peek() == TokenKind.Ident:
-                        parser.pending_decorators.push(parser.parse_dotted_name())
-                    if parser.accept(TokenKind.LParen):
-                        depth: mutable int = 1
-                        while depth > 0 and parser.peek() != TokenKind.Eof:
-                            kind: TokenKind = parser.advance().kind
-                            if kind == TokenKind.LParen:
-                                depth <- depth + 1
-                            elif kind == TokenKind.RParen:
-                                depth <- depth - 1
-                    parser.skip_newlines()
+                    parser.parse_one_decorator()
+                parser.skip_newlines()
 
+
+        # Append an optional declaration node to `out` (a no-op when parsing yielded
+        # none). Collapses the `if parser.X() is n: out.push(n)` idiom that every
+        # single-keyword decl arm in `parse_decl_unit` shares.
+        def push_opt(parser: mutable Parser&, out: mutable darray[Ast::Decl]&, node: Ast::Decl?) -> void:
+            if node is d:
+                out.push(d)
+
+        # Skip a whole indented block, entered with the cursor just after the opening
+        # `:`. Balances nested Indent/Dedent pairs; a no-op if no block follows
+        # (`depth` is loop-local, seeded to the one open Indent).
+        def skip_indented_block(parser: mutable Parser&) -> void:
+            parser.accept(TokenKind.Newline)
+            return if not parser.accept(TokenKind.Indent)
+            while depth > 0 and parser.peek() != TokenKind.Eof |depth = 1|:
+                depth <- match parser.advance().kind:
+                    TokenKind.Indent: depth + 1
+                    TokenKind.Dedent: depth - 1
+                    _: depth
+
+        # Consume tokens through the end of the current logical line.
+        def skip_to_line_end(parser: mutable Parser&) -> void:
+            while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof:
+                parser.advance()
 
         def parse_decl_unit(parser: mutable Parser&, out: mutable darray[Ast::Decl]&) -> void:
             parser.parse_decorators()
@@ -67,22 +88,29 @@ extend Parser:
             if parser.peek() == TokenKind.Ident:
                 cur: Token = parser.cursor()
                 text: sview = Lexer::text_or_empty(cur, parser.source)
-                match text:
-                    "module":
-                        if parser.module_decl() is mod:
-                            out.push(mod)
-                        return
-                    # `extend Foo:` shares the module body grammar; modeled as a Module node
-                    # (member collection is identical — the canonical/duplicate checks the
-                    # backend enforces aren't part of stage1's resolver).
-                    "extend":
-                        if parser.module_decl() is ext:
-                            out.push(ext)
-                        return
-                    "include":
-                        if parser.include_decl() is inc:
-                            out.push(inc)
-                        return
+                # A recognized declaration keyword parses to an optional `Decl` node,
+                # collected once below; `matched` stays true so the unit returns even
+                # when the node is null. The three `out`-managing forms
+                # (`using`/visibility/`impl`) collect themselves and return in-arm. A
+                # non-keyword ident clears `matched` and falls through to the
+                # compile-time forms.
+                matched: mutable bool = true
+                no_decl: Ast::Decl? = null
+                node: Ast::Decl? = match text:
+                    # `extend Foo:` shares the module body grammar and is modeled as a
+                    # Module node (member collection is identical — the canonical/duplicate
+                    # checks the backend enforces aren't part of stage1's resolver).
+                    "module" | "extend": parser.module_decl()
+                    "include": parser.include_decl()
+                    "type": parser.type_alias_decl()
+                    "alias": parser.alias_decl()
+                    "law": parser.law_decl()
+                    "permission" | "effect" | "protocol": parser.named_block_decl()
+                    # Single-use discipline modifiers (`linear struct X:` / `affine struct
+                    # X:`) — struct-only in stage0. struct_decl parses the modifier itself
+                    # (mirrors how it owns its `layout(...)` clause), so route straight
+                    # there rather than discarding the modifier and recursing generically.
+                    "linear" | "affine": parser.struct_decl()
                     # `using Foo` (wildcard), `using Foo::bar`/`using Foo.bar` (selective
                     # member), `using Foo as F` (qualifier alias) — drops/shortens a
                     # module qualifier. Not yet modeled in stage1's resolver (name lookup
@@ -94,36 +122,15 @@ extend Parser:
                     "public" | "private":
                         parser.visibility_section(out)
                         return
-                    "type":
-                        if parser.type_alias_decl() is alias:
-                            out.push(alias)
-                        return
-                    "alias":
-                        if parser.alias_decl() is alias_node:
-                            out.push(alias_node)
-                        return
-                    "law":
-                        if parser.law_decl() is law_node:
-                            out.push(law_node)
-                        return
-                    "permission" | "effect" | "protocol":
-                        if parser.named_block_decl() is block_node:
-                            out.push(block_node)
-                        return
                     "impl":
                         parser.impl_decl(out)
                         return
-                    # Single-use discipline modifiers (`linear struct X:` / `affine
-                    # struct X:`) — struct-only in stage0 (no enum/other form).
-                    # struct_decl parses the modifier itself (mirrors how it also
-                    # owns its `layout(...)` clause), so route straight there rather
-                    # than discarding the modifier and recursing generically.
-                    "linear" | "affine":
-                        if parser.struct_decl() is struct_node:
-                            out.push(struct_node)
-                        return
                     _:
-                        pass
+                        matched <- false
+                        no_decl
+                if matched:
+                    parser.push_opt(out, node)
+                    return
 
             # `static if/elif/else COND:` compile-time conditional declarations, plus the
             # other compile-time forms: `static def NAME(...)` (compile-time function —
@@ -148,22 +155,13 @@ extend Parser:
                         directive: sview = Lexer::text_or_empty(directive_tok, parser.source)
                         if directive == "generate" or directive == "assert":
                             parser.advance()           # the directive name
-                            # Block form (`static generate:` / `static assert:`): skip the
-                            # whole indented block. Line form (`static assert COND[, MSG]`):
-                            # skip to end of line.
+                            # Block form (`static generate:` / `static assert:`) skips the
+                            # whole indented block; line form (`static assert COND[, MSG]`)
+                            # skips to end of line.
                             if parser.accept(TokenKind.Colon):
-                                parser.accept(TokenKind.Newline)
-                                if parser.accept(TokenKind.Indent):
-                                    sdepth =
-                                        while sdepth > 0 and parser.peek() != TokenKind.Eof |parser, sdepth=1| -> sdepth:
-                                            sk: TokenKind = parser.advance().kind
-                                            sdepth <- match sk:
-                                                TokenKind.Indent: sdepth + 1
-                                                TokenKind.Dedent: sdepth - 1
-                                                _: sdepth
+                                parser.skip_indented_block()
                             else:
-                                while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof:
-                                    parser.advance()
+                                parser.skip_to_line_end()
                             return
                         # Not a recognized directive — rewind and fall through to decl().
                         parser.position <- static_saved
