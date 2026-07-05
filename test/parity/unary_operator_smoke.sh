@@ -16,32 +16,32 @@ fail() { echo "unary-operator smoke FAIL: $1" >&2; exit 1; }
 
 # 1. `not` on an int operand MUST be flagged.
 out=$(printf 'def f(n: i64) -> bool:\n    return not n\n' | "$RPT")
-echo "$out" | grep -q "not operator requires bool operand" || fail "not-on-int not flagged: $out"
+echo "$out" | grep -q "logical 'not' requires bool operands" || fail "not-on-int not flagged: $out"
 
 # 2. unary `-` on a bool operand MUST be flagged.
 out=$(printf 'def f(b: bool) -> i64:\n    x: i64 = -b\n    return x\n' | "$RPT")
-echo "$out" | grep -q "operator '-' requires numeric operand" || fail "minus-on-bool not flagged: $out"
+echo "$out" | grep -q "operator '-' requires numeric operands" || fail "minus-on-bool not flagged: $out"
 
 # 3. unary `~` on a string operand MUST be flagged.
 out=$(printf 'def f(s: sview) -> i64:\n    x: i64 = ~s\n    return x\n' | "$RPT")
-echo "$out" | grep -q "operator '~' requires numeric operand" || fail "tilde-on-string not flagged: $out"
+echo "$out" | grep -q "operator '~' requires numeric operands" || fail "tilde-on-string not flagged: $out"
 
 # 4. `not` on bool operand must NOT be flagged.
 out=$(printf 'def f(b: bool) -> bool:\n    return not b\n' | "$RPT")
-echo "$out" | grep -q "not operator requires" && fail "false positive on not-bool: $out"
+echo "$out" | grep -q "logical 'not' requires" && fail "false positive on not-bool: $out"
 
 # 5. unary `-` on int must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    return -n\n' | "$RPT")
-echo "$out" | grep -q "unary operator requires numeric" && fail "false positive on minus-int: $out"
+echo "$out" | grep -q "requires numeric operands" && fail "false positive on minus-int: $out"
 
 # 6. unary `~` on int must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    return ~n\n' | "$RPT")
-echo "$out" | grep -q "unary operator requires numeric" && fail "false positive on tilde-int: $out"
+echo "$out" | grep -q "requires numeric operands" && fail "false positive on tilde-int: $out"
 
 # 7. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "not operator requires|unary operator requires" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "logical 'not' requires|unary operator requires" || true)
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t unary-operator false positives across frontend+stdlib"
