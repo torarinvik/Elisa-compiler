@@ -9,11 +9,7 @@ set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
-command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; exit 2; }
-RPT="$REPO_ROOT/build/parse_report"
-mkdir -p "$REPO_ROOT/build"
-"$ELISACORE_BIN" -emit obj -O2 -permissive -o "$REPO_ROOT/build/parse_report.o" "$REPO_ROOT/test/breadth/parse_report.elisa" >/dev/null 2>&1
-clang -O2 "$REPO_ROOT/build/parse_report.o" -o "$RPT" 2>/dev/null
+source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "operator-operands smoke FAIL: $1" >&2; exit 1; }
 
 # 1. int operand to a logical `and` MUST be flagged.
