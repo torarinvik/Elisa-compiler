@@ -22,11 +22,11 @@ fail() { echo "struct-layout smoke FAIL: $1" >&2; exit 1; }
 
 # 1. An unknown field type MUST be flagged (only lowercase names, to avoid cross-module false positives).
 out=$(printf 'struct Point:\n    x: unknown\n    y: i64\n' | "$RPT")
-echo "$out" | grep -q "has unknown type 'unknown'" || fail "unknown field type not flagged: $out"
+echo "$out" | grep -q "L2 .*has unknown type 'unknown'" || fail "unknown field type not flagged on field line: $out"
 
 # 2. A directly self-recursive struct MUST be flagged.
 out=$(printf 'struct Node:\n    val: i64\n    next: Node\n' | "$RPT")
-echo "$out" | grep -q "directly self-recursive" || fail "direct self-recursion not flagged: $out"
+echo "$out" | grep -q "L3 .*directly self-recursive" || fail "direct self-recursion not flagged on field line: $out"
 
 # 3. A ref-indirected self-reference must NOT be flagged (sound indirection).
 out=$(printf 'struct Node:\n    val: i64\n    next: Node&\n' | "$RPT")
