@@ -6,6 +6,101 @@ extend Semantic:
         # none of their [required, total] ranges. Any shadowing local, non-Func symbol
         # (extern/const/struct/builtin), labeled argument, or unknown name skips the
         # check, so an unmodeled call shape can never produce a false positive.
+        # Collect the FIELD path (root→leaf) of a place expression into `out`, returning
+        # whether it is a modelable field-only place. Address-of / `mutable` / `lmut`
+        # prefixes are seen through; any Index/Slice/other node makes the place
+        # unmodelable (returns false) so the aliasing check stays sound — it only ever
+        # compares places it can match exactly, never guessing about dynamic indices.
+        def place_fields(e: Ast::Expr, out: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match e:
+                    Expr.Ident(name, iline):
+                        return true
+                    Expr.Field(obj, field, fline):
+                        if not place_fields(obj, out):
+                            return false
+                        out.push(field)
+                        return true
+                    Expr.Unary(op, operand, uline):
+                        if op == TokenKind.Ampersand or op == TokenKind.Mutable or op == TokenKind.Lmut:
+                            return place_fields(operand, out)
+                        return false
+                    _:
+                        return false
+
+
+        # Whether two argument expressions name overlapping storage: same root variable
+        # and one field path a prefix of (or equal to) the other. Only field-only places
+        # are compared; anything with an index/slice is treated as non-overlapping (sound
+        # — we never flag unless the two places provably collide).
+        def places_overlap(a: Ast::Expr, b: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                ra: sview = target_root_ident(a)
+                rb: sview = target_root_ident(b)
+                if ra == "" or ra != rb:
+                    return false
+                fa: mutable darray[sview] = []
+                fb: mutable darray[sview] = []
+                if not place_fields(a, fa):
+                    return false
+                if not place_fields(b, fb):
+                    return false
+                m: usize = fa.count if fa.count < fb.count else fb.count
+                i: mutable usize = 0
+                while i < m:
+                    if fa[i] != fb[i]:
+                        return false
+                    i <- i + 1
+                return true
+
+
+        # Whether callee `fname` declares an `lmut` parameter at positional index `pos`.
+        def arg_pos_is_lmut(table: mutable SymbolTable&, fname: sview, pos: usize) -> bool:
+            can Abort.Panic:
+                k: mutable usize = 0
+                while k < table.lmut_param_owner.count:
+                    if table.lmut_param_owner[k] == fname and table.lmut_param_pos[k].usize() == pos:
+                        return true
+                    k <- k + 1
+                return false
+
+
+        # The `lmut` non-aliasing rule at a direct call site: an argument bound to an
+        # `lmut` parameter may not name the same place as any other argument of the same
+        # call. Conservative like the arity check — only for a uniquely-named function
+        # (overloaded names can't be positionally resolved here, so they are skipped).
+        def check_call_lmut_aliasing(table: mutable SymbolTable&, fname: sview, args: darray[Ast::Expr], line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Fast bail: does this name have any lmut parameter at all?
+                any_lmut: mutable bool = false
+                k: mutable usize = 0
+                while k < table.lmut_param_owner.count:
+                    if table.lmut_param_owner[k] == fname:
+                        any_lmut <- true
+                    k <- k + 1
+                if not any_lmut:
+                    return
+                # Poison overloaded names: only a unique Func decl binds positionally here.
+                func_count: mutable u32 = 0
+                si: mutable usize = 0
+                while si < table.symbols.count:
+                    if table.symbols[si].name == fname and table.symbols[si].kind == SymbolKind.Func:
+                        func_count <- func_count + 1
+                    si <- si + 1
+                if func_count != 1:
+                    return
+                argc: usize = args.count
+                i: mutable usize = 0
+                while i < argc:
+                    j: mutable usize = i + 1
+                    while j < argc:
+                        if (arg_pos_is_lmut(table, fname, i) or arg_pos_is_lmut(table, fname, j)) and places_overlap(args[i], args[j]):
+                            root: sview = target_root_ident(args[j])
+                            table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LmutAliasing, name: root, line: line, expected: "", actual: ""})
+                        j <- j + 1
+                    i <- i + 1
+
+
         def check_call_arity(table: mutable SymbolTable&, fname: sview, argc: usize, line: u32) -> void:
             can Memory.Allocate, Abort.Panic:
                 # docs/119 §3: the symbol scan is a multi-accumulator loop expression — the
@@ -93,6 +188,9 @@ extend Semantic:
                             shadowed: bool = any b in bound where b == fname
                             if not labeled and not shadowed:
                                 check_call_arity(table, fname, args.count, line)
+                                # lmut single-live-binding rule: no argument bound to an
+                                # `lmut` parameter may alias another argument of this call.
+                                check_call_lmut_aliasing(table, fname, args, line)
                         # Enum-constructor arity: `Enum.Variant(v1, …)` must supply
                         # exactly the declared payload count (labels allowed — the
                         # count is positional either way).
