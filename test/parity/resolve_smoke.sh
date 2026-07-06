@@ -205,6 +205,43 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* Capture-mutability check: capturing an immutable outer binding in a value block
+       must report CaptureImmutable at the block line. `total` is immutable here. */
+    const char *csrc =
+        "def f(xs: darray[i64]) -> i64:\n"
+        "    total: i64 = 0\n"
+        "    r: i64 =\n"
+        "        for x in xs |acc = 0, total| -> acc:\n"
+        "            acc <- acc + 1\n"
+        "    return r\n";
+    size_t cn = 0; while (csrc[cn]) cn++;
+    uint64_t ccount = 0; uint32_t cline = 0;
+    capture_probe_export((uint8_t *)csrc, cn, &ccount, &cline);
+    if (ccount != 1) {
+        fprintf(stderr, "capture probe FAILED: count=%llu (want count=1)\n", (unsigned long long)ccount);
+        return 5;
+    }
+
+    /* Capture mutability must use the nearest scoped binding, not any same-named
+       mutable binding elsewhere in the function. The inner `total` is immutable. */
+    const char *cshadow =
+        "def f(xs: darray[i64], flag: bool) -> i64:\n"
+        "    total: mutable i64 = 0\n"
+        "    if flag:\n"
+        "        total: i64 = 1\n"
+        "        r: i64 =\n"
+        "            for x in xs |acc = 0, total| -> acc:\n"
+        "                acc <- acc + total\n"
+        "        return r\n"
+        "    return total\n";
+    size_t csn = 0; while (cshadow[csn]) csn++;
+    uint64_t cshadow_count = 0; uint32_t cshadow_line = 0;
+    capture_probe_export((uint8_t *)cshadow, csn, &cshadow_count, &cshadow_line);
+    if (cshadow_count != 1) {
+        fprintf(stderr, "capture shadow probe FAILED: count=%llu (want count=1)\n", (unsigned long long)cshadow_count);
+        return 5;
+    }
+
     /* Duplicate-declaration check: the checker must report a DuplicateDecl at the
        redefinition's line. `dup` is defined twice; the second def is on line 4, and
        exactly one duplicate must be reported (guards add_symbol's duplicate path). */
