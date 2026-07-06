@@ -205,6 +205,23 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* Capture-mutability check: capturing an immutable outer binding in a value block
+       must report CaptureImmutable at the block line. `total` is immutable here. */
+    const char *csrc =
+        "def f(xs: darray[i64]) -> i64:\n"
+        "    total: i64 = 0\n"
+        "    r: i64 =\n"
+        "        for x in xs |acc = 0, total| -> acc:\n"
+        "            acc <- acc + 1\n"
+        "    return r\n";
+    size_t cn = 0; while (csrc[cn]) cn++;
+    uint64_t ccount = 0; uint32_t cline = 0;
+    capture_probe_export((uint8_t *)csrc, cn, &ccount, &cline);
+    if (ccount != 1) {
+        fprintf(stderr, "capture probe FAILED: count=%llu (want count=1)\n", (unsigned long long)ccount);
+        return 5;
+    }
+
     /* Duplicate-declaration check: the checker must report a DuplicateDecl at the
        redefinition's line. `dup` is defined twice; the second def is on line 4, and
        exactly one duplicate must be reported (guards add_symbol's duplicate path). */
