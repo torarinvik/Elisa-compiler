@@ -35,11 +35,15 @@ echo "$out" | grep -q "expects.*arguments, got" && fail "false positive on defau
 out=$(printf 'def add(x: i64, y: i64 = 7) -> i64:\n    return x + y\n\ndef g() -> i64:\n    return add()\n' | "$RPT")
 echo "$out" | grep -q "expects 1-2 arguments, got 0\|wrong number of arguments" || fail "missing required arg before default not flagged: $out"
 
-# 6. Overloaded function names with different arities are ambiguous (no error expected).
+# 6. Required parameters after defaulted parameters are rejected.
+out=$(printf 'def bad(x: i64 = 1, y: i64) -> i64:\n    return x + y\n' | "$RPT")
+echo "$out" | grep -q "must declare a default because it follows a defaulted parameter" || fail "non-trailing default parameter not flagged: $out"
+
+# 7. Overloaded function names with different arities are ambiguous (no error expected).
 out=$(printf 'def f(n: i64) -> i64:\n    return n\n\ndef f(s: sview) -> i64:\n    return 0\n\ndef g() -> i64:\n    return f()\n' | "$RPT")
 echo "$out" | grep -q "expects.*arguments, got" && fail "false positive on overload ambiguity: $out"
 
-# 7. 0 FP across frontend + stdlib.
+# 8. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "expects.*arguments, got" || true)
@@ -47,4 +51,4 @@ while IFS= read -r f; do
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t call-arity false positives across frontend+stdlib"
 
-echo "call-arity smoke OK: flags mismatched argument counts, honors defaulted arity, silent on correct/overloaded calls, 0 FP across frontend+stdlib"
+echo "call-arity smoke OK: flags mismatched argument counts, honors defaulted arity, rejects non-trailing defaults, silent on correct/overloaded calls, 0 FP across frontend+stdlib"
