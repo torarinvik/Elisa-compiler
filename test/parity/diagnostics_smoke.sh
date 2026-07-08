@@ -46,6 +46,7 @@ NAMES=(
     ungranted_panic
     ungranted_effect_call
     ungranted_inferred_effect_call
+    contract_not_first
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -61,6 +62,7 @@ EXPECTS=(
     "panic performed with no enclosing effect grant"
     "call to 'g' requires an enclosing effect grant"
     "call to 'h' requires an enclosing effect grant"
+    "must be the first statements of the function body"
 )
 
 total=0
