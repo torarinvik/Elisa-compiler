@@ -48,6 +48,8 @@ NAMES=(
     ungranted_inferred_effect_call
     contract_not_first
     contract_ensure_result_void
+    dict_key_affine
+    set_element_affine
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -65,6 +67,8 @@ EXPECTS=(
     "call to 'h' requires an enclosing effect grant"
     "must be the first statements of the function body"
     "returns void (no result value to bind)"
+    "dict keys cannot contain linear handles, got Guard"
+    "set elements cannot contain linear handles, got Guard"
 )
 
 total=0
