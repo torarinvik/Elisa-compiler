@@ -55,6 +55,7 @@ NAMES=(
     const_enum_storage
     const_enum_value
     raise_without_error_set
+    region_annotation_scalar
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -79,6 +80,7 @@ EXPECTS=(
     "storage type must be an explicit integer type, got bool"
     "value does not fit storage type u8"
     "raise requires the current function to return an error union"
+    "the scalar type i32 cannot carry a region"
 )
 
 total=0
