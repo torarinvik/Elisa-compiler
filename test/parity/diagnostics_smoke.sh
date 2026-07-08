@@ -53,6 +53,7 @@ NAMES=(
     unused_decreases
     ghost_field_default
     const_enum_storage
+    const_enum_value
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -75,6 +76,7 @@ EXPECTS=(
     "termination clause is unused"
     "cannot have a default value (it is verification-only"
     "storage type must be an explicit integer type, got bool"
+    "value does not fit storage type u8"
 )
 
 total=0
