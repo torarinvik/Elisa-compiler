@@ -287,6 +287,11 @@ extend Parser:
                 # may be omitted in a by-label construction.
                 rebind is_optional: bool, parser = parser.accept(TokenKind.Question)
                 parser, _ <- parser.expect(TokenKind.Colon)
+                # Capture the field's type-head identifier before parsing the type
+                # expression, so `flags: bitset:` / `layout: bitfield:` groups can be
+                # recognized (a bare `bitset`/`bitfield` name followed by a `:` block).
+                type_head_token: Token = parser.cursor()
+                type_head_text: sview = Lexer::text_or_empty(type_head_token, parser.source)
                 rebind member_type_opt: Ast::Expr?, parser = parser.expression()
                 if member_type_opt is member_type:
                     # Optional default value `name: T = <expression>` — the type parser stops
@@ -298,6 +303,23 @@ extend Parser:
                     if accepted_assign_2:
                         has_default <- true
                         parser, _ <- parser.expression()
+
+                    # A field with its own indented block (`flags: bitset:` then flag names,
+                    # or `layout: bitfield:` then `name: T` members) — the type expression
+                    # above consumed the `bitset`/`bitfield` head, so a trailing `: NEWLINE
+                    # INDENT ... DEDENT` follows. When the head is exactly `bitset`/`bitfield`
+                    # the members are captured structurally; any other nested block is
+                    # skipped blindly (unchanged behavior).
+                    group_kind: mutable sview = ""
+                    group_members: mutable darray[Ast::BitGroupMember] = []
+                    opens_block: bool = parser.peek() == TokenKind.Colon and parser.peek_at(1) == TokenKind.Newline
+                    is_bit_group: bool = type_head_text == "bitset" or type_head_text == "bitfield"
+                    if opens_block and is_bit_group:
+                        group_kind <- type_head_text
+                        group_members, parser <- parser.bit_group_member_block()
+                    elif opens_block:
+                        parser <- parser.skip_bit_group_block_raw()
+
                     # Optional `@region` field annotation (`next: T @owner`) — a region
                     # selector, not part of the field type. Captured verbatim so the
                     # region-annotation-on-scalar check can inspect it; "" when absent.
@@ -308,31 +330,62 @@ extend Parser:
                         rebind accepted_region_name: bool, parser = parser.accept(TokenKind.Ident)
                         if accepted_region_name:
                             member_region <- Lexer::text_or_empty(region_token, parser.source)
-                    member: Ast::StructMember = Ast::StructMember{name: Lexer::text_or_empty(member_name, parser.source), type_expression: member_type, omittable: is_optional or has_default, is_ghost: is_ghost_field, has_default: has_default, region: member_region}
+                    member: Ast::StructMember = Ast::StructMember{name: Lexer::text_or_empty(member_name, parser.source), type_expression: member_type, omittable: is_optional or has_default, is_ghost: is_ghost_field, has_default: has_default, region: member_region, bit_group_kind: group_kind, bit_group_members: group_members}
                     members.push(member)
                     # `field: type at OFFSET [requires size >= N]` guest-overlay clause.
                     parser <- parser.skip_guest_overlay_clause()
-
-                # A field with its own indented block (`flags: bitset:` then flag names) —
-                # the type expression above consumed `bitset`; skip the trailing `: NEWLINE INDENT
-                # ... DEDENT` so the flag lines aren't parsed as malformed members.
-                if parser.peek() == TokenKind.Colon and parser.peek_at(1) == TokenKind.Newline:
-                    parser, _ <- parser.advance()                 # the nested `:`
-                    parser, _ <- parser.expect(TokenKind.Newline)
-                    rebind accepted_indent_2: bool, parser = parser.accept(TokenKind.Indent)
-                    if accepted_indent_2:
-                        while depth > 0 and parser.peek() != TokenKind.Eof |parser, depth: int = 1|:
-                            rebind advanced_token: Token, parser = parser.advance()
-
-                            kind: TokenKind = advanced_token.kind
-                            if kind == TokenKind.Indent:
-                                depth <- depth + 1
-                            elif kind == TokenKind.Dedent:
-                                depth <- depth - 1
                 parser, _ <- parser.accept(TokenKind.Newline)
 
             parser, _ <- parser.expect(TokenKind.Dedent)
             return members
+
+
+        # Parse the indented body of a packed bit group (`flags: bitset:` / `layout:
+        # bitfield:`). The leading `:` NEWLINE INDENT and trailing DEDENT are consumed here.
+        # A `bitset` flag is a bare `IDENT` line (type left `Invalid` — an implicit 1-bit
+        # member); a `bitfield` member is `IDENT : TYPE`. Names and (bitfield) storage types
+        # are captured in declaration order for the semantic layout checks.
+        def bit_group_member_block(parser: lmut Parser) -> darray[Ast::BitGroupMember]:
+            result: mutable darray[Ast::BitGroupMember] = []
+            parser, _ <- parser.advance()                 # the nested `:`
+            parser, _ <- parser.expect(TokenKind.Newline)
+            rebind accepted_indent: bool, parser = parser.accept(TokenKind.Indent)
+            if accepted_indent:
+                while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, result|:
+                    parser <- parser.skip_newlines()
+                    if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
+                        break
+                    if parser.peek() != TokenKind.Ident:
+                        parser, _ <- parser.advance()
+                        continue
+                    rebind bg_name: Token, parser = parser.expect(TokenKind.Ident)
+                    bg_line: u32 = bg_name.line
+                    bg_type: mutable Ast::Expr = (Ast::Expr.Invalid)
+                    rebind accepted_bg_colon: bool, parser = parser.accept(TokenKind.Colon)
+                    if accepted_bg_colon:
+                        rebind bg_type_opt: Ast::Expr?, parser = parser.expression()
+                        if bg_type_opt is bg_type_value:
+                            bg_type <- bg_type_value
+                    result.push(Ast::BitGroupMember{name: Lexer::text_or_empty(bg_name, parser.source), type_expression: bg_type, line: bg_line})
+                    parser, _ <- parser.accept(TokenKind.Newline)
+                parser, _ <- parser.expect(TokenKind.Dedent)
+            return result
+
+
+        # Blindly skip a field's nested `:` NEWLINE INDENT ... DEDENT block that is not a
+        # recognized packed bit group (depth-tracked token consumption; unchanged behavior).
+        def skip_bit_group_block_raw(parser: lmut Parser) -> void:
+            parser, _ <- parser.advance()                 # the nested `:`
+            parser, _ <- parser.expect(TokenKind.Newline)
+            rebind accepted_indent_raw: bool, parser = parser.accept(TokenKind.Indent)
+            if accepted_indent_raw:
+                while depth > 0 and parser.peek() != TokenKind.Eof |parser, depth: int = 1|:
+                    rebind advanced_token: Token, parser = parser.advance()
+                    kind: TokenKind = advanced_token.kind
+                    if kind == TokenKind.Indent:
+                        depth <- depth + 1
+                    elif kind == TokenKind.Dedent:
+                        depth <- depth - 1
 
 
         # Parse the indented body of an enum: `(IDENT [ ( <field>, ... ) ] NEWLINE)*`.
