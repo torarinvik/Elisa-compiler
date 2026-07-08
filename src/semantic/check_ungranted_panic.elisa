@@ -96,10 +96,78 @@ extend Semantic:
                             pass
 
 
+        # Whether `target` is one of `names` (content equality on the copied spans). Used to
+        # suppress the effect-call fire when the callee is shadowed by a local/param binder.
+        def names_contains(names: darray[sview], target: sview) -> bool:
+            for candidate in names:
+                candidate_name: sview = candidate
+                if candidate_name == target:
+                    return true
+            return false
+
+
+        # Collect every name a pattern binds (recursively), pushing into `names` in place.
+        def pattern_bound_names(pattern: Ast::Pattern, names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name):
+                        names.push(name)
+                    Pattern.TypeBind(type_name, binder):
+                        names.push(binder)
+                    Pattern.As(name, inner):
+                        names.push(name)
+                        for sub in inner:
+                            pattern_bound_names(sub, names)
+                    Pattern.Variant(path, fields):
+                        for sub in fields:
+                            pattern_bound_names(sub, names)
+                    Pattern.Struct(path, fields):
+                        for sub in fields:
+                            pattern_bound_names(sub, names)
+                    Pattern.Tuple(elements):
+                        for sub in elements:
+                            pattern_bound_names(sub, names)
+                    Pattern.Or(options):
+                        for sub in options:
+                            pattern_bound_names(sub, names)
+                    _:
+                        pass
+
+
+        # Collect every name bound anywhere in a statement list (params handled by the caller):
+        # local var-decls, for-loop variables, block bindings, and match-arm pattern bindings.
+        # Over-collection is sound here — it only ever SUPPRESSES the effect-call fire, so a name
+        # bound in any scope of the function shadows the top-level callee for the whole function.
+        def collect_bound_names(statements: darray[Ast::Stmt], names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            names.push(name)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            for loop_variable in variables:
+                                names.push(loop_variable)
+                            collect_bound_names(body, names)
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_bound_names(then_body, names)
+                            collect_bound_names(else_body, names)
+                        Stmt.While(condition, body, line):
+                            collect_bound_names(body, names)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            names.push(binding)
+                            collect_bound_names(body, names)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                pattern_bound_names(arm.pattern, names)
+                                collect_bound_names(arm.body, names)
+                        _:
+                            pass
+
+
         # Walk a statement list tracking whether any enclosing `can`/`trusted` grant block (or
         # a signature effect grant, folded in by the caller) is active. `can`/`trusted` blocks
         # set the grant for their body; all other block-bearing statements pass it through.
-        def check_ungranted_panic_statements(statements: darray[Ast::Stmt], in_grant: bool, table: lmut SymbolTable) -> void:
+        def check_ungranted_panic_statements(statements: darray[Ast::Stmt], in_grant: bool, bound_names: darray[sview], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
@@ -108,7 +176,7 @@ extend Semantic:
                                 callee_name: sview = called_function_name(expression)
                                 if callee_name == "panic":
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedPanic, name: "", line: line, expected: "", actual: ""})
-                                elif callee_name != "" and direct_function_count(table, callee_name) == 1 and function_has_effect(table, callee_name):
+                                elif callee_name != "" and not names_contains(bound_names, callee_name) and direct_function_count(table, callee_name) == 1 and function_has_effect(table, callee_name):
                                     # A call to a uniquely-resolved function that DECLARES
                                     # signature effects OR INFERS one (untrusted panic in its
                                     # body — one hop of stage0's transitive inference) requires
@@ -119,17 +187,17 @@ extend Semantic:
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: callee_name, line: line, expected: "", actual: ""})
                         Stmt.Block(kind, clause, binding, body, line):
                             block_grant: bool = in_grant or kind == "can" or kind == "trusted"
-                            table <- check_ungranted_panic_statements(body, block_grant, table)
+                            table <- check_ungranted_panic_statements(body, block_grant, bound_names, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_ungranted_panic_statements(then_body, in_grant, table)
-                            table <- check_ungranted_panic_statements(else_body, in_grant, table)
+                            table <- check_ungranted_panic_statements(then_body, in_grant, bound_names, table)
+                            table <- check_ungranted_panic_statements(else_body, in_grant, bound_names, table)
                         Stmt.While(condition, body, line):
-                            table <- check_ungranted_panic_statements(body, in_grant, table)
+                            table <- check_ungranted_panic_statements(body, in_grant, bound_names, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_ungranted_panic_statements(body, in_grant, table)
+                            table <- check_ungranted_panic_statements(body, in_grant, bound_names, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table| -> table:
-                                table <- check_ungranted_panic_statements(arm.body, in_grant, table)
+                                table <- check_ungranted_panic_statements(arm.body, in_grant, bound_names, table)
                         Stmt.Return(value, line):
                             pass
                         Stmt.Contract(kind, expression, line):
@@ -155,7 +223,11 @@ extend Semantic:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, effects, decorators, line):
                             signature_grant: bool = effects.count > 0
-                            table <- check_ungranted_panic_statements(body, signature_grant, table)
+                            bound_names: mutable darray[sview] = []
+                            for parameter in parameters:
+                                bound_names.push(parameter.name)
+                            collect_bound_names(body, bound_names)
+                            table <- check_ungranted_panic_statements(body, signature_grant, bound_names, table)
                         Decl.Module(name, body, line):
                             table <- check_ungranted_panic(body, table)
                         Decl.Scoped(body, line):
