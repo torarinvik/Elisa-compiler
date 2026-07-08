@@ -54,6 +54,7 @@ NAMES=(
     ghost_field_default
     const_enum_storage
     const_enum_value
+    raise_without_error_set
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -77,6 +78,7 @@ EXPECTS=(
     "cannot have a default value (it is verification-only"
     "storage type must be an explicit integer type, got bool"
     "value does not fit storage type u8"
+    "raise requires the current function to return an error union"
 )
 
 total=0
