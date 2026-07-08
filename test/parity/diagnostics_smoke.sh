@@ -57,6 +57,7 @@ NAMES=(
     raise_without_error_set
     region_annotation_scalar
     duplicate_bit_group_member
+    named_states_without_derive
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -83,6 +84,7 @@ EXPECTS=(
     "raise requires the current function to return an error union"
     "the scalar type i32 cannot carry a region"
     "duplicate packed group member 'b' in H.flags"
+    "declares named states but is missing a derive state: block"
 )
 
 total=0
