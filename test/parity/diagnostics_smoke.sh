@@ -43,6 +43,7 @@ NAMES=(
     darray_element_mismatch
     struct_pattern_type_mismatch
     match_arm_enum_mismatch
+    ungranted_panic
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -55,6 +56,7 @@ EXPECTS=(
     "darray literal element expects i64, got string"
     "struct pattern expects struct 'Q', got 'P'"
     "match arm expects enum 'E', got 'G'"
+    "panic performed with no enclosing effect grant"
 )
 
 total=0
