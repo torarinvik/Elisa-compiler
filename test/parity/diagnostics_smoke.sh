@@ -51,6 +51,7 @@ NAMES=(
     dict_key_affine
     set_element_affine
     unused_decreases
+    ghost_field_default
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -71,6 +72,7 @@ EXPECTS=(
     "dict keys cannot contain linear handles, got Guard"
     "set elements cannot contain linear handles, got Guard"
     "termination clause is unused"
+    "cannot have a default value (it is verification-only"
 )
 
 total=0
