@@ -45,6 +45,7 @@ NAMES=(
     match_arm_enum_mismatch
     ungranted_panic
     ungranted_effect_call
+    ungranted_inferred_effect_call
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -59,6 +60,7 @@ EXPECTS=(
     "match arm expects enum 'E', got 'G'"
     "panic performed with no enclosing effect grant"
     "call to 'g' requires an enclosing effect grant"
+    "call to 'h' requires an enclosing effect grant"
 )
 
 total=0
