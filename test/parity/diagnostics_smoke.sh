@@ -44,6 +44,7 @@ NAMES=(
     struct_pattern_type_mismatch
     match_arm_enum_mismatch
     ungranted_panic
+    ungranted_effect_call
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -57,6 +58,7 @@ EXPECTS=(
     "struct pattern expects struct 'Q', got 'P'"
     "match arm expects enum 'E', got 'G'"
     "panic performed with no enclosing effect grant"
+    "call to 'g' requires an enclosing effect grant"
 )
 
 total=0
