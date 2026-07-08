@@ -50,6 +50,7 @@ NAMES=(
     contract_ensure_result_void
     dict_key_affine
     set_element_affine
+    unused_decreases
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -69,6 +70,7 @@ EXPECTS=(
     "returns void (no result value to bind)"
     "dict keys cannot contain linear handles, got Guard"
     "set elements cannot contain linear handles, got Guard"
+    "termination clause is unused"
 )
 
 total=0
