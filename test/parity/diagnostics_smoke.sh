@@ -52,6 +52,7 @@ NAMES=(
     set_element_affine
     unused_decreases
     ghost_field_default
+    const_enum_storage
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -73,6 +74,7 @@ EXPECTS=(
     "set elements cannot contain linear handles, got Guard"
     "termination clause is unused"
     "cannot have a default value (it is verification-only"
+    "storage type must be an explicit integer type, got bool"
 )
 
 total=0
