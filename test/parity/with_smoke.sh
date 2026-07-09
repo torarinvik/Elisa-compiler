@@ -26,4 +26,19 @@ out=$(printf 'const enum K of u8:\n    A\n    B\ndef f(k: K) -> i64:\n    return
 echo "$out" | grep -q "^P 0$" || fail "with-less arm regressed (parse): $out"
 echo "$out" | grep -q "^D 0$" || fail "with-less arm regressed (diagnostics): $out"
 
-echo "with smoke OK: single-line + multi-line/multi-decl alternatives bind their constants; with-less arm unchanged"
+# 4. docs/125 §5 R1 — alternatives that bind DIFFERENT constant name-sets are refused
+# early at the arm (a parse error), not surfaced late as an undefined-identifier. Two
+# shapes: mismatched names (`x` vs `y`) and a name present on only one side.
+for arm in 'K.A with x = 1 | K.B with y = 2' 'K.A with x = 1 | K.B'; do
+    out=$(printf 'const enum K of u8:\n    A\n    B\ndef f(k: K) -> i64:\n    return match k:\n        %s:\n            return x\n        _:\n            return 0\n' "$arm" | "$RPT")
+    echo "$out" | grep -q "^P 0$" && fail "R1 not raised for mismatched `with` sets [$arm]: $out"
+    echo "$out" | grep -q "must bind the same constants" || fail "R1 message missing [$arm]: $out"
+done
+
+# 5. R1 is zero-false-positive: alternatives binding the IDENTICAL set (same names, values
+# may differ) are accepted clean — the body reads the shared constant.
+out=$(printf 'const enum K of u8:\n    A\n    B\ndef f(k: K) -> i64:\n    return match k:\n        K.A with x = 1 | K.B with x = 2:\n            return x\n        _:\n            return 0\n' | "$RPT")
+echo "$out" | grep -q "^P 0$" || fail "R1 false-positive on identical name-set (parse): $out"
+echo "$out" | grep -q "^D 0$" || fail "R1 false-positive on identical name-set (diagnostics): $out"
+
+echo "with smoke OK: alternatives bind their constants; with-less arm unchanged; R1 refuses mismatched sets, accepts identical sets"
