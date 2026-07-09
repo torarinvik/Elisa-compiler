@@ -1,0 +1,138 @@
+extend Parser:
+    public:
+        # docs/125 §5 — `with NAME = LITERAL[, NAME = LITERAL]*` or-alternative discriminators.
+        # Port of stage0's match_with.go. An or-arm whose alternatives share a body but differ
+        # in shape gives each alternative a distinguishing COMPILE-TIME CONSTANT, so the body
+        # is written once and reads the constant uniformly:
+        #
+        #   Expr.IntLit(magnitude) with negated = false
+        #   | Expr.Unary(TokenKind.Minus, Expr.IntLit(magnitude), _) with negated = true:
+        #       ...uses `magnitude` and `negated`...
+        #
+        # Like `machine`/`when`, this is a PARSER-LEVEL desugar and stage1 owns no codegen: the
+        # arm is FANNED OUT into one sibling MatchArm per alternative, each carrying a fresh copy
+        # of the shared body with its `with` bindings prepended as ordinary immutable locals. No
+        # AST/semantic/backend change — the constant is a normal local the body already reads.
+        #
+        # `with` binds at the arm-ALTERNATIVE (top) level; nested `with` inside a payload's
+        # or-group is not supported (lift the or to the arm level). Because stage1's normal arm
+        # header parses `|` with LOWER precedence than `,` (parse_pattern), this fan-out path is
+        # taken ONLY when a top-level `with` is actually present (arm_header_has_with), leaving
+        # every `with`-less arm on the existing path byte-for-byte unchanged.
+
+        struct WithArmAlternative:
+            pattern: Ast::Pattern
+            with_decls: darray[Ast::Stmt]
+            line: u32
+
+        # Does the current arm header carry a top-level `with`? Scans from the cursor to the
+        # arm's block colon at bracket-depth 0, skipping grouped sub-spans; `|` doesn't nest.
+        def arm_header_has_with(parser: Parser&) -> bool:
+            index: mutable usize = parser.position
+            depth: mutable i64 = 0
+            while index < parser.tokens.count |index, depth|:
+                token: Token = parser.tokens[index]
+                kind: TokenKind = token.kind
+                if depth == 0 and (kind == TokenKind.Colon or kind == TokenKind.Newline or kind == TokenKind.Eof):
+                    return false
+                elif kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace:
+                    depth <- depth + 1
+                elif kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace:
+                    depth <- depth - 1
+                elif depth == 0 and kind == TokenKind.With:
+                    return true
+                index <- index + 1
+            return false
+
+        # Is the next non-Newline token a `|` (alternative separator on a continuation line)?
+        def next_nonnewline_is_pipe(parser: Parser&) -> bool:
+            index: mutable usize = parser.position
+            while index < parser.tokens.count |index|:
+                probe: Token = parser.tokens[index]
+                break if probe.kind != TokenKind.Newline
+                index <- index + 1
+            false return if index >= parser.tokens.count
+            landing: Token = parser.tokens[index]
+            return landing.kind == TokenKind.Pipe
+
+        # Parse a full `with`-bearing arm and fan it out into one MatchArm per alternative.
+        def parse_with_arm(parser: lmut Parser) -> darray[Ast::MatchArm]:
+            alternatives: mutable darray[WithArmAlternative] = []
+            rebind first_alt: WithArmAlternative, parser = parser.parse_with_alternative()
+            alternatives.push(first_alt)
+            # A `|` separating alternatives may sit on a continuation line, so a layout
+            # Newline can precede it (unlike inside an expression). Skip newlines only when a
+            # `|` actually follows, so a header that ends at `if`/`:` isn't over-consumed.
+            while parser.next_nonnewline_is_pipe() |parser, alternatives|:
+                parser <- parser.skip_newlines()
+                parser, _ <- parser.advance()                       # `|`
+                rebind alt: WithArmAlternative, parser = parser.parse_with_alternative()
+                alternatives.push(alt)
+
+            # Optional arm-header guard, shared by every fanned-out alternative.
+            guard: mutable Ast::Expr = (Ast::Expr.Absent)
+            if parser.peek() == TokenKind.If:
+                parser, _ <- parser.advance()
+                rebind guard_opt: Ast::Expr?, parser = parser.expression()
+                if guard_opt is guard_value:
+                    guard <- guard_value
+
+            arms: mutable darray[Ast::MatchArm] = []
+            # Halt safety: if an exotic tail left us off the block colon, drop it losslessly.
+            if parser.peek() != TokenKind.Colon:
+                parser, _ <- parser.capture_pattern_span()
+            if parser.peek() != TokenKind.Colon:
+                parser, _ <- parser.advance()   # malformed arm; don't spin
+                return arms
+
+            rebind body: darray[Ast::Stmt], parser = parser.parse_block()
+            for alt in alternatives:
+                combined: mutable darray[Ast::Stmt] = []
+                for decl in alt.with_decls:
+                    combined.push(decl)
+                for statement in body:
+                    combined.push(statement)
+                arms.push(Ast::MatchArm{pattern: alt.pattern, body: combined, guard: guard})
+            return arms
+
+        # One alternative: a primary/comma-tuple pattern (no top-level `|`) plus its `with`.
+        def parse_with_alternative(parser: lmut Parser) -> WithArmAlternative:
+            alt_token: Token = parser.cursor()
+            rebind pattern: Ast::Pattern, parser = parser.parse_with_alternative_pattern()
+            rebind decls: darray[Ast::Stmt], parser = parser.parse_optional_with_bindings()
+            return WithArmAlternative{pattern: pattern, with_decls: decls, line: alt_token.line}
+
+        # A pattern for one alternative: a primary, or a comma-tuple of primaries. Unlike the
+        # normal path this never consumes a top-level `|` (that separates alternatives).
+        def parse_with_alternative_pattern(parser: lmut Parser) -> Ast::Pattern:
+            rebind first: Ast::Pattern, parser = parser.parse_pattern_primary()
+            first return if parser.peek() != TokenKind.Comma
+            elements: mutable darray[Ast::Pattern] = [first]
+            while parser.accept(TokenKind.Comma) |parser, elements|:
+                break if parser.peek() == TokenKind.Colon or parser.peek() == TokenKind.Newline
+                elements.push(parser.parse_pattern_primary())
+            return (Ast::Pattern.Tuple(elements))
+
+        # Trailing `with NAME = LITERAL[, NAME = LITERAL]*` into immutable, inferred VarDecls,
+        # or an empty list when absent. Values are parsed leniently (a `with` constant is a
+        # literal; the frontend need not re-check that — stage0 owns the constant-ness rule).
+        def parse_optional_with_bindings(parser: lmut Parser) -> darray[Ast::Stmt]:
+            decls: mutable darray[Ast::Stmt] = []
+            decls return if parser.peek() != TokenKind.With
+            parser, _ <- parser.advance()   # with
+            while true |parser, decls|:
+                name_token: Token = parser.cursor()
+                name: sview = Lexer::text_or_empty(name_token, parser.source)
+                line: u32 = name_token.line
+                parser, _ <- parser.expect(TokenKind.Ident)
+                parser, _ <- parser.expect(TokenKind.Assign)
+                # A `with` constant is a LITERAL / qualified-member value, never a computed
+                # expression: parse at the postfix level so a following `|` (the alternative
+                # separator) is NOT swallowed as a bit-or operator.
+                rebind value_opt: Ast::Expr?, parser = parser.postfix_expression()
+                value: mutable Ast::Expr = (Ast::Expr.Invalid)
+                if value_opt is parsed_value:
+                    value <- parsed_value
+                decls.push((Ast::Stmt.VarDecl(name, (Ast::Expr.Invalid), value, line)))
+                break if not parser.accept(TokenKind.Comma)
+            return decls
