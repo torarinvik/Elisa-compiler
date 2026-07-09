@@ -58,6 +58,7 @@ NAMES=(
     region_annotation_scalar
     duplicate_bit_group_member
     named_states_without_derive
+    flow_flag_state_machine
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -85,6 +86,7 @@ EXPECTS=(
     "the scalar type i32 cannot carry a region"
     "duplicate packed group member 'b' in H.flags"
     "declares named states but is missing a derive state: block"
+    "written in multiple branches and read after the join"
 )
 
 total=0

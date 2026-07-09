@@ -1,0 +1,244 @@
+# Structured-control-flow lint (docs/125 increment 1, no stage0 counterpart). A "flow flag"
+# is a `mutable bool` local whose writes all live inside branch statements and which is read
+# after the branching join — the boolean is smearing a state machine's state into a variable
+# any line could flip. Warning tier (severity 2).
+#
+# v1 SOUNDNESS STANCE (zero false positives is the prime directive): fire ONLY on the exact
+# proven shape — a `mutable bool` VarDecl at some statement level where (a) NO write to it
+# appears in straight-line code at that level, (b) writes appear inside >= 2 DISTINCT branch
+# statements (If/While/For/Match) at that level, and (c) some statement strictly after the
+# last branch-writing statement mentions the flag (the post-join read). Anything murkier —
+# a level write, a write inside a non-can/trusted block, a same-name redeclaration mid-scan,
+# writes hidden in lambda/block expressions — disqualifies the flag entirely (sound miss).
+extend Semantic:
+    private:
+        # Whether a VarDecl's type annotation is exactly `mutable bool`.
+        def is_mutable_bool_type(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                if type_expression is Expr.Unary(operator, operand, unary_line):
+                    if operator == TokenKind.Mutable:
+                        if operand is Expr.Ident(type_name, ident_line):
+                            bare_name: sview = type_name
+                            return bare_name == "bool"
+                return false
+
+
+        # Whether an expression mentions identifier `name` anywhere. Conservative in the
+        # MISS direction (unknown shapes -> false): a missed mention only suppresses the
+        # post-join-read condition, never adds a fire.
+        def expr_mentions_flag(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(ident_name, line):
+                        candidate: sview = ident_name
+                        return candidate == name
+                    Expr.Call(callee, arguments, argument_names, line):
+                        if expr_mentions_flag(callee, name):
+                            return true
+                        for argument in arguments:
+                            if expr_mentions_flag(argument, name):
+                                return true
+                        return false
+                    Expr.Binary(left, operator, right, line):
+                        return expr_mentions_flag(left, name) or expr_mentions_flag(right, name)
+                    Expr.Unary(operator, operand, line):
+                        return expr_mentions_flag(operand, name)
+                    Expr.Paren(inner, line):
+                        return expr_mentions_flag(inner, name)
+                    Expr.Field(object, field, line):
+                        return expr_mentions_flag(object, name)
+                    Expr.Index(object, index, line):
+                        return expr_mentions_flag(object, name) or expr_mentions_flag(index, name)
+                    Expr.Array(elements, line):
+                        for element in elements:
+                            if expr_mentions_flag(element, name):
+                                return true
+                        return false
+                    Expr.Tuple(elements, line):
+                        for element in elements:
+                            if expr_mentions_flag(element, name):
+                                return true
+                        return false
+                    Expr.If(condition, then_expression, else_expression, line):
+                        return expr_mentions_flag(condition, name) or expr_mentions_flag(then_expression, name) or expr_mentions_flag(else_expression, name)
+                    Expr.Match(scrutinee, arms, line):
+                        return expr_mentions_flag(scrutinee, name)
+                    _:
+                        return false
+
+
+        # Whether a statement subtree mentions `name` in any expression position (recursing
+        # into nested bodies). Used for the post-join-read test only.
+        def stmt_mentions_flag(statement: Ast::Stmt, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, line):
+                        return expr_mentions_flag(expression, name)
+                    Stmt.VarDecl(decl_name, type_expression, value, line):
+                        return expr_mentions_flag(value, name)
+                    Stmt.Assign(target, operator, value, line):
+                        return expr_mentions_flag(target, name) or expr_mentions_flag(value, name)
+                    Stmt.Return(value, line):
+                        if value is return_value:
+                            return expr_mentions_flag(return_value, name)
+                        return false
+                    Stmt.If(condition, then_body, else_body, line):
+                        return expr_mentions_flag(condition, name) or stmts_mention_flag(then_body, name) or stmts_mention_flag(else_body, name)
+                    Stmt.While(condition, body, line):
+                        return expr_mentions_flag(condition, name) or stmts_mention_flag(body, name)
+                    Stmt.For(bind, variables, iterable, body, line):
+                        return expr_mentions_flag(iterable, name) or stmts_mention_flag(body, name)
+                    Stmt.Block(kind, clause, binding, body, line):
+                        return stmts_mention_flag(body, name)
+                    Stmt.Match(scrutinee, arms, line):
+                        if expr_mentions_flag(scrutinee, name):
+                            return true
+                        for arm in arms:
+                            if stmts_mention_flag(arm.body, name):
+                                return true
+                        return false
+                    _:
+                        return false
+
+
+        def stmts_mention_flag(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    if stmt_mentions_flag(statement, name):
+                        return true
+                return false
+
+
+        # Count assignments (`<-` or compound) whose target is exactly `Ident(name)` in a
+        # statement subtree. Only statement-position assignments are counted; a write hidden
+        # inside a lambda/block EXPRESSION is invisible here, so v1 undercounts (a missed
+        # write can only suppress a fire, never add one — the sound-miss direction).
+        def flag_write_count(statements: darray[Ast::Stmt], name: sview) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                total: mutable usize = 0
+                for statement in statements:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            if target is Expr.Ident(target_name, target_line):
+                                candidate: sview = target_name
+                                if candidate == name:
+                                    total <- total + 1
+                        Stmt.If(condition, then_body, else_body, line):
+                            total <- total + flag_write_count(then_body, name) + flag_write_count(else_body, name)
+                        Stmt.While(condition, body, line):
+                            total <- total + flag_write_count(body, name)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            total <- total + flag_write_count(body, name)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            total <- total + flag_write_count(body, name)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                total <- total + flag_write_count(arm.body, name)
+                        _:
+                            pass
+                return total
+
+
+        # Analyze one statement level: for each `mutable bool` declared here, classify every
+        # later statement at this level and fire on the proven flow-flag shape.
+        def analyze_flow_flags_at_level(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                declaration_index: mutable usize = 0
+                while declaration_index < statements.count:
+                    match statements[declaration_index]:
+                        Stmt.VarDecl(flag_name, type_expression, value, decl_line):
+                            if is_mutable_bool_type(type_expression):
+                                candidate_name: sview = flag_name
+                                branch_writers: mutable usize = 0
+                                last_writer_index: mutable usize = 0
+                                disqualified: mutable bool = false
+                                scan_end: mutable usize = statements.count
+                                scan_index: mutable usize = declaration_index + 1
+                                while scan_index < scan_end:
+                                    match statements[scan_index]:
+                                        Stmt.VarDecl(other_name, other_type, other_value, other_line):
+                                            shadow_name: sview = other_name
+                                            if shadow_name == candidate_name:
+                                                # Same-name redeclaration: stop the scan here.
+                                                scan_end <- scan_index
+                                        Stmt.Assign(target, operator, assigned_value, assign_line):
+                                            if target is Expr.Ident(target_name, target_line):
+                                                written_name: sview = target_name
+                                                if written_name == candidate_name:
+                                                    # Straight-line write at the declaring
+                                                    # level: not the flow-flag shape.
+                                                    disqualified <- true
+                                        Stmt.If(condition, then_body, else_body, line):
+                                            if flag_write_count(then_body, candidate_name) + flag_write_count(else_body, candidate_name) > 0:
+                                                branch_writers <- branch_writers + 1
+                                                last_writer_index <- scan_index
+                                        Stmt.While(condition, body, line):
+                                            if flag_write_count(body, candidate_name) > 0:
+                                                branch_writers <- branch_writers + 1
+                                                last_writer_index <- scan_index
+                                        Stmt.For(bind, variables, iterable, body, line):
+                                            if flag_write_count(body, candidate_name) > 0:
+                                                branch_writers <- branch_writers + 1
+                                                last_writer_index <- scan_index
+                                        Stmt.Match(scrutinee, arms, line):
+                                            match_writes: mutable usize = 0
+                                            for arm in arms:
+                                                match_writes <- match_writes + flag_write_count(arm.body, candidate_name)
+                                            if match_writes > 0:
+                                                branch_writers <- branch_writers + 1
+                                                last_writer_index <- scan_index
+                                        Stmt.Block(kind, clause, binding, body, line):
+                                            if flag_write_count(body, candidate_name) > 0:
+                                                # A write inside an opaque block at this
+                                                # level: conservatively disqualify.
+                                                disqualified <- true
+                                        _:
+                                            pass
+                                    scan_index <- scan_index + 1
+                                if not disqualified and branch_writers >= 2:
+                                    read_index: mutable usize = last_writer_index + 1
+                                    while read_index < scan_end:
+                                        if stmt_mentions_flag(statements[read_index], candidate_name):
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowFlagStateMachine, name: candidate_name, line: decl_line, expected: "", actual: "", expected_count: branch_writers.u32(), actual_count: 0})
+                                            read_index <- scan_end
+                                        else:
+                                            read_index <- read_index + 1
+                        _:
+                            pass
+                    declaration_index <- declaration_index + 1
+
+
+        # Recurse the analysis into every nested statement level.
+        def walk_statements_for_flow_flag(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- analyze_flow_flags_at_level(statements, table)
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- walk_statements_for_flow_flag(then_body, table)
+                            table <- walk_statements_for_flow_flag(else_body, table)
+                        Stmt.While(condition, body, line):
+                            table <- walk_statements_for_flow_flag(body, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- walk_statements_for_flow_flag(body, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- walk_statements_for_flow_flag(body, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- walk_statements_for_flow_flag(arm.body, table)
+                        _:
+                            pass
+
+
+        def check_flow_flag(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            table <- walk_statements_for_flow_flag(body, table)
+                        Decl.Module(name, body, line):
+                            table <- check_flow_flag(body, table)
+                        Decl.Scoped(body, line):
+                            table <- check_flow_flag(body, table)
+                        _:
+                            pass
