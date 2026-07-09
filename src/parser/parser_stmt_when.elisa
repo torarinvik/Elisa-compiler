@@ -1,0 +1,171 @@
+extend Parser:
+    private:
+        # docs/125 §4 — `when`: an order-independent decision table. Port of stage0's
+        # parser desugar (compiler/src/parser/when.go). Like `machine` (docs/123) it is a
+        # contextual keyword lowered ENTIRELY in the parser, onto the existing Match node,
+        # so every downstream pass (resolve, the check_* diagnostics, semantic) reuses its
+        # `match` handling unchanged.
+        #
+        # Stage1 deltas from stage0 (frontend-only; the `when` source is already
+        # stage0-validated when it reaches this parser):
+        #   - the R1/R2/R3 refusal diagnostics (disjointness, totality, restricted arm
+        #     grammar) are NOT re-emitted — stage0 owns them; the stage1 parse is purely
+        #     structural (mirrors the machine port).
+        #   - arm bodies desugar to Match arms exactly as stage0 does.
+        #
+        # Grammar (arms differ from `match` top-level arms: `|` binds WITHIN a column and
+        # `,` separates columns, so `"u8" | "u16", true` is ONE two-column row):
+        #
+        #   when SCRUT[, SCRUT]*:
+        #       PAT[|PAT]*[, PAT[|PAT]*]* -> VALUE-or-BLOCK
+        #       _ -> VALUE-or-BLOCK
+
+        # `when` is a contextual keyword: the construct is recognized only when the next
+        # token can begin a scrutinee in a position a `when` variable could not continue
+        # (an identifier, a literal, or a unary minus). Postfix/operator continuations
+        # (`when(x)`, `when[i]`, `when.f`, `when <- v`, `when = e`) keep the identifier
+        # meaning — this mirrors stage0's gate exactly.
+        def when_construct_ahead(parser: Parser&) -> bool:
+            next_kind: TokenKind = parser.peek_at(1)
+            return next_kind in {TokenKind.Ident, TokenKind.IntLit, TokenKind.HexLit, TokenKind.FloatLit, TokenKind.CharLit, TokenKind.StringLit, TokenKind.True, TokenKind.False, TokenKind.Minus}
+
+        # Parse the comma-separated scrutinee list (mirrors match_statement's head). A
+        # single scrutinee stays scalar; two or more form a tuple the arm columns match.
+        def parse_when_head(parser: lmut Parser) -> Ast::Expr:
+            when_token: Token = parser.cursor()
+            rebind first_option: Ast::Expr?, parser = parser.expression()
+            first: Ast::Expr = get first_option else (Ast::Expr.Invalid)
+            first return if parser.peek() != TokenKind.Comma
+
+            scrutinees: mutable darray[Ast::Expr] = [first]
+            while parser.accept(TokenKind.Comma) |parser|:
+                rebind more_option: Ast::Expr?, parser = parser.expression()
+                if more_option is more:
+                    scrutinees.push(more)
+            return (Ast::Expr.Tuple(scrutinees, when_token.line))
+
+        def when_statement(parser: lmut Parser) -> Ast::Stmt?:
+            rebind when_token: Token, parser = parser.advance()      # `when`
+            rebind scrutinee: Ast::Expr, parser = parser.parse_when_head()
+            rebind arms: darray[Ast::MatchArm], parser = parser.parse_when_arms()
+            return (Ast::Stmt.Match(scrutinee, arms, when_token.line))
+
+        def when_expression(parser: lmut Parser) -> Ast::Expr?:
+            rebind when_token: Token, parser = parser.advance()      # `when`
+            rebind scrutinee: Ast::Expr, parser = parser.parse_when_head()
+            rebind arms: darray[Ast::MatchArm], parser = parser.parse_when_arms()
+            return (Ast::Expr.Match(scrutinee, arms, when_token.line))
+
+        # `: NEWLINE INDENT (ROW)* DEDENT`, each ROW a `PATTERN-COLUMNS -> BODY` arm.
+        # The `_` default row is emitted LAST (order-independence: a mid-table default
+        # must not shadow later arms under match's first-wins), matching stage0.
+        def parse_when_arms(parser: lmut Parser) -> darray[Ast::MatchArm]:
+            parser, _ <- parser.expect(TokenKind.Colon)
+            parser, _ <- parser.expect(TokenKind.Newline)
+            parser, _ <- parser.expect(TokenKind.Indent)
+
+            arms: mutable darray[Ast::MatchArm] = []
+            defaults: mutable darray[Ast::MatchArm] = []
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, arms, defaults|:
+                parser <- parser.skip_newlines()
+                break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+
+                rebind arm: Ast::MatchArm, parser = parser.parse_when_row()
+                is_default: bool = match arm.pattern:
+                    Ast::Pattern.Wildcard:
+                        true
+                    _:
+                        false
+                if is_default:
+                    defaults.push(arm)
+                else:
+                    arms.push(arm)
+            parser, _ <- parser.expect(TokenKind.Dedent)
+
+            for default_arm in defaults:
+                arms.push(default_arm)
+            return arms
+
+        # One `PATTERN-COLUMNS -> BODY` row. Columns are `PAT (| PAT)*`, separated by
+        # `,`; a single wildcard column is the total-default row (Pattern.Wildcard).
+        def parse_when_row(parser: lmut Parser) -> Ast::MatchArm:
+            row_token: Token = parser.cursor()
+
+            columns: mutable darray[darray[Ast::Pattern]] = []
+            while true |parser, columns|:
+                rebind first_option: Ast::Pattern, parser = parser.parse_pattern_primary()
+                column: mutable darray[Ast::Pattern] = [first_option]
+                while parser.accept(TokenKind.Pipe) |parser, column|:
+                    column.push(parser.parse_pattern_primary())
+                columns.push(column)
+                break if not parser.accept(TokenKind.Comma)
+
+            # A stage0-invalid guard (`PAT if COND ->`) is not part of `when` (R3); stage0
+            # owns the diagnostic. Consume it here only so the parser reaches the arrow.
+            if parser.peek() == TokenKind.If:
+                parser, _ <- parser.advance()
+                parser, _ <- parser.expression()
+
+            pattern: Ast::Pattern = when_columns_pattern(columns)
+
+            # If the row head didn't land on the arrow (an exotic/malformed pattern),
+            # drop the rest of the line losslessly so the arm loop never spins.
+            if parser.peek() != TokenKind.Arrow:
+                while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser|:
+                    parser, _ <- parser.advance()
+                empty_body: darray[Ast::Stmt] = []
+                return Ast::MatchArm{pattern: pattern, body: empty_body, guard: (Ast::Expr.Absent)}
+
+            parser, _ <- parser.advance()                           # `->`
+            rebind body: darray[Ast::Stmt], parser = parser.parse_when_body(row_token.line)
+            return Ast::MatchArm{pattern: pattern, body: body, guard: (Ast::Expr.Absent)}
+
+        # The arm value after `->`: an indented statement block, or an inline expression
+        # (a top-level comma builds a tuple value, mirroring a match-expression arm).
+        def parse_when_body(parser: lmut Parser, line: u32) -> darray[Ast::Stmt]:
+            if parser.peek() == TokenKind.Newline:
+                parser, _ <- parser.expect(TokenKind.Newline)
+                parser, _ <- parser.expect(TokenKind.Indent)
+                block: mutable darray[Ast::Stmt] = []
+                while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, block|:
+                    parser <- parser.skip_newlines()
+                    break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+                    rebind statement_option: Ast::Stmt?, parser = parser.statement()
+                    if statement_option is body_statement:
+                        block.push(body_statement)
+                        parser <- parser.skip_trailing_can(true)
+                        parser, _ <- parser.accept(TokenKind.Newline)
+                    else:
+                        parser, _ <- parser.advance()               # error recovery: never spin
+                parser, _ <- parser.expect(TokenKind.Dedent)
+                return block
+
+            rebind value_option: Ast::Expr?, parser = parser.expression()
+            value: Ast::Expr = get value_option else (Ast::Expr.Invalid)
+            if parser.peek() == TokenKind.Comma:
+                elements: mutable darray[Ast::Expr] = [value]
+                while parser.accept(TokenKind.Comma) |parser, elements|:
+                    rebind element_option: Ast::Expr?, parser = parser.expression()
+                    if element_option is element:
+                        elements.push(element)
+                inline_tuple_body: darray[Ast::Stmt] = [(Ast::Stmt.Expr((Ast::Expr.Tuple(elements, line)), line))]
+                return inline_tuple_body
+            parser, _ <- parser.accept(TokenKind.Newline)
+            inline_body: darray[Ast::Stmt] = [(Ast::Stmt.Expr(value, line))]
+            return inline_body
+
+        # Build the arm pattern from the parsed columns. A single column collapses to its
+        # sole pattern (or an Or of its options); multiple columns form a Tuple whose
+        # elements are per-column patterns (each itself an Or when it has options).
+        def when_columns_pattern(columns: darray[darray[Ast::Pattern]]) -> Ast::Pattern:
+            if columns.count == 1:
+                return when_column_pattern(columns[0])
+            elements: mutable darray[Ast::Pattern] = []
+            for column in columns:
+                elements.push(when_column_pattern(column))
+            return (Ast::Pattern.Tuple(elements))
+
+        def when_column_pattern(options: darray[Ast::Pattern]) -> Ast::Pattern:
+            if options.count == 1:
+                return options[0]
+            return (Ast::Pattern.Or(options))
