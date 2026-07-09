@@ -1,0 +1,214 @@
+extend Parser:
+    public:
+        # docs/125 §5 — `machine from START [decreases M]:` state-machine EXPRESSION.
+        # Port of stage0's MachineFromExpr. Stage1 is a frontend (no codegen), so this
+        # desugars — entirely in the parser — to a value `Expr.Block` that RESOLVES:
+        #   result/done/mode locals + `while not done: <mode if-chain>`, yielding result.
+        # States are the variants of an EXISTING enum, so `mode` reuses that enum and no
+        # enum is synthesized (unlike `machine over`). Per the machine-port philosophy the
+        # graph refusals (R2/R3/R4) are NOT re-emitted — stage0 owns them; the parse is
+        # structural. `next State` -> `mode <- Enum.State`; `done VALUE` ->
+        # `result <- VALUE; done <- true`.
+
+        struct MachineFromTermAst:
+            is_done: bool
+            target: sview          # next: successor state
+            value: Ast::Expr       # done: yielded value (Invalid for next)
+            guard: Ast::Expr       # Absent when unguarded
+            line: u32
+
+        struct MachineFromArmS:
+            state: sview
+            body: darray[Ast::Stmt]
+            terminators: darray[MachineFromTermAst]
+            line: u32
+
+        # `machine from …`: recognized when the ident `from` immediately follows `machine`.
+        def machine_from_ahead(parser: Parser&) -> bool:
+            if parser.position + 1 >= parser.tokens.count:
+                return false
+            next_token: Token = parser.tokens[parser.position + 1]
+            return next_token.kind == TokenKind.Ident and Lexer::text_or_empty(next_token, parser.source) == "from"
+
+        # Parse `Enum.State` (or a bare `State`); returns the variant name. The enum prefix
+        # is captured separately by the caller for the start state.
+        def parse_machine_from_variant(parser: lmut Parser) -> sview:
+            rebind first: Token, parser = parser.expect(TokenKind.Ident)
+            first_text: sview = Lexer::text_or_empty(first, parser.source)
+            rebind accepted_dot: bool, parser = parser.accept(TokenKind.Dot)
+            if accepted_dot:
+                rebind second: Token, parser = parser.expect(TokenKind.Ident)
+                return Lexer::text_or_empty(second, parser.source)
+            return first_text
+
+        def machine_from_expression(parser: lmut Parser) -> Ast::Expr?:
+            rebind machine_token: Token, parser = parser.advance()   # machine
+            parser, _ <- parser.advance()                            # from
+
+            # Start state `Enum.State`: capture both the enum (for `mode`'s member exprs)
+            # and the entry variant.
+            rebind start_first: Token, parser = parser.expect(TokenKind.Ident)
+            start_enum: mutable sview = Lexer::text_or_empty(start_first, parser.source)
+            start_state: mutable sview = start_enum
+            rebind start_dotted: bool, parser = parser.accept(TokenKind.Dot)
+            if start_dotted:
+                rebind start_second: Token, parser = parser.expect(TokenKind.Ident)
+                start_state <- Lexer::text_or_empty(start_second, parser.source)
+
+            # Optional `decreases MEASURE` — consumed and evaluated (so its names resolve),
+            # then discarded (the desugar loop doesn't need it; stage0 owns the check).
+            decreases_token: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(decreases_token, parser.source) == "decreases":
+                parser, _ <- parser.advance()
+                parser, _ <- parser.expression()
+
+            parser, _ <- parser.expect(TokenKind.Colon)
+            parser, _ <- parser.expect(TokenKind.Newline)
+            parser, _ <- parser.expect(TokenKind.Indent)
+
+            machine_arms: mutable darray[MachineFromArmS] = []
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, machine_arms|:
+                parser <- parser.skip_newlines()
+                break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+                rebind arm: MachineFromArmS, parser = parser.parse_machine_from_arm()
+                machine_arms.push(arm)
+            parser, _ <- parser.expect(TokenKind.Dedent)
+
+            return (build_machine_from_block(start_enum, start_state, machine_arms, machine_token.line))
+
+        def parse_machine_from_arm(parser: lmut Parser) -> MachineFromArmS:
+            arm_token: Token = parser.cursor()
+            rebind state: sview, parser = parser.parse_machine_from_variant()
+            parser, _ <- parser.expect(TokenKind.Colon)
+            parser, _ <- parser.expect(TokenKind.Newline)
+            parser, _ <- parser.expect(TokenKind.Indent)
+
+            body: mutable darray[Ast::Stmt] = []
+            terminators: mutable darray[MachineFromTermAst] = []
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, body, terminators|:
+                parser <- parser.skip_newlines()
+                break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+                head_token: Token = parser.cursor()
+                head: sview = Lexer::text_or_empty(head_token, parser.source)
+                if parser.peek() == TokenKind.Ident and (head == "next" or head == "done"):
+                    rebind term: MachineFromTermAst, parser = parser.parse_machine_from_terminator()
+                    terminators.push(term)
+                else:
+                    rebind stmt_opt: Ast::Stmt?, parser = parser.statement()
+                    if stmt_opt is body_statement:
+                        body.push(body_statement)
+                        parser <- parser.skip_trailing_can(true)
+                        parser, _ <- parser.accept(TokenKind.Newline)
+                    else:
+                        parser, _ <- parser.advance()   # error recovery: never spin
+            parser, _ <- parser.expect(TokenKind.Dedent)
+
+            return MachineFromArmS{state: state, body: body, terminators: terminators, line: arm_token.line}
+
+        def parse_machine_from_terminator(parser: lmut Parser) -> MachineFromTermAst:
+            rebind keyword_token: Token, parser = parser.advance()   # next | done
+            is_done: bool = Lexer::text_or_empty(keyword_token, parser.source) == "done"
+            value: mutable Ast::Expr = (Ast::Expr.Invalid)
+            target: mutable sview = ""
+            if is_done:
+                # The value ends at a top-level `if` guard; the lenient ternary parse
+                # yields an `Expr.If` with an Absent alternative, whose then-branch is the
+                # value and whose condition is the guard.
+                rebind value_opt: Ast::Expr?, parser = parser.expression()
+                if value_opt is parsed_value:
+                    value <- parsed_value
+            else:
+                rebind parsed_target: sview, parser = parser.parse_machine_from_variant()
+                target <- parsed_target
+
+            guard: mutable Ast::Expr = (Ast::Expr.Absent)
+            if is_done:
+                # A `done VALUE if COND` was swallowed as an else-less ternary — split it.
+                match value:
+                    Ast::Expr.If(condition, then_value, else_value, if_line):
+                        is_absent: bool = match else_value:
+                            Ast::Expr.Absent: true
+                            _: false
+                        if is_absent:
+                            guard <- condition
+                            value <- then_value
+                    _:
+                        pass
+            else:
+                if parser.peek() == TokenKind.If:
+                    parser, _ <- parser.advance()
+                    rebind guard_opt: Ast::Expr?, parser = parser.expression()
+                    if guard_opt is parsed_guard:
+                        guard <- parsed_guard
+            parser, _ <- parser.accept(TokenKind.Newline)
+            return MachineFromTermAst{is_done: is_done, target: target, value: value, guard: guard, line: keyword_token.line}
+
+        # Build the value-block desugar: result/done/mode locals + `while not done:` over a
+        # mode if-chain, yielding result.
+        def build_machine_from_block(start_enum: sview, start_state: sview, machine_arms: darray[MachineFromArmS], line: u32) -> Ast::Expr:
+            result_var: sview = "__mf_result"
+            done_var: sview = "__mf_done"
+            mode_var: sview = "__mf_mode"
+
+            declarations: mutable darray[Ast::Stmt] = []
+            declarations.push((Ast::Stmt.VarDecl(result_var, (Ast::Expr.Invalid), (Ast::Expr.Ident("zeroed", line)), line)))
+            declarations.push((Ast::Stmt.VarDecl(done_var, (Ast::Expr.Invalid), (Ast::Expr.BoolLit(false)), line)))
+            declarations.push((Ast::Stmt.VarDecl(mode_var, (Ast::Expr.Invalid), (Ast::Expr.Field((Ast::Expr.Ident(start_enum, line)), start_state, line)), line)))
+
+            # Per-state dispatch block: arm body ++ terminator if/else chain.
+            state_blocks: mutable darray[darray[Ast::Stmt]] = []
+            for arm in machine_arms:
+                block: mutable darray[Ast::Stmt] = []
+                for statement in arm.body:
+                    block.push(statement)
+                for chained in machine_from_terminator_chain(arm.terminators, start_enum, result_var, done_var, mode_var, arm.line):
+                    block.push(chained)
+                state_blocks.push(block)
+
+            # Mode dispatch as an `if mode == Enum.S0: … else: …` chain (last state = else).
+            dispatch: mutable darray[Ast::Stmt] = []
+            if state_blocks.count > 0:
+                dispatch <- state_blocks[state_blocks.count - 1]
+                state_index: mutable usize = machine_arms.count - 1
+                while state_index > 0 |dispatch, state_index, machine_arms, state_blocks, start_enum, line|:
+                    previous: usize = state_index - 1
+                    compare: Ast::Expr = (Ast::Expr.Binary((Ast::Expr.Ident(mode_var, machine_arms[previous].line)), TokenKind.EqEq, (Ast::Expr.Field((Ast::Expr.Ident(start_enum, machine_arms[previous].line)), machine_arms[previous].state, machine_arms[previous].line)), machine_arms[previous].line))
+                    dispatch <- [(Ast::Stmt.If(compare, state_blocks[previous], dispatch, machine_arms[previous].line))]
+                    state_index <- state_index - 1
+
+            loop_condition: Ast::Expr = (Ast::Expr.Unary(TokenKind.Not, (Ast::Expr.Ident(done_var, line)), line))
+            declarations.push((Ast::Stmt.While(loop_condition, dispatch, line)))
+
+            no_captures: darray[sview] = []
+            return (Ast::Expr.Block(declarations, (Ast::Expr.Ident(result_var, line)), no_captures, line))
+
+        # A trailing run of terminators as a nested if/else: guarded terminators become the
+        # conditions, the final unguarded one the else. A single unguarded terminator is its
+        # bare action.
+        def machine_from_terminator_chain(terminators: darray[MachineFromTermAst], start_enum: sview, result_var: sview, done_var: sview, mode_var: sview, line: u32) -> darray[Ast::Stmt]:
+            count: usize = terminators.count
+            if count == 0:
+                return []
+            # Build right-to-left: the last terminator's action is the base.
+            chain: mutable darray[Ast::Stmt] = machine_from_terminator_action(terminators[count - 1], start_enum, result_var, done_var, mode_var)
+            remaining: mutable usize = count - 1
+            while remaining > 0 |chain, remaining, terminators, start_enum, result_var, done_var, mode_var|:
+                term: MachineFromTermAst = terminators[remaining - 1]
+                action: darray[Ast::Stmt] = machine_from_terminator_action(term, start_enum, result_var, done_var, mode_var)
+                guard_absent: bool = match term.guard:
+                    Ast::Expr.Absent: true
+                    _: false
+                if guard_absent:
+                    chain <- action
+                else:
+                    chain <- [(Ast::Stmt.If(term.guard, action, chain, term.line))]
+                remaining <- remaining - 1
+            return chain
+
+        def machine_from_terminator_action(term: MachineFromTermAst, start_enum: sview, result_var: sview, done_var: sview, mode_var: sview) -> darray[Ast::Stmt]:
+            if term.is_done:
+                stmts: mutable darray[Ast::Stmt] = []
+                stmts.push((Ast::Stmt.Assign((Ast::Expr.Ident(result_var, term.line)), TokenKind.LArrow, term.value, term.line)))
+                stmts.push((Ast::Stmt.Assign((Ast::Expr.Ident(done_var, term.line)), TokenKind.LArrow, (Ast::Expr.BoolLit(true)), term.line)))
+                return stmts
+            return [(Ast::Stmt.Assign((Ast::Expr.Ident(mode_var, term.line)), TokenKind.LArrow, (Ast::Expr.Field((Ast::Expr.Ident(start_enum, term.line)), term.target, term.line)), term.line))]
