@@ -20,4 +20,23 @@ out=$(printf 'const enum St of u8:\n    Step\n    Stop\ndef down(x: i64) -> i64:
 echo "$out" | grep -q "^P 0$" || fail "cyclic machine had parse errors: $out"
 echo "$out" | grep -q "^D 0$" || fail "cyclic machine had diagnostics: $out"
 
-echo "machine from smoke OK: acyclic + cyclic(decreases, threaded mutable) state machines parse P0 D0"
+# 3. docs/125 §5 state payloads — `next` constructs the successor's payload, the arm
+# header binds it, so a body reading the binding resolves (the `is`-dispatch desugar binds
+# each state's fields). Regular (non-const) enum so variants can carry fields. Also covers
+# an entry-state payload `machine from Phase.Mid(true)` is exercised via the routed form.
+out=$(printf 'enum Phase:\n    Start\n    Mid(bool)\n    End(i64)\ndef run(x: i64) -> i64:\n    r: i64 = machine from Phase.Start:\n        Phase.Start:\n            next Phase.Mid(true) if x > 0\n            next Phase.Mid(false)\n        Phase.Mid(flag):\n            next Phase.End(10) if flag\n            next Phase.End(20)\n        Phase.End(val):\n            done val\n    return r\n' | "$RPT")
+echo "$out" | grep -q "^P 0$" || fail "payload machine had parse errors: $out"
+echo "$out" | grep -q "^D 0$" || fail "payload machine had diagnostics (binding unresolved?): $out"
+
+# 4. Entry-state payload: `machine from Once.Only(seed)` binds `val` in the sole arm.
+out=$(printf 'enum Once:\n    Only(i64)\ndef echo(seed: i64) -> i64:\n    r: i64 = machine from Once.Only(seed):\n        Once.Only(val):\n            done val\n    return r\n' | "$RPT")
+echo "$out" | grep -q "^P 0$" || fail "entry-payload machine had parse errors: $out"
+echo "$out" | grep -q "^D 0$" || fail "entry-payload machine had diagnostics: $out"
+
+# 5. R5 declared out-edges `State -> {A, B}:` parse and desugar cleanly (stage0 owns the R5
+# enforcement; stage1 consumes the clause structurally).
+out=$(printf 'enum Route:\n    In(i64)\n    Left\n    Right\ndef route(x: i64) -> i64:\n    r: i64 = machine from Route.In(x):\n        Route.In(v) -> {Left, Right}:\n            next Route.Left if v > 0\n            next Route.Right\n        Route.Left:\n            done 1\n        Route.Right:\n            done 2\n    return r\n' | "$RPT")
+echo "$out" | grep -q "^P 0$" || fail "declared-out machine had parse errors: $out"
+echo "$out" | grep -q "^D 0$" || fail "declared-out machine had diagnostics: $out"
+
+echo "machine from smoke OK: acyclic + cyclic(decreases) + state payloads (next-construct + entry + arm-binding) + R5 declared out-edges parse P0 D0"

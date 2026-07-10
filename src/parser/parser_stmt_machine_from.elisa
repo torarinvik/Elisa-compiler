@@ -13,12 +13,14 @@ extend Parser:
         struct MachineFromTermAst:
             is_done: bool
             target: sview          # next: successor state
+            args: darray[Ast::Expr]  # next: payload construction args (empty when none)
             value: Ast::Expr       # done: yielded value (Invalid for next)
             guard: Ast::Expr       # Absent when unguarded
             line: u32
 
         struct MachineFromArmS:
             state: sview
+            bindings: darray[sview]  # payload field bindings from `State(a, b):` (empty when none)
             body: darray[Ast::Stmt]
             terminators: darray[MachineFromTermAst]
             line: u32
@@ -54,6 +56,8 @@ extend Parser:
             if start_dotted:
                 rebind start_second: Token, parser = parser.expect(TokenKind.Ident)
                 start_state <- Lexer::text_or_empty(start_second, parser.source)
+            # Optional entry-state payload `machine from Once.Only(seed)` (docs/125 §5).
+            rebind start_args: darray[Ast::Expr], parser = parser.parse_machine_from_call_args()
 
             # Optional `decreases MEASURE` — consumed and evaluated (so its names resolve),
             # then discarded (the desugar loop doesn't need it; stage0 owns the check).
@@ -74,11 +78,53 @@ extend Parser:
                 machine_arms.push(arm)
             parser, _ <- parser.expect(TokenKind.Dedent)
 
-            return (build_machine_from_block(start_enum, start_state, machine_arms, machine_token.line))
+            return (build_machine_from_block(start_enum, start_state, start_args, machine_arms, machine_token.line))
+
+        # Optional `(EXPR, EXPR, …)` payload-construction args after a state reference (start
+        # state or a `next` target). Returns [] when no `(` follows, so a payload-free state
+        # stays a bare reference.
+        def parse_machine_from_call_args(parser: lmut Parser) -> darray[Ast::Expr]:
+            args: mutable darray[Ast::Expr] = []
+            args return if parser.peek() != TokenKind.LParen
+            parser, _ <- parser.advance()   # (
+            while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser, args|:
+                rebind arg_opt: Ast::Expr?, parser = parser.expression()
+                if arg_opt is parsed_arg:
+                    args.push(parsed_arg)
+                break if not parser.accept(TokenKind.Comma)
+            parser, _ <- parser.expect(TokenKind.RParen)
+            return args
+
+        # Optional `(name, name, …)` payload BINDING list in an arm header
+        # (`Num.Exponent(was_fraction):`) — identifiers the arm body binds.
+        def parse_machine_from_bindings(parser: lmut Parser) -> darray[sview]:
+            names: mutable darray[sview] = []
+            names return if parser.peek() != TokenKind.LParen
+            parser, _ <- parser.advance()   # (
+            while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser, names|:
+                rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+                names.push(Lexer::text_or_empty(name_token, parser.source))
+                break if not parser.accept(TokenKind.Comma)
+            parser, _ <- parser.expect(TokenKind.RParen)
+            return names
+
+        # Optional R5 out-edge contract `-> {A, B}` after an arm header. Stage0 owns the R5
+        # enforcement; stage1 only consumes the clause so the arm reaches its block colon.
+        def skip_machine_from_declared_out(parser: lmut Parser) -> void:
+            return if parser.peek() != TokenKind.Arrow
+            parser, _ <- parser.advance()   # ->
+            parser, _ <- parser.expect(TokenKind.LBrace)
+            while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof |parser|:
+                parser, _ <- parser.parse_machine_from_variant()
+                break if not parser.accept(TokenKind.Comma)
+            parser, _ <- parser.expect(TokenKind.RBrace)
 
         def parse_machine_from_arm(parser: lmut Parser) -> MachineFromArmS:
             arm_token: Token = parser.cursor()
             rebind state: sview, parser = parser.parse_machine_from_variant()
+            # Optional payload bindings `State(a, b):` and R5 out-edge contract `-> {…}`.
+            rebind bindings: darray[sview], parser = parser.parse_machine_from_bindings()
+            parser <- parser.skip_machine_from_declared_out()
             parser, _ <- parser.expect(TokenKind.Colon)
             parser, _ <- parser.expect(TokenKind.Newline)
             parser, _ <- parser.expect(TokenKind.Indent)
@@ -103,13 +149,14 @@ extend Parser:
                         parser, _ <- parser.advance()   # error recovery: never spin
             parser, _ <- parser.expect(TokenKind.Dedent)
 
-            return MachineFromArmS{state: state, body: body, terminators: terminators, line: arm_token.line}
+            return MachineFromArmS{state: state, bindings: bindings, body: body, terminators: terminators, line: arm_token.line}
 
         def parse_machine_from_terminator(parser: lmut Parser) -> MachineFromTermAst:
             rebind keyword_token: Token, parser = parser.advance()   # next | done
             is_done: bool = Lexer::text_or_empty(keyword_token, parser.source) == "done"
             value: mutable Ast::Expr = (Ast::Expr.Invalid)
             target: mutable sview = ""
+            next_args: mutable darray[Ast::Expr] = []
             if is_done:
                 # The value ends at a top-level `if` guard; the lenient ternary parse
                 # yields an `Expr.If` with an Absent alternative, whose then-branch is the
@@ -120,6 +167,9 @@ extend Parser:
             else:
                 rebind parsed_target: sview, parser = parser.parse_machine_from_variant()
                 target <- parsed_target
+                # `next Num.Exponent(was_fraction)` constructs the successor's payload.
+                rebind parsed_args: darray[Ast::Expr], parser = parser.parse_machine_from_call_args()
+                next_args <- parsed_args
 
             guard: mutable Ast::Expr = (Ast::Expr.Absent)
             if is_done:
@@ -141,11 +191,16 @@ extend Parser:
                     if guard_opt is parsed_guard:
                         guard <- parsed_guard
             parser, _ <- parser.accept(TokenKind.Newline)
-            return MachineFromTermAst{is_done: is_done, target: target, value: value, guard: guard, line: keyword_token.line}
+            return MachineFromTermAst{is_done: is_done, target: target, args: next_args, value: value, guard: guard, line: keyword_token.line}
 
         # Build the value-block desugar: result/done/mode locals + `while not done:` over a
-        # mode if-chain, yielding result.
-        def build_machine_from_block(start_enum: sview, start_state: sview, machine_arms: darray[MachineFromArmS], line: u32) -> Ast::Expr:
+        # mode if-chain, yielding result. Dispatch is an `if mode is Enum.State(binds): …`
+        # chain rather than `mode == Enum.State`: the refinement `is`-pattern both selects
+        # the arm AND binds the state's payload fields (docs/125 §5 state payloads), so a
+        # body reading a payload resolves. Payload-free states use a bare `mode is Enum.State`
+        # test. Every arm is conditional (innermost else is empty) so each arm's `is` binds in
+        # its own branch; stage0 owns exhaustiveness, the stage1 parse stays structural.
+        def build_machine_from_block(start_enum: sview, start_state: sview, start_args: darray[Ast::Expr], machine_arms: darray[MachineFromArmS], line: u32) -> Ast::Expr:
             result_var: sview = "__mf_result"
             done_var: sview = "__mf_done"
             mode_var: sview = "__mf_mode"
@@ -153,7 +208,7 @@ extend Parser:
             declarations: mutable darray[Ast::Stmt] = []
             declarations.push((Ast::Stmt.VarDecl(result_var, (Ast::Expr.Invalid), (Ast::Expr.Ident("zeroed", line)), line)))
             declarations.push((Ast::Stmt.VarDecl(done_var, (Ast::Expr.Invalid), (Ast::Expr.BoolLit(false)), line)))
-            declarations.push((Ast::Stmt.VarDecl(mode_var, (Ast::Expr.Invalid), (Ast::Expr.Field((Ast::Expr.Ident(start_enum, line)), start_state, line)), line)))
+            declarations.push((Ast::Stmt.VarDecl(mode_var, (Ast::Expr.Invalid), machine_from_state_value(start_enum, start_state, start_args, line), line)))
 
             # Per-state dispatch block: arm body ++ terminator if/else chain.
             state_blocks: mutable darray[darray[Ast::Stmt]] = []
@@ -165,16 +220,16 @@ extend Parser:
                     block.push(chained)
                 state_blocks.push(block)
 
-            # Mode dispatch as an `if mode == Enum.S0: … else: …` chain (last state = else).
+            # Mode dispatch built right-to-left: `if mode is S0(..): b0 else: (if mode is S1(..):
+            # b1 else: …)`, innermost else empty.
             dispatch: mutable darray[Ast::Stmt] = []
-            if state_blocks.count > 0:
-                dispatch <- state_blocks[state_blocks.count - 1]
-                state_index: mutable usize = machine_arms.count - 1
-                while state_index > 0 |dispatch, state_index, machine_arms, state_blocks, start_enum, line|:
-                    previous: usize = state_index - 1
-                    compare: Ast::Expr = (Ast::Expr.Binary((Ast::Expr.Ident(mode_var, machine_arms[previous].line)), TokenKind.EqEq, (Ast::Expr.Field((Ast::Expr.Ident(start_enum, machine_arms[previous].line)), machine_arms[previous].state, machine_arms[previous].line)), machine_arms[previous].line))
-                    dispatch <- [(Ast::Stmt.If(compare, state_blocks[previous], dispatch, machine_arms[previous].line))]
-                    state_index <- state_index - 1
+            state_index: mutable usize = machine_arms.count
+            while state_index > 0 |dispatch, state_index, machine_arms, state_blocks, start_enum, mode_var|:
+                current: usize = state_index - 1
+                arm_line: u32 = machine_arms[current].line
+                condition: Ast::Expr = machine_from_is_condition(mode_var, start_enum, machine_arms[current].state, machine_arms[current].bindings, arm_line)
+                dispatch <- [(Ast::Stmt.If(condition, state_blocks[current], dispatch, arm_line))]
+                state_index <- state_index - 1
 
             loop_condition: Ast::Expr = (Ast::Expr.Unary(TokenKind.Not, (Ast::Expr.Ident(done_var, line)), line))
             declarations.push((Ast::Stmt.While(loop_condition, dispatch, line)))
@@ -211,4 +266,26 @@ extend Parser:
                 stmts.push((Ast::Stmt.Assign((Ast::Expr.Ident(result_var, term.line)), TokenKind.LArrow, term.value, term.line)))
                 stmts.push((Ast::Stmt.Assign((Ast::Expr.Ident(done_var, term.line)), TokenKind.LArrow, (Ast::Expr.BoolLit(true)), term.line)))
                 return stmts
-            return [(Ast::Stmt.Assign((Ast::Expr.Ident(mode_var, term.line)), TokenKind.LArrow, (Ast::Expr.Field((Ast::Expr.Ident(start_enum, term.line)), term.target, term.line)), term.line))]
+            # `next State(args)` -> `mode <- Enum.State(args)` (a payload-free target stays a
+            # bare member reference).
+            return [(Ast::Stmt.Assign((Ast::Expr.Ident(mode_var, term.line)), TokenKind.LArrow, machine_from_state_value(start_enum, term.target, term.args, term.line), term.line))]
+
+
+# `Enum.State` — or `Enum.State(args)` when the state carries a payload (docs/125 §5). Used
+# for the entry-state init and every `next` target. A payload-free state stays a bare member.
+def machine_from_state_value(start_enum: sview, state: sview, args: darray[Ast::Expr], line: u32) -> Ast::Expr:
+    member: Ast::Expr = (Ast::Expr.Field((Ast::Expr.Ident(start_enum, line)), state, line))
+    member return if args.count == 0
+    no_names: darray[sview] = []
+    return (Ast::Expr.Call(member, args, no_names, line))
+
+
+# The dispatch condition `mode is Enum.State(binds…)`: the refinement `is`-pattern selects
+# the arm and binds the state's payload fields for the arm body. Payload-free states test a
+# bare `mode is Enum.State`.
+def machine_from_is_condition(mode_var: sview, start_enum: sview, state: sview, bindings: darray[sview], line: u32) -> Ast::Expr:
+    binding_exprs: mutable darray[Ast::Expr] = []
+    for name in bindings:
+        binding_exprs.push((Ast::Expr.Ident(name, line)))
+    rhs: Ast::Expr = machine_from_state_value(start_enum, state, binding_exprs, line)
+    return (Ast::Expr.Binary((Ast::Expr.Ident(mode_var, line)), TokenKind.Is, rhs, line))
