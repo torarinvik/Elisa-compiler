@@ -1,5 +1,28 @@
 extend Lexer:
     private:
+        # The number scanner's character classes — a TOTAL partition of char, so the
+        # `machine` below dispatches on classes instead of re-testing raw chars
+        # (classified dispatch, docs/125 §9). `ExpMark` ('e'/'E') is split out of the
+        # hex-letter class so Whole/Fraction can see an exponent lead while Hex
+        # consumes it as a plain hex digit (Digit | ExpMark | HexAlpha == hex digit).
+        const enum NumberClass of u8:
+            Digit        # '0'..'9'
+            ExpMark      # 'e' | 'E' (also a hex digit)
+            HexAlpha     # 'a'..'d', 'f', 'A'..'D', 'F' (hex letters minus e/E)
+            Dot          # '.'
+            Sign         # '+' | '-'
+            Other
+
+        @inline(always)
+        def classify_number_char(c: char) -> NumberClass:
+            return when c:
+                '0'..='9' -> NumberClass.Digit
+                'e' | 'E' -> NumberClass.ExpMark
+                'a'..='d' | 'f' | 'A'..='D' | 'F' -> NumberClass.HexAlpha
+                '.' -> NumberClass.Dot
+                '+' | '-' -> NumberClass.Sign
+                _ -> NumberClass.Other
+
         @inline(always)
         def is_digit(character: char) -> bool:
             return character in '0'..'9'
@@ -15,7 +38,6 @@ extend Lexer:
                 'f', '6' -> lexer.peek(offset + 2) == '4' and not lexer.peek(offset + 3).is_identifier_char()
                 _, _ -> false
 
-        @inline(always)
         def should_read_float_fraction(lexer: Lexer&) -> bool:
             # Not a `.` fraction: a non-dot, or the `..` range operator.
             false return if lexer.current_char() != '.' or lexer.peek(1) == '.'
@@ -30,74 +52,96 @@ extend Lexer:
                 or lexer.has_float_suffix_at(1)
                 or not next_char.is_identifier_char())
 
-        # Digit runs never contain '\n', so bump position/column directly and skip
-        # advance_char's newline branch + current-char re-read (see read_identifier).
+        # A valid exponent tail follows the current 'e'/'E': `e5`, `e+5`, `e-5` — but
+        # not `e` alone or `e+x` (those leave the 'e' to the identifier lexer).
         @inline(always)
-        def scan_decimal_digits(lexer: lmut Lexer):
-            while not lexer.is_end_of_source() and lexer.current_char().is_digit() |lexer|:
-                lexer.position <- lexer.position + 1
-                lexer.column <- lexer.column + 1
+        def exponent_follows(lexer: Lexer&) -> bool:
+            exponent_next_char: char = lexer.peek(1)
+            return lexer.peek(2).is_digit() if exponent_next_char in {'+', '-'} else exponent_next_char.is_digit()
 
-
-        @inline(always)
-        def scan_hex_digits(lexer: lmut Lexer):
-            while not lexer.is_end_of_source() and lexer.current_char().is_hex_digit() |lexer|:
-                lexer.position <- lexer.position + 1
-                lexer.column <- lexer.column + 1
-
-
+        # One classified machine (docs/125 §9): the literal's phases are STATES, its
+        # transitions fire on character CLASSES, and lookahead decisions live in
+        # guards. The token kind rides the states as payload — `Fraction`/`ExpLead`
+        # can only be entered carrying FloatLit, `Hex` only HexLit — and EOF falls
+        # out of the machine with that payload intact. Digit-run arms bump
+        # position/column directly (runs never contain '\n', see read_identifier);
+        # single structural chars advance through advance_char.
         def read_number(lexer: lmut Lexer) -> Token:
             position: LexerPosition = lexer.cursor_position()
             start: usize = lexer.position
 
-            # Hex `0x…` is a distinct radix lead, not a phase of the decimal scan: it
-            # returns its own HexLit. A radix fork whose taken branch consumes and returns
-            # can't fold into a value/guard (the `lmut` scan must thread by reassignment,
-            # so it needs its own block), and `machine over` matches literal delimiters,
-            # not the digit CLASSES a number is built from — so this genuine two-way lead
-            # is stated as such (docs/125 §6b `can ComplexFlow:`), mirroring next_token.
-            can ComplexFlow:
-                if lexer.current_char() == '0' and lexer.peek(1) in {'x', 'X'}:
-                    lexer <- lexer.advance_char()
-                    lexer <- lexer.advance_char()
-                    lexer <- lexer.scan_hex_digits()
-                    text_end: usize = lexer.position
-                    rebind suffix: sview?, lexer = lexer.read_type_suffix()
-                    return Token(TokenKind.HexLit, position, start, text_end, lexer.position)
+            kind: TokenKind =
+                machine over classify_number_char(lexer.current_char()) while not lexer.is_end_of_source() -> kind:
+                    # Hot states first: state-decl order shapes the lowered dispatch
+                    # ladder, and digit runs spend their lives in Whole/Hex.
+                    state Whole(kind: TokenKind)
+                    state Hex(kind: TokenKind)
+                    state Fraction(kind: TokenKind)
+                    state ExpDigits(kind: TokenKind)
+                    state ExpLead(kind: TokenKind)
+                    state Lead(kind: TokenKind)
 
-            lexer <- lexer.scan_decimal_digits()
+                    start Lead(TokenKind.IntLit)
 
-            # Floatness is not a mutable flag: each phase reports whether it consumed
-            # anything, and the literal's kind is a value computed once at the end
-            # (docs/125: state as a produced value, not a branch-mutated variable).
-            rebind has_fraction: bool, lexer = lexer.scan_float_fraction()
-            rebind has_exponent: bool, lexer = lexer.scan_float_exponent()
+                    # The radix fork: a '0x'/'0X' lead selects the hex automaton.
+                    Lead(kind), NumberClass.Digit if lexer.current_char() == '0' and lexer.peek(1) in {'x', 'X'}:
+                        lexer <- lexer.advance_char()
+                        lexer <- lexer.advance_char()
+                        -> Hex(TokenKind.HexLit)
+                    Lead(kind), _:
+                        -> Whole(kind)          # same char, reclassified as a decimal lead
+
+                    Hex(kind), NumberClass.Digit | NumberClass.ExpMark | NumberClass.HexAlpha:
+                        lexer.position <- lexer.position + 1
+                        lexer.column <- lexer.column + 1
+                        -> Hex(kind)
+                    Hex(kind), _:
+                        break
+
+                    Whole(kind), NumberClass.Digit:
+                        lexer.position <- lexer.position + 1
+                        lexer.column <- lexer.column + 1
+                        -> Whole(kind)
+                    Whole(kind), NumberClass.Dot if lexer.should_read_float_fraction():
+                        lexer <- lexer.advance_char()
+                        -> Fraction(TokenKind.FloatLit)
+                    Whole(kind), NumberClass.ExpMark if lexer.exponent_follows():
+                        lexer <- lexer.advance_char()
+                        -> ExpLead(TokenKind.FloatLit)
+                    Whole(kind), _:
+                        break
+
+                    Fraction(kind), NumberClass.Digit:
+                        lexer.position <- lexer.position + 1
+                        lexer.column <- lexer.column + 1
+                        -> Fraction(kind)
+                    Fraction(kind), NumberClass.ExpMark if lexer.exponent_follows():
+                        lexer <- lexer.advance_char()
+                        -> ExpLead(kind)
+                    Fraction(kind), _:
+                        break
+
+                    ExpLead(kind), NumberClass.Sign:
+                        lexer <- lexer.advance_char()
+                        -> ExpDigits(kind)
+                    ExpLead(kind), NumberClass.Digit:
+                        lexer.position <- lexer.position + 1
+                        lexer.column <- lexer.column + 1
+                        -> ExpDigits(kind)
+                    ExpLead(kind), _:
+                        break               # unreachable: the guarded entry proved a digit follows
+
+                    ExpDigits(kind), NumberClass.Digit:
+                        lexer.position <- lexer.position + 1
+                        lexer.column <- lexer.column + 1
+                        -> ExpDigits(kind)
+                    ExpDigits(kind), _:
+                        break
 
             text_end: usize = lexer.position
             rebind suffix: sview?, lexer = lexer.read_type_suffix()
-            is_float: bool = has_fraction or has_exponent or suffix_names_float(suffix)
-            kind: TokenKind = TokenKind.FloatLit if is_float else TokenKind.IntLit
-            return Token(kind, position, start, text_end, lexer.position)
-
-
-        # Consume a `.digits` fraction if one begins here; report whether it did.
-        def scan_float_fraction(lexer: lmut Lexer) -> bool:
-            false return if not lexer.should_read_float_fraction()
-            lexer <- lexer.advance_char()
-            lexer <- lexer.scan_decimal_digits()
-            return true
-
-
-        # Consume an `e[+-]digits` exponent if a valid one begins here; report whether it did.
-        def scan_float_exponent(lexer: lmut Lexer) -> bool:
-            false return if lexer.is_end_of_source() or not (lexer.current_char() in {'e', 'E'})
-            exponent_next_char: char = lexer.peek(1)
-            exponent_valid: bool = lexer.peek(2).is_digit() if exponent_next_char in {'+', '-'} else exponent_next_char.is_digit()
-            false return if not exponent_valid
-            lexer <- lexer.advance_char()
-            lexer <- lexer.advance_char() if not lexer.is_end_of_source() and lexer.current_char() in {'+', '-'}
-            lexer <- lexer.scan_decimal_digits()
-            return true
+            final_kind: TokenKind = kind if kind == TokenKind.HexLit else TokenKind.FloatLit if kind == TokenKind.FloatLit or suffix_names_float(suffix) else TokenKind.IntLit
+            return Token(final_kind, position, start, text_end, lexer.position)
 
 
         # Whether a type suffix spells a float type.
