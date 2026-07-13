@@ -23,4 +23,8 @@ echo "$out" | grep -q "^P 0$" && fail "open-domain state without wildcard NOT re
 out=$(printf 'def s(lx: mutable Lx&) -> i64:\n    n: i64 = 0\n    machine over lx.cur() while not lx.done():\n        state Run\n        start Run\n        Run, _:\n            -> Run\n        Run, 48:\n            -> Run\n    return n\n' | "$RPT")
 echo "$out" | grep -q "^P 0$" && fail "arm after irrefutable arm NOT refused as unreachable: $out"
 
-echo "machine-over coverage smoke OK: open+wildcard legal; open-no-wildcard + unreachable-after-wildcard refused by stage1"
+# 4. ILLEGAL: the same literal input (`48`) handled by two arms of one state.
+out=$(printf 'def s(lx: mutable Lx&) -> i64:\n    n: i64 = 0\n    machine over lx.cur() while not lx.done():\n        state Run\n        start Run\n        Run, 48:\n            -> Run\n        Run, 48:\n            -> Run\n        Run, _:\n            -> Run\n    return n\n' | "$RPT")
+echo "$out" | grep -q "^P 0$" && fail "duplicate literal input NOT refused: $out"
+
+echo "machine-over coverage smoke OK: open+wildcard legal; open-no-wildcard + unreachable-after-wildcard + duplicate-input refused by stage1"
