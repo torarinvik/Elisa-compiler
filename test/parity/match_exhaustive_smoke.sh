@@ -37,6 +37,18 @@ echo "$out" | grep -q "non-exhaustive" && fail "false positive on or-pattern cov
 out=$(printf 'def m(n: i64) -> i64:\n    match n:\n        0:\n            return 1\n        1:\n            return 2\n' | "$RPT")
 echo "$out" | grep -q "non-exhaustive" && fail "false positive on integer match: $out"
 
+# 5b. EXPRESSION-position match/when must be checked too (docs/125 R2 parity with stage0):
+#     `x = match e:` / `return when e:` omitting a variant with no `_` MUST be flagged.
+out=$(printf "${E3}def p(e: E) -> i64:\n    r: i64 = match e:\n        E.A: 1\n        E.B: 2\n    return r\n" | "$RPT")
+echo "$out" | grep -q "non-exhaustive match over 'E'; missing variant 'C'" || fail "expr-form match not checked: $out"
+out=$(printf "${E3}def q(e: E) -> i64:\n    r: i64 = when e:\n        E.A: 1\n        E.B: 2\n    return r\n" | "$RPT")
+echo "$out" | grep -q "non-exhaustive match over 'E'; missing variant 'C'" || fail "expr-form when not checked: $out"
+out=$(printf "${E3}def r(e: E) -> i64:\n    return when e:\n        E.A: 1\n        E.B: 2\n" | "$RPT")
+echo "$out" | grep -q "non-exhaustive match over 'E'; missing variant 'C'" || fail "return-position when not checked: $out"
+# 5c. an exhaustive expr-form match/when must STAY SILENT.
+out=$(printf "${E3}def s(e: E) -> i64:\n    r: i64 = when e:\n        E.A: 1\n        E.B: 2\n        E.C: 3\n    return r\n" | "$RPT")
+echo "$out" | grep -q "non-exhaustive" && fail "false positive on exhaustive expr-form when: $out"
+
 # 6. the whole frontend + stdlib must produce ZERO findings (all compile on stage0 → exhaustive).
 n=0
 while IFS= read -r f; do
