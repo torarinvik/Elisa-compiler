@@ -1,5 +1,40 @@
 extend Parser:
     private:
+        # docs/125 §4 R1 (stage1-OWNED, docs/125 step 13): the comparable value a single
+        # `when` column atom reduces to, for disjointness testing. `Opaque` is an atom the
+        # parser could not evaluate — overlap involving it is NEVER reported (a missed
+        # overlap is a sound miss; a wrong overlap report would be a false positive, which
+        # is worse). Stage1's Pattern.Literal erases the token kind (the lexer stores a
+        # string/char literal's CONTENT, quotes stripped — so `"a"`, `'a'`, and a bare
+        # `a` are byte-identical), so this port is deliberately narrower than stage0's
+        # kinded whenAtom: a `Lit` carries its RAW text (compared by byte-equality — two
+        # arms with identical literal text always denote the same value, whatever the
+        # scrutinee type) plus a `numeric` value that is CONSUMED ONLY against a `Range`.
+        # That is sound because a `Range` can only appear in a numeric-scrutinee column
+        # (you cannot range over strings), so a sibling `Lit`'s integer reading is correct
+        # exactly where it is used. Cross-spelling misses (`1` vs `01`, char ranges) are
+        # sound misses.
+        const enum WhenAtomKind of u8:
+            Wild
+            Lit
+            Tag
+            Range
+            Opaque
+
+        # One classified column option. For `Lit`: `text` is the raw span (byte-equality),
+        # `numeric` says whether `text` is a pure integer literal, and `ival`==`hi` is its
+        # value when numeric. For `Range`: `ival`..`hi` is the inclusive numeric interval.
+        # For `Tag`: `text` is the dotted variant path (compared on its final segment).
+        struct WhenAtom:
+            kind: WhenAtomKind
+            ival: i64
+            hi: i64
+            numeric: bool
+            text: sview
+
+
+extend Parser:
+    private:
         # docs/125 §4 — `when`: an order-independent decision table. Port of stage0's
         # parser desugar (compiler/src/parser/when.go). Like `machine` (docs/123) it is a
         # contextual keyword lowered ENTIRELY in the parser, onto the existing Match node,
@@ -66,11 +101,18 @@ extend Parser:
 
             arms: mutable darray[Ast::MatchArm] = []
             defaults: mutable darray[Ast::MatchArm] = []
-            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, arms, defaults|:
+            # docs/125 §4 R1: every row's pattern + head token, in source order, for the
+            # stage1-owned disjointness check once the whole table is parsed.
+            check_patterns: mutable darray[Ast::Pattern] = []
+            check_tokens: mutable darray[Token] = []
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, arms, defaults, check_patterns, check_tokens|:
                 parser <- parser.skip_newlines()
                 break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
 
+                row_head: Token = parser.cursor()
                 rebind arm: Ast::MatchArm, parser = parser.parse_when_row()
+                check_patterns.push(arm.pattern)
+                check_tokens.push(row_head)
                 is_default: bool = match arm.pattern:
                     Ast::Pattern.Wildcard:
                         true
@@ -79,6 +121,8 @@ extend Parser:
                 defaults.push(arm) if is_default
                 arms.push(arm) if not is_default
             parser, _ <- parser.expect(TokenKind.Dedent)
+
+            parser <- parser.check_when_disjoint(check_patterns, check_tokens)
 
             for default_arm in defaults:
                 arms.push(default_arm)
@@ -218,3 +262,197 @@ extend Parser:
                 Ast::Pattern.TypeBind(type, binder): true
                 Ast::Pattern.As(name, inner): true
                 Ast::Pattern.Other(text): true
+
+        # ============================================================
+        # docs/125 §4 R1 (stage1-OWNED, docs/125 step 13): disjointness.
+        # Choosing `when` over `match` DECLARES the arms order-independent; the parser
+        # enforces it — every pair of non-default rows must be PROVABLY disjoint (some
+        # column non-overlapping), and a second `_` default row is itself an overlap.
+        # An atom the parser cannot evaluate stays Opaque and NEVER reports an overlap
+        # (a missed overlap is a sound miss; a wrong report is a false positive). Mirrors
+        # stage0's checkWhenDisjoint / whenAtomsOverlap (parser/when.go).
+        # ============================================================
+
+        # Byte-equality of two source spans (Str / Float raw-text comparison).
+        def when_text_equal(a: sview, b: sview) -> bool:
+            la: usize = sview_len(a)
+            lb: usize = sview_len(b)
+            false return if la != lb
+            i: mutable usize = 0
+            while i < la |i|:
+                false return if sview_at(a, i) != sview_at(b, i)
+                i <- i + 1
+            return true
+
+        # Index just past the last `.`/`:` path separator — the final tag segment start.
+        # Both `.Red` and `Color.Red` normalize to `Red`, matching stage0's tag render.
+        def when_tail_start(text: sview) -> usize:
+            n: usize = sview_len(text)
+            start: mutable usize = 0
+            i: mutable usize = 0
+            while i < n |start, i|:
+                separator: bool = sview_at(text, i) == 46 or sview_at(text, i) == 58
+                start <- i + 1 if separator
+                i <- i + 1
+            return start
+
+        # Tag equality on final path segments (a single `when`'s tags share one enum, so
+        # equal final segments mean the same variant).
+        def when_tag_equal(a: sview, b: sview) -> bool:
+            start_a: usize = when_tail_start(a)
+            start_b: usize = when_tail_start(b)
+            len_a: usize = sview_len(a) - start_a
+            len_b: usize = sview_len(b) - start_b
+            false return if len_a != len_b
+            i: mutable usize = 0
+            while i < len_a |i|:
+                false return if sview_at(a, start_a + i) != sview_at(b, start_b + i)
+                i <- i + 1
+            return true
+
+        # Whether a raw literal span is a pure integer literal (decimal digits, or a
+        # `0x`/`0X` hex body), allowing `_` digit separators. Only such a span gets a
+        # numeric reading — and that reading is used solely against a `Range` (see the
+        # WhenAtomKind comment for why that is sound).
+        def when_is_integer_text(text: sview) -> bool:
+            n: usize = sview_len(text)
+            false return if n == 0
+            is_hex: bool = n >= 2 and sview_at(text, 0) == 48 and (sview_at(text, 1) == 120 or sview_at(text, 1) == 88)
+            false return if is_hex and n == 2                      # bare `0x`, no digits
+            start: usize = 2 if is_hex else 0
+            saw_digit: mutable bool = false
+            i: mutable usize = start
+            while i < n |saw_digit, i|:
+                b: u8 = sview_at(text, i)
+                is_decimal: bool = b >= 48 and b <= 57
+                is_hex_digit: bool = is_hex and ((b >= 97 and b <= 102) or (b >= 65 and b <= 70))
+                is_separator: bool = b == 95
+                false return if not (is_decimal or is_hex_digit or is_separator)
+                saw_digit <- true if is_decimal or is_hex_digit
+                i <- i + 1
+            return saw_digit
+
+        # Reduce a literal-pattern span to a `Lit` atom: raw text for byte-equality, plus a
+        # numeric value when the text is a pure integer literal.
+        def classify_when_literal(text: sview) -> WhenAtom:
+            WhenAtom{kind: WhenAtomKind.Opaque, ival: 0, hi: 0, numeric: false, text: text} return if sview_len(text) == 0
+            numeric: bool = when_is_integer_text(text)
+            value: i64 = parse_int_literal_value(text) if numeric else 0
+            return WhenAtom{kind: WhenAtomKind.Lit, ival: value, hi: value, numeric: numeric, text: text}
+
+        # Reduce a range pattern to a numeric interval [lo, hi] (inclusive). A range can
+        # only appear in a numeric-scrutinee column, so integer bounds are the norm; a
+        # non-integer bound (e.g. a char range) leaves the range Opaque — a sound miss.
+        def classify_when_range(lo: sview, hi: sview, inclusive: bool) -> WhenAtom:
+            opaque: WhenAtom = WhenAtom{kind: WhenAtomKind.Opaque, ival: 0, hi: 0, numeric: false, text: Lexer::empty_sview()}
+            opaque return if not (when_is_integer_text(lo) and when_is_integer_text(hi))
+            lo_value: i64 = parse_int_literal_value(lo)
+            hi_raw: i64 = parse_int_literal_value(hi)
+            hi_value: i64 = hi_raw if inclusive else hi_raw - 1
+            return WhenAtom{kind: WhenAtomKind.Range, ival: lo_value, hi: hi_value, numeric: true, text: Lexer::empty_sview()}
+
+        def classify_when_atom(pattern: Ast::Pattern) -> WhenAtom:
+            return match pattern:
+                Ast::Pattern.Wildcard:
+                    WhenAtom{kind: WhenAtomKind.Wild, ival: 0, hi: 0, numeric: false, text: Lexer::empty_sview()}
+                Ast::Pattern.Literal(text):
+                    classify_when_literal(text)
+                Ast::Pattern.Range(lo, hi, inclusive):
+                    classify_when_range(lo, hi, inclusive)
+                Ast::Pattern.Variant(path, fields):
+                    WhenAtom{kind: WhenAtomKind.Tag, ival: 0, hi: 0, numeric: false, text: path} if fields.count == 0 else WhenAtom{kind: WhenAtomKind.Opaque, ival: 0, hi: 0, numeric: false, text: path}
+                _:
+                    WhenAtom{kind: WhenAtomKind.Opaque, ival: 0, hi: 0, numeric: false, text: Lexer::empty_sview()}
+
+        # A row's column count, read structurally with no allocation (a Tuple for multi-
+        # column rows, Wildcard for the default, a lone atom/Or for single-column).
+        def when_pattern_column_count(pattern: Ast::Pattern) -> usize:
+            return match pattern:
+                Ast::Pattern.Wildcard: 0
+                Ast::Pattern.Tuple(elements): elements.count
+                _: 1
+
+        # The i-th column pattern (itself an Or or atom). Region-neutral: returns a stored
+        # handle, never a fresh container.
+        def when_pattern_column(pattern: Ast::Pattern, index: usize) -> Ast::Pattern:
+            return match pattern:
+                Ast::Pattern.Tuple(elements): elements[index]
+                _: pattern
+
+        def when_is_wildcard(pattern: Ast::Pattern) -> bool:
+            return match pattern:
+                Ast::Pattern.Wildcard: true
+                _: false
+
+        # A full-row default: a bare `_`, or a multi-column row of only wildcards.
+        def when_pattern_full_wild(pattern: Ast::Pattern) -> bool:
+            return match pattern:
+                Ast::Pattern.Wildcard: true
+                Ast::Pattern.Tuple(elements):
+                    elements.count > 0 and not (any element in elements where not when_is_wildcard(element))
+                _: false
+
+        def when_atom_overlap(a: WhenAtom, b: WhenAtom) -> bool:
+            false return if a.kind == WhenAtomKind.Opaque or b.kind == WhenAtomKind.Opaque
+            true return if a.kind == WhenAtomKind.Wild or b.kind == WhenAtomKind.Wild
+            # A range compares on the numeric interval; the other side must supply one (a
+            # range, or a `Lit` with an integer reading). `Lit` stores ival == hi, so the
+            # same interval-overlap test serves a point value too.
+            if a.kind == WhenAtomKind.Range or b.kind == WhenAtomKind.Range:
+                a_interval: bool = a.kind == WhenAtomKind.Range or (a.kind == WhenAtomKind.Lit and a.numeric)
+                b_interval: bool = b.kind == WhenAtomKind.Range or (b.kind == WhenAtomKind.Lit and b.numeric)
+                return a_interval and b_interval and a.ival <= b.hi and b.ival <= a.hi
+            # Two literals overlap iff their raw texts are byte-equal (identical literal
+            # text denotes the same value for any single scrutinee type).
+            when_text_equal(a.text, b.text) return if a.kind == WhenAtomKind.Lit and b.kind == WhenAtomKind.Lit
+            when_tag_equal(a.text, b.text) return if a.kind == WhenAtomKind.Tag and b.kind == WhenAtomKind.Tag
+            return false
+
+        # Two columns overlap if some option of one overlaps some option of the other.
+        # An `A | B` column fans out recursively over the stored options darray (no fresh
+        # allocation, so the check stays region-neutral).
+        def when_columns_overlap(a: Ast::Pattern, b: Ast::Pattern) -> bool:
+            return match a:
+                Ast::Pattern.Or(a_options):
+                    any a_option in a_options where when_columns_overlap(a_option, b)
+                _:
+                    when_column_atom_overlap(a, b)
+
+        def when_column_atom_overlap(a: Ast::Pattern, b: Ast::Pattern) -> bool:
+            return match b:
+                Ast::Pattern.Or(b_options):
+                    any b_option in b_options where when_column_atom_overlap(a, b_option)
+                _:
+                    when_atom_overlap(classify_when_atom(a), classify_when_atom(b))
+
+        # Two non-default rows overlap iff EVERY column overlaps.
+        def when_patterns_overlap(a: Ast::Pattern, b: Ast::Pattern) -> bool:
+            count_a: usize = when_pattern_column_count(a)
+            count_b: usize = when_pattern_column_count(b)
+            false return if count_a != count_b
+            false return if count_a == 0
+            i: mutable usize = 0
+            while i < count_a |i|:
+                false return if not when_columns_overlap(when_pattern_column(a, i), when_pattern_column(b, i))
+                i <- i + 1
+            return true
+
+        # Report R1: a duplicate `_` default row, and any pair of overlapping non-default
+        # rows. Errors anchor at the offending (later) row's head token.
+        def check_when_disjoint(parser: lmut Parser, patterns: darray[Ast::Pattern], tokens: darray[Token]) -> void:
+            default_seen: mutable bool = false
+            i: mutable usize = 0
+            while i < patterns.count |parser, default_seen, i|:
+                if when_pattern_full_wild(patterns[i]):
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, tokens[i]) if default_seen
+                    default_seen <- true
+                i <- i + 1
+            a: mutable usize = 0
+            while a < patterns.count |parser, a|:
+                if not when_pattern_full_wild(patterns[a]):
+                    b: mutable usize = a + 1
+                    while b < patterns.count |parser, b|:
+                        overlaps: bool = not when_pattern_full_wild(patterns[b]) and when_patterns_overlap(patterns[a], patterns[b])
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, tokens[b]) if overlaps
+                        b <- b + 1
+                a <- a + 1
