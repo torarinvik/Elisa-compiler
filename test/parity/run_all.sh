@@ -5,10 +5,10 @@
 # ran them, so a regression could rot silently (see the "test tree never gated" lesson).
 # One green run here means every stage1-owned guarantee still holds.
 #
-# KNOWN pre-existing failures (NOT regressions — present before the docs/125 step-13
-# refusal work; a green delta means "no NEW failures"):
-#   - machine_from_smoke.sh — the machine-from nested-binding SIGBUS (region/codegen).
-#   - diagnostics_smoke.sh — literal_comparison_impossible.neg false-positive (1/52).
+# As of 2026-07-14 the gate is FULLY GREEN — no known failures (the earlier machine_from
+# nested-binding SIGBUS and the diagnostics literal_comparison_impossible FP are both fixed).
+# It now also runs flow_strict_census_smoke.sh (docs/125 step 15 graduation): the strict
+# block-`if` ban is a gate-enforced standard — the compiler's src + std stay at 0 block-`if`s.
 #
 #   Usage:  ELISA_CORE=/path/to/Elisa-core  test/parity/run_all.sh
 #           (ELISA_CORE defaults to ../../Go projects/Elisa-core)
