@@ -125,6 +125,21 @@ porting source of truth.
 
 ## Phase C — Type-system core (91–110)
 
+**DESIGN CONSTRAINT (found 2026-07-15, the critical prerequisite for this whole phase):**
+`InferType` (in semantic_types.elisa) is currently a POD `{kind, name: sview}` returned by
+value from `infer_expression_type`. Structural element types (for tuples/generics/refs) must
+NOT be added as an owned `darray[InferType]` field — doing so makes the returned value
+region-bearing, which turns `infer_expression_type` region-polymorphic and forces **all ~20
+of its call sites** into region-inferable contexts (verified empirically: a one-field add
+produced "call to region-polymorphic … must occur where a region can be inferred" at every
+caller). Use stage0's flat-interned model instead: keep `InferType` POD and carry a `u32`
+index into a `SymbolTable`-held pool of element-type lists (mirrors stage0 `typeid.go` /
+`types.go`). Every Phase C sub-item below assumes that interned-table representation. A
+placeholder scalar `TypeKind.Tuple`/`Ref`/`Optional` with no structural payload is NOT worth
+landing on its own — no consumer can use it, and it still risks the arithmetic-inference
+interaction in `infer_expression_type`.
+
+
 91. Replace coarse TypeKind (Unknown/Void/Int/Float/Bool/Char/String/Named) with a real type representation: tuples.
 92. Type representation: references (`T&`, `mutable T&`).
 93. Type representation: optionals.
