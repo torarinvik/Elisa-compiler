@@ -36,7 +36,12 @@ scripts/
 - **Parser: active region-inferred implementation.** The older parser
   prototypes have been removed; `src/parser/parser.elisa` is the single parser
   source.
-- **Semantic: not yet written.** Next milestone after parser parity.
+- **Semantic: in progress.** `src/semantic/` implements name resolution plus a
+  growing diagnostics suite — 142 `DiagnosticKind` variants wired through
+  ~90 `check_*.elisa` passes, aggregated by `src/semantic/semantic.elisa`.
+  Remaining work (analysis engines: regions, borrows, effects, contracts,
+  refinement, termination) and a native backend are tracked in
+  [`docs/stage1_port_backlog.md`](docs/stage1_port_backlog.md).
 
 ## Single source of truth
 
@@ -60,9 +65,20 @@ scripts/check_runtime_drift.sh                    # runtime in sync?
 
 ## TODO
 
+The full, phased backlog (300 items, stage0 → stage1) lives in
+[`docs/stage1_port_backlog.md`](docs/stage1_port_backlog.md). Near-term
+milestones:
+
 - [ ] Cross-repo **parity oracle**: expose the stage0 Go lexer's token-kind
       checksum (e.g. a `-emit tokens`/checksum subcommand on `elisacore`) so this
       repo's CI can compare without reaching into Elisa-core's Go test internals.
+- [ ] Fixtures for the semantic diagnostics that still lack pos/neg coverage
+      (backlog Phase A).
+- [ ] Real type representation (tuples/refs/optionals/generics) to replace the
+      coarse `TypeKind` — the prerequisite for the analysis engines (backlog
+      Phase C).
+- [ ] Analysis engines: regions, borrows, effects, contracts, refinement,
+      termination (backlog Phase D).
+- [ ] Native backend / codegen (backlog Phase F).
 - [ ] Retire the originals in Elisa-core (`Code/frontend_elisacore/`) and rewire
       the 5 in-tree Go consumers once cross-repo parity is green.
-- [ ] Parser parity, then name resolution + typecheck.

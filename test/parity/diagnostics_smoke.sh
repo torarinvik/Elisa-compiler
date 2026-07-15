@@ -14,9 +14,12 @@
 # diagnostic_message() in src/semantic/semantic_api.elisa (confirmed by hand against
 # `./build/parse_report` output when each fixture was authored).
 #
-# This does NOT attempt full coverage of all 78 checks — it seeds a representative,
-# engine-dependent subset (checks that ride infer_expression_type / local_type_of and
-# are therefore most exposed to a regression in the shared type-inference engine).
+# Coverage: this now exercises ~94 of the ~93 check_*.elisa diagnostics (the original
+# engine-dependent seed plus a batch closing the 68 previously-uncovered checks — backlog
+# Phase A). A handful of checks are covered by dedicated smokes instead (e.g.
+# machine_tag_coverage_smoke.sh, flow_strict_census_smoke.sh) or are duplicate
+# DiagnosticKinds of an already-listed entry (contract_position == ContractNotFirst,
+# contract_result_void == ContractEnsureResultVoid).
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -59,6 +62,75 @@ NAMES=(
     duplicate_bit_group_member
     named_states_without_derive
     flow_flag_state_machine
+    # --- fixtures batch (backlog Phase A items 18-32): 68 previously-uncovered checks ---
+    affine_collection
+    array_literal_arity
+    array_literal_element
+    assign_to_loop_var
+    call_named_non_function
+    call_non_function
+    compound_assign_nonnumeric
+    const_enum_member_value
+    constant_comparison
+    constant_condition
+    construct_field_type
+    dict_key_mismatch
+    dict_value_mismatch
+    discarded_call_result
+    division_by_zero
+    double_negation
+    duplicate_condition
+    duplicate_decorator
+    duplicate_dict_key
+    duplicate_match_arm
+    duplicate_pattern_binding
+    duplicate_set_element
+    duplicate_variant_field
+    empty_iterable
+    empty_range
+    field_access_on_primitive
+    firm_arg_type_mismatch
+    float_equality
+    identical_branches
+    identical_logical_operands
+    if_value_missing_else
+    immediate_overwrite
+    index_non_indexable
+    index_out_of_bounds
+    infinite_loop
+    literal_arg_type_mismatch
+    literal_assign_out_of_range
+    logical_constant_operand
+    modulo_by_zero
+    negated_comparison
+    negative_index
+    negative_shift
+    nonbool_match_guard
+    nonnumeric_shift
+    oversized_shift
+    range_bound_non_integral
+    redundant_arithmetic
+    redundant_bool_compare
+    redundant_continue
+    self_arithmetic
+    self_assignment
+    self_comparison
+    set_element_mismatch
+    shift_by_zero
+    shift_non_integral
+    string_index_nonintegral
+    ternary_branch_mismatch
+    unknown_field_access
+    unknown_type_name
+    unused_expression
+    void_argument
+    void_collection_element
+    void_field_access
+    void_index
+    void_match_scrutinee
+    void_operand
+    void_unary_operand
+    void_value_use
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -87,6 +159,75 @@ EXPECTS=(
     "duplicate packed group member 'b' in H.flags"
     "declares named states but is missing a derive state: block"
     "written in multiple branches and read after the join"
+    # --- matching expected substrings for the batch above (index-aligned) ---
+    "dict keys cannot contain linear handles, got Guard"
+    "array literal for 'xs' has 2 elements but the type declares 3"
+    "array literal element expects i64, got string"
+    "assignment to loop variable 'i' has no effect on iteration"
+    "cannot call non-function value of type Point"
+    "cannot call non-function value of type int"
+    "augmented assignment requires numeric operands"
+    "const enum member 'Color'.'Red' value does not fit storage type u8"
+    "constant comparison is always false"
+    "condition is always true"
+    "struct literal field 'a' expects i64, got string"
+    "dict literal key expects i64, got string"
+    "dict literal value expects i64, got string"
+    "result of 'compute' (returns i64) is discarded; assign it or discard explicitly with _ ="
+    "division by zero"
+    "double negation has no effect; use the value directly"
+    "duplicate condition: this branch repeats an earlier condition and can never run"
+    "duplicate decorator 'hot'"
+    "dict literal has a duplicate key ''"
+    "match arm '1' duplicates an earlier arm"
+    "name x bound more than once in pattern"
+    "set literal has a duplicate element ''"
+    "duplicate payload field 'x' in variant 'A'"
+    "for loop iterates over an empty literal"
+    "for loop over an empty range never executes"
+    "field access requires struct type, got int"
+    "argument to 'g' expects i64, got string"
+    "floating-point equality comparison is unreliable; use a tolerance"
+    "if and else branches are identical"
+    "identical operands on both sides of 'and'"
+    "an \`if\` used as a value must have a final \`else\`"
+    "value assigned to x is immediately overwritten"
+    "indexing requires an indexable type, got int"
+    "index out of bounds: 'xs' has 3 elements, index is 5"
+    "'while true' loop never exits (no break or return in its body)"
+    "argument string literal cannot be passed to 'g' parameter of type i64"
+    "literal 300 out of range for u8"
+    "logical operator with constant boolean operand"
+    "modulo by zero"
+    "negated equality comparison; use the opposite operator"
+    "negative index -1 on sequence ''"
+    "shift count is negative"
+    "match guard must be bool, got int"
+    "operator requires numeric operands"
+    "shift count is out of range for every integer width (valid range 0..63)"
+    "range bounds must be integral, got float"
+    "redundant arithmetic: the literal operand makes this operation a no-op or a constant"
+    "redundant comparison to a boolean literal; use the value (or its negation) directly"
+    "redundant continue at end of loop body"
+    "arithmetic of 'x' with itself always yields a constant"
+    "has no effect: target and value are identical"
+    "with itself is always the same"
+    "set literal element expects i64, got string"
+    "shift by zero has no effect"
+    "shift requires integral operands"
+    "index must be integral, got float"
+    "ternary branches are incompatible: int and string"
+    "has no field 'z'"
+    "unknown type 'mysterytype'"
+    "expression statement has no effect; its result is discarded"
+    "argument to 'take' cannot be void"
+    "collection element cannot be void"
+    "field access requires struct type, got void"
+    "indexing requires an indexable type, got void"
+    "match scrutinee cannot be void"
+    "operand of this operator cannot be void"
+    "unary operand cannot be void"
+    "'g' returns void; its call cannot be used as a value"
 )
 
 total=0

@@ -22,17 +22,20 @@ command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; exit 2; }
 RPT="$REPO_ROOT/build/parse_report"
 mkdir -p "$REPO_ROOT/build"
 
-# Try to build the test harness. If it fails (known stage1 parser issues with
-# docs/119 E4 mutations), skip the test rather than failing CI.
-if ! "$ELISACORE_BIN" -emit obj -O2 -permissive -o "$REPO_ROOT/build/parse_report.o" \
-    "$REPO_ROOT/test/breadth/parse_report.elisa" >/dev/null 2>&1; then
-  echo "match-pattern smoke SKIP: stage1 compiler build blocked (see parser_expr_literals warnings)"
-  exit 0
+# Build the test harness. The stage1 frontend builds cleanly (the historical
+# docs/119 E4-mutation parser break is resolved), so a build or link failure is
+# a real regression and must FAIL the gate — never a silent SKIP.
+if ! "$ELISACORE_BIN" -emit obj -O2 -o "$REPO_ROOT/build/parse_report.o" \
+    "$REPO_ROOT/test/breadth/parse_report.elisa" >"$REPO_ROOT/build/parse_report.build.log" 2>&1; then
+  echo "match-pattern smoke FAIL: stage1 parse_report build broke" >&2
+  grep -i "error:" "$REPO_ROOT/build/parse_report.build.log" | head -20 >&2
+  exit 1
 fi
 
-clang -O2 "$REPO_ROOT/build/parse_report.o" -o "$RPT" 2>/dev/null || {
-  echo "match-pattern smoke SKIP: clang link failed"
-  exit 0
+clang -O2 "$REPO_ROOT/build/parse_report.o" -o "$RPT" 2>"$REPO_ROOT/build/parse_report.link.log" || {
+  echo "match-pattern smoke FAIL: clang link failed" >&2
+  cat "$REPO_ROOT/build/parse_report.link.log" >&2
+  exit 1
 }
 
 fail() { echo "match-pattern smoke FAIL: $1" >&2; exit 1; }
