@@ -145,6 +145,7 @@ NAMES=(
     container_var_scalar_mismatch
     container_var_ordering
     optional_var_scalar_mismatch
+    container_count_scalar_mismatch
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -256,6 +257,7 @@ EXPECTS=(
     "variable 'x' expects i64, got container"
     "ordering comparison requires numeric operands"
     "variable 'y' expects i64, got optional"
+    "variable 'n' expects bool, got usize"
 )
 
 total=0
