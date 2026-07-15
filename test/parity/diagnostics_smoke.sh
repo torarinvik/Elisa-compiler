@@ -136,6 +136,7 @@ NAMES=(
     tuple_pattern_arity
     or_pattern_binding_mismatch
     tuple_var_scalar_mismatch
+    tuple_return_scalar_mismatch
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -238,6 +239,7 @@ EXPECTS=(
     "tuple pattern arity does not match the tuple scrutinee"
     "or-pattern alternatives must bind the same names"
     "variable 'x' expects i64, got tuple"
+    "return type expects i64, got tuple"
 )
 
 total=0
