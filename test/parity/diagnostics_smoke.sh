@@ -135,6 +135,7 @@ NAMES=(
     tuple_scalar_element_mismatch
     tuple_pattern_arity
     or_pattern_binding_mismatch
+    tuple_var_scalar_mismatch
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -236,6 +237,7 @@ EXPECTS=(
     "darray literal element expects i64, got tuple"
     "tuple pattern arity does not match the tuple scrutinee"
     "or-pattern alternatives must bind the same names"
+    "variable 'x' expects i64, got tuple"
 )
 
 total=0
