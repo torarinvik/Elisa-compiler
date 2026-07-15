@@ -144,6 +144,7 @@ NAMES=(
     tuple_var_compound_assign
     container_var_scalar_mismatch
     container_var_ordering
+    optional_var_scalar_mismatch
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -254,6 +255,7 @@ EXPECTS=(
     "augmented assignment requires numeric operands"
     "variable 'x' expects i64, got container"
     "ordering comparison requires numeric operands"
+    "variable 'y' expects i64, got optional"
 )
 
 total=0
