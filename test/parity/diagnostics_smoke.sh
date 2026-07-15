@@ -131,6 +131,7 @@ NAMES=(
     void_operand
     void_unary_operand
     void_value_use
+    ordering_non_numeric_tuple
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -228,6 +229,7 @@ EXPECTS=(
     "operand of this operator cannot be void"
     "unary operand cannot be void"
     "'g' returns void; its call cannot be used as a value"
+    "ordering comparison requires numeric operands"
 )
 
 total=0
