@@ -40,7 +40,10 @@ per-batch copy.
 - **Severity**: `<<1=Error / 2=Warning / 4=Hint>>` (match stage0's severity for
   this class of finding; hints are stage1-only extras stage0 doesn't have)
 - **Next `code_of_diag_kind` ordinal**: `<<N>>` (one past the current highest;
-  see wiring point 6 below — as of this writing the highest is 122)
+  see wiring point 6 below. Don't trust a number written here — it drifts. Get
+  the live highest with:
+  `grep -oE ': [0-9]+' test/parity/resolve_smoke.elisa | grep -oE '[0-9]+' | sort -n | tail -1`
+  — as of 2026-07-15 that was 139, so the next new kind uses 140)
 
 ---
 
@@ -53,9 +56,11 @@ won't build, or the check will silently produce no visible diagnostic text, or
 the smoke harness (`resolve_smoke.elisa`) won't classify it.
 
 1. **`src/semantic/semantic_types.elisa`** — add a new member to the
-   `const enum DiagnosticKind of u8:` block (starts at line 67; the current
-   last member is `FieldImmutableAssign` at line 509, immediately before the
-   `struct Diagnostic` declaration at line 516). Give it a doc comment in the
+   `const enum DiagnosticKind of u8:` block, immediately before the
+   `struct Diagnostic` declaration that follows it. (Line numbers drift; find
+   the current last member with
+   `awk '/const enum DiagnosticKind/{f=1} f&&/struct Diagnostic/{exit} f' src/semantic/semantic_types.elisa | grep -vE '^ *#|^ *$' | tail -1`
+   — as of 2026-07-15 the last member was `IfValueMissingElse`.) Give it a doc comment in the
    same style as its neighbors: what fires it, what `name`/`expected`/`actual`
    carry (if anything), and the soundness/parity note. The `Diagnostic` struct
    itself (line 516-529: `name: sview`, `line: u32`, `kind: DiagnosticKind`,
@@ -64,41 +69,39 @@ the smoke harness (`resolve_smoke.elisa`) won't classify it.
    `expected` / `actual` for context; only add new fields if no existing field
    shape fits (rare; grep for `expected_count`/`actual_count` usage first).
 
-2. **`src/semantic/semantic_api.elisa`, `diagnostic_message`** (match starts
-   line 169) — add a `DiagnosticKind.<<PascalCaseName>>:` arm immediately
-   before the final `return buffer` (currently line 476, right after the
-   `FieldImmutableAssign` arm at line 474-475). This match has **no wildcard
+2. **`src/semantic/semantic_api.elisa`, `diagnostic_message`** — add a
+   `DiagnosticKind.<<PascalCaseName>>:` arm immediately before the final
+   `return buffer` (it sits right after the arm for the current last enum
+   member; grep `diagnostic_message` for that member's name to find the spot).
+   This match has **no wildcard
    arm** — it is exhaustive by design, so a kind added without a message here
    is a stage1 **compile error**, not a silent fallback. Use an f-string:
    `buffer.extend(f"...{diagnostic.name}...")`.
 
-3. **`src/semantic/semantic_api.elisa`, `diagnostic_severity`** (match starts
-   line 482) — add a `DiagnosticKind.<<PascalCaseName>>: <<1|2|4>>` arm
-   immediately before the blank line ending the match (currently line 607,
-   right after `FieldImmutableAssign: 1`). Also exhaustive/no wildcard.
+3. **`src/semantic/semantic_api.elisa`, `diagnostic_severity`** — add a
+   `DiagnosticKind.<<PascalCaseName>>: <<1|2|4>>` arm immediately before the
+   blank line ending the match (right after the current last enum member's
+   arm). Also exhaustive/no wildcard.
 
-4. **`src/semantic/semantic_api.elisa`, `def check(...)`** (line 35-128) —
-   append `table <- check_<<snake_case_name>>(file.top_decls, table)` to the
+4. **`src/semantic/semantic_api.elisa`, `def check(...)`** — append
+   `table <- check_<<snake_case_name>>(file.top_decls, table)` to the
    ordered call chain inside the `if file.errors.count == 0:` block, right
-   before `return table` (currently line 127, after
-   `check_field_immutable_assign`). Order within the chain doesn't affect
+   before `return table` (after the current last `check_…` call). Order within the chain doesn't affect
    correctness (each check independently appends to `table.diagnostics`) but
    keep it appended at the END to match the batch-ordering convention already
    visible in the file (batches 7/8/9/10/11 each landed as a contiguous run).
 
 5. **`src/semantic/semantic.elisa`** — add
    `include "./check_<<snake_case_name>>.elisa"` to the ordered `include`
-   list, immediately before `include "./semantic_api.elisa"` (currently the
-   very last include, line 146, right after
-   `include "./check_field_immutable_assign.elisa"`). `semantic_api.elisa`
-   must be the LAST include (it's the facade that calls everything above it).
+   list, immediately before the final `include "./semantic_api.elisa"`.
+   `semantic_api.elisa` must be the LAST include (it's the facade that calls
+   everything above it).
 
-6. **`test/parity/resolve_smoke.elisa`, `def code_of_diag_kind(...)`** (match
-   starts line 281) — add
+6. **`test/parity/resolve_smoke.elisa`, `def code_of_diag_kind(...)`** — add
    `Semantic::DiagnosticKind.<<PascalCaseName>>: <<N>>` as a new arm. `N` must
-   be a fresh integer one past the current highest in-use code (as of this
-   writing, the highest assigned code is 122, for `FieldImmutableAssign`; the
-   next new kind should use 123). This oracle is consumed by
+   be a fresh integer one past the current highest in-use code (get it live with
+   `grep -oE ': [0-9]+' test/parity/resolve_smoke.elisa | grep -oE '[0-9]+' | sort -n | tail -1`;
+   as of 2026-07-15 the highest was 139, so the next new kind uses 140). This oracle is consumed by
    `test/breadth/run.sh`'s corpus sweep and by ad-hoc probes; it does not need
    to match any stage0 numbering — it is stage1-internal.
 

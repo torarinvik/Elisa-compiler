@@ -8,8 +8,9 @@
 # Each file is piped to build/parse_report, which prints `P <n>` (parse errors)
 # then `D <n>` (semantic diagnostics). Note: semantic diagnostics are computed
 # per-file in ISOLATION, so cross-file name references show as UndefinedName —
-# only the P (parse) count is meaningful for a single file. Files under a path
-# containing `_unused` are skipped (stale, intentionally not maintained).
+# only the P (parse) count is meaningful for a single file. Files under a
+# `_unused/` path segment (or named `*_unused.elisa`) are skipped (stale,
+# intentionally not maintained) — see the precise glob below.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISAC="${ELISAC:-$HOME/.elisac/elisac}"
@@ -24,7 +25,12 @@ files=0
 witherr=0
 for d in "$@"; do
     while IFS= read -r f; do
-        case "$f" in *_unused*) continue;; esac
+        # Skip corpus files parked as stale/unmaintained: a path SEGMENT named
+        # `_unused` (…/_unused/…) or a basename ending `_unused.elisa`. Deliberately
+        # NOT the bare substring `_unused` — that would also swallow legitimate
+        # source like check_unused_expression.elisa / check_unused_import.elisa /
+        # check_unused_decreases.elisa if this sweep is ever pointed at src/.
+        case "$f" in */_unused/*|*_unused.elisa) continue;; esac
         files=$((files + 1))
         p=$("$RPT" < "$f" | head -1 | awk '{print $2}')
         if [ "${p:-0}" -gt 0 ] 2>/dev/null; then
