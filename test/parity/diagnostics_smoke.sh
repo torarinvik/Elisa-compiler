@@ -141,6 +141,7 @@ NAMES=(
     tuple_var_ordering
     tuple_var_arithmetic
     tuple_var_shift
+    tuple_var_compound_assign
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -248,6 +249,7 @@ EXPECTS=(
     "ordering comparison requires numeric operands"
     "operator '+' requires numeric operands, got tuple"
     "operator requires numeric operands"
+    "augmented assignment requires numeric operands"
 )
 
 total=0
