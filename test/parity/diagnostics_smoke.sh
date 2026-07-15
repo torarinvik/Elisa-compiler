@@ -139,6 +139,7 @@ NAMES=(
     tuple_return_scalar_mismatch
     tuple_arg_scalar_mismatch
     tuple_var_ordering
+    tuple_var_arithmetic
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -244,6 +245,7 @@ EXPECTS=(
     "return type expects i64, got tuple"
     "argument to 'g' expects i64, got tuple"
     "ordering comparison requires numeric operands"
+    "operator '+' requires numeric operands, got tuple"
 )
 
 total=0
