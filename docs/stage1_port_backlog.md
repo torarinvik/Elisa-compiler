@@ -140,7 +140,7 @@ landing on its own — no consumer can use it, and it still risks the arithmetic
 interaction in `infer_expression_type`.
 
 
-91. Replace coarse TypeKind (Unknown/Void/Int/Float/Bool/Char/String/Named) with a real type representation: tuples.
+91. Replace coarse TypeKind (Unknown/Void/Int/Float/Bool/Char/String/Named) with a real type representation: tuples. **[STARTED 2026-07-15, daa1c0a/3f50f03]** `TypeKind.Tuple` added; `Expr.Tuple` infers to it (POD — structure read from the AST, not stored); tuples are firm-non-numeric (operator checks fire) and firm-never-fit a scalar (container/assign mismatch flags "got tuple"). Remaining: structural element access for tuple-pattern arity + multi-scrutinee exhaustiveness (A17); refs/optionals/generics still infer to Unknown.
 92. Type representation: references (`T&`, `mutable T&`).
 93. Type representation: optionals.
 94. Type representation: generic instances (darray[T], dict[K,V], user generics).
