@@ -8,6 +8,26 @@ porting source of truth.
 
 ## Phase A — Stage1 hygiene, known bugs, and test debt (1–40)
 
+**Status (2026-07-15):**
+- DONE (committed): 1, 2, 5 (README/manifest freshness); 6, 7, 8 (match_pattern_smoke
+  false-green SKIP paths → hard FAIL, strict build); 11, 12, 13 (primer de-staled to
+  grep anchors; breadth `_unused` glob tightened); 18–32 (68 previously-uncovered
+  check_* diagnostics now have verified pos/neg fixtures — diagnostics smoke 188/188,
+  full gate 44/44). 33 is the same corpus-hygiene as covered here.
+- SATISFIED (no change needed): 10 (breadth run.sh consumes only the P count, so the
+  UndefinedName D-noise never reaches the gate; already documented); 15 (both named
+  regressions are guarded — literal_comparison_impossible.neg fixture is the FP guard,
+  machine_from_smoke case 3 exercises the arm/payload binding).
+- BLOCKED on Phase C (real type + namespace/visibility resolution, items 107–110):
+  16 (extending UnknownFieldType/UnknownTypeName past the lowercase-only heuristic would
+  false-positive on every legitimate cross-module capitalized type until the resolver can
+  see them — the uppercase-skip is a deliberate soundness guard, not laziness).
+- DEFERRED (needs a decision / larger effort): 3, 4 (cross-repo lexer oracle infra);
+  9 (runtime drift reconciliation — real bidirectional drift, tracked separately);
+  14 (reproduce-or-retire the stage0 `*ast.TypeExprExpr` backend divergence — needs a
+  stage0 backend build); 17 (multi-scrutinee tuple-match exhaustiveness — real feature).
+
+
 1. Update README.md:39 "Semantic: not yet written" — stale; 93 checks + 142 DiagnosticKinds exist.
 2. Rewrite README.md:68 TODO list to reflect real remaining work (backend, oracle, resolver depth).
 3. Build the cross-repo parity oracle: `-emit tokens`/checksum subcommand on stage0 `elisacore` (README:63-65).
