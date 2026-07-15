@@ -134,6 +134,7 @@ NAMES=(
     ordering_non_numeric_tuple
     tuple_scalar_element_mismatch
     tuple_pattern_arity
+    or_pattern_binding_mismatch
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -234,6 +235,7 @@ EXPECTS=(
     "ordering comparison requires numeric operands"
     "darray literal element expects i64, got tuple"
     "tuple pattern arity does not match the tuple scrutinee"
+    "or-pattern alternatives must bind the same names"
 )
 
 total=0
