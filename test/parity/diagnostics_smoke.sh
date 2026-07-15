@@ -137,6 +137,7 @@ NAMES=(
     or_pattern_binding_mismatch
     tuple_var_scalar_mismatch
     tuple_return_scalar_mismatch
+    tuple_arg_scalar_mismatch
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -240,6 +241,7 @@ EXPECTS=(
     "or-pattern alternatives must bind the same names"
     "variable 'x' expects i64, got tuple"
     "return type expects i64, got tuple"
+    "argument to 'g' expects i64, got tuple"
 )
 
 total=0
