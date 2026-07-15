@@ -132,6 +132,7 @@ NAMES=(
     void_unary_operand
     void_value_use
     ordering_non_numeric_tuple
+    tuple_scalar_element_mismatch
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -230,6 +231,7 @@ EXPECTS=(
     "unary operand cannot be void"
     "'g' returns void; its call cannot be used as a value"
     "ordering comparison requires numeric operands"
+    "darray literal element expects i64, got tuple"
 )
 
 total=0
