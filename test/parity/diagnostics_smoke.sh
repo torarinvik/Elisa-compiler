@@ -125,6 +125,8 @@ NAMES=(
     unknown_type_name_generic
     nonbool_condition_container
     nonbool_condition_optional
+    container_element_index_mismatch
+    loop_element_type
     unused_expression
     void_argument
     void_collection_element
@@ -240,6 +242,8 @@ EXPECTS=(
     "unknown type 'mysterytype'"
     "if condition must be bool, got container"
     "while condition must be bool, got optional"
+    "variable 'n' expects bool, got int"
+    "operator '+' requires numeric operands, got string"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
