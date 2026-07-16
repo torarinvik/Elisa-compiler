@@ -162,6 +162,12 @@ int main(int argc, char **argv) {
         "def use_extern(a: int) -> int:\n"
         "    return ext_fn(a)\n"
         "\n"
+        /* Generic declaration names are function-scoped semantic bindings. Both
+           the explicit specialization and size_of type operand must resolve T;
+           dropping the generic header would add two spurious unresolved refs. */
+        "def generic_id[T](value: T) -> usize:\n"
+        "    return size_of(T) + helper[T](0)\n"
+        "\n"
         /* nested_mod exercises Decl.Module recursion in resolve_decls: a function body
            INSIDE a module must still be walked. `helper` is a file-global, so calling
            it here proves cross-module resolution works; `undefined_in_module` is
