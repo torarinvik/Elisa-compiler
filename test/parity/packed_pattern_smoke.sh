@@ -26,6 +26,9 @@ wrong_store="$(printf '%s' $'packed enum Expr:\n    Int(value: int)\n\npacked en
 echo "$wrong_store" | grep -q '^D 1$' || fail "wrong packed Store owner was not rejected exactly once: $wrong_store"
 echo "$wrong_store" | grep -q "requires store type 'Expr.Store', got Token.Store" || fail "wrong packed Store diagnostic missing: $wrong_store"
 
+store_assign=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad(store: Expr.Store[Frozen], node: Expr) -> void:\n    store[0] <- node\n' | "$RPT")
+echo "$store_assign" | grep -Fq 'cannot assign to packed store index result' || fail "packed store index assignment not flagged: $store_assign"
+
 clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    can Abort.Panic:\n        expect node as Expr.Int(value):\n            return value\n    return 0\n'
 
 removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> Box:\n    return value as Box\n' | "$RPT")"
