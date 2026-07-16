@@ -138,6 +138,15 @@ placeholder scalar `TypeKind.Tuple`/`Ref`/`Optional` with no structural payload 
 landing on its own — no consumer can use it, and it still risks the arithmetic-inference
 interaction in `infer_expression_type`.
 
+**STATUS 2026-07-16 (30cbaf9):** the interned table LANDED — `type_table.elisa`:
+`intern_type`/`interned_kind|name|elem_count|elem` + `annotation_type_id` (structural
+conversion of declared annotations: tuples, `T?`, `T&`, generic heads, fixed arrays) +
+`intern_file_types`/`intern_declared_types` registration pass (VarDecls at any depth);
+TypeKind gained Optional/Ref/Container; type_table_smoke (11 assertions) in the gate
+(46/46). KNOWN HOLE: parameter annotations excluded — param-position payload lists read
+ALIASED (dict[cstr,i64] → dict[dict,dict]); a stage0 store-hoisting bug (task spawned).
+NEXT: wire TypeIds into note_local_type/infer_expression_type consumers (94-98).
+
 
 91. Replace coarse TypeKind (Unknown/Void/Int/Float/Bool/Char/String/Named) with a real type representation: tuples. **[STARTED 2026-07-15, daa1c0a/3f50f03]** `TypeKind.Tuple` added; `Expr.Tuple` infers to it (POD — structure read from the AST, not stored); tuples are firm-non-numeric (operator checks fire) and firm-never-fit a scalar (container/assign mismatch flags "got tuple"). Remaining: structural element access for tuple-pattern arity + multi-scrutinee exhaustiveness (A17); refs/optionals/generics still infer to Unknown.
 92. Type representation: references (`T&`, `mutable T&`).
