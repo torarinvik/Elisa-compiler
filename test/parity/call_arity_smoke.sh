@@ -59,7 +59,11 @@ echo "$out" | grep -q "cannot use positional arguments after named arguments" ||
 out=$(printf 'def f(n: i64) -> i64:\n    return n\n\ndef f(s: sview) -> i64:\n    return 0\n\ndef g() -> i64:\n    return f()\n' | "$RPT")
 echo "$out" | grep -q "expects.*arguments, got" && fail "false positive on overload ambiguity: $out"
 
-# 13. 0 FP across frontend + stdlib.
+# 13. Extern function signatures retain arity too (stage0 semantic parity).
+out=$(printf 'extern alloc(size: usize) -> int\n\ndef g() -> int:\n    return alloc()\n' | "$RPT")
+echo "$out" | grep -q "function 'alloc' expects 1 arguments, got 0\|wrong number of arguments" || fail "extern missing-required-arg not flagged: $out"
+
+# 14. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "expects.*arguments, got" || true)
