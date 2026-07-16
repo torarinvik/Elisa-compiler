@@ -130,6 +130,7 @@ NAMES=(
     string_index_element_type
     container_count_condition
     structural_return_condition
+    struct_field_structural_type
     unused_expression
     void_argument
     void_collection_element
@@ -249,6 +250,7 @@ EXPECTS=(
     "operator '+' requires numeric operands, got string"
     "variable 'x' expects bool, got char"
     "if condition must be bool, got int"
+    "if condition must be bool, got container"
     "if condition must be bool, got container"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
