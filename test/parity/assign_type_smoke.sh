@@ -33,6 +33,10 @@ echo "$out" | grep -q "expects bool, got int" || fail "Assign <- mismatch not fl
 out=$(printf 'def f() -> void:\n    b: mutable i64 = 0\n    b <- 10\n' | "$RPT")
 echo "$out" | grep -q "expects i64" && fail "false positive on matching Assign <-: $out"
 
+# A void call cannot satisfy a value-returning function's return type.
+out=$(printf 'def helper() -> void:\n    return\ndef f() -> i64:\n    return helper()\n' | "$RPT")
+echo "$out" | grep -q "return type expects i64, got void" || fail "void call return mismatch not flagged: $out"
+
 # 6. Return value type mismatch MUST flag.
 out=$(printf 'def f() -> i64:\n    return true\n' | "$RPT")
 echo "$out" | grep -q "return type expects i64, got bool" || fail "Return mismatch not flagged: $out"
