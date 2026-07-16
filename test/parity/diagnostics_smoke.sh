@@ -123,6 +123,8 @@ NAMES=(
     unknown_field_access
     unknown_type_name
     unknown_type_name_generic
+    nonbool_condition_container
+    nonbool_condition_optional
     unused_expression
     void_argument
     void_collection_element
@@ -236,6 +238,8 @@ EXPECTS=(
     "has no field 'z'"
     "unknown type 'mysterytype'"
     "unknown type 'mysterytype'"
+    "if condition must be bool, got container"
+    "while condition must be bool, got optional"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
