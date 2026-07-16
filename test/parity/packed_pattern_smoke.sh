@@ -18,7 +18,7 @@ clean() {
 
 clean $'packed enum Expr:\n    Int(value: int)\n    Add(left: Expr, right: Expr)\n\ndef left_value(node: Expr, store: Expr.Store[Frozen]) -> int:\n    if node as Expr.Add(Expr.Int(value), rhs):\n        _ = rhs\n        return value\n    return 0\n'
 
-clean $'packed enum Expr:\n    common:\n        @storage(side_table)\n        span: int\n    Int(value: int)\n    End\n\ndef build(store: Expr.Store[Local]) -> Expr:\n    return Expr.Int(span: 1, value: 2)\n'
+clean $'packed enum Expr:\n    common:\n        @storage(side_table)\n        span: int\n    Int(value: int)\n    End\n\ndef build(store: Expr.Store[Local]) -> Expr:\n    return Expr.Int(value: 2)\n'
 
 clean $'packed enum Expr:\n    Int(value: int)\n    Add(left: Expr, right: Expr)\n\ndef left(node: Expr, store: Expr.Store[Frozen]) -> Expr:\n    move node in store as Expr.Add(lhs, rhs)\n    _ = rhs\n    return lhs\n'
 
