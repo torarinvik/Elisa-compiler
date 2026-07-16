@@ -70,6 +70,12 @@ out=$(printf "${P2}def rv(point: Point) -> Point:\n    return point{x = 3}\n" | 
 echo "$out" | grep -q "record update has no field" && fail "false positive on valid record update: $out"
 
 # 13. the whole frontend + stdlib must produce ZERO findings for any field check.
+# Anonymous let destructuring preserves selectors separately from binders.
+out=$(printf "${P2}def ld(point: Point) -> i64:\n    let {z} = point\n    return 0\n" | "$RPT")
+echo "$out" | grep -q 'struct "Point" has no field "z"' || fail "unknown let-destructure field not flagged: $out"
+out=$(printf "${P2}def lr(point: Point) -> i64:\n    let {x: renamed} = point\n    return renamed\n" | "$RPT")
+echo "$out" | grep -q 'has no field "renamed"' && fail "binder was confused with let field selector: $out"
+
 n=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "has no field|more than once|is missing field" || true)
