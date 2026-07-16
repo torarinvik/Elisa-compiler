@@ -159,6 +159,22 @@ string-index -> Char + firm-char bool/string walls; structural RETURN typing
 (struct_field_type_id registry; `if b.names:`/`for x in p.items:`). Items 94/95/97/98
 each partially real now. Diagnostics smoke 236/236; gate 46/46.
 
+**STATUS 2026-07-16 evening (..1b884ca):** PARAM CHANNEL UNBLOCKED — the payload-aliasing
+bug was root-caused and FIXED in stage0 (da3fb1c6: brace struct literals weren't counted
+region-valued in grower inference, so pushed ParamDecls' side-tables dangled; regression
+test packed_payload_struct_wrap_runtime_test.go). Parameters now intern + seed the
+structural channel: every engine wall fires through signatures. Further increments:
+container-mutation wall (`xs <- 5`), structural return-statement wall, dict READ/WRITE
+key+value walls, `xs.push(v)` element wall, membership `in` container-RHS rejection,
+container comparison group (`xs == 5`), value-ctor walls (`bool(3)`, `i64(xs)`), shape
+rules (`cstr[shape]` scalar / `i64[3]` array / `darray[T, shape]`), Stmt.Expr statements
+reach the operator walk, primitive ctor names resolve. New DiagnosticKinds 142-145.
+Every increment stage0-oracle-verified + corpus-differential-clean. Smoke 252/252.
+DONE-in-substance: 91 (minus pattern-side), 92-96, 101, 103 (partial), 104; walls of 97.
+REMAINING Phase C: 98 unification, 99/100 generics, 102 contextual, 105 pretty-format
+(blocked on arena-stable string interning for Diagnostic sviews), 106 scoped tables,
+107-110 namespaces; A17 exhaustiveness.
+
 
 91. Replace coarse TypeKind (Unknown/Void/Int/Float/Bool/Char/String/Named) with a real type representation: tuples. **[STARTED 2026-07-15, daa1c0a/3f50f03]** `TypeKind.Tuple` added; `Expr.Tuple` infers to it (POD — structure read from the AST, not stored); tuples are firm-non-numeric (operator checks fire) and firm-never-fit a scalar (container/assign mismatch flags "got tuple"). Remaining: structural element access for tuple-pattern arity + multi-scrutinee exhaustiveness (A17); refs/optionals/generics still infer to Unknown.
 92. Type representation: references (`T&`, `mutable T&`).
