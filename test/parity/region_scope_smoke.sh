@@ -18,6 +18,8 @@ clean() {
 
 clean $'def f(seed: i32) -> i32:\n    region scratch(1024)\n    value: i32& @scratch = new[scratch] seed + 1\n    result: i32 = value[0]\n    destroy scratch\n    return result\n'
 clean $'def f() -> void:\n    region a(1024) using reserve_commit\n    region b(1024) using fixed\n    region c(1024) using chained\n    region d(1024) using scratch\n    destroy a\n    destroy b\n    destroy c\n    destroy d\n'
+out=$(printf 'def f() -> void:\n    region a(1024) using bogus\n    destroy a\n' | "$RPT")
+echo "$out" | grep -q 'unknown region backing "bogus"' || fail "unknown backing strategy was not flagged: $out"
 clean $'def id[T, @r](value: T& @r) -> T& @r:\n    return value\n'
 
 out="$(printf '%s' $'def f() -> void:\n    destroy missing\n' | "$RPT")"
