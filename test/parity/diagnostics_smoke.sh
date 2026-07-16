@@ -133,6 +133,7 @@ NAMES=(
     struct_field_structural_type
     container_assign_scalar
     structural_return_mismatch
+    membership_rhs_container
     unused_expression
     void_argument
     void_collection_element
@@ -256,6 +257,7 @@ EXPECTS=(
     "if condition must be bool, got container"
     "variable 'xs' expects darray, got int"
     "return type expects darray, got int"
+    "membership operator requires a list literal or tokenset on the right-hand side, got container"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
