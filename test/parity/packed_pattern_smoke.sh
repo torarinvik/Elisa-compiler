@@ -32,6 +32,11 @@ removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> B
 echo "$removed" | grep -q '^P 1$' || fail "removed value cast was accepted: $removed"
 echo "$removed" | grep -q "unexpected token 'as'" || fail "removed value cast lacks directed error: $removed"
 
+removed_abi=$(printf '@packed_abi(dense_fixed)\npacked enum Expr:\n    Lit(value: int)\n' | "$RPT")
+echo "$removed_abi" | grep -Fq '@packed_abi on enum "Expr" has been removed' || fail "removed packed ABI annotation not flagged: $removed_abi"
+removed_prefix=$(printf '@packed_prefix(common_only)\npacked enum Expr:\n    common:\n        span: int\n    Lit(value: int)\n' | "$RPT")
+echo "$removed_prefix" | grep -Fq '@packed_prefix on enum "Expr" has been removed' || fail "removed packed prefix annotation not flagged: $removed_prefix"
+
 removed_store_as="$(printf '%s' $'packed enum Expr:\n    Lit(value: int)\n\ndef bad(node: Expr, store: Expr.Store[Local]) -> int:\n    if node in store as Expr.Lit(value):\n        return value\n    return 0\n' | "$RPT")"
 echo "$removed_store_as" | grep -Eq '^P [1-9][0-9]*$' || fail "removed in-store as binder was accepted: $removed_store_as"
 
