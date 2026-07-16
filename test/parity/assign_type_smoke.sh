@@ -45,7 +45,11 @@ echo "$out" | grep -q "return type expects bool" && fail "false positive on matc
 out=$(printf 'struct S:\n    x: bool\ndef f() -> void:\n    s: S = S{}\n    s.x <- 5\n' | "$RPT")
 echo "$out" | grep -q "expects bool, got int" || fail "Field assign mismatch not flagged: $out"
 
-# 9. 0 findings across frontend + stdlib (self-contained resolution set).
+# 9. Structural generic-container mismatch MUST flag (darray <- dict).
+out=$(printf 'def f() -> void:\n    a: mutable darray[i64] = []\n    b: dict[cstr, i64] = {}\n    a <- b\n' | "$RPT")
+echo "$out" | grep -q "expects darray, got dict" || fail "generic container mismatch not flagged: $out"
+
+# 10. 0 findings across frontend + stdlib (self-contained resolution set).
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE " expects .*, got " || true)

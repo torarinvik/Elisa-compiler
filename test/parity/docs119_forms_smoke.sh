@@ -4,7 +4,8 @@
 # headers `|acc = 0| -> yield` with `|capture|`, and the `rebind` statement. Each must
 # parse with zero parse errors, resolve cleanly, and flag an undefined name inside the
 # new construct — while a bitwise `|` in an iterable is never misread as a header, and
-# there are zero parse false positives across the frontend + stdlib.
+# there are zero parse false positives across the frontend + stdlib. The form
+# contract is documented in docs/119_expression_unification.md.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"

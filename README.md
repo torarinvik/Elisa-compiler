@@ -39,9 +39,8 @@ scripts/
 - **Semantic: in progress.** `src/semantic/` implements name resolution plus a
   growing diagnostics suite — 142 `DiagnosticKind` variants wired through
   ~90 `check_*.elisa` passes, aggregated by `src/semantic/semantic.elisa`.
-  Remaining work (analysis engines: regions, borrows, effects, contracts,
-  refinement, termination) and a native backend are tracked in
-  [`docs/stage1_port_backlog.md`](docs/stage1_port_backlog.md).
+  Remaining work includes analysis engines (regions, borrows, effects,
+  contracts, refinement, termination) and a native backend.
 
 ## Single source of truth
 
@@ -52,7 +51,7 @@ Two guards keep stage1 honest while stage0 still exists:
    difference. Run in CI. Set `$ELISA_CORE` to your Elisa-core checkout (defaults
    to the sibling `../../Go projects/Elisa-core`).
 2. **Lexer parity** — the frontend's token-kind checksum must equal the stage0 Go
-   lexer's on a shared corpus. (Oracle hookup is the next infra task — see below.)
+   lexer's on a shared corpus; `test/parity/run_all.sh` runs this as a standing gate.
 
 ## Building / checking locally
 
@@ -65,20 +64,19 @@ scripts/check_runtime_drift.sh                    # runtime in sync?
 
 ## TODO
 
-The full, phased backlog (300 items, stage0 → stage1) lives in
-[`docs/stage1_port_backlog.md`](docs/stage1_port_backlog.md). Near-term
-milestones:
+Near-term milestones:
 
 - [ ] Cross-repo **parity oracle**: expose the stage0 Go lexer's token-kind
       checksum (e.g. a `-emit tokens`/checksum subcommand on `elisacore`) so this
       repo's CI can compare without reaching into Elisa-core's Go test internals.
-- [ ] Fixtures for the semantic diagnostics that still lack pos/neg coverage
-      (backlog Phase A).
+- [x] Breadth diagnostic-count baselines: `test/breadth/run.sh` supports
+      `--write-baseline FILE` and `--baseline FILE` for per-file `D <n>` drift.
+- [x] Breadth corpus exclusions are explicit: paths containing a `_unused/`
+      segment and files ending in `_unused.elisa` are intentionally skipped.
 - [ ] Real type representation (tuples/refs/optionals/generics) to replace the
-      coarse `TypeKind` — the prerequisite for the analysis engines (backlog
-      Phase C).
+      coarse `TypeKind` — the prerequisite for the analysis engines.
 - [ ] Analysis engines: regions, borrows, effects, contracts, refinement,
-      termination (backlog Phase D).
-- [ ] Native backend / codegen (backlog Phase F).
-- [ ] Retire the originals in Elisa-core (`Code/frontend_elisacore/`) and rewire
-      the 5 in-tree Go consumers once cross-repo parity is green.
+      termination.
+- [ ] Native backend / codegen.
+- [ ] Audit and retire remaining stage0 frontend references in Elisa-core; the
+      old `Code/frontend_elisacore/` tree and “5 consumers” estimate are stale.

@@ -40,7 +40,16 @@ echo "$out" | grep -q "directly self-recursive" && fail "false positive on disti
 out=$(printf 'struct A:\n    b: B&\nstruct B:\n    a: A&\n' | "$RPT")
 echo "$out" | grep -q "directly self-recursive" && fail "false positive on mutual ref-recursion: $out"
 
-# 7. 0 FP across frontend + stdlib.
+# 7. A qualified type in a known module must flag an unknown member type.
+out=$(printf 'module M:\n    struct Good:\n        x: i64\n\nstruct Bad:\n    x: M::Missing\n' | "$RPT")
+echo "$out" | grep -q "has unknown type 'Missing'" || fail "qualified unknown field type not flagged: $out"
+
+# 8. Nested/compound qualified paths remain conservative until nested ownership
+# metadata is modeled; a known nested type must not produce a false positive.
+out=$(printf 'module M::N:\n    struct Good:\n        x: i64\n\nstruct Uses:\n    x: M::N::Good\n' | "$RPT")
+echo "$out" | grep -q "unknown type" && fail "false positive on nested qualified type: $out"
+
+# 9. 0 FP across frontend + stdlib.
 n=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "unknown type|directly self-recursive" || true)

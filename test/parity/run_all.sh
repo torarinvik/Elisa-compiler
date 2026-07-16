@@ -44,6 +44,7 @@ echo "stage1 parity gate — standing invariants:"
 run_one "runtime drift guard (elisacore_std in sync)" "$REPO_ROOT/scripts/check_runtime_drift.sh"
 run_one "self-hostable (0 unresolved / 132 files)" "$REPO_ROOT/test/parity/check_self_hostable.sh"
 run_one "lexer parity (stage1 == stage0)"          "$REPO_ROOT/test/parity/run_parity.sh"
+run_one "diagnostic breadth baseline"              "$REPO_ROOT/test/breadth/run.sh" --baseline "$REPO_ROOT/test/fixtures/diagnostics.baseline.tsv" "$REPO_ROOT/test/fixtures/diagnostics"
 
 echo "stage1 parity gate — behavioral smokes:"
 for smoke in "$REPO_ROOT"/test/parity/*_smoke.sh; do

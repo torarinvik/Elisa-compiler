@@ -58,7 +58,10 @@ extend Parser:
         def variable_declaration_statement(parser: lmut Parser) -> Ast::Stmt?:
             rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
             parser, _ <- parser.expect(TokenKind.Colon)
-            rebind type_expression: Ast::Expr, parser = get parser.expression()
+            rebind parsed_type_expression: Ast::Expr?, parser = parser.expression()
+            type_expression: mutable Ast::Expr = get parsed_type_expression
+            rebind refined_type: Ast::Expr, parser = parser.parse_refinement_suffix(type_expression)
+            type_expression <- refined_type
 
             # Optional `@region` binding annotation (`x: T @scratch = …`) pinning the
             # local to a named region. The region name is a region selector, not a value
@@ -114,12 +117,20 @@ extend Parser:
             return (Ast::Stmt.Assign((Ast::Expr.Array(targets, keyword_token.line)), TokenKind.Assign, value, keyword_token.line))
 
 
-        # `requires E` / `ensure E` / `decreases E` / `invariant E` / `changes PATH` —
+        # `requires E` / `ensure E` / `decreases E` / `invariant E` / `changes PATH` /
+        # `preserves PATH` —
         # a design-by-contract leading body statement. The keyword is contextual; the
         # dispatcher has already confirmed an operand follows on the same line.
         def contract_statement(parser: lmut Parser) -> Ast::Stmt?:
             rebind keyword_token: Token, parser = parser.advance()              # consume the contract keyword
             kind_text: sview = Lexer::text_or_empty(keyword_token, parser.source)
+            if kind_text == "decreases" and parser.peek() == TokenKind.Star:
+                parser, _ <- parser.advance()
+                reason: mutable Ast::Expr = (Ast::Expr.StringLit(""))
+                if parser.peek() == TokenKind.StringLit:
+                    rebind reason_token: Token, parser = parser.advance()
+                    reason <- (Ast::Expr.StringLit(Lexer::text_or_empty(reason_token, parser.source)))
+                return (Ast::Stmt.Contract("decreases*", reason, keyword_token.line))
             rebind predicate_value: Ast::Expr, parser = get parser.expression()
             predicate: mutable Ast::Expr = predicate_value
             # `ensure GUARD => POST` / `ensure GUARD implies POST` — an implication
@@ -183,8 +194,9 @@ extend Parser:
         # A statement whose prefix clause is not yet modeled but which introduces a
         # `:`-block (e.g. `can Mem.Allocate:`, `region scratch:`, `try:`). Skip the
         # prefix tokens up to a paren-balanced top-level `:`, then parse the block.
-        # A prefix with no block (e.g. `region scratch(1024)`) degrades to an empty
-        # statement so the line is consumed without cascading errors.
+        # A prefix with no block (e.g. `region scratch(1024)`) is malformed. Do not
+        # silently degrade it to an empty statement: the stage0 parser rejects the
+        # construct and silently dropping it makes a typo disappear from the AST.
         def prefixed_block_statement(parser: lmut Parser) -> Ast::Stmt?:
             line: u32 = parser.cursor().line
 
@@ -225,29 +237,47 @@ extend Parser:
             # (`region scratch(…):`). The leading clause keyword and the arm binding are
             # already captured above, so skip identifiers at position 0.
             clause: mutable darray[sview] = []
+            region_capacity_start: mutable usize = 0
             while parser.peek() != TokenKind.Eof |parser, depth: int = 0, first: bool = true|:
                 kind: TokenKind = parser.peek()
                 match kind:
                     TokenKind.LParen | TokenKind.LBracket:
+                        region_capacity_start <- parser.cursor().start.usize() + 1 if block_kind == "region" and kind == TokenKind.LParen and depth == 0
                         depth <- depth + 1
                         parser, _ <- parser.advance()
                     TokenKind.RParen | TokenKind.RBracket:
+                        if block_kind == "region" and kind == TokenKind.RParen and depth == 1 and region_capacity_start > 0:
+                            capacity_end: usize = parser.cursor().start.usize()
+                            clause.push(parser.span_view(region_capacity_start, capacity_end))
+                            region_capacity_start <- 0
                         depth <- depth - 1
                         parser, _ <- parser.advance()
                     TokenKind.Colon | TokenKind.Newline if depth == 0:
                         break
                     TokenKind.Ident if depth == 0 and not first:
-                        # Capture the WHOLE dotted path as one clause entry (`can Mem.Allocate:` →
-                        # ["Mem.Allocate"], not ["Mem","Allocate"]) so qualified effect grants are
-                        # distinguishable from two bare-family grants. parse_dotted_name advances
-                        # past the entire path.
-                        rebind dotted_clause_name: sview, parser = parser.parse_dotted_name()
-                        clause.push(dotted_clause_name)
+                        # Preserve region's contextual `using` marker separately so the
+                        # clause side-table retains allocator intent; qualified effect
+                        # paths remain one entry.
+                        clause_token: Token = parser.cursor()
+                        if block_kind == "region" and Lexer::text_or_empty(clause_token, parser.source) == "using":
+                            clause.push("using")
+                            parser, _ <- parser.advance()
+                        else:
+                            rebind dotted_clause_name: sview, parser = parser.parse_dotted_name()
+                            clause.push(dotted_clause_name)
                     _:
                         first <- false
                         parser, _ <- parser.advance()
 
-            (Ast::Stmt.Expr((Ast::Expr.Invalid), line)) return if parser.peek() != TokenKind.Colon
+            if parser.peek() != TokenKind.Colon:
+                # Region declarations are the only currently recognized prefix whose
+                # no-block form is unambiguously invalid at this frontend layer. Keep
+                # legacy recovery for other keyword-shaped expression forms until their
+                # dedicated AST nodes are ported.
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, first_token) if block_kind == "region"
+                # Keep the existing recovery node shape after recording the error;
+                # downstream walkers already treat this expression as non-executable.
+                return (Ast::Stmt.Expr((Ast::Expr.Invalid), line))
 
             rebind body: darray[Ast::Stmt], parser = parser.parse_block()
             return (Ast::Stmt.Block(block_kind, clause, binding, body, line))

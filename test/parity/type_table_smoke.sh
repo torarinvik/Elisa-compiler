@@ -37,7 +37,8 @@ int main(void) {
         "    d: u8& = zeroed\n"
         "    e: dict[cstr, i64] = {}\n"
         "    f: i64[3] = [1, 2, 3]\n"
-        "    g: darray[i64]? = null\n";
+        "    g: darray[i64]? = null\n"
+        "    h: Box[i64] = zeroed\n";
     size_t n = 0; while (src[n]) n++;
     uint64_t passed = 0, total = 0;
     type_table_smoke_export((uint8_t *)src, n, &passed, &total);
@@ -54,9 +55,9 @@ clang -O2 -I "$WORK" "$WORK/driver.c" "$WORK/type_table_smoke.o" -o "$WORK/run"
 OUT="$("$WORK/run")"
 read -r PASSED TOTAL <<<"$OUT"
 
-# 11 checks in the fixture; every one must pass, and the probe must be found at all.
-if [[ "$TOTAL" != "11" || "$PASSED" != "$TOTAL" ]]; then
-  echo "type_table_smoke FAILED: passed=$PASSED total=$TOTAL (expected 11/11)" >&2
+# 18 checks in the fixture; every one must pass, and the probe must be found at all.
+if [[ "$TOTAL" != "18" || "$PASSED" != "$TOTAL" ]]; then
+  echo "type_table_smoke FAILED: passed=$PASSED total=$TOTAL (expected 18/18)" >&2
   exit 1
 fi
 echo "type_table_smoke OK: $PASSED/$TOTAL structural checks"
