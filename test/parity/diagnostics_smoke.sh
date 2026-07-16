@@ -137,6 +137,7 @@ NAMES=(
     darray_push_type_mismatch
     dict_index_key_mismatch
     param_structural_type
+    container_comparison
     unused_expression
     void_argument
     void_collection_element
@@ -264,6 +265,7 @@ EXPECTS=(
     "darray push expects i64, got string"
     "dict index expects key of type i64, got string"
     "if condition must be bool, got container"
+    "cannot compare container with int"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
