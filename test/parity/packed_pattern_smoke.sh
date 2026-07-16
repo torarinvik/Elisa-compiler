@@ -29,6 +29,10 @@ echo "$wrong_store" | grep -q "requires store type 'Expr.Store', got Token.Store
 store_assign=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad(store: Expr.Store[Frozen], node: Expr) -> void:\n    store[0] <- node\n' | "$RPT")
 echo "$store_assign" | grep -Fq 'cannot assign to packed store index result' || fail "packed store index assignment not flagged: $store_assign"
 
+bare_ctor=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad() -> Expr:\n    return Expr.Int(value: 1)\n' | "$RPT")
+echo "$bare_ctor" | grep -Fq 'packed enum constructor "Expr.Int" requires an active in Expr.Store' || fail "bare packed constructor not flagged: $bare_ctor"
+clean $'packed enum Expr:\n    Int(value: int)\n\ndef build(owner: Arena) -> Expr:\n    store: Expr.Store[Local] = Expr.Store(owner)\n    return Expr.Int(value: 1)\n'
+
 clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    can Abort.Panic:\n        expect node as Expr.Int(value):\n            return value\n    return 0\n'
 
 removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> Box:\n    return value as Box\n' | "$RPT")"
