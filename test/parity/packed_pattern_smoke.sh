@@ -33,6 +33,11 @@ bare_ctor=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad() -> Expr:
 echo "$bare_ctor" | grep -Fq 'packed enum constructor "Expr.Int" requires an active in Expr.Store' || fail "bare packed constructor not flagged: $bare_ctor"
 clean $'packed enum Expr:\n    Int(value: int)\n\ndef build(owner: Arena) -> Expr:\n    store: Expr.Store[Local] = Expr.Store(owner)\n    return Expr.Int(value: 1)\n'
 
+missing_match_store=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad(node: Expr) -> int:\n    match node:\n        Expr.Int(value: value):\n            return value\n' | "$RPT")
+echo "$missing_match_store" | grep -Fq 'packed enum match over "Expr" requires an in Expr.Store clause' || fail "packed match without store not flagged: $missing_match_store"
+ordinary_store=$(printf 'enum Expr:\n    Int(value: int)\npacked enum PackedExpr:\n    Int(value: int)\ndef bad(node: Expr, store: PackedExpr.Store[Local]) -> int:\n    match node in store:\n        Expr.Int(value: value):\n            return value\n' | "$RPT")
+echo "$ordinary_store" | grep -Fq 'ordinary enum match over "Expr" does not take an in-store clause' || fail "ordinary match store clause not flagged: $ordinary_store"
+
 clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    can Abort.Panic:\n        expect node as Expr.Int(value):\n            return value\n    return 0\n'
 
 removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> Box:\n    return value as Box\n' | "$RPT")"
