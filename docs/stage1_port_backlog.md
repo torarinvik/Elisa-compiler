@@ -147,6 +147,18 @@ TypeKind gained Optional/Ref/Container; type_table_smoke (11 assertions) in the 
 ALIASED (dict[cstr,i64] → dict[dict,dict]); a stage0 store-hoisting bug (task spawned).
 NEXT: wire TypeIds into note_local_type/infer_expression_type consumers (94-98).
 
+**STATUS 2026-07-16 later (25bfc88..253d503):** the engine now CONSUMES the table —
+6 increments, each corpus-differential-verified (zero new findings on real code):
+structural unknown-type tier (`darray[mysterytype]` at any depth); transient
+local_type_ids channel + Ident structural fallback (container/optional locals; refs
+deliberately NOT dereferenced — buffer-ref indexing FPs); container element typing
+(`xs[i]`, dict values, loop variables incl. `for k, v in d:`); size-field typing
+(count/len/capacity/size on known heads -> Int, sidecar count path retired) +
+string-index -> Char + firm-char bool/string walls; structural RETURN typing
+(Symbol.return_type_id; `if g():`/`for x in g():`); struct-FIELD structural typing
+(struct_field_type_id registry; `if b.names:`/`for x in p.items:`). Items 94/95/97/98
+each partially real now. Diagnostics smoke 236/236; gate 46/46.
+
 
 91. Replace coarse TypeKind (Unknown/Void/Int/Float/Bool/Char/String/Named) with a real type representation: tuples. **[STARTED 2026-07-15, daa1c0a/3f50f03]** `TypeKind.Tuple` added; `Expr.Tuple` infers to it (POD — structure read from the AST, not stored); tuples are firm-non-numeric (operator checks fire) and firm-never-fit a scalar (container/assign mismatch flags "got tuple"). Remaining: structural element access for tuple-pattern arity + multi-scrutinee exhaustiveness (A17); refs/optionals/generics still infer to Unknown.
 92. Type representation: references (`T&`, `mutable T&`).
