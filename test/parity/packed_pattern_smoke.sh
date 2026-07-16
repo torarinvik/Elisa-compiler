@@ -20,6 +20,10 @@ clean $'packed enum Expr:\n    Int(value: int)\n    Add(left: Expr, right: Expr)
 
 clean $'packed enum Expr:\n    Int(value: int)\n    Add(left: Expr, right: Expr)\n\ndef left(node: Expr, store: Expr.Store[Frozen]) -> Expr:\n    move node in store as Expr.Add(lhs, rhs)\n    _ = rhs\n    return lhs\n'
 
+wrong_store="$(printf '%s' $'packed enum Expr:\n    Int(value: int)\n\npacked enum Token:\n    Ident\n\ndef bad(node: Expr, store: Token.Store[Local]) -> int:\n    move node in store as Expr.Int(value)\n    return value\n' | "$RPT")"
+echo "$wrong_store" | grep -q '^D 1$' || fail "wrong packed Store owner was not rejected exactly once: $wrong_store"
+echo "$wrong_store" | grep -q "requires store type 'Expr.Store', got Token.Store" || fail "wrong packed Store diagnostic missing: $wrong_store"
+
 clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    can Abort.Panic:\n        expect node as Expr.Int(value):\n            return value\n    return 0\n'
 
 removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> Box:\n    return value as Box\n' | "$RPT")"
