@@ -199,6 +199,19 @@ REMAINING Phase C: 98 unification, 99/100 generics, 102 contextual, 105 pretty-f
 108. Namespace-vs-value disambiguation diagnostics (`%q is a namespace; write %s::%s`).
 109. Extension-method resolution + duplicate detection (stage0 extension_methods.go).
 110. Cross-declaration analysis record building (stage0 analyzer_decl_analysis.go).
+110b. **Reject the positional tuple type `(i64, i64)`.** Elisa's tuple type is NAMED-FIELD
+   only — `(a: i64, b: i64)`; stage0 requires the labels in its parser (parseTupleTypeExpr:
+   `IDENT : Type`) and prints them in its unparser, and rejects the positional spelling in
+   EVERY position. Stage1 accepts it: it has no separate type grammar (a type IS an
+   expression), so `(a, b)` builds the same `Expr.Tuple(elements, line)` in value and type
+   position, and the parser CONSUMES the labels without storing them — the node therefore
+   cannot tell `(a: i64, b: i64)` from `(i64, i64)`. Closing this needs labels on
+   `Expr.Tuple` (or a distinct tuple-type node), then a check that an annotation-position
+   tuple is labeled. Deliberately deferred 2026-07-16: it is a MISSING diagnostic (stage1
+   accepts a program stage0 rejects), never a false positive on valid code, so it is the
+   same class as every other unported check. The fixtures were respelled to the canonical
+   named form at the same time (7f8a5311 + follow-up), so nothing in the corpus depends on
+   the positional spelling.
 
 ## Phase D — Semantic analysis engines (111–220)
 

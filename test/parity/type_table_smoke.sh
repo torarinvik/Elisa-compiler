@@ -30,8 +30,8 @@ cat > "$WORK/driver.c" <<'EOF'
 
 int main(void) {
     const char *src =
-        "def probe(p: dict[cstr, i64], q: (i64, i64)) -> void:\n"
-        "    a: (i64, i64) = (1, 2)\n"
+        "def probe(p: dict[cstr, i64], q: (first: i64, second: i64)) -> void:\n"
+        "    a: (first: i64, second: i64) = (1, 2)\n"
         "    b: darray[i64] = []\n"
         "    c: bool? = null\n"
         "    d: u8& = zeroed\n"
