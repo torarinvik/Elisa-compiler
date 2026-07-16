@@ -31,6 +31,8 @@ check_clean() {
 
 check_diagnostic $'@smoke\ndef sample_case() -> void:\n    pass\n' 'unknown function annotation @smoke'
 check_diagnostic $'@smoke\nextern borrow_value(holder: i32&) -> i32&\n' 'unknown extern function annotation @smoke on "borrow_value"'
+check_diagnostic $'@borrows_return(missing)\nextern borrow_value(holder: i32&) -> i32&\n' '@borrows_return on extern function "borrow_value" references unknown parameter "missing"'
+check_diagnostic $'@borrows_return(count)\nextern borrow_value(count: i32) -> i32&\n' '@borrows_return on extern function "borrow_value" cannot borrow from parameter "count" of type i32'
 check_diagnostic $'@test\ndef sample_case(value: int) -> void:\n    pass\n' '@test function "sample_case" must not take parameters'
 check_diagnostic $'@bench\ndef hot_loop() -> int:\n    return 7\n' '@bench function "hot_loop" must return void, got int'
 check_diagnostic $'@fixture\ndef shared_seed[T]() -> int:\n    return 7\n' '@fixture function "shared_seed" must not have type or shape parameters'
