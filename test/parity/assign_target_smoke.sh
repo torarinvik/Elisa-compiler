@@ -42,6 +42,14 @@ echo "$out" | grep -q "cannot assign to string index" || fail "string index not 
 echo "$out" | grep -q "cannot assign to string view index" || fail "string view index not flagged: $out"
 echo "$out" | grep -q "field 'len' is immutable" || fail "string len field not flagged: $out"
 
+# 2f. Writable capability cannot be laundered through a mutable view or loop binder.
+out=$(printf 'def f(src: darray[i64]&) -> void:\n    v: mutable view[i64] = src[0:2]\n' | "$RPT")
+echo "$out" | grep -q "cannot create a mutable view from a read-only source" || fail "mutable view provenance not flagged: $out"
+out=$(printf 'def f(src: mutable darray[i64]&) -> void:\n    v: mutable view[i64] = src[0:2]\n' | "$RPT")
+echo "$out" | grep -q "cannot create a mutable view" && fail "mutable source provenance false positive: $out"
+out=$(printf 'def f(src: mutable darray[i64]&) -> void:\n    v: view[i64] = src[0:2]\n    for mutable e in v:\n        e <- e + 1\n' | "$RPT")
+echo "$out" | grep -q "mutable iteration requires a writable view" || fail "readonly mutable iteration not flagged: $out"
+
 # 3. 0 findings across frontend + stdlib (self-contained resolution set).
 t=0
 while IFS= read -r f; do
