@@ -27,6 +27,12 @@ echo "$out" | grep -q "$MSG" && fail "false positive on ref cast: $out"
 out=$(printf 'struct S:\n    a: i64\ndef f(x: i64) -> S:\n    return x.cast[S]\n' | "$RPT")
 echo "$out" | grep -q "$MSG" && fail "false positive on struct cast: $out"
 
+# Removed cast-call and reference-shorthand forms receive directed diagnostics.
+out=$(printf 'def f(x: i64) -> i64:\n    return x.cast[i64]()\n' | "$RPT")
+echo "$out" | grep -Fq 'legacy cast syntax `.cast[T]()` is no longer supported' || fail "legacy cast call not flagged: $out"
+out=$(printf 'def f(x: i64&) -> i64&:\n    return x.ref[i64&]\n' | "$RPT")
+echo "$out" | grep -Fq '`x.ref[T]` reference shorthand has been removed' || fail "removed ref shorthand not flagged: $out"
+
 # 5. Zero false positives across the whole frontend + stdlib.
 t=0
 while IFS= read -r f; do
