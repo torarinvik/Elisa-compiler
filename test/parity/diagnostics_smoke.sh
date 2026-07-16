@@ -132,6 +132,7 @@ NAMES=(
     structural_return_condition
     struct_field_structural_type
     container_assign_scalar
+    structural_return_mismatch
     unused_expression
     void_argument
     void_collection_element
@@ -254,6 +255,7 @@ EXPECTS=(
     "if condition must be bool, got container"
     "if condition must be bool, got container"
     "variable 'xs' expects darray, got int"
+    "return type expects darray, got int"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
