@@ -135,6 +135,7 @@ NAMES=(
     structural_return_mismatch
     membership_rhs_container
     darray_push_type_mismatch
+    dict_index_key_mismatch
     unused_expression
     void_argument
     void_collection_element
@@ -260,6 +261,7 @@ EXPECTS=(
     "return type expects darray, got int"
     "membership operator requires a list literal or tokenset on the right-hand side, got container"
     "darray push expects i64, got string"
+    "dict index expects key of type i64, got string"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
