@@ -138,6 +138,7 @@ NAMES=(
     dict_index_key_mismatch
     param_structural_type
     container_comparison
+    invalid_ctor_cast
     unused_expression
     void_argument
     void_collection_element
@@ -266,6 +267,7 @@ EXPECTS=(
     "dict index expects key of type i64, got string"
     "if condition must be bool, got container"
     "cannot compare container with int"
+    "invalid cast from int to bool"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
