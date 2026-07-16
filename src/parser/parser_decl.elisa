@@ -194,6 +194,15 @@ extend Parser:
                     "law":
                         rebind __v_176: Ast::Decl?, parser = parser.law_declaration()
                         __v_176
+                    "refine":
+                        rebind refine_decl: Ast::Decl?, parser = parser.refine_declaration()
+                        refine_decl
+                    "typestate":
+                        rebind typestate_decl: Ast::Decl?, parser = parser.typestate_declaration(false)
+                        typestate_decl
+                    "contract":
+                        rebind contract_decl: Ast::Decl?, parser = parser.contract_declaration()
+                        contract_decl
                     "permission" | "effect" | "protocol":
                         rebind __v_177: Ast::Decl?, parser = parser.named_block_declaration()
                         __v_177
@@ -202,8 +211,14 @@ extend Parser:
                     # (mirrors how it owns its `layout(...)` clause), so route straight
                     # there rather than discarding the modifier and recursing generically.
                     "linear" | "affine":
-                        rebind __v_182: Ast::Decl?, parser = parser.struct_declaration()
-                        __v_182
+                        next_token: Token = parser.tokens[parser.position + 1]
+                        next_text: sview = Lexer::text_or_empty(next_token, parser.source)
+                        if text == "linear" and parser.peek_at(1) == TokenKind.Ident and next_text == "typestate":
+                            rebind linear_typestate_decl: Ast::Decl?, parser = parser.typestate_declaration(true)
+                            linear_typestate_decl
+                        else:
+                            rebind __v_182: Ast::Decl?, parser = parser.struct_declaration()
+                            __v_182
                     # `using Foo` (wildcard), `using Foo::bar`/`using Foo.bar` (selective
                     # member), `using Foo as F` (qualifier alias) — drops/shortens a
                     # module qualifier. Not yet modeled in stage1's resolver (name lookup
@@ -304,14 +319,29 @@ extend Parser:
                 header_kind: TokenKind = parser.peek()
                 break if depth == 0 and header_kind == TokenKind.Newline
                 break if depth == 0 and header_kind == TokenKind.Colon and parser.peek_at(1) == TokenKind.Newline
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor()) if depth == 0 and header_kind == TokenKind.Colon
                 depth <- match header_kind:
                     TokenKind.LParen | TokenKind.LBracket: depth + 1
                     TokenKind.RParen | TokenKind.RBracket: depth - 1
                     _: depth
                 parser, _ <- parser.advance()
             rebind accepted_colon_2: bool, parser = parser.accept(TokenKind.Colon)
+            declaration_kind: sview = Lexer::text_or_empty(token, parser.source)
+            parser <- parser.reject_protocol_method_bodies() if accepted_colon_2 and declaration_kind == "protocol"
             parser <- parser.skip_indented_block() if accepted_colon_2
             return (Ast::Decl.Alias(Lexer::text_or_empty(name_token, parser.source), (Ast::Expr.Invalid), token.line))
+
+        def reject_protocol_method_bodies(parser: lmut Parser) -> void:
+            scan: mutable usize = 0
+            indent_depth: mutable int = 0
+            while parser.peek_at(scan) != TokenKind.Eof |parser, scan, indent_depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                scanned: Token = parser.tokens[parser.position + scan]
+                indent_depth <- indent_depth + 1 if kind == TokenKind.Indent
+                indent_depth <- indent_depth - 1 if kind == TokenKind.Dedent
+                break if kind == TokenKind.Dedent and indent_depth == 0
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, scanned) if indent_depth >= 2 and kind in {TokenKind.Assign, TokenKind.LArrow}
+                scan <- scan + 1
 
 
         # `static if/elif/else COND:` compile-time conditional declarations. Each branch
@@ -350,6 +380,112 @@ extend Parser:
             rebind predicate_option: Ast::Expr?, parser = parser.expression()
             predicate <- parsed_predicate if predicate_option is parsed_predicate
             return (Ast::Decl.Law(Lexer::text_or_empty(name_token, parser.source), predicate, token.line))
+
+        # Named refinement sugar: `refine Name[Ts](params) = Base where predicate`.
+        # Stage1 represents it with the same structured Alias+Refinement shape as a
+        # `type` refinement while consuming both generic and value parameter headers.
+        def refine_declaration(parser: lmut Parser) -> Ast::Decl?:
+            rebind token: Token, parser = parser.advance()
+            rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            rebind has_generic_params: bool, parser = parser.accept(TokenKind.LBracket)
+            parser <- parser.skip_bracketed_group() if has_generic_params
+            rebind has_value_params: bool, parser = parser.accept(TokenKind.LParen)
+            parser <- parser.skip_refine_value_params() if has_value_params
+            parser, _ <- parser.expect(TokenKind.Assign)
+            rebind base_opt: Ast::Expr?, parser = parser.expression()
+            base: mutable Ast::Expr = get base_opt else (Ast::Expr.Invalid)
+            where_token: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(where_token, parser.source) == "where":
+                parser, _ <- parser.advance()
+                rebind predicate_opt: Ast::Expr?, parser = parser.expression()
+                if predicate_opt is predicate:
+                    base <- (Ast::Expr.Refinement(base, predicate, where_token.line))
+            return (Ast::Decl.Alias(Lexer::text_or_empty(name_token, parser.source), base, token.line))
+
+        def skip_refine_value_params(parser: lmut Parser) -> void:
+            while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser|:
+                parser, _ <- parser.advance()
+            parser, _ <- parser.expect(TokenKind.RParen)
+
+        def typestate_name_exists(names: darray[sview], candidate: sview) -> bool:
+            for name in names:
+                true return if name == candidate
+            return false
+
+        # Parse the legacy typestate declaration sugar and expose its state-bearing
+        # aggregate plus transition functions through existing stage1 AST nodes.
+        def typestate_declaration(parser: lmut Parser, is_linear: bool) -> Ast::Decl?:
+            parser, _ <- parser.advance() if is_linear                 # `linear`
+            rebind token: Token, parser = parser.advance()             # `typestate`
+            rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            parser, _ <- parser.expect(TokenKind.Colon)
+            parser, _ <- parser.expect(TokenKind.Newline)
+            parser, _ <- parser.expect(TokenKind.Indent)
+            states: mutable darray[sview] = []
+            while parser.peek() not in {TokenKind.Dedent, TokenKind.Eof} |parser, states|:
+                parser <- parser.skip_newlines()
+                break if parser.peek() in {TokenKind.Dedent, TokenKind.Eof}
+                line_head: Token = parser.cursor()
+                head_text: sview = Lexer::text_or_empty(line_head, parser.source)
+                if head_text == "states":
+                    parser, _ <- parser.advance()
+                    parser, _ <- parser.expect(TokenKind.Colon)
+                    while parser.peek() not in {TokenKind.Newline, TokenKind.Dedent, TokenKind.Eof} |parser, states|:
+                        if parser.peek() == TokenKind.Ident:
+                            rebind state_token: Token, parser = parser.advance()
+                            states.push(Lexer::text_or_empty(state_token, parser.source))
+                        else:
+                            parser, _ <- parser.advance()
+                elif head_text == "terminal":
+                    parser, _ <- parser.advance()
+                    parser, _ <- parser.expect(TokenKind.Colon)
+                    rebind terminal_token: Token, parser = parser.expect(TokenKind.Ident)
+                    terminal_name: sview = Lexer::text_or_empty(terminal_token, parser.source)
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, terminal_token) if not typestate_name_exists(states, terminal_name)
+                elif head_text == "transition":
+                    parser, _ <- parser.advance()
+                    rebind transition_name: Token, parser = parser.expect(TokenKind.Ident)
+                    rebind has_transition_params: bool, parser = parser.accept(TokenKind.LParen)
+                    if has_transition_params:
+                        while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser|:
+                            parser, _ <- parser.advance()
+                        parser, _ <- parser.expect(TokenKind.RParen)
+                    parser, _ <- parser.expect(TokenKind.Colon)
+                    rebind source_state: Token, parser = parser.expect(TokenKind.Ident)
+                    parser, _ <- parser.expect(TokenKind.Arrow)
+                    rebind target_state: Token, parser = parser.expect(TokenKind.Ident)
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, source_state) if not typestate_name_exists(states, Lexer::text_or_empty(source_state, parser.source))
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, target_state) if not typestate_name_exists(states, Lexer::text_or_empty(target_state, parser.source))
+                    rebind has_other_target: bool, parser = parser.accept(TokenKind.Pipe)
+                    if has_other_target:
+                        rebind other_target: Token, parser = parser.expect(TokenKind.Ident)
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, other_target) if not typestate_name_exists(states, Lexer::text_or_empty(other_target, parser.source))
+                    no_params: darray[Ast::ParamDecl] = []
+                    no_body: darray[Ast::Stmt] = []
+                    no_effects: darray[sview] = []
+                    no_decorators: darray[sview] = []
+                    parser.pending_decls <- parser.pending_decls.push((Ast::Decl.Func(Lexer::text_or_empty(transition_name, parser.source), no_params, null, no_body, no_effects, no_decorators, transition_name.line)))
+                while parser.peek() not in {TokenKind.Newline, TokenKind.Dedent, TokenKind.Eof} |parser|:
+                    parser, _ <- parser.advance()
+                parser, _ <- parser.accept(TokenKind.Newline)
+            parser, _ <- parser.expect(TokenKind.Dedent)
+            no_members: darray[Ast::StructMember] = []
+            no_invariants: darray[Ast::Expr] = []
+            affinity: sview = "linear" if is_linear else ""
+            return (Ast::Decl.Struct(Lexer::text_or_empty(name_token, parser.source), no_members, affinity, true, true, no_invariants, token.line))
+
+        # Named contract declaration; structurally a function whose body consists of
+        # contract statements. This keeps its symbol and parameter scope available.
+        def contract_declaration(parser: lmut Parser) -> Ast::Decl?:
+            rebind token: Token, parser = parser.advance()
+            rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            params: mutable darray[Ast::ParamDecl] = []
+            rebind has_params: bool, parser = parser.accept(TokenKind.LParen)
+            parser <- parser.parse_param_list(params) if has_params
+            rebind body: darray[Ast::Stmt], parser = parser.parse_block()
+            no_effects: darray[sview] = []
+            no_decorators: darray[sview] = []
+            return (Ast::Decl.Func(Lexer::text_or_empty(name_token, parser.source), params, null, body, no_effects, no_decorators, token.line))
 
 
         # `alias Name = <effect-list>` / `alias Name = <type>` (effect-set / capability

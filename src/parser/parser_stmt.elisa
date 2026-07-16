@@ -92,6 +92,10 @@ extend Parser:
                     parser, _ <- parser.advance()
                     return (Ast::Stmt.Expr((Ast::Expr.Invalid), token.line))
 
+                TokenKind.Error if parser.peek_at(1) == TokenKind.LParen:
+                    rebind error_call: Ast::Expr, parser = get parser.expression()
+                    return (Ast::Stmt.Expr(error_call, token.line))
+
                 TokenKind.With | TokenKind.Region | TokenKind.In | TokenKind.Error:
                     # `region NAME` is unambiguously a region prefix; keep the new
                     # missing-block diagnostic scoped to that form. Other keyword
@@ -135,9 +139,18 @@ extend Parser:
                     # Contextual-keyword statements (the lexer emits these as identifiers).
                     if kind == TokenKind.Ident:
                         head: sview = Lexer::text_or_empty(token, parser.source)
+                        # Removed statement families retain directed parser refusals.
+                        # Keep their words contextual in ordinary identifier positions.
+                        if head == "cascade" and parser.peek_at(1) == TokenKind.Ident:
+                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token)
+                            rebind removed_cascade: Ast::Stmt?, parser = parser.prefixed_block_statement()
+                            return removed_cascade
+                        if head == "notify" and parser.peek_at(1) == TokenKind.Ident:
+                            next_text: sview = Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source)
+                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if next_text == "one" or next_text == "all"
                         # Effect/concurrency block openers (`can …:`, `nursery workers(n):`,
                         # `pool …:`, `parallel …:`) — prefix consumed to the block colon.
-                        if head == "can" or head == "trusted" or head == "nursery" or (head == "pool" and parser.peek_at(1) == TokenKind.Ident) or head == "parallel":
+                        if head == "can" or head == "trusted" or head == "nursery" or head == "scope" or (head == "pool" and parser.peek_at(1) == TokenKind.Ident) or head == "parallel":
                             rebind __ret_125: Ast::Stmt?, parser = parser.prefixed_block_statement()
                             return __ret_125
                         # `lock MUTEX:` / `lock MUTEX as GUARD:` synchronized block. `lock`
@@ -149,10 +162,26 @@ extend Parser:
                         # `expect EXPR as PATTERN[:block]` / `expect let PATTERN = EXPR` —
                         # pattern assertion; desugars to a one-arm Match (stage0's own
                         # lowering) so the pattern's bindings resolve inside the block.
-                        if head == "expect" and tokenStartsValue(parser.peek_at(1)):
+                        if head == "expect" and parser.peek_at(1) != TokenKind.LParen and tokenStartsValue(parser.peek_at(1)):
                             rebind __ret_135: Ast::Stmt?, parser = parser.expect_statement()
                             return __ret_135
-                        if head == "for":
+                        if head == "move" and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) == TokenKind.As:
+                            parser, _ <- parser.advance()
+                            rebind moved_value: Ast::Expr, parser = get parser.expression()
+                            parser, _ <- parser.expect(TokenKind.As)
+                            rebind moved_pattern: Ast::Pattern, parser = parser.parse_pattern()
+                            moved_body: darray[Ast::Stmt] = []
+                            moved_arms: darray[Ast::MatchArm] = [Ast::MatchArm{pattern: moved_pattern, body: moved_body, guard: (Ast::Expr.Absent)}]
+                            return (Ast::Stmt.Match(moved_value, moved_arms, token.line))
+                        if head == "let" and parser.peek_at(1) in {TokenKind.Ident, TokenKind.LBrace, TokenKind.LParen}:
+                            parser, _ <- parser.advance()
+                            rebind let_pattern: Ast::Pattern, parser = parser.parse_pattern()
+                            parser, _ <- parser.expect(TokenKind.Assign)
+                            rebind let_value: Ast::Expr, parser = get parser.expression()
+                            let_body: darray[Ast::Stmt] = []
+                            let_arms: darray[Ast::MatchArm] = [Ast::MatchArm{pattern: let_pattern, body: let_body, guard: (Ast::Expr.Absent)}]
+                            return (Ast::Stmt.Match(let_value, let_arms, token.line))
+                        if head == "for" and parser.peek_at(1) != TokenKind.LParen:
                             rebind __ret_137: Ast::Stmt?, parser = parser.for_statement()
                             return __ret_137
                         # `machine over INPUT [while COND] [-> YIELD]:` (docs/123) —
@@ -265,6 +294,7 @@ extend Parser:
                                     _:
                                         pass
                             return (Ast::Stmt.Assign((Ast::Expr.Array(targets, token.line)), multi_operator, first_value, token.line))
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not parser.in_value_block
                         return (Ast::Stmt.Expr(target, token.line))
                     if parser.peek() == TokenKind.LArrow or parser.peek() == TokenKind.Assign or isCompoundAssign(parser.peek()):
                         rebind assign_operator_token: Token, parser = parser.advance()
@@ -343,8 +373,14 @@ extend Parser:
             bind: sview = "mutable" if accepted_mutable else ""
 
             variables_buffer: mutable darray[sview] = []
-            rebind variable_token: Token, parser = parser.expect(TokenKind.Ident)
-            variables_buffer.push(Lexer::text_or_empty(variable_token, parser.source))
+            match parser.peek():
+                TokenKind.LBrace:
+                    parser <- parser.consume_for_brace_pattern(variables_buffer)
+                TokenKind.Ident if parser.peek_at(1) == TokenKind.LParen:
+                    parser <- parser.consume_for_constructor_pattern(variables_buffer)
+                _:
+                    rebind variable_token: Token, parser = parser.expect(TokenKind.Ident)
+                    variables_buffer.push(Lexer::text_or_empty(variable_token, parser.source))
 
             while parser.accept(TokenKind.Comma) |parser|:
                 rebind next_variable_token: Token, parser = parser.expect(TokenKind.Ident)
@@ -362,6 +398,19 @@ extend Parser:
             if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(where_token, parser.source) == "where":
                 parser, _ <- parser.advance()                       # `where`
                 parser, _ <- parser.expression()                          # filter condition (consumed)
+                # Pattern filter guard: `where Pattern: predicate:`. The first colon
+                # separates pattern from guard; the second opens the loop body.
+                if parser.peek() == TokenKind.Colon and parser.colon_before_line_end(1):
+                    parser, _ <- parser.advance()
+                    parser, _ <- parser.expression()
+            if parser.peek() == TokenKind.If:
+                parser, _ <- parser.advance()
+                parser, _ <- parser.expression()
+            # Range execution marker `by par` is part of the header, not the iterable.
+            by_token: Token = parser.cursor()
+            if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(by_token, parser.source) == "by":
+                parser, _ <- parser.advance()
+                parser, _ <- parser.expect(TokenKind.Ident)
             # docs/119 §3: optional loop-expression header `|acc = init, …| [-> yield]`.
             header_declarations: mutable darray[Ast::Stmt] = []
             header_captures: mutable darray[sview] = []
@@ -388,3 +437,40 @@ extend Parser:
                 rebind __ret_292: Ast::Stmt, parser = parser.wrap_loop_header(header_declarations, header_yield, loop_statement, for_token.line, header_captures)
                 return __ret_292
             return loop_statement
+
+        def consume_for_constructor_pattern(parser: lmut Parser, variables: mutable darray[sview]&) -> void:
+            parser, _ <- parser.advance()                       # constructor/type name
+            parser, _ <- parser.advance()                       # `(`
+            while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser, variables|:
+                match parser.peek():
+                    TokenKind.Ident:
+                        rebind field_token: Token, parser = parser.advance()
+                        variables.push(Lexer::text_or_empty(field_token, parser.source))
+                    _:
+                        parser, _ <- parser.advance()
+            parser, _ <- parser.expect(TokenKind.RParen)
+
+        # Whether a second top-level colon occurs later on the current logical line.
+        # Used to distinguish `where Pattern: guard:` from `where condition:`.
+        def colon_before_line_end(parser: Parser&, start: usize) -> bool:
+            scan: mutable usize = start
+            depth: mutable int = 0
+            while parser.peek_at(scan) not in {TokenKind.Newline, TokenKind.Eof} |scan, depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                depth <- depth + 1 if kind in {TokenKind.LParen, TokenKind.LBracket, TokenKind.LBrace}
+                depth <- depth - 1 if kind in {TokenKind.RParen, TokenKind.RBracket, TokenKind.RBrace}
+                true return if depth == 0 and kind == TokenKind.Colon
+                scan <- scan + 1
+            return false
+
+        def consume_for_brace_pattern(parser: lmut Parser, variables: mutable darray[sview]&) -> void:
+            parser, _ <- parser.expect(TokenKind.LBrace)
+            while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof |parser, variables|:
+                if parser.peek() == TokenKind.Ident:
+                    rebind name_token: Token, parser = parser.advance()
+                    # Both shorthand fields and renamed binders are useful resolver
+                    # bindings; duplicate labels are harmless in this parser-side list.
+                    variables.push(Lexer::text_or_empty(name_token, parser.source))
+                else:
+                    parser, _ <- parser.advance()
+            parser, _ <- parser.expect(TokenKind.RBrace)

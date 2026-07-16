@@ -136,6 +136,8 @@ extend Parser:
             is_name_ident: bool = parser.peek() == TokenKind.Ident
             name: mutable sview = Lexer::text_or_empty(name_cursor, parser.source) if is_name_ident else ""
             parser <- parser.advance_when(is_name_ident)
+            is_export_signature: bool = Lexer::text_or_empty(token, parser.source) == "export"
+            parser <- parser.reject_extern_param_defaults() if is_export_signature
             parser <- parser.skip_declaration_header_clauses()          # to the block colon or end of line
             # Only `extern:` / `export:` followed by a newline opens an indented block;
             # a typed `extern name: T` stops at the colon (skip the rest of the line).
@@ -146,10 +148,23 @@ extend Parser:
             parser <- parser.skip_extern_line_remainder() if not has_trailing_block
             return (Ast::Decl.Extern(name, token.line))
 
+        def reject_extern_param_defaults(parser: lmut Parser) -> void:
+            return if parser.peek() != TokenKind.LParen
+            scan: mutable usize = 1
+            depth: mutable int = 1
+            while depth > 0 and parser.peek_at(scan) != TokenKind.Eof |parser, scan, depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                scanned_token: Token = parser.tokens[parser.position + scan]
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, scanned_token) if depth == 1 and kind == TokenKind.Assign
+                depth <- depth + 1 if kind == TokenKind.LParen
+                depth <- depth - 1 if kind == TokenKind.RParen
+                scan <- scan + 1
+
         # `func`/`fn` word immediately after `export`/`extern` before the name.
         def skip_export_func_word(parser: lmut Parser) -> void:
             func_word: Token = parser.cursor()
             func_word_text: sview = Lexer::text_or_empty(func_word, parser.source)
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, func_word) if func_word_text == "func"
             parser <- parser.advance_when(func_word_text == "func" or func_word_text == "fn")
 
         # `extern:`/`export:` indented block, entered with the cursor on the opening `:`.
@@ -167,6 +182,9 @@ extend Parser:
         def function_declaration(parser: lmut Parser) -> Ast::Decl?:
             rebind token: Token, parser = parser.expect(TokenKind.Def)
             rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            parser.declared_thread_slots <- parser.declared_thread_slots.truncate(0)
+            parser.lmut_param_names <- parser.lmut_param_names.truncate(0)
+            parser.mutable_param_names <- parser.mutable_param_names.truncate(0)
 
             # Leading `@name` decorators were captured just before dispatch; snapshot them
             # now before any nested parse clobbers the parser's pending buffer.
@@ -176,6 +194,7 @@ extend Parser:
 
             # Optional generic/region params `[T]`, `[K, V]`, `[@r]` between name and `(`.
             rebind accepted_lbracket: bool, parser = parser.accept(TokenKind.LBracket)
+            parser <- parser.reject_legacy_region_params() if accepted_lbracket
             parser <- parser.skip_bracketed_group() if accepted_lbracket
 
             param_items: mutable darray[Ast::ParamDecl] = []
@@ -186,6 +205,7 @@ extend Parser:
 
             rebind accepted_arrow: bool, parser = parser.accept(TokenKind.Arrow)
             rebind return_type: Ast::Expr?, parser = parser.capture_return_type_and_effects(accepted_arrow)
+            parser <- parser.validate_declared_thread_slots(token)
             # The return-type `expression()` consumes a trailing effect grant
             # (`-> T can[...]`) via skip_trailing_can; recover it from the parser. The
             # copy lives HERE, where `effects` is locally owned — growing it through a
@@ -262,11 +282,24 @@ extend Parser:
             rebind leading_mutable: bool, parser = parser.accept(TokenKind.Mutable)
             rebind param_name: Token, parser = parser.expect(TokenKind.Ident)
             parser, _ <- parser.expect(TokenKind.Colon)
+            parser <- parser.reject_positional_tuple_type_ahead()
+            is_lmut_param: bool = parser.peek() == TokenKind.Lmut
+            parser.lmut_param_names <- parser.lmut_param_names.push(Lexer::text_or_empty(param_name, parser.source)) if is_lmut_param
+            is_mutable_param: bool = leading_mutable or parser.peek() == TokenKind.Mutable or is_lmut_param
+            parser.mutable_param_names <- parser.mutable_param_names.push(Lexer::text_or_empty(param_name, parser.source)) if is_mutable_param
             rebind parsed_type_expression: Ast::Expr?, parser = parser.expression()
             type_expression: mutable Ast::Expr? = parsed_type_expression
             if type_expression is param_type:
                 rebind refined_type: Ast::Expr, parser = parser.parse_refinement_suffix(param_type)
                 type_expression <- refined_type
+
+            # Function-type error set: `fn(...) -> T error[R]`. The function type is
+            # represented by the existing expression shape; consume its error-set
+            # selector so it remains part of this parameter rather than an orphan token.
+            if parser.peek() == TokenKind.Error:
+                parser, _ <- parser.advance()
+                rebind accepted_error_lbracket: bool, parser = parser.accept(TokenKind.LBracket)
+                parser <- parser.skip_bracketed_group() if accepted_error_lbracket
 
             # Optional `@region` binding on the param type (`out: darray[u8]& @r`) pinning
             # the parameter to a region-polymorphic region declared in the `[@r]` generic
@@ -312,11 +345,34 @@ extend Parser:
         # single call via a value-first exit guard instead.
         def capture_return_type_and_effects(parser: lmut Parser, has_arrow: bool) -> Ast::Expr?:
             null return if not has_arrow
+            parser <- parser.reject_positional_tuple_type_ahead()
+            parser <- parser.capture_declared_thread_slots()
             rebind return_type_opt: Ast::Expr?, parser = parser.expression()
             if return_type_opt is return_type:
                 rebind refined_return_type: Ast::Expr, parser = parser.parse_refinement_suffix(return_type)
                 return refined_return_type
             return return_type_opt
+
+        def capture_declared_thread_slots(parser: lmut Parser) -> void:
+            return if parser.peek() != TokenKind.LParen
+            scan: mutable usize = 1
+            depth: mutable int = 1
+            while depth > 0 and parser.peek_at(scan) != TokenKind.Eof |parser, scan, depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                if depth == 1 and kind == TokenKind.Ident and parser.peek_at(scan + 1) == TokenKind.Colon:
+                    label_token: Token = parser.tokens[parser.position + scan]
+                    is_lmut_slot: bool = parser.peek_at(scan + 2) == TokenKind.Lmut
+                    parser.declared_thread_slots <- parser.declared_thread_slots.push(Lexer::text_or_empty(label_token, parser.source)) if is_lmut_slot
+                depth <- depth + 1 if kind == TokenKind.LParen
+                depth <- depth - 1 if kind == TokenKind.RParen
+                scan <- scan + 1
+
+        def validate_declared_thread_slots(parser: lmut Parser, token: Token) -> void:
+            for slot in parser.declared_thread_slots |parser|:
+                found: mutable bool = false
+                for param in parser.lmut_param_names |found|:
+                    found <- true if slot == param
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not found
 
         # Expression-bodied function `def f(...) -> T = EXPR`: builds the one-element
         # body as a list literal (not `[]`+push): a push-only fresh darray does not
@@ -453,6 +509,9 @@ extend Parser:
                     member: Ast::StructMember = Ast::StructMember{name: Lexer::text_or_empty(member_name, parser.source), type_expression: member_type_value, omittable: is_optional or has_default, is_ghost: is_ghost_field, has_default: has_default, region: member_region, bit_group_kind: group_kind, bit_group_members: group_members}
                     members.push(member)
                     # `field: type at OFFSET [requires size >= N]` guest-overlay clause.
+                    guest_clause_token: Token = parser.cursor()
+                    has_guest_at: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(guest_clause_token, parser.source) == "at"
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, member_name) if parser.current_struct_is_guest and not has_guest_at
                     parser <- parser.skip_guest_overlay_clause()
                 parser, _ <- parser.accept(TokenKind.Newline)
 

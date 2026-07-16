@@ -58,6 +58,7 @@ extend Parser:
         def variable_declaration_statement(parser: lmut Parser) -> Ast::Stmt?:
             rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
             parser, _ <- parser.expect(TokenKind.Colon)
+            parser <- parser.reject_positional_tuple_type_ahead()
             rebind parsed_type_expression: Ast::Expr?, parser = parser.expression()
             type_expression: mutable Ast::Expr = get parsed_type_expression
             rebind refined_type: Ast::Expr, parser = parser.parse_refinement_suffix(type_expression)
@@ -145,6 +146,9 @@ extend Parser:
                 rebind consequent: Ast::Expr, parser = get parser.expression()
                 negated_guard: Ast::Expr = (Ast::Expr.Unary(TokenKind.Not, predicate, arrow_token.line))
                 predicate <- (Ast::Expr.Binary(negated_guard, TokenKind.Or, consequent, arrow_token.line))
+            if kind_text == "assert" and parser.peek() == TokenKind.Comma:
+                parser, _ <- parser.advance()
+                parser, _ <- parser.expression()
             return (Ast::Stmt.Contract(kind_text, predicate, keyword_token.line))
 
 
@@ -171,7 +175,8 @@ extend Parser:
                 parser, _ <- parser.capture_pattern_span() if parser.peek() != TokenKind.Assign      # exotic tail; consumed losslessly
                 parser, _ <- parser.expect(TokenKind.Assign)
                 rebind let_value: Ast::Expr, parser = get parser.expression()
-                let_body: darray[Ast::Stmt] = []
+                let_body: mutable darray[Ast::Stmt] = []
+                let_body, parser <- parser.parse_block() if parser.peek() == TokenKind.Colon
                 let_arms: mutable darray[Ast::MatchArm] = [Ast::MatchArm{pattern: let_pattern, body: let_body, guard: (Ast::Expr.Absent)}]
                 let_panic_body: darray[Ast::Stmt] = [parser.expect_pattern_failure_stmt(expect_token.line)]
                 let_arms.push(Ast::MatchArm{pattern: (Ast::Pattern.Wildcard), body: let_panic_body, guard: (Ast::Expr.Absent)})
@@ -254,6 +259,12 @@ extend Parser:
                         parser, _ <- parser.advance()
                     TokenKind.Colon | TokenKind.Newline if depth == 0:
                         break
+                    TokenKind.As if depth == 0 and (block_kind == "can" or block_kind == "lock"):
+                        # `can Effects as Family:` records the effect-family cast
+                        # target; `lock mutex as guard:` records the guard binding.
+                        parser, _ <- parser.advance()
+                        rebind binding_token: Token, parser = parser.expect(TokenKind.Ident)
+                        binding <- Lexer::text_or_empty(binding_token, parser.source)
                     TokenKind.Ident if depth == 0 and not first:
                         # Preserve region's contextual `using` marker separately so the
                         # clause side-table retains allocator intent; qualified effect
@@ -325,6 +336,9 @@ extend Parser:
 
         def while_statement(parser: lmut Parser) -> Ast::Stmt?:
             rebind while_token: Token, parser = parser.expect(TokenKind.While)
+            hint_token: Token = parser.cursor()
+            has_hint: bool = parser.peek() == TokenKind.Ident and (Lexer::text_or_empty(hint_token, parser.source) == "likely" or Lexer::text_or_empty(hint_token, parser.source) == "unlikely") and tokenStartsValue(parser.peek_at(1))
+            parser, _ <- parser.advance() if has_hint
             # docs/119 §3: binary parsing stops at a header's opening `|` (loop_header_at),
             # so the ordinary condition parse already yields the pre-header expression.
             rebind condition: Ast::Expr, parser = get parser.expression()
@@ -343,12 +357,22 @@ extend Parser:
         def return_statement(parser: lmut Parser) -> Ast::Stmt?:
             rebind return_token: Token, parser = parser.expect(TokenKind.Return)
 
-            # Bare postfix guard `return if COND` (== `if COND: return`). A bare return has
-            # no value, so an `if` right after `return` is unambiguously a guard (never a
-            # ternary). Desugar to a real If node so the guard's references resolve.
+            # `return if COND: THEN else: ELSE` is a value expression. Its leading tokens
+            # overlap the postfix guard `return if COND`; a top-level colon before the
+            # newline distinguishes the value form.
             rebind accepted_if: bool, parser = parser.accept(TokenKind.If)
             if accepted_if:
                 rebind condition: Ast::Expr, parser = get parser.expression()
+                if parser.peek() == TokenKind.Colon:
+                    parser, _ <- parser.advance()
+                    rebind then_value: Ast::Expr, parser = parser.parse_bare_block_value()
+                    parser <- parser.skip_newlines()
+                    parser, _ <- parser.expect(TokenKind.Else)
+                    parser, _ <- parser.expect(TokenKind.Colon)
+                    rebind else_value: Ast::Expr, parser = parser.parse_bare_block_value()
+                    conditional: Ast::Expr = (Ast::Expr.If(condition, then_value, else_value, return_token.line))
+                    return (Ast::Stmt.Return(conditional, return_token.line))
+                # No colon: bare postfix guard `return if COND` (== `if COND: return`).
                 body: mutable darray[Ast::Stmt] = []
                 body.push((Ast::Stmt.Return(null, return_token.line)))
                 no_else: darray[Ast::Stmt] = []
@@ -369,6 +393,8 @@ extend Parser:
                         return_elements.push(return_element) if return_element_option is return_element
                     value <- (Ast::Expr.Tuple(return_elements, return_token.line))
 
+                parser <- parser.validate_declared_thread_return(value, return_token)
+
                 # Trailing guard `return VALUE if COND` (== `if COND: return VALUE`).
                 rebind accepted_if_2: bool, parser = parser.accept(TokenKind.If)
                 if accepted_if_2:
@@ -379,3 +405,24 @@ extend Parser:
                     return (Ast::Stmt.If(value_condition, value_body, value_no_else, return_token.line))
                 else:
                     return (Ast::Stmt.Return(value, return_token.line))
+
+        def validate_declared_thread_return(parser: lmut Parser, value: Ast::Expr?, token: Token) -> void:
+            return if parser.declared_thread_slots.count == 0
+            if value is threaded_value:
+                match threaded_value:
+                    Ast::Expr.Tuple(elements, line):
+                        if elements.count == parser.declared_thread_slots.count + 1:
+                            valid: mutable bool = true
+                            i: mutable usize = 0
+                            while i < parser.declared_thread_slots.count |i, valid|:
+                                expected: sview = parser.declared_thread_slots[i]
+                                match elements[i + 1]:
+                                    Ast::Expr.Ident(actual, ident_line):
+                                        valid <- false if actual != expected
+                                    _:
+                                        valid <- false
+                                i <- i + 1
+                            return if valid
+                    _:
+                        pass
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token)
