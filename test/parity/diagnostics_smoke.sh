@@ -139,6 +139,7 @@ NAMES=(
     param_structural_type
     container_comparison
     invalid_ctor_cast
+    scoped_shadowing_type
     unused_expression
     void_argument
     void_collection_element
@@ -268,6 +269,7 @@ EXPECTS=(
     "if condition must be bool, got container"
     "cannot compare container with int"
     "invalid cast from int to bool"
+    "operator '+' requires numeric operands, got string"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
