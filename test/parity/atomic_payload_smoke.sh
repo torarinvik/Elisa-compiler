@@ -22,4 +22,9 @@ echo "$out" | grep -Fq 'type "Thread" expects 2 type arguments, got 1' || fail "
 out=$(printf 'def ok(thread: Thread[i64, Joinable], task: Task[i64, Pending]) -> void:\n    pass\n' | "$RPT")
 echo "$out" | grep -Fq 'expects 2 type arguments' && fail "valid protocol carrier rejected: $out"
 
+bool_rmw=$(printf 'enum MemoryOrder:\n    AcqRel\nextern fetch_or(slot: atomic[bool]&, value: bool, order: MemoryOrder) -> bool\ndef bad(slot: mutable atomic[bool]) -> bool:\n    slot_ref: atomic[bool]& = (&slot).cast[atomic[bool]&]\n    return fetch_or(slot_ref, true, MemoryOrder.AcqRel)\n' | "$RPT")
+echo "$bool_rmw" | grep -Fq 'argument to "fetch_or" requires atomic_numeric(T), got atomic[bool]' || fail "bool atomic RMW accepted: $bool_rmw"
+ref_rmw=$(printf 'enum MemoryOrder:\n    AcqRel\nextern fetch_xor(slot: atomic[u8&]&, value: u8&, order: MemoryOrder) -> u8&\ndef bad(slot: mutable atomic[u8&], value: u8&) -> u8&:\n    slot_ref: atomic[u8&]& = (&slot).cast[atomic[u8&]&]\n    return fetch_xor(slot_ref, value, MemoryOrder.AcqRel)\n' | "$RPT")
+echo "$ref_rmw" | grep -Fq 'argument to "fetch_xor" requires atomic_numeric(T), got atomic[u8&]' || fail "pointer atomic RMW accepted: $ref_rmw"
+
 echo "atomic-payload smoke OK: aggregate payloads rejected; numeric, bool, and pointer payloads accepted"
