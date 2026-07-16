@@ -34,14 +34,14 @@ run_one() {
 }
 
 echo "stage1 parity gate — standing invariants:"
-# NOTE: scripts/check_runtime_drift.sh is intentionally NOT run here yet. The vendored
-# elisacore_std has real, pre-existing bidirectional drift vs Elisa-core's canonical copy
-# (docs/125 remodeled the vendored mirror unilaterally in 48b9230; 6 files also carry
-# genuine content divergence — e.g. test.elisa panic()->fail(), debug_referee stage1-only
-# funcs, concurrency core-only additions). Wiring it in now would make this shared gate
-# permanently red. It must be reconciled per-file first (see docs/stage1_port_backlog.md
-# item 9 / 300), then this line un-commented:
-#   run_one "runtime drift guard (elisacore_std in sync)" "$REPO_ROOT/scripts/check_runtime_drift.sh"
+# Runtime drift guard: the vendored elisacore_std must stay byte-identical to Elisa-core's
+# canonical copy (README "Single source of truth"). Reconciled 2026-07-15 (backlog item 9):
+# the docs/125 postfix-guard remodel was adopted into Elisa-core's canonical runtime and
+# re-vendored core->stage1; the 6 apparent content diffs were all semantically-identical
+# remodels (test.elisa now routes asserts through the existing fail() helper; the collections
+# trusted-Alias/UncheckedIndex wrappers are redundant under stdlib trust; concurrency was a
+# ternary collapse). The mirror is byte-identical again, so this guard now runs.
+run_one "runtime drift guard (elisacore_std in sync)" "$REPO_ROOT/scripts/check_runtime_drift.sh"
 run_one "self-hostable (0 unresolved / 132 files)" "$REPO_ROOT/test/parity/check_self_hostable.sh"
 run_one "lexer parity (stage1 == stage0)"          "$REPO_ROOT/test/parity/run_parity.sh"
 

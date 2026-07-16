@@ -23,7 +23,6 @@ porting source of truth.
   false-positive on every legitimate cross-module capitalized type until the resolver can
   see them — the uppercase-skip is a deliberate soundness guard, not laziness).
 - DEFERRED (needs a decision / larger effort): 3, 4 (cross-repo lexer oracle infra);
-  9 (runtime drift reconciliation — real bidirectional drift, tracked separately);
   14 (reproduce-or-retire the stage0 `*ast.TypeExprExpr` backend divergence — needs a
   stage0 backend build); 17 (multi-scrutinee tuple-match exhaustiveness — real feature).
 
@@ -36,7 +35,7 @@ porting source of truth.
 6. Remove the SKIP-on-build-break path in `test/parity/match_pattern_smoke.sh:25-34` (silently green when stage1 fails to build).
 7. Remove the SKIP-on-clang-link-failure path in `match_pattern_smoke.sh:34`.
 8. Port/write the missing docs/119 spec referenced by `match_pattern_smoke.sh:29`.
-9. Wire `scripts/check_runtime_drift.sh` into `test/parity/run_all.sh` (runtime can drift while gate stays green).
+9. ~~Wire `scripts/check_runtime_drift.sh` into `test/parity/run_all.sh` (runtime can drift while gate stays green).~~ **DONE 2026-07-15.** Direction (a): the docs/125 postfix-guard remodel was adopted into Elisa-core's canonical `compiler/runtime/elisacore_std/` (completing docs/125 in stage0's own runtime) and re-vendored core→stage1, restoring byte-identity. The "6 content-divergence" files were re-examined and found to be semantically-identical remodels, not genuine forks: test.elisa routes asserts through the existing `fail()` helper (equiv to inline `panic`); collections' dropped `trusted Unsafe.Alias:`/`UncheckedIndex:` wrappers are redundant under stdlib trust (`permissions_validation.go:128`) and `get … else return null` → bare `get` is sanctioned None-propagation (`analyzeGetExpr`); concurrency's "core-only additions" were a ternary `<-` collapse; debug_referee's if/elif ladder became a `match`. `collections.elisai` was regenerated via `-emit interface` (picks up `fn` rename + fresh externs). Core builds + runtime smokes green; stage1 gate 45/45 with the drift guard now live in `run_all.sh`.
 10. Fix `test/breadth/run.sh` per-file-isolation UndefinedName noise: resolve cross-file names or suppress the kind in breadth mode so `D <n>` counts become trustworthy.
 11. Document/enumerate the `_unused`-path exclusions in `test/breadth/run.sh:14`.
 12. Re-audit primer doc `docs/notes/port_primer_template.md` wiring anchors (claims ordinal 122/old line numbers; enum is at 142).
@@ -44,7 +43,7 @@ porting source of truth.
 14. Reproduce-or-retire the open stage0 backend divergence: `x is Enum.PayloadlessVariant` in `if` crashing stage0 on `*ast.TypeExprExpr` (ast_shape_gotchas.md:351-377).
 15. Verify regression fixtures for the two historically-fixed bugs named in `run_all.sh:9-11` still exist and fail-on-revert.
 16. Extend `UnknownFieldType` beyond the lowercase-only heuristic (struct_layout_smoke.sh:18-19) with proper cross-module resolution.
-17. Multi-scrutinee tuple-match exhaustiveness (`match a, b:`) in `resolve_types.elisa:287` (cartesian product).
+17. Multi-scrutinee tuple-match exhaustiveness (`match a, b:`) in `resolve_types.elisa:287` (cartesian product). **[arity piece done 2026-07-15, 3f6dc54]** New `TuplePatternArityMismatch` diagnostic flags a multi-scrutinee arm whose sub-pattern count differs from the scrutinee arity (region-safe, AST-only, 0 corpus FPs). The exhaustiveness (cartesian-product coverage) piece still remains.
 18–40. Add pos/neg fixtures (and smoke where warranted) for the 70 uncovered check_* diagnostics — batched:
 18. fixtures: affine_collection, assign_to_loop_var, call_non_function, call_named_non_function.
 19. fixtures: array_literal_arity, array_literal_element, construct_field_type, firm_arg_type_mismatch, literal_arg_type_mismatch.
