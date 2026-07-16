@@ -142,6 +142,7 @@ NAMES=(
     scoped_shadowing_type
     qualified_call_return_type
     nested_darray_literal_element
+    namespace_used_as_value
     unused_expression
     void_argument
     void_collection_element
@@ -274,6 +275,7 @@ EXPECTS=(
     "operator '+' requires numeric operands, got string"
     "variable 'n' expects bool, got int"
     "darray literal element expects i64, got string"
+    "'M' is a namespace; write M::member"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
