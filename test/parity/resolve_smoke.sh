@@ -166,7 +166,7 @@ int main(int argc, char **argv) {
            the explicit specialization and size_of type operand must resolve T;
            dropping the generic header would add two spurious unresolved refs. */
         "def generic_id[T](value: T) -> usize:\n"
-        "    return size_of(T) + helper[T](0)\n"
+        "    return size_of(T) + helper[T](0) + helper[cstr[key_shape]](0)\n"
         "\n"
         /* nested_mod exercises Decl.Module recursion in resolve_decls: a function body
            INSIDE a module must still be walked. `helper` is a file-global, so calling
