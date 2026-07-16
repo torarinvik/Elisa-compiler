@@ -21,6 +21,9 @@ echo "$out" | grep -q "cannot mix positional and named arguments" || fail "mixed
 out=$(printf 'enum E:\n    A(i64, i64)\n\ndef f() -> E:\n    return E.A(x: 1, y: 2)\n' | "$RPT")
 echo "$out" | grep -q "does not declare named payload fields" || fail "unnamed enum payload accepted named args: $out"
 
+out=$(printf 'enum MaybeInt:\n    Some(int)\ndef unwrap(value: MaybeInt) -> int:\n    match value:\n        MaybeInt.Some(value: inner):\n            return inner\n    return 0\n' | "$RPT")
+echo "$out" | grep -Fq 'match arm "MaybeInt.Some" does not declare named payload fields' || fail "unnamed payload accepted named pattern: $out"
+
 # 4. Unknown payload labels are rejected.
 out=$(printf 'enum E:\n    A(x: i64)\n\ndef f() -> E:\n    return E.A(y: 1)\n' | "$RPT")
 echo "$out" | grep -q "has no payload field 'y'" || fail "unknown enum payload field not flagged: $out"
