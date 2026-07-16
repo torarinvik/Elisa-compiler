@@ -38,6 +38,10 @@ echo "$missing_match_store" | grep -Fq 'packed enum match over "Expr" requires a
 ordinary_store=$(printf 'enum Expr:\n    Int(value: int)\npacked enum PackedExpr:\n    Int(value: int)\ndef bad(node: Expr, store: PackedExpr.Store[Local]) -> int:\n    match node in store:\n        Expr.Int(value: value):\n            return value\n' | "$RPT")
 echo "$ordinary_store" | grep -Fq 'ordinary enum match over "Expr" does not take an in-store clause' || fail "ordinary match store clause not flagged: $ordinary_store"
 
+missing_if_binder=$(printf 'packed enum Expr:\n    Int(value: int)\ndef bad(node: Expr, store: Expr.Store[Local]) -> int:\n    if node in store:\n        return 1\n    return 0\n' | "$RPT")
+echo "$missing_if_binder" | grep -Fq 'if pattern binder requires `as Enum.Variant(...)` after store expression' || fail "packed if-store binder omission not flagged: $missing_if_binder"
+clean $'def contains(value: int, values: darray[int]&) -> bool:\n    if value in values:\n        return true\n    return false\n'
+
 ordinary_variant_type=$(printf 'enum Expr:\n    Int(value: int)\ndef bad(node: Expr.Int) -> int:\n    return 0\n' | "$RPT")
 echo "$ordinary_variant_type" | grep -Fq 'bare variant type "Expr.Int" requires a packed enum or tree category' || fail "ordinary bare variant type not flagged: $ordinary_variant_type"
 clean $'packed enum Expr:\n    Int(value: int)\ndef ok(node: Expr.Int) -> int:\n    return 0\n'
