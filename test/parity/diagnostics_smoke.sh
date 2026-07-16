@@ -122,6 +122,7 @@ NAMES=(
     ternary_branch_mismatch
     unknown_field_access
     unknown_type_name
+    unknown_type_name_generic
     unused_expression
     void_argument
     void_collection_element
@@ -233,6 +234,7 @@ EXPECTS=(
     "index must be integral, got float"
     "ternary branches are incompatible: int and string"
     "has no field 'z'"
+    "unknown type 'mysterytype'"
     "unknown type 'mysterytype'"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
