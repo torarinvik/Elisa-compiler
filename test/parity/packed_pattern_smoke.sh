@@ -35,4 +35,10 @@ echo "$removed" | grep -q "unexpected token 'as'" || fail "removed value cast la
 removed_store_as="$(printf '%s' $'packed enum Expr:\n    Lit(value: int)\n\ndef bad(node: Expr, store: Expr.Store[Local]) -> int:\n    if node in store as Expr.Lit(value):\n        return value\n    return 0\n' | "$RPT")"
 echo "$removed_store_as" | grep -Eq '^P [1-9][0-9]*$' || fail "removed in-store as binder was accepted: $removed_store_as"
 
-echo "packed-pattern smoke OK: if/move/expect patterns parse and bind; removed value casts stay rejected"
+move_arity="$(printf '%s' $'struct Pair:\n    left: mutable i64\n    right: mutable i64\n\ndef bad(pair: Pair) -> void:\n    move pair as Pair(left)\n' | "$RPT")"
+echo "$move_arity" | grep -q '^D 1$' || fail "move struct arity mismatch was not rejected exactly once: $move_arity"
+echo "$move_arity" | grep -q "move-as pattern 'Pair' expects 2 bindings, got 1" || fail "move struct arity diagnostic missing: $move_arity"
+
+clean $'struct Pair:\n    left: mutable i64\n    right: mutable i64\n\ndef take(pair: Pair) -> i64:\n    move pair as Pair(left, right)\n    return left + right\n'
+
+echo "packed-pattern smoke OK: if/move/expect patterns parse and bind with arity checks; removed value casts stay rejected"
