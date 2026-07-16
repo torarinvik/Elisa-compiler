@@ -127,6 +127,8 @@ NAMES=(
     nonbool_condition_optional
     container_element_index_mismatch
     loop_element_type
+    string_index_element_type
+    container_count_condition
     unused_expression
     void_argument
     void_collection_element
@@ -244,6 +246,8 @@ EXPECTS=(
     "while condition must be bool, got optional"
     "variable 'n' expects bool, got int"
     "operator '+' requires numeric operands, got string"
+    "variable 'x' expects bool, got char"
+    "if condition must be bool, got int"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
@@ -267,7 +271,7 @@ EXPECTS=(
     "variable 'x' expects i64, got container"
     "ordering comparison requires numeric operands"
     "variable 'y' expects i64, got optional"
-    "variable 'n' expects bool, got usize"
+    "variable 'n' expects bool, got int"
 )
 
 total=0
