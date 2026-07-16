@@ -43,7 +43,10 @@ porting source of truth.
 14. Reproduce-or-retire the open stage0 backend divergence: `x is Enum.PayloadlessVariant` in `if` crashing stage0 on `*ast.TypeExprExpr` (ast_shape_gotchas.md:351-377).
 15. Verify regression fixtures for the two historically-fixed bugs named in `run_all.sh:9-11` still exist and fail-on-revert.
 16. Extend `UnknownFieldType` beyond the lowercase-only heuristic (struct_layout_smoke.sh:18-19) with proper cross-module resolution.
-17. Multi-scrutinee tuple-match exhaustiveness (`match a, b:`) in `resolve_types.elisa:287` (cartesian product). **[arity piece done 2026-07-15, 3f6dc54]** New `TuplePatternArityMismatch` diagnostic flags a multi-scrutinee arm whose sub-pattern count differs from the scrutinee arity (region-safe, AST-only, 0 corpus FPs). The exhaustiveness (cartesian-product coverage) piece still remains.
+17. Multi-scrutinee tuple-match exhaustiveness (`match a, b:`) in `resolve_types.elisa:287` (cartesian product). **[arity piece done 2026-07-15, 3f6dc54]** New `TuplePatternArityMismatch` diagnostic flags a multi-scrutinee arm whose sub-pattern count differs from the scrutinee arity (region-safe, AST-only, 0 corpus FPs). The exhaustiveness (cartesian-product coverage) piece: ORACLE FINDING 2026-07-16 —
+stage0 does NOT enforce it (a `match a, b:` missing a combination compiles silently), so
+there is no parity to port; adding it would be a stage1-only rule. Needs a language-design
+decision (docs/122 follow-up) rather than a port — parked.
 18–40. Add pos/neg fixtures (and smoke where warranted) for the 70 uncovered check_* diagnostics — batched:
 18. fixtures: affine_collection, assign_to_loop_var, call_non_function, call_named_non_function.
 19. fixtures: array_literal_arity, array_literal_element, construct_field_type, firm_arg_type_mismatch, literal_arg_type_mismatch.

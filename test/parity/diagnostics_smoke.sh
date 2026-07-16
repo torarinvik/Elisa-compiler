@@ -141,6 +141,7 @@ NAMES=(
     invalid_ctor_cast
     scoped_shadowing_type
     qualified_call_return_type
+    nested_darray_literal_element
     unused_expression
     void_argument
     void_collection_element
@@ -272,6 +273,7 @@ EXPECTS=(
     "invalid cast from int to bool"
     "operator '+' requires numeric operands, got string"
     "variable 'n' expects bool, got int"
+    "darray literal element expects i64, got string"
     "expression statement has no effect; its result is discarded"
     "argument to 'take' cannot be void"
     "collection element cannot be void"
