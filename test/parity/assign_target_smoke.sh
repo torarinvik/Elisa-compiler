@@ -32,6 +32,16 @@ echo "$out" | grep -q "invalid assignment target" || fail "call-target assign no
 out=$(printf 'def f() -> i64:\n    y += 1\n    return 1\n' | "$RPT")
 echo "$out" | grep -q "undefined assignment target 'y'" || fail "compound-assign undeclared not flagged: $out"
 
+# 2e. Read-only view and string-derived places cannot be written through.
+out=$(printf 'def f(src: mutable darray[i64]&) -> void:\n    ro: view[i64] = src[0:2]\n    ro[0] <- 1\n' | "$RPT")
+echo "$out" | grep -q "cannot assign to read-only view index result" || fail "readonly view index not flagged: $out"
+out=$(printf 'def f(src: mutable darray[i64]&) -> void:\n    rw: mutable view[i64] = src[0:2]\n    rw[0] <- 1\n' | "$RPT")
+echo "$out" | grep -q "cannot assign to read-only view index result" && fail "mutable view index false positive: $out"
+out=$(printf 'def f(text: cstr[row], view: sview) -> void:\n    text[0] <- 1\n    view[0] <- 1\n    text.len <- 1\n' | "$RPT")
+echo "$out" | grep -q "cannot assign to string index" || fail "string index not flagged: $out"
+echo "$out" | grep -q "cannot assign to string view index" || fail "string view index not flagged: $out"
+echo "$out" | grep -q "field 'len' is immutable" || fail "string len field not flagged: $out"
+
 # 3. 0 findings across frontend + stdlib (self-contained resolution set).
 t=0
 while IFS= read -r f; do
