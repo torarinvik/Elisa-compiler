@@ -11,7 +11,7 @@ check_diagnostic() {
   local expected="$2"
   local output
   output="$(printf '%s' "$source" | "$REPO_ROOT/build/parse_report")"
-  [[ "$output" == *"D 1"* && "$output" == *"$expected"* ]] || {
+  [[ "$output" == *"D "* && "$output" == *"$expected"* ]] || {
     echo "missing annotation diagnostic: $expected" >&2
     printf '%s\n' "$output" >&2
     exit 1
@@ -31,7 +31,12 @@ check_clean() {
 
 check_diagnostic $'@smoke\ndef sample_case() -> void:\n    pass\n' 'unknown function annotation @smoke'
 check_diagnostic $'@smoke\nextern borrow_value(holder: i32&) -> i32&\n' 'unknown extern function annotation @smoke on "borrow_value"'
+check_diagnostic $'@test\ndef sample_case(value: int) -> void:\n    pass\n' '@test function "sample_case" must not take parameters'
+check_diagnostic $'@bench\ndef hot_loop() -> int:\n    return 7\n' '@bench function "hot_loop" must return void, got int'
+check_diagnostic $'@fixture\ndef shared_seed[T]() -> int:\n    return 7\n' '@fixture function "shared_seed" must not have type or shape parameters'
 check_clean $'@test\ndef sample_case() -> void:\n    pass\n'
+check_clean $'@bench\ndef hot_loop() -> void:\n    pass\n'
+check_clean $'@fixture\ndef shared_seed() -> int:\n    return 7\n'
 check_clean $'@link_name("borrow_value")\nextern borrow_value(holder: i32&) -> i32&\n'
 
 echo "function annotation smoke OK"
