@@ -32,12 +32,30 @@ echo "$out" | grep -q "requires numeric operands" && fail "false positive on cha
 out=$(printf 'def f(n: i64) -> i64:\n    return n + n\n' | "$RPT")
 echo "$out" | grep -q "requires numeric operands" && fail "false positive on int arithmetic: $out"
 
-# 6. 0 FP across frontend + stdlib.
+# 6. modulo is integral-only.
+out=$(printf 'def f(value: f64) -> f64:\n    return value %% 2.0\n' | "$RPT")
+echo "$out" | grep -q "operator requires integral operands" || fail "float modulo not flagged: $out"
+out=$(printf 'def f(value: i64) -> i64:\n    return value %% 2\n' | "$RPT")
+echo "$out" | grep -q "operator requires integral operands" && fail "false positive on integer modulo: $out"
+
+# 7. fixed arrays require integral indexes.
+out=$(printf 'def f(values: i32[4], idx: f64) -> i32:\n    return values[idx]\n' | "$RPT")
+echo "$out" | grep -q "index must be integral, got float" || fail "float array index not flagged: $out"
+out=$(printf 'def f(values: i32[4], idx: i64) -> i32:\n    return values[idx]\n' | "$RPT")
+echo "$out" | grep -q "index must be integral" && fail "false positive on integer array index: $out"
+
+# 8. literal-zero for-range strides are rejected, nonzero strides are valid.
+out=$(printf 'def f() -> void:\n    for i in 0..<10..0:\n        pass\n' | "$RPT")
+echo "$out" | grep -q "for loop range step cannot be zero" || fail "zero range step not flagged: $out"
+out=$(printf 'def f() -> void:\n    for i in 0..<10..2:\n        pass\n' | "$RPT")
+echo "$out" | grep -q "for loop range step cannot be zero" && fail "false positive on nonzero range step: $out"
+
+# 9. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "requires bool operands|requires numeric operands" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "requires bool operands|requires numeric operands|operator requires integral operands|index must be integral|range step cannot be zero" || true)
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t operator-operand false positives across frontend+stdlib"
 
-echo "operator-operands smoke OK: flags non-bool logical + non-numeric arithmetic operands, silent on bool/char/int, 0 FP across frontend+stdlib"
+echo "operator-operands smoke OK: flags logical/arithmetic/integral violations, silent on valid operands, 0 FP across frontend+stdlib"

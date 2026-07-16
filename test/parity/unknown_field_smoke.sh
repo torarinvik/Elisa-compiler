@@ -61,7 +61,15 @@ POM='struct Q:\n    x: i64\n    y: i64 = 5\n    z?: i64\n\n'
 out=$(printf "${POM}def op() -> Q:\n    return Q{x: 1}\n" | "$RPT")
 echo "$out" | grep -q "is missing field" && fail "false positive on omittable (default/optional) fields: $out"
 
-# 11. the whole frontend + stdlib must produce ZERO findings for any of the three checks.
+# 11. a record update naming an absent field gets the record-update-specific finding.
+out=$(printf "${P2}def ru(point: Point) -> Point:\n    return point{z = 3}\n" | "$RPT")
+echo "$out" | grep -q "record update has no field 'z'" || fail "unknown record-update field not flagged: $out"
+
+# 12. valid record updates stay silent.
+out=$(printf "${P2}def rv(point: Point) -> Point:\n    return point{x = 3}\n" | "$RPT")
+echo "$out" | grep -q "record update has no field" && fail "false positive on valid record update: $out"
+
+# 13. the whole frontend + stdlib must produce ZERO findings for any field check.
 n=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "has no field|more than once|is missing field" || true)
@@ -69,4 +77,4 @@ while IFS= read -r f; do
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$n" -eq 0 ] || fail "$n struct-literal field false positives across frontend+stdlib"
 
-echo "unknown-field smoke OK: flags undeclared/duplicate/missing labels, silent on valid/positional/empty/generic/omittable, 0 false positives across frontend+stdlib"
+echo "unknown-field smoke OK: flags construction/update field errors, silent on valid/positional/empty/generic/omittable, 0 false positives across frontend+stdlib"
