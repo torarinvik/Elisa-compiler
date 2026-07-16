@@ -37,6 +37,12 @@ echo "$out" | grep -q "expects i64" && fail "false positive on matching Assign <
 out=$(printf 'def helper() -> void:\n    return\ndef f() -> i64:\n    return helper()\n' | "$RPT")
 echo "$out" | grep -q "return type expects i64, got void" || fail "void call return mismatch not flagged: $out"
 
+# An unannotated empty array binding has no element-type context.
+out=$(printf 'def f() -> void:\n    values = []\n' | "$RPT")
+echo "$out" | grep -q "empty list literal requires an expected array or darray type" || fail "context-free empty array not flagged: $out"
+out=$(printf 'def f() -> void:\n    values: darray[i64] = []\n' | "$RPT")
+echo "$out" | grep -q "empty list literal requires" && fail "typed empty array false positive: $out"
+
 # 6. Return value type mismatch MUST flag.
 out=$(printf 'def f() -> i64:\n    return true\n' | "$RPT")
 echo "$out" | grep -q "return type expects i64, got bool" || fail "Return mismatch not flagged: $out"
