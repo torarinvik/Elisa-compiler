@@ -38,6 +38,10 @@ echo "$missing_match_store" | grep -Fq 'packed enum match over "Expr" requires a
 ordinary_store=$(printf 'enum Expr:\n    Int(value: int)\npacked enum PackedExpr:\n    Int(value: int)\ndef bad(node: Expr, store: PackedExpr.Store[Local]) -> int:\n    match node in store:\n        Expr.Int(value: value):\n            return value\n' | "$RPT")
 echo "$ordinary_store" | grep -Fq 'ordinary enum match over "Expr" does not take an in-store clause' || fail "ordinary match store clause not flagged: $ordinary_store"
 
+ordinary_variant_type=$(printf 'enum Expr:\n    Int(value: int)\ndef bad(node: Expr.Int) -> int:\n    return 0\n' | "$RPT")
+echo "$ordinary_variant_type" | grep -Fq 'bare variant type "Expr.Int" requires a packed enum or tree category' || fail "ordinary bare variant type not flagged: $ordinary_variant_type"
+clean $'packed enum Expr:\n    Int(value: int)\ndef ok(node: Expr.Int) -> int:\n    return 0\n'
+
 clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    can Abort.Panic:\n        expect node as Expr.Int(value):\n            return value\n    return 0\n'
 
 removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> Box:\n    return value as Box\n' | "$RPT")"
