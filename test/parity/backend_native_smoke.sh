@@ -583,6 +583,17 @@ diff_case penum_named_field_u8 'enum Box:\n    Small(v: u8)\n\ndef main() -> i64
 # `Node.Store[Local]`'s TYPESTATE is not modeled: [Local] and [Frozen] have the same layout
 # and the distinction is enforced by freeze/move, which still decline.
 diff_case packed_store_ctor 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    return 42\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
+# The AoS STORE, end to end. A packed enum's value is an i32 store INDEX -- NOT the
+# `{i32, [N x i64]}` row. stage0: `%n = alloca i32`, `store i32 %packed.alloc.index`, and the
+# match passes that index to `ctx_packed_store_read_variant_sparse_tag(state, index)`; the
+# payload comes back via `read_variant_sparse_word(index, state, 1)` (word 0 is the tag).
+# The struct is only the ROW LAYOUT, written at alloc time. Getting that backwards would have
+# been a silent miscompile -- the IR is what said otherwise.
+diff_case packed_store_leaf 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        n: Node = new Node.Leaf(v: 42)\n        result <- match n:\n            Node.Leaf(v): v\n            Node.Tag(t): t\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
+# The SECOND variant proves the runtime tag actually dispatches.
+diff_case packed_store_tag 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        n: Node = new Node.Tag(t: 21)\n        result <- match n:\n            Node.Leaf(v): v\n            Node.Tag(t): t * 2\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
+# TWO rows in one store: the second allocation must get its own index, not overwrite the first.
+diff_case packed_store_two_rows 'packed enum Node:\n    Leaf(v: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        a: Node = new Node.Leaf(v: 40)\n        b: Node = new Node.Leaf(v: 2)\n        av: mutable i64 = 0\n        bv: mutable i64 = 0\n        av <- match a:\n            Node.Leaf(v): v\n        bv <- match b:\n            Node.Leaf(v): v\n        result <- av + bv\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -632,13 +643,9 @@ decline_case() {
 # MULTI-FIELD payload needs the widest-variant layout computed exactly as stage0 computes it,
 # and guessing it would silently misread every payload -- so it declines.
 decline_case enum_multi_field_payload 'enum Pair:\n    Both(a: i64, b: i64)\n\ndef main() -> i64:\n    return match Pair.Both(1, 2):\n        Pair.Both(a, b): a + b\n'
-# A `packed enum` is NOT a tagged union: its values are HANDLES into an AoS store
-# (ctx_packed_store_*), so it must decline until that store is ported (ABI mapped in
-# docs/backend_port_notes.md). This is a REGRESSION FIXTURE: the payload-enum work
-# (d872f3c) registered packed enums on the inline `{i32, [N x i64]}` path, so stage1 EMITTED
-# a wrong representation for a program stage0 REJECTS ("packed enum match over Node requires
-# an in Node.Store clause"). Decl.Enum carries no packed flag -- the names live in a
-# parallel FILE side-table (file.packed_enum_names), which is exactly why it was missed.
+# A packed constructor with NO active store declines: stage0 rejects the same program
+# ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
+# is no store to allocate the row from anyway.
 decline_case packed_enum_needs_store 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef read(n: Node) -> i64:\n    return match n:\n        Node.Leaf(v): v\n        Node.Tag(t): t\n\ndef main() -> i64:\n    return read(Node.Leaf(42))\n'
 # A RECURSIVE enum is AUTO-PROMOTED to packed by stage0 even though it was never declared
 # so ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and it

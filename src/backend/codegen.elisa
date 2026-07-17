@@ -263,12 +263,11 @@ module Backend:
             # @take(ptr)`).
             LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.CStr
             arena_llvm_type(ctx) return if value_type.kind == TypeKind.Arena
-            # A packed HANDLE has the same shape as a payload enum's value.
-            if value_type.kind == TypeKind.PackedEnum:
-                packed_words: u32 = structs.packed_payload_words[value_type.bits.usize()]
-                packed_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt64TypeInContext(ctx), packed_words)]
-                packed_pointer: void& = (&packed_fields[0]).cast[void&] can Unsafe.PointerCast
-                return LLVMStructTypeInContext(ctx, packed_pointer, 2, 0)
+            # A packed handle is an **i32 INDEX** into the store, NOT the row. stage0:
+            # `%n = alloca i32`, `store i32 %packed.alloc.index, ptr %n`, and the match
+            # passes that index to the runtime. The `{i32, [N x i64]}` struct below is only
+            # the ROW LAYOUT, used when WRITING a row -- it is never the value's type.
+            LLVMInt32TypeInContext(ctx) return if value_type.kind == TypeKind.PackedEnum
             # `{ptr arena, i64 row_bytes, ptr state}` — stage0's `%Node__Store`.
             if value_type.kind == TypeKind.PackedStore:
                 store_fields: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), LLVMInt64TypeInContext(ctx), LLVMPointerTypeInContext(ctx, 0)]
@@ -632,6 +631,13 @@ module Backend:
             packed_read_tag_type: LLVMTypeRef
             packed_read_word: LLVMValueRef
             packed_read_word_type: LLVMTypeRef
+            # The store an `in store:` block made ACTIVE, and which packed enum it stores
+            # (-1 = none). Threaded on Runtime for the same reason `arena` is: a packed
+            # constructor names no store, it uses whichever one is in scope. stage0 is
+            # explicit that this is required, not implicit -- "packed enum constructor
+            # Node.Leaf requires an active in Node.Store: scope".
+            active_store: mutable LLVMValueRef
+            active_store_enum: mutable i64
 
 
         # Declare the runtime entry points in the module. Signatures are dictated by
@@ -682,6 +688,8 @@ module Backend:
 
             return Runtime{
                 owns_arena: true,
+                active_store: LLVMConstNull(pointer_type),
+                active_store_enum: -1,
                 packed_state_new: LLVMAddFunction(m, "ctx_packed_store_state_new_variant_sparse", state_new_type),
                 packed_state_new_type: state_new_type,
                 packed_alloc: LLVMAddFunction(m, "ctx_packed_store_alloc_fixed_tagged_variant_sparse_result", alloc_fn_type),
@@ -978,6 +986,9 @@ module Backend:
                 # `x.u8()` is a CAST (postfix call unifies cast and UFCS: `recv.Name()`
                 # where Name is a type name is a conversion).
                 if call_callee is Expr.Field(cast_object, cast_name, cast_line):
+                    if cast_object is Expr.Ident(packed_call_enum, packed_call_enum_line):
+                        packed_call_index: i64 = packed_index_of(structs, packed_call_enum)
+                        ValueType{kind: TypeKind.PackedEnum, bits: packed_call_index.u32()} return if packed_call_index >= 0 and cast_name != "Store"
                     if cast_object is Expr.Ident(store_type_enum, store_type_enum_line):
                         if cast_name == "Store":
                             store_type_index: i64 = packed_index_of(structs, store_type_enum)
@@ -1143,6 +1154,50 @@ module Backend:
                     slot: usize = structs.penum_variant_start[label_enum_index.usize()] + label_tag.usize()
                     false return if not structs.penum_has_payload[slot]
                     return structs.penum_field_names[slot] == argument_names[0]
+            return false
+
+
+        def packed_variant_index_of_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            for enum_index in 0..<structs.packed_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.packed_names[enum_index], 0, dot)
+                for offset in 0..<structs.packed_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    variant: sview = structs.packed_variants[structs.packed_variant_start[enum_index] + offset]
+                    offset.i64() return if sview_matches_prefix(path, variant, dot + 1, sview_len(path).i64())
+            return -1
+
+
+        def packed_payload_of_path(path: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            unmodeled_type() return if dot <= 0
+            for enum_index in 0..<structs.packed_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.packed_names[enum_index], 0, dot)
+                for offset in 0..<structs.packed_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    slot: usize = structs.packed_variant_start[enum_index] + offset
+                    continue if not sview_matches_prefix(path, structs.packed_variants[slot], dot + 1, sview_len(path).i64())
+                    unmodeled_type() return if not structs.packed_has_payload[slot]
+                    return copied_type(structs.packed_payloads[slot])
+            return unmodeled_type()
+
+
+        # The packed twin of penum_ctor_labels_match: `new Node.Leaf(v: 42)` labels the
+        # payload field, and the label must be the field's real name.
+        def packed_ctor_labels_match(callee: Expr, argument_names: darray[sview]&, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            false return if argument_names.count != 1
+            if callee is Expr.Field(packed_label_head, packed_label_variant, packed_label_line):
+                if packed_label_head is Expr.Ident(packed_label_enum, packed_label_enum_line):
+                    packed_label_index: i64 = packed_index_of(structs, packed_label_enum)
+                    false return if packed_label_index < 0
+                    packed_label_tag: i64 = packed_variant_index(structs, packed_label_index, packed_label_variant)
+                    false return if packed_label_tag < 0
+                    packed_label_slot: usize = structs.packed_variant_start[packed_label_index.usize()] + packed_label_tag.usize()
+                    false return if not structs.packed_has_payload[packed_label_slot]
+                    return structs.packed_field_names[packed_label_slot] == argument_names[0]
             return false
 
 
@@ -1487,6 +1542,46 @@ module Backend:
                                     return LLVMBuildInsertValue(builder, with_row, state, 2, "packed.store.state1")
                             return null
 
+            # `Node.Leaf(v: 42)` inside an `in store:` block — a PACKED constructor. Unlike
+            # a payload enum's inline value, this allocates a ROW: extract the arena/state
+            # out of the active store, call alloc_fixed_tagged_variant_sparse_result(arena,
+            # state, tag), zero the row, then write the payload. stage0's shape exactly.
+            if callee is Expr.Field(packed_ctor_head, packed_ctor_variant, packed_ctor_line):
+                if packed_ctor_head is Expr.Ident(packed_ctor_enum, packed_ctor_enum_line):
+                    packed_ctor_index: i64 = packed_index_of(structs, packed_ctor_enum)
+                    if packed_ctor_index >= 0:
+                        # No active store -> decline. stage0 rejects the same program
+                        # ("requires an active in Node.Store: scope"), and there is no store
+                        # to allocate the row from anyway.
+                        null return if runtime.active_store_enum != packed_ctor_index
+                        packed_tag: i64 = packed_variant_index(structs, packed_ctor_index, packed_ctor_variant)
+                        null return if packed_tag < 0
+                        packed_slot_index: usize = structs.packed_variant_start[packed_ctor_index.usize()] + packed_tag.usize()
+                        packed_wants_payload: bool = structs.packed_has_payload[packed_slot_index]
+                        null return if packed_wants_payload and arguments.count != 1
+                        null return if not packed_wants_payload and arguments.count != 0
+
+                        packed_arena: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 0, "packed.arena")
+                        packed_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "packed.state")
+                        packed_alloc_args: mutable darray[LLVMValueRef] = [packed_arena, packed_state, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0)]
+                        packed_alloc_pointer: void& = (&packed_alloc_args[0]).cast[void&] can Unsafe.PointerCast
+                        packed_alloc_result: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_alloc_type, runtime.packed_alloc, packed_alloc_pointer, 3, "packed.variant_sparse.alloc")
+                        packed_row: LLVMValueRef = LLVMBuildExtractValue(builder, packed_alloc_result, 0, "packed.alloc.ptr")
+
+                        packed_handle_llvm: LLVMTypeRef = packed_row_llvm_type(structs, packed_ctor_index, ctx)
+                        _ = LLVMBuildStore(builder, LLVMConstNull(packed_handle_llvm), packed_row)
+                        packed_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, 0, "packed.tag.ptr")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0), packed_tag_pointer)
+                        if packed_wants_payload:
+                            packed_payload_type: ValueType = copied_type(structs.packed_payloads[packed_slot_index])
+                            if emit_expression(arguments[0], packed_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is packed_payload_value:
+                                packed_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, 1, "packed.payload.ptr")
+                                _ = LLVMBuildStore(builder, packed_payload_value, packed_payload_pointer)
+                            else:
+                                return null
+                        # The VALUE is the row's INDEX, not the row.
+                        return LLVMBuildExtractValue(builder, packed_alloc_result, 1, "packed.alloc.index")
+
             # `Shape.Circle(42)` — a payload-enum CONSTRUCTOR. stage0 emits: alloca, store
             # zeroinitializer, store the tag at field 0, store the payload at field 1, load
             # the value. Only ONE payload argument is modeled, matching what
@@ -1673,6 +1768,8 @@ module Backend:
         def copied_runtime(runtime: Runtime&) -> Runtime:
             return Runtime{
                 owns_arena: runtime.owns_arena,
+                active_store: runtime.active_store,
+                active_store_enum: runtime.active_store_enum,
                 packed_state_new: runtime.packed_state_new,
                 packed_state_new_type: runtime.packed_state_new_type,
                 packed_alloc: runtime.packed_alloc,
@@ -1997,7 +2094,11 @@ module Backend:
                 scrutinee_type: ValueType = resolve_type(match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
                 # An integer scrutinee compares directly; a PAYLOAD ENUM compares on its TAG.
                 penum_scrutinee: bool = scrutinee_type.kind == TypeKind.PayloadEnum
-                null return if not is_integer_type(scrutinee_type) and not penum_scrutinee
+                # A PACKED scrutinee is an i32 store INDEX: its tag and payload are read back
+                # through the runtime rather than out of the value.
+                packed_scrutinee: bool = scrutinee_type.kind == TypeKind.PackedEnum
+                null return if packed_scrutinee and runtime.active_store_enum != scrutinee_type.bits.i64()
+                null return if not is_integer_type(scrutinee_type) and not penum_scrutinee and not packed_scrutinee
                 match_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
                 null return if expected.kind == TypeKind.Unmodeled
                 if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scrutinee_raw:
@@ -2008,6 +2109,13 @@ module Backend:
                     scrutinee: mutable LLVMValueRef = scrutinee_raw
                     compare_type: mutable LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
                     penum_slot: mutable LLVMValueRef = scrutinee_raw
+                    if packed_scrutinee:
+                        # `%packed.tag.store = call i32 @ctx_packed_store_read_variant_sparse_tag(ptr %state, i32 %n)`
+                        packed_match_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "packed.state")
+                        packed_tag_args: mutable darray[LLVMValueRef] = [packed_match_state, scrutinee_raw]
+                        packed_tag_pointer: void& = (&packed_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                        scrutinee <- LLVMBuildCall2(builder, runtime.packed_read_tag_type, runtime.packed_read_tag, packed_tag_pointer, 2, "packed.tag.store")
+                        compare_type <- LLVMInt32TypeInContext(ctx)
                     if penum_scrutinee:
                         scrutinee <- LLVMBuildExtractValue(builder, scrutinee_raw, 0, "match.tag.value")
                         compare_type <- LLVMInt32TypeInContext(ctx)
@@ -2020,7 +2128,7 @@ module Backend:
                     declined: mutable bool = false
                     saw_default: mutable bool = false
 
-                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, penum_scrutinee, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, penum_scrutinee, packed_scrutinee, scrutinee_raw, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
                         # Once a catch-all is emitted the chain is closed.
                         continue if declined or saw_default
                         if arm_has_guard(arm.guard):
@@ -2040,6 +2148,14 @@ module Backend:
                             payload_path: mutable sview = ""
                             if arm.pattern is Pattern.Variant(variant_path, variant_fields):
                                 payload_path <- variant_path
+                                if packed_scrutinee:
+                                    variant_ordinal <- packed_variant_index_of_path(variant_path, structs)
+                                    payload_declined <- true if variant_fields.count > 1
+                                    if variant_fields.count == 1:
+                                        if variant_fields[0] is Pattern.Binding(packed_bound):
+                                            payload_binding <- packed_bound
+                                        else:
+                                            payload_declined <- true
                                 if penum_scrutinee:
                                     # `Shape.Circle(r)` — the tag is the variant's index in
                                     # its own enum, and the arm may bind ONE payload field.
@@ -2063,6 +2179,28 @@ module Backend:
                                 LLVMPositionBuilderAtEnd(builder, arm_block)
                                 # Bind the payload INSIDE the arm: `getelementptr %Shape, ptr
                                 # %tmp, i32 0, i32 1` then load at the variant's own type.
+                                if packed_scrutinee and payload_binding != "":
+                                    # `call i64 @ctx_packed_store_read_variant_sparse_word(i32 %n, ptr %state, i64 1)`
+                                    # -- word 0 is the tag, so the first payload field is word 1.
+                                    packed_arm_payload: ValueType = packed_payload_of_path(payload_path, structs)
+                                    if packed_arm_payload.kind == TypeKind.Unmodeled:
+                                        declined <- true
+                                        continue
+                                    packed_arm_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "packed.state")
+                                    packed_word_args: mutable darray[LLVMValueRef] = [scrutinee_raw, packed_arm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), 1, 0)]
+                                    packed_word_pointer: void& = (&packed_word_args[0]).cast[void&] can Unsafe.PointerCast
+                                    packed_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, packed_word_pointer, 3, "packed.word")
+                                    # The runtime hands back an i64 word; a narrower payload
+                                    # is truncated to its own width.
+                                    packed_word_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                                    if emit_conversion(packed_word, packed_word_type, packed_arm_payload, structs, ctx, builder) is packed_arm_value:
+                                        packed_arm_storage: mutable darray[u8] = []
+                                        packed_arm_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(packed_arm_payload, structs, ctx), sview_to_cstr(payload_binding, packed_arm_storage))
+                                        _ = LLVMBuildStore(builder, packed_arm_value, packed_arm_slot)
+                                        declare_local(local_scope, payload_binding, packed_arm_slot, packed_arm_payload)
+                                    else:
+                                        declined <- true
+                                        continue
                                 if penum_scrutinee and payload_binding != "":
                                     payload_type: ValueType = penum_payload_of_path(payload_path, structs)
                                     if payload_type.kind == TypeKind.Unmodeled:
@@ -2298,7 +2436,7 @@ module Backend:
                 for argument_name in call_argument_names |labelled|:
                     labelled <- true if argument_name != ""
                 if labelled:
-                    null return if not penum_ctor_labels_match(call_callee, call_argument_names, structs)
+                    null return if not penum_ctor_labels_match(call_callee, call_argument_names, structs) and not packed_ctor_labels_match(call_callee, call_argument_names, structs)
                 # `x.u8()` is a CAST, not a call: postfix call unifies cast and UFCS, so a
                 # TYPE-NAME receiver-method is a conversion. A receiver-method that is NOT a
                 # type name falls through to emit_call, which resolves it as UFCS.
@@ -2378,6 +2516,15 @@ module Backend:
                 if block_kind == "in":
                     declined_status return if block_clause.count != 1
                     in_type: ValueType = lookup_type(local_scope, block_clause[0])
+                    # `in store:` — make a packed STORE active. Every packed constructor in
+                    # the block allocates its row from this store.
+                    if in_type.kind == TypeKind.PackedStore:
+                        if lookup_slot(local_scope, block_clause[0]) is store_slot:
+                            store_runtime: mutable Runtime = copied_runtime(runtime)
+                            store_runtime.active_store <- LLVMBuildLoad2(builder, llvm_type_of(in_type, structs, ctx), store_slot, "store.active")
+                            store_runtime.active_store_enum <- in_type.bits.i64()
+                            return emit_statements(block_body, return_type, local_scope, loops, regions, fns, structs, generics, store_runtime, m, ctx, builder)
+                        return declined_status
                     declined_status return if in_type.kind != TypeKind.Arena
                     if lookup_slot(local_scope, block_clause[0]) is in_slot:
                         in_runtime: mutable Runtime = copied_runtime(runtime)
@@ -2920,6 +3067,15 @@ module Backend:
                 offset.i64() return if structs.packed_variants[start + offset] == variant_name
                 offset <- offset + 1
             return -1
+
+
+        # The ROW LAYOUT `{i32 tag, [N x i64] payload}` — what a row contains, as distinct
+        # from the handle (an i32 index) that names it.
+        def packed_row_llvm_type(structs: mutable StructTable&, enum_index: i64, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            words: u32 = structs.packed_payload_words[enum_index.usize()]
+            row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt64TypeInContext(ctx), words)]
+            row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, row_pointer, 2, 0)
 
 
         # A store row's size in bytes: the `{i32, [N x i64]}` handle laid out at i64

@@ -563,7 +563,7 @@ Still ahead in the region model: region PARAMS / `@r` annotations and explicit r
 polymorphism, death-time, and the non-darray containers (dict/set, which are additionally
 blocked behind error unions).
 
-## `packed enum` / the AoS store — ABI mapped, NOT implemented
+## `packed enum` / the AoS store — LANDED (scalar-payload subset)
 
 This is the REAL AoS store, and it is a different subsystem from the payload enums landed
 in d872f3c (those are a plain tagged union `{ i32, [N x i64] }`, no store involved).
@@ -635,9 +635,20 @@ Prerequisites this needs that the backend does NOT have yet:
    packed constructor with "requires an active in Node.Store: scope or explicit
    new[Node.Store]".
 
-Beyond that, the full subsystem also has typestate (`Store[Local]` vs `Store[Frozen]`),
-`freeze(move store)`, and `common:` blocks with `@storage(inline)` — see the corpus in
-`Code/test_programs/` (compiler_parallel_fixture.elisa, packed_enum_common.elisa).
+THE CORRECTION THAT MATTERED: a packed enum's VALUE is an **i32 store INDEX**, not the
+`{i32, [N x i64]}` row. stage0 emits `%n = alloca i32` and `store i32 %packed.alloc.index`,
+and the match passes that index to `read_variant_sparse_tag(state, index)`. The struct is
+only the ROW LAYOUT, written at alloc time. I had it as the row until the IR said otherwise
+— it would have been a silent miscompile, since the shapes are plausible either way.
+
+Payload words are 1-BASED: word 0 is the tag, so the first payload field is
+`read_variant_sparse_word(index, state, 1)`. The runtime returns an i64, so a narrower
+payload is truncated to its own width.
+
+Still ahead: typestate (`Store[Local]` vs `Store[Frozen]`), `freeze(move store)`, and
+`common:` blocks with `@storage(inline)` — see the corpus in `Code/test_programs/`
+(compiler_parallel_fixture.elisa, packed_enum_common.elisa). The typestate is currently
+unmodeled and that is only sound because freeze/move themselves decline.
 
 Sharp edge worth knowing: a RECURSIVE plain enum is auto-promoted to packed. `enum Node:
 Leaf(v: i64) / Pair(a: Node, b: Node)` fails with "packed enum constructor Node.Leaf
