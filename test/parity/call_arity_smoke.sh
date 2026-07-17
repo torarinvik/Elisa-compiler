@@ -63,7 +63,21 @@ echo "$out" | grep -q "expects.*arguments, got" && fail "false positive on overl
 out=$(printf 'extern alloc(size: usize) -> int\n\ndef g() -> int:\n    return alloc()\n' | "$RPT")
 echo "$out" | grep -q "function 'alloc' expects 1 arguments, got 0\|wrong number of arguments" || fail "extern missing-required-arg not flagged: $out"
 
-# 14. 0 FP across frontend + stdlib.
+# 14. REGRESSION: a function named `get` must be CALLABLE. `get` is contextual (`get EXPR
+# else …`), and the expression head used to route on the name alone, with no lookahead —
+# so `get(1, 2, 3)` consumed the `get` and parsed `(1, 2, 3)` as the guarded expression.
+# The call node VANISHED, which is why this is an arity test: the residue is a well-formed
+# expression, so nothing errored — stage1 silently reported "variable expects i64, got
+# tuple" where stage0 reports an arity mismatch. The gate mirrors stage0
+# (parser_expr_parsepostfix…go: `Text == "get" && tokens[pos+1].Kind == TOKEN_IDENT`).
+out=$(printf 'def get(n: i64) -> i64:\n    return n\n\ndef g() -> i64:\n    return get(1, 2, 3)\n' | "$RPT")
+echo "$out" | grep -q "function 'get' expects 1 arguments, got 3" || fail "call to a function named 'get' was not parsed as a call: $out"
+
+# 15. …and the `get EXPR else …` form it is contextual for must still parse.
+out=$(printf 'def find(k: i64) -> i64?:\n    return 42 if k > 0 else null\n\ndef g() -> i64:\n    v: i64 = get find(1) else return 0\n    return v\n' | "$RPT")
+echo "$out" | grep -q "expects.*arguments, got" && fail "false positive on the get-else form: $out"
+
+# 16. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "expects.*arguments, got" || true)
