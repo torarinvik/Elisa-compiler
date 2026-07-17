@@ -46,6 +46,66 @@ extend Semantic:
             return any item in consumed where item == name
 
 
+        def lifecycle_alias_root(alias_names: darray[sview]&, alias_roots: darray[sview]&, name: sview) -> sview:
+            can Abort.Panic:
+                while index > 0 |index: usize = alias_names.count|:
+                    index <- index - 1
+                    alias_roots[index] return if alias_names[index] == name
+                return name
+
+
+        def lifecycle_root(expression: Ast::Expr, alias_names: darray[sview]&, alias_roots: darray[sview]&) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return lifecycle_alias_root(alias_names, alias_roots, name)
+                    Expr.Unary(operator, operand, line) | Expr.Move(operand, line) | Expr.Paren(operand, line):
+                        return lifecycle_root(operand, alias_names, alias_roots)
+                    Expr.Field(object, field, line):
+                        return lifecycle_root(object, alias_names, alias_roots)
+                    Expr.Index(Expr.Field(object, field, field_line), argument, line):
+                        return lifecycle_root(object, alias_names, alias_roots)
+                    Expr.Index(object, argument, line):
+                        return lifecycle_root(object, alias_names, alias_roots)
+                    _:
+                        return ""
+
+
+        def lifecycle_set_alias(alias_names: mutable darray[sview]&, alias_roots: mutable darray[sview]&, name: sview, root: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while index > 0 |index: usize = alias_names.count|:
+                    index <- index - 1
+                    if alias_names[index] == name:
+                        alias_roots[index] <- root
+                        return
+                alias_names.push(name)
+                alias_roots.push(root)
+
+
+        def lifecycle_is_shutdown(shutdown_names: darray[sview]&, shutdown_flags: darray[bool]&, root: sview) -> bool:
+            can Abort.Panic:
+                while index > 0 |index: usize = shutdown_names.count|:
+                    index <- index - 1
+                    shutdown_flags[index] return if shutdown_names[index] == root
+                return false
+
+
+        def lifecycle_set_shutdown(shutdown_names: mutable darray[sview]&, shutdown_flags: mutable darray[bool]&, root: sview, value: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while index > 0 |index: usize = shutdown_names.count|:
+                    index <- index - 1
+                    if shutdown_names[index] == root:
+                        shutdown_flags[index] <- value
+                        return
+                shutdown_names.push(root)
+                shutdown_flags.push(value)
+
+
+        def report_shutdown_use(root: sview, line: u32, shutdown_names: darray[sview]&, shutdown_flags: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineUseAfterConsume, name: root, line: line, expected: "", actual: ""}) if root != "" and lifecycle_is_shutdown(shutdown_names, shutdown_flags, root)
+
+
         def type_contains_named_state(expression: Ast::Expr, wanted: sview) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match expression:
@@ -165,6 +225,84 @@ extend Semantic:
                 return flags
 
 
+        def lifecycle_alias_source(expression: Ast::Expr, alias_names: darray[sview]&, alias_roots: darray[sview]&) -> sview:
+            can Abort.Panic:
+                direct: sview = lifecycle_root(expression, alias_names, alias_roots)
+                direct return if direct != ""
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        lifecycle_root(arguments[0], alias_names, alias_roots) return if arguments.count > 0
+                    Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
+                        lifecycle_root(fields[0].value, alias_names, alias_roots) return if fields.count > 0
+                    _:
+                        pass
+                return ""
+
+
+        def walk_lifecycle_expression(expression: Ast::Expr, alias_names: mutable darray[sview]&, alias_roots: mutable darray[sview]&, shutdown_names: mutable darray[sview]&, shutdown_flags: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        call_name: sview = match callee:
+                            Expr.Ident(name, call_line): name
+                            _: ""
+                        if call_name == "pool_shutdown" and arguments.count > 0:
+                            root: sview = lifecycle_root(arguments[0], alias_names, alias_roots)
+                            table <- report_shutdown_use(root, line, shutdown_names, shutdown_flags, table)
+                            lifecycle_set_shutdown(shutdown_names, shutdown_flags, root, true) if root != ""
+                        for argument in arguments |alias_names, alias_roots, shutdown_names, shutdown_flags, table| -> table:
+                            argument_root: sview = lifecycle_root(argument, alias_names, alias_roots)
+                            table <- report_shutdown_use(argument_root, line, shutdown_names, shutdown_flags, table) if call_name != "pool_shutdown"
+                            table <- walk_lifecycle_expression(argument, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                    Expr.Unary(operator, operand, line) | Expr.Move(operand, line) | Expr.Paren(operand, line):
+                        table <- walk_lifecycle_expression(operand, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                    Expr.Binary(left, operator, right, line):
+                        table <- walk_lifecycle_expression(left, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                        table <- walk_lifecycle_expression(right, alias_names, alias_roots, shutdown_names, shutdown_flags, table) if operator != TokenKind.Is and operator != TokenKind.As
+                    Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
+                        for field in fields |alias_names, alias_roots, shutdown_names, shutdown_flags, table| -> table:
+                            table <- walk_lifecycle_expression(field.value, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |alias_names, alias_roots, shutdown_names, shutdown_flags, table| -> table:
+                            table <- walk_lifecycle_expression(element, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                    _:
+                        pass
+
+
+        def walk_thread_pool_lifecycle(statements: darray[Ast::Stmt], alias_names: mutable darray[sview]&, alias_roots: mutable darray[sview]&, shutdown_names: mutable darray[sview]&, shutdown_flags: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |alias_names, alias_roots, shutdown_names, shutdown_flags, table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- walk_lifecycle_expression(value, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                            source: sview = lifecycle_alias_source(value, alias_names, alias_roots)
+                            lifecycle_set_alias(alias_names, alias_roots, name, source) if source != ""
+                        Stmt.Assign(target, operator, value, line):
+                            table <- walk_lifecycle_expression(value, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                            target_root: sview = lifecycle_root(target, alias_names, alias_roots)
+                            source: sview = lifecycle_alias_source(value, alias_names, alias_roots)
+                            lifecycle_set_alias(alias_names, alias_roots, affine_root(target), source) if source != "" and affine_root(target) != ""
+                            lifecycle_set_shutdown(shutdown_names, shutdown_flags, target_root, false) if lifecycle_expression_flags(value) & 4 != 0
+                        Stmt.Expr(expression, line):
+                            table <- walk_lifecycle_expression(expression, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                        Stmt.Return(value, line):
+                            table <- walk_lifecycle_expression(returned, alias_names, alias_roots, shutdown_names, shutdown_flags, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- walk_lifecycle_expression(condition, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                            table <- walk_thread_pool_lifecycle(then_body, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                            table <- walk_thread_pool_lifecycle(else_body, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- walk_thread_pool_lifecycle(body, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                        Stmt.While(condition, body, line):
+                            table <- walk_lifecycle_expression(condition, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            table <- walk_lifecycle_expression(scrutinee, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                            for arm in arms |table| -> table:
+                                table <- walk_thread_pool_lifecycle(arm.body, alias_names, alias_roots, shutdown_names, shutdown_flags, table)
+                        _:
+                            pass
+
+
         def walk_affine_expression(expression: Ast::Expr, names: darray[sview]&, flags: darray[bool]&, consumed: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
@@ -252,14 +390,19 @@ extend Semantic:
                             names: mutable darray[sview] = []
                             flags: mutable darray[bool] = []
                             consumed: mutable darray[sview] = []
+                            alias_names: mutable darray[sview] = []
+                            alias_roots: mutable darray[sview] = []
+                            shutdown_names: mutable darray[sview] = []
+                            shutdown_flags: mutable darray[bool] = []
                             for param in params |names, flags|:
                                 names.push(param.name)
                                 flags.push(affine_type_expression(param.type_expression, table))
                             table <- walk_affine_statements(body, names, flags, consumed, table)
+                            lifecycle: u32 = lifecycle_statement_flags(body)
+                            table <- walk_thread_pool_lifecycle(body, alias_names, alias_roots, shutdown_names, shutdown_flags, table) if (lifecycle & 8) != 0
                             for param in params |table| -> table:
                                 obligation: sview = exit_obligation(param.type_expression, table)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineScopeExit, name: param.name, line: line, expected: obligation, actual: ""}) if obligation != "" and body_is_empty_pass(body)
-                            lifecycle: u32 = lifecycle_statement_flags(body)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineScopeExit, name: "group", line: line, expected: "task group with pending tasks", actual: ""}) if (lifecycle & 1) != 0 and (lifecycle & 2) == 0
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineScopeExit, name: "pool", line: line, expected: "thread pool requiring shutdown", actual: ""}) if (lifecycle & 4) != 0 and (lifecycle & 8) == 0
                         Decl.Module(name, body, line):
