@@ -63,6 +63,7 @@ NAMES=(
     raise_without_error_set
     region_annotation_scalar
     region_param_inference_failure
+    fresh_shape_return_mismatch
     duplicate_bit_group_member
     named_states_without_derive
     flow_flag_state_machine
@@ -201,6 +202,7 @@ EXPECTS=(
     "raise requires the current function to return an error union"
     "the scalar type i32 cannot carry a region"
     "cannot be returned with a region-less type"
+    "return type expects row[0], got shape_out[0]"
     "duplicate packed group member 'b' in H.flags"
     "declares named states but is missing a derive state: block"
     "written in multiple branches and read after the join"
