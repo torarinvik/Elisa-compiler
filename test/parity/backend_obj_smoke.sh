@@ -45,6 +45,31 @@ obj_case() {
 }
 
 obj_case scalar   'def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n' 42
+
+# The pipeline actually RUNS -- not a no-op. Every case above would pass identically at -O0
+# (an exit code cannot see optimization), so this asserts the one thing that distinguishes
+# them: at -O2 `add(40, 2)` is constant-folded into main, so main must NOT call _add.
+# Without a check like this "run the passes" could silently do nothing and every test would
+# stay green. -Wperf's whole basis is judging what the vectorizer did, so a pipeline that
+# does not run is worse than none.
+optimizer_case() {
+    total=$((total + 1))
+    local dir="$BUILD/obj_optimizer"; rm -rf "$dir"; mkdir -p "$dir"
+    local src='def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n'
+    if ! ( cd "$dir" && printf '%b' "$src" | RUN "$BUILD/emit_obj" >/dev/null 2>&1 ); then
+        echo "  FAIL obj_optimizer: emit_obj errored"; return
+    fi
+    local dis
+    dis="$( (objdump -d --disassemble-symbols=_main "$dir/stage1_out.o" 2>/dev/null || otool -tV "$dir/stage1_out.o" 2>/dev/null) )"
+    if [ -z "$dis" ]; then echo "  SKIP obj_optimizer: no disassembler"; total=$((total - 1)); return; fi
+    # 42 = 0x2a folded into main is the fingerprint of the optimizer having run.
+    if echo "$dis" | grep -qiE "#0x2a|#42"; then
+        pass=$((pass + 1))
+    else
+        echo "  FAIL obj_optimizer: no folded constant in _main -- passes did not run"
+    fi
+}
+optimizer_case
 obj_case recursion 'def fact(n: i64) -> i64:\n    return 1 if n <= 1 else n * fact(n - 1)\n\ndef main() -> i64:\n    return fact(5) - 78\n' 42
 obj_case darray   'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(42)\n    return xs[0] can Unsafe.UncheckedIndex\n' 42
 obj_case comprehension 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[3] can Unsafe.UncheckedIndex) + 39\n' 42

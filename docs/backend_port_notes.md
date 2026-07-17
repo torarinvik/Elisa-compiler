@@ -737,9 +737,19 @@ symbol, so it cannot be bound — call the per-target functions it wraps
 (LLVMInitializeAArch64TargetInfo/Target/TargetMC/AsmPrinter). That also makes the driver
 arm64-only for now; the gate skips on other hosts rather than failing.
 
-What REMAINS for DWARF/-Wperf is the PASS PIPELINE (LLVMRunPasses) plus, for DWARF, the
-DIBuilder surface. Object emission alone does not give either: -Wperf's verification runs
-AFTER the passes, and DWARF needs debug metadata built during emission.
+The PASS PIPELINE is now done too: `LLVMRunPasses(module, "default<O2>", tm, options)` runs
+before emission. Note it takes a pipeline STRING, not a level enum, and returns an
+LLVMErrorRef that is NULL on success -- so it binds as `-> void&?` and `is` narrowing reads
+"an error is present".
+
+The gate proves the passes actually RUN rather than no-op: every behavioural case would pass
+identically at -O0 (an exit code cannot see optimization), so obj_optimizer asserts that
+`add(40, 2)` is constant-folded into main. Verified by neutering the pipeline to "verify" and
+watching it fail.
+
+What REMAINS for DWARF is the DIBuilder surface (metadata built during emission). For
+-Wperf, what remains is the autovec TAGGING at emit time plus the post-pass inspection --
+the pipeline it needed to judge against now exists.
 
 The original point still stands for both: That is a different kind of work from every slice landed
 so far (all of which were "build the right IR"), and it also changes the test method — the
