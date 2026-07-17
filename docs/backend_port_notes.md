@@ -773,3 +773,30 @@ either, since neither is observable in an exit code.
 
 Doing the metadata TAGGING half without the pipeline is possible but pointless in isolation:
 nothing in stage1 would consume it, and there is no stage0 IR to diff it against.
+
+## Death-time — NOT backend work (verified, like effects)
+
+`death-time` sat on the remaining list for this port. It is not backend work at all.
+
+stage0's implementation is `compiler/src/semantic/analyzer_region_deathtime.go` (550 lines),
+in the SEMANTIC layer. The backend never references it -- grep for DeathTime across
+`compiler/src/backend/*.go` returns nothing.
+
+Its own header says what it is:
+
+    // docs/91 G0 — read-only death-point + cohort analysis.
+    // This is the FIRST, NON-DESTRUCTIVE step of the global death-time region model
+    // (docs/91): it computes, per function, where each INFERRED heap allocation ... is last
+    // used — its approximate "death point" — and groups allocations that die together into
+    // cohorts. A cohort is the region the death-time model WOULD form. The point is
+    // observability ...
+
+So it is an analysis that REPORTS what a future region model would do. It emits no code and
+changes no codegen. That also matches the recorded conclusion of the investigation itself:
+magnitude was small (~5.4%), and the decision was NOT to build the destructive step (G1).
+
+Third item on the "remaining" list to turn out not to be backend work, after effects (no
+representation at all: `can[...]` and no annotation emit byte-identical IR) and the semantic
+half of -Wperf. The pattern is worth stating: a feature living in `semantic/` rather than
+`backend/` is a strong signal there is nothing here to port -- check which directory the
+reference implements it in BEFORE estimating it.
