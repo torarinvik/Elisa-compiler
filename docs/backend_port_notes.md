@@ -680,3 +680,27 @@ through llc. Debug metadata WOULD survive that pipe, but there is no stage0 IR t
 against. DWARF is also invisible to an exit code, so `diff_case` cannot see it at all --
 it needs `ir_case`-style checks against the metadata, or a dwarfdump comparison on the linked
 object. Worth doing deliberately rather than by analogy with the other slices.
+
+## `-Wperf` — a 260-line backend hook, GATED behind comprehensions
+
+`-Wperf` does not change codegen: `-emit llvm` with and without it is identical. But unlike
+effects it is not purely semantic — `compiler/src/backend/llvm_autovec_verify.go` (260 lines)
+attaches `!llvm.loop` metadata carrying an `elisa.autovec.expected` marker plus the source
+position, and a POST-OPTIMIZATION pass finds loops that were lowered to be vectorizable and
+then failed to. The marker rides in the IR so it survives inlining.
+
+The reason the IR diff showed nothing: it only tags **comprehension build loops**. So the
+`-Wperf` backend hook is gated behind comprehensions, which are NOT ported:
+
+    xs: darray[i64] = [i for i in 0..<10]     # stage0: exit 42;  stage1: DECLINES
+
+That is the next real unblocked increment, and it is a prerequisite for `-Wperf` rather than
+a sibling of it.
+
+### Probe harness bug worth knowing
+
+The one-liner probes used throughout this port grep stdout for `UNSUPPORTED` and call its
+absence "emits". `emit_native` exits **1 on a PARSE ERROR** and **2 on a decline**, and a
+parse error prints no `UNSUPPORTED` — so an invalid program reads as "EMITS". That is how
+`fold(+, [...])` (which stage0 rejects outright: "unexpected token + in expression") looked
+like a working feature for one probe. Check the EXIT CODE, not just the marker.
