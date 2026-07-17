@@ -500,6 +500,13 @@ diff_case region_return_then_fill 'def build() -> darray[i64]:\n    xs: mutable 
 diff_case region_scope_darray 'def main() -> i64:\n    total: mutable i64 = 0\n    region r:\n        xs: mutable darray[i64] = []\n        xs.push(42)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
 diff_case region_scope_grows 'def main() -> i64:\n    total: mutable i64 = 0\n    region r:\n        xs: mutable darray[i64] = []\n        for i in 0..<500:\n            xs.push(1)\n        for j in 0..<500:\n            total <- total + (xs[j] can Unsafe.UncheckedIndex)\n    return total - 458\n'
 diff_case region_scope_empty 'def main() -> i64:\n    region r:\n        v: i64 = 1\n    return 42\n'
+# A `return` INSIDE a region block must unwind EVERY live owned region, not just the
+# innermost: stage0's IR frees `%r` AND the enclosing auto region on that path. RegionStack
+# tracks them the way LoopStack tracks enclosing loops, and the unwind runs innermost-first.
+# This used to decline (it freed `r` and LEAKED the auto region -- a leak no exit-code
+# differential could ever catch).
+diff_case region_return_inside 'def main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(1)\n    region r:\n        xs: mutable darray[i64] = []\n        xs.push(42)\n        return xs[0] can Unsafe.UncheckedIndex\n'
+diff_case region_return_nested 'def main() -> i64:\n    region outer:\n        xs: mutable darray[i64] = []\n        xs.push(40)\n        region inner:\n            ys: mutable darray[i64] = []\n            ys.push(2)\n            return (xs[0] can Unsafe.UncheckedIndex) + (ys[0] can Unsafe.UncheckedIndex)\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -577,12 +584,6 @@ decline_case cstr_count 'def main() -> i64:\n    s: cstr = "hi"\n    return s.co
 # is therefore the whole of what the backend can soundly do here.
 decline_case tuple_field_access 'def main() -> i64:\n    t: (a: i64, b: i64) = (40, 2)\n    return t.a + t.b\n'
 decline_case tuple_return 'def pair() -> (a: i64, b: i64):\n    return (40, 2)\n\ndef main() -> i64:\n    t: (a: i64, b: i64) = pair()\n    return t.a + t.b\n'
-# A `return` INSIDE a region block declines. That return path is emitted with the SCOPED
-# runtime, so it frees `r` and LEAKS the function's own auto region -- a return must unwind
-# EVERY live region, not just the innermost, which needs a region stack (the way LoopStack
-# tracks enclosing loops). A leak does not change an exit code, so no differential would
-# catch it; that is precisely why it declines rather than quietly emitting.
-decline_case region_return_inside 'def main() -> i64:\n    region r:\n        return 42\n    return 0\n'
 # Only `region` is modeled. `kind` is an opaque sview, so treating an unknown block prefix as
 # "just run the body" would silently drop the semantics the prefix carries.
 decline_case region_with_block 'def main() -> i64:\n    with x:\n        v: i64 = 1\n    return 42\n'
