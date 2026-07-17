@@ -1,0 +1,168 @@
+# Values crossing a thread boundary may not retain dependencies on an unpublished
+# local packed store or a local region. Dependency rows propagate through ordinary
+# wrappers, arrays, calls, and views; freezing a store publishes/remaps store-backed
+# values but deliberately leaves independent local-region dependencies intact.
+extend Semantic:
+    private:
+        def transfer_type_is_local_store(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Index(Expr.Field(_, field, field_line), Expr.Ident(state, state_line), line):
+                        return sview_equal(field, "Store") and sview_equal(state, "Local")
+                    Expr.Index(Expr.Scope(_, field, field_line), Expr.Ident(state, state_line), line):
+                        return sview_equal(field, "Store") and sview_equal(state, "Local")
+                    Expr.Unary(_, inner, line) | Expr.Paren(inner, line):
+                        return transfer_type_is_local_store(inner)
+                    _:
+                        return false
+
+
+        def transfer_name_exists(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                for name in names:
+                    true return if name == wanted
+                return false
+
+
+        def transfer_allocation_on_line(allocation_names: darray[sview]&, allocation_lines: darray[u32]&, line: u32) -> sview:
+            can Abort.Panic:
+                while index < allocation_names.count |index: usize = 0|:
+                    allocation_names[index] return if allocation_lines[index] == line
+                    index <- index + 1
+                return ""
+
+
+        def transfer_note(owner: sview, kind: u8, dependency: sview, owners: mutable darray[sview]&, kinds: mutable darray[u8]&, dependencies: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if owner == "" or dependency == "" or kind == 0
+                while index < owners.count |index: usize = 0|:
+                    return if owners[index] == owner and kinds[index] == kind and dependencies[index] == dependency
+                    index <- index + 1
+                owners.push(owner)
+                kinds.push(kind)
+                dependencies.push(dependency)
+
+
+        def transfer_copy_name(target: sview, source: sview, owners: mutable darray[sview]&, kinds: mutable darray[u8]&, dependencies: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                original_count: usize = owners.count
+                while index < original_count |index: usize = 0|:
+                    transfer_note(target, kinds[index], dependencies[index], owners, kinds, dependencies) if owners[index] == source and kinds[index] != 0
+                    index <- index + 1
+
+
+        def transfer_propagate_expression(target: sview, expression: Ast::Expr, owners: mutable darray[sview]&, kinds: mutable darray[u8]&, dependencies: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        transfer_copy_name(target, name, owners, kinds, dependencies)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments:
+                            transfer_propagate_expression(target, argument, owners, kinds, dependencies)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line):
+                        for element in elements:
+                            transfer_propagate_expression(target, element, owners, kinds, dependencies)
+                    Expr.Slice(object, low, high, line) | Expr.Binary(object, _, low, line):
+                        transfer_propagate_expression(target, object, owners, kinds, dependencies)
+                        transfer_propagate_expression(target, low, owners, kinds, dependencies)
+                    Expr.Index(object, index, line) | Expr.Field(object, _, line) | Expr.Unary(_, object, line) | Expr.Move(object, line) | Expr.Paren(object, line):
+                        transfer_propagate_expression(target, object, owners, kinds, dependencies)
+                    Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
+                        for field in fields:
+                            transfer_propagate_expression(target, field.value, owners, kinds, dependencies)
+                    _:
+                        pass
+
+
+        def transfer_freeze_source(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.Call(Expr.Ident(name, ident_line), arguments, argument_names, line):
+                        affine_root(arguments[0]) return if name == "freeze" and arguments.count > 0
+                    _:
+                        return ""
+                return ""
+
+
+        def transfer_publish_store(store: sview, kinds: mutable darray[u8]&, dependencies: darray[sview]&) -> void:
+            can Abort.Panic:
+                while index < kinds.count |index: usize = 0|:
+                    kinds[index] <- 0 if kinds[index] == 1 and dependencies[index] == store
+                    index <- index + 1
+
+
+        def transfer_dependency_of(expression: Ast::Expr, wanted_kind: u8, owners: darray[sview]&, kinds: darray[u8]&, dependencies: darray[sview]&) -> sview:
+            can Abort.Panic:
+                root: sview = transfer_dependency_root(expression)
+                while index < owners.count |index: usize = 0|:
+                    dependencies[index] return if owners[index] == root and kinds[index] == wanted_kind
+                    index <- index + 1
+                return ""
+
+
+        def transfer_dependency_root(expression: Ast::Expr) -> sview:
+            match expression:
+                Expr.Slice(object, low, high, line) | Expr.Move(object, line) | Expr.Unary(_, object, line):
+                    return transfer_dependency_root(object)
+                _:
+                    return affine_root(expression)
+
+
+        def check_transfer_boundary(expression: Ast::Expr, owners: darray[sview]&, kinds: darray[u8]&, dependencies: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(Expr.Ident(name, ident_line), arguments, argument_names, line):
+                    boundary: bool = name == "spawn1" or name == "pool_submit1"
+                    while has_payload |has_payload: bool = boundary and arguments.count > 0, table|:
+                        payload: Ast::Expr = arguments[arguments.count - 1]
+                        store_dependency: sview = transfer_dependency_of(payload, 1, owners, kinds, dependencies)
+                        region_dependency: sview = transfer_dependency_of(payload, 2, owners, kinds, dependencies)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ThreadTransferStoreDependency, name: name, line: line, expected: "", actual: store_dependency}) if store_dependency != ""
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ThreadTransferRegionDependency, name: name, line: line, expected: "", actual: region_dependency}) if region_dependency != ""
+                        has_payload <- false
+
+
+        def walk_transfer_statements(statements: darray[Ast::Stmt], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, store_names: mutable darray[sview]&, owners: mutable darray[sview]&, kinds: mutable darray[u8]&, dependencies: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            store_names.push(name) if transfer_type_is_local_store(type_expression)
+                            allocation: sview = transfer_allocation_on_line(allocation_names, allocation_lines, line)
+                            allocation_kind: u8 = 1 if transfer_name_exists(store_names, allocation) else (2 if allocation != "" else 0)
+                            transfer_note(name, allocation_kind, allocation, owners, kinds, dependencies)
+                            transfer_propagate_expression(name, value, owners, kinds, dependencies)
+                            frozen_store: sview = transfer_freeze_source(value)
+                            transfer_publish_store(frozen_store, kinds, dependencies) if frozen_store != ""
+                            table <- check_transfer_boundary(value, owners, kinds, dependencies, table)
+                        Stmt.Assign(target, operator, value, line) | Stmt.Expr(value, line):
+                            table <- check_transfer_boundary(value, owners, kinds, dependencies, table)
+                        Stmt.Return(value, line):
+                            table <- check_transfer_boundary(returned, owners, kinds, dependencies, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- walk_transfer_statements(then_body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, table)
+                            table <- walk_transfer_statements(else_body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, table)
+                        Stmt.Block(_, _, _, body, line) | Stmt.While(_, body, line) | Stmt.For(_, _, _, body, line):
+                            table <- walk_transfer_statements(body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, table)
+                        _:
+                            pass
+
+
+        def check_transfer_declarations(declarations: darray[Ast::Decl], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            store_names: mutable darray[sview] = []
+                            owners: mutable darray[sview] = []
+                            kinds: mutable darray[u8] = []
+                            dependencies: mutable darray[sview] = []
+                            table <- walk_transfer_statements(body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, table)
+                        Decl.Module(name, body, line) | Decl.Scoped(body, line):
+                            table <- check_transfer_declarations(body, allocation_names, allocation_lines, table)
+                        _:
+                            pass
+
+    public:
+        def check_thread_transfer_provenance(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_transfer_declarations(file.top_decls, file.allocation_region_names, file.allocation_region_lines, table)
