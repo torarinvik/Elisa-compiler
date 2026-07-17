@@ -25,7 +25,11 @@ case_count="$(wc -l < "$ORACLE" | tr -d ' ')"
 }
 
 while IFS=$'\t' read -r name expected_errors expected_warnings encoded_filename encoded_source; do
-    out="$(printf '%s' "$encoded_source" | openssl base64 -d -A | "$RPT")"
+    if [[ "$name" == TestAnalyzeStrict* ]]; then
+        out="$({ printf '# strict\n'; printf '%s' "$encoded_source" | openssl base64 -d -A; } | "$RPT")"
+    else
+        out="$(printf '%s' "$encoded_source" | openssl base64 -d -A | "$RPT")"
+    fi
     parse_errors="$(printf '%s\n' "$out" | awk '$1 == "P" { print $2; exit }')"
     diagnostics="$(printf '%s\n' "$out" | awk '$1 == "D" { print $2; exit }')"
     [[ -n "$parse_errors" ]] || parse_errors=999999
