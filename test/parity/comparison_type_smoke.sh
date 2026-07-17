@@ -39,10 +39,16 @@ echo "$out" | grep -q "cannot compare sview with int" || fail "sview==int not fl
 out=$(printf 'def f(view: sview, text: cstr[row]) -> bool:\n    return view == text\n' | "$RPT")
 echo "$out" | grep -q "cannot compare" && fail "false positive on sview==cstr: $out"
 
-# 8. 0 FP across frontend + stdlib.
+# 8. A variant test requires an enum-typed value and retains a slice's surface type.
+out=$(printf 'enum Flag:\n    On\n\ndef f(text: cstr[row]) -> bool:\n    return text[0:1] is Flag.On\n' | "$RPT")
+echo "$out" | grep -q "is requires an enum value for variant tests, got sview" || fail "sview variant-test operand not flagged: $out"
+out=$(printf 'enum Flag:\n    On\n\ndef f(flag: Flag) -> bool:\n    return flag is Flag.On\n' | "$RPT")
+echo "$out" | grep -q "is requires an enum value" && fail "false positive on enum variant test: $out"
+
+# 9. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -c "cannot compare" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "cannot compare|is requires an enum value for variant tests" || true)
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t comparison false positives across frontend+stdlib"
