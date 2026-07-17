@@ -271,7 +271,7 @@ EXPECTS=(
     "darray push expects i64, got string"
     "dict index expects key of type i64, got string"
     "if condition must be bool, got container"
-    "cannot compare container with int"
+    "cannot compare darray with int"
     "invalid cast from int to bool"
     "operator '+' requires numeric operands, got string"
     "variable 'n' expects bool, got int"
