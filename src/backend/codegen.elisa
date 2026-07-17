@@ -698,7 +698,13 @@ module Backend:
                 # `x.u8()` is a CAST (postfix call unifies cast and UFCS: `recv.Name()`
                 # where Name is a type name is a conversion).
                 if call_callee is Expr.Field(cast_object, cast_name, cast_line):
-                    return scalar_type_of_name(cast_name)
+                    # A type name is a CAST and has that type; anything else is UFCS
+                    # (`p.get()` == `get(p)`) and has the FUNCTION's return type. Without
+                    # the second case a UFCS call reports Unmodeled and every
+                    # type-directed check downstream silently stops applying.
+                    cast_type: ValueType = scalar_type_of_name(cast_name)
+                    cast_type return if cast_type.kind != TypeKind.Unmodeled
+                    return lookup_return_type(fns, cast_name)
                 # `f[i64](x)` — an explicit generic call. Its type is the template's return
                 # annotation resolved under that binding, which for `-> T` is the type
                 # argument itself.
@@ -1100,33 +1106,65 @@ module Backend:
                     inferred: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
                     null return if inferred.kind == TypeKind.Unmodeled
                     return emit_generic_call(callee_name, inferred, arguments, local_scope, fns, structs, generics, m, ctx, builder)
-                target_opt: LLVMValueRef? = lookup_function(fns, callee_name)
-                if target_opt is target:
-                    null return if LLVMCountParams(target).i64() != arguments.count.i64()
+                return emit_direct_call(callee_name, callee, false, arguments, local_scope, fns, structs, generics, m, ctx, builder)
+            # UFCS: `p.get(a)` IS `get(p, a)`. A postfix call unifies casts and UFCS —
+            # `recv.Name()` where Name is a TYPE name is a conversion (handled on the cast
+            # path), and where Name is a FUNCTION it is an ordinary call with the receiver
+            # as the leading argument. Only the latter is resolved here; a name that is
+            # neither declines rather than inventing a call.
+            if callee is Expr.Field(receiver, method_name, method_line):
+                method_as_type: ValueType = scalar_type_of_name(method_name)
+                null return if method_as_type.kind != TypeKind.Unmodeled
+                ufcs_target_opt: LLVMValueRef? = lookup_function(fns, method_name)
+                if ufcs_target_opt is ufcs_target:
+                    return emit_direct_call(method_name, receiver, true, arguments, local_scope, fns, structs, generics, m, ctx, builder)
+                return null
+            return null
 
-                    argument_values: mutable darray[LLVMValueRef] = []
-                    declined: mutable bool = false
-                    argument_index: mutable usize = 0
-                    for argument in arguments |argument_values, declined, argument_index, target, local_scope, fns, structs, generics, m, ctx, builder|:
-                        # Each argument is emitted at its PARAMETER's declared type, so a
-                        # literal argument adopts the parameter type rather than i64.
-                        argument_value: LLVMValueRef? = emit_expression(argument, param_type_of(fns, callee_name, argument_index), local_scope, fns, structs, generics, m, ctx, builder)
-                        if argument_value is emitted_argument:
-                            argument_values.push(emitted_argument)
-                        else:
-                            declined <- true
-                        argument_index <- argument_index + 1
-                    null return if declined
 
-                    # LLVMBuildCall2 needs the callee's FUNCTION type, not its pointer
-                    # type: LLVM pointers are opaque, so the type cannot be recovered from
-                    # the value itself.
-                    fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
-                    # A VOID call must be unnamed: "instructions returning void cannot have a name".
-                    result_name: cstr = call_result_name(lookup_return_type(fns, callee_name))
-                    LLVMBuildCall2(builder, fn_type, target, null, 0, result_name) return if arguments.count == 0
-                    args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
-                    return LLVMBuildCall2(builder, fn_type, target, args_pointer, arguments.count.u32(), result_name)
+        # Emit a call to a NON-generic function by name. UFCS passes its receiver as a
+        # SEPARATE leading argument rather than prepending it to a list: building a local
+        # `darray[Expr]` of receiver-then-arguments CRASHES stage0 (SIGTRAP inside cgo —
+        # bisected to the darray construction itself, a darray of packed-enum node handles
+        # built in this function). Threading the receiver is the only spelling that
+        # compiles, not a style preference. `receiver` is ignored when `has_receiver` is
+        # false; callers pass the callee node itself rather than synthesize a dummy.
+        def emit_direct_call(callee_name: sview, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            target_opt: LLVMValueRef? = lookup_function(fns, callee_name)
+            if target_opt is target:
+                total_arguments: usize = arguments.count + 1 if has_receiver else arguments.count
+                null return if LLVMCountParams(target).i64() != total_arguments.i64()
+
+                argument_values: mutable darray[LLVMValueRef] = []
+                declined: mutable bool = false
+                argument_index: mutable usize = 0
+                if has_receiver:
+                    receiver_value: LLVMValueRef? = emit_expression(receiver, param_type_of(fns, callee_name, 0), local_scope, fns, structs, generics, m, ctx, builder)
+                    if receiver_value is emitted_receiver:
+                        argument_values.push(emitted_receiver)
+                    else:
+                        declined <- true
+                    argument_index <- 1
+                for argument in arguments |argument_values, declined, argument_index, target, local_scope, fns, structs, generics, m, ctx, builder|:
+                    # Each argument is emitted at its PARAMETER's declared type, so a
+                    # literal argument adopts the parameter type rather than i64.
+                    argument_value: LLVMValueRef? = emit_expression(argument, param_type_of(fns, callee_name, argument_index), local_scope, fns, structs, generics, m, ctx, builder)
+                    if argument_value is emitted_argument:
+                        argument_values.push(emitted_argument)
+                    else:
+                        declined <- true
+                    argument_index <- argument_index + 1
+                null return if declined
+
+                # LLVMBuildCall2 needs the callee's FUNCTION type, not its pointer
+                # type: LLVM pointers are opaque, so the type cannot be recovered from
+                # the value itself.
+                fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                # A VOID call must be unnamed: "instructions returning void cannot have a name".
+                result_name: cstr = call_result_name(lookup_return_type(fns, callee_name))
+                LLVMBuildCall2(builder, fn_type, target, null, 0, result_name) return if total_arguments == 0
+                args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildCall2(builder, fn_type, target, args_pointer, total_arguments.u32(), result_name)
             return null
 
 
@@ -1729,17 +1767,18 @@ module Backend:
                 for argument_name in call_argument_names:
                     null return if argument_name != ""
                 # `x.u8()` is a CAST, not a call: postfix call unifies cast and UFCS, so a
-                # TYPE-NAME receiver-method is a conversion.
+                # TYPE-NAME receiver-method is a conversion. A receiver-method that is NOT a
+                # type name falls through to emit_call, which resolves it as UFCS.
                 if call_callee is Expr.Field(cast_object, cast_name, cast_line):
                     target_type: ValueType = scalar_type_of_name(cast_name)
-                    null return if target_type.kind == TypeKind.Unmodeled
-                    null return if call_arguments.count != 0
-                    # The source's own type decides; only a bare literal receiver needs a
-                    # default, and `1.5.i64()` is not a form the subset needs to model.
-                    source_type: ValueType = resolve_type(cast_object, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
-                    if emit_expression(cast_object, source_type, local_scope, fns, structs, generics, m, ctx, builder) is source_value:
-                        return emit_conversion(source_value, source_type, target_type, structs, ctx, builder)
-                    return null
+                    if target_type.kind != TypeKind.Unmodeled:
+                        null return if call_arguments.count != 0
+                        # The source's own type decides; only a bare literal receiver needs a
+                        # default, and `1.5.i64()` is not a form the subset needs to model.
+                        source_type: ValueType = resolve_type(cast_object, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
+                        if emit_expression(cast_object, source_type, local_scope, fns, structs, generics, m, ctx, builder) is source_value:
+                            return emit_conversion(source_value, source_type, target_type, structs, ctx, builder)
+                        return null
                 return emit_call(call_callee, call_arguments, local_scope, fns, structs, generics, m, ctx, builder)
             return null
 

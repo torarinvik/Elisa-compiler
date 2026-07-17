@@ -364,6 +364,17 @@ diff_case enum_first 'const enum Color of u8:\n    Red\n    Green\n    Blue\n\nd
 diff_case enum_last  'const enum Color of u8:\n    Red\n    Green\n    Blue\n\ndef main() -> i64:\n    return match Color.Blue:\n        Color.Red: 0\n        Color.Green: 1\n        Color.Blue: 42\n'
 diff_case enum_local 'const enum Color of u8:\n    Red\n    Green\n    Blue\n\ndef main() -> i64:\n    c: Color = Color.Blue\n    return match c:\n        Color.Blue: 42\n        _: 0\n'
 diff_case enum_default 'const enum Color of u8:\n    Red\n    Green\n    Blue\n\ndef code(c: Color) -> i64:\n    return match c:\n        Color.Red: 1\n        _: 42\n\ndef main() -> i64:\n    return code(Color.Blue)\n'
+# UFCS: a postfix call unifies casts and UFCS — `p.get()` where `get` is a FUNCTION is
+# exactly `get(p)`, while `x.i64()` where the name is a TYPE stays a conversion.
+diff_case ufcs_receiver 'struct P:\n    x: i64\n\ndef get(p: P) -> i64:\n    return p.x\n\ndef main() -> i64:\n    p: P = P{x: 42}\n    return p.get()\n'
+diff_case ufcs_extra_args 'def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    x: i64 = 40\n    return x.add(2)\n'
+diff_case ufcs_chained 'def double(n: i64) -> i64:\n    return n * 2\n\ndef main() -> i64:\n    x: i64 = 10\n    return x.double().double() + 2\n'
+# The receiver is argument 0, so it is emitted at the PARAMETER's type, not defaulted to
+# i64 — a u8 receiver must stay a u8.
+diff_case ufcs_u8_receiver 'def widen(b: u8) -> i64:\n    return b.i64()\n\ndef main() -> i64:\n    v: u8 = 200\n    return v.widen() - 158\n'
+diff_case ufcs_void 'struct Acc:\n    total: mutable i64\n\ndef bump(a: mutable Acc&) -> void:\n    a.total <- a.total + 42\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    a.bump()\n    return a.total\n'
+# A cast is still a cast, not a UFCS call to a function that happens to be missing.
+diff_case ufcs_cast_unaffected 'def main() -> i64:\n    a: u8 = 200\n    return a.i64() - 158\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
