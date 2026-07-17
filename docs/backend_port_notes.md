@@ -497,3 +497,44 @@ on Expr.Tuple — closes both that diagnostic gap and this backend blocker.
 
 Spellings (verified against stage0): the TYPE is named-field `(a: i64, b: i64)`; the VALUE
 is POSITIONAL `(40, 2)`. `(a: 40, b: 2)` is rejected ("expected IDENT, got INT").
+
+## Region threading (cross-fn) — ABI mapped, NOT implemented. THE next region step.
+
+This is the first real piece of region POLYMORPHISM, and stage0's shape is simple. For
+
+    def fill(out: mutable darray[i64]&) -> void:
+        out.push(42)
+
+    def main() -> i64:
+        xs: mutable darray[i64] = []
+        fill(xs)
+        return xs[0]                       # stage0: exit 42; stage1 currently DECLINES
+
+stage0 emits `define void @fill(ptr %0, ptr %1)` — **TWO** params for a one-param function.
+`%1` is the CALLER's arena, threaded implicitly, and the growth inside uses it:
+`call ptr @arena_alloc(ptr %1, ...)` / `@arena_realloc(ptr %1, ...)`. The call site passes
+it: `call void @fill(ptr %xs, ptr %"__auto_85#1")`.
+
+So the rule: a function with a GROWABLE CONTAINER REF param (`mutable darray[T]&`) gains an
+implicit trailing `ptr` arena parameter, and growth inside uses THAT arena instead of the
+function's own auto region. It must NOT arena_free it — the region belongs to the caller.
+
+Implementation sketch:
+1. `needs_arena_param(decl, structs)` — true when any param is a Ref whose target is a
+   DArray. Add a `needs_arena: darray[bool]` column to FnTable so call sites can ask.
+2. `declare_function` — append one `ptr` param when so.
+3. `emit_function_body` — bind `local_runtime.arena` to the TRAILING PARAM rather than
+   building a fresh `auto.region` alloca, and skip the arena_free.
+4. `emit_direct_call` — append the caller's `runtime.arena` as the trailing argument.
+
+BLOCKER (the actual work): step 4 needs the runtime at the call site, and
+**`emit_expression` does not take `runtime` today** — `emit_statements` does, but
+`emit_expression` / `emit_call` / `emit_direct_call` / `emit_generic_call` do not. Threading
+it through is ~33 `emit_expression(` call sites plus their Elisa CAPTURE LISTS (a loop body
+that calls emit_expression must add `runtime` to its `|...|`), which is where this gets
+error-prone rather than merely tedious. Do that refactor as its own mechanical commit,
+verify smoke stays at 204/204, and only then add the arena param.
+
+Related and NOT the same thing: returning an owned container (see 95915b5) needs region
+RETURN inference, which is a further step — the callee would allocate in the caller's region
+rather than its own. Threading a param arena is the prerequisite.
