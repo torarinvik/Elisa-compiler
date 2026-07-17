@@ -507,6 +507,27 @@ diff_case region_scope_empty 'def main() -> i64:\n    region r:\n        v: i64 
 # differential could ever catch).
 diff_case region_return_inside 'def main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(1)\n    region r:\n        xs: mutable darray[i64] = []\n        xs.push(42)\n        return xs[0] can Unsafe.UncheckedIndex\n'
 diff_case region_return_nested 'def main() -> i64:\n    region outer:\n        xs: mutable darray[i64] = []\n        xs.push(40)\n        region inner:\n            ys: mutable darray[i64] = []\n            ys.push(2)\n            return (xs[0] can Unsafe.UncheckedIndex) + (ys[0] can Unsafe.UncheckedIndex)\n'
+# PAYLOAD ENUMS as a tagged union. Read from stage0's IR, not guessed: `%Shape = type
+# { i32, [1 x i64] }`, the tag is `extractvalue %Shape %sh, 0` compared with `icmp eq i32`
+# against the variant's DECLARATION ordinal, and the payload is a GEP to field 1 loaded at
+# the variant's own type. Construction is alloca / zeroinitializer / store tag / store
+# payload / load.
+diff_case penum_first_variant 'enum Shape:\n    Circle(r: i64)\n    Square(s: i64)\n\ndef area(sh: Shape) -> i64:\n    return match sh:\n        Shape.Circle(r): r\n        Shape.Square(s): s * 2\n\ndef main() -> i64:\n    return area(Shape.Circle(42))\n'
+# The SECOND variant proves the tag actually dispatches rather than always taking arm one.
+diff_case penum_second_variant 'enum Shape:\n    Circle(r: i64)\n    Square(s: i64)\n\ndef area(sh: Shape) -> i64:\n    return match sh:\n        Shape.Circle(r): r\n        Shape.Square(s): s * 2\n\ndef main() -> i64:\n    return area(Shape.Square(21))\n'
+diff_case penum_local 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(42)\n    return match s:\n        Shape.Circle(r): r\n'
+# A u8 payload must be read back at its OWN width, not as the i64 the slot is sized in.
+diff_case penum_u8_payload 'enum Box:\n    Small(v: u8)\n\ndef main() -> i64:\n    b: Box = Box.Small(200)\n    return match b:\n        Box.Small(v): v.i64() - 158\n'
+# A payload-free variant alongside a payload-carrying one still gets a tag slot, so its
+# ordinal stays its declaration index.
+diff_case penum_mixed_variants 'enum Opt:\n    None\n    Some(v: i64)\n\ndef read(o: Opt) -> i64:\n    return match o:\n        Opt.None: 0\n        Opt.Some(v): v\n\ndef main() -> i64:\n    return read(Opt.Some(42)) + read(Opt.None)\n'
+# A PLAIN (non-const, payload-free) enum is still a tagged union -- every variant just has
+# an empty payload. Passing it through a function defeats stage0's constant folding (a
+# same-function match folds to `br i1 true` and proves nothing about the representation).
+# Note `enum Color of u8:` WITHOUT `const` is a syntax error in stage0 ("expected :, got
+# IDENT(of)") -- `of` belongs to const enums only.
+diff_case penum_plain_enum 'enum Color:\n    Red\n    Green\n\ndef code(c: Color) -> i64:\n    return match c:\n        Color.Red: 42\n        Color.Green: 0\n\ndef main() -> i64:\n    return code(Color.Red) + code(Color.Green)\n'
+diff_case penum_plain_second 'enum Color:\n    Red\n    Green\n\ndef code(c: Color) -> i64:\n    return match c:\n        Color.Red: 0\n        Color.Green: 42\n\ndef main() -> i64:\n    return code(Color.Green)\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -549,44 +570,13 @@ decline_case() {
 # a three-line dict program emits 102 functions. Supporting dict therefore requires generic
 # instantiation plus compiling elisacore_std/collections.elisa (error unions, refs,
 # optional-of-ref), not an ABI to mirror. Until then it must DECLINE, not half-emit.
-# A `const enum` is exactly its backing scalar, so it is modeled. The two enum forms that
-# are NOT scalars must decline rather than silently narrow to an ordinal compare:
-# a PAYLOAD-carrying variant is packed-store territory (register_enum skips it), and a
-# non-`const` enum is not the backing scalar at all.
-decline_case enum_payload_variant 'enum Shape:\n    Circle(r: i64)\n    Square(s: i64)\n\ndef main() -> i64:\n    return match Shape.Circle(1):\n        Shape.Circle: 42\n        _: 0\n'
-decline_case enum_not_const 'enum Color of u8:\n    Red\n    Green\n\ndef main() -> i64:\n    return match Color.Red:\n        Color.Red: 42\n        _: 0\n'
-# A CYCLIC alias never resolves. Resolution iterates to a fixpoint rather than recursing
-# at each mention precisely so this DECLINES instead of recursing forever — a naive
-# resolver stack-overflows here.
-decline_case type_alias_cycle 'type A = B\ntype B = A\n\ndef main() -> A:\n    return 42\n'
-# A FORWARD reference is not a language feature — stage0 rejects it, so stage1 must not
-# quietly resolve it and emit code for a program the reference compiler refuses.
-decline_case type_alias_forward 'type A = B\ntype B = i64\n\ndef main() -> A:\n    return 42\n'
-# stage0 rejects both of these as not "a compile-time value", so stage1 must not fold them.
-# The cycle is why folding iterates to a fixpoint instead of substituting the initializer
-# expression at each use: substitution would recurse forever here.
-decline_case const_cycle 'const A: i64 = B\nconst B: i64 = A\n\ndef main() -> i64:\n    return A\n'
-decline_case const_from_call 'def f() -> i64:\n    return 42\n\nconst A: i64 = f()\n\ndef main() -> i64:\n    return A\n'
-# A NESTED module (`A::B::get`) nests Scope inside Scope, whose head is not an Ident. One
-# owner column cannot express a dotted path, so it declines rather than mangling a wrong
-# symbol and silently calling the wrong function.
-decline_case nested_module 'module A:\n    module B:\n        def fetch() -> i64:\n            return 42\n\ndef main() -> i64:\n    return A::B::fetch()\n'
-# A cstr carries no LENGTH, so `.count`, indexing and comparison need the runtime and are
-# not modeled. Emitting a raw GEP for `s[0]` would be an unchecked read past the end.
-decline_case cstr_index 'def main() -> i64:\n    s: cstr = "hi"\n    return s[0].i64()\n'
-decline_case cstr_count 'def main() -> i64:\n    s: cstr = "hi"\n    return s.count.i64()\n'
-# TUPLES are blocked on the stage1 AST, not on the backend. A tuple IS an anonymous struct
-# ({ i64, i64 }, GEP by index, passed/returned by value -- stage0's IR), which the existing
-# struct machinery already covers. But `Expr.Tuple(elements, line)` stores NO LABELS: the
-# parser consumes them and keeps only the element types (parser_expr.elisa ~266, and the
-# node's own comment says so). `t.a` needs the label to resolve to index 0, and `t.0` is not
-# valid Elisa (it lexes as FLOAT ".0"), so a tuple's fields cannot be read at all. Declining
-# is therefore the whole of what the backend can soundly do here.
-decline_case tuple_field_access 'def main() -> i64:\n    t: (a: i64, b: i64) = (40, 2)\n    return t.a + t.b\n'
-decline_case tuple_return 'def pair() -> (a: i64, b: i64):\n    return (40, 2)\n\ndef main() -> i64:\n    t: (a: i64, b: i64) = pair()\n    return t.a + t.b\n'
-# Only `region` is modeled. `kind` is an opaque sview, so treating an unknown block prefix as
-# "just run the body" would silently drop the semantics the prefix carries.
-decline_case region_with_block 'def main() -> i64:\n    with x:\n        v: i64 = 1\n    return 42\n'
+# A `const enum` is exactly its backing scalar. A PAYLOAD-carrying enum is a TAGGED UNION
+# `{ i32, [N x i64] }` (stage0's `%Shape = type { i32, [1 x i64] }`) -- NOT the AoS packed
+# store, which is `packed enum`, a different subsystem. Only the subset whose layout is
+# trivially reproducible is modeled: at most ONE scalar payload field per variant. A
+# MULTI-FIELD payload needs the widest-variant layout computed exactly as stage0 computes it,
+# and guessing it would silently misread every payload -- so it declines.
+decline_case enum_multi_field_payload 'enum Pair:\n    Both(a: i64, b: i64)\n\ndef main() -> i64:\n    return match Pair.Both(1, 2):\n        Pair.Both(a, b): a + b\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'

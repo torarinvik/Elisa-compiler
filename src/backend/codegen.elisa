@@ -72,6 +72,12 @@ module Backend:
             # (`array_elements` / `array_extents`) — same reason as Struct: ValueType is
             # POD, so a nested element type cannot live inline.
             Array
+            # A PAYLOAD-carrying enum (`enum Shape: Circle(r: i64)`). In LLVM a TAGGED UNION
+            # `{ i32, [N x i64] }`: field 0 is the variant ORDINAL, field 1 is payload
+            # storage sized to the largest variant (stage0's `%Shape = type { i32, [1 x
+            # i64] }`, read from its IR). NOT the AoS packed store -- that is `packed enum`,
+            # a different subsystem. `bits` indexes the PAYLOAD-ENUM side-pool.
+            PayloadEnum
             # `cstr` — a NUL-terminated string constant. In LLVM just a `ptr`: stage0
             # lowers `s: cstr = "hi"` to `@str = private unnamed_addr constant [3 x i8]
             # c"hi\00"` plus `store ptr @str`. Carries no length, so `.count`, indexing and
@@ -213,6 +219,8 @@ module Backend:
                 # `c: Color` as an i8, so there is no distinct enum type to model.
                 enum_index: i64 = enum_index_of(structs, type_name)
                 copied_type(structs.enum_backings[enum_index.usize()]) return if enum_index >= 0
+                penum_index: i64 = penum_index_of(structs, type_name)
+                ValueType{kind: TypeKind.PayloadEnum, bits: penum_index.u32()} return if penum_index >= 0
                 # A user STRUCT name: `bits` carries its registry index.
                 struct_index: i64 = struct_index_of(structs, type_name)
                 ValueType{kind: TypeKind.Struct, bits: struct_index.u32()} return if struct_index >= 0
@@ -226,6 +234,12 @@ module Backend:
             # A cstr is an opaque `ptr`, exactly as stage0 passes it (`define i64
             # @take(ptr)`).
             LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.CStr
+            # `{ i32, [N x i64] }` — stage0's tagged-union layout for a payload enum.
+            if value_type.kind == TypeKind.PayloadEnum:
+                words: u32 = structs.penum_payload_words[value_type.bits.usize()]
+                penum_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt64TypeInContext(ctx), words)]
+                penum_pointer: void& = (&penum_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, penum_pointer, 2, 0)
             structs.handles[value_type.bits.usize()] return if value_type.kind == TypeKind.Struct
             if value_type.kind == TypeKind.Array:
                 slot: usize = value_type.bits.usize()
@@ -284,6 +298,18 @@ module Backend:
             enum_variants: mutable darray[sview]
             enum_variant_start: mutable darray[usize]
             enum_variant_count: mutable darray[usize]
+            # PAYLOAD-carrying enums, in a side-pool parallel to the const-enum one above.
+            # `penum_payloads` is the payload ValueType of each variant (one per variant, in
+            # declaration order); a variant with NO payload still takes a slot so that a
+            # variant's index within its enum IS its tag.
+            penum_names: mutable darray[sview]
+            penum_variants: mutable darray[sview]
+            penum_payloads: mutable darray[ValueType]
+            penum_has_payload: mutable darray[bool]
+            penum_variant_start: mutable darray[usize]
+            penum_variant_count: mutable darray[usize]
+            # Payload words (i64 units) of the WIDEST variant — the `[N x i64]` extent.
+            penum_payload_words: mutable darray[u32]
             # `alias Num = i64` — a NAME for an existing type, carrying no representation of
             # its own, so it resolves to the target's ValueType and disappears.
             #
@@ -819,6 +845,8 @@ module Backend:
             # `Color.Green` has the enum's BACKING type.
             if expression is Expr.Field(enum_head, enum_member, enum_head_line):
                 if enum_head is Expr.Ident(enum_head_name, enum_head_name_line):
+                    penum_head_index: i64 = penum_index_of(structs, enum_head_name)
+                    ValueType{kind: TypeKind.PayloadEnum, bits: penum_head_index.u32()} return if penum_head_index >= 0
                     enum_slot: i64 = enum_index_of(structs, enum_head_name)
                     if enum_slot >= 0:
                         copied_type(structs.enum_backings[enum_slot.usize()]) return if enum_ordinal_of(structs, enum_slot.usize(), enum_member) >= 0
@@ -842,6 +870,12 @@ module Backend:
                 # `x.u8()` is a CAST (postfix call unifies cast and UFCS: `recv.Name()`
                 # where Name is a type name is a conversion).
                 if call_callee is Expr.Field(cast_object, cast_name, cast_line):
+                    # `Shape.Circle(42)` is a payload-enum CONSTRUCTOR and has the enum's
+                    # type. Checked before the cast/UFCS split: the head is an enum NAME, so
+                    # neither of those readings applies.
+                    if cast_object is Expr.Ident(ctor_enum_name, ctor_enum_line):
+                        ctor_index: i64 = penum_index_of(structs, ctor_enum_name)
+                        ValueType{kind: TypeKind.PayloadEnum, bits: ctor_index.u32()} return if ctor_index >= 0
                     # A type name is a CAST and has that type; anything else is UFCS
                     # (`p.get()` == `get(p)`) and has the FUNCTION's return type. Without
                     # the second case a UFCS call reports Unmodeled and every
@@ -982,6 +1016,49 @@ module Backend:
 
 
         # `Color.Red` -> its ordinal, or -1 if the path is not a const-enum member.
+        # `Shape.Circle` -> the variant's TAG, or -1. Same byte-comparison approach as
+        # ordinal_of_dotted_path, against the payload-enum pools.
+        def penum_variant_index_of_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
+                for offset in 0..<structs.penum_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    variant: sview = structs.penum_variants[structs.penum_variant_start[enum_index] + offset]
+                    offset.i64() return if sview_matches_prefix(path, variant, dot + 1, sview_len(path).i64())
+            return -1
+
+
+        # `Shape.Circle` -> its payload's ValueType, or Unmodeled when the path names no
+        # payload-carrying variant.
+        def penum_payload_of_path(path: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            unmodeled_type() return if dot <= 0
+            for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
+                for offset in 0..<structs.penum_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    slot: usize = structs.penum_variant_start[enum_index] + offset
+                    continue if not sview_matches_prefix(path, structs.penum_variants[slot], dot + 1, sview_len(path).i64())
+                    unmodeled_type() return if not structs.penum_has_payload[slot]
+                    return copied_type(structs.penum_payloads[slot])
+            return unmodeled_type()
+
+
+        # `Shape.Circle` -> the enclosing enum's ValueType, or Unmodeled.
+        def penum_type_of_path(path: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            unmodeled_type() return if dot <= 0
+            for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
+                ValueType{kind: TypeKind.PayloadEnum, bits: enum_index.u32()} return if sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
+            return unmodeled_type()
+
+
         # Pattern.Variant carries the path as one dotted STRING, so it is split here.
         def ordinal_of_dotted_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
             dot: mutable i64 = -1
@@ -1255,6 +1332,31 @@ module Backend:
                     null return if inferred.kind == TypeKind.Unmodeled
                     return emit_generic_call(callee_name, inferred, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 return emit_direct_call("", callee_name, callee, false, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            # `Shape.Circle(42)` — a payload-enum CONSTRUCTOR. stage0 emits: alloca, store
+            # zeroinitializer, store the tag at field 0, store the payload at field 1, load
+            # the value. Only ONE payload argument is modeled, matching what
+            # register_payload_enum accepts.
+            if callee is Expr.Field(ctor_head, ctor_variant, ctor_line):
+                if ctor_head is Expr.Ident(ctor_enum_name, ctor_enum_line):
+                    ctor_enum_index: i64 = penum_index_of(structs, ctor_enum_name)
+                    if ctor_enum_index >= 0:
+                        ctor_tag: i64 = penum_variant_index(structs, ctor_enum_index, ctor_variant)
+                        null return if ctor_tag < 0
+                        null return if arguments.count != 1
+                        ctor_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: ctor_enum_index.u32()}
+                        ctor_payload_type: ValueType = copied_type(structs.penum_payloads[structs.penum_variant_start[ctor_enum_index.usize()] + ctor_tag.usize()])
+                        null return if ctor_payload_type.kind == TypeKind.Unmodeled
+                        ctor_llvm: LLVMTypeRef = llvm_type_of(ctor_type, structs, ctx)
+                        ctor_slot: LLVMValueRef = LLVMBuildAlloca(builder, ctor_llvm, "enum.ctor")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(ctor_llvm), ctor_slot)
+                        ctor_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, ctor_llvm, ctor_slot, 0, "enum.tag.ptr")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), ctor_tag.u64(), 0), ctor_tag_pointer)
+                        if emit_expression(arguments[0], ctor_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ctor_payload_value:
+                            ctor_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, ctor_llvm, ctor_slot, 1, "enum.payload.ptr")
+                            _ = LLVMBuildStore(builder, ctor_payload_value, ctor_payload_pointer)
+                            return LLVMBuildLoad2(builder, ctor_llvm, ctor_slot, "enum.value")
+                        return null
+
             # UFCS: `p.get(a)` IS `get(p, a)`. A postfix call unifies casts and UFCS —
             # `recv.Name()` where Name is a TYPE name is a conversion (handled on the cast
             # path), and where Name is a FUNCTION it is an ordinary call with the receiver
@@ -1727,17 +1829,32 @@ module Backend:
             # source order, and turning a dense chain into a switch is llc's job.
             if expression is Expr.Match(match_scrutinee, match_arms, match_line):
                 scrutinee_type: ValueType = resolve_type(match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
-                null return if not is_integer_type(scrutinee_type)
+                # An integer scrutinee compares directly; a PAYLOAD ENUM compares on its TAG.
+                penum_scrutinee: bool = scrutinee_type.kind == TypeKind.PayloadEnum
+                null return if not is_integer_type(scrutinee_type) and not penum_scrutinee
                 match_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
                 null return if expected.kind == TypeKind.Unmodeled
-                if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scrutinee:
+                if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scrutinee_raw:
                     function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                    # `%match.tag.value = extractvalue %Shape %sh, 0` — stage0's shape. The
+                    # tag is an i32 regardless of the payload, so the compare constant below
+                    # is built at i32, not at the scrutinee's own type.
+                    scrutinee: mutable LLVMValueRef = scrutinee_raw
+                    compare_type: mutable LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
+                    penum_slot: mutable LLVMValueRef = scrutinee_raw
+                    if penum_scrutinee:
+                        scrutinee <- LLVMBuildExtractValue(builder, scrutinee_raw, 0, "match.tag.value")
+                        compare_type <- LLVMInt32TypeInContext(ctx)
+                        # The payload is read through memory (stage0 spills the value too),
+                        # so the arm's binding loads from this slot.
+                        penum_slot <- LLVMBuildAlloca(builder, llvm_type_of(scrutinee_type, structs, ctx), "match.payload.tmp")
+                        _ = LLVMBuildStore(builder, scrutinee_raw, penum_slot)
                     result_slot: LLVMValueRef = LLVMBuildAlloca(builder, match_type, "match.result")
                     done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.done")
                     declined: mutable bool = false
                     saw_default: mutable bool = false
 
-                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, penum_scrutinee, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
                         # Once a catch-all is emitted the chain is closed.
                         continue if declined or saw_default
                         if arm_has_guard(arm.guard):
@@ -1750,14 +1867,47 @@ module Backend:
                             # `icmp eq i8 %c, 0`). Resolved to its ordinal and folded into
                             # the same compare chain.
                             variant_ordinal: mutable i64 = -1
+                            payload_binding: mutable sview = ""
+                            payload_declined: mutable bool = false
+                            # The `is` binding is scoped to its branch, so the path is copied
+                            # out for the payload load further down.
+                            payload_path: mutable sview = ""
                             if arm.pattern is Pattern.Variant(variant_path, variant_fields):
-                                if variant_fields.count == 0:
-                                    variant_ordinal <- ordinal_of_dotted_path(variant_path, structs)
+                                payload_path <- variant_path
+                                if penum_scrutinee:
+                                    # `Shape.Circle(r)` — the tag is the variant's index in
+                                    # its own enum, and the arm may bind ONE payload field.
+                                    variant_ordinal <- penum_variant_index_of_path(variant_path, structs)
+                                    payload_declined <- true if variant_fields.count > 1
+                                    if variant_fields.count == 1:
+                                        if variant_fields[0] is Pattern.Binding(bound_name):
+                                            payload_binding <- bound_name
+                                        else:
+                                            payload_declined <- true
+                                else:
+                                    if variant_fields.count == 0:
+                                        variant_ordinal <- ordinal_of_dotted_path(variant_path, structs)
+                            if payload_declined:
+                                declined <- true
+                                continue
                             if variant_ordinal >= 0:
                                 next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.next")
-                                hit: LLVMValueRef = LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(llvm_type_of(scrutinee_type, structs, ctx), variant_ordinal.u64(), 0), "match.cmp")
+                                hit: LLVMValueRef = LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(compare_type, variant_ordinal.u64(), 0), "match.cmp")
                                 _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
                                 LLVMPositionBuilderAtEnd(builder, arm_block)
+                                # Bind the payload INSIDE the arm: `getelementptr %Shape, ptr
+                                # %tmp, i32 0, i32 1` then load at the variant's own type.
+                                if penum_scrutinee and payload_binding != "":
+                                    payload_type: ValueType = penum_payload_of_path(payload_path, structs)
+                                    if payload_type.kind == TypeKind.Unmodeled:
+                                        declined <- true
+                                        continue
+                                    payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(scrutinee_type, structs, ctx), penum_slot, 1, "enum.payload.ptr")
+                                    payload_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(payload_type, structs, ctx), payload_pointer, "match.payload")
+                                    payload_name_storage: mutable darray[u8] = []
+                                    payload_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(payload_type, structs, ctx), sview_to_cstr(payload_binding, payload_name_storage))
+                                    _ = LLVMBuildStore(builder, payload_value, payload_slot)
+                                    declare_local(local_scope, payload_binding, payload_slot, payload_type)
                                 if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is variant_value:
                                     _ = LLVMBuildStore(builder, variant_value, result_slot)
                                     _ = LLVMBuildBr(builder, done_block)
@@ -1928,6 +2078,23 @@ module Backend:
                         null return if ordinal < 0
                         backing: ValueType = copied_type(structs.enum_backings[enum_slot.usize()])
                         return LLVMConstInt(llvm_type_of(backing, structs, ctx), ordinal.u64(), 0)
+                    # `Opt.None` — a PAYLOAD-FREE variant of a payload enum, used as a bare
+                    # value rather than called. It is still the tagged union: the tag, with
+                    # the payload slot left zeroed.
+                    penum_slot_index: i64 = penum_index_of(structs, enum_type_name)
+                    if penum_slot_index >= 0:
+                        penum_tag: i64 = penum_variant_index(structs, penum_slot_index, enum_variant)
+                        null return if penum_tag < 0
+                        # A variant WITH a payload is a constructor and must be called; a
+                        # bare mention of one is not a value.
+                        null return if structs.penum_has_payload[structs.penum_variant_start[penum_slot_index.usize()] + penum_tag.usize()]
+                        penum_value_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: penum_slot_index.u32()}
+                        penum_llvm: LLVMTypeRef = llvm_type_of(penum_value_type, structs, ctx)
+                        penum_ctor_slot: LLVMValueRef = LLVMBuildAlloca(builder, penum_llvm, "enum.ctor")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(penum_llvm), penum_ctor_slot)
+                        penum_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, penum_llvm, penum_ctor_slot, 0, "enum.tag.ptr")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), penum_tag.u64(), 0), penum_tag_pointer)
+                        return LLVMBuildLoad2(builder, penum_llvm, penum_ctor_slot, "enum.value")
 
             # `xs.count` — read the darray header's count field.
             if expression is Expr.Field(darray_object, darray_field, darray_field_line):
@@ -2521,6 +2688,63 @@ module Backend:
             return -1
 
 
+        def penum_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.penum_names.count |index, structs, name|:
+                index.i64() return if structs.penum_names[index] == name
+                index <- index + 1
+            return -1
+
+
+        # A variant's TAG is its index within its own enum's span, matching stage0, where the
+        # tag compare is `icmp eq i32 %tag, <declaration ordinal>`. -1 when unknown.
+        def penum_variant_index(structs: StructTable&, enum_index: i64, variant_name: sview) -> i64 can[Abort.Panic]:
+            start: usize = structs.penum_variant_start[enum_index.usize()]
+            count: usize = structs.penum_variant_count[enum_index.usize()]
+            offset: mutable usize = 0
+            while offset < count |offset, structs, start, variant_name|:
+                offset.i64() return if structs.penum_variants[start + offset] == variant_name
+                offset <- offset + 1
+            return -1
+
+
+        # Register a PAYLOAD-carrying enum as a tagged union. Only the subset stage0's layout
+        # makes trivially reproducible is modeled: at most ONE payload field per variant, of a
+        # scalar type. A multi-field or aggregate payload needs the widest-variant layout
+        # computed the way stage0 computes it, and guessing it would silently misread every
+        # payload -- so it declines by not registering, and every use then declines too.
+        def register_payload_enum(declaration: Decl, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if declaration is Decl.Enum(enum_name, variants, is_const, storage_type, enum_line):
+                return if is_const
+                return if variants.count == 0
+                start: usize = structs.penum_variants.count
+                declined: mutable bool = false
+                widest: mutable u32 = 0
+                for variant in variants |structs, declined, widest|:
+                    declined <- true if variant.fields.count > 1
+                    payload: mutable ValueType = unmodeled_type()
+                    if variant.fields.count == 1:
+                        payload <- annotation_value_type(variant.fields[0], structs)
+                        # Only a scalar payload: it must fit the `[N x i64]` slot and be read
+                        # back by a plain load at the payload pointer.
+                        declined <- true if not is_numeric_type(payload) and payload.kind != TypeKind.Bool
+                        widest <- 1 if widest == 0
+                    structs.penum_variants <- structs.penum_variants.push(variant.name)
+                    structs.penum_payloads <- structs.penum_payloads.push(payload)
+                    structs.penum_has_payload <- structs.penum_has_payload.push(variant.fields.count == 1)
+                if declined:
+                    # Unregister: leave no half-built enum behind for a use site to find.
+                    while structs.penum_variants.count > start |structs|:
+                        _ = structs.penum_variants.pop()
+                        _ = structs.penum_payloads.pop()
+                        _ = structs.penum_has_payload.pop()
+                    return
+                structs.penum_names <- structs.penum_names.push(enum_name)
+                structs.penum_variant_start <- structs.penum_variant_start.push(start)
+                structs.penum_variant_count <- structs.penum_variant_count.push(variants.count)
+                structs.penum_payload_words <- structs.penum_payload_words.push(widest)
+
+
         # Register a CONST enum: its backing scalar and its variants in declaration order
         # (the ordinal IS the variant's value). Only `const enum … of <scalar>` is modeled —
         # a payload-carrying enum is a packed AoS store, a different subsystem entirely.
@@ -2731,7 +2955,7 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -2751,6 +2975,7 @@ module Backend:
                 # Const enums resolve to a scalar, so they must be known before any
                 # signature or field mentioning one is resolved.
                 register_enum(declaration, structs)
+                register_payload_enum(declaration, structs)
                 register_alias(declaration, structs)
             # Aliases resolve AFTER struct names and enums (an alias may name either) and
             # BEFORE struct bodies (a field may be alias-typed).
