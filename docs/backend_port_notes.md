@@ -251,7 +251,23 @@ Fixed by replacing the two `<- []` lines with pops. Nested generics now work, in
 three-deep chains and two type arguments; the decline fixture was promoted to real coverage.
 The pre-sizing refactor was NOT needed and was not applied.
 
-## references (`T&`): started, not landed (2026-07-17)
+## references (`T&`): LANDED (68402af)
+
+RESOLVED. The blocker recorded below was WRONG: `T&` is a POSTFIX
+`Expr.Unary(Ampersand, T)` all along (parser_expr_ops.elisa ~147 — the parser distinguishes
+it from infix bitwise-and by looking PAST the whole `&` run). The annotation resolved fine;
+that is exactly why the end-of-function classifier probe never fired. The decline was
+DOWNSTREAM: field access through a reference.
+
+`struct_address_of` is the piece that was missing: a plain local's struct address is its
+alloca; a `P&` parameter's is that alloca LOADED. After that, field GEP/load/store are
+identical for both, so field access needs no ref-specific path.
+
+Lesson: "the probe never fired" meant *everything resolved*, i.e. look DOWNSTREAM — not
+"the node is unknown". Two sessions were spent hunting the AST shape that was never the
+problem.
+
+## references (superseded — the wrong diagnosis, kept for the lesson)
 
 Attempted next, reverted rather than leave dead code. What is known:
 
