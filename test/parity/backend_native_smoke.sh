@@ -185,6 +185,17 @@ run_case struct_large_abi 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    
 run_case struct_mixed_abi 'struct M:\n    a: u8\n    b: f64\n\ndef total(m: M) -> i64:\n    return m.a.i64() + m.b.i64()\n\ndef main() -> i64:\n    return total(M{a: 40, b: 2.5})\n'  42
 run_case struct_two_args  'struct P:\n    x: i64\n    y: i64\n\ndef add(a: P, b: P) -> P:\n    return P{x: a.x + b.x, y: a.y + b.y}\n\ndef main() -> i64:\n    r: P = add(P{x: 30, y: 1}, P{x: 10, y: 1})\n    return r.x + r.y\n'  42
 
+# FIXED ARRAYS: `T[N]` types, literals, index read/write.
+run_case array_literal    'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'  42
+run_case array_assign     'def main() -> i64:\n    xs: mutable i64[3] = [1, 1, 1]\n    xs[0] <- 40\n    xs[1] <- 2\n    xs[2] <- 0\n    return xs[0] + xs[1] + xs[2]\n'  42
+# A DYNAMIC index (the loop variable): a constant-only GEP would not compile this.
+run_case array_dynamic_index 'def main() -> i64:\n    xs: i64[4] = [10, 10, 20, 2]\n    total: mutable i64 = 0\n    for i in 0..<4:\n        total <- total + xs[i]\n    return total\n'  42
+# Element type drives load/store width: u8 elements, not i64.
+run_case array_u8         'def main() -> i64:\n    xs: u8[3] = [200, 100, 50]\n    return xs[0].i64() - xs[1].i64() - xs[2].i64() - 8\n'  42
+run_case array_f64        'def main() -> i64:\n    xs: f64[2] = [40.5, 1.5]\n    return (xs[0] + xs[1]).i64()\n'  42
+# Write then read back through dynamic indices: 0+2+4+6+8 == 20, +22 == 42.
+run_case array_write_loop 'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0, 0, 0]\n    for i in 0..<5:\n        xs[i] <- i * 2\n    total: mutable i64 = 0\n    for j in 0..<5:\n        total <- total + xs[j]\n    return total + 22\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -242,6 +253,9 @@ diff_case bitnot      'def main() -> i64:\n    a: i64 = 5\n    return ~a + 200\n
 diff_case and_or_not  'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'
 diff_case compound    'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'
 diff_case short_circuit 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'
+diff_case array_literal 'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'
+diff_case array_u8      'def main() -> i64:\n    xs: u8[3] = [200, 100, 50]\n    return xs[0].i64() - xs[1].i64() - xs[2].i64() - 8\n'
+diff_case array_rw      'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0, 0, 0]\n    for i in 0..<5:\n        xs[i] <- i * 2\n    total: mutable i64 = 0\n    for j in 0..<5:\n        total <- total + xs[j]\n    return total + 22\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
 diff_case struct_large 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n    e: i64\n\ndef sum(g: Big) -> i64:\n    return g.a + g.b + g.c + g.d + g.e\n\ndef main() -> i64:\n    g: Big = Big{a: 10, b: 10, c: 10, d: 10, e: 2}\n    return sum(g)\n'
 diff_case struct_mixed_abi 'struct M:\n    a: u8\n    b: f64\n\ndef total(m: M) -> i64:\n    return m.a.i64() + m.b.i64()\n\ndef main() -> i64:\n    return total(M{a: 40, b: 2.5})\n'
@@ -272,6 +286,8 @@ decline_case() {
 # `-> f64` is outside the modeled i64 subset.
 # Bitwise operators have no float form.
 # A NESTED struct field needs the inner layout resolved first; only scalar fields are modeled.
+# A literal shorter than the declared extent would leave elements undef.
+decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
 decline_case struct_nested 'struct Inner:\n    v: i64\n\nstruct Outer:\n    i: Inner\n\ndef main() -> i64:\n    o: Outer = Outer{i: Inner{v: 42}}\n    return o.i.v\n'
 # Construction must name EVERY field: a missing one would silently leave a slot undef.
 decline_case struct_partial 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 42}\n    return p.x\n'

@@ -50,6 +50,10 @@ module Backend:
             # A user struct. `bits` is its index in the StructTable — a ValueType must stay
             # POD (an sview name would be fine, but an index also gives O(1) field lookup).
             Struct
+            # A fixed array `T[N]`. `bits` indexes the StructTable's ARRAY side-pool
+            # (`array_elements` / `array_extents`) — same reason as Struct: ValueType is
+            # POD, so a nested element type cannot live inline.
+            Array
 
 
         struct ValueType:
@@ -97,9 +101,19 @@ module Backend:
         # Unary node wrapping the type, so it is unwrapped here — mutability is the
         # frontend's business (it already rejects `x <- 1` on an immutable local), and the
         # backend only needs the underlying type.
-        def annotation_value_type(type_expression: Expr, structs: StructTable&) -> ValueType can[Abort.Panic]:
+        def annotation_value_type(type_expression: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             if type_expression is Expr.Unary(qualifier, qualified_type, qualifier_line):
                 return annotation_value_type(qualified_type, structs) if qualifier == TokenKind.Mutable else unmodeled_type()
+            # `i64[3]` — a fixed array. The bracket holds an extent VALUE and the HEAD is
+            # the element type. A NON-literal bracket (`cstr[shape]`) is a shape parameter,
+            # not an array, and is not modeled.
+            if type_expression is Expr.Index(array_head, array_extent, array_line):
+                if array_extent is Expr.IntLit(extent_value):
+                    element: ValueType = annotation_value_type(array_head, structs)
+                    unmodeled_type() return if element.kind == TypeKind.Unmodeled or element.kind == TypeKind.Array
+                    unmodeled_type() return if extent_value <= 0
+                    return intern_array_type(element, extent_value.u32(), structs)
+                return unmodeled_type()
             if type_expression is Expr.Ident(type_name, type_line):
                 scalar: ValueType = scalar_type_of_name(type_name)
                 scalar return if scalar.kind != TypeKind.Unmodeled
@@ -110,9 +124,12 @@ module Backend:
 
 
         # The LLVM type backing a ValueType.
-        def llvm_type_of(value_type: ValueType, structs: StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
+        def llvm_type_of(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
             LLVMInt1TypeInContext(ctx) return if value_type.kind == TypeKind.Bool
             structs.handles[value_type.bits.usize()] return if value_type.kind == TypeKind.Struct
+            if value_type.kind == TypeKind.Array:
+                slot: usize = value_type.bits.usize()
+                return LLVMArrayType(llvm_type_of(structs.array_elements[slot], structs, ctx), structs.array_extents[slot])
             if value_type.kind == TypeKind.Float:
                 return LLVMFloatTypeInContext(ctx) if value_type.bits == 32 else LLVMDoubleTypeInContext(ctx)
             LLVMInt8TypeInContext(ctx) return if value_type.bits == 8
@@ -133,10 +150,43 @@ module Backend:
             field_types: mutable darray[ValueType]
             field_start: mutable darray[usize]
             field_count: mutable darray[usize]
+            # Fixed-array types, interned on demand: `array_elements[i]` is the element
+            # type and `array_extents[i]` the length of the array whose ValueType has
+            # `bits == i`. Interning (rather than a fresh entry per mention) keeps
+            # `i64[3]` one type, so two locals of the same array type compare equal.
+            array_elements: mutable darray[ValueType]
+            array_extents: mutable darray[u32]
+
+
+        # Copy a ValueType out of the region-backed registry.
+        #
+        # ValueType is POD, but a value read straight out of `structs`' darrays is a
+        # BORROW tied to the registry's region — returning it region-less is (correctly)
+        # rejected. Rebuilding it from its fields severs the borrow at zero cost.
+        def copied_type(value_type: ValueType) -> ValueType:
+            return ValueType{kind: value_type.kind, bits: value_type.bits}
+
+
+        # Intern a fixed-array type `element[extent]`, returning its ValueType. Same
+        # element+extent always yields the same index, so `i64[3]` is one type.
+        def intern_array_type(element: ValueType, extent: u32, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<structs.array_elements.count |structs, element, extent|:
+                existing: ValueType = structs.array_elements[index]
+                if existing.kind == element.kind and existing.bits == element.bits and structs.array_extents[index] == extent:
+                    return ValueType{kind: TypeKind.Array, bits: index.u32()}
+            structs.array_elements <- structs.array_elements.push(element)
+            structs.array_extents <- structs.array_extents.push(extent)
+            return ValueType{kind: TypeKind.Array, bits: (structs.array_elements.count - 1).u32()}
+
+
+        # The element type of an array ValueType.
+        def array_element_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.Array
+            return copied_type(structs.array_elements[value_type.bits.usize()])
 
 
         # The registry index of struct `name`, or -1.
-        def struct_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+        def struct_index_of(structs: mutable StructTable&, name: sview) -> i64 can[Abort.Panic]:
             for index in 0..<structs.names.count |structs, name|:
                 index.i64() return if structs.names[index] == name
             return -1
@@ -144,7 +194,7 @@ module Backend:
 
         # The position of `field` within struct `struct_index`, or -1. This IS the LLVM
         # element index: fields are emitted in declaration order.
-        def field_index_of(structs: StructTable&, struct_index: usize, field: sview) -> i64 can[Abort.Panic]:
+        def field_index_of(structs: mutable StructTable&, struct_index: usize, field: sview) -> i64 can[Abort.Panic]:
             for offset in 0..<structs.field_count[struct_index] |structs, struct_index, field|:
                 offset.i64() return if structs.field_names[structs.field_start[struct_index] + offset] == field
             return -1
@@ -233,7 +283,7 @@ module Backend:
         def lookup_type(local_scope: mutable Scope&, name: sview) -> ValueType can[Abort.Panic]:
             index: i64 = lookup_index(local_scope, name)
             unmodeled_type() return if index < 0
-            return local_scope.types[index.usize()]
+            return copied_type(local_scope.types[index.usize()])
 
 
         # Record a local: name, slot and declared type, kept index-parallel.
@@ -250,7 +300,7 @@ module Backend:
             for index in 0..<fns.names.count |fns, name, position|:
                 if fns.names[index] == name:
                     unmodeled_type() return if position >= fns.param_count[index]
-                    return fns.param_types[fns.param_start[index] + position]
+                    return copied_type(fns.param_types[fns.param_start[index] + position])
             return unmodeled_type()
 
 
@@ -258,7 +308,7 @@ module Backend:
         # function.
         def lookup_return_type(fns: FnTable&, name: sview) -> ValueType can[Abort.Panic]:
             for index in 0..<fns.names.count |fns, name|:
-                fns.returns[index] return if fns.names[index] == name
+                copied_type(fns.returns[index]) return if fns.names[index] == name
             return unmodeled_type()
 
 
@@ -268,7 +318,7 @@ module Backend:
         # (Unmodeled) and adopts whatever its context supplies. That is why the emitters
         # thread an `expected` type downward — `a: u8 = 200` must make 200 a u8, not an
         # i64 that is then silently truncated.
-        def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&) -> ValueType can[Abort.Panic]:
+        def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             if expression is Expr.Ident(ident_name, ident_line):
                 return lookup_type(local_scope, ident_name)
             if expression is Expr.Paren(paren_inner, paren_line):
@@ -290,6 +340,10 @@ module Backend:
                 left_type: ValueType = expression_type(binary_left, local_scope, fns, structs)
                 left_type return if left_type.kind != TypeKind.Unmodeled
                 return expression_type(binary_right, local_scope, fns, structs)
+            # `xs[i]` — an index READ yields the array's element type.
+            if expression is Expr.Index(indexed_object, index_expression, index_line):
+                indexed_type: ValueType = expression_type(indexed_object, local_scope, fns, structs)
+                return array_element_of(indexed_type, structs)
             # `p.x` — a field READ has the field's declared type. (A cast `x.u8()` is a
             # Field under a Call, handled below, so a bare Field is always a field read.)
             if expression is Expr.Field(field_object, field_name, field_line):
@@ -298,7 +352,7 @@ module Backend:
                 struct_slot: usize = object_type.bits.usize()
                 position: i64 = field_index_of(structs, struct_slot, field_name)
                 unmodeled_type() return if position < 0
-                return structs.field_types[structs.field_start[struct_slot] + position.usize()]
+                return copied_type(structs.field_types[structs.field_start[struct_slot] + position.usize()])
             # `Point{x: 1, y: 2}` — a brace construction has the constructed type.
             if expression is Expr.Construct(construct_type, construct_fields, construct_line):
                 return annotation_value_type(construct_type, structs)
@@ -359,7 +413,7 @@ module Backend:
             return -1
 
 
-        def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, structs: StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+        def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
             # Floats are a different instruction family end to end: fadd/fdiv/fcmp, never
             # add/sdiv/icmp. Bitwise and shifts have no float form and decline.
             if operand_type.kind == TypeKind.Float:
@@ -503,7 +557,7 @@ module Backend:
         #   br left ? rhs : done              ; `or` swaps the targets
         #   rhs:  result = right; br done
         #   done: load result
-        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
             is_and: bool = operator == TokenKind.And
 
@@ -535,7 +589,7 @@ module Backend:
         # is modeled: the callee must exist in the module (emit_module declares every
         # function before emitting any body, so definition order does not matter) and the
         # arity must match.
-        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if callee is Expr.Ident(callee_name, callee_line):
                 target_opt: LLVMValueRef? = lookup_function(fns, callee_name)
                 if target_opt is target:
@@ -568,7 +622,7 @@ module Backend:
         # The type a value will actually have: its own if known, else the context's.
         # An integer literal has no intrinsic type, so `expected` is what makes
         # `a: u8 = 200` a u8 rather than an i64 that is then truncated behind your back.
-        def resolve_type(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&) -> ValueType can[Abort.Panic]:
+        def resolve_type(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             own: ValueType = expression_type(expression, local_scope, fns, structs)
             own return if own.kind != TypeKind.Unmodeled
             return expected
@@ -578,7 +632,7 @@ module Backend:
         # source and zero-extends an unsigned one (that IS the difference between
         # `u8 200 -> i64 200` and `i8 200 -> i64 -56`); narrowing truncates. Same width is
         # a no-op — a signed/unsigned reinterpretation costs no instruction.
-        def emit_conversion(value: LLVMValueRef, from_type: ValueType, to_type: ValueType, structs: StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+        def emit_conversion(value: LLVMValueRef, from_type: ValueType, to_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
             null return if from_type.kind == TypeKind.Unmodeled or to_type.kind == TypeKind.Unmodeled
             target: LLVMTypeRef = llvm_type_of(to_type, structs, ctx)
             # bool <-> int needs an explicit widening decision; only int<->int, float, and
@@ -604,9 +658,28 @@ module Backend:
             return LLVMBuildSExt(builder, value, target, "sext") if from_type.kind == TypeKind.Signed else LLVMBuildZExt(builder, value, target, "zext")
 
 
+        # The ADDRESS of `xs[i]`.
+        #
+        # A two-index GEP: the first index (always 0) steps over the array POINTER itself,
+        # the second selects the element — the classic C-array shape. StructGEP cannot be
+        # used because the index is dynamic.
+        #
+        # NO BOUNDS CHECK: the subset does not model one. That matches `-emit obj` without
+        # -fbounds-check, which is what the differential compares against; a checked build
+        # is a separate feature, not a silent default.
+        def emit_index_address(array_slot: LLVMValueRef, array_type: ValueType, index_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if array_type.kind != TypeKind.Array
+            index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+            if emit_expression(index_expression, index_type, local_scope, fns, structs, m, ctx, builder) is index_value:
+                indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), index_value]
+                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildGEP2(builder, llvm_type_of(array_type, structs, ctx), array_slot, indices_pointer, 2, "elem.ptr")
+            return null
+
+
         # Emit a value expression, producing a value of `resolve_type(expression, expected)`.
         # `null` = unmodeled; the caller must decline.
-        def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if expression is Expr.IntLit(literal_value):
                 # A literal takes the context's type. sign_extend=1 so a negative literal
                 # fills correctly at any width.
@@ -763,6 +836,43 @@ module Backend:
                             LLVMPositionBuilderAtEnd(builder, done_block)
                             return LLVMBuildLoad2(builder, ternary_type, result_slot, "ifx")
                 return null
+            # `[10, 30, 2]` — a fixed-array literal. Built in a temporary slot element by
+            # element, then loaded back; SROA turns it into registers/constants at -O2.
+            # The literal must have exactly the declared extent: a short literal would
+            # leave elements undef.
+            if expression is Expr.Array(array_elements, array_literal_line):
+                null return if expected.kind != TypeKind.Array
+                slot_index: usize = expected.bits.usize()
+                null return if array_elements.count != structs.array_extents[slot_index].usize()
+                element_type: ValueType = structs.array_elements[slot_index]
+                array_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                temporary: LLVMValueRef = LLVMBuildAlloca(builder, array_llvm, "array")
+                declined: mutable bool = false
+                position: mutable u32 = 0
+                for element_expression in array_elements |declined, position, element_type, array_llvm, temporary, local_scope, fns, structs, m, ctx, builder|:
+                    indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), LLVMConstInt(LLVMInt64TypeInContext(ctx), position.u64(), 0)]
+                    indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                    pointer: LLVMValueRef = LLVMBuildGEP2(builder, array_llvm, temporary, indices_pointer, 2, "init.ptr")
+                    if emit_expression(element_expression, element_type, local_scope, fns, structs, m, ctx, builder) is element_value:
+                        _ = LLVMBuildStore(builder, element_value, pointer)
+                    else:
+                        declined <- true
+                    position <- position + 1
+                null return if declined
+                return LLVMBuildLoad2(builder, array_llvm, temporary, "arrayval")
+
+            # `xs[i]` — an index READ. Only a local array receiver is modeled: the address
+            # comes from the local's slot, so no temporary spill is needed.
+            if expression is Expr.Index(indexed_object, index_expression, index_line):
+                if indexed_object is Expr.Ident(array_name, array_name_line):
+                    array_type: ValueType = lookup_type(local_scope, array_name)
+                    null return if array_type.kind != TypeKind.Array
+                    if lookup_slot(local_scope, array_name) is array_slot:
+                        if emit_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, m, ctx, builder) is pointer:
+                            element_type: ValueType = array_element_of(array_type, structs)
+                            return LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), pointer, "elem")
+                return null
+
             # `Point{x: 40, y: 2}` — build the value in a temporary slot, store each
             # field, then load the whole struct back. mem2reg/SROA turn this into plain
             # registers at -O2, so the temporary costs nothing in the output.
@@ -831,7 +941,7 @@ module Backend:
         # Emit a branch condition: a modeled `bool` (i1). Elisa requires a bool condition,
         # so this simply emits at bool type — no `!= 0` narrowing, because a comparison
         # already yields i1 and a bool local is stored as i1.
-        def emit_condition(condition: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_condition(condition: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             bool_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
             condition_type: ValueType = resolve_type(condition, bool_type, local_scope, fns, structs)
             null return if condition_type.kind != TypeKind.Bool
@@ -852,7 +962,7 @@ module Backend:
         # A statement AFTER a terminator is unreachable; the subset does not model dead
         # code, so it declines rather than emitting into a closed block (which LLVM would
         # reject anyway).
-        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             status: mutable EmitStatus = EmitStatus.Open
             for statement in body |status, return_type, local_scope, loops, fns, structs, m, ctx, builder|:
                 if status == EmitStatus.Open:
@@ -863,7 +973,7 @@ module Backend:
 
 
         # Emit one statement. Returns false to DECLINE (unmodeled construct).
-        def emit_statement(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_statement(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
 
             if statement is Stmt.Return(return_value_opt, return_line):
@@ -912,6 +1022,22 @@ module Backend:
                                     _ = LLVMBuildStore(builder, combined, compound_slot)
                                     return EmitStatus.Open
                     return EmitStatus.Declined
+                # `xs[i] <- v` — an index assignment: address, then store. Only a plain
+                # `<-` to a local array is modeled (a compound `xs[i] += v` would need the
+                # address computed once and reused, which is a separate lowering).
+                if assign_target is Expr.Index(assign_array, assign_index, assign_index_line):
+                    EmitStatus.Declined return if assign_operator != TokenKind.LArrow
+                    if assign_array is Expr.Ident(assign_array_name, assign_array_name_line):
+                        assign_array_type: ValueType = lookup_type(local_scope, assign_array_name)
+                        EmitStatus.Declined return if assign_array_type.kind != TypeKind.Array
+                        if lookup_slot(local_scope, assign_array_name) is assign_array_slot:
+                            if emit_index_address(assign_array_slot, assign_array_type, assign_index, local_scope, fns, structs, m, ctx, builder) is element_pointer:
+                                element_type: ValueType = array_element_of(assign_array_type, structs)
+                                if emit_expression(assign_value, element_type, local_scope, fns, structs, m, ctx, builder) is element_value:
+                                    _ = LLVMBuildStore(builder, element_value, element_pointer)
+                                    return EmitStatus.Open
+                    return EmitStatus.Declined
+
                 EmitStatus.Declined return if assign_operator != TokenKind.LArrow
                 if assign_target is Expr.Ident(target_name, target_line):
                     slot_opt: LLVMValueRef? = lookup_slot(local_scope, target_name)
@@ -1130,7 +1256,7 @@ module Backend:
         # types in `fns`. Null when the signature is outside the modeled subset.
         #
         # Signature types are REAL now: any modeled scalar width/signedness, not just i64.
-        def declare_function(declaration: Decl, fns: mutable FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_function(declaration: Decl, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 if return_type_opt is return_type:
                     return_value_type: ValueType = annotation_value_type(return_type, structs)
@@ -1170,7 +1296,7 @@ module Backend:
 
 
         # Emit the body of an already-declared function. False = declined.
-        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 return_value_type: ValueType = lookup_return_type(fns, function_name)
                 false return if return_value_type.kind == TypeKind.Unmodeled
@@ -1216,7 +1342,7 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: []}
             fns: mutable FnTable = FnTable{names: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
