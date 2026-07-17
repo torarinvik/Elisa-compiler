@@ -725,6 +725,16 @@ diff_case error_union_u8 'error E:\n    X\n\ndef mk(n: u8) -> u8 error[E]:\n    
 diff_case contract_requires 'def half(n: i64) -> i64:\n    requires n >= 0\n    return n / 2\n\ndef main() -> i64:\n    return half(84)\n'
 diff_case contract_two_requires 'def add(a: i64, b: i64) -> i64:\n    requires a > 0\n    requires b > 0\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n'
 diff_case contract_requires_u8 'def widen(b: u8) -> i64:\n    requires b > 100\n    return b.i64()\n\ndef main() -> i64:\n    return widen(200) - 158\n'
+# NESTED STRUCTS: a struct-typed field, its construction, and multi-level reads (`o.i.v`).
+# A struct member is just the inner struct's named handle; bodies are set in a pass before
+# any use, and LLVM resolves a still-opaque referenced struct once both bodies land -- so
+# declaration order is irrelevant (pinned below). Previously declined ("only scalar fields").
+diff_case struct_nested_read 'struct Inner:\n    v: i64\nstruct Outer:\n    i: Inner\n\ndef main() -> i64:\n    o: Outer = Outer{i: Inner{v: 42}}\n    return o.i.v\n'
+diff_case struct_nested_three 'struct A:\n    n: i64\nstruct B:\n    a: A\nstruct C:\n    b: B\n\ndef main() -> i64:\n    c: C = C{b: B{a: A{n: 42}}}\n    return c.b.a.n\n'
+# The inner struct DECLARED AFTER the outer -- forward reference through the named handle.
+diff_case struct_nested_declorder 'struct Outer:\n    i: Inner\nstruct Inner:\n    v: i64\n\ndef main() -> i64:\n    o: Outer = Outer{i: Inner{v: 42}}\n    return o.i.v\n'
+# A struct with two struct-typed fields, reading a field of each.
+diff_case struct_nested_two_fields 'struct P:\n    x: i64\n    y: i64\nstruct Line:\n    start: P\n    stop: P\n\ndef main() -> i64:\n    l: Line = Line{start: P{x: 40, y: 1}, stop: P{x: 1, y: 1}}\n    return l.start.x + l.stop.x + l.start.y\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -797,7 +807,6 @@ decline_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n  
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
-decline_case struct_nested 'struct Inner:\n    v: i64\n\nstruct Outer:\n    i: Inner\n\ndef main() -> i64:\n    o: Outer = Outer{i: Inner{v: 42}}\n    return o.i.v\n'
 # Construction must name EVERY field: a missing one would silently leave a slot undef.
 decline_case struct_partial 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 42}\n    return p.x\n'
 decline_case float_bitwise 'def main() -> i64:\n    x: f64 = 2.0\n    y: f64 = x & x\n    return y.i64()\n'

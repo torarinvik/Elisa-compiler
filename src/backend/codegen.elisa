@@ -2107,6 +2107,41 @@ module Backend:
             return ref_target_of(declared, structs)
 
 
+        # The struct type of a field-access CHAIN (`o`, `o.i`, `o.i.j`, ...). Recurses so
+        # nested field reads resolve their receiver's type, not just a bare Ident's.
+        def struct_chain_type(object: Expr, local_scope: mutable Scope&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            if object is Expr.Ident(chain_name, chain_name_line):
+                return struct_type_of_name(chain_name, local_scope, structs)
+            if object is Expr.Field(chain_inner, chain_field, chain_field_line):
+                inner_type: ValueType = struct_chain_type(chain_inner, local_scope, structs)
+                unmodeled_type() return if inner_type.kind != TypeKind.Struct
+                inner_slot: usize = inner_type.bits.usize()
+                position: i64 = field_index_of(structs, inner_slot, chain_field)
+                unmodeled_type() return if position < 0
+                return copied_type(structs.field_types[structs.field_start[inner_slot] + position.usize()])
+            return unmodeled_type()
+
+
+        # The ADDRESS of a field-access chain's struct value. A bare Ident is its slot; a
+        # nested field GEPs into its receiver's address. This is what makes `o.i.v` work:
+        # the receiver `o.i` is itself a Field, addressed recursively rather than requiring
+        # an Ident.
+        def struct_chain_address(object: Expr, local_scope: mutable Scope&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if object is Expr.Ident(chain_name, chain_name_line):
+                return struct_address_of(chain_name, local_scope, structs, ctx, builder)
+            if object is Expr.Field(chain_inner, chain_field, chain_field_line):
+                inner_type: ValueType = struct_chain_type(chain_inner, local_scope, structs)
+                null return if inner_type.kind != TypeKind.Struct
+                inner_slot: usize = inner_type.bits.usize()
+                position: i64 = field_index_of(structs, inner_slot, chain_field)
+                null return if position < 0
+                if struct_chain_address(chain_inner, local_scope, structs, ctx, builder) is inner_address:
+                    inner_llvm: LLVMTypeRef = llvm_type_of(inner_type, structs, ctx)
+                    return LLVMBuildStructGEP2(builder, inner_llvm, inner_address, position.u32(), "field.chain.ptr")
+                return null
+            return null
+
+
         # Whether an expression threads its `expected` type down to sub-expressions rather
         # than producing a value directly. Such a form must NOT be implicitly wrapped: its
         # ARMS each wrap themselves, which is what makes `42 if flag else null` work.
@@ -2669,19 +2704,20 @@ module Backend:
             # `p.x` — a field READ. Only a local struct receiver is modeled: the address
             # comes from the local's slot, so there is no need to spill a temporary.
             if expression is Expr.Field(field_object, field_name, field_line):
-                if field_object is Expr.Ident(object_name, object_line):
-                    # Looks through a reference: `p.x` works the same for `p: P` and `p: P&`.
-                    object_type: ValueType = struct_type_of_name(object_name, local_scope, structs)
-                    null return if object_type.kind != TypeKind.Struct
+                # The receiver may be a bare Ident (`p.x`) OR a nested field access
+                # (`o.i.v`), both addressed by struct_chain_address. Looks through a
+                # reference, so `p.x` works the same for `p: P` and `p: P&`.
+                object_type: ValueType = struct_chain_type(field_object, local_scope, structs)
+                if object_type.kind == TypeKind.Struct:
                     struct_slot: usize = object_type.bits.usize()
                     position: i64 = field_index_of(structs, struct_slot, field_name)
                     null return if position < 0
-                    if struct_address_of(object_name, local_scope, structs, ctx, builder) is object_address:
+                    if struct_chain_address(field_object, local_scope, structs, ctx, builder) is object_address:
                         field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
                         struct_llvm: LLVMTypeRef = llvm_type_of(object_type, structs, ctx)
                         pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, struct_llvm, object_address, position.u32(), "field.ptr")
                         return LLVMBuildLoad2(builder, llvm_type_of(field_type, structs, ctx), pointer, "field")
-                return null
+                    return null
 
             if expression is Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
                 # A labelled argument is a different calling convention and is not modeled —
@@ -3585,11 +3621,14 @@ module Backend:
                 start: usize = structs.field_names.count
                 for member in members |element_types, declined, structs, ctx|:
                     member_type: ValueType = annotation_value_type(member.type_expression, structs)
-                    if member_type.kind == TypeKind.Unmodeled or member_type.kind == TypeKind.Struct:
-                        # A nested struct field would need the field's own layout resolved
-                        # first; only scalar fields are modeled.
+                    if member_type.kind == TypeKind.Unmodeled:
                         declined <- true
                     else:
+                        # A STRUCT-typed member is fine: its element type is the inner
+                        # struct's named handle. Bodies are set in a dedicated pass BEFORE
+                        # any use, and a named struct may reference another still-opaque one
+                        # at set-body time -- LLVM resolves it once both bodies land -- so
+                        # declaration order does not matter.
                         element_types.push(llvm_type_of(member_type, structs, ctx))
                         structs.field_names <- structs.field_names.push(member.name)
                         structs.field_types <- structs.field_types.push(member_type)
