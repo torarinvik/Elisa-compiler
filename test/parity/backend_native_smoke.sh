@@ -262,6 +262,15 @@ run_case generic_nested    'def wrap[T](x: T) -> T:\n    return identity(x)\n\nd
 run_case generic_nested_3  'def a3[T](x: T) -> T:\n    return a2(x)\n\ndef a2[T](x: T) -> T:\n    return a1(x)\n\ndef a1[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    n: i64 = 42\n    return a3(n)\n'  42
 # Nested AND two type arguments: wrap__u8 -> identity__u8, wrap__i64 -> identity__i64.
 run_case generic_nested_2t 'def wrap[T](x: T) -> T:\n    return identity(x)\n\ndef identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    a: u8 = 200\n    b: i64 = 2\n    return wrap(a).i64() - wrap(b) - 156\n'  42
+# MULTI-TYPE-PARAMETER generics: `f[K, T]` binds two type params independently. The dict
+# prerequisite — `arena_dict_put[K, T]` / `arena_dict_get[K, T]`. Returning K vs T proves
+# each parameter is tracked, not conflated.
+run_case generic_multi_first  'def pick[K, T](a: K, b: T) -> K:\n    return a\n\ndef main() -> i64:\n    return pick[i64, i32](42, 7)\n'  42
+run_case generic_multi_second 'def second[K, T](a: K, b: T) -> T:\n    return b\n\ndef main() -> i64:\n    return second[i32, i64](7, 42)\n'  42
+# Mixed widths across params: the u8 and i64 arguments must adopt their own parameter type.
+run_case generic_multi_widths 'def combine[K, T](a: K, b: T) -> i64:\n    return a.i64() + b.i64()\n\ndef main() -> i64:\n    return combine[u8, i64](40, 2)\n'  42
+# Two distinct instantiations of the SAME two-param template must be emitted once each.
+run_case generic_multi_two_insts 'def pick[K, T](a: K, b: T) -> K:\n    return a\n\ndef main() -> i64:\n    return pick[i64, i32](40, 1) + pick[i64, u8](2, 3)\n'  42
 
 # REFERENCES (`T&` / `mutable T&`), field assignment, and `void`.
 #

@@ -170,18 +170,16 @@ module Backend:
 
         # The return type of generic `base` instantiated at `type_argument`: its return
         # annotation resolved under that binding.
-        def generic_return_type(base: sview, type_argument: ValueType, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+        def generic_return_type(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
             index: i64 = generic_index_of(generics, base)
             unmodeled_type() return if index < 0
             slot: usize = index.usize()
-            unmodeled_type() return if generics.param_count[slot] != 1
+            unmodeled_type() return if generics.param_count[slot] != type_args.count
             if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 if return_type_opt is declared_return:
-                    structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
-                    structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
+                    bound: usize = push_type_bindings(generics, structs, slot, type_args)
                     resolved: ValueType = annotation_value_type(declared_return, structs)
-                    _ = structs.binding_names.pop()
-                    _ = structs.binding_types.pop()
+                    pop_type_bindings(structs, bound)
                     return resolved
             return unmodeled_type()
 
@@ -864,21 +862,48 @@ module Backend:
             params: mutable darray[sview]
             param_start: mutable darray[usize]
             param_count: mutable darray[usize]
-            # Instantiations, keyed by (base name, type argument).
+            # Instantiations, keyed by (base name, type-argument TUPLE). A generic may have
+            # more than one type parameter (`arena_dict_put[K, T]`), so the arguments live in
+            # a flat pool with a per-instantiation span rather than one ValueType per row.
             inst_bases: mutable darray[sview]
-            inst_types: mutable darray[ValueType]
+            inst_args: mutable darray[ValueType]
+            inst_arg_start: mutable darray[usize]
+            inst_arg_count: mutable darray[usize]
             inst_handles: mutable darray[LLVMValueRef]
             # The WORKLIST: instantiations declared but whose BODY still needs emitting. A
             # body cannot be emitted at the call site (the builder sits inside the caller),
             # so emit_module drains this afterwards — and keeps draining, because a generic
-            # can call another generic.
+            # can call another generic. Type args are pooled the same way as inst_args.
             pending_bases: mutable darray[sview]
-            pending_types: mutable darray[ValueType]
+            pending_args: mutable darray[ValueType]
+            pending_arg_start: mutable darray[usize]
+            pending_arg_count: mutable darray[usize]
             pending_handles: mutable darray[LLVMValueRef]
 
 
         def new_generic_table() -> GenericTable can[Abort.Panic, Memory.Allocate]:
-            return GenericTable{names: [], decls: [], params: [], param_start: [], param_count: [], inst_bases: [], inst_types: [], inst_handles: [], pending_bases: [], pending_types: [], pending_handles: []}
+            return GenericTable{names: [], decls: [], params: [], param_start: [], param_count: [], inst_bases: [], inst_args: [], inst_arg_start: [], inst_arg_count: [], inst_handles: [], pending_bases: [], pending_args: [], pending_arg_start: [], pending_arg_count: [], pending_handles: []}
+
+
+        # Push one type-parameter binding per (param name, type arg) for template `slot`, so
+        # annotation_value_type resolves the template's `K`/`T` to the concrete args. Returns
+        # the number pushed, to pop symmetrically with pop_type_bindings.
+        def push_type_bindings(generics: GenericTable&, structs: mutable StructTable&, slot: usize, type_args: darray[ValueType]&) -> usize can[Abort.Panic, Memory.Allocate]:
+            pstart: usize = generics.param_start[slot]
+            count: usize = generics.param_count[slot]
+            bound: mutable usize = 0
+            for k in 0..<count |structs, generics, pstart, type_args, bound, count|:
+                break if k >= type_args.count
+                structs.binding_names <- structs.binding_names.push(generics.params[pstart + k])
+                structs.binding_types <- structs.binding_types.push(copied_type(type_args[k]))
+                bound <- bound + 1
+            return bound
+
+
+        def pop_type_bindings(structs: mutable StructTable&, count: usize) -> void can[Abort.Panic, Memory.Allocate]:
+            for _drop in 0..<count |structs|:
+                _ = structs.binding_names.pop()
+                _ = structs.binding_types.pop()
 
 
         # The index of generic template `name`, or -1.
@@ -888,12 +913,17 @@ module Backend:
             return -1
 
 
-        # The already-declared instantiation for (base, type), or null.
-        def instantiation_of(generics: GenericTable&, base: sview, type_argument: ValueType) -> LLVMValueRef? can[Abort.Panic]:
-            for index in 0..<generics.inst_bases.count |generics, base, type_argument|:
-                if generics.inst_bases[index] == base:
-                    existing: ValueType = generics.inst_types[index]
-                    generics.inst_handles[index] return if existing.kind == type_argument.kind and existing.bits == type_argument.bits
+        # The already-declared instantiation for (base, type-argument tuple), or null.
+        def instantiation_of(generics: GenericTable&, base: sview, type_args: darray[ValueType]&) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<generics.inst_bases.count |generics, base, type_args|:
+                continue if generics.inst_bases[index] != base
+                continue if generics.inst_arg_count[index] != type_args.count
+                astart: usize = generics.inst_arg_start[index]
+                matched: mutable bool = true
+                for k in 0..<type_args.count |generics, matched, astart, type_args|:
+                    stored: ValueType = generics.inst_args[astart + k]
+                    matched <- false if stored.kind != type_args[k].kind or stored.bits != type_args[k].bits
+                generics.inst_handles[index] return if matched
             return null
 
 
@@ -1147,7 +1177,16 @@ module Backend:
                 if call_callee is Expr.Index(generic_head, generic_type_argument, generic_head_line):
                     if generic_head is Expr.Ident(generic_head_name, generic_head_name_line):
                         if generic_index_of(generics, generic_head_name) >= 0:
-                            return generic_return_type(generic_head_name, annotation_value_type(generic_type_argument, structs), generics, structs)
+                            single_return_args: mutable darray[ValueType] = [annotation_value_type(generic_type_argument, structs)]
+                            return generic_return_type(generic_head_name, single_return_args, generics, structs)
+                # `f[K, V](x)` — an explicit MULTI-argument generic call's type.
+                if call_callee is Expr.IndexN(multi_head, multi_head_args, multi_head_line):
+                    if multi_head is Expr.Ident(multi_head_name, multi_head_name_line):
+                        if generic_index_of(generics, multi_head_name) >= 0:
+                            multi_return_args: mutable darray[ValueType] = []
+                            for multi_return_arg_expr in multi_head_args |multi_return_args, structs|:
+                                multi_return_args.push(annotation_value_type(multi_return_arg_expr, structs))
+                            return generic_return_type(multi_head_name, multi_return_args, generics, structs)
                 if call_callee is Expr.Ident(callee_name, callee_line):
                     # A GENERIC template is NOT in `fns` — only its instantiations are —
                     # so it must be resolved through the template. Without this a generic
@@ -1157,7 +1196,8 @@ module Backend:
                         unmodeled_type() return if call_arguments.count == 0
                         inferred: ValueType = expression_type(call_arguments[0], local_scope, fns, structs, generics)
                         unmodeled_type() return if inferred.kind == TypeKind.Unmodeled
-                        return generic_return_type(callee_name, inferred, generics, structs)
+                        inferred_return_args: mutable darray[ValueType] = [inferred]
+                        return generic_return_type(callee_name, inferred_return_args, generics, structs)
                     return lookup_return_type(fns, "", callee_name)
                 # A module-qualified call's type is the qualified function's return type.
                 if call_callee is Expr.Scope(scope_head, scope_name, scope_line):
@@ -1539,21 +1579,20 @@ module Backend:
         # The SIGNATURE is built here — cheap, needs no builder, and yields the handle the
         # call site needs immediately. The BODY is queued because emitting it needs the
         # builder, which is currently positioned inside the caller.
-        def instantiate_generic(base: sview, type_argument: ValueType, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            if instantiation_of(generics, base, type_argument) is already_declared:
+        def instantiate_generic(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instantiation_of(generics, base, type_args) is already_declared:
                 return already_declared
 
             index: i64 = generic_index_of(generics, base)
             null return if index < 0
             slot: usize = index.usize()
-            # Only ONE type parameter is modeled; more needs per-parameter inference.
-            null return if generics.param_count[slot] != 1
+            # The call must supply exactly one argument per type parameter.
+            null return if generics.param_count[slot] != type_args.count
 
             if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 if return_type_opt is return_type:
-                    # Bind T for the duration of resolving this signature.
-                    structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
-                    structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
+                    # Bind every K/T for the duration of resolving this signature.
+                    bound: usize = push_type_bindings(generics, structs, slot, type_args)
 
                     return_value_type: ValueType = annotation_value_type(return_type, structs)
                     llvm_params: mutable darray[LLVMTypeRef] = []
@@ -1565,12 +1604,11 @@ module Backend:
                         else:
                             llvm_params.push(llvm_type_of(parameter_type, structs, ctx))
 
-                    _ = structs.binding_names.pop()
-                    _ = structs.binding_types.pop()
+                    pop_type_bindings(structs, bound)
                     null return if declined or return_value_type.kind == TypeKind.Unmodeled
 
                     name_storage: mutable darray[u8] = []
-                    mangled: cstr = mangled_name_into(base, type_argument, name_storage)
+                    mangled: cstr = mangled_name_multi_into(base, type_args, structs, name_storage)
                     llvm_return: LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
                     fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
                     if params.count != 0:
@@ -1578,36 +1616,38 @@ module Backend:
                         fn_type <- LLVMFunctionType(llvm_return, params_pointer, params.count.u32(), 0)
                     handle: LLVMValueRef = LLVMAddFunction(m, mangled, fn_type)
 
+                    inst_arg_start: usize = generics.inst_args.count
+                    for argument in type_args |generics|:
+                        generics.inst_args <- generics.inst_args.push(copied_type(argument))
                     generics.inst_bases <- generics.inst_bases.push(base)
-                    generics.inst_types <- generics.inst_types.push(copied_type(type_argument))
+                    generics.inst_arg_start <- generics.inst_arg_start.push(inst_arg_start)
+                    generics.inst_arg_count <- generics.inst_arg_count.push(type_args.count)
                     generics.inst_handles <- generics.inst_handles.push(handle)
+                    pending_arg_start: usize = generics.pending_args.count
+                    for argument in type_args |generics|:
+                        generics.pending_args <- generics.pending_args.push(copied_type(argument))
                     generics.pending_bases <- generics.pending_bases.push(base)
-                    generics.pending_types <- generics.pending_types.push(copied_type(type_argument))
+                    generics.pending_arg_start <- generics.pending_arg_start.push(pending_arg_start)
+                    generics.pending_arg_count <- generics.pending_arg_count.push(type_args.count)
                     generics.pending_handles <- generics.pending_handles.push(handle)
                     return handle
             return null
 
 
-        # The declared type of instantiation (base, type)'s parameter `position`, resolved
+        # The declared type of instantiation (base, args)'s parameter `position`, resolved
         # through the template's bindings.
-        def instantiation_param_type(base: sview, type_argument: ValueType, position: usize, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+        def instantiation_param_type(base: sview, type_args: darray[ValueType]&, position: usize, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
             index: i64 = generic_index_of(generics, base)
             unmodeled_type() return if index < 0
             slot: usize = index.usize()
             if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 unmodeled_type() return if position >= params.count
-                structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
-                structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
+                # POP is symmetric via pop_type_bindings — never `<- []`, which would rebind
+                # the caller's darray to callee-region memory AND wipe an outer instantiation's
+                # bindings (the historical nested-generic crash).
+                bound: usize = push_type_bindings(generics, structs, slot, type_args)
                 resolved: ValueType = annotation_value_type(params[position].type_expression, structs)
-                # POP — never `<- []`. Assigning a fresh `[]` here does NOT clear the
-                # caller's darray: it REBINDS the caller's field to a new empty darray
-                # allocated in THIS callee's auto region, which is freed on return, so every
-                # later access follows freed memory. It also wiped any OUTER instantiation's
-                # bindings. That was the nested-generic crash (SIGTRAP from a bounds check
-                # against a garbage count). The empty literal is allocated where you are
-                # STANDING, not where the field lives.
-                _ = structs.binding_names.pop()
-                _ = structs.binding_types.pop()
+                pop_type_bindings(structs, bound)
                 return resolved
             return unmodeled_type()
 
@@ -1619,16 +1659,16 @@ module Backend:
 
 
         # Emit a call to a generic function, instantiating on first use.
-        def emit_generic_call(base: sview, type_argument: ValueType, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            if instantiate_generic(base, type_argument, generics, structs, m, ctx) is target:
+        def emit_generic_call(base: sview, type_args: darray[ValueType]&, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instantiate_generic(base, type_args, generics, structs, m, ctx) is target:
                 argument_values: mutable darray[LLVMValueRef] = []
                 declined: mutable bool = false
                 argument_index: mutable usize = 0
-                for argument in arguments |argument_values, declined, argument_index, base, type_argument, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                for argument in arguments |argument_values, declined, argument_index, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
                     # Each argument is emitted at its PARAMETER's type, resolved through the
                     # instantiation's bindings — so a literal argument to `f[u8]` becomes a
                     # u8, not an i64.
-                    wanted: ValueType = instantiation_param_type(base, type_argument, argument_index, generics, structs)
+                    wanted: ValueType = instantiation_param_type(base, type_args, argument_index, generics, structs)
                     if emit_expression(argument, wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is emitted_argument:
                         argument_values.push(emitted_argument)
                     else:
@@ -1637,7 +1677,7 @@ module Backend:
                 null return if declined
                 fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
                 # A VOID call must be unnamed: "instructions returning void cannot have a name".
-                gresult_name: cstr = call_result_name(generic_return_type(base, type_argument, generics, structs))
+                gresult_name: cstr = call_result_name(generic_return_type(base, type_args, generics, structs))
                 LLVMBuildCall2(builder, fn_type, target, null, 0, gresult_name) return if arguments.count == 0
                 args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
                 return LLVMBuildCall2(builder, fn_type, target, args_pointer, arguments.count.u32(), gresult_name)
@@ -1656,18 +1696,34 @@ module Backend:
                     explicit_type: ValueType = annotation_value_type(generic_argument, structs)
                     null return if explicit_type.kind == TypeKind.Unmodeled
                     null return if generic_index_of(generics, explicit_name) < 0
-                    return emit_generic_call(explicit_name, explicit_type, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    explicit_args: mutable darray[ValueType] = [explicit_type]
+                    return emit_generic_call(explicit_name, explicit_args, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                return null
+            # `f[K, V](x)` — EXPLICIT multi-argument type application. The callee is an
+            # IndexN whose bracket holds the type arguments.
+            if callee is Expr.IndexN(multi_generic_callee, multi_generic_args, multi_generic_line):
+                if multi_generic_callee is Expr.Ident(multi_name, multi_name_line):
+                    null return if generic_index_of(generics, multi_name) < 0
+                    multi_type_args: mutable darray[ValueType] = []
+                    multi_declined: mutable bool = false
+                    for type_argument_expression in multi_generic_args |multi_type_args, multi_declined, structs|:
+                        resolved_type_argument: ValueType = annotation_value_type(type_argument_expression, structs)
+                        multi_declined <- true if resolved_type_argument.kind == TypeKind.Unmodeled
+                        multi_type_args.push(resolved_type_argument)
+                    null return if multi_declined
+                    return emit_generic_call(multi_name, multi_type_args, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 return null
             if callee is Expr.Ident(callee_name, callee_line):
                 # A GENERIC callee with an INFERRED type argument: `identity(42)`. The first
                 # argument's own type supplies it — enough for the single-type-parameter
-                # subset. A bare literal argument has no type of its own, so `identity(42)`
-                # with no other information declines rather than guessing i64.
+                # subset. A multi-parameter generic can't be inferred from one argument, so it
+                # declines here and requires an explicit `f[K, V](…)`.
                 if generic_index_of(generics, callee_name) >= 0:
                     null return if arguments.count == 0
                     inferred: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
                     null return if inferred.kind == TypeKind.Unmodeled
-                    return emit_generic_call(callee_name, inferred, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    inferred_args: mutable darray[ValueType] = [inferred]
+                    return emit_generic_call(callee_name, inferred_args, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 return emit_direct_call("", callee_name, callee, false, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             # `Node.Store(owner)` — build the AoS store: ask the runtime for its state, then
             # assemble `{arena, row_bytes, state}` with three insertvalues (stage0's shape).
@@ -3664,6 +3720,18 @@ module Backend:
                 storage.push(sview_at(text, index))
 
 
+        # A type argument's contribution to a monomorphized name. Only needs to be readable
+        # and reasonably distinct (the instantiation memo is the real key, and LLVM
+        # uniquifies a duplicate named-struct anyway).
+        def push_generic_arg_name(value_type: ValueType, structs: StructTable&, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if value_type.kind == TypeKind.Struct:
+                struct_name: sview = structs.names[value_type.bits.usize()]
+                for index in 0..<sview_len(struct_name) |storage, struct_name|:
+                    storage.push(sview_at(struct_name, index))
+                return
+            push_type_name(value_type, storage)
+
+
         # Build `identity` + i64 -> "identity__i64" into `storage`, NUL-terminated.
         #
         # The result is transient by design: LLVMAddFunction COPIES the name, so the buffer
@@ -3677,6 +3745,34 @@ module Backend:
             push_type_name(type_argument, storage)
             storage.push(0)
             return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        # `arena_dict_put` + [i64, i64] -> "arena_dict_put__i64__i64". One `__ARG` per type
+        # argument, so a two-parameter generic gets a distinct name per (K, T) tuple. Struct
+        # arguments contribute their registered name (push_generic_arg_name).
+        def mangled_name_multi_into(base: sview, type_args: darray[ValueType]&, structs: StructTable&, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<sview_len(base) |storage, base|:
+                storage.push(sview_at(base, index))
+            # UNROLLED rather than a loop: growing `storage` through a nested call INSIDE a
+            # loop is not a region-inferable pattern (the callee's growth site can't reach a
+            # loop-carried region), so each arg is appended on a straight-line path. Four
+            # covers every modeled generic (dict is two); a 5+-parameter generic would alias
+            # names, which only costs readability since the instantiation memo is the key.
+            append_mangled_arg(type_args, 0, structs, storage)
+            append_mangled_arg(type_args, 1, structs, storage)
+            append_mangled_arg(type_args, 2, structs, storage)
+            append_mangled_arg(type_args, 3, structs, storage)
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        # Append `__<argname>` for type_args[position] when it exists. A no-op past the end,
+        # so mangled_name_multi_into can call it a fixed number of times.
+        def append_mangled_arg(type_args: darray[ValueType]&, position: usize, structs: StructTable&, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            return if position >= type_args.count
+            storage.push(95)
+            storage.push(95)
+            push_generic_arg_name(type_args[position], structs, storage)
 
 
         # Pass 1: create the NAMED (empty) LLVM type for a struct declaration and record
@@ -3794,18 +3890,6 @@ module Backend:
                 structs.generic_struct_inst_index <- structs.generic_struct_inst_index.push(idx)
                 return ValueType{kind: TypeKind.Struct, bits: idx.u32()}
             return unmodeled_type()
-
-
-        # A type argument's contribution to a monomorphized struct's LLVM name. Only needs
-        # to be readable and reasonably distinct (the instantiation memo is the real key,
-        # and LLVM uniquifies a duplicate named-struct anyway).
-        def push_generic_arg_name(value_type: ValueType, structs: StructTable&, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
-            if value_type.kind == TypeKind.Struct:
-                struct_name: sview = structs.names[value_type.bits.usize()]
-                for index in 0..<sview_len(struct_name) |storage, struct_name|:
-                    storage.push(sview_at(struct_name, index))
-                return
-            push_type_name(value_type, storage)
 
 
         def register_struct_name(declaration: Decl, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
@@ -4373,20 +4457,24 @@ module Backend:
         # whole emission — so every `T` inside resolves to the concrete type.
         def emit_instantiation_body(index: usize, generics: mutable GenericTable&, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             base: sview = generics.pending_bases[index]
-            type_argument: ValueType = copied_type(generics.pending_types[index])
             handle: LLVMValueRef = generics.pending_handles[index]
             template_index: i64 = generic_index_of(generics, base)
             false return if template_index < 0
             slot: usize = template_index.usize()
 
-            structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
-            structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
+            # Rebuild this instantiation's type-argument tuple from the pending pool and bind
+            # every K/T for the body emission.
+            arg_start: usize = generics.pending_arg_start[index]
+            arg_count: usize = generics.pending_arg_count[index]
+            type_args: mutable darray[ValueType] = []
+            for offset in 0..<arg_count |type_args, generics, arg_start|:
+                type_args.push(copied_type(generics.pending_args[arg_start + offset]))
+            bound: usize = push_type_bindings(generics, structs, slot, type_args)
             # A generic template is never error-returning in the modeled subset (dict/set
             # generics, which are, are blocked on catch), so no error lines apply here.
             no_error_lines: darray[u32] = []
             emitted: bool = emit_function_body(generics.decls[slot], handle, no_error_lines, fns, structs, generics, runtime, m, ctx, builder)
-            _ = structs.binding_names.pop()
-            _ = structs.binding_types.pop()
+            pop_type_bindings(structs, bound)
             return emitted
 
 
