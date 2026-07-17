@@ -35,6 +35,20 @@ module Backend:
             return (&storage[0]).cast[cstr] can Unsafe.PointerCast
 
 
+        # The LLVM SYMBOL name for `owner::name`: stage0 emits `module M: def get()` as
+        # `define i64 @M.get` — DOT-separated, even though the call spelling is `M::get()`.
+        # An empty owner is a top-level function and keeps its bare name.
+        def qualified_name_cstr(owner: sview, name: sview, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            sview_to_cstr(name, storage) return if sview_len(owner) == 0
+            for index in 0..<sview_len(owner) |storage|:
+                storage.push(sview_at(owner, index))
+            storage.push(46)
+            for index in 0..<sview_len(name) |storage|:
+                storage.push(sview_at(name, index))
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
         # A modeled value's type. `bits` is the integer width; `Bool` is i1 (LLVM's
         # natural boolean) and carries no width of its own.
         #
@@ -570,6 +584,12 @@ module Backend:
         # already know every function we declared, so this is also just less work.
         struct FnTable:
             names: mutable darray[sview]
+            # The enclosing MODULE's name, or "" for a top-level function. Functions are
+            # keyed on the (owner, name) PAIR rather than on a mangled "M.get" string:
+            # `names` are sviews into the SOURCE buffer, and a synthesized name has no
+            # source text to point at — an sview into a growing darray would dangle. The
+            # mangled form is built only as a temporary cstr for the LLVM symbol.
+            owners: mutable darray[sview]
             handles: mutable darray[LLVMValueRef]
             returns: mutable darray[ValueType]
             # Parameter types as a FLAT pool plus a per-function span (`param_start[i]`,
@@ -606,10 +626,10 @@ module Backend:
             Terminated
 
 
-        # The handle for `name`, or null when the module has no such function.
-        def lookup_function(fns: FnTable&, name: sview) -> LLVMValueRef? can[Abort.Panic]:
-            for index in 0..<fns.names.count |fns, name|:
-                fns.handles[index] return if fns.names[index] == name
+        # The handle for `owner::name`, or null when there is no such function.
+        def lookup_function(fns: FnTable&, owner: sview, name: sview) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.handles[index] return if fns.names[index] == name and fns.owners[index] == owner
             return null
 
 
@@ -647,9 +667,9 @@ module Backend:
         # The declared type of function `name`'s parameter `position`, or Unmodeled.
         # Emitting each argument at its parameter's type is what makes a literal argument
         # adopt the parameter type instead of defaulting to i64.
-        def param_type_of(fns: FnTable&, name: sview, position: usize) -> ValueType can[Abort.Panic]:
-            for index in 0..<fns.names.count |fns, name, position|:
-                if fns.names[index] == name:
+        def param_type_of(fns: FnTable&, owner: sview, name: sview, position: usize) -> ValueType can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, position|:
+                if fns.names[index] == name and fns.owners[index] == owner:
                     unmodeled_type() return if position >= fns.param_count[index]
                     return copied_type(fns.param_types[fns.param_start[index] + position])
             return unmodeled_type()
@@ -657,9 +677,9 @@ module Backend:
 
         # The declared return type of `name`, or Unmodeled when the module has no such
         # function.
-        def lookup_return_type(fns: FnTable&, name: sview) -> ValueType can[Abort.Panic]:
-            for index in 0..<fns.names.count |fns, name|:
-                copied_type(fns.returns[index]) return if fns.names[index] == name
+        def lookup_return_type(fns: FnTable&, owner: sview, name: sview) -> ValueType can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                copied_type(fns.returns[index]) return if fns.names[index] == name and fns.owners[index] == owner
             return unmodeled_type()
 
 
@@ -736,7 +756,7 @@ module Backend:
                     # type-directed check downstream silently stops applying.
                     cast_type: ValueType = scalar_type_of_name(cast_name)
                     cast_type return if cast_type.kind != TypeKind.Unmodeled
-                    return lookup_return_type(fns, cast_name)
+                    return lookup_return_type(fns, "", cast_name)
                 # `f[i64](x)` — an explicit generic call. Its type is the template's return
                 # annotation resolved under that binding, which for `-> T` is the type
                 # argument itself.
@@ -754,7 +774,11 @@ module Backend:
                         inferred: ValueType = expression_type(call_arguments[0], local_scope, fns, structs, generics)
                         unmodeled_type() return if inferred.kind == TypeKind.Unmodeled
                         return generic_return_type(callee_name, inferred, generics, structs)
-                    return lookup_return_type(fns, callee_name)
+                    return lookup_return_type(fns, "", callee_name)
+                # A module-qualified call's type is the qualified function's return type.
+                if call_callee is Expr.Scope(scope_head, scope_name, scope_line):
+                    if scope_head is Expr.Ident(module_name, module_name_line):
+                        return lookup_return_type(fns, module_name, scope_name)
             return unmodeled_type()
 
 
@@ -1138,7 +1162,7 @@ module Backend:
                     inferred: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
                     null return if inferred.kind == TypeKind.Unmodeled
                     return emit_generic_call(callee_name, inferred, arguments, local_scope, fns, structs, generics, m, ctx, builder)
-                return emit_direct_call(callee_name, callee, false, arguments, local_scope, fns, structs, generics, m, ctx, builder)
+                return emit_direct_call("", callee_name, callee, false, arguments, local_scope, fns, structs, generics, m, ctx, builder)
             # UFCS: `p.get(a)` IS `get(p, a)`. A postfix call unifies casts and UFCS —
             # `recv.Name()` where Name is a TYPE name is a conversion (handled on the cast
             # path), and where Name is a FUNCTION it is an ordinary call with the receiver
@@ -1147,9 +1171,17 @@ module Backend:
             if callee is Expr.Field(receiver, method_name, method_line):
                 method_as_type: ValueType = scalar_type_of_name(method_name)
                 null return if method_as_type.kind != TypeKind.Unmodeled
-                ufcs_target_opt: LLVMValueRef? = lookup_function(fns, method_name)
+                ufcs_target_opt: LLVMValueRef? = lookup_function(fns, "", method_name)
                 if ufcs_target_opt is ufcs_target:
-                    return emit_direct_call(method_name, receiver, true, arguments, local_scope, fns, structs, generics, m, ctx, builder)
+                    return emit_direct_call("", method_name, receiver, true, arguments, local_scope, fns, structs, generics, m, ctx, builder)
+                return null
+            # `M::get(a)` — a MODULE-qualified call. `::` parses to Expr.Scope, a node kind
+            # distinct from Expr.Field, so a qualified call is never confused with UFCS.
+            # Only a single level is modeled: `A::B::get` nests Scope inside Scope, whose
+            # head is not an Ident, so it declines rather than mangling a wrong symbol.
+            if callee is Expr.Scope(scope_head, scope_name, scope_line):
+                if scope_head is Expr.Ident(module_name, module_name_line):
+                    return emit_direct_call(module_name, scope_name, callee, false, arguments, local_scope, fns, structs, generics, m, ctx, builder)
                 return null
             return null
 
@@ -1161,8 +1193,8 @@ module Backend:
         # built in this function). Threading the receiver is the only spelling that
         # compiles, not a style preference. `receiver` is ignored when `has_receiver` is
         # false; callers pass the callee node itself rather than synthesize a dummy.
-        def emit_direct_call(callee_name: sview, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            target_opt: LLVMValueRef? = lookup_function(fns, callee_name)
+        def emit_direct_call(callee_owner: sview, callee_name: sview, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            target_opt: LLVMValueRef? = lookup_function(fns, callee_owner, callee_name)
             if target_opt is target:
                 total_arguments: usize = arguments.count + 1 if has_receiver else arguments.count
                 null return if LLVMCountParams(target).i64() != total_arguments.i64()
@@ -1171,7 +1203,7 @@ module Backend:
                 declined: mutable bool = false
                 argument_index: mutable usize = 0
                 if has_receiver:
-                    receiver_value: LLVMValueRef? = emit_expression(receiver, param_type_of(fns, callee_name, 0), local_scope, fns, structs, generics, m, ctx, builder)
+                    receiver_value: LLVMValueRef? = emit_expression(receiver, param_type_of(fns, callee_owner, callee_name, 0), local_scope, fns, structs, generics, m, ctx, builder)
                     if receiver_value is emitted_receiver:
                         argument_values.push(emitted_receiver)
                     else:
@@ -1180,7 +1212,7 @@ module Backend:
                 for argument in arguments |argument_values, declined, argument_index, target, local_scope, fns, structs, generics, m, ctx, builder|:
                     # Each argument is emitted at its PARAMETER's declared type, so a
                     # literal argument adopts the parameter type rather than i64.
-                    argument_value: LLVMValueRef? = emit_expression(argument, param_type_of(fns, callee_name, argument_index), local_scope, fns, structs, generics, m, ctx, builder)
+                    argument_value: LLVMValueRef? = emit_expression(argument, param_type_of(fns, callee_owner, callee_name, argument_index), local_scope, fns, structs, generics, m, ctx, builder)
                     if argument_value is emitted_argument:
                         argument_values.push(emitted_argument)
                     else:
@@ -1193,7 +1225,7 @@ module Backend:
                 # the value itself.
                 fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
                 # A VOID call must be unnamed: "instructions returning void cannot have a name".
-                result_name: cstr = call_result_name(lookup_return_type(fns, callee_name))
+                result_name: cstr = call_result_name(lookup_return_type(fns, callee_owner, callee_name))
                 LLVMBuildCall2(builder, fn_type, target, null, 0, result_name) return if total_arguments == 0
                 args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
                 return LLVMBuildCall2(builder, fn_type, target, args_pointer, total_arguments.u32(), result_name)
@@ -2137,10 +2169,10 @@ module Backend:
             return ""
 
 
-        # The index of function `name` in the table, or -1.
-        def function_index_of(fns: FnTable&, name: sview) -> i64 can[Abort.Panic]:
-            for index in 0..<fns.names.count |fns, name|:
-                index.i64() return if fns.names[index] == name
+        # The index of function `owner::name` in the table, or -1.
+        def function_index_of(fns: FnTable&, owner: sview, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                index.i64() return if fns.names[index] == name and fns.owners[index] == owner
             return -1
 
 
@@ -2382,7 +2414,7 @@ module Backend:
         # types in `fns`. Null when the signature is outside the modeled subset.
         #
         # Signature types are REAL now: any modeled scalar width/signedness, not just i64.
-        def declare_function(declaration: Decl, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_function(declaration: Decl, owner: sview, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 if return_type_opt is return_type:
                     return_value_type: ValueType = annotation_value_type(return_type, structs)
@@ -2401,7 +2433,7 @@ module Backend:
                     null return if declined
 
                     name_storage: mutable darray[u8] = []
-                    fn_name: cstr = sview_to_cstr(function_name, name_storage)
+                    fn_name: cstr = qualified_name_cstr(owner, function_name, name_storage)
                     llvm_return: LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
                     fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
                     if params.count != 0:
@@ -2410,6 +2442,7 @@ module Backend:
                     handle: LLVMValueRef = LLVMAddFunction(m, fn_name, fn_type)
 
                     fns.names <- fns.names.push(function_name)
+                    fns.owners <- fns.owners.push(owner)
                     fns.handles <- fns.handles.push(handle)
                     fns.returns <- fns.returns.push(return_value_type)
                     fns.param_start <- fns.param_start.push(fns.param_types.count)
@@ -2520,7 +2553,7 @@ module Backend:
             # Templates must be known before any body is emitted: a call decides between
             # "ordinary function" and "instantiate a generic" by looking here.
             register_generics(file, generics)
-            fns: mutable FnTable = FnTable{names: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
+            fns: mutable FnTable = FnTable{names: [], owners: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
             # THREE passes. Structs first: a function signature can name a struct, and a
@@ -2550,21 +2583,44 @@ module Backend:
             # The body pass looks its handle up by NAME — `fns` is no longer index-parallel
             # with `top_decls` now that non-function declarations exist.
             for declaration in file.top_decls |fns, declined, structs, generics, m, ctx|:
+                # A MODULE's functions are declared under the module's name as their owner
+                # (stage0 emits `module M: def get()` as `@M.get`). Without this a module's
+                # functions were never declared at all and every qualified call declined.
+                if declaration is Decl.Module(module_name, module_body, module_line):
+                    for nested in module_body |fns, declined, structs, generics, m, ctx, module_name|:
+                        continue if function_name_of(nested) == ""
+                        continue if generic_index_of(generics, function_name_of(nested)) >= 0
+                        if not (declare_function(nested, module_name, fns, structs, generics, m, ctx) is declared_nested_fn):
+                            declined <- true
+                    continue
                 continue if function_name_of(declaration) == ""
                 # A generic TEMPLATE has no code of its own — only its instantiations do —
                 # so it is skipped here, not declined.
                 continue if generic_index_of(generics, function_name_of(declaration)) >= 0
                 # declare_function records the signature's types into `fns` itself.
-                if not (declare_function(declaration, fns, structs, generics, m, ctx) is declared_fn):
+                if not (declare_function(declaration, "", fns, structs, generics, m, ctx) is declared_fn):
                     declined <- true
             -1 return if declined
 
             emitted_count: mutable i64 = 0
             for declaration in file.top_decls |emitted_count, declined, fns, structs, m, ctx, builder|:
+                if declaration is Decl.Module(module_name, module_body, module_line):
+                    for nested in module_body |emitted_count, declined, fns, structs, m, ctx, builder, module_name|:
+                        nested_name: sview = function_name_of(nested)
+                        continue if nested_name == ""
+                        continue if generic_index_of(generics, nested_name) >= 0
+                        nested_index: i64 = function_index_of(fns, module_name, nested_name)
+                        if nested_index < 0:
+                            declined <- true
+                            continue
+                        nested_emitted: bool = emit_function_body(nested, fns.handles[nested_index.usize()], fns, structs, generics, runtime, m, ctx, builder)
+                        emitted_count <- emitted_count + 1 if nested_emitted else emitted_count
+                        declined <- true if not nested_emitted else declined
+                    continue
                 declaration_name: sview = function_name_of(declaration)
                 continue if declaration_name == ""
                 continue if generic_index_of(generics, declaration_name) >= 0
-                handle_index: i64 = function_index_of(fns, declaration_name)
+                handle_index: i64 = function_index_of(fns, "", declaration_name)
                 if handle_index < 0:
                     declined <- true
                     continue

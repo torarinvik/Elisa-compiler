@@ -410,7 +410,7 @@ same gap — check it when fixing.
 Only the single-error-set, non-generic case is needed to start; `collections.elisa` uses
 `error[RuntimeError]` throughout.
 
-## Modules — ABI mapped, not yet implemented
+## Modules — LANDED
 
 Read from stage0's `-emit llvm`, not guessed:
 
@@ -442,5 +442,12 @@ argument, `""` at existing call sites. `emit_module`'s four passes must also wal
 "" for a module today, so a module's functions are silently never emitted — which is why a
 qualified call declines).
 
-Nested modules (`A::B::get`) are NOT covered by a single owner column; either flatten the
-owner to a dotted path or decline them.
+Nested modules (`A::B::get`) are NOT covered by a single owner column: they nest Scope
+inside Scope, whose head is not an Ident, so they DECLINE rather than mangle a wrong symbol.
+Flattening the owner to a dotted path would lift that, but a dotted owner has no source text
+to point an sview at — the same constraint as above.
+
+Implemented as described. One footgun found while probing: stage1's parser treats `get` as
+an UNGATED contextual keyword (parser_expr.elisa ~114), so `def get()` cannot be called even
+though stage0 compiles it — every other contextual keyword there (`do`, `when`, `machine`)
+is gated on lookahead. Filed separately; avoid `get` in fixtures until fixed.

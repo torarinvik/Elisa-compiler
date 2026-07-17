@@ -400,6 +400,19 @@ diff_case const_shadowed_by_local 'const V: i64 = 1\n\ndef main() -> i64:\n    V
 diff_case const_in_arithmetic 'const A: i64 = 40\nconst B: i64 = 2\n\ndef main() -> i64:\n    return A + B\n'
 # `const A: mutable i64 = 42` is accepted by stage0, so `is_mutable` must not decline.
 diff_case const_mutable_global 'const A: mutable i64 = 42\n\ndef main() -> i64:\n    return A\n'
+# MODULES. stage0 emits `module M: def fetch()` as `define i64 @M.fetch` — DOT-mangled,
+# though the call spelling is `M::fetch()` (`::` parses to Expr.Scope, a node kind distinct
+# from Expr.Field, so a qualified call is never confused with UFCS).
+diff_case module_call 'module M:\n    def fetch() -> i64:\n        return 42\n\ndef main() -> i64:\n    return M::fetch()\n'
+diff_case module_args 'module M:\n    def add(a: i64, b: i64) -> i64:\n        return a + b\n\ndef main() -> i64:\n    return M::add(40, 2)\n'
+# A module function and a top-level function may share a NAME — they are keyed on the
+# (owner, name) pair, so `M::pick` and `pick` are different functions.
+diff_case module_name_collision 'module M:\n    def pick() -> i64:\n        return 40\n\ndef pick() -> i64:\n    return 2\n\ndef main() -> i64:\n    return M::pick() + pick()\n'
+diff_case module_two_modules 'module A:\n    def val() -> i64:\n        return 40\n\nmodule B:\n    def val() -> i64:\n        return 2\n\ndef main() -> i64:\n    return A::val() + B::val()\n'
+# A module function calling another function in the SAME module still spells the call
+# qualified, so the owner must resolve from inside a module body too.
+diff_case module_internal_call 'module M:\n    def base() -> i64:\n        return 40\n\n    def total() -> i64:\n        return M::base() + 2\n\ndef main() -> i64:\n    return M::total()\n'
+diff_case module_u8_param 'module M:\n    def widen(b: u8) -> i64:\n        return b.i64()\n\ndef main() -> i64:\n    v: u8 = 200\n    return M::widen(v) - 158\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -460,6 +473,10 @@ decline_case type_alias_forward 'type A = B\ntype B = i64\n\ndef main() -> A:\n 
 # expression at each use: substitution would recurse forever here.
 decline_case const_cycle 'const A: i64 = B\nconst B: i64 = A\n\ndef main() -> i64:\n    return A\n'
 decline_case const_from_call 'def f() -> i64:\n    return 42\n\nconst A: i64 = f()\n\ndef main() -> i64:\n    return A\n'
+# A NESTED module (`A::B::get`) nests Scope inside Scope, whose head is not an Ident. One
+# owner column cannot express a dotted path, so it declines rather than mangling a wrong
+# symbol and silently calling the wrong function.
+decline_case nested_module 'module A:\n    module B:\n        def fetch() -> i64:\n            return 42\n\ndef main() -> i64:\n    return A::B::fetch()\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
