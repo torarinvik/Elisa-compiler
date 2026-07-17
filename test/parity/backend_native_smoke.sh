@@ -169,6 +169,22 @@ run_case struct_field_order 'struct S:\n    first: i64\n    second: i64\n\ndef m
 run_case struct_forward   'def main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return p.x + p.y\n\nstruct Point:\n    x: i64\n    y: i64\n'  42
 run_case struct_in_cond   'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 10, y: 20}\n    return 42 if p.y > p.x else 7\n'  42
 
+# AGGREGATE ABI: structs as parameters and return values.
+#
+# No explicit sret/byval lowering is needed. Both stage0 and stage1 hand LLVM the struct
+# TYPE by value in the signature and let LLVM's own target lowering apply the platform ABI
+# (small structs in registers on arm64, larger ones indirect). Since both go through the
+# same lowering, they agree by construction — which the differentials below confirm rather
+# than assume.
+run_case struct_param     'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'  42
+run_case struct_return    'struct Point:\n    x: i64\n    y: i64\n\ndef make(a: i64, b: i64) -> Point:\n    return Point{x: a, y: b}\n\ndef main() -> i64:\n    p: Point = make(40, 2)\n    return p.x + p.y\n'  42
+run_case struct_roundtrip 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef make(a: i64, b: i64) -> Point:\n    return Point{x: a, y: b}\n\ndef main() -> i64:\n    return total(make(40, 2))\n'  42
+# 40 bytes: past the register-passing threshold, so this is the indirect/sret path.
+run_case struct_large_abi 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n    e: i64\n\ndef sum(g: Big) -> i64:\n    return g.a + g.b + g.c + g.d + g.e\n\ndef main() -> i64:\n    g: Big = Big{a: 10, b: 10, c: 10, d: 10, e: 2}\n    return sum(g)\n'  42
+# A mixed int/float layout is the case a hand-rolled ABI most easily gets wrong.
+run_case struct_mixed_abi 'struct M:\n    a: u8\n    b: f64\n\ndef total(m: M) -> i64:\n    return m.a.i64() + m.b.i64()\n\ndef main() -> i64:\n    return total(M{a: 40, b: 2.5})\n'  42
+run_case struct_two_args  'struct P:\n    x: i64\n    y: i64\n\ndef add(a: P, b: P) -> P:\n    return P{x: a.x + b.x, y: a.y + b.y}\n\ndef main() -> i64:\n    r: P = add(P{x: 30, y: 1}, P{x: 10, y: 1})\n    return r.x + r.y\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -186,11 +202,16 @@ diff_case() {
     clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
     RUN "$BUILD/diff_${name}_s1"; local got1=$?
 
+    # The stage0 reference is built with -emit c-archive, NOT -emit obj: a program that
+    # touches the runtime (any struct construction does) leaves `arena_free` undefined in
+    # a bare object, and the link fails. That failure used to hit the SKIP path below, so
+    # struct cases were silently NEVER compared. A skip that hides a missing comparison is
+    # worse than no test.
     printf '%b' "$src" > "$BUILD/diff_$name.elisa"
-    if ! "$ELISACORE_BIN" -emit obj -o "$BUILD/diff_${name}_s0.o" "$BUILD/diff_$name.elisa" 2>/dev/null; then
-        echo "  SKIP diff_$name: stage0 could not compile the reference"; total=$((total - 1)); return
+    if ! "$ELISACORE_BIN" -emit c-archive -o "$BUILD/diff_${name}_s0.a" "$BUILD/diff_$name.elisa" 2>/dev/null; then
+        echo "  SKIP diff_$name: stage0 rejects this program (not a backend divergence)"; total=$((total - 1)); return
     fi
-    clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.o" 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
+    clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.a" 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
     RUN "$BUILD/diff_${name}_s0"; local got0=$?
 
     if [ "$got1" -eq 124 ] || [ "$got0" -eq 124 ]; then
@@ -221,6 +242,10 @@ diff_case bitnot      'def main() -> i64:\n    a: i64 = 5\n    return ~a + 200\n
 diff_case and_or_not  'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'
 diff_case compound    'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'
 diff_case short_circuit 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'
+diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
+diff_case struct_large 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n    e: i64\n\ndef sum(g: Big) -> i64:\n    return g.a + g.b + g.c + g.d + g.e\n\ndef main() -> i64:\n    g: Big = Big{a: 10, b: 10, c: 10, d: 10, e: 2}\n    return sum(g)\n'
+diff_case struct_mixed_abi 'struct M:\n    a: u8\n    b: f64\n\ndef total(m: M) -> i64:\n    return m.a.i64() + m.b.i64()\n\ndef main() -> i64:\n    return total(M{a: 40, b: 2.5})\n'
+diff_case struct_two_args 'struct P:\n    x: i64\n    y: i64\n\ndef add(a: P, b: P) -> P:\n    return P{x: a.x + b.x, y: a.y + b.y}\n\ndef main() -> i64:\n    r: P = add(P{x: 30, y: 1}, P{x: 10, y: 1})\n    return r.x + r.y\n'
 diff_case struct_basic 'struct Point:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return p.x + p.y\n'
 diff_case struct_mixed 'struct Rec:\n    a: u8\n    b: i64\n    c: f64\n\ndef main() -> i64:\n    r: Rec = Rec{a: 200, b: 5, c: 2.5}\n    return r.a.i64() + r.b + r.c.i64() - 165\n'
 diff_case struct_order 'struct S:\n    first: i64\n    second: i64\n\ndef main() -> i64:\n    s: S = S{second: 2, first: 40}\n    return s.first + s.second\n'
