@@ -200,6 +200,20 @@ run_case struct_large_abi 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    
 run_case struct_mixed_abi 'struct M:\n    a: u8\n    b: f64\n\ndef total(m: M) -> i64:\n    return m.a.i64() + m.b.i64()\n\ndef main() -> i64:\n    return total(M{a: 40, b: 2.5})\n'  42
 run_case struct_two_args  'struct P:\n    x: i64\n    y: i64\n\ndef add(a: P, b: P) -> P:\n    return P{x: a.x + b.x, y: a.y + b.y}\n\ndef main() -> i64:\n    r: P = add(P{x: 30, y: 1}, P{x: 10, y: 1})\n    return r.x + r.y\n'  42
 
+# GENERIC STRUCTS: `struct Box[T]` monomorphized per type argument (dict prerequisite —
+# `dict[K,V]` is the runtime `DynDict[K,V]` template). Construction + field read verify by
+# value, so a backend that dropped the type argument could not produce these exits.
+run_case generic_struct_basic  'struct Box[T]:\n    value: mutable T\n\ndef main() -> i64:\n    b: mutable Box[i64] = Box[i64]{value: 42}\n    return b.value\n'  42
+# Two type parameters, mixed widths: the layout must bind K and T independently.
+run_case generic_struct_pair   'struct Pair[K, T]:\n    a: mutable K\n    b: mutable T\n\ndef main() -> i64:\n    p: mutable Pair[i64, i32] = Pair[i64, i32]{a: 40, b: 2}\n    return p.a + p.b.i64()\n'  42
+# By-value generic-struct parameter: the instantiation must resolve in a signature too.
+run_case generic_struct_param  'struct Box[T]:\n    value: mutable T\n\ndef unwrap(b: Box[i64]) -> i64:\n    return b.value\n\ndef main() -> i64:\n    return unwrap(Box[i64]{value: 42})\n'  42
+# Nested generic struct: `Outer[i64]` contains an `Inner[i64]`, each materialized once.
+run_case generic_struct_nested 'struct Inner[T]:\n    v: mutable T\n\nstruct Outer[T]:\n    inner: mutable Inner[T]\n\ndef main() -> i64:\n    o: mutable Outer[i64] = Outer[i64]{inner: Inner[i64]{v: 42}}\n    return o.inner.v\n'  42
+# One instantiation reused across two locals: emitted ONCE (a duplicate type would still
+# link, but the memo is what keeps `Box[i64]` a single type).
+run_case generic_struct_reuse  'struct Box[T]:\n    value: mutable T\n\ndef main() -> i64:\n    a: mutable Box[i64] = Box[i64]{value: 40}\n    b: mutable Box[i64] = Box[i64]{value: 2}\n    return a.value + b.value\n'  42
+
 # FIXED ARRAYS: `T[N]` types, literals, index read/write.
 run_case array_literal    'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'  42
 run_case array_assign     'def main() -> i64:\n    xs: mutable i64[3] = [1, 1, 1]\n    xs[0] <- 40\n    xs[1] <- 2\n    xs[2] <- 0\n    return xs[0] + xs[1] + xs[2]\n'  42

@@ -157,7 +157,13 @@ module Backend:
         # What `name` is bound to in the CURRENT instantiation, or Unmodeled if it is not a
         # type parameter (i.e. it is an ordinary type name).
         def bound_type_of(structs: mutable StructTable&, name: sview) -> ValueType can[Abort.Panic]:
-            for index in 0..<structs.binding_names.count |structs, name|:
+            # Scan most-recent-first so an inner instantiation's binding shadows an outer
+            # one that reuses the same parameter name (`DictBucket[K, T]` nested inside
+            # `DynDict[K, T]`). For a single instantiation there are no duplicates, so this
+            # is identical to a forward scan.
+            count: usize = structs.binding_names.count
+            for offset in 0..<count |structs, name, count|:
+                index: usize = count - 1 - offset
                 copied_type(structs.binding_types[index]) return if structs.binding_names[index] == name
             return unmodeled_type()
 
@@ -228,6 +234,27 @@ module Backend:
                     unmodeled_type() return if element.kind == TypeKind.Unmodeled
                     unmodeled_type() return if extent_value <= 0
                     return intern_array_type(element, extent_value.u32(), structs)
+                # `Box[i64]` — a single-argument generic struct application.
+                if array_head is Expr.Ident(generic_base, generic_base_line):
+                    if generic_struct_index_of(structs, generic_base) >= 0:
+                        single_argument: ValueType = annotation_value_type(array_extent, structs)
+                        single_argument_list: mutable darray[ValueType] = [single_argument]
+                        return instantiate_generic_struct(generic_base, single_argument_list, structs)
+                return unmodeled_type()
+            # `dict[K, V]` / `Pair[K, V]` — a multi-argument generic type application. The
+            # `dict` spelling denotes the runtime's `DynDict[K, V]` struct.
+            if type_expression is Expr.IndexN(application_head, application_args, application_line):
+                if application_head is Expr.Ident(application_name, application_name_line):
+                    resolved_base: sview = "DynDict" if application_name == "dict" else application_name
+                    if generic_struct_index_of(structs, resolved_base) >= 0:
+                        argument_types: mutable darray[ValueType] = []
+                        application_declined: mutable bool = false
+                        for argument_expression in application_args |argument_types, application_declined, structs|:
+                            argument_type: ValueType = annotation_value_type(argument_expression, structs)
+                            application_declined <- true if argument_type.kind == TypeKind.Unmodeled
+                            argument_types.push(argument_type)
+                        unmodeled_type() return if application_declined
+                        return instantiate_generic_struct(resolved_base, argument_types, structs)
                 return unmodeled_type()
             if type_expression is Expr.Ident(type_name, type_line):
                 # A TYPE PARAMETER shadows everything: inside an instantiation of
@@ -315,6 +342,35 @@ module Backend:
             field_types: mutable darray[ValueType]
             field_start: mutable darray[usize]
             field_count: mutable darray[usize]
+            # GENERIC struct templates. A `struct Box[T]:` is NOT a concrete type — it is
+            # a template materialized per type-argument tuple into an ordinary registered
+            # struct named `Box__i64` (the concrete name doubles as the instantiation memo:
+            # struct_index_of finding it means it is already built). The template stores its
+            # own Decl so its member types can be re-resolved with the type parameters bound.
+            # Param names live in a FLAT pool with a per-template span, like struct fields.
+            generic_struct_names: mutable darray[sview]
+            generic_struct_decls: mutable darray[Decl]
+            generic_struct_param_names: mutable darray[sview]
+            generic_struct_param_start: mutable darray[usize]
+            generic_struct_param_count: mutable darray[usize]
+            # Instantiation memo, keyed by (base, type-argument tuple) — NOT by a mangled
+            # name, so no synthetic name sview has to outlive the call that builds it. Args
+            # are flattened into a pool with a per-instantiation span; `inst_index` is the
+            # resulting entry's slot in `names`/`handles`.
+            generic_struct_inst_bases: mutable darray[sview]
+            generic_struct_inst_args: mutable darray[ValueType]
+            generic_struct_inst_arg_start: mutable darray[usize]
+            generic_struct_inst_arg_count: mutable darray[usize]
+            generic_struct_inst_index: mutable darray[usize]
+            # Base names currently mid-instantiation. A self-recursive generic struct that
+            # recurses BY VALUE (infinite size) is declined rather than looped on; the valid
+            # by-pointer case (`Node[T]: next: Node[T]&?`) is not modeled yet and also
+            # declines here, conservatively.
+            generic_struct_inprogress: mutable darray[sview]
+            # The module's LLVM context, stashed so annotation_value_type — which has no ctx
+            # parameter — can LAZILY materialize a `Base[args]` instantiation (create its
+            # named struct and set its body) the first time an annotation names it.
+            context: LLVMContextRef
             # Fixed-array types, interned on demand: `array_elements[i]` is the element
             # type and `array_extents[i]` the length of the array whose ValueType has
             # `bits == i`. Interning (rather than a fresh entry per mention) keeps
@@ -3625,8 +3681,137 @@ module Backend:
 
         # Pass 1: create the NAMED (empty) LLVM type for a struct declaration and record
         # its name. Bodies are set separately so declaration order never matters.
+        # Index of a registered generic struct TEMPLATE by base name (-1 = none).
+        def generic_struct_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<structs.generic_struct_names.count |structs, name|:
+                index.i64() return if structs.generic_struct_names[index] == name
+            return -1
+
+
+        # Register every generic struct declaration (`struct Box[T]:`) as a TEMPLATE. A
+        # template is not a concrete LLVM type; it is materialized per type-argument tuple
+        # by instantiate_generic_struct. Type-parameter names come from the line-keyed
+        # generic side table the parser fills (the same one function generics use), so a
+        # struct is generic exactly when it has at least one non-bound row on its line.
+        def register_generic_structs(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration in file.top_decls |structs, file|:
+                if declaration is Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                    start: usize = structs.generic_struct_param_names.count
+                    for row in 0..<file.generic_param_lines.count |structs, file, struct_line|:
+                        # High-bit rows are constraint metadata, not fresh params.
+                        continue if file.generic_param_lines[row] >= 2147483648
+                        continue if file.generic_param_lines[row] != struct_line
+                        structs.generic_struct_param_names <- structs.generic_struct_param_names.push(file.generic_param_names[row])
+                    param_count: usize = structs.generic_struct_param_names.count - start
+                    if param_count > 0:
+                        structs.generic_struct_names <- structs.generic_struct_names.push(struct_name)
+                        structs.generic_struct_decls <- structs.generic_struct_decls.push(declaration)
+                        structs.generic_struct_param_start <- structs.generic_struct_param_start.push(start)
+                        structs.generic_struct_param_count <- structs.generic_struct_param_count.push(param_count)
+
+
+        # Materialize `Base[type_args]` into a concrete registered struct and return its
+        # Struct ValueType. Memoized by (base, args) so a second mention is a lookup and a
+        # recursive/self mention terminates. Declines (Unmodeled) if the base is not a
+        # template, the arity is wrong, any argument or field type is unmodeled, or the
+        # template recurses by value.
+        def instantiate_generic_struct(base: sview, type_args: darray[ValueType]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # Memo: an already-built (base, args) tuple resolves straight to its entry.
+            for inst in 0..<structs.generic_struct_inst_bases.count |structs, base, type_args|:
+                continue if structs.generic_struct_inst_bases[inst] != base
+                continue if structs.generic_struct_inst_arg_count[inst] != type_args.count
+                astart: usize = structs.generic_struct_inst_arg_start[inst]
+                matched: mutable bool = true
+                for k in 0..<type_args.count |structs, matched, astart, type_args|:
+                    stored: ValueType = structs.generic_struct_inst_args[astart + k]
+                    matched <- false if stored.kind != type_args[k].kind or stored.bits != type_args[k].bits
+                ValueType{kind: TypeKind.Struct, bits: structs.generic_struct_inst_index[inst].u32()} return if matched
+            template_index: i64 = generic_struct_index_of(structs, base)
+            unmodeled_type() return if template_index < 0
+            tslot: usize = template_index.usize()
+            unmodeled_type() return if structs.generic_struct_param_count[tslot] != type_args.count
+            for arg in type_args |structs|:
+                unmodeled_type() return if arg.kind == TypeKind.Unmodeled
+            # Conservative recursion guard: a base already mid-instantiation would loop.
+            for pending in structs.generic_struct_inprogress |structs, base|:
+                unmodeled_type() return if pending == base
+
+            if structs.generic_struct_decls[tslot] is Decl.Struct(sname, members, saffinity, shas_states, shas_derive, sinvariants, sline):
+                unmodeled_type() return if members.count == 0
+                structs.generic_struct_inprogress <- structs.generic_struct_inprogress.push(base)
+                pstart: usize = structs.generic_struct_param_start[tslot]
+                for k in 0..<type_args.count |structs, pstart, type_args|:
+                    structs.binding_names <- structs.binding_names.push(structs.generic_struct_param_names[pstart + k])
+                    structs.binding_types <- structs.binding_types.push(copied_type(type_args[k]))
+
+                element_types: mutable darray[LLVMTypeRef] = []
+                resolved_names: mutable darray[sview] = []
+                resolved_types: mutable darray[ValueType] = []
+                declined: mutable bool = false
+                for member in members |element_types, resolved_names, resolved_types, declined, structs|:
+                    member_type: ValueType = annotation_value_type(member.type_expression, structs)
+                    if member_type.kind == TypeKind.Unmodeled:
+                        declined <- true
+                    else:
+                        element_types.push(llvm_type_of(member_type, structs, structs.context))
+                        resolved_names.push(member.name)
+                        resolved_types.push(member_type)
+
+                for k in 0..<type_args.count |structs, type_args|:
+                    _ = structs.binding_names.pop()
+                    _ = structs.binding_types.pop()
+                _ = structs.generic_struct_inprogress.pop()
+                unmodeled_type() return if declined
+
+                name_storage: mutable darray[u8] = []
+                for index in 0..<sview_len(base) |name_storage, base|:
+                    name_storage.push(sview_at(base, index))
+                for arg in type_args |name_storage, structs|:
+                    name_storage.push(95)
+                    name_storage.push(95)
+                    push_generic_arg_name(arg, structs, name_storage)
+                name_storage.push(0)
+                mangled: cstr = (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                handle: LLVMTypeRef = LLVMStructCreateNamed(structs.context, mangled)
+                idx: usize = structs.names.count
+                structs.names <- structs.names.push(base)
+                structs.handles <- structs.handles.push(handle)
+                field_start: usize = structs.field_names.count
+                for slot in 0..<resolved_names.count |structs, resolved_names, resolved_types|:
+                    structs.field_names <- structs.field_names.push(resolved_names[slot])
+                    structs.field_types <- structs.field_types.push(resolved_types[slot])
+                structs.field_start <- structs.field_start.push(field_start)
+                structs.field_count <- structs.field_count.push(resolved_names.count)
+                elements_pointer: void& = (&element_types[0]).cast[void&] can Unsafe.PointerCast
+                LLVMStructSetBody(handle, elements_pointer, element_types.count.u32(), 0)
+
+                arg_start: usize = structs.generic_struct_inst_args.count
+                for arg in type_args |structs|:
+                    structs.generic_struct_inst_args <- structs.generic_struct_inst_args.push(copied_type(arg))
+                structs.generic_struct_inst_bases <- structs.generic_struct_inst_bases.push(base)
+                structs.generic_struct_inst_arg_start <- structs.generic_struct_inst_arg_start.push(arg_start)
+                structs.generic_struct_inst_arg_count <- structs.generic_struct_inst_arg_count.push(type_args.count)
+                structs.generic_struct_inst_index <- structs.generic_struct_inst_index.push(idx)
+                return ValueType{kind: TypeKind.Struct, bits: idx.u32()}
+            return unmodeled_type()
+
+
+        # A type argument's contribution to a monomorphized struct's LLVM name. Only needs
+        # to be readable and reasonably distinct (the instantiation memo is the real key,
+        # and LLVM uniquifies a duplicate named-struct anyway).
+        def push_generic_arg_name(value_type: ValueType, structs: StructTable&, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if value_type.kind == TypeKind.Struct:
+                struct_name: sview = structs.names[value_type.bits.usize()]
+                for index in 0..<sview_len(struct_name) |storage, struct_name|:
+                    storage.push(sview_at(struct_name, index))
+                return
+            push_type_name(value_type, storage)
+
+
         def register_struct_name(declaration: Decl, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                # A generic template has no concrete type of its own; skip it here.
+                return if generic_struct_index_of(structs, struct_name) >= 0
                 name_storage: mutable darray[u8] = []
                 handle: LLVMTypeRef = LLVMStructCreateNamed(ctx, sview_to_cstr(struct_name, name_storage))
                 structs.names <- structs.names.push(struct_name)
@@ -4374,7 +4559,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -4389,6 +4574,10 @@ module Backend:
             # struct field can name another struct, so every struct type must exist before
             # any signature is resolved. Named-empty-then-set-body (see llvm_c.elisa) is
             # what makes the field pass tolerate any declaration order.
+            # Generic struct templates first: a concrete struct's field may name a
+            # `Base[args]` application, and register_struct_name must know to SKIP a template
+            # rather than register it as a (fieldless) concrete type.
+            register_generic_structs(file, structs)
             for declaration in file.top_decls |structs, ctx|:
                 register_struct_name(declaration, structs, ctx)
                 # Const enums resolve to a scalar, so they must be known before any
