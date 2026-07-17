@@ -285,6 +285,37 @@ run_case optional_absent  'def pick(flag: bool) -> i64?:\n    return 42 if flag 
 # A non-i64 payload: the wrap must use the payload's own width.
 run_case optional_u8      'def main() -> i64:\n    v: u8? = 200\n    if v is found:\n        return found.i64() - 158\n    return 0\n'  42
 
+# --- IR-shape check against stage0 ---------------------------------------------------
+# For values whose EXIT CODE cannot observe the difference (a string literal's contents,
+# with no `extern strlen` to measure it), assert instead that stage1 emits the same IR LINE
+# stage0 does. Weaker than a behavioral differential, so it is used only where behavior is
+# genuinely unobservable -- never as a substitute for one.
+ir_case() {
+    local name="$1" src="$2" pattern="$3"
+    total=$((total + 1))
+    local ll="$BUILD/ir_$name.ll" s0ll="$BUILD/ir_${name}_s0.ll"
+    if ! printf '%b' "$src" | "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        echo "  FAIL ir_$name: stage1 declined"; return
+    fi
+    printf '%b' "$src" > "$BUILD/ir_$name.elisa"
+    if ! "$ELISACORE_BIN" -emit llvm -o "$s0ll" "$BUILD/ir_$name.elisa" 2>/dev/null; then
+        echo "  SKIP ir_$name: stage0 rejects this program"; return
+    fi
+    local got want
+    got="$(grep -cE "$pattern" "$ll" 2>/dev/null || true)"
+    want="$(grep -cE "$pattern" "$s0ll" 2>/dev/null || true)"
+    if [ "$got" -ge 1 ] && [ "$want" -ge 1 ]; then
+        pass=$((pass + 1)); echo "  ok       ir_$name: both emit /$pattern/"
+    else
+        echo "  FAIL ir_$name: stage1=$got stage0=$want for /$pattern/"
+    fi
+}
+
+# The literal's storage must be a private unnamed_addr [N x i8] with a NUL terminator, and
+# it must reach a cstr parameter as a bare `ptr` -- exactly stage0's shape.
+ir_case cstr_global_shape 'def main() -> i64:\n    s: cstr = "hi"\n    return 42\n' '^@str = private unnamed_addr constant \[3 x i8\] c"hi\\00"'
+ir_case cstr_param_is_ptr 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n' 'define i64 @take\(ptr'
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -413,6 +444,16 @@ diff_case module_two_modules 'module A:\n    def val() -> i64:\n        return 4
 # qualified, so the owner must resolve from inside a module body too.
 diff_case module_internal_call 'module M:\n    def base() -> i64:\n        return 40\n\n    def total() -> i64:\n        return M::base() + 2\n\ndef main() -> i64:\n    return M::total()\n'
 diff_case module_u8_param 'module M:\n    def widen(b: u8) -> i64:\n        return b.i64()\n\ndef main() -> i64:\n    v: u8 = 200\n    return M::widen(v) - 158\n'
+# STRING LITERALS. stage0 lowers `"hi"` to `@str = private unnamed_addr constant [3 x i8]
+# c"hi\00"` plus a `ptr` to it; a cstr param is `define i64 @take(ptr)`. These fixtures pin
+# compile-and-run parity, but note the exit code CANNOT observe the string's contents --
+# that needs `extern strlen`, which is blocked on the stage1 AST discarding an extern's
+# return type. The `ir_case` below pins the global's actual shape instead.
+diff_case cstr_local 'def main() -> i64:\n    s: cstr = "hi"\n    return 42\n'
+diff_case cstr_param 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n'
+diff_case cstr_two_literals 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    a: cstr = "one"\n    b: cstr = "two"\n    return take(a) - take(b) + 42\n'
+diff_case cstr_empty 'def main() -> i64:\n    s: cstr = ""\n    return 42\n'
+diff_case cstr_reassign 'def main() -> i64:\n    s: mutable cstr = "a"\n    s <- "b"\n    return 42\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -477,6 +518,10 @@ decline_case const_from_call 'def f() -> i64:\n    return 42\n\nconst A: i64 = f
 # owner column cannot express a dotted path, so it declines rather than mangling a wrong
 # symbol and silently calling the wrong function.
 decline_case nested_module 'module A:\n    module B:\n        def fetch() -> i64:\n            return 42\n\ndef main() -> i64:\n    return A::B::fetch()\n'
+# A cstr carries no LENGTH, so `.count`, indexing and comparison need the runtime and are
+# not modeled. Emitting a raw GEP for `s[0]` would be an unchecked read past the end.
+decline_case cstr_index 'def main() -> i64:\n    s: cstr = "hi"\n    return s[0].i64()\n'
+decline_case cstr_count 'def main() -> i64:\n    s: cstr = "hi"\n    return s.count.i64()\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'

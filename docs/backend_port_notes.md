@@ -451,3 +451,24 @@ Implemented as described. One footgun found while probing: stage1's parser treat
 an UNGATED contextual keyword (parser_expr.elisa ~114), so `def get()` cannot be called even
 though stage0 compiles it — every other contextual keyword there (`do`, `when`, `machine`)
 is gated on lookahead. Filed separately; avoid `get` in fixtures until fixed.
+
+## Externs — BLOCKED on the stage1 AST (like error unions)
+
+`extern strlen(s: cstr) -> usize` lowers to `declare i64 @strlen(ptr)` in stage0 — trivial
+IR. But `Ast::Decl.Extern(name, param_start, arity, variadic, callable, decorators, line)`
+has **no return-type field**, and `extern_declaration` (parser_types.elisa ~172) calls
+`skip_declaration_header_clauses()`, which swallows the `-> usize`. The return type is
+parsed and discarded, so the backend cannot emit the `declare`.
+
+Param types DO survive, but in a side table rather than the node: `param_start`/`arity`
+index `File.extern_params` (`ExternParam{name, type_name: sview, provenance_bearing}`),
+where the type is a bare NAME, not an Expr.
+
+Filed as task_d010c4d5. Same shape as task_c19cb583 (`Stmt.Block` has no Expr, so `catch
+risky(true):` loses its subject): an AST that cannot carry what the backend needs. Both are
+FRONTEND fixes, not backend ones.
+
+Knock-on: a cstr fixture's EXIT CODE cannot observe a string's contents without `strlen`,
+so `ir_case` (assert stage1 and stage0 emit the same IR line) covers the literal's shape.
+That is strictly weaker than a behavioral differential and is used ONLY where behavior is
+genuinely unobservable.
