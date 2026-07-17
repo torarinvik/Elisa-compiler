@@ -3568,6 +3568,51 @@ module Backend:
 
     public:
 
+        # DWARF. Debug info is built DURING emission and only lands in the OBJECT file --
+        # stage0's own `-emit llvm -g` shows none of it -- so the oracle for this is dwarfdump
+        # on the emitted object, not an IR diff.
+        #
+        # Scope: a compile unit plus one DISubprogram per function, which is what makes lldb
+        # able to name a frame. Per-line locations and variable info (DILocalVariable,
+        # dbg.declare) are NOT emitted: they need a source position on every statement, which
+        # the emitter does not thread today. So a backtrace names functions but has no line
+        # numbers -- honest about what it gives rather than half-emitting a wrong line table.
+        #
+        # `-g` off costs nothing: the builder is never created and no flags are set.
+        def emit_debug_info(file: Ast::File&, m: LLVMModuleRef, fns: FnTable&, source_name: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # LLVM emits NO DWARF unless these module flags are present -- and it does not
+            # warn if they are missing, it just silently drops the debug info.
+            # 1 = LLVMModuleFlagBehaviorWarning, matching stage0.
+            version_value: LLVMMetadataRef = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ctx), 3, 0))
+            LLVMAddModuleFlag(m, 1, "Debug Info Version", 18, version_value)
+            dwarf_value: LLVMMetadataRef = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ctx), 4, 0))
+            LLVMAddModuleFlag(m, 1, "Dwarf Version", 13, dwarf_value)
+
+            builder: LLVMDIBuilderRef = LLVMCreateDIBuilder(m)
+            name_storage: mutable darray[u8] = []
+            file_name: cstr = sview_to_cstr(source_name, name_storage)
+            di_file: LLVMMetadataRef = LLVMDIBuilderCreateFile(builder, file_name, sview_len(source_name), ".", 1)
+            # LLVMDWARFSourceLanguageC99 = **11**, LLVMDWARFEmissionFull = 1 — stage0's
+            # choices. Counted out of DebugInfo.h, not guessed: 12 is Ada95, and passing it
+            # produced a perfectly valid compile unit that claimed the language was Ada.
+            # Nothing errors on a wrong enum here; only dwarfdump shows it.
+            unit: LLVMMetadataRef = LLVMDIBuilderCreateCompileUnit(builder, 11, di_file, "elisacore", 9, 0, "", 0, 0, "", 0, 1, 0, 0, 0, "", 0, "", 0)
+
+            for declaration in file.top_decls |builder, di_file, unit, fns|:
+                if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                    handle_index: i64 = function_index_of(fns, "", function_name)
+                    continue if handle_index < 0
+                    subroutine: LLVMMetadataRef = LLVMDIBuilderCreateSubroutineType(builder, di_file, null, 0, 0)
+                    subprogram_storage: mutable darray[u8] = []
+                    subprogram_name: cstr = sview_to_cstr(function_name, subprogram_storage)
+                    # isLocalToUnit=0, isDefinition=1, scopeLine=line, flags=0, isOptimized=0.
+                    subprogram: LLVMMetadataRef = LLVMDIBuilderCreateFunction(builder, unit, subprogram_name, sview_len(function_name), subprogram_name, sview_len(function_name), di_file, line, subroutine, 0, 1, line, 0, 0)
+                    LLVMSetSubprogram(fns.handles[handle_index.usize()], subprogram)
+
+            # Without Finalize the metadata is left unresolved and LLVM asserts or drops it.
+            LLVMDIBuilderFinalize(builder)
+
+
         # Does this MDNode's operand 0 spell `name`?
         def md_property_is(property: LLVMValueRef, name: sview) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # `is` binds when the value is PRESENT, so this reads "not an MDNode -> false".
@@ -3677,7 +3722,10 @@ module Backend:
         #
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
-        def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # `want_debug` emits DWARF (a compile unit + one DISubprogram per function). Kept as a
+        # parameter rather than a separate entry point so there is ONE emission path: a
+        # second path would drift from this one silently.
+        def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
@@ -3779,4 +3827,11 @@ module Backend:
                     declined <- true
                 drained <- drained + 1
             -1 return if declined
+            # AFTER the bodies: every function must already have its handle in `fns`.
+            emit_debug_info(file, m, fns, source_name, ctx) if want_debug
             return emitted_count
+
+
+        # The original entry point, unchanged for every caller that does not want debug info.
+        def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return emit_module_with_debug(file, m, ctx, builder, false, "")

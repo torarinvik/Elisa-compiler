@@ -720,7 +720,7 @@ parse error prints no `UNSUPPORTED` — so an invalid program reads as "EMITS". 
 `fold(+, [...])` (which stage0 rejects outright: "unexpected token + in expression") looked
 like a working feature for one probe. Check the EXIT CODE, not just the marker.
 
-## DWARF and `-Wperf` share ONE blocker — object emission LANDED, pass pipeline remains
+## DWARF and `-Wperf` — BOTH LANDED (the shared blocker is gone)
 
 Both were on the remaining list as separate features. They are not: they are the same
 architectural gap, and neither is a codegen feature.

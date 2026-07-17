@@ -133,6 +133,38 @@ wperf_case warns 'def fib(n: i64) -> i64:\n    return n if n < 2 else fib(n - 1)
 wperf_case silent 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<1000]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' no
 # An UNROLLED loop has no latch left to carry the marker, so there is nothing to judge and no
 # warning -- not a miss.
+# DWARF. The oracle here is dwarfdump on the OBJECT, not an IR diff: debug info is built
+# during emission and stage0's own `-emit llvm -g` shows none of it. Compared against
+# stage0's actual output (`elisac -emit obj -g`), which gives producer "elisacore",
+# DW_LANG_C99, and a DW_TAG_subprogram per function.
+#
+# DW_AT_language is asserted BY NAME because nothing errors on a wrong enum: passing 12
+# (Ada95) instead of 11 (C99) produced a perfectly valid compile unit claiming the language
+# was Ada, and only dwarfdump showed it.
+dwarf_case() {
+    local name="$1" pattern="$2"
+    total=$((total + 1))
+    local dir="$BUILD/obj_dwarf"; mkdir -p "$dir"
+    local dump="$(dirname "$LLVM_CONFIG")/llvm-dwarfdump"
+    [ -x "$dump" ] || { echo "  SKIP obj_dwarf_$name: no llvm-dwarfdump"; total=$((total - 1)); return; }
+    if [ ! -f "$dir/stage1_out.o" ]; then
+        local src='def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n'
+        ( cd "$dir" && printf '%b' "$src" | RUN "$BUILD/emit_obj" >/dev/null 2>&1 ) \
+          || { echo "  FAIL obj_dwarf_$name: emit_obj errored"; return; }
+    fi
+    if "$dump" --debug-info "$dir/stage1_out.o" 2>/dev/null | grep -qE "$pattern"; then
+        pass=$((pass + 1))
+    else
+        echo "  FAIL obj_dwarf_$name: no /$pattern/ in DWARF"
+    fi
+}
+rm -rf "$BUILD/obj_dwarf"
+dwarf_case compile_unit 'DW_TAG_compile_unit'
+dwarf_case producer 'DW_AT_producer.*elisacore'
+dwarf_case language_is_c99 'DW_AT_language.*DW_LANG_C99'
+dwarf_case subprogram 'DW_TAG_subprogram'
+dwarf_case names_the_function 'DW_AT_name.*"add"'
+
 wperf_case unrolled_is_silent 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<8]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' no
 
 if [ "$pass" -ne "$total" ]; then echo "backend_obj_smoke FAILED: passed=$pass total=$total"; exit 1; fi
