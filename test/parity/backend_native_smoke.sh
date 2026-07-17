@@ -130,6 +130,19 @@ run_case match_default    'def classify(n: i64) -> i64:\n    return match n:\n  
 run_case match_negative   'def classify(n: i64) -> i64:\n    return match n:\n        -1: 42\n        _: 7\n\ndef main() -> i64:\n    return classify(-1)\n'  42
 run_case match_as_value   'def main() -> i64:\n    n: i64 = 2\n    v: i64 = match n:\n        1: 10\n        2: 40\n        _: 0\n    return v + 2\n'  42
 
+# Integer WIDTHS and SIGNEDNESS. These are the cases an i64-only backend gets wrong:
+# stage0 lowers unsigned `/` and `>>` to udiv/lshr, and widening follows the SOURCE's
+# signedness (zext vs sext).
+run_case u8_unsigned_div  'def divide(a: u8, b: u8) -> u8:\n    return a / b\n\ndef main() -> i64:\n    return divide(200, 3).i64()\n'  66
+run_case u8_unsigned_shr  'def shift(a: u8) -> u8:\n    return a >> 1\n\ndef main() -> i64:\n    return shift(200).i64()\n'  100
+# u8 200 -> i64 must ZERO-extend (200). Sign-extending would give -56.
+run_case u8_zero_extend   'def main() -> i64:\n    a: u8 = 200\n    return a.i64()\n'  200
+# i8 -56 -> i64 must SIGN-extend (-56, +100 == 44). Zero-extending would give 200.
+run_case i8_sign_extend   'def main() -> i64:\n    a: i8 = -56\n    return a.i64() + 100\n'  44
+run_case i32_arithmetic   'def main() -> i64:\n    a: i32 = 1000\n    b: i32 = 3\n    c: i32 = a / b\n    return c.i64()\n'  77
+# 4000000000 > 100 is TRUE unsigned; read as a signed i32 it is negative and FALSE.
+run_case u32_compare      'def main() -> i64:\n    a: u32 = 4000000000\n    return 42 if a > 100 else 7\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -182,6 +195,11 @@ diff_case bitnot      'def main() -> i64:\n    a: i64 = 5\n    return ~a + 200\n
 diff_case and_or_not  'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'
 diff_case compound    'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'
 diff_case short_circuit 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'
+diff_case u8_div      'def divide(a: u8, b: u8) -> u8:\n    return a / b\n\ndef main() -> i64:\n    return divide(200, 3).i64()\n'
+diff_case u8_shr      'def shift(a: u8) -> u8:\n    return a >> 1\n\ndef main() -> i64:\n    return shift(200).i64()\n'
+diff_case u8_zext     'def main() -> i64:\n    a: u8 = 200\n    return a.i64()\n'
+diff_case i8_sext     'def main() -> i64:\n    a: i8 = -56\n    return a.i64() + 100\n'
+diff_case u32_cmp     'def main() -> i64:\n    a: u32 = 4000000000\n    return 42 if a > 100 else 7\n'
 diff_case match_chain 'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        1: 200\n        -1: 300\n        _: 400\n\ndef main() -> i64:\n    return classify(-1) - classify(0)\n'
 
 
@@ -194,7 +212,11 @@ decline_case() {
 }
 
 # `-> f64` is outside the modeled i64 subset.
+# f64 needs the float instruction family (fadd/fdiv/fcmp) — not modeled yet.
 decline_case float_return 'def main() -> f64:\n    return 1\n'
+# MIXED WIDTHS have no implicit conversion in the subset: silently extending one side
+# would invent semantics the language does not have.
+decline_case mixed_widths 'def main() -> i64:\n    a: i32 = 1\n    b: i64 = 2\n    c: i64 = a + b\n    return c\n'
 # `i = i + 1` is a DECLARATION, not a store: stage0 lowers a bare `name = value` to a fresh
 # VarDeclStmt, so in a loop body it declares a shadow and the outer `i` never moves — an
 # INFINITE LOOP with no diagnostic (observed). stage1's parser folds `<-` and `=` into the
