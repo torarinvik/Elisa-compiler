@@ -67,6 +67,7 @@ NAMES=(
     fresh_shape_argument_mismatch
     destroyed_region_use
     destroyed_region_allocate
+    storage_dependency_invalidated
     duplicate_bit_group_member
     named_states_without_derive
     flow_flag_state_machine
@@ -209,6 +210,7 @@ EXPECTS=(
     "return type expects pair[0], got pair[0]"
     "region dependency facts were invalidated"
     "region \"scratch\" was destroyed"
+    "storage dependency facts were invalidated"
     "duplicate packed group member 'b' in H.flags"
     "declares named states but is missing a derive state: block"
     "written in multiple branches and read after the join"
