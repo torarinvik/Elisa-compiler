@@ -33,6 +33,8 @@ clean $'def f() -> void:\n    region same(64)\n    value: i32& @same = new[same]
 
 out=$(printf 'def bad() -> i32&:\n    region scratch(64)\n    value: i32& = new[scratch] 1\n    return value\n' | "$RPT")
 echo "$out" | grep -q 'cannot return reference: region dependency facts include local region "scratch"' || fail "local-region return escape was not flagged: $out"
+out=$(printf 'def bad() -> i32&:\n    region scratch(64)\n    value: i32& = new[scratch] 1\n    return value.cast[i32&]\n' | "$RPT")
+echo "$out" | grep -q 'cannot return reference: region dependency facts include local region "scratch"' || fail "cast local-region return escape was not flagged: $out"
 clean $'def id[T, @r](value: T& @r) -> T& @r:\n    alias: T& @r = value\n    return alias\n'
 
 out="$(printf '%s' $'def f() -> void:\n    destroy missing\n' | "$RPT")"
