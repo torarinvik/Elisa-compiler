@@ -288,6 +288,13 @@ run_case generic_multi_second 'def second[K, T](a: K, b: T) -> T:\n    return b\
 run_case generic_multi_widths 'def combine[K, T](a: K, b: T) -> i64:\n    return a.i64() + b.i64()\n\ndef main() -> i64:\n    return combine[u8, i64](40, 2)\n'  42
 # Two distinct instantiations of the SAME two-param template must be emitted once each.
 run_case generic_multi_two_insts 'def pick[K, T](a: K, b: T) -> K:\n    return a\n\ndef main() -> i64:\n    return pick[i64, i32](40, 1) + pick[i64, u8](2, 3)\n'  42
+# `trusted X:` / `can X:` blocks (compile-time trust/effect grants, no runtime lowering),
+# `assert` (runtime check like `requires`), and `decreases` (a termination obligation, no
+# runtime effect). All three appear in the std dict internals. Verified by VALUE: the body
+# still runs / the check passes.
+run_case trusted_block 'def main() -> i64:\n    x: mutable i64 = 0\n    trusted Unsafe.AssumeProgress:\n        x <- 42\n    return x\n'  42
+run_case assert_holds  'def main() -> i64:\n    x: i64 = 42\n    assert x == 42\n    return x\n'  42
+run_case decreases_skip 'def main() -> i64:\n    r: mutable i64 = 5\n    total: mutable i64 = 0\n    while r > 0:\n        decreases r\n        total <- total + r\n        r <- r - 1\n    return total + 27\n'  42
 # INFERENCE by UNIFICATION: a generic whose parameter is `Map[T]&`, called with a
 # `Map[i64]` argument, must infer T=i64 (unify the annotation against the arg's
 # instantiation) — NOT T=Map[i64] (the whole arg type). The dict `.put`/`.get` machinery:
