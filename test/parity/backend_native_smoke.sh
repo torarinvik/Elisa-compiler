@@ -717,6 +717,14 @@ diff_case error_union_success 'error E:\n    X\n\ndef doubler(n: i64) -> i64 err
 diff_case error_union_raise 'error E:\n    X\n    Y\n\ndef fails(n: i64) -> i64 error[E]:\n    raise E.Y\n\ndef main() -> i64:\n    return try fails(5) else 42\n'
 # A u8 success value round-trips through the out-param at its own width.
 diff_case error_union_u8 'error E:\n    X\n\ndef mk(n: u8) -> u8 error[E]:\n    return n\n\ndef main() -> i64:\n    v: u8 = try mk(200) else 0\n    return v.i64() - 158\n'
+# CONTRACTS: `requires PRED` is a precondition, lowered to `if not PRED: abort`. stage0
+# emits a predicate check + panic; a provably-true predicate is optimized away. The SUCCESS
+# path (predicate holds) is bit-identical to stage0 -- these fixtures exercise that. (A
+# provably-FALSE contract is a stage0 COMPILE error -- "argument provably does not satisfy
+# requires" -- not a runtime path, so it is not differentiable here.)
+diff_case contract_requires 'def half(n: i64) -> i64:\n    requires n >= 0\n    return n / 2\n\ndef main() -> i64:\n    return half(84)\n'
+diff_case contract_two_requires 'def add(a: i64, b: i64) -> i64:\n    requires a > 0\n    requires b > 0\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n'
+diff_case contract_requires_u8 'def widen(b: u8) -> i64:\n    requires b > 100\n    return b.i64()\n\ndef main() -> i64:\n    return widen(200) - 158\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -783,6 +791,9 @@ decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() ->
 # A FILTERED comprehension declines: the output count is not known up front, so the presized
 # form does not apply -- and stage0 itself says only the filter-free form auto-vectorizes.
 decline_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n'
+# `ensure` is a POSTCONDITION over `result`, which is not bound until the return; modeled
+# only as a decline (requires -- the precondition over params -- is the portable half).
+decline_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
