@@ -858,6 +858,12 @@ run_case nested_array_write 'def main() -> i64:\n    m: mutable i64[3][2] = [[1,
 # `catch f():` — the ERROR-fn ABI (i32 status + out-param): code 0 takes the success
 # arm (binding the out value), a nonzero code is ordinal+1 and dispatches down the
 # error arms; `_` is the catch-all.
+# STATEMENT-position `catch f():` (parses to Stmt.Match with the call scrutinee):
+# multi-statement arms, `slot:` binds the out value, `error e:` is the catch-all;
+# all-arms-return makes the whole catch a terminator.
+run_case stmt_catch_ok 'error E:\n    Oops\n\ndef f(x: i64) -> i64 error[E]:\n    raise E.Oops if x < 0\n    return x * 2\n\ndef main() -> i64:\n    catch f(21):\n        slot:\n            return slot\n        error e:\n            return 7\n' 42
+run_case stmt_catch_err 'error E:\n    Oops\n\ndef f(x: i64) -> i64 error[E]:\n    raise E.Oops if x < 0\n    return x * 2\n\ndef main() -> i64:\n    catch f(-1):\n        slot:\n            return slot\n        error e:\n            return 42\n' 42
+run_case stmt_catch_variant 'error E:\n    Oops\n    Bad\n\ndef f(x: i64) -> i64 error[E]:\n    raise E.Bad if x > 100\n    raise E.Oops if x < 0\n    return x\n\ndef main() -> i64:\n    catch f(200):\n        slot:\n            return slot\n        E.Oops:\n            return 9\n        E.Bad:\n            return 42\n' 42
 run_case catch_success 'error ParseError:\n    BadDigit\n    Overflow\n\ndef parse_num(x: i64) -> i64 error[ParseError]:\n    raise ParseError.BadDigit if x < 0\n    return x * 2\n\ndef main() -> i64:\n    v: i64 = catch parse_num(21):\n        n: n\n        ParseError.BadDigit: 7\n        ParseError.Overflow: 9\n    return v\n' 42
 run_case catch_error_arm 'error ParseError:\n    BadDigit\n    Overflow\n\ndef parse_num(x: i64) -> i64 error[ParseError]:\n    raise ParseError.BadDigit if x < 0\n    return x * 2\n\ndef main() -> i64:\n    v: i64 = catch parse_num(-1):\n        n: n\n        ParseError.BadDigit: 42\n        ParseError.Overflow: 9\n    return v\n' 42
 run_case catch_second_arm 'error ParseError:\n    BadDigit\n    Overflow\n\ndef parse_num(x: i64) -> i64 error[ParseError]:\n    raise ParseError.Overflow if x > 100\n    raise ParseError.BadDigit if x < 0\n    return x\n\ndef main() -> i64:\n    v: i64 = catch parse_num(200):\n        n: n\n        ParseError.BadDigit: 9\n        ParseError.Overflow: 42\n    return v\n' 42
