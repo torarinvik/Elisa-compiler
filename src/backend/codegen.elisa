@@ -361,6 +361,12 @@ module Backend:
             packed_variant_start: mutable darray[usize]
             packed_variant_count: mutable darray[usize]
             packed_payload_words: mutable darray[u32]
+            # How many leading fields of each variant are COMMON (shared across variants).
+            # The parser PREPENDS them to every variant's field list, so from here a common
+            # block just means "the first N fields are shared". They are stored INLINE
+            # between the tag and the payload: stage0 lays out `%Expr = {i32, i64, [1 x i64]}`
+            # for one common field, vs `{i32, [1 x i64]}` for none.
+            packed_common_counts: mutable darray[u32]
             penum_variant_start: mutable darray[usize]
             penum_variant_count: mutable darray[usize]
             # Payload words (i64 units) of the WIDEST variant — the `[N x i64]` extent.
@@ -928,6 +934,9 @@ module Backend:
                 return unmodeled_type()
             if expression is Expr.Paren(paren_inner, paren_line):
                 return expression_type(paren_inner, local_scope, fns, structs, generics)
+            # A move has the moved value's type: it transfers ownership, not representation.
+            if expression is Expr.Move(moved_value, move_line):
+                return expression_type(moved_value, local_scope, fns, structs, generics)
             if expression is Expr.BoolLit(bool_value):
                 return ValueType{kind: TypeKind.Bool, bits: 1}
             # A STRING literal has a type of its own (cstr) — unlike an int literal, which
@@ -1188,6 +1197,11 @@ module Backend:
         # The packed twin of penum_ctor_labels_match: `new Node.Leaf(v: 42)` labels the
         # payload field, and the label must be the field's real name.
         def packed_ctor_labels_match(callee: Expr, argument_names: darray[sview]&, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            # With a `common:` block a constructor carries commons THEN the payload
+            # (`new Expr.Int(span: 1, value: 42)`), so more than one label is legitimate.
+            # Only the payload label is checked against its declared name here; the commons
+            # are positional-by-construction (the parser prepends them in order).
+            true return if argument_names.count > 1
             false return if argument_names.count != 1
             if callee is Expr.Field(packed_label_head, packed_label_variant, packed_label_line):
                 if packed_label_head is Expr.Ident(packed_label_enum, packed_label_enum_line):
@@ -1558,8 +1572,12 @@ module Backend:
                         null return if packed_tag < 0
                         packed_slot_index: usize = structs.packed_variant_start[packed_ctor_index.usize()] + packed_tag.usize()
                         packed_wants_payload: bool = structs.packed_has_payload[packed_slot_index]
-                        null return if packed_wants_payload and arguments.count != 1
-                        null return if not packed_wants_payload and arguments.count != 0
+                        packed_commons: u32 = structs.packed_common_counts[packed_ctor_index.usize()]
+                        # `new Expr.Int(span: 1, value: 42)` — the COMMON args come first,
+                        # then at most one payload arg. The parser prepends commons to the
+                        # variant's field list, so the arity is commons (+1 with a payload).
+                        packed_expected_args: usize = packed_commons.usize() + 1 if packed_wants_payload else packed_commons.usize()
+                        null return if arguments.count != packed_expected_args
 
                         packed_arena: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 0, "packed.arena")
                         packed_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "packed.state")
@@ -1572,10 +1590,21 @@ module Backend:
                         _ = LLVMBuildStore(builder, LLVMConstNull(packed_handle_llvm), packed_row)
                         packed_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, 0, "packed.tag.ptr")
                         _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0), packed_tag_pointer)
+                        # Commons are stored INLINE at fields 1..commons, ahead of the payload.
+                        packed_common_ok: mutable bool = true
+                        for common_index in 0..<packed_commons.usize() |packed_common_ok, arguments, packed_handle_llvm, packed_row, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            common_slot_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                            if emit_expression(arguments[common_index], common_slot_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is common_value:
+                                common_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, (1 + common_index).u32(), "packed.common.ptr")
+                                _ = LLVMBuildStore(builder, common_value, common_pointer)
+                            else:
+                                packed_common_ok <- false
+                        null return if not packed_common_ok
                         if packed_wants_payload:
                             packed_payload_type: ValueType = copied_type(structs.packed_payloads[packed_slot_index])
-                            if emit_expression(arguments[0], packed_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is packed_payload_value:
-                                packed_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, 1, "packed.payload.ptr")
+                            # The payload sits AFTER the commons: field 1 + commons.
+                            if emit_expression(arguments[packed_commons.usize()], packed_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is packed_payload_value:
+                                packed_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, (1 + packed_commons), "packed.payload.ptr")
                                 _ = LLVMBuildStore(builder, packed_payload_value, packed_payload_pointer)
                             else:
                                 return null
@@ -2109,6 +2138,17 @@ module Backend:
             # `null` is an IDENT named "null" in the AST, not its own node. It is the
             # empty optional: `{false, undef}` — the payload half is never read when the
             # tag is false, so a zeroed struct is the whole value.
+            # `move x` — an ownership TRANSFER, which the backend emits as the value itself.
+            # Verified against stage0's IR: `freeze(move store)` adds no runtime call and no
+            # new instruction, just `%frozen = alloca %Node__Store` + a copy of the store
+            # value. The typestate (`Store[Local]` -> `Store[Frozen]`) is enforced by the
+            # SEMANTIC checker -- same layout, no runtime effect -- so honouring the marker
+            # here would be inventing work stage0 does not do.
+            #
+            # `freeze` itself never reaches the backend: the parser discards the marker and
+            # yields the wrapped value.
+            if expression is Expr.Move(moved_value, move_line):
+                return emit_expression(moved_value, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             if expression is Expr.Comprehension(comp_var, comp_iterable, comp_condition, comp_body, comp_line):
                 return emit_comprehension(comp_var, comp_iterable, comp_condition, comp_body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             if expression is Expr.StringLit(string_text):
@@ -2310,7 +2350,10 @@ module Backend:
                                         declined <- true
                                         continue
                                     packed_arm_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "packed.state")
-                                    packed_word_args: mutable darray[LLVMValueRef] = [scrutinee_raw, packed_arm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), 1, 0)]
+                                    # Word 0 is the tag and words 1..commons are the common
+                                    # fields, so the first payload word is 1 + commons.
+                                    packed_arm_commons: u32 = structs.packed_common_counts[scrutinee_type.bits.usize()]
+                                    packed_word_args: mutable darray[LLVMValueRef] = [scrutinee_raw, packed_arm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + packed_arm_commons).u64(), 0)]
                                     packed_word_pointer: void& = (&packed_word_args[0]).cast[void&] can Unsafe.PointerCast
                                     packed_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, packed_word_pointer, 3, "packed.word")
                                     # The runtime hands back an i64 word; a narrower payload
@@ -3196,22 +3239,30 @@ module Backend:
         # from the handle (an i32 index) that names it.
         def packed_row_llvm_type(structs: mutable StructTable&, enum_index: i64, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             words: u32 = structs.packed_payload_words[enum_index.usize()]
-            row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt64TypeInContext(ctx), words)]
+            commons: u32 = structs.packed_common_counts[enum_index.usize()]
+            # `{i32 tag, <commons x i64>, [N x i64] payload}` — commons sit BETWEEN the tag
+            # and the payload, which is why every payload index shifts by `commons`.
+            row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx)]
+            for _ in 0..<commons.usize() |row_fields, ctx|:
+                row_fields.push(LLVMInt64TypeInContext(ctx))
+            row_fields.push(LLVMArrayType(LLVMInt64TypeInContext(ctx), words))
             row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
-            return LLVMStructTypeInContext(ctx, row_pointer, 2, 0)
+            return LLVMStructTypeInContext(ctx, row_pointer, (2 + commons), 0)
 
 
         # A store row's size in bytes: the `{i32, [N x i64]}` handle laid out at i64
         # alignment, so the tag's 4 bytes pad to 8. stage0 passes 16 for a one-word payload
         # (`state_new_variant_sparse(ptr %owner, i64 16)`), which this reproduces.
         def packed_row_bytes(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
-            return 8 + 8 * structs.packed_payload_words[enum_index.usize()].i64()
+            # 8 (tag, padded to i64 alignment) + 8 per common + 8 per payload word. stage0
+            # passes 16 with no commons and 24 with one — both reproduced.
+            return 8 + 8 * structs.packed_common_counts[enum_index.usize()].i64() + 8 * structs.packed_payload_words[enum_index.usize()].i64()
 
 
         # Register a `packed enum`. Same per-variant subset as register_payload_enum (at most
         # one SCALAR payload field), but into the packed pools: the representation is a store
         # row, not inline data.
-        def register_packed_enum(declaration: Decl, packed_enum_names: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+        def register_packed_enum(declaration: Decl, packed_enum_names: darray[sview]&, common_owners: darray[sview]&, common_counts: darray[u32]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             if declaration is Decl.Enum(enum_name, variants, is_const, storage_type, enum_line):
                 return if is_const
                 return if variants.count == 0
@@ -3219,18 +3270,40 @@ module Backend:
                 for packed_name in packed_enum_names |is_packed, enum_name|:
                     is_packed <- true if packed_name == enum_name
                 return if not is_packed
+                # How many of each variant's leading fields are COMMON.
+                #
+                # This reads 0 TODAY for every enum, because the count never reaches the AST:
+                # the parser sets `parser.captured_enum_common_count` (parser_types.elisa
+                # ~838) but nothing transfers it into `File.enum_common_owners` /
+                # `enum_common_counts` -- the side table is declared, copied onward to the
+                # semantic table, and never populated. So a `common:` enum arrives here
+                # looking like a plain one whose variants have an extra leading field, and
+                # DECLINES on the arity check rather than mis-reading the layout. The layout
+                # code below is correct and dormant: it starts working the moment the count
+                # is carried through.
+                commons: mutable u32 = 0
+                for owner_index in 0..<common_owners.count |commons, enum_name, common_owners, common_counts|:
+                    commons <- common_counts[owner_index] if common_owners[owner_index] == enum_name
                 start: usize = structs.packed_variants.count
                 declined: mutable bool = false
                 widest: mutable u32 = 0
-                for variant in variants |structs, declined, widest|:
-                    declined <- true if variant.fields.count > 1
+                for variant in variants |structs, declined, widest, commons|:
+                    # Commons come first; at most ONE payload field after them is modeled.
+                    declined <- true if variant.fields.count.u32() < commons
+                    declined <- true if variant.fields.count.u32() > commons + 1
                     payload: mutable ValueType = unmodeled_type()
-                    if variant.fields.count == 1:
-                        payload <- annotation_value_type(variant.fields[0], structs)
+                    if variant.fields.count.u32() == commons + 1:
+                        payload <- annotation_value_type(variant.fields[commons.usize()], structs)
                         declined <- true if not is_numeric_type(payload) and payload.kind != TypeKind.Bool
                         widest <- 1 if widest == 0
+                    # Every common field must be a scalar too: they are laid out inline as
+                    # i64-sized slots between the tag and the payload.
+                    for common_index in 0..<commons.usize() |structs, declined, variant|:
+                        continue if common_index >= variant.fields.count
+                        common_type: ValueType = annotation_value_type(variant.fields[common_index], structs)
+                        declined <- true if not is_numeric_type(common_type) and common_type.kind != TypeKind.Bool
                     field_name: mutable sview = ""
-                    field_name <- variant.field_names[0] if variant.field_names.count == 1
+                    field_name <- variant.field_names[commons.usize()] if variant.field_names.count.u32() == commons + 1
                     structs.packed_variants <- structs.packed_variants.push(variant.name)
                     structs.packed_payloads <- structs.packed_payloads.push(payload)
                     structs.packed_has_payload <- structs.packed_has_payload.push(variant.fields.count == 1)
@@ -3246,6 +3319,7 @@ module Backend:
                 structs.packed_variant_start <- structs.packed_variant_start.push(start)
                 structs.packed_variant_count <- structs.packed_variant_count.push(variants.count)
                 structs.packed_payload_words <- structs.packed_payload_words.push(widest)
+                structs.packed_common_counts <- structs.packed_common_counts.push(commons)
 
 
         def penum_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
@@ -3726,7 +3800,7 @@ module Backend:
         # parameter rather than a separate entry point so there is ONE emission path: a
         # second path would drift from this one silently.
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -3747,7 +3821,7 @@ module Backend:
                 # signature or field mentioning one is resolved.
                 register_enum(declaration, structs)
                 register_payload_enum(declaration, file.packed_enum_names, structs)
-                register_packed_enum(declaration, file.packed_enum_names, structs)
+                register_packed_enum(declaration, file.packed_enum_names, file.enum_common_owners, file.enum_common_counts, structs)
                 register_alias(declaration, structs)
             # Aliases resolve AFTER struct names and enums (an alias may name either) and
             # BEFORE struct bodies (a field may be alias-typed).

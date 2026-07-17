@@ -683,6 +683,19 @@ diff_case comprehension_inclusive 'def main() -> i64:\n    xs: darray[i64] = [i 
 # An EMPTY range must yield an empty darray, not a negative allocation.
 diff_case comprehension_empty 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<0]\n    return xs.count.i64() + 42\n'
 diff_case comprehension_u8 'def main() -> i64:\n    xs: darray[u8] = [200 for i in 0..<3]\n    return (xs[2] can Unsafe.UncheckedIndex).i64() - 158\n'
+# `freeze(move store)` — the store's TYPESTATE. Verified against stage0's IR: it adds NO
+# runtime call and no instruction, just a copy of the store value. `Store[Local]` ->
+# `Store[Frozen]` is enforced by the SEMANTIC checker (same layout, no runtime effect), and
+# `freeze` never even reaches the backend -- the parser discards the marker and yields the
+# wrapped value. So `move` emits its operand and that is the whole feature.
+#
+# This retires the caveat on the AoS store (6b800a1), which noted the typestate was unmodeled
+# and that this was "sound only because freeze/move decline". They no longer decline, and the
+# reason it stays sound is now a verified fact rather than an assumption: there is nothing to
+# model.
+diff_case packed_freeze 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: mutable Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        n: Node = new Node.Leaf(v: 42)\n        result <- match n:\n            Node.Leaf(v): v\n            Node.Tag(t): t\n    frozen: Node.Store[Frozen] = freeze(move store)\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
+# `move` on an ordinary value is likewise just the value.
+diff_case move_scalar 'def main() -> i64:\n    a: mutable darray[i64] = []\n    a.push(42)\n    b: darray[i64] = move a\n    return b[0] can Unsafe.UncheckedIndex\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -749,6 +762,17 @@ decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() ->
 # A FILTERED comprehension declines: the output count is not known up front, so the presized
 # form does not apply -- and stage0 itself says only the filter-free form auto-vectorizes.
 decline_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n'
+# A `common:` block DECLINES -- blocked on the AST, not the backend. stage0 lays it out as
+# `%Expr = {i32, i64, [1 x i64]}` (commons INLINE between tag and payload, row_bytes 16->24,
+# every payload index shifted by the common count), which is implemented and dormant here.
+# The blocker: the parser PREPENDS commons to each variant's field list but never carries the
+# COUNT -- it sets parser.captured_enum_common_count and nothing transfers it into
+# File.enum_common_owners/enum_common_counts. Without the count a common field is
+# indistinguishable from a payload field, so the layout cannot be reconstructed.
+#
+# It declines rather than miscompiling: the count reads 0, the variant looks like it has one
+# field too many, and the arity check refuses it.
+decline_case packed_common_block 'packed enum Expr:\n    common:\n        @storage(inline)\n        span: i64\n    Int(value: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Expr.Store[Local] = Expr.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        e: Expr = new Expr.Int(span: 1, value: 42)\n        result <- match e:\n            Expr.Int(value): value\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
