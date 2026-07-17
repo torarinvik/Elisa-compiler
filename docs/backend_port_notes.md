@@ -303,3 +303,82 @@ Next step is therefore NOT to guess the node again: dump the actual annotation f
 (e.g. teach test/breadth a mode that prints the parsed annotation, or probe the parser
 directly) and find where `&` is recorded. `parser_types.elisa:245` mentions
 `TokenKind.Ampersand` alongside `Lmut` under a `provenance` flag — that is the lead.
+
+## error unions: ABI fully mapped, not yet implemented (2026-07-17)
+
+The last named blocker before `collections.elisa` compiles (hence dict/set). References
+(68402af) and optionals (d82d2c8) already cleared the other type-model prerequisites.
+
+Not started as code — it is a new CALLING CONVENTION, a bigger slice than the recent ones,
+and this was the tail of a long session. But the expensive part (discovering the ABI) is
+DONE. Everything below is read out of stage0's `-emit llvm`; implement directly from it.
+
+### Working source (stage0 accepts, returns 42)
+
+    error Bad:
+        Nope
+
+    def risky(flag: bool) -> i64 error[Bad]:
+        raise Bad.Nope if not flag
+        return 42
+
+    def main() -> i64:
+        catch risky(true):
+            ok:
+                return ok
+            error e:
+                return 1
+
+SYNTAX GOTCHAS (both cost a round): `catch` is NOT infix — `x = f() catch 0` does not
+parse. And a `catch` block's SUCCESS ARM MUST COME FIRST ("catch expression must start with
+a success arm").
+
+### The ABI — the tag is the RETURN, the value goes through an OUT-POINTER
+
+`def risky(flag: bool) -> i64 error[Bad]` lowers to:
+
+    define i32 @risky(ptr %0, i1 %1)
+
+NOT the `{i32, i64}` struct by value. The i32 RESULT is the error tag (0 == ok) and the
+success value is stored through the leading out-pointer:
+
+    if.then:  store i64 0,  ptr %0   ; raise: payload zeroed
+              ret i32 1              ;        tag = the error's code
+    if.end:   store i64 42, ptr %0   ; return v
+              ret i32 0              ;        tag = 0 == ok
+
+So: **`f(out_ptr, args…) -> i32 tag`**. The declared type
+`%ErrUnion__Bad__i64 = type { i32, i64 }` exists but is only materialized at the CALL SITE.
+
+### Call site + catch
+
+    %call.result = alloca i64
+    store i64 0, ptr %call.result
+    %calltmp     = call i32 @risky(ptr %call.result, i1 true)
+    %call.payload = load i64, ptr %call.result
+    ; rebuild the union value from (tag, payload)
+    %errunion.err   = insertvalue %ErrUnion__Bad__i64 undef, i32 %calltmp, 0
+    %errunion.value = insertvalue %ErrUnion__Bad__i64 %errunion.err, i64 %call.payload, 1
+    %errunion.code  = extractvalue %ErrUnion__Bad__i64 %errunion.value, 0
+    %catch.ok = icmp eq i32 %errunion.code, 0
+    br i1 %catch.ok, label %catch.value, label %catch.dispatch
+
+    catch.value:      ; the `ok:` arm — payload = extractvalue …, 1
+    catch.dispatch:   ; switch i32 %errunion.code, label %catch.error [ … ]
+                      ; per-variant arms become switch cases; `error e:` is the default
+
+### Implementation order
+
+1. `error Bad: Nope` decl -> a table of error sets and their variant CODES. Codes start at
+   1; **0 is reserved for ok**.
+2. `declare_function`: a `-> T error[E]` signature becomes `i32 (ptr, params…)`.
+3. `emit_function_body`: `return v` -> `store v, out; ret i32 0`. `raise E.X` ->
+   `store zero, out; ret i32 <code>`.
+4. Call site: alloca the payload, call, then either rebuild the union (to match stage0) or
+   just branch on the tag directly — the union value is an artifact of stage0's lowering,
+   not something the ABI requires.
+5. `catch` statement: success arm FIRST, then a switch over the code with `error e:` as the
+   default.
+
+Only the single-error-set, non-generic case is needed to start; `collections.elisa` uses
+`error[RuntimeError]` throughout.
