@@ -46,6 +46,7 @@ module Backend:
             Signed
             Unsigned
             Bool
+            Float
 
 
         struct ValueType:
@@ -59,6 +60,10 @@ module Backend:
 
         def is_integer_type(value_type: ValueType) -> bool:
             return value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned
+
+
+        def is_numeric_type(value_type: ValueType) -> bool:
+            return is_integer_type(value_type) or value_type.kind == TypeKind.Float
 
 
         # The named scalar types the backend models. Anything else (f32/f64, containers,
@@ -77,6 +82,8 @@ module Backend:
             ValueType{kind: TypeKind.Unsigned, bits: 32} return if name == "u32"
             ValueType{kind: TypeKind.Unsigned, bits: 64} return if name == "u64" or name == "usize"
             ValueType{kind: TypeKind.Bool, bits: 1} return if name == "bool"
+            ValueType{kind: TypeKind.Float, bits: 32} return if name == "f32"
+            ValueType{kind: TypeKind.Float, bits: 64} return if name == "f64"
             return unmodeled_type()
 
 
@@ -98,6 +105,8 @@ module Backend:
         # The LLVM type backing a ValueType.
         def llvm_type_of(value_type: ValueType, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
             LLVMInt1TypeInContext(ctx) return if value_type.kind == TypeKind.Bool
+            if value_type.kind == TypeKind.Float:
+                return LLVMFloatTypeInContext(ctx) if value_type.bits == 32 else LLVMDoubleTypeInContext(ctx)
             LLVMInt8TypeInContext(ctx) return if value_type.bits == 8
             LLVMInt16TypeInContext(ctx) return if value_type.bits == 16
             LLVMInt32TypeInContext(ctx) return if value_type.bits == 32
@@ -229,6 +238,8 @@ module Backend:
                 return expression_type(paren_inner, local_scope, fns)
             if expression is Expr.BoolLit(bool_value):
                 return ValueType{kind: TypeKind.Bool, bits: 1}
+            # A FLOAT literal, like an int literal, defers to its context (`x: f32 = 1.5`),
+            # so it reports Unmodeled here rather than pinning itself to f64.
             if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
                 # `not x` is a bool whatever `x` is; `-x` / `~x` keep the operand's type.
                 ValueType{kind: TypeKind.Bool, bits: 1} return if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang
@@ -286,7 +297,31 @@ module Backend:
         # SDiv/SRem (not UDiv/URem): the subset is signed. Elisa's `%` is LLVM's `srem`
         # (sign follows the DIVIDEND: -7 % 2 == -1) — verified against stage0, which
         # selects the same instruction for a signed operand type.
+        # The ORDERED float predicate matching an integer one. Ordered = any comparison
+        # with NaN is false, which is IEEE `==` / `<` semantics.
+        # OEQ=1, OGT=2, OGE=3, OLT=4, OLE=5, ONE=6.
+        def float_predicate_of(operator: TokenKind) -> i32:
+            1 return if operator == TokenKind.EqEq
+            6 return if operator == TokenKind.BangEq
+            4 return if operator == TokenKind.Lt
+            5 return if operator == TokenKind.LtEq
+            2 return if operator == TokenKind.Gt
+            3 return if operator == TokenKind.GtEq
+            return -1
+
+
         def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            # Floats are a different instruction family end to end: fadd/fdiv/fcmp, never
+            # add/sdiv/icmp. Bitwise and shifts have no float form and decline.
+            if operand_type.kind == TypeKind.Float:
+                LLVMBuildFAdd(builder, left, right, "fadd") return if operator == TokenKind.Plus
+                LLVMBuildFSub(builder, left, right, "fsub") return if operator == TokenKind.Minus
+                LLVMBuildFMul(builder, left, right, "fmul") return if operator == TokenKind.Star
+                LLVMBuildFDiv(builder, left, right, "fdiv") return if operator == TokenKind.Slash
+                LLVMBuildFRem(builder, left, right, "frem") return if operator == TokenKind.Percent
+                float_predicate: i32 = float_predicate_of(operator)
+                LLVMBuildFCmp(builder, float_predicate, left, right, "fcmp") return if float_predicate >= 0
+                return null
             unsigned: bool = operand_type.kind == TypeKind.Unsigned
             LLVMBuildAdd(builder, left, right, "add") return if operator == TokenKind.Plus
             LLVMBuildSub(builder, left, right, "sub") return if operator == TokenKind.Minus
@@ -497,11 +532,24 @@ module Backend:
         def emit_conversion(value: LLVMValueRef, from_type: ValueType, to_type: ValueType, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
             null return if from_type.kind == TypeKind.Unmodeled or to_type.kind == TypeKind.Unmodeled
             target: LLVMTypeRef = llvm_type_of(to_type, ctx)
-            # bool <-> int needs an explicit widening decision; only int<->int and the
-            # identity are modeled.
+            # bool <-> int needs an explicit widening decision; only int<->int, float, and
+            # the identity are modeled.
             if from_type.kind == TypeKind.Bool or to_type.kind == TypeKind.Bool:
                 value return if from_type.kind == to_type.kind
                 return null
+
+            # float -> int TRUNCATES toward zero (`7.5.i64()` is 7, and `(-7.5).i64()` is
+            # -7), which is what FPToSI does — verified against stage0.
+            if from_type.kind == TypeKind.Float and to_type.kind != TypeKind.Float:
+                return LLVMBuildFPToSI(builder, value, target, "fptosi") if to_type.kind == TypeKind.Signed else LLVMBuildFPToUI(builder, value, target, "fptoui")
+            # int -> float follows the SOURCE's signedness: u8 200 becomes 200.0, i8 -56
+            # becomes -56.0.
+            if to_type.kind == TypeKind.Float and from_type.kind != TypeKind.Float:
+                return LLVMBuildSIToFP(builder, value, target, "sitofp") if from_type.kind == TypeKind.Signed else LLVMBuildUIToFP(builder, value, target, "uitofp")
+            if from_type.kind == TypeKind.Float and to_type.kind == TypeKind.Float:
+                value return if from_type.bits == to_type.bits
+                return LLVMBuildFPTrunc(builder, value, target, "fptrunc") if to_type.bits < from_type.bits else LLVMBuildFPExt(builder, value, target, "fpext")
+
             value return if from_type.bits == to_type.bits
             LLVMBuildTrunc(builder, value, target, "trunc") return if to_type.bits < from_type.bits
             return LLVMBuildSExt(builder, value, target, "sext") if from_type.kind == TypeKind.Signed else LLVMBuildZExt(builder, value, target, "zext")
@@ -518,6 +566,12 @@ module Backend:
             if expression is Expr.BoolLit(bool_value):
                 bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
                 return LLVMConstInt(bool_type, 1, 0) if bool_value else LLVMConstInt(bool_type, 0, 0)
+            # `1.5` — built from the SOURCE TEXT, so LLVM's own parser decides the exact
+            # bits rather than the backend re-implementing decimal rounding.
+            if expression is Expr.FloatLit(float_text):
+                null return if expected.kind != TypeKind.Float
+                text_storage: mutable darray[u8] = []
+                return LLVMConstRealOfString(llvm_type_of(expected, ctx), sview_to_cstr(float_text, text_storage))
             # An ident is a local read: load from its slot, at the slot's own type.
             if expression is Expr.Ident(ident_name, ident_line):
                 ident_type: ValueType = lookup_type(local_scope, ident_name)
@@ -536,11 +590,15 @@ module Backend:
                         return LLVMBuildXor(builder, bool_operand, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), "not")
                     return null
                 operand_type: ValueType = resolve_type(unary_operand, expected, local_scope, fns)
-                null return if not is_integer_type(operand_type)
+                null return if not is_numeric_type(operand_type)
                 if emit_expression(unary_operand, operand_type, local_scope, fns, m, ctx, builder) is operand:
                     operand return if unary_operator == TokenKind.Plus
-                    LLVMBuildNeg(builder, operand, "neg") return if unary_operator == TokenKind.Minus
-                    LLVMBuildNot(builder, operand, "bnot") return if unary_operator == TokenKind.Tilde
+                    if unary_operator == TokenKind.Minus:
+                        # `-x` on a float is fneg; `~x` has no float form.
+                        return LLVMBuildFNeg(builder, operand, "fneg") if operand_type.kind == TypeKind.Float else LLVMBuildNeg(builder, operand, "neg")
+                    if unary_operator == TokenKind.Tilde:
+                        null return if operand_type.kind == TypeKind.Float
+                        return LLVMBuildNot(builder, operand, "bnot")
                 return null
             if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
                 # `and`/`or` SHORT-CIRCUIT: the right side must only be emitted on the path
@@ -555,8 +613,8 @@ module Backend:
                 if operand_type.kind == TypeKind.Unmodeled:
                     # Both sides are literals (`2 + 3`): fall back to the context, which
                     # for a comparison is bool — so use i64 there.
-                    operand_type <- expected if is_integer_type(expected) else ValueType{kind: TypeKind.Signed, bits: 64}
-                null return if not is_integer_type(operand_type)
+                    operand_type <- expected if is_numeric_type(expected) else ValueType{kind: TypeKind.Signed, bits: 64}
+                null return if not is_numeric_type(operand_type)
                 # MIXED WIDTHS are not modeled: Elisa has no implicit numeric conversion
                 # in the subset, and silently extending one side would invent semantics.
                 left_own: ValueType = expression_type(binary_left, local_scope, fns)
@@ -666,6 +724,8 @@ module Backend:
                     target_type: ValueType = scalar_type_of_name(cast_name)
                     null return if target_type.kind == TypeKind.Unmodeled
                     null return if call_arguments.count != 0
+                    # The source's own type decides; only a bare literal receiver needs a
+                    # default, and `1.5.i64()` is not a form the subset needs to model.
                     source_type: ValueType = resolve_type(cast_object, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns)
                     if emit_expression(cast_object, source_type, local_scope, fns, m, ctx, builder) is source_value:
                         return emit_conversion(source_value, source_type, target_type, ctx, builder)

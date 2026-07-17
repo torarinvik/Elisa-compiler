@@ -143,6 +143,20 @@ run_case i32_arithmetic   'def main() -> i64:\n    a: i32 = 1000\n    b: i32 = 3
 # 4000000000 > 100 is TRUE unsigned; read as a signed i32 it is negative and FALSE.
 run_case u32_compare      'def main() -> i64:\n    a: u32 = 4000000000\n    return 42 if a > 100 else 7\n'  42
 
+# FLOATS. A different instruction family end to end (fadd/fdiv/fcmp), plus int<->float
+# conversion. 7.5+2.0=9.5->9, 7.5/2.0=3.75->3, 7.5*2.0=15 => 27, which also pins that
+# float->int TRUNCATES toward zero rather than rounding.
+run_case f64_arithmetic   'def main() -> i64:\n    x: f64 = 7.5\n    y: f64 = 2.0\n    a: f64 = x + y\n    b: f64 = x / y\n    c: f64 = x * y\n    return a.i64() + b.i64() + c.i64()\n'  27
+run_case f64_from_int     'def main() -> i64:\n    n: i64 = 7\n    x: f64 = n.f64()\n    y: f64 = x / 2.0\n    return y.i64()\n'  3
+run_case f64_compare      'def main() -> i64:\n    x: f64 = 1.5\n    return 42 if x < 2.0 else 7\n'  42
+run_case f64_negate       'def main() -> i64:\n    x: f64 = 7.5\n    y: f64 = -x\n    return y.i64() + 49\n'  42
+run_case f64_params       'def scale(x: f64, k: f64) -> f64:\n    return x * k\n\ndef main() -> i64:\n    return scale(10.5, 4.0).i64()\n'  42
+# 7.9 -> 7 proves truncation toward zero (rounding would give 8).
+run_case f64_truncates    'def main() -> i64:\n    x: f64 = 7.9\n    return x.i64() + 35\n'  42
+# u8 -> f64 must go through uitofp: sitofp would read 200 as -56.
+run_case u8_to_f64        'def main() -> i64:\n    a: u8 = 200\n    x: f64 = a.f64()\n    return x.i64()\n'  200
+run_case f32_arithmetic   'def main() -> i64:\n    x: f32 = 2.5\n    y: f32 = x * 4.0\n    return y.i64() + 32\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -195,6 +209,10 @@ diff_case bitnot      'def main() -> i64:\n    a: i64 = 5\n    return ~a + 200\n
 diff_case and_or_not  'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'
 diff_case compound    'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'
 diff_case short_circuit 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'
+diff_case f64_arith   'def main() -> i64:\n    x: f64 = 7.5\n    y: f64 = 2.0\n    a: f64 = x + y\n    b: f64 = x / y\n    c: f64 = x * y\n    return a.i64() + b.i64() + c.i64()\n'
+diff_case f64_trunc   'def main() -> i64:\n    x: f64 = 7.9\n    return x.i64() + 35\n'
+diff_case u8_to_f64   'def main() -> i64:\n    a: u8 = 200\n    x: f64 = a.f64()\n    return x.i64()\n'
+diff_case f32         'def main() -> i64:\n    x: f32 = 2.5\n    y: f32 = x * 4.0\n    return y.i64() + 32\n'
 diff_case u8_div      'def divide(a: u8, b: u8) -> u8:\n    return a / b\n\ndef main() -> i64:\n    return divide(200, 3).i64()\n'
 diff_case u8_shr      'def shift(a: u8) -> u8:\n    return a >> 1\n\ndef main() -> i64:\n    return shift(200).i64()\n'
 diff_case u8_zext     'def main() -> i64:\n    a: u8 = 200\n    return a.i64()\n'
@@ -212,8 +230,8 @@ decline_case() {
 }
 
 # `-> f64` is outside the modeled i64 subset.
-# f64 needs the float instruction family (fadd/fdiv/fcmp) — not modeled yet.
-decline_case float_return 'def main() -> f64:\n    return 1\n'
+# Bitwise operators have no float form.
+decline_case float_bitwise 'def main() -> i64:\n    x: f64 = 2.0\n    y: f64 = x & x\n    return y.i64()\n'
 # MIXED WIDTHS have no implicit conversion in the subset: silently extending one side
 # would invent semantics the language does not have.
 decline_case mixed_widths 'def main() -> i64:\n    a: i32 = 1\n    b: i64 = 2\n    c: i64 = a + b\n    return c\n'
