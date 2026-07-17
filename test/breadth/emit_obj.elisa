@@ -1,0 +1,89 @@
+# The DRIVER counterpart to emit_native: instead of PRINTING the module's IR text and leaving
+# `llc` to turn it into an object out of process, this builds a target machine and emits the
+# native OBJECT itself.
+#
+# Why it matters beyond tidiness: this is the capability DWARF and `-Wperf` need. Both are
+# invisible in IR text -- stage0's own `-emit llvm -g` emits ZERO debug metadata, and the
+# autovec markers never reach IR output at -O0 or -O2 -- and `-Wperf`'s check is inherently
+# POST-optimization. Neither can exist while the backend stops at printing IR.
+#
+# Reads the program on stdin (like emit_native) and writes the object to a fixed path given
+# as the first argument.
+include "../../src/backend/codegen.elisa"
+
+using Bytes
+
+extern read(fd: int, buf: void&, count: usize) -> isize can[Console]
+extern puts(s: cstr) -> int can[Console]
+
+def read_all() -> darray[u8] can[Console, Memory.Allocate, Abort.Panic]:
+    buf: mutable darray[u8] = []
+    chunk: mutable darray[u8] = [0 for _ in 0..<8192]
+    while true |buf|:
+        n: isize = read(0, (&chunk[0]).cast[void&], 8192) can Console
+        break if n <= 0
+        for index in 0..<n.usize() |buf|:
+            buf.push(chunk[index])
+    buf.push(0)
+    return buf
+
+def main() -> i64 can[Console, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    src: darray[u8] = read_all()
+    1 return if src.count <= 1
+    source_length: usize = src.count - 1
+    tokens: darray[Lexer::Token] = frontend_tokenize_with_length(&src[0], &src[0], source_length)
+    file: Ast::File = frontend_parser_parse_file(&src[0], tokens)
+    1 return if file.errors.count != 0
+
+    ctx: LLVMContextRef = LLVMContextCreate()
+    module_handle: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisa_stage1", ctx)
+    builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+    # This driver always requests debug info: its purpose is proving DWARF reaches the
+    # object, and stage0's own `-emit llvm -g` cannot show it.
+    emitted_count: i64 = Backend::emit_module_with_debug(file, module_handle, ctx, builder, true, "stage1.elisa")
+    if emitted_count <= 0:
+        _ = puts("UNSUPPORTED") can Console
+        return 2
+
+    # The per-target initializers, NOT LLVMInitializeNativeTarget: that one is a
+    # `static inline` in Target.h and has no symbol to bind against.
+    LLVMInitializeAArch64TargetInfo()
+    LLVMInitializeAArch64Target()
+    LLVMInitializeAArch64TargetMC()
+    LLVMInitializeAArch64AsmPrinter()
+
+    triple: cstr = LLVMGetDefaultTargetTriple()
+    LLVMSetTarget(module_handle, triple)
+    target: mutable LLVMTargetRef = zeroed
+    error_message: mutable cstr = zeroed
+    target_pointer: void& = (&target).cast[void&] can Unsafe.PointerCast
+    error_pointer: void& = (&error_message).cast[void&] can Unsafe.PointerCast
+    # Returns 0 on SUCCESS — an error flag, not a truth value.
+    if LLVMGetTargetFromTriple(triple, target_pointer, error_pointer) != 0:
+        _ = puts("NO TARGET") can Console
+        return 3
+
+    machine: LLVMTargetMachineRef = LLVMCreateTargetMachine(target, triple, "generic", "", 0, 0, 0)
+
+    # Run the OPTIMIZER before emitting. `LLVMRunPasses` takes a pipeline STRING, not a level
+    # enum, and returns an LLVMErrorRef that is NULL on success (not a bool). Without this
+    # the backend emits -O0 code and, more importantly, can never judge what the vectorizer
+    # did -- which is the whole basis of `-Wperf`.
+    pass_options: LLVMPassBuilderOptionsRef = LLVMCreatePassBuilderOptions()
+    pass_error: void&? = LLVMRunPasses(module_handle, "default<O2>", machine, pass_options)
+    LLVMDisposePassBuilderOptions(pass_options)
+    if pass_error is real_error:
+        _ = puts("PASSES FAILED") can Console
+        return 5
+    # `-Wperf`: AFTER the passes, report every loop that asked to be vectorized and was not.
+    # The judgement only exists here -- before the passes there is nothing to judge, and the
+    # marker is what ties the verdict back to the comprehension that asked.
+    unvectorized: i64 = Backend::verify_autovec_expectations(module_handle, ctx)
+    if unvectorized > 0:
+        _ = puts("WPERF: a comprehension did not vectorize") can Console
+
+    # 1 = LLVMObjectFile (0 would be assembly).
+    if LLVMTargetMachineEmitToFile(machine, module_handle, "stage1_out.o", 1, error_pointer) != 0:
+        _ = puts("EMIT FAILED") can Console
+        return 4
+    return 0
