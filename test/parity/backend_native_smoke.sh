@@ -60,17 +60,63 @@ run_case() {
     pass=$((pass + 1))
 }
 
-# The spine's modeled subset: a parameterless `-> i64` whose body is one `return <int>`.
+# The spine's modeled subset: a parameterless `-> i64` returning an int expression.
 run_case return_42        'def main() -> i64:\n    return 42\n'   42
 run_case return_0         'def main() -> i64:\n    return 0\n'     0
 run_case return_7         'def main() -> i64:\n    return 7\n'     7
 # Exit codes are taken mod 256 by the shell; 200 stays in range and is not a boundary.
 run_case return_200       'def main() -> i64:\n    return 200\n'  200
 
-# An UNSUPPORTED input must be DECLINED, never silently mis-emitted. `return x + 1` is
-# outside the modeled subset (no binary-op emission yet), so the emitter must exit 2.
+# Arithmetic. Precedence/grouping are asserted by VALUE (2+3*4 == 14, not 20), so a
+# backend that ignored precedence could not pass.
+run_case precedence       'def main() -> i64:\n    return 2 + 3 * 4\n'    14
+run_case grouping         'def main() -> i64:\n    return (2 + 3) * 4\n'  20
+run_case subtraction      'def main() -> i64:\n    return 50 - 8\n'       42
+run_case division         'def main() -> i64:\n    return 100 / 7\n'      14
+run_case remainder        'def main() -> i64:\n    return 100 % 7\n'       2
+run_case unary_minus      'def main() -> i64:\n    return -5 + 47\n'      42
+
+# --- differential against stage0 -----------------------------------------------------
+# The strongest oracle available: compile the SAME source with the reference compiler and
+# require identical observable behavior. Hardcoding an expected value only checks what we
+# guessed; this checks what Elisa actually means. Signed div/rem is where a backend most
+# plausibly diverges (sdiv/srem vs udiv/urem), so the corners are the payload here.
+diff_case() {
+    local name="$1" src="$2"
+    total=$((total + 1))
+    local ll="$BUILD/diff_$name.ll"
+
+    if ! printf '%b' "$src" | "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        echo "  FAIL diff_$name: stage1 declined to emit"; return
+    fi
+    "$LLC" -filetype=obj "$ll" -o "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: llc rejected stage1 IR"; return; }
+    clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
+    "$BUILD/diff_${name}_s1"; local got1=$?
+
+    printf '%b' "$src" > "$BUILD/diff_$name.elisa"
+    if ! "$ELISACORE_BIN" -emit obj -o "$BUILD/diff_${name}_s0.o" "$BUILD/diff_$name.elisa" 2>/dev/null; then
+        echo "  SKIP diff_$name: stage0 could not compile the reference"; total=$((total - 1)); return
+    fi
+    clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.o" 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
+    "$BUILD/diff_${name}_s0"; local got0=$?
+
+    if [ "$got1" -ne "$got0" ]; then
+        echo "  FAIL diff_$name: stage1=$got1 stage0=$got0 (backends disagree)"; return
+    fi
+    pass=$((pass + 1))
+}
+
+diff_case neg_rem     'def main() -> i64:\n    return -7 % 2\n'
+diff_case neg_div     'def main() -> i64:\n    return -7 / 2\n'
+diff_case rem_neg_rhs 'def main() -> i64:\n    return 7 % -2\n'
+diff_case precedence  'def main() -> i64:\n    return 2 + 3 * 4\n'
+diff_case div         'def main() -> i64:\n    return 100 / 7\n'
+
+# An UNSUPPORTED input must be DECLINED, never silently mis-emitted. A call is outside
+# the modeled subset (no call emission yet), so the emitter must exit 2. Keep this case
+# pointed at something genuinely unmodeled as coverage grows.
 total=$((total + 1))
-printf '%b' 'def main() -> i64:\n    return 1 + 1\n' | "$BUILD/emit_native" >/dev/null 2>&1
+printf '%b' 'def g() -> i64:\n    return 1\n\ndef main() -> i64:\n    return g()\n' | "$BUILD/emit_native" >/dev/null 2>&1
 if [ $? -eq 2 ]; then
     pass=$((pass + 1))
 else
