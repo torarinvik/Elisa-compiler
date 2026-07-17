@@ -31,6 +31,10 @@ out=$(printf 'def f() -> void:\n    region left(64)\n    region right(64)\n    v
 echo "$out" | grep -q 'variable "other" expects i32& @right, got i32& @left' || fail "mismatched local regions were not flagged: $out"
 clean $'def f() -> void:\n    region same(64)\n    value: i32& @same = new[same] 1\n    alias: i32& @same = value\n'
 
+out=$(printf 'def bad() -> i32&:\n    region scratch(64)\n    value: i32& = new[scratch] 1\n    return value\n' | "$RPT")
+echo "$out" | grep -q 'cannot return reference: region dependency facts include local region "scratch"' || fail "local-region return escape was not flagged: $out"
+clean $'def id[T, @r](value: T& @r) -> T& @r:\n    alias: T& @r = value\n    return alias\n'
+
 out="$(printf '%s' $'def f() -> void:\n    destroy missing\n' | "$RPT")"
 echo "$out" | grep -q "undefined name 'missing'" || fail "destroy of unknown region was not resolved: $out"
 
