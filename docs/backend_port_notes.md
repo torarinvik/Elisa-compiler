@@ -367,7 +367,34 @@ So: **`f(out_ptr, args…) -> i32 tag`**. The declared type
     catch.dispatch:   ; switch i32 %errunion.code, label %catch.error [ … ]
                       ; per-variant arms become switch cases; `error e:` is the default
 
-### Implementation order
+### BLOCKED — and NOT on the backend: stage1's AST loses the catch subject
+
+Do not start the implementation below until this is fixed. `Ast::Stmt.Block` is:
+
+    Block(kind: sview, clause: darray[sview], binding: sview, body: darray[Stmt], line: u32)
+
+There is **no Expr field**. `catch risky(true):` is parsed by `parse_block_prefix`
+(src/parser/parser_stmt_control.elisa ~238): `block_kind` becomes "catch" and the prefix
+tokens go into `clause` (dotted-name sviews) or are skipped by the `_:` fallthrough. The
+SUBJECT EXPRESSION is discarded — at best the dotted name "risky" survives, with the call
+and its arguments gone. The backend cannot emit a catch because the information is not in
+the tree.
+
+Worse, stage1 also MIS-DIAGNOSES that program (which stage0 compiles and runs):
+
+    P 0
+    D 2
+      L9 top-level integer match arm must use an integer literal or _
+      L9 top-level integer match arm must use an integer literal or _
+
+L9 is the `ok:` success arm — the checker is running catch arms through the INTEGER MATCH
+arm check. A real stage1/stage0 divergence, filed as a task against the frontend.
+
+`try EXPR` (statement form, e.g. collections.elisa:977
+`try arena_dict_reserve(owner, m, target_capacity)`) has the same shape and probably the
+same gap — check it when fixing.
+
+### Implementation order (once the AST carries the subject)
 
 1. `error Bad: Nope` decl -> a table of error sets and their variant CODES. Codes start at
    1; **0 is reserved for ok**.
