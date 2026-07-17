@@ -64,6 +64,10 @@ module Backend:
             # `call void @bump(ptr %x)`. Mutability is a FRONTEND concern (it already
             # rejects writes through a `T&`), so the backend models only the referent.
             Ref
+            # An optional `T?`. `bits` indexes the OPTIONAL side-pool (`optional_targets`).
+            # Represented exactly as stage0 does — `{i1 has_value, T value}` (read from its
+            # `-emit llvm`: `%Optional__i64 = type { i1, i64 }`).
+            Optional
             # A `darray[T]`. `bits` indexes the DARRAY side-pool (`darray_elements`).
             # Represented exactly as stage0 does — `{ptr items, i64 count, i64 capacity}`,
             # backed by an Arena — because both link the SAME runtime, so the layout is
@@ -151,6 +155,8 @@ module Backend:
                 # `T&` — a POSTFIX unary in the AST (the parser distinguishes it from infix
                 # bitwise-and by looking past the whole `&` run).
                 intern_ref_type(annotation_value_type(qualified_type, structs), structs) return if qualifier == TokenKind.Ampersand
+                # `T?` — also a postfix unary.
+                intern_optional_type(annotation_value_type(qualified_type, structs), structs) return if qualifier == TokenKind.Question
                 return unmodeled_type()
             # `i64[3]` — a fixed array. The bracket holds an extent VALUE and the HEAD is
             # the element type. A NON-literal bracket (`cstr[shape]`) is a shape parameter,
@@ -193,6 +199,12 @@ module Backend:
             if value_type.kind == TypeKind.Array:
                 slot: usize = value_type.bits.usize()
                 return LLVMArrayType(llvm_type_of(structs.array_elements[slot], structs, ctx), structs.array_extents[slot])
+            # `{i1 has_value, T value}` — stage0's Optional layout.
+            if value_type.kind == TypeKind.Optional:
+                payload: ValueType = copied_type(structs.optional_targets[value_type.bits.usize()])
+                fields: mutable darray[LLVMTypeRef] = [LLVMInt1TypeInContext(ctx), llvm_type_of(payload, structs, ctx)]
+                fields_pointer: void& = (&fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, fields_pointer, 2, 0)
             # A reference is just a pointer; the referent matters only at the load/store.
             LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.Ref
             # `{ptr items, i64 count, i64 capacity}` — stage0's DynArray layout, which the
@@ -229,6 +241,8 @@ module Backend:
             darray_elements: mutable darray[ValueType]
             # `T&` referent types, interned the same way.
             ref_targets: mutable darray[ValueType]
+            # `T?` payload types, interned the same way.
+            optional_targets: mutable darray[ValueType]
             # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
             # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
             #
@@ -303,6 +317,23 @@ module Backend:
                     return ValueType{kind: TypeKind.Ref, bits: index.u32()}
             structs.ref_targets <- structs.ref_targets.push(target)
             return ValueType{kind: TypeKind.Ref, bits: (structs.ref_targets.count - 1).u32()}
+
+
+        # Intern an optional type `T?`.
+        def intern_optional_type(payload: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if payload.kind == TypeKind.Unmodeled or payload.kind == TypeKind.Optional
+            for index in 0..<structs.optional_targets.count |structs, payload|:
+                existing: ValueType = structs.optional_targets[index]
+                if existing.kind == payload.kind and existing.bits == payload.bits:
+                    return ValueType{kind: TypeKind.Optional, bits: index.u32()}
+            structs.optional_targets <- structs.optional_targets.push(payload)
+            return ValueType{kind: TypeKind.Optional, bits: (structs.optional_targets.count - 1).u32()}
+
+
+        # The payload type of a `T?`.
+        def optional_payload_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.Optional
+            return copied_type(structs.optional_targets[value_type.bits.usize()])
 
 
         # The referent type of a `T&`.
@@ -588,7 +619,8 @@ module Backend:
                 ValueType{kind: TypeKind.Bool, bits: 1} return if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang
                 return expression_type(unary_operand, local_scope, fns, structs, generics)
             if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
-                # A comparison or logical yields bool regardless of operand type.
+                # A comparison, logical, or `is` narrowing yields bool regardless of operands.
+                ValueType{kind: TypeKind.Bool, bits: 1} return if binary_operator == TokenKind.Is
                 ValueType{kind: TypeKind.Bool, bits: 1} return if int_predicate_of(binary_operator) >= 0
                 ValueType{kind: TypeKind.Bool, bits: 1} return if binary_operator == TokenKind.And or binary_operator == TokenKind.Or
                 # Arithmetic keeps the operands' type: take whichever side is known, since
@@ -1239,9 +1271,61 @@ module Backend:
             return ref_target_of(declared, structs)
 
 
+        # Whether an expression threads its `expected` type down to sub-expressions rather
+        # than producing a value directly. Such a form must NOT be implicitly wrapped: its
+        # ARMS each wrap themselves, which is what makes `42 if flag else null` work.
+        def propagates_expected(expression: Expr) -> bool can[Abort.Panic]:
+            if expression is Expr.If(condition, then_expression, else_expression, line):
+                return true
+            if expression is Expr.Match(scrutinee, arms, match_line):
+                return true
+            if expression is Expr.Paren(inner, paren_line):
+                return propagates_expected(inner)
+            return false
+
+
+        # Whether an expression is the `null` literal (an IDENT named "null" in the AST).
+        def is_null_literal(expression: Expr) -> bool can[Abort.Panic]:
+            if expression is Expr.Ident(name, line):
+                return name == "null"
+            return false
+
+
+        # Wrap `value` (of type `payload`) into a `T?` — `{true, value}`.
+        #
+        # Built through a slot rather than insertvalue: the tag and payload are two plain
+        # stores, and SROA collapses it at -O2 exactly the same. An Elisa expression of
+        # payload type in an optional context is implicitly wrapped — the language has no
+        # `some(x)`, so this is where that happens.
+        def wrap_optional(value: LLVMValueRef, optional_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            optional_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+            slot: LLVMValueRef = LLVMBuildAlloca(builder, optional_llvm, "opt")
+            tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, slot, 0, "opt.tag.ptr")
+            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), tag_pointer)
+            value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, slot, 1, "opt.value.ptr")
+            _ = LLVMBuildStore(builder, value, value_pointer)
+            return LLVMBuildLoad2(builder, optional_llvm, slot, "opt.wrapped")
+
+
         # Emit a value expression, producing a value of `resolve_type(expression, expected)`.
         # `null` = unmodeled; the caller must decline.
         def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # IMPLICIT WRAP: Elisa has no `some(x)` — an expression of payload type in an
+            # optional context IS the optional. Handled before everything else so each
+            # value form stays unaware of optionals: re-emit at the PAYLOAD type, then wrap.
+            # `null` is excluded (it is the empty optional, not a payload).
+            if expected.kind == TypeKind.Optional:
+                payload_type: ValueType = optional_payload_of(expected, structs)
+                # A value-`if` / `match` already threads `expected` DOWN to its arms, so
+                # each arm wraps itself. Wrapping the whole form instead would push the
+                # payload type into the arms and reject `42 if flag else null` — the `null`
+                # arm is not an i64.
+                if not is_null_literal(expression) and not propagates_expected(expression):
+                    own: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+                    if own.kind != TypeKind.Optional:
+                        if emit_expression(expression, payload_type, local_scope, fns, structs, generics, m, ctx, builder) is payload_value:
+                            return wrap_optional(payload_value, expected, structs, ctx, builder)
+                        return null
             if expression is Expr.IntLit(literal_value):
                 # A literal takes the context's type. sign_extend=1 so a negative literal
                 # fills correctly at any width.
@@ -1257,6 +1341,13 @@ module Backend:
                 text_storage: mutable darray[u8] = []
                 return LLVMConstRealOfString(llvm_type_of(expected, structs, ctx), sview_to_cstr(float_text, text_storage))
             # An ident is a local read: load from its slot, at the slot's own type.
+            # `null` is an IDENT named "null" in the AST, not its own node. It is the
+            # empty optional: `{false, undef}` — the payload half is never read when the
+            # tag is false, so a zeroed struct is the whole value.
+            if expression is Expr.Ident(null_name, null_line):
+                if null_name == "null":
+                    null return if expected.kind != TypeKind.Optional
+                    return LLVMConstNull(llvm_type_of(expected, structs, ctx))
             if expression is Expr.Ident(ident_name, ident_line):
                 ident_type: ValueType = lookup_type(local_scope, ident_name)
                 null return if ident_type.kind == TypeKind.Unmodeled
@@ -1291,6 +1382,28 @@ module Backend:
                         null return if operand_type.kind == TypeKind.Float
                         return LLVMBuildNot(builder, operand, "bnot")
                 return null
+            # `v is name` — optional NARROWING. Yields the tag as a bool AND binds the
+            # payload to `name`, which the guarded block then reads. The binding is
+            # introduced unconditionally here; the frontend has already proved it is only
+            # read where the tag is true, so the backend does not re-prove it.
+            if expression is Expr.Binary(is_left, is_operator, is_right, is_line):
+                if is_operator == TokenKind.Is:
+                    if is_right is Expr.Ident(bind_name, bind_line):
+                        optional_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                        null return if optional_type.kind != TypeKind.Optional
+                        if emit_expression(is_left, optional_type, local_scope, fns, structs, generics, m, ctx, builder) is optional_value:
+                            optional_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+                            holder: LLVMValueRef = LLVMBuildAlloca(builder, optional_llvm, "is.opt")
+                            _ = LLVMBuildStore(builder, optional_value, holder)
+                            payload_type: ValueType = optional_payload_of(optional_type, structs)
+                            payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, holder, 1, "is.value.ptr")
+                            bind_storage: mutable darray[u8] = []
+                            bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(payload_type, structs, ctx), sview_to_cstr(bind_name, bind_storage))
+                            _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(payload_type, structs, ctx), payload_pointer, "is.value"), bind_slot)
+                            declare_local(local_scope, bind_name, bind_slot, payload_type)
+                            tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, holder, 0, "is.tag.ptr")
+                            return LLVMBuildLoad2(builder, LLVMInt1TypeInContext(ctx), tag_pointer, "is.tag")
+                    return null
             if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
                 # `and`/`or` SHORT-CIRCUIT: the right side must only be emitted on the path
                 # that reaches it, so they cannot go through emit_binary.
@@ -2080,7 +2193,7 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], binding_names: [], binding_types: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], binding_names: [], binding_types: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)

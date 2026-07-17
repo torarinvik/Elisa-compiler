@@ -268,6 +268,23 @@ run_case field_assign     'struct P:\n    x: mutable i64\n    y: i64\n\ndef main
 run_case void_call        'def noop() -> void:\n    return\n\ndef main() -> i64:\n    noop()\n    return 42\n'  42
 run_case void_fallthrough 'struct C:\n    v: mutable i64\n\ndef setit(c: mutable C&) -> void:\n    c.v <- 42\n\ndef main() -> i64:\n    c: mutable C = C{v: 0}\n    setit(c)\n    return c.v\n'  42
 
+# OPTIONALS (`T?`) — `{i1 has_value, T value}`, stage0's layout read from its `-emit llvm`
+# (`%Optional__i64 = type { i1, i64 }`). In the AST `T?` is a POSTFIX Expr.Unary(Question, T),
+# and `null` is an IDENT named "null", not its own node.
+#
+# Elisa has no `some(x)`: a payload-typed expression in an optional context IS the optional,
+# so the backend wraps implicitly. A value-`if`/`match` is EXCLUDED from that — it threads
+# `expected` to its arms, which wrap themselves; wrapping the whole form would push the
+# payload type into the arms and reject `42 if flag else null`.
+run_case optional_local   'def main() -> i64:\n    v: i64? = 42\n    if v is found:\n        return found\n    return 0\n'  42
+run_case optional_null    'def main() -> i64:\n    v: i64? = null\n    if v is found:\n        return found\n    return 42\n'  42
+# An optional RETURN with mixed value/null arms — the case that breaks a naive wrap.
+run_case optional_return  'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(true)\n    if v is found:\n        return found\n    return 0\n'  42
+# The null path of the same function: proves the tag is real, not always-true.
+run_case optional_absent  'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(false)\n    if v is found:\n        return found\n    return 42\n'  42
+# A non-i64 payload: the wrap must use the payload's own width.
+run_case optional_u8      'def main() -> i64:\n    v: u8? = 200\n    if v is found:\n        return found.i64() - 158\n    return 0\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -336,6 +353,9 @@ diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n   
 diff_case array_literal 'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'
 diff_case array_u8      'def main() -> i64:\n    xs: u8[3] = [200, 100, 50]\n    return xs[0].i64() - xs[1].i64() - xs[2].i64() - 8\n'
 diff_case array_rw      'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0, 0, 0]\n    for i in 0..<5:\n        xs[i] <- i * 2\n    total: mutable i64 = 0\n    for j in 0..<5:\n        total <- total + xs[j]\n    return total + 22\n'
+diff_case optional_return 'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(true)\n    if v is found:\n        return found\n    return 0\n'
+diff_case optional_absent 'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(false)\n    if v is found:\n        return found\n    return 42\n'
+diff_case optional_u8     'def main() -> i64:\n    v: u8? = 200\n    if v is found:\n        return found.i64() - 158\n    return 0\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
