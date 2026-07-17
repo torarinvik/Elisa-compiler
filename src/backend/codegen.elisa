@@ -1,0 +1,88 @@
+# Stage1 backend — LLVM codegen (`module Backend`).
+#
+# The stage0 counterpart is compiler/src/backend/llvm_*.go (~54k lines of cgo). This is
+# the spine of that port: it walks the stage1 AST and drives LLVM-C (see llvm_c.elisa).
+#
+# Sound SUBSET, mirroring how the frontend was ported: only firmly-modeled constructs
+# emit. `emit_function` returns false for anything it does not model yet, so the driver
+# can report an honest "unsupported" instead of emitting wrong code. Coverage grows one
+# construct at a time, each with a compile-and-run fixture that asserts real behavior
+# (an exit code / stdout), never just "it compiled".
+
+include "../semantic/semantic.elisa"
+include "llvm_c.elisa"
+using Ast
+
+module Backend:
+
+    private:
+
+        # LLVM-C takes NUL-terminated `const char*`, but an `sview` is a (ptr, len) view
+        # into the source buffer with no terminator — taking `&view[0]` would hand LLVM a
+        # string that runs to the end of the FILE. Copy the bytes and terminate.
+        # `storage` is caller-owned on purpose: the returned pointer aliases it, so it
+        # must outlive the LLVM call that consumes the name.
+        def sview_to_cstr(name: sview, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<sview_len(name) |storage|:
+                storage.push(sview_at(name, index))
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        # An `i64` literal is the only value form the spine models. `null` means "not
+        # modeled" and the caller must decline to emit.
+        #
+        # Returns a bare `LLVMValueRef?` rather than a `(value, ok)` pair: `null` already
+        # carries "not modeled", so the companion flag was redundant.
+        def emit_expression(expression: Expr, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic]:
+            if expression is Expr.IntLit(literal_value):
+                int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                # sign_extend=1: Elisa's `i64` is signed, so a negative literal must
+                # sign-extend into LLVM's u64-shaped constant argument.
+                return LLVMConstInt(int64_type, literal_value.u64(), 1)
+            return null
+
+    public:
+
+        # Emit every modeled declaration in `file`, returning how many were emitted.
+        #
+        # Takes `file` BY REFERENCE, mirroring `Semantic::check(file: Ast::File&)` — the
+        # AST is a large region-backed structure and there is no reason to copy it.
+        #
+        # `emitted_count <- …`, NOT `=`: inside a `for … |captures|:` loop a captured
+        # scalar must be threaded with `<-`. A plain `=` compiles clean and silently does
+        # nothing, so the count stays 0 and every emitted function looks unsupported.
+        def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            emitted_count: mutable i64 = 0
+            for declaration in file.top_decls |emitted_count, m, ctx, builder|:
+                emitted_count <- emitted_count + 1 if emit_function(declaration, m, ctx, builder) else emitted_count
+            return emitted_count
+
+
+        # Emit one `def name() -> i64` whose body is a single `return <int literal>`.
+        # Deliberately narrow: this is the vertical slice that proves the whole toolchain
+        # (lex -> parse -> backend -> LLVM -> object -> link -> run), not a general emitter.
+        # Returns false when the declaration is outside the modeled subset.
+        def emit_function(declaration: Decl, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if declaration is Decl.Func(function_name, params, return_type, body, effects, decorators, line):
+                false return if params.count != 0
+                false return if body.count != 1
+
+                statement: Stmt = body[0]
+                if statement is Stmt.Return(return_value_opt, return_line):
+                    if return_value_opt is return_value:
+                        emitted: LLVMValueRef? = emit_expression(return_value, ctx)
+                        if emitted is return_constant:
+                            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                            # A parameterless function: null params pointer, count 0.
+                            fn_type: LLVMTypeRef = LLVMFunctionType(int64_type, null, 0, 0)
+                            name_storage: mutable darray[u8] = []
+                            fn_name: cstr = sview_to_cstr(function_name, name_storage)
+                            fn: LLVMValueRef = LLVMAddFunction(m, fn_name, fn_type)
+                            entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
+                            LLVMPositionBuilderAtEnd(builder, entry)
+                            _ = LLVMBuildRet(builder, return_constant)
+                            return true
+                return false
+            # Not a function declaration (a struct/enum/extern/…): not modeled.
+            return false
