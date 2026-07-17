@@ -2348,6 +2348,119 @@ module Backend:
                                 LLVMPositionBuilderAtEnd(builder, try_done_block)
                                 return LLVMBuildLoad2(builder, try_result_type, try_result_slot, "try.value")
                 return null
+
+            # `catch f(args):` with a success arm and error-variant arms. The callee is an
+            # ERROR fn (i32 status + out-param, stage0's ABI): call it, `code == 0` takes
+            # the SUCCESS arm (arm 0, its Binding pattern names the out-value), a nonzero
+            # code is `ordinal + 1` and dispatches down an icmp chain over the error arms.
+            # Merged through a result slot, not a phi (the codebase avoids phi).
+            if expression is Expr.Catch(catch_guarded, catch_arms, catch_line):
+                null return if catch_arms.count < 1
+                if catch_guarded is Expr.Call(catch_callee, catch_args, catch_arg_names, catch_call_line):
+                    if catch_callee is Expr.Ident(catch_name, catch_name_line):
+                        null return if not function_is_error(fns, "", catch_name)
+                        catch_value_type: ValueType = lookup_return_type(fns, "", catch_name)
+                        null return if catch_value_type.kind == TypeKind.Unmodeled
+                        if lookup_function(fns, "", catch_name) is catch_target:
+                            catch_value_llvm: LLVMTypeRef = llvm_type_of(catch_value_type, structs, ctx)
+                            catch_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, catch_value_llvm, "catch.out")
+                            catch_call_args: mutable darray[LLVMValueRef] = [catch_out_slot]
+                            catch_declined: mutable bool = false
+                            catch_arg_index: mutable usize = 0
+                            for catch_arg in catch_args |catch_call_args, catch_declined, catch_arg_index, catch_name, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                if emit_expression(catch_arg, param_type_of(fns, "", catch_name, catch_arg_index), local_scope, fns, structs, generics, runtime, m, ctx, builder) is catch_arg_value:
+                                    catch_call_args.push(catch_arg_value)
+                                else:
+                                    catch_declined <- true
+                                catch_arg_index <- catch_arg_index + 1
+                            null return if catch_declined
+                            catch_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(catch_target)
+                            catch_args_pointer: void& = (&catch_call_args[0]).cast[void&] can Unsafe.PointerCast
+                            catch_code: LLVMValueRef = LLVMBuildCall2(builder, catch_fn_type, catch_target, catch_args_pointer, catch_call_args.count.u32(), "catch.code")
+                            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            catch_value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.value")
+                            catch_dispatch_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.dispatch")
+                            catch_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.done")
+                            catch_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, catch_value_llvm, "catch.result")
+                            catch_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, catch_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "catch.ok")
+                            _ = LLVMBuildCondBr(builder, catch_ok, catch_value_block, catch_dispatch_block)
+
+                            # SUCCESS arm: arm 0. A Binding pattern names the out-slot value
+                            # for the arm's body; a Wildcard uses the value unchanged.
+                            LLVMPositionBuilderAtEnd(builder, catch_value_block)
+                            success_arm: MatchArm = catch_arms[0]
+                            null return if arm_has_guard(success_arm.guard)
+                            if success_arm.pattern is Pattern.Binding(success_binding):
+                                declare_local(local_scope, success_binding, catch_out_slot, catch_value_type)
+                            if arm_value_expression(success_arm.body) is success_expression:
+                                if emit_expression(success_expression, catch_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is success_value:
+                                    _ = LLVMBuildStore(builder, success_value, catch_result_slot)
+                                    _ = LLVMBuildBr(builder, catch_done_block)
+                                else:
+                                    return null
+                            else:
+                                return null
+
+                            # ERROR arms: icmp chain over `code == ordinal + 1`. A Wildcard
+                            # arm is the catch-all; without one the chain ends unreachable
+                            # (the checker proved exhaustiveness).
+                            LLVMPositionBuilderAtEnd(builder, catch_dispatch_block)
+                            error_arm_index: mutable usize = 1
+                            error_declined: mutable bool = false
+                            saw_catch_all: mutable bool = false
+                            while error_arm_index < catch_arms.count |error_arm_index, error_declined, saw_catch_all, catch_arms, catch_code, catch_value_type, catch_result_slot, catch_done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                error_arm: MatchArm = catch_arms[error_arm_index]
+                                error_arm_index <- error_arm_index + 1
+                                continue if error_declined or saw_catch_all
+                                if arm_has_guard(error_arm.guard):
+                                    error_declined <- true
+                                    continue
+                                if arm_value_expression(error_arm.body) is error_expression:
+                                    if error_arm.pattern is Pattern.Wildcard:
+                                        # catch-all: emit straight into the current block.
+                                        if emit_expression(error_expression, catch_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is catch_all_value:
+                                            _ = LLVMBuildStore(builder, catch_all_value, catch_result_slot)
+                                            _ = LLVMBuildBr(builder, catch_done_block)
+                                            saw_catch_all <- true
+                                        else:
+                                            error_declined <- true
+                                        continue
+                                    if error_arm.pattern is Pattern.Variant(error_path, error_fields):
+                                        if error_fields.count != 0:
+                                            error_declined <- true
+                                            continue
+                                        # An error decl registers as a PAYLOAD enum, so its
+                                        # variant index comes from the penum pools; a const
+                                        # enum path is the fallback.
+                                        error_ordinal: mutable i64 = penum_variant_index_of_path(error_path, structs)
+                                        if error_ordinal < 0:
+                                            error_ordinal <- ordinal_of_dotted_path(error_path, structs)
+                                        if error_ordinal < 0:
+                                            error_declined <- true
+                                            continue
+                                        error_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.arm")
+                                        error_next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.next")
+                                        error_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, catch_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), (error_ordinal + 1).u64(), 0), "catch.cmp")
+                                        _ = LLVMBuildCondBr(builder, error_hit, error_arm_block, error_next_block)
+                                        LLVMPositionBuilderAtEnd(builder, error_arm_block)
+                                        if emit_expression(error_expression, catch_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is error_value:
+                                            _ = LLVMBuildStore(builder, error_value, catch_result_slot)
+                                            _ = LLVMBuildBr(builder, catch_done_block)
+                                        else:
+                                            error_declined <- true
+                                        LLVMPositionBuilderAtEnd(builder, error_next_block)
+                                        continue
+                                    error_declined <- true
+                                else:
+                                    error_declined <- true
+                            null return if error_declined
+                            # No catch-all: the residual block is unreachable (stage0's
+                            # catch.fail) -- the checker proved the arms exhaustive.
+                            if not saw_catch_all:
+                                _ = LLVMBuildUnreachable(builder)
+                            LLVMPositionBuilderAtEnd(builder, catch_done_block)
+                            return LLVMBuildLoad2(builder, catch_value_llvm, catch_result_slot, "catch.value")
+                return null
             if expression is Expr.StringLit(string_text):
                 null return if expected.kind != TypeKind.CStr and expected.kind != TypeKind.Unmodeled
                 literal_storage: mutable darray[u8] = []
