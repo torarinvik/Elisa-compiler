@@ -4364,6 +4364,15 @@ module Backend:
         # `want_debug` emits DWARF (a compile unit + one DISubprogram per function). Kept as a
         # parameter rather than a separate entry point so there is ONE emission path: a
         # second path would drift from this one silently.
+        # Strip a half-emitted function back to a bare `declare`: delete every basic
+        # block. Used by the per-function tolerance pass — a failed body must not leave
+        # unterminated blocks in the module. An unreferenced declaration is linker-
+        # stripped; a referenced one fails the LINK loudly, never a silently-wrong binary.
+        def strip_function_body(handle: LLVMValueRef) -> void can[Abort.Panic]:
+            while LLVMGetFirstBasicBlock(handle) is first_block |handle|:
+                LLVMDeleteBasicBlock(first_block)
+
+
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
@@ -4396,76 +4405,76 @@ module Backend:
             for declaration in file.top_decls |structs|:
                 register_const(declaration, structs)
             fold_consts(file, structs)
-            for declaration in file.top_decls |structs, declined, ctx|:
-                declined <- true if not set_struct_body(declaration, structs, ctx) else declined
-            -1 return if declined
+            # A struct whose body cannot be modeled stays OPAQUE (named, no body): every
+            # function touching it then declines individually and is stripped below. An
+            # unreachable use never runs; a reachable one fails llc/link LOUDLY.
+            for declaration in file.top_decls |structs, ctx|:
+                _ = set_struct_body(declaration, structs, ctx)
 
             # Passes 3 and 4 cover FUNCTIONS only: a struct declaration emits no code of
             # its own (its type was built above), so it is skipped rather than declined.
             # The body pass looks its handle up by NAME — `fns` is no longer index-parallel
             # with `top_decls` now that non-function declarations exist.
-            for declaration in file.top_decls |fns, declined, structs, generics, m, ctx|:
+            # A function whose SIGNATURE cannot be modeled is simply not declared: it has
+            # no entry in `fns`, so every call to it declines its CALLER (which is then
+            # stripped below). Only `main` failing is fatal to the module.
+            for declaration in file.top_decls |fns, structs, generics, m, ctx|:
                 # A MODULE's functions are declared under the module's name as their owner
                 # (stage0 emits `module M: def get()` as `@M.get`). Without this a module's
                 # functions were never declared at all and every qualified call declined.
                 if declaration is Decl.Module(module_name, module_body, module_line):
-                    for nested in module_body |fns, declined, structs, generics, m, ctx, module_name|:
+                    for nested in module_body |fns, structs, generics, m, ctx, module_name|:
                         continue if function_name_of(nested) == ""
                         continue if generic_index_of(generics, function_name_of(nested)) >= 0
-                        if not (declare_function(nested, module_name, file.error_set_func_lines, fns, structs, generics, m, ctx) is declared_nested_fn):
-                            declined <- true
+                        _ = declare_function(nested, module_name, file.error_set_func_lines, fns, structs, generics, m, ctx)
                     continue
                 # An EXTERN is declared, never defined: `declare i64 @strlen(ptr)`.
                 if declaration is Decl.Extern(extern_probe_name, extern_probe_start, extern_probe_arity, extern_probe_variadic, extern_probe_callable, extern_probe_return, extern_probe_decorators, extern_probe_line):
-                    declined <- true if not declare_extern(declaration, file.extern_params, fns, structs, m, ctx)
+                    _ = declare_extern(declaration, file.extern_params, fns, structs, m, ctx)
                     continue
                 continue if function_name_of(declaration) == ""
                 # A generic TEMPLATE has no code of its own — only its instantiations do —
                 # so it is skipped here, not declined.
                 continue if generic_index_of(generics, function_name_of(declaration)) >= 0
                 # declare_function records the signature's types into `fns` itself.
-                if not (declare_function(declaration, "", file.error_set_func_lines, fns, structs, generics, m, ctx) is declared_fn):
-                    declined <- true
-            -1 return if declined
+                _ = declare_function(declaration, "", file.error_set_func_lines, fns, structs, generics, m, ctx)
 
             emitted_count: mutable i64 = 0
-            for declaration in file.top_decls |emitted_count, declined, fns, structs, m, ctx, builder|:
+            main_ok: mutable bool = false
+            for declaration in file.top_decls |emitted_count, main_ok, fns, structs, m, ctx, builder|:
                 if declaration is Decl.Module(module_name, module_body, module_line):
-                    for nested in module_body |emitted_count, declined, fns, structs, m, ctx, builder, module_name|:
+                    for nested in module_body |emitted_count, fns, structs, m, ctx, builder, module_name|:
                         nested_name: sview = function_name_of(nested)
                         continue if nested_name == ""
                         continue if generic_index_of(generics, nested_name) >= 0
                         nested_index: i64 = function_index_of(fns, module_name, nested_name)
-                        if nested_index < 0:
-                            declined <- true
-                            continue
+                        continue if nested_index < 0
                         nested_emitted: bool = emit_function_body(nested, fns.handles[nested_index.usize()], file.error_set_func_lines, fns, structs, generics, runtime, m, ctx, builder)
                         emitted_count <- emitted_count + 1 if nested_emitted else emitted_count
-                        declined <- true if not nested_emitted else declined
+                        strip_function_body(fns.handles[nested_index.usize()]) if not nested_emitted
                     continue
                 declaration_name: sview = function_name_of(declaration)
                 continue if declaration_name == ""
                 continue if generic_index_of(generics, declaration_name) >= 0
                 handle_index: i64 = function_index_of(fns, "", declaration_name)
-                if handle_index < 0:
-                    declined <- true
-                    continue
+                continue if handle_index < 0
                 emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], file.error_set_func_lines, fns, structs, generics, runtime, m, ctx, builder)
                 emitted_count <- emitted_count + 1 if emitted else emitted_count
-                declined <- true if not emitted else declined
-            -1 return if declined
+                strip_function_body(fns.handles[handle_index.usize()]) if not emitted
+                main_ok <- true if emitted and declaration_name == "main"
 
             # Drain the instantiation worklist. A LOOP, not a single pass: emitting one
             # instantiation's body can request another (a generic calling a generic), which
             # appends to the queue while it is being drained.
             drained: mutable usize = 0
-            while drained < generics.pending_bases.count |drained, generics, fns, structs, runtime, m, ctx, builder, declined, emitted_count|:
+            while drained < generics.pending_bases.count |drained, generics, fns, structs, runtime, m, ctx, builder, emitted_count|:
                 if emit_instantiation_body(drained, generics, fns, structs, runtime, m, ctx, builder):
                     emitted_count <- emitted_count + 1
                 else:
-                    declined <- true
+                    strip_function_body(generics.pending_handles[drained])
                 drained <- drained + 1
-            -1 return if declined
+            # Without a successfully emitted `main` the module is not a program: decline.
+            -1 return if not main_ok
             # AFTER the bodies: every function must already have its handle in `fns`.
             emit_debug_info(file, m, fns, source_name, ctx) if want_debug
             return emitted_count

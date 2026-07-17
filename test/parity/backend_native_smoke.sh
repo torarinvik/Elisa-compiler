@@ -790,6 +790,25 @@ decline_case() {
     if [ $? -eq 2 ]; then pass=$((pass + 1)); else echo "  FAIL decline_$name: emitter did not decline"; fi
 }
 
+# Per-function tolerance: an unmodeled NON-main function is stripped to a bare
+# `declare`. If main references it the LINK must fail — the contract is "never a
+# silently-wrong binary", not "whole-module decline". Decline also passes.
+stripped_case() {
+    local name="$1" src="$2"
+    total=$((total + 1))
+    local ll="$BUILD/stripped_$name.ll" obj="$BUILD/stripped_$name.o" exe="$BUILD/stripped_$name"
+    if ! printf '%b' "$src" | "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        pass=$((pass + 1)); return   # declined: fine
+    fi
+    if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
+        pass=$((pass + 1)); return   # invalid IR rejected loudly: fine
+    fi
+    if clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
+        echo "  FAIL stripped_$name: linked a binary despite the unmodeled helper"; return
+    fi
+    pass=$((pass + 1))
+}
+
 # `-> f64` is outside the modeled i64 subset.
 # Bitwise operators have no float form.
 # A NESTED struct field needs the inner layout resolved first; only scalar fields are modeled.
@@ -820,7 +839,9 @@ decline_case packed_enum_needs_store 'packed enum Node:\n    Leaf(v: i64)\n    T
 decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a: Node, b: Node)\n\ndef main() -> i64:\n    n: Node = Node.Leaf(42)\n    return match n:\n        Node.Leaf(v): v\n        Node.Pair(a, b): 0\n'
 # A VARIADIC extern needs a different LLVMFunctionType flag and a call site that knows which
 # args are fixed; not modeled, so it declines rather than emitting a wrong signature.
-decline_case extern_variadic 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n'
+# An UNUSED variadic extern no longer poisons the module (per-fn tolerance): the
+# program runs. stage0 compiles this program too, so this is parity, not permissiveness.
+run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
 decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(bogus: 42)\n    return match s:\n        Shape.Circle(r): r\n'
@@ -829,7 +850,7 @@ decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() ->
 decline_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n'
 # `ensure` is a POSTCONDITION over `result`, which is not bound until the return; modeled
 # only as a decline (requires -- the precondition over params -- is the portable half).
-decline_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n'
+stripped_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
@@ -878,11 +899,11 @@ decline_case break_outside_loop 'def main() -> i64:\n    break\n    return 0\n'
 # A match GUARD is a second per-arm condition; not modeled. Ignoring it emitted the arm
 # unconditionally — a silent MISCOMPILE (stage1 gave 100 where stage0 gives 42), caught by
 # this fixture.
-decline_case match_guard 'def classify(n: i64) -> i64:\n    return match n:\n        0 if n > 1: 100\n        _: 42\n\ndef main() -> i64:\n    return classify(0)\n'
+stripped_case match_guard 'def classify(n: i64) -> i64:\n    return match n:\n        0 if n > 1: 100\n        _: 42\n\ndef main() -> i64:\n    return classify(0)\n'
 # A BINDING arm is INVALID Elisa in an integer match — stage0: "top-level integer match arm
 # must use an integer literal or _". Treating it as a catch-all made stage1 emit code for a
 # program the language rejects.
-decline_case match_binding_arm 'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        other: other + 2\n\ndef main() -> i64:\n    return classify(40)\n'
+stripped_case match_binding_arm 'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        other: other + 2\n\ndef main() -> i64:\n    return classify(40)\n'
 
 if [ "$pass" -ne "$total" ]; then
     echo "backend_native_smoke FAILED: passed=$pass total=$total"
