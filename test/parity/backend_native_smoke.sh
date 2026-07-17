@@ -522,6 +522,15 @@ decline_case nested_module 'module A:\n    module B:\n        def fetch() -> i64
 # not modeled. Emitting a raw GEP for `s[0]` would be an unchecked read past the end.
 decline_case cstr_index 'def main() -> i64:\n    s: cstr = "hi"\n    return s[0].i64()\n'
 decline_case cstr_count 'def main() -> i64:\n    s: cstr = "hi"\n    return s.count.i64()\n'
+# TUPLES are blocked on the stage1 AST, not on the backend. A tuple IS an anonymous struct
+# ({ i64, i64 }, GEP by index, passed/returned by value -- stage0's IR), which the existing
+# struct machinery already covers. But `Expr.Tuple(elements, line)` stores NO LABELS: the
+# parser consumes them and keeps only the element types (parser_expr.elisa ~266, and the
+# node's own comment says so). `t.a` needs the label to resolve to index 0, and `t.0` is not
+# valid Elisa (it lexes as FLOAT ".0"), so a tuple's fields cannot be read at all. Declining
+# is therefore the whole of what the backend can soundly do here.
+decline_case tuple_field_access 'def main() -> i64:\n    t: (a: i64, b: i64) = (40, 2)\n    return t.a + t.b\n'
+decline_case tuple_return 'def pair() -> (a: i64, b: i64):\n    return (40, 2)\n\ndef main() -> i64:\n    t: (a: i64, b: i64) = pair()\n    return t.a + t.b\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'

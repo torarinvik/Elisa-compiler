@@ -472,3 +472,28 @@ Knock-on: a cstr fixture's EXIT CODE cannot observe a string's contents without 
 so `ir_case` (assert stage1 and stage0 emit the same IR line) covers the literal's shape.
 That is strictly weaker than a behavioral differential and is used ONLY where behavior is
 genuinely unobservable.
+
+## Tuples — BLOCKED on the stage1 AST (labels discarded)
+
+The BACKEND side is trivial and already built: a tuple IS an anonymous struct. stage0 emits
+`t: (a: i64, b: i64) = (40, 2)` as `alloca { i64, i64 }` + `store { i64, i64 } { i64 40,
+i64 2 }`, reads `t.a` as `getelementptr { i64, i64 }, ptr %t, i32 0, i32 0`, and passes /
+returns by value (`define { i64, i64 } @pair()`, `define i64 @take({ i64, i64 } %0)`) —
+exactly the existing Struct machinery with a structurally-interned anonymous type.
+
+The blocker is that `Ast::Expr.Tuple(elements: darray[Expr], line: u32)` stores **no
+labels**. For the named-tuple TYPE `(a: i64, b: i64)`, parser_expr.elisa (~266) consumes
+each label and keeps only the element types; the node's own comment in parser_tokens.elisa
+(~94) states this and notes that closing it "needs labels on this node".
+
+`t.a` cannot resolve to index 0 without the label, and `t.0` is not valid Elisa (it lexes as
+FLOAT ".0" — stage0: `expected newline, got FLOAT(".0")`), so a tuple's fields cannot be
+read AT ALL. Since reading fields is the only use of a tuple, the backend declines.
+
+Note the same missing labels already cause a known FRONTEND divergence: the node cannot
+distinguish canonical `(x: int, y: int)` from positional `(int, int)`, which stage0 rejects
+everywhere, so stage1 wrongly ACCEPTS the positional form (backlog 110b). One fix — labels
+on Expr.Tuple — closes both that diagnostic gap and this backend blocker.
+
+Spellings (verified against stage0): the TYPE is named-field `(a: i64, b: i64)`; the VALUE
+is POSITIONAL `(40, 2)`. `(a: 40, b: 2)` is rejected ("expected IDENT, got INT").
