@@ -41,6 +41,21 @@ if ! clang -o "$BUILD/emit_native" "$BUILD/emit_native.o" -L"$LIBDIR" -lLLVM -Wl
     echo "backend_native_smoke FAILED: could not link emit_native"; sed -n '1,10p' "$BUILD/emit_native.linklog"; exit 1
 fi
 
+# Extract elisacore_runtime.o from a throwaway c-archive. Emitted programs link against
+# it because a darray's backing comes from the Elisa runtime (arena_alloc/realloc/free) —
+# the backend is no longer self-contained once containers are in play. Scalar programs
+# simply do not reference these symbols, so linking it unconditionally is harmless.
+RUNTIME_DIR="$BUILD/runtime"
+mkdir -p "$RUNTIME_DIR"
+printf 'def main() -> i64:\n    s: mutable darray[u8] = []\n    s.push(1)\n    return s.count.i64() - 1\n' > "$RUNTIME_DIR/probe.elisa"
+if "$ELISACORE_BIN" -emit c-archive -o "$RUNTIME_DIR/probe.a" "$RUNTIME_DIR/probe.elisa" 2>/dev/null; then
+    ( cd "$RUNTIME_DIR" && ar x probe.a elisacore_runtime.o 2>/dev/null )
+fi
+RUNTIME_OBJ="$RUNTIME_DIR/elisacore_runtime.o"
+if [ ! -f "$RUNTIME_OBJ" ]; then
+    echo "backend_native_smoke FAILED: could not extract elisacore_runtime.o"; exit 1
+fi
+
 pass=0
 total=0
 
@@ -56,7 +71,7 @@ run_case() {
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
         echo "  FAIL $name: llc rejected the emitted IR (backend produced invalid module)"; return
     fi
-    if ! clang -o "$exe" "$obj" 2>/dev/null; then
+    if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
         echo "  FAIL $name: link failed"; return
     fi
     RUN "$exe"
@@ -196,6 +211,20 @@ run_case array_f64        'def main() -> i64:\n    xs: f64[2] = [40.5, 1.5]\n   
 # Write then read back through dynamic indices: 0+2+4+6+8 == 20, +22 == 42.
 run_case array_write_loop 'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0, 0, 0]\n    for i in 0..<5:\n        xs[i] <- i * 2\n    total: mutable i64 = 0\n    for j in 0..<5:\n        total <- total + xs[j]\n    return total + 22\n'  42
 
+# DARRAY — dynamic containers, backed by Elisa's RUNTIME (arena_alloc/realloc/free) and by
+# a per-function AUTO REGION. This is the first slice where the backend is not
+# self-contained: representation ({ptr items, i64 count, i64 capacity}), Arena layout, the
+# 256 initial capacity and the grow rule are all stage0's, read out of its own `-emit llvm`
+# output — they are dictated by the shared runtime, not chosen here.
+run_case darray_push      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'  42
+run_case darray_count     'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(7)\n    xs.push(7)\n    xs.push(7)\n    return xs.count * 14\n'  42
+run_case darray_loop      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<10:\n        xs.push(i)\n    total: mutable i64 = 0\n    for j in 0..<10:\n        total <- total + xs[j]\n    return total - 3\n'  42
+run_case darray_u8        'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'  42
+run_case darray_write     'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(1)\n    xs.push(1)\n    xs[0] <- 40\n    xs[1] <- 2\n    return xs[0] + xs[1]\n'  42
+# 500 pushes past the 256 initial capacity: this is the arena_realloc GROW path. A push
+# that never grew would pass the smaller cases and fail only here.
+run_case darray_grow      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -210,7 +239,7 @@ diff_case() {
         echo "  FAIL diff_$name: stage1 declined to emit"; return
     fi
     "$LLC" -filetype=obj "$ll" -o "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: llc rejected stage1 IR"; return; }
-    clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
+    clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" "$RUNTIME_OBJ" 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
     RUN "$BUILD/diff_${name}_s1"; local got1=$?
 
     # The stage0 reference is built with -emit c-archive, NOT -emit obj: a program that
@@ -253,6 +282,9 @@ diff_case bitnot      'def main() -> i64:\n    a: i64 = 5\n    return ~a + 200\n
 diff_case and_or_not  'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'
 diff_case compound    'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'
 diff_case short_circuit 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'
+diff_case darray_push  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'
+diff_case darray_grow  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'
+diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'
 diff_case array_literal 'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'
 diff_case array_u8      'def main() -> i64:\n    xs: u8[3] = [200, 100, 50]\n    return xs[0].i64() - xs[1].i64() - xs[2].i64() - 8\n'
 diff_case array_rw      'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0, 0, 0]\n    for i in 0..<5:\n        xs[i] <- i * 2\n    total: mutable i64 = 0\n    for j in 0..<5:\n        total <- total + xs[j]\n    return total + 22\n'
@@ -287,6 +319,8 @@ decline_case() {
 # Bitwise operators have no float form.
 # A NESTED struct field needs the inner layout resolved first; only scalar fields are modeled.
 # A literal shorter than the declared extent would leave elements undef.
+# A non-empty darray literal would need a push (plus the grow path) per element.
+decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
 decline_case struct_nested 'struct Inner:\n    v: i64\n\nstruct Outer:\n    i: Inner\n\ndef main() -> i64:\n    o: Outer = Outer{i: Inner{v: 42}}\n    return o.i.v\n'
 # Construction must name EVERY field: a missing one would silently leave a slot undef.

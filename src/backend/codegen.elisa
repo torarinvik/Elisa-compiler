@@ -54,6 +54,11 @@ module Backend:
             # (`array_elements` / `array_extents`) — same reason as Struct: ValueType is
             # POD, so a nested element type cannot live inline.
             Array
+            # A `darray[T]`. `bits` indexes the DARRAY side-pool (`darray_elements`).
+            # Represented exactly as stage0 does — `{ptr items, i64 count, i64 capacity}`,
+            # backed by an Arena — because both link the SAME runtime, so the layout is
+            # dictated, not chosen.
+            DArray
 
 
         struct ValueType:
@@ -108,6 +113,16 @@ module Backend:
             # the element type. A NON-literal bracket (`cstr[shape]`) is a shape parameter,
             # not an array, and is not modeled.
             if type_expression is Expr.Index(array_head, array_extent, array_line):
+                # `darray[T]` — the head is a CONTAINER NAME, not an element type, and the
+                # bracket holds a TYPE rather than an extent.
+                if array_head is Expr.Ident(container_name, container_line):
+                    if container_name == "darray":
+                        darray_element: ValueType = annotation_value_type(array_extent, structs)
+                        # Only scalar elements are modeled: a nested container or struct
+                        # element needs its own stride/layout handling.
+                        unmodeled_type() return if darray_element.kind == TypeKind.Unmodeled or darray_element.kind == TypeKind.Struct
+                        unmodeled_type() return if darray_element.kind == TypeKind.Array or darray_element.kind == TypeKind.DArray
+                        return intern_darray_type(darray_element, structs)
                 if array_extent is Expr.IntLit(extent_value):
                     element: ValueType = annotation_value_type(array_head, structs)
                     unmodeled_type() return if element.kind == TypeKind.Unmodeled or element.kind == TypeKind.Array
@@ -130,6 +145,10 @@ module Backend:
             if value_type.kind == TypeKind.Array:
                 slot: usize = value_type.bits.usize()
                 return LLVMArrayType(llvm_type_of(structs.array_elements[slot], structs, ctx), structs.array_extents[slot])
+            # `{ptr items, i64 count, i64 capacity}` — stage0's DynArray layout, which the
+            # shared runtime dictates.
+            if value_type.kind == TypeKind.DArray:
+                return darray_llvm_type(structs, ctx)
             if value_type.kind == TypeKind.Float:
                 return LLVMFloatTypeInContext(ctx) if value_type.bits == 32 else LLVMDoubleTypeInContext(ctx)
             LLVMInt8TypeInContext(ctx) return if value_type.bits == 8
@@ -156,6 +175,30 @@ module Backend:
             # `i64[3]` one type, so two locals of the same array type compare equal.
             array_elements: mutable darray[ValueType]
             array_extents: mutable darray[u32]
+            # `darray[T]` element types, interned the same way.
+            darray_elements: mutable darray[ValueType]
+
+
+        # The LLVM type of ANY darray: `{ptr, i64, i64}` = {items, count, capacity}.
+        #
+        # One shape for every element type — the element only affects the STRIDE when
+        # indexing, never the header. Matches stage0's `%DynArray__T` (verified by reading
+        # its `-emit llvm` output); the layout is dictated by the shared runtime.
+        def darray_llvm_type(structs: mutable StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            fields: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), int64_type, int64_type]
+            fields_pointer: void& = (&fields[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, fields_pointer, 3, 0)
+
+
+        # The `Arena` header: `{ptr, ptr, i64, i64}`. Field 3 is the STRATEGY, which the
+        # runtime reads; stage0 stores 2 (lazy) for an auto region, so this does too.
+        def arena_llvm_type(ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            fields: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, int64_type, int64_type]
+            fields_pointer: void& = (&fields[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, fields_pointer, 4, 0)
 
 
         # Copy a ValueType out of the region-backed registry.
@@ -179,6 +222,29 @@ module Backend:
             return ValueType{kind: TypeKind.Array, bits: (structs.array_elements.count - 1).u32()}
 
 
+        # Intern a `darray[T]` type.
+        def intern_darray_type(element: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<structs.darray_elements.count |structs, element|:
+                existing: ValueType = structs.darray_elements[index]
+                if existing.kind == element.kind and existing.bits == element.bits:
+                    return ValueType{kind: TypeKind.DArray, bits: index.u32()}
+            structs.darray_elements <- structs.darray_elements.push(element)
+            return ValueType{kind: TypeKind.DArray, bits: (structs.darray_elements.count - 1).u32()}
+
+
+        # The element type of a `darray[T]`.
+        def darray_element_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.DArray
+            return copied_type(structs.darray_elements[value_type.bits.usize()])
+
+
+        # The size in BYTES of a scalar type — the stride a darray indexes by. Only scalars
+        # are modeled as darray elements, so this needs no DataLayout query.
+        def scalar_byte_size(value_type: ValueType) -> u64:
+            1 return if value_type.kind == TypeKind.Bool
+            return (value_type.bits / 8).u64()
+
+
         # The element type of an array ValueType.
         def array_element_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             unmodeled_type() return if value_type.kind != TypeKind.Array
@@ -198,6 +264,62 @@ module Backend:
             for offset in 0..<structs.field_count[struct_index] |structs, struct_index, field|:
                 offset.i64() return if structs.field_names[structs.field_start[struct_index] + offset] == field
             return -1
+
+
+        # The runtime entry points a darray needs, plus the current function's auto
+        # region. Declared once per module and threaded down, because `push` can appear
+        # anywhere an expression can.
+        #
+        # `arena` is the function's AUTO REGION: stage0 gives every function one, zeroed,
+        # with strategy 2 (lazy), and `arena_free`s it on every return path. That is the
+        # first real piece of Elisa's region model in this backend — container backing
+        # lives in a region, not in malloc.
+        struct Runtime:
+            # `arena` is per-FUNCTION (each gets its own auto region), so it is the one
+            # mutable field: the module-level Runtime carries a placeholder that
+            # emit_function_body replaces with the function's own region slot.
+            arena: mutable LLVMValueRef
+            arena_alloc: LLVMValueRef
+            arena_realloc: LLVMValueRef
+            arena_free: LLVMValueRef
+            arena_alloc_type: LLVMTypeRef
+            arena_realloc_type: LLVMTypeRef
+            arena_free_type: LLVMTypeRef
+
+
+        # Declare the runtime entry points in the module. Signatures are dictated by
+        # elisacore_runtime.o (read from stage0's own emitted IR):
+        #   ptr  arena_alloc(ptr arena, i64 bytes)
+        #   ptr  arena_realloc(ptr arena, ptr old, i64 old_bytes, i64 new_bytes)
+        #   void arena_free(ptr arena)
+        def declare_runtime(m: LLVMModuleRef, ctx: LLVMContextRef) -> Runtime can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+
+            alloc_params: mutable darray[LLVMTypeRef] = [pointer_type, int64_type]
+            alloc_pointer: void& = (&alloc_params[0]).cast[void&] can Unsafe.PointerCast
+            alloc_type: LLVMTypeRef = LLVMFunctionType(pointer_type, alloc_pointer, 2, 0)
+
+            realloc_params: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, int64_type, int64_type]
+            realloc_pointer: void& = (&realloc_params[0]).cast[void&] can Unsafe.PointerCast
+            realloc_type: LLVMTypeRef = LLVMFunctionType(pointer_type, realloc_pointer, 4, 0)
+
+            free_params: mutable darray[LLVMTypeRef] = [pointer_type]
+            free_pointer: void& = (&free_params[0]).cast[void&] can Unsafe.PointerCast
+            free_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), free_pointer, 1, 0)
+
+            return Runtime{
+                arena_alloc: LLVMAddFunction(m, "arena_alloc", alloc_type),
+                arena_realloc: LLVMAddFunction(m, "arena_realloc", realloc_type),
+                arena_free: LLVMAddFunction(m, "arena_free", free_type),
+                arena_alloc_type: alloc_type,
+                arena_realloc_type: realloc_type,
+                arena_free_type: free_type,
+                # No region until a function supplies its own; a null placeholder keeps
+                # the module clean (declaring a dummy function to fill this would emit a
+                # bogus symbol).
+                arena: LLVMConstNull(pointer_type)
+            }
 
 
         # A function's local slots: `names[i]` lives in the `alloca` at `slots[i]`.
@@ -340,14 +462,17 @@ module Backend:
                 left_type: ValueType = expression_type(binary_left, local_scope, fns, structs)
                 left_type return if left_type.kind != TypeKind.Unmodeled
                 return expression_type(binary_right, local_scope, fns, structs)
-            # `xs[i]` — an index READ yields the array's element type.
+            # `xs[i]` — an index READ yields the element type of an array OR a darray.
             if expression is Expr.Index(indexed_object, index_expression, index_line):
                 indexed_type: ValueType = expression_type(indexed_object, local_scope, fns, structs)
+                darray_element_of(indexed_type, structs) return if indexed_type.kind == TypeKind.DArray
                 return array_element_of(indexed_type, structs)
             # `p.x` — a field READ has the field's declared type. (A cast `x.u8()` is a
             # Field under a Call, handled below, so a bare Field is always a field read.)
             if expression is Expr.Field(field_object, field_name, field_line):
                 object_type: ValueType = expression_type(field_object, local_scope, fns, structs)
+                # `xs.count` is a usize-shaped i64.
+                ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "count"
                 unmodeled_type() return if object_type.kind != TypeKind.Struct
                 struct_slot: usize = object_type.bits.usize()
                 position: i64 = field_index_of(structs, struct_slot, field_name)
@@ -658,6 +783,24 @@ module Backend:
             return LLVMBuildSExt(builder, value, target, "sext") if from_type.kind == TypeKind.Signed else LLVMBuildZExt(builder, value, target, "zext")
 
 
+        # The ADDRESS of `xs[i]` for a DARRAY.
+        #
+        # ONE index, not two: `items` is already a `T*`, so there is no leading 0 to step
+        # over the way a fixed array's pointer-to-array needs.
+        def emit_darray_index_address(array_slot: LLVMValueRef, array_type: ValueType, index_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if array_type.kind != TypeKind.DArray
+            element_type: ValueType = darray_element_of(array_type, structs)
+            null return if element_type.kind == TypeKind.Unmodeled
+            index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+            if emit_expression(index_expression, index_type, local_scope, fns, structs, m, ctx, builder) is index_value:
+                items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), array_slot, 0, "darray.items.ptr")
+                items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "darray.items")
+                indices: mutable darray[LLVMValueRef] = [index_value]
+                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items, indices_pointer, 1, "darray.elem.ptr")
+            return null
+
+
         # The ADDRESS of `xs[i]`.
         #
         # A two-index GEP: the first index (always 0) steps over the array POINTER itself,
@@ -675,6 +818,118 @@ module Backend:
                 indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
                 return LLVMBuildGEP2(builder, llvm_type_of(array_type, structs, ctx), array_slot, indices_pointer, 2, "elem.ptr")
             return null
+
+
+        # Copy a Runtime out of a reference (same borrow rule as copied_type).
+        def copied_runtime(runtime: Runtime&) -> Runtime:
+            return Runtime{
+                arena_alloc: runtime.arena_alloc,
+                arena_realloc: runtime.arena_realloc,
+                arena_free: runtime.arena_free,
+                arena_alloc_type: runtime.arena_alloc_type,
+                arena_realloc_type: runtime.arena_realloc_type,
+                arena_free_type: runtime.arena_free_type,
+                arena: runtime.arena
+            }
+
+
+        # `arena_free(region)` — release the function's auto region. Idempotent in the
+        # runtime and a no-op for a region that never allocated (strategy 2 is lazy), so
+        # emitting it unconditionally on every return path is correct and cheap.
+        def emit_region_free(runtime: Runtime&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            arguments: mutable darray[LLVMValueRef] = [runtime.arena]
+            arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            _ = LLVMBuildCall2(builder, runtime.arena_free_type, runtime.arena_free, arguments_pointer, 1, "")
+
+
+        # `xs.push(v)` — grow-if-needed, store, bump count.
+        #
+        # Mirrors stage0's lowering, read out of its own `-emit llvm` output:
+        #
+        #   count = xs.count; needed = count + 1
+        #   if xs.capacity < needed:
+        #       new_cap = capacity == 0 ? 256 : max(capacity * 2, needed)
+        #       items = xs.items == null ? arena_alloc(arena, new_bytes)
+        #                                : arena_realloc(arena, items, old_bytes, new_bytes)
+        #       xs.items = items; xs.capacity = new_cap
+        #   xs.items[count] = v; xs.count = needed
+        #
+        # The 256 initial capacity is stage0's, not a guess. Overflow TRAPS are omitted:
+        # they only abort on a capacity that cannot occur in a modeled program, so their
+        # absence is unobservable in the differential — but it does mean this lowering is
+        # not a bit-for-bit clone, only a behavioural one.
+        def emit_darray_push(array_slot: LLVMValueRef, array_type: ValueType, value_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            element_type: ValueType = darray_element_of(array_type, structs)
+            false return if element_type.kind == TypeKind.Unmodeled
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+            stride: LLVMValueRef = LLVMConstInt(int64_type, scalar_byte_size(element_type), 0)
+
+            items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, array_slot, 0, "darray.items.ptr")
+            count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, array_slot, 1, "darray.count.ptr")
+            capacity_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, array_slot, 2, "darray.cap.ptr")
+
+            count: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, count_pointer, "push.count")
+            needed: LLVMValueRef = LLVMBuildAdd(builder, count, LLVMConstInt(int64_type, 1, 0), "push.needed")
+            capacity: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, capacity_pointer, "push.cap")
+
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            grow_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "push.grow")
+            store_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "push.store")
+            # 35 = UGE: capacities are unsigned.
+            enough: LLVMValueRef = LLVMBuildICmp(builder, 35, capacity, needed, "push.cap.ok")
+            _ = LLVMBuildCondBr(builder, enough, store_block, grow_block)
+
+            LLVMPositionBuilderAtEnd(builder, grow_block)
+            doubled: LLVMValueRef = LLVMBuildMul(builder, capacity, LLVMConstInt(int64_type, 2, 0), "push.cap.double")
+            # 32 = EQ.
+            is_empty: LLVMValueRef = LLVMBuildICmp(builder, 32, capacity, LLVMConstInt(int64_type, 0, 0), "push.cap.zero")
+            base: LLVMValueRef = LLVMBuildSelect(builder, is_empty, LLVMConstInt(int64_type, 256, 0), doubled, "push.cap.base")
+            # 36 = ULT.
+            too_small: LLVMValueRef = LLVMBuildICmp(builder, 36, base, needed, "push.cap.lt")
+            new_capacity: LLVMValueRef = LLVMBuildSelect(builder, too_small, needed, base, "push.cap.new")
+            old_bytes: LLVMValueRef = LLVMBuildMul(builder, capacity, stride, "push.old.bytes")
+            new_bytes: LLVMValueRef = LLVMBuildMul(builder, new_capacity, stride, "push.new.bytes")
+
+            old_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "push.items")
+            is_null: LLVMValueRef = LLVMBuildICmp(builder, 32, old_items, LLVMConstNull(LLVMPointerTypeInContext(ctx, 0)), "push.items.null")
+            alloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "push.alloc")
+            realloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "push.realloc")
+            grown_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "push.grown")
+            _ = LLVMBuildCondBr(builder, is_null, alloc_block, realloc_block)
+
+            # The fresh pointer lands in a slot rather than a phi: both arms are calls, and
+            # a slot needs no incoming-block bookkeeping. mem2reg restores the phi at -O2.
+            LLVMPositionBuilderAtEnd(builder, alloc_block)
+            alloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, new_bytes]
+            alloc_pointer: void& = (&alloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+            allocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "push.alloc")
+            _ = LLVMBuildStore(builder, allocated, items_pointer)
+            _ = LLVMBuildBr(builder, grown_block)
+
+            LLVMPositionBuilderAtEnd(builder, realloc_block)
+            realloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, old_items, old_bytes, new_bytes]
+            realloc_pointer: void& = (&realloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+            reallocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_realloc_type, runtime.arena_realloc, realloc_pointer, 4, "push.realloc")
+            _ = LLVMBuildStore(builder, reallocated, items_pointer)
+            _ = LLVMBuildBr(builder, grown_block)
+
+            LLVMPositionBuilderAtEnd(builder, grown_block)
+            _ = LLVMBuildStore(builder, new_capacity, capacity_pointer)
+            _ = LLVMBuildBr(builder, store_block)
+
+            LLVMPositionBuilderAtEnd(builder, store_block)
+            if emit_expression(value_expression, element_type, local_scope, fns, structs, m, ctx, builder) is pushed_value:
+                items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "push.items.cur")
+                indices: mutable darray[LLVMValueRef] = [count]
+                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                # ONE index: `items` is already a T*, not a pointer-to-array, so there is
+                # no leading 0 to step over (unlike a fixed array's two-index GEP).
+                slot: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items, indices_pointer, 1, "push.slot")
+                _ = LLVMBuildStore(builder, pushed_value, slot)
+                _ = LLVMBuildStore(builder, needed, count_pointer)
+                return true
+            return false
 
 
         # Emit a value expression, producing a value of `resolve_type(expression, expected)`.
@@ -841,6 +1096,12 @@ module Backend:
             # The literal must have exactly the declared extent: a short literal would
             # leave elements undef.
             if expression is Expr.Array(array_elements, array_literal_line):
+                # `[]` initializing a darray: the zero value {null, 0, 0}. `[1, 2]` into a
+                # darray is not modeled (it would need a push per element plus the grow
+                # path inline), so it declines.
+                if expected.kind == TypeKind.DArray:
+                    null return if array_elements.count != 0
+                    return LLVMConstNull(darray_llvm_type(structs, ctx))
                 null return if expected.kind != TypeKind.Array
                 slot_index: usize = expected.bits.usize()
                 null return if array_elements.count != structs.array_extents[slot_index].usize()
@@ -866,8 +1127,15 @@ module Backend:
             if expression is Expr.Index(indexed_object, index_expression, index_line):
                 if indexed_object is Expr.Ident(array_name, array_name_line):
                     array_type: ValueType = lookup_type(local_scope, array_name)
-                    null return if array_type.kind != TypeKind.Array
                     if lookup_slot(local_scope, array_name) is array_slot:
+                        # A darray indexes through its `items` pointer; a fixed array
+                        # indexes the storage directly.
+                        if array_type.kind == TypeKind.DArray:
+                            if emit_darray_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, m, ctx, builder) is darray_pointer:
+                                darray_element: ValueType = darray_element_of(array_type, structs)
+                                return LLVMBuildLoad2(builder, llvm_type_of(darray_element, structs, ctx), darray_pointer, "darray.elem")
+                            return null
+                        null return if array_type.kind != TypeKind.Array
                         if emit_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, m, ctx, builder) is pointer:
                             element_type: ValueType = array_element_of(array_type, structs)
                             return LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), pointer, "elem")
@@ -901,6 +1169,15 @@ module Backend:
                             declined <- true
                 null return if declined
                 return LLVMBuildLoad2(builder, struct_llvm, temporary, "constructed")
+
+            # `xs.count` — read the darray header's count field.
+            if expression is Expr.Field(darray_object, darray_field, darray_field_line):
+                if darray_object is Expr.Ident(darray_name, darray_name_line):
+                    darray_type: ValueType = lookup_type(local_scope, darray_name)
+                    if darray_type.kind == TypeKind.DArray and darray_field == "count":
+                        if lookup_slot(local_scope, darray_name) is darray_slot:
+                            count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), darray_slot, 1, "darray.count.ptr")
+                            return LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), count_pointer, "darray.count")
 
             # `p.x` — a field READ. Only a local struct receiver is modeled: the address
             # comes from the local's slot, so there is no need to spill a temporary.
@@ -962,24 +1239,39 @@ module Backend:
         # A statement AFTER a terminator is unreachable; the subset does not model dead
         # code, so it declines rather than emitting into a closed block (which LLVM would
         # reject anyway).
-        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             status: mutable EmitStatus = EmitStatus.Open
-            for statement in body |status, return_type, local_scope, loops, fns, structs, m, ctx, builder|:
+            for statement in body |status, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder|:
                 if status == EmitStatus.Open:
-                    status <- emit_statement(statement, return_type, local_scope, loops, fns, structs, m, ctx, builder)
+                    status <- emit_statement(statement, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
                 else:
                     status <- EmitStatus.Declined
             return status
 
 
         # Emit one statement. Returns false to DECLINE (unmodeled construct).
-        def emit_statement(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_statement(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+
+            # `xs.push(v)` — a statement-position method call on a darray.
+            if statement is Stmt.Expr(statement_expression, statement_expression_line):
+                if statement_expression is Expr.Call(push_callee, push_arguments, push_argument_names, push_call_line):
+                    if push_callee is Expr.Field(push_object, push_method, push_method_line):
+                        if push_object is Expr.Ident(push_name, push_name_line):
+                            push_type: ValueType = lookup_type(local_scope, push_name)
+                            if push_type.kind == TypeKind.DArray and push_method == "push" and push_arguments.count == 1:
+                                if lookup_slot(local_scope, push_name) is push_slot:
+                                    if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, runtime, m, ctx, builder):
+                                        return EmitStatus.Open
+                return EmitStatus.Declined
 
             if statement is Stmt.Return(return_value_opt, return_line):
                 if return_value_opt is return_value:
                     emitted: LLVMValueRef? = emit_expression(return_value, return_type, local_scope, fns, structs, m, ctx, builder)
                     if emitted is return_constant:
+                        # Free the auto region on the way out — EVERY return path, which is
+                        # why this lives here rather than at one function exit.
+                        emit_region_free(runtime, builder)
                         _ = LLVMBuildRet(builder, return_constant)
                         return EmitStatus.Terminated
                 # A bare `return` in an `-> i64` function is not modeled.
@@ -1029,6 +1321,14 @@ module Backend:
                     EmitStatus.Declined return if assign_operator != TokenKind.LArrow
                     if assign_array is Expr.Ident(assign_array_name, assign_array_name_line):
                         assign_array_type: ValueType = lookup_type(local_scope, assign_array_name)
+                        if lookup_slot(local_scope, assign_array_name) is darray_assign_slot:
+                            if assign_array_type.kind == TypeKind.DArray:
+                                if emit_darray_index_address(darray_assign_slot, assign_array_type, assign_index, local_scope, fns, structs, m, ctx, builder) is darray_element_pointer:
+                                    darray_assign_element: ValueType = darray_element_of(assign_array_type, structs)
+                                    if emit_expression(assign_value, darray_assign_element, local_scope, fns, structs, m, ctx, builder) is darray_assigned:
+                                        _ = LLVMBuildStore(builder, darray_assigned, darray_element_pointer)
+                                        return EmitStatus.Open
+                                return EmitStatus.Declined
                         EmitStatus.Declined return if assign_array_type.kind != TypeKind.Array
                         if lookup_slot(local_scope, assign_array_name) is assign_array_slot:
                             if emit_index_address(assign_array_slot, assign_array_type, assign_index, local_scope, fns, structs, m, ctx, builder) is element_pointer:
@@ -1058,12 +1358,12 @@ module Backend:
                     _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
 
                     LLVMPositionBuilderAtEnd(builder, then_block)
-                    then_status: EmitStatus = emit_statements(then_body, return_type, local_scope, loops, fns, structs, m, ctx, builder)
+                    then_status: EmitStatus = emit_statements(then_body, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
                     EmitStatus.Declined return if then_status == EmitStatus.Declined
                     branch_if_open(then_status, builder, join_block)
 
                     LLVMPositionBuilderAtEnd(builder, else_block)
-                    else_status: EmitStatus = emit_statements(else_body, return_type, local_scope, loops, fns, structs, m, ctx, builder)
+                    else_status: EmitStatus = emit_statements(else_body, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
                     EmitStatus.Declined return if else_status == EmitStatus.Declined
                     branch_if_open(else_status, builder, join_block)
 
@@ -1094,7 +1394,7 @@ module Backend:
                     # A `while` continues to its CONDITION.
                     loops.exits <- loops.exits.push(exit_block)
                     loops.continues <- loops.continues.push(head_block)
-                    body_status: EmitStatus = emit_statements(while_body, return_type, local_scope, loops, fns, structs, m, ctx, builder)
+                    body_status: EmitStatus = emit_statements(while_body, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
                     _ = loops.exits.pop()
                     _ = loops.continues.pop()
                     EmitStatus.Declined return if body_status == EmitStatus.Declined
@@ -1170,7 +1470,7 @@ module Backend:
                             LLVMPositionBuilderAtEnd(builder, body_block)
                             loops.exits <- loops.exits.push(exit_block)
                             loops.continues <- loops.continues.push(step_block)
-                            body_status: EmitStatus = emit_statements(for_body, return_type, local_scope, loops, fns, structs, m, ctx, builder)
+                            body_status: EmitStatus = emit_statements(for_body, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
                             _ = loops.exits.pop()
                             _ = loops.continues.pop()
                             EmitStatus.Declined return if body_status == EmitStatus.Declined
@@ -1296,12 +1596,24 @@ module Backend:
 
 
         # Emit the body of an already-declared function. False = declined.
-        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 return_value_type: ValueType = lookup_return_type(fns, function_name)
                 false return if return_value_type.kind == TypeKind.Unmodeled
                 entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
                 LLVMPositionBuilderAtEnd(builder, entry)
+
+                # This function's AUTO REGION — the first real piece of Elisa's region
+                # model here. stage0 gives every function one: an Arena alloca, zeroed,
+                # with strategy 2 (lazy, so an untouched region costs no syscall), which
+                # backs any container the function builds and is arena_free'd on return.
+                local_runtime: mutable Runtime = copied_runtime(runtime)
+                arena_type: LLVMTypeRef = arena_llvm_type(ctx)
+                arena_slot: LLVMValueRef = LLVMBuildAlloca(builder, arena_type, "auto.region")
+                _ = LLVMBuildStore(builder, LLVMConstNull(arena_type), arena_slot)
+                strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, arena_type, arena_slot, 3, "region.strategy")
+                _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 2, 0), strategy_pointer)
+                local_runtime.arena <- arena_slot
 
                 # Each parameter gets a slot too, so a parameter reads and assigns exactly
                 # like a local and emit_expression's Ident path needs no param special
@@ -1319,7 +1631,7 @@ module Backend:
 
                 # A function that can run off the end is not modeled — rather than invent
                 # a return value, decline. (LLVM would reject the unterminated block.)
-                return emit_statements(body, return_value_type, local_scope, loops, fns, structs, m, ctx, builder) == EmitStatus.Terminated
+                return emit_statements(body, return_value_type, local_scope, loops, fns, structs, local_runtime, m, ctx, builder) == EmitStatus.Terminated
             return false
 
     public:
@@ -1342,7 +1654,10 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: []}
+            # The runtime is declared once per module; each function gets its own arena
+            # value below (the `arena` field here is a placeholder until then).
+            runtime: mutable Runtime = declare_runtime(m, ctx)
             fns: mutable FnTable = FnTable{names: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
@@ -1375,7 +1690,7 @@ module Backend:
                 if handle_index < 0:
                     declined <- true
                     continue
-                emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], fns, structs, m, ctx, builder)
+                emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], fns, structs, runtime, m, ctx, builder)
                 emitted_count <- emitted_count + 1 if emitted else emitted_count
                 declined <- true if not emitted else declined
             -1 return if declined
