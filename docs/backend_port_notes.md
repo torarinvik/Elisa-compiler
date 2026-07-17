@@ -558,3 +558,74 @@ differential rather than a decline fixture.
 Still ahead in the region model: region PARAMS / `@r` annotations and explicit region
 polymorphism, death-time, and the non-darray containers (dict/set, which are additionally
 blocked behind error unions).
+
+## `packed enum` / the AoS store — ABI mapped, NOT implemented
+
+This is the REAL AoS store, and it is a different subsystem from the payload enums landed
+in d872f3c (those are a plain tagged union `{ i32, [N x i64] }`, no store involved).
+
+The good news, read from stage0's `-emit llvm`: the store is **runtime-call based, not
+open-coded** — the same shape as arena_alloc/realloc/free, which the backend already binds.
+The heavy lifting lives in the runtime; the backend declares the externs and calls them.
+
+Working stage0 program (verified, exit 42) — note EVERY piece of this is required:
+
+    packed enum Node:
+        Leaf(v: int)
+        Pair(a: Node, b: Node)
+
+    def build(owner: Arena) -> int:
+        store: Node.Store[Local] = Node.Store(owner)
+        result: mutable int = 0
+        in store:
+            n: Node = new Node.Leaf(v: 42)
+            result <- match n:
+                Node.Leaf(v): v
+                Node.Pair(a, b): 0
+        return result
+
+    def main() -> int:
+        region r(4096):
+            return build(r)
+        return 0
+
+Types:
+
+    %Node__Store = type { ptr, i64, ptr }            ; { arena, row_bytes, state }
+    %PackedStoreIndexAllocResult = type { ptr, i32 } ; { row ptr, index }
+    %Node = type { i32, [1 x i64] }                  ; the handle: tag + payload words
+
+Runtime entry points:
+
+    declare ptr @ctx_packed_store_state_new_variant_sparse(ptr arena, i64 row_bytes)
+    declare %PackedStoreIndexAllocResult @ctx_packed_store_alloc_fixed_tagged_variant_sparse_result(ptr arena, ptr state, i32 tag)
+    declare i32 @ctx_packed_store_read_variant_sparse_tag(ptr state, i32 index)
+    declare i64 @ctx_packed_store_read_variant_sparse_word(i32 index, ptr state, i64 word)
+
+Sequence for `Node.Store(owner)`: call state_new_variant_sparse(owner, row_bytes), then
+build the store value with three insertvalues (arena, row_bytes, state). For `new
+Node.Leaf(v: 42)`: extractvalue the arena/state out of the store, call
+alloc_fixed_tagged_variant_sparse_result(arena, state, tag), `store %Node zeroinitializer`
+into the returned row pointer, then write the payload words. A match reads the tag with
+read_variant_sparse_tag and each payload word with read_variant_sparse_word.
+
+Prerequisites this needs that the backend does NOT have yet:
+1. `region NAME(capacity):` — a region scope with a CAPACITY argument. The capacity lands in
+   `clause` alongside the name, so today's `clause.count != 1` check declines it (1e10f38).
+2. `Arena` as a PARAMETER type. Note the asymmetry: `def build(owner: Arena)` is accepted,
+   while `-> darray[i64] @owner` is rejected ("internal runtime carrier type ... not
+   supported in user-facing code"). So the carrier is passable but not annotatable.
+3. `new T.Variant(field: value)` — NAMED-field construction, distinct from the positional
+   `Shape.Circle(42)` that payload enums use.
+4. `in store:` — an in-block binding the ACTIVE store, which every constructor in scope
+   uses implicitly. Note the diagnostic is explicit that a packed constructor REQUIRES one:
+   "packed enum constructor Node.Leaf requires an active in Node.Store: scope or explicit
+   new[Node.Store]".
+
+Beyond that, the full subsystem also has typestate (`Store[Local]` vs `Store[Frozen]`),
+`freeze(move store)`, and `common:` blocks with `@storage(inline)` — see the corpus in
+`Code/test_programs/` (compiler_parallel_fixture.elisa, packed_enum_common.elisa).
+
+Sharp edge worth knowing: a RECURSIVE plain enum is auto-promoted to packed. `enum Node:
+Leaf(v: i64) / Pair(a: Node, b: Node)` fails with "packed enum constructor Node.Leaf
+requires an active in Node.Store: scope" even though it was never declared `packed`.
