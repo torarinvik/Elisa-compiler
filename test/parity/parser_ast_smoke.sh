@@ -22,8 +22,8 @@ printf '%s\n' "$summary" | grep -Eq 'failed=0$' || {
 }
 
 selected="$(printf '%s\n' "$summary" | sed -E 's/.* ([0-9]+) test\(s\) selected;.*/\1/')"
-[[ "$selected" -ge 84 ]] || {
-    echo "parser AST smoke FAILED: only $selected tests ran (expected at least 84)" >&2
+[[ "$selected" -ge 97 ]] || {
+    echo "parser AST smoke FAILED: only $selected tests ran (expected at least 97)" >&2
     exit 1
 }
 echo "parser AST smoke OK: $selected structural tests passed" >&2
