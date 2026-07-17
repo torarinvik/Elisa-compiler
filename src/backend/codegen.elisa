@@ -187,11 +187,14 @@ module Backend:
             slot: usize = index.usize()
             unmodeled_type() return if generics.param_count[slot] != type_args.count
             if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                # A missing return annotation is `void` — so a call to it names its result ""
+                # (LLVM rejects a named void instruction).
+                resolved: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
                 if return_type_opt is declared_return:
                     bound: usize = push_type_bindings(generics, structs, slot, type_args)
-                    resolved: ValueType = annotation_value_type(declared_return, structs)
+                    resolved <- annotation_value_type(declared_return, structs)
                     pop_type_bindings(structs, bound)
-                    return resolved
+                return resolved
             return unmodeled_type()
 
 
@@ -1813,58 +1816,59 @@ module Backend:
             null return if generics.param_count[slot] != type_args.count
 
             if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                # Bind every K/T for the duration of resolving this signature.
+                bound: usize = push_type_bindings(generics, structs, slot, type_args)
+                # A MISSING return annotation is `void` (std helpers omit `-> void`).
+                return_value_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
                 if return_type_opt is return_type:
-                    # Bind every K/T for the duration of resolving this signature.
-                    bound: usize = push_type_bindings(generics, structs, slot, type_args)
+                    return_value_type <- annotation_value_type(return_type, structs)
+                llvm_params: mutable darray[LLVMTypeRef] = []
+                declined: mutable bool = false
+                for parameter in params |llvm_params, declined, structs, ctx|:
+                    parameter_type: ValueType = annotation_value_type(parameter.type_expression, structs)
+                    if parameter_type.kind == TypeKind.Unmodeled:
+                        declined <- true
+                    else:
+                        llvm_params.push(llvm_type_of(parameter_type, structs, ctx))
 
-                    return_value_type: ValueType = annotation_value_type(return_type, structs)
-                    llvm_params: mutable darray[LLVMTypeRef] = []
-                    declined: mutable bool = false
-                    for parameter in params |llvm_params, declined, structs, ctx|:
-                        parameter_type: ValueType = annotation_value_type(parameter.type_expression, structs)
-                        if parameter_type.kind == TypeKind.Unmodeled:
-                            declined <- true
-                        else:
-                            llvm_params.push(llvm_type_of(parameter_type, structs, ctx))
+                # The arena/error ABI must match emit_function_body's param layout for the
+                # instantiation body: `[out-param if error], <declared params>, [arena if
+                # the signature grows a container]`, and an error fn returns i32.
+                instantiation_is_error: bool = generics.is_error[slot]
+                instantiation_needs_arena: bool = signature_needs_arena(params, return_value_type, structs)
+                pop_type_bindings(structs, bound)
+                null return if declined or return_value_type.kind == TypeKind.Unmodeled
 
-                    # The arena/error ABI must match emit_function_body's param layout for the
-                    # instantiation body: `[out-param if error], <declared params>, [arena if
-                    # the signature grows a container]`, and an error fn returns i32.
-                    instantiation_is_error: bool = generics.is_error[slot]
-                    instantiation_needs_arena: bool = signature_needs_arena(params, return_value_type, structs)
-                    pop_type_bindings(structs, bound)
-                    null return if declined or return_value_type.kind == TypeKind.Unmodeled
+                name_storage: mutable darray[u8] = []
+                mangled: cstr = mangled_name_multi_into(base, type_args, structs, name_storage)
+                llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
+                llvm_return <- LLVMInt32TypeInContext(ctx) if instantiation_is_error
+                full_params: mutable darray[LLVMTypeRef] = []
+                full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_is_error
+                for llvm_param in llvm_params |full_params|:
+                    full_params.push(llvm_param)
+                full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_needs_arena
+                fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
+                if full_params.count != 0:
+                    params_pointer: void& = (&full_params[0]).cast[void&] can Unsafe.PointerCast
+                    fn_type <- LLVMFunctionType(llvm_return, params_pointer, full_params.count.u32(), 0)
+                handle: LLVMValueRef = LLVMAddFunction(m, mangled, fn_type)
 
-                    name_storage: mutable darray[u8] = []
-                    mangled: cstr = mangled_name_multi_into(base, type_args, structs, name_storage)
-                    llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
-                    llvm_return <- LLVMInt32TypeInContext(ctx) if instantiation_is_error
-                    full_params: mutable darray[LLVMTypeRef] = []
-                    full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_is_error
-                    for llvm_param in llvm_params |full_params|:
-                        full_params.push(llvm_param)
-                    full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_needs_arena
-                    fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
-                    if full_params.count != 0:
-                        params_pointer: void& = (&full_params[0]).cast[void&] can Unsafe.PointerCast
-                        fn_type <- LLVMFunctionType(llvm_return, params_pointer, full_params.count.u32(), 0)
-                    handle: LLVMValueRef = LLVMAddFunction(m, mangled, fn_type)
-
-                    inst_arg_start: usize = generics.inst_args.count
-                    for argument in type_args |generics|:
-                        generics.inst_args <- generics.inst_args.push(copied_type(argument))
-                    generics.inst_bases <- generics.inst_bases.push(base)
-                    generics.inst_arg_start <- generics.inst_arg_start.push(inst_arg_start)
-                    generics.inst_arg_count <- generics.inst_arg_count.push(type_args.count)
-                    generics.inst_handles <- generics.inst_handles.push(handle)
-                    pending_arg_start: usize = generics.pending_args.count
-                    for argument in type_args |generics|:
-                        generics.pending_args <- generics.pending_args.push(copied_type(argument))
-                    generics.pending_bases <- generics.pending_bases.push(base)
-                    generics.pending_arg_start <- generics.pending_arg_start.push(pending_arg_start)
-                    generics.pending_arg_count <- generics.pending_arg_count.push(type_args.count)
-                    generics.pending_handles <- generics.pending_handles.push(handle)
-                    return handle
+                inst_arg_start: usize = generics.inst_args.count
+                for argument in type_args |generics|:
+                    generics.inst_args <- generics.inst_args.push(copied_type(argument))
+                generics.inst_bases <- generics.inst_bases.push(base)
+                generics.inst_arg_start <- generics.inst_arg_start.push(inst_arg_start)
+                generics.inst_arg_count <- generics.inst_arg_count.push(type_args.count)
+                generics.inst_handles <- generics.inst_handles.push(handle)
+                pending_arg_start: usize = generics.pending_args.count
+                for argument in type_args |generics|:
+                    generics.pending_args <- generics.pending_args.push(copied_type(argument))
+                generics.pending_bases <- generics.pending_bases.push(base)
+                generics.pending_arg_start <- generics.pending_arg_start.push(pending_arg_start)
+                generics.pending_arg_count <- generics.pending_arg_count.push(type_args.count)
+                generics.pending_handles <- generics.pending_handles.push(handle)
+                return handle
             return null
 
 
@@ -4934,7 +4938,11 @@ module Backend:
                 # From the ANNOTATION, not from `fns`: a generic TEMPLATE has no fns entry
                 # (only its instantiations do), and with bindings active the annotation
                 # already resolves `T` to this instantiation's concrete type.
-                return_value_type: mutable ValueType = unmodeled_type()
+                # A MISSING return annotation means `void` — `def zero_buckets[K,T](…):` with
+                # no `-> T` is a void procedure (the std dict's zero-fill / place / clear
+                # helpers are all written this way). Only a PRESENT but unmodeled annotation
+                # declines.
+                return_value_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
                 if return_type_opt is declared_return:
                     return_value_type <- annotation_value_type(declared_return, structs)
                 false return if return_value_type.kind == TypeKind.Unmodeled
