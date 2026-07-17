@@ -552,6 +552,22 @@ diff_case arena_param 'def sink(owner: Arena) -> i64:\n    return 42\n\ndef main
 # target: stage0 rejects the push WITHOUT the in-block ("darray push requires an active in
 # <arena>: scope"). The arena is BORROWED inside it, so nothing frees it.
 diff_case arena_in_scope 'def fill(owner: Arena, out: mutable darray[i64]&) -> void:\n    in owner:\n        out.push(42)\n\ndef main() -> i64:\n    total: mutable i64 = 0\n    region r(4096):\n        xs: mutable darray[i64] = []\n        fill(r, xs)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
+# EXTERNS: `extern strlen(s: cstr) -> usize` -> `declare i64 @strlen(ptr)`, no body, symbol
+# resolved at link time. Param and return types are bare NAMES, not Exprs -- the params live
+# in the File.extern_params SIDE TABLE and the return type is `return_type_name` on the node,
+# so both resolve via scalar_type_of_name.
+#
+# This was BLOCKED: Decl.Extern had no return-type field and the parser threw the `-> usize`
+# away (task_d010c4d5). That fix landed, so this is now portable.
+#
+# These are also the FIRST cstr fixtures whose EXIT CODE observes a string's CONTENTS --
+# `strlen("hello") + 37 == 42`. Until now that was unobservable, which is why cstr leaned on
+# ir_case (assert the same IR line) instead of behavior.
+diff_case extern_strlen 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    s: cstr = "hello"\n    return strlen(s).i64() + 37\n'
+diff_case extern_strlen_literal 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return strlen("0123456789").i64() + 32\n'
+diff_case extern_strlen_empty 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return strlen("").i64() + 42\n'
+# Two args, and a return type that is not the i64 default.
+diff_case extern_two_args 'extern strncmp(a: cstr, b: cstr, n: usize) -> i32\n\ndef main() -> i64:\n    return strncmp("abc", "abc", 3).i64() + 42\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -613,6 +629,9 @@ decline_case packed_enum_needs_store 'packed enum Node:\n    Leaf(v: i64)\n    T
 # so ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and it
 # declines here too -- for the independent reason that its payload is not a scalar.
 decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a: Node, b: Node)\n\ndef main() -> i64:\n    n: Node = Node.Leaf(42)\n    return match n:\n        Node.Leaf(v): v\n        Node.Pair(a, b): 0\n'
+# A VARIADIC extern needs a different LLVMFunctionType flag and a call site that knows which
+# args are fixed; not modeled, so it declines rather than emitting a wrong signature.
+decline_case extern_variadic 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'

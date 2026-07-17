@@ -452,7 +452,7 @@ an UNGATED contextual keyword (parser_expr.elisa ~114), so `def get()` cannot be
 though stage0 compiles it — every other contextual keyword there (`do`, `when`, `machine`)
 is gated on lookahead. Filed separately; avoid `get` in fixtures until fixed.
 
-## Externs — BLOCKED on the stage1 AST (like error unions)
+## Externs — LANDED (the AST gap was fixed)
 
 `extern strlen(s: cstr) -> usize` lowers to `declare i64 @strlen(ptr)` in stage0 — trivial
 IR. But `Ast::Decl.Extern(name, param_start, arity, variadic, callable, decorators, line)`
@@ -464,14 +464,18 @@ Param types DO survive, but in a side table rather than the node: `param_start`/
 index `File.extern_params` (`ExternParam{name, type_name: sview, provenance_bearing}`),
 where the type is a bare NAME, not an Expr.
 
-Filed as task_d010c4d5. Same shape as task_c19cb583 (`Stmt.Block` has no Expr, so `catch
-risky(true):` loses its subject): an AST that cannot carry what the backend needs. Both are
-FRONTEND fixes, not backend ones.
+Filed as task_d010c4d5 — and FIXED: `Decl.Extern` now carries `return_type_name`, so this is
+implemented. Param and return types are bare NAMES (not Exprs), so both resolve through
+scalar_type_of_name rather than annotation_value_type. Variadic externs and `extern name: T`
+(a global, not a function) decline.
 
-Knock-on: a cstr fixture's EXIT CODE cannot observe a string's contents without `strlen`,
-so `ir_case` (assert stage1 and stage0 emit the same IR line) covers the literal's shape.
-That is strictly weaker than a behavioral differential and is used ONLY where behavior is
-genuinely unobservable.
+Still open in the same family: task_c19cb583 (`Stmt.Block` has no Expr, so `catch
+risky(true):` loses its subject) and tuple labels. Those remain FRONTEND fixes.
+
+Knock-on, now resolved: a cstr fixture's EXIT CODE could not observe a string's contents
+without `strlen`, so `ir_case` covered the literal's shape instead. With externs working,
+`strlen("hello") + 37 == 42` observes the contents behaviorally, and the cstr ir_cases are
+now belt-and-braces rather than the only evidence.
 
 ## Tuples — BLOCKED on the stage1 AST (labels discarded)
 
