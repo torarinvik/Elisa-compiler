@@ -97,7 +97,7 @@ extend Parser:
             target_name: sview = Lexer::text_or_empty(target_token, parser.source) if parser.peek() == TokenKind.Ident else ""
             parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_name, name: "__export_type", line: token.line}) if target_name != ""
             parser <- parser.skip_extern_line_remainder()
-            decl <- (Ast::Decl.Extern(target_name, parser.extern_params.count.u32(), 0, false, false, parser.pending_decorators, token.line))
+            decl <- (Ast::Decl.Extern(target_name, parser.extern_params.count.u32(), 0, false, false, "", parser.pending_decorators, token.line))
 
         # `is_export_global` branch of `extern_declaration`, isolated to a single real
         # call so the caller's guarded reassign threads `parser` cleanly.
@@ -126,7 +126,7 @@ extend Parser:
                 target_name <- exported_name if is_plain_ident else target_name
                 parser <- parser.advance_when(not is_alias and not is_plain_ident)
             parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_name, name: "__export_global", line: token.line}) if target_name != ""
-            return (Ast::Decl.Extern(exported_name, parser.extern_params.count.u32(), 0, false, false, parser.pending_decorators, token.line))
+            return (Ast::Decl.Extern(exported_name, parser.extern_params.count.u32(), 0, false, false, "", parser.pending_decorators, token.line))
 
         # `as alias` — consume the `as` and record the alias identifier's text.
         def capture_export_alias(parser: lmut Parser, exported_name: mutable sview&) -> void:
@@ -167,6 +167,8 @@ extend Parser:
             variadic: mutable bool = false
             param_start: u32 = parser.extern_params.count.u32()
             parser <- parser.scan_extern_params(arity, variadic) if has_params
+            extern_return_type: sview = parser.extern_return_type_head()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__extern_return", name: extern_return_type, line: token.line}) if extern_return_type != ""
             parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__extern_effect", line: token.line}) if parser.header_has_signature_can()
             parser <- parser.skip_declaration_header_clauses()          # to the block colon or end of line
             # Only `extern:` / `export:` followed by a newline opens an indented block;
@@ -176,7 +178,17 @@ extend Parser:
             # Typed `extern name: T` (or any single-line extern): consume the remainder
             # of the line (the `: T`) so it isn't reparsed.
             parser <- parser.skip_extern_line_remainder() if not has_trailing_block
-            return (Ast::Decl.Extern(name, param_start, arity, variadic, has_params, parser.pending_decorators, token.line))
+            return (Ast::Decl.Extern(name, param_start, arity, variadic, has_params, extern_return_type, parser.pending_decorators, token.line))
+
+
+        def extern_return_type_head(parser: Parser&) -> sview:
+            can Abort.Panic:
+                "" return if parser.peek() != TokenKind.Arrow
+                while parser.peek_at(scan) not in {TokenKind.Newline, TokenKind.Eof, TokenKind.Colon} |scan: usize = 1|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    Lexer::text_or_empty(token, parser.source) return if token.kind == TokenKind.Ident
+                    scan <- scan + 1
+                return ""
 
         def header_has_signature_can(parser: Parser&) -> bool:
             can Abort.Panic:
@@ -322,6 +334,7 @@ extend Parser:
 
             rebind accepted_arrow: bool, parser = parser.accept(TokenKind.Arrow)
             parser <- parser.validate_conditional_ensures_return() if accepted_arrow
+            parser <- parser.capture_typestate_postcondition(function_name, param_items, token.line)
             rebind return_type: Ast::Expr?, parser = parser.capture_return_type_and_effects(accepted_arrow)
             return_region_token: Token = parser.cursor()
             rebind accepted_return_region: bool, parser = parser.accept(TokenKind.At)
@@ -572,7 +585,7 @@ extend Parser:
         # Parse the indented body of a struct: `(IDENT : <type> NEWLINE)*`.
         # Non-field forms (e.g. `pass`, `bitset:`) are skipped token-by-token so an
         # unrecognized member never derails the surrounding declaration.
-        def struct_member_block(parser: lmut Parser) -> darray[Ast::StructMember]:
+        def struct_member_block(parser: lmut Parser, struct_name: sview) -> darray[Ast::StructMember]:
             parser, _ <- parser.expect(TokenKind.Colon)
             parser, _ <- parser.expect(TokenKind.Newline)
             parser, _ <- parser.expect(TokenKind.Indent)
@@ -592,10 +605,11 @@ extend Parser:
 
                 # `derive state:` — typestate derivation block (`struct X[state A | B]:`),
                 # an indented list of `Variant when PREDICATE` lines mapping field values
-                # to states. Not modeled in stage1; the whole block is skipped.
+                # to states. Preserve every predicate in parser metadata for typestate
+                # validation and mutation invalidation in semantic analysis.
                 derive_token: Token = parser.cursor()
                 is_derive: bool = Lexer::text_or_empty(derive_token, parser.source) == "derive" and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) == TokenKind.Colon
-                parser <- parser.skip_struct_derive_block() if is_derive
+                parser <- parser.parse_struct_derive_block(struct_name) if is_derive
                 continue if is_derive
 
                 # `ghost NAME: T` — a verification-only model field, erased at codegen.
@@ -684,13 +698,24 @@ extend Parser:
             return members
 
         # `derive state:` block, entered with the cursor on the `derive` identifier.
-        def skip_struct_derive_block(parser: lmut Parser) -> void:
+        def parse_struct_derive_block(parser: lmut Parser, struct_name: sview) -> void:
             parser.captured_has_derive <- true              # a `derive state:` block is present
             parser, _ <- parser.advance()                   # `derive`
-            parser, _ <- parser.advance()                   # `state` (the derived clause name)
-            parser, _ <- parser.advance()                   # `:`
-            parser <- parser.skip_indented_block()
-            parser, _ <- parser.accept(TokenKind.Newline)
+            parser, _ <- parser.advance()                   # `state`
+            parser, _ <- parser.expect(TokenKind.Colon)
+            parser, _ <- parser.expect(TokenKind.Newline)
+            parser, _ <- parser.expect(TokenKind.Indent)
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser|:
+                parser <- parser.skip_newlines()
+                break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+                rebind state_token: Token, parser = parser.expect(TokenKind.Ident)
+                rebind when_token: Token, parser = parser.expect(TokenKind.Ident)
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, when_token) if Lexer::text_or_empty(when_token, parser.source) != "when"
+                rebind condition_opt: Ast::Expr?, parser = parser.expression()
+                if condition_opt is condition:
+                    parser.derived_state_rules <- parser.derived_state_rules.push(Ast::DerivedStateRule{owner: struct_name, state: Lexer::text_or_empty(state_token, parser.source), condition: condition, line: state_token.line})
+                parser, _ <- parser.accept(TokenKind.Newline)
+            parser, _ <- parser.expect(TokenKind.Dedent)
 
         # `invariant EXPR` struct-body clause, entered with the cursor on `invariant`.
         def skip_invariant_clause(parser: lmut Parser) -> void:

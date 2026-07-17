@@ -110,6 +110,124 @@ extend Semantic:
                 return ""
 
 
+        def region_return_can_carry_reference(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        true return if operator == TokenKind.Ampersand or operator == TokenKind.Lmut
+                        return region_return_can_carry_reference(operand)
+                    Expr.Index(head, argument, line):
+                        return region_return_can_carry_reference(head) or region_return_can_carry_reference(argument)
+                    Expr.IndexN(head, arguments, line):
+                        true return if region_return_can_carry_reference(head)
+                        for argument in arguments:
+                            true return if region_return_can_carry_reference(argument)
+                        return false
+                    Expr.Paren(inner, line):
+                        return region_return_can_carry_reference(inner)
+                    _:
+                        return false
+
+
+        def region_tainted_name(names: darray[sview]&, name: sview) -> bool:
+            return any candidate in names where candidate == name
+
+
+        def region_expression_depends_on(expression: Ast::Expr, names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return region_tainted_name(names, name)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        true return if region_expression_depends_on(callee, names)
+                        for argument in arguments:
+                            true return if region_expression_depends_on(argument, names)
+                        return false
+                    Expr.Field(object, field, line) | Expr.Scope(object, field, line):
+                        return region_expression_depends_on(object, names)
+                    Expr.Index(object, index, line):
+                        return region_expression_depends_on(object, names) or region_expression_depends_on(index, names)
+                    Expr.Slice(object, low, high, line):
+                        return region_expression_depends_on(object, names) or region_expression_depends_on(low, names) or region_expression_depends_on(high, names)
+                    Expr.IndexN(object, arguments, line):
+                        true return if region_expression_depends_on(object, names)
+                        for argument in arguments:
+                            true return if region_expression_depends_on(argument, names)
+                        return false
+                    Expr.Unary(operator, operand, line) | Expr.Move(operand, line) | Expr.Paren(operand, line):
+                        return region_expression_depends_on(operand, names)
+                    Expr.Binary(left, operator, right, line) | Expr.Refinement(left, right, line):
+                        return region_expression_depends_on(left, names) or region_expression_depends_on(right, names)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements:
+                            true return if region_expression_depends_on(element, names)
+                        return false
+                    Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
+                        for field in fields:
+                            true return if region_expression_depends_on(field.value, names)
+                        return false
+                    _:
+                        return false
+
+
+        def taint_move_bindings(body: darray[Ast::Stmt]&, tainted: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if body.count == 0
+                match body[0]:
+                    Stmt.Match(scrutinee, arms, line):
+                        return if not region_expression_depends_on(scrutinee, tainted)
+                        for statement in body |tainted|:
+                            tainted.push(name) if statement is Stmt.VarDecl(name, type_expression, value, decl_line) and not region_tainted_name(tainted, name)
+                    _:
+                        pass
+
+
+        def walk_local_region_dependencies(statements: darray[Ast::Stmt], region: sview, return_carries_reference: bool, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, tainted: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |tainted, table|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            allocated_here: bool = allocation_region_at(allocation_regions, allocation_lines, line) == region
+                            tainted.push(name) if (allocated_here or region_expression_depends_on(value, tainted)) and not region_tainted_name(tainted, name)
+                        Stmt.Assign(target, operator, value, line):
+                            target_name: sview = region_return_source_name(target)
+                            tainted.push(target_name) if target_name != "" and region_expression_depends_on(value, tainted) and not region_tainted_name(tainted, target_name)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: region_return_source_name(returned), line: line, expected: "", actual: region}) if return_carries_reference and region_expression_depends_on(returned, tainted)
+                        Stmt.Block("move", clause, binding, body, line):
+                            taint_move_bindings(body, tainted)
+                            table <- walk_local_region_dependencies(body, region, return_carries_reference, allocation_regions, allocation_lines, tainted, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- walk_local_region_dependencies(body, region, return_carries_reference, allocation_regions, allocation_lines, tainted, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- walk_local_region_dependencies(then_body, region, return_carries_reference, allocation_regions, allocation_lines, tainted, table)
+                            table <- walk_local_region_dependencies(else_body, region, return_carries_reference, allocation_regions, allocation_lines, tainted, table)
+                        Stmt.While(condition, body, line) | Stmt.For(_, _, condition, body, line):
+                            table <- walk_local_region_dependencies(body, region, return_carries_reference, allocation_regions, allocation_lines, tainted, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |tainted, table|:
+                                table <- walk_local_region_dependencies(arm.body, region, return_carries_reference, allocation_regions, allocation_lines, tainted, table)
+                        _:
+                            pass
+
+
+        def check_local_region_dependencies(statements: darray[Ast::Stmt], return_type: Ast::Expr, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table|:
+                    match statement:
+                        Stmt.Block("region", clause, binding, body, line):
+                            tainted: mutable darray[sview] = []
+                            table <- walk_local_region_dependencies(body, binding, region_return_can_carry_reference(return_type), allocation_regions, allocation_lines, tainted, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- check_local_region_dependencies(body, return_type, allocation_regions, allocation_lines, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- check_local_region_dependencies(then_body, return_type, allocation_regions, allocation_lines, table)
+                            table <- check_local_region_dependencies(else_body, return_type, allocation_regions, allocation_lines, table)
+                        _:
+                            pass
+
+
         def check_region_assignment_statements(statements: darray[Ast::Stmt], declarations: darray[Ast::Decl]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, function_line: u32, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
@@ -151,6 +269,7 @@ extend Semantic:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
                             table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, line, table)
+                            table <- check_local_region_dependencies(body, function_return_type, allocation_regions, allocation_lines, table) if return_type is function_return_type
                         Decl.Module(name, body, line) | Decl.Scoped(body, line):
                             table <- check_region_assignment_declarations(body, annotations, allocation_regions, allocation_lines, table)
                         _:
