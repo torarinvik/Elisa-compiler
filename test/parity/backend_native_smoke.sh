@@ -744,6 +744,15 @@ diff_case array_of_struct_write 'struct P:\n    x: mutable i64\n\ndef main() -> 
 # A field of a struct-valued RECEIVER with no address -- a call result (`mk().x`) or any
 # temporary. Emit the receiver as a value, spill to a temp, then GEP the field.
 diff_case call_result_field 'struct P:\n    x: i64\n    y: i64\n\ndef mk() -> P:\n    return P{x: 40, y: 2}\n\ndef main() -> i64:\n    return mk().x + mk().y\n'
+# darray-of-STRUCT. The element stride is the struct's ABI size via LLVMSizeOf (the
+# datalayout resolves it), not a hardcoded scalar width -- which is what let struct elements
+# stop declining at intern time. push stores the struct by value; `a[i].x` addresses the
+# element in place.
+diff_case darray_of_struct 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: mutable darray[P] = []\n    a.push(P{x: 42})\n    return a[0].x\n'
+# 100 struct pushes force REALLOCATION with the struct stride, then a per-element field sum.
+diff_case darray_struct_grow 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    a: mutable darray[P] = []\n    for i in 0..<100:\n        a.push(P{x: i, y: 1})\n    total: mutable i64 = 0\n    for j in 0..<100:\n        total <- total + a[j].x + a[j].y\n    return total - 5008\n'
+# A struct COMPREHENSION -- presize-and-fill with a struct element stride.
+diff_case comprehension_struct 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: darray[P] = [P{x: i} for i in 0..<10]\n    return a[3].x + 39\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
