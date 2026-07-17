@@ -886,8 +886,7 @@ Both are the SAME shape as the ones already landed -- a receiver resolver that o
 a bare Ident, needing the recursive chain form. Neither is blocked on anything; both are
 straightforward.
 
-1. **Struct with a darray FIELD** (`struct Bag: items: darray[i64]`; `b.items.push(v)`,
-   `b.items[i]`). DECLARATION + construction already work (set_struct_body accepts a DArray
+1. ~~Struct with a darray FIELD~~ — DONE (b.items.push/count/index). DECLARATION already worked (set_struct_body accepts a DArray
    member; `Bag{items: []}` builds). Only the OPS decline: push/count/index resolve their
    receiver via `darray_address_of(name)` / `darray_type_behind(name)`, which are Ident-only.
    FIX: add `darray_address_of_expr(object)` / `darray_type_behind_expr(object)` -- for a

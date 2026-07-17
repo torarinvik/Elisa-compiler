@@ -753,6 +753,14 @@ diff_case darray_of_struct 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: 
 diff_case darray_struct_grow 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    a: mutable darray[P] = []\n    for i in 0..<100:\n        a.push(P{x: i, y: 1})\n    total: mutable i64 = 0\n    for j in 0..<100:\n        total <- total + a[j].x + a[j].y\n    return total - 5008\n'
 # A struct COMPREHENSION -- presize-and-fill with a struct element stride.
 diff_case comprehension_struct 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: darray[P] = [P{x: i} for i in 0..<10]\n    return a[3].x + 39\n'
+# CONTAINER IN A STRUCT: a darray FIELD (`struct Bag: items: darray[i64]`). push, count,
+# and indexed reads all go through the receiver as a struct field -- the darray-op receiver
+# resolvers were extended from Ident-only to an Expr form (Ident or struct field), the
+# header sitting inline in the struct.
+diff_case struct_darray_push_read 'struct Bag:\n    items: mutable darray[i64]\n\ndef main() -> i64:\n    b: mutable Bag = Bag{items: []}\n    b.items.push(42)\n    return b.items[0] can Unsafe.UncheckedIndex\n'
+diff_case struct_darray_count 'struct Bag:\n    items: mutable darray[i64]\n\ndef main() -> i64:\n    b: mutable Bag = Bag{items: []}\n    b.items.push(1)\n    b.items.push(2)\n    return b.items.count.i64() + 40\n'
+# Growth through a struct field: 100 pushes reallocate the field's backing.
+diff_case struct_darray_grow 'struct Bag:\n    items: mutable darray[i64]\n\ndef main() -> i64:\n    b: mutable Bag = Bag{items: []}\n    for i in 0..<100:\n        b.items.push(1)\n    total: mutable i64 = 0\n    for j in 0..<100:\n        total <- total + (b.items[j] can Unsafe.UncheckedIndex)\n    return total - 58\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
