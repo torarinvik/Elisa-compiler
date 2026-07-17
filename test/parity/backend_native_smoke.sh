@@ -302,6 +302,10 @@ run_case ref_addr_field   'struct Box:\n    value: mutable i64\n\ndef get_ref(b:
 run_case ref_optional     'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef get_ref(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 42, used: 1}\n    if get_ref(b) is v:\n        return v\n    return 0\n'  42
 # Absent case of a ref-optional: the null branch is taken, so the fallback returns.
 run_case ref_optional_absent 'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef get_ref(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 7, used: 0}\n    if get_ref(b) is v:\n        return v\n    return 42\n'  42
+# REF-AS-ARRAY-BASE indexing: `items[i]` where `items: Bucket&` is a C-style pointer base
+# (GEP by struct stride). How the std walks `DictBucket[K,T]&` rows. `&arr[0]` supplies the
+# base as a ref; `items[1].value` reads the second element in place.
+run_case ref_index_base 'struct Bucket:\n    value: mutable i64\n\ndef second_value(items: Bucket&) -> i64:\n    return items[1].value\n\ndef main() -> i64:\n    arr: mutable Bucket[3] = [Bucket{value: 10}, Bucket{value: 42}, Bucket{value: 99}]\n    return second_value(&arr[0])\n'  42
 # `void`: a bare `return`, a void call in statement position (its result must be UNNAMED —
 # LLVM rejects a named void instruction), and a void body running off the end.
 run_case void_call        'def noop() -> void:\n    return\n\ndef main() -> i64:\n    noop()\n    return 42\n'  42
