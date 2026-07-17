@@ -502,6 +502,15 @@ module Backend:
         # region would free it at return and hand back freed memory. The return case IS
         # region-return inference, and it is why returning an owned container no longer has
         # to decline (see 95915b5, which declined it precisely because this was missing).
+        # Whether the function declared at `line` returns an error union. The frontend
+        # records error-returning functions by LINE in File.error_set_func_lines (the
+        # `error[E]` clause is consumed at parse time; only this side table survives).
+        def line_is_error_returning(error_lines: darray[u32]&, line: u32) -> bool can[Abort.Panic]:
+            for error_line in error_lines |line|:
+                true return if error_line == line
+            return false
+
+
         def signature_needs_arena(params: darray[ParamDecl]&, return_value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
             true return if return_value_type.kind == TypeKind.DArray
             for parameter in params |structs|:
@@ -644,6 +653,11 @@ module Backend:
             # Node.Leaf requires an active in Node.Store: scope".
             active_store: mutable LLVMValueRef
             active_store_enum: mutable i64
+            # When the current function returns an error union: the leading `ptr` out-param
+            # (the T value is stored through it) and a flag. A `return x` then stores x to
+            # the out-param and returns `i32 0`; a `raise` returns `i32 (ordinal + 1)`.
+            error_out: mutable LLVMValueRef
+            in_error_fn: mutable bool
 
 
         # Declare the runtime entry points in the module. Signatures are dictated by
@@ -696,6 +710,8 @@ module Backend:
                 owns_arena: true,
                 active_store: LLVMConstNull(pointer_type),
                 active_store_enum: -1,
+                error_out: LLVMConstNull(pointer_type),
+                in_error_fn: false,
                 packed_state_new: LLVMAddFunction(m, "ctx_packed_store_state_new_variant_sparse", state_new_type),
                 packed_state_new_type: state_new_type,
                 packed_alloc: LLVMAddFunction(m, "ctx_packed_store_alloc_fixed_tagged_variant_sparse_result", alloc_fn_type),
@@ -803,6 +819,10 @@ module Backend:
             # True when the function has an implicit trailing arena parameter (it takes a
             # growable container by reference). The CALL SITE must then pass its own arena.
             needs_arena: mutable darray[bool]
+            # True when the function returns an error union `T error[E]`: its LLVM signature
+            # is `i32 @f(ptr out, <params>)` -- an i32 error code, with the T value written
+            # through a leading out-pointer. `returns[i]` still holds T (the success type).
+            is_error: mutable darray[bool]
             handles: mutable darray[LLVMValueRef]
             returns: mutable darray[ValueType]
             # Parameter types as a FLAT pool plus a per-function span (`param_start[i]`,
@@ -1256,6 +1276,18 @@ module Backend:
             for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
                 ValueType{kind: TypeKind.PayloadEnum, bits: enum_index.u32()} return if sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
             return unmodeled_type()
+
+
+        # `E.Variant` as an Expr.Field -> the variant's ordinal in its (payload-free) enum,
+        # or -1. Error sets parse as plain enums, so their ordinals live in the enum pools.
+        def ordinal_of_dotted_path_expr(expression: Expr, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            if expression is Expr.Field(enum_head, variant_name, field_line):
+                if enum_head is Expr.Ident(enum_name, enum_name_line):
+                    enum_index: i64 = penum_index_of(structs, enum_name)
+                    penum_variant_index(structs, enum_index, variant_name) return if enum_index >= 0
+                    plain_index: i64 = enum_index_of(structs, enum_name)
+                    enum_ordinal_of(structs, plain_index.usize(), variant_name) return if plain_index >= 0
+            return -1
 
 
         # Pattern.Variant carries the path as one dotted STRING, so it is split here.
@@ -1799,6 +1831,8 @@ module Backend:
                 owns_arena: runtime.owns_arena,
                 active_store: runtime.active_store,
                 active_store_enum: runtime.active_store_enum,
+                error_out: runtime.error_out,
+                in_error_fn: runtime.in_error_fn,
                 packed_state_new: runtime.packed_state_new,
                 packed_state_new_type: runtime.packed_state_new_type,
                 packed_alloc: runtime.packed_alloc,
@@ -2151,6 +2185,55 @@ module Backend:
                 return emit_expression(moved_value, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             if expression is Expr.Comprehension(comp_var, comp_iterable, comp_condition, comp_body, comp_line):
                 return emit_comprehension(comp_var, comp_iterable, comp_condition, comp_body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            # `try CALL else FALLBACK` -> Expr.Refinement(fallback, guarded). Modeled only
+            # when the guarded is a call to an ERROR-returning function: call it with a fresh
+            # out-slot, and if the returned i32 code is 0 use the out-value, else the
+            # fallback. (`get arr[i] else f`, the optional form, shares this node but is not
+            # modeled here.)
+            if expression is Expr.Refinement(try_fallback, try_guarded, try_line):
+                if try_guarded is Expr.Call(try_callee, try_args, try_arg_names, try_call_line):
+                    if try_callee is Expr.Ident(try_name, try_name_line):
+                        if function_is_error(fns, "", try_name):
+                            try_value_type: ValueType = lookup_return_type(fns, "", try_name)
+                            null return if try_value_type.kind == TypeKind.Unmodeled
+                            if lookup_function(fns, "", try_name) is try_target:
+                                try_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(try_value_type, structs, ctx), "try.out")
+                                try_call_args: mutable darray[LLVMValueRef] = [try_out_slot]
+                                try_declined: mutable bool = false
+                                try_arg_index: mutable usize = 0
+                                for try_arg in try_args |try_call_args, try_declined, try_arg_index, try_name, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                    if emit_expression(try_arg, param_type_of(fns, "", try_name, try_arg_index), local_scope, fns, structs, generics, runtime, m, ctx, builder) is try_arg_value:
+                                        try_call_args.push(try_arg_value)
+                                    else:
+                                        try_declined <- true
+                                    try_arg_index <- try_arg_index + 1
+                                null return if try_declined
+                                try_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(try_target)
+                                try_args_pointer: void& = (&try_call_args[0]).cast[void&] can Unsafe.PointerCast
+                                try_code: LLVMValueRef = LLVMBuildCall2(builder, try_fn_type, try_target, try_args_pointer, try_call_args.count.u32(), "try.code")
+                                try_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, try_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                try_value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "try.value")
+                                try_fallback_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "try.fallback")
+                                try_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "try.done")
+                                # alloca+store+load, not phi -- the codebase avoids phi (a
+                                # void phi ICEs stage0, and the two paths merge cleanly here).
+                                try_result_type: LLVMTypeRef = llvm_type_of(try_value_type, structs, ctx)
+                                try_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, try_result_type, "try.result")
+                                _ = LLVMBuildCondBr(builder, try_ok, try_value_block, try_fallback_block)
+                                LLVMPositionBuilderAtEnd(builder, try_value_block)
+                                try_value: LLVMValueRef = LLVMBuildLoad2(builder, try_result_type, try_out_slot, "try.value.load")
+                                _ = LLVMBuildStore(builder, try_value, try_result_slot)
+                                _ = LLVMBuildBr(builder, try_done_block)
+                                LLVMPositionBuilderAtEnd(builder, try_fallback_block)
+                                if emit_expression(try_fallback, try_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is try_fallback_value:
+                                    _ = LLVMBuildStore(builder, try_fallback_value, try_result_slot)
+                                    _ = LLVMBuildBr(builder, try_done_block)
+                                else:
+                                    return null
+                                LLVMPositionBuilderAtEnd(builder, try_done_block)
+                                return LLVMBuildLoad2(builder, try_result_type, try_result_slot, "try.value")
+                return null
             if expression is Expr.StringLit(string_text):
                 null return if expected.kind != TypeKind.CStr and expected.kind != TypeKind.Unmodeled
                 literal_storage: mutable darray[u8] = []
@@ -2749,6 +2832,21 @@ module Backend:
                 emit_region_free(scoped_runtime, builder)
                 return scoped_status
 
+            # `raise MyErr.Bad` — parses to Call(Ident("raise"), [E.Variant]). It TERMINATES:
+            # store a zero into the error out-param (the success value is unused on the error
+            # path) and return the i32 code `ordinal + 1` (0 is reserved for success).
+            if statement is Stmt.Expr(raise_stmt_expr, raise_stmt_line):
+                if raise_stmt_expr is Expr.Call(raise_callee, raise_args, raise_arg_names, raise_call_line):
+                    if raise_callee is Expr.Ident(raise_name, raise_name_line):
+                        if raise_name == "raise" and runtime.in_error_fn and raise_args.count == 1:
+                            raise_ordinal: i64 = ordinal_of_dotted_path_expr(raise_args[0], structs)
+                            if raise_ordinal >= 0:
+                                emit_region_unwind(regions, runtime, builder)
+                                # The out-param slot is a pointer; zero its first word so a
+                                # later spurious read is deterministic (stage0 stores 0).
+                                _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), runtime.error_out)
+                                _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), (raise_ordinal + 1).u64(), 0))
+                                return EmitStatus.Terminated
             if statement is Stmt.Expr(statement_expression, statement_expression_line):
                 if statement_expression is Expr.Call(push_callee, push_arguments, push_argument_names, push_call_line):
                     if push_callee is Expr.Field(push_object, push_method, push_method_line):
@@ -2775,6 +2873,12 @@ module Backend:
                         # return path rather than at one function exit because a return can
                         # happen from inside any depth of scope.
                         emit_region_unwind(regions, runtime, builder)
+                        # An error fn writes the SUCCESS value through its out-param and
+                        # returns the i32 success code 0, rather than returning the value.
+                        if runtime.in_error_fn:
+                            _ = LLVMBuildStore(builder, return_constant, runtime.error_out)
+                            _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0))
+                            return EmitStatus.Terminated
                         _ = LLVMBuildRet(builder, return_constant)
                         return EmitStatus.Terminated
                     return EmitStatus.Declined
@@ -3025,6 +3129,12 @@ module Backend:
             return ""
 
 
+        def function_line_of(declaration: Decl) -> u32 can[Abort.Panic]:
+            if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                return line
+            return 0
+
+
         # Does `owner::name` take the implicit trailing arena parameter?
         def callee_needs_arena(fns: FnTable&, owner: sview, name: sview) -> bool can[Abort.Panic]:
             for index in 0..<fns.names.count |fns, owner, name|:
@@ -3033,6 +3143,12 @@ module Backend:
 
 
         # The index of function `owner::name` in the table, or -1.
+        def function_is_error(fns: FnTable&, owner: sview, name: sview) -> bool can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.is_error[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return false
+
+
         def function_index_of(fns: FnTable&, owner: sview, name: sview) -> i64 can[Abort.Panic]:
             for index in 0..<fns.names.count |fns, owner, name|:
                 index.i64() return if fns.names[index] == name and fns.owners[index] == owner
@@ -3456,7 +3572,7 @@ module Backend:
         # types in `fns`. Null when the signature is outside the modeled subset.
         #
         # Signature types are REAL now: any modeled scalar width/signedness, not just i64.
-        def declare_function(declaration: Decl, owner: sview, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_function(declaration: Decl, owner: sview, error_lines: darray[u32]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 if return_type_opt is return_type:
                     return_value_type: ValueType = annotation_value_type(return_type, structs)
@@ -3479,8 +3595,19 @@ module Backend:
                     # The implicit trailing arena parameter, if this signature needs one.
                     wants_arena: bool = signature_needs_arena(params, return_value_type, structs)
                     llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if wants_arena
-                    total_params: usize = params.count + 1 if wants_arena else params.count
-                    llvm_return: LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
+                    # An error-returning fn: prepend a `ptr` OUT-param for the T value and
+                    # make the LLVM return an i32 error code. The arena param (if any) still
+                    # trails the declared params; the out-param leads.
+                    is_error_fn: bool = line_is_error_returning(error_lines, line)
+                    error_out_param: mutable darray[LLVMTypeRef] = []
+                    if is_error_fn:
+                        error_out_param.push(LLVMPointerTypeInContext(ctx, 0))
+                        for existing in llvm_param_types |error_out_param|:
+                            error_out_param.push(existing)
+                        llvm_param_types <- error_out_param
+                    total_params: usize = llvm_param_types.count
+                    llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
+                    llvm_return <- LLVMInt32TypeInContext(ctx) if is_error_fn
                     fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
                     if total_params != 0:
                         params_pointer: void& = (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
@@ -3490,6 +3617,7 @@ module Backend:
                     fns.names <- fns.names.push(function_name)
                     fns.owners <- fns.owners.push(owner)
                     fns.needs_arena <- fns.needs_arena.push(wants_arena)
+                    fns.is_error <- fns.is_error.push(is_error_fn)
                     fns.handles <- fns.handles.push(handle)
                     fns.returns <- fns.returns.push(return_value_type)
                     fns.param_start <- fns.param_start.push(fns.param_types.count)
@@ -3549,6 +3677,7 @@ module Backend:
                 fns.names <- fns.names.push(extern_name)
                 fns.owners <- fns.owners.push("")
                 fns.needs_arena <- fns.needs_arena.push(false)
+                fns.is_error <- fns.is_error.push(false)
                 fns.handles <- fns.handles.push(handle)
                 fns.returns <- fns.returns.push(return_value_type)
                 fns.param_start <- fns.param_start.push(fns.param_types.count)
@@ -3560,7 +3689,7 @@ module Backend:
 
 
         # Emit the body of an already-declared function. False = declined.
-        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_function_body(declaration: Decl, fn: LLVMValueRef, error_lines: darray[u32]&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 # From the ANNOTATION, not from `fns`: a generic TEMPLATE has no fns entry
                 # (only its instantiations do), and with bindings active the annotation
@@ -3581,9 +3710,16 @@ module Backend:
                 # region, handed over as the implicit trailing parameter, rather than its
                 # own: the container's backing outlives this call, so allocating it from a
                 # region freed at return would hand the caller freed memory.
+                # An error fn's out-param is LLVM param 0; declared params (and the arena)
+                # shift past it by one.
+                fn_is_error: bool = line_is_error_returning(error_lines, function_line_of(declaration))
+                error_param_offset: u32 = 1 if fn_is_error else 0
+                if fn_is_error:
+                    local_runtime.error_out <- LLVMGetParam(fn, 0)
+                    local_runtime.in_error_fn <- true
                 threads_arena: bool = signature_needs_arena(params, return_value_type, structs)
                 if threads_arena:
-                    local_runtime.arena <- LLVMGetParam(fn, params.count.u32())
+                    local_runtime.arena <- LLVMGetParam(fn, params.count.u32() + error_param_offset)
                     local_runtime.owns_arena <- false
                 else:
                     arena_type: LLVMTypeRef = arena_llvm_type(ctx)
@@ -3603,7 +3739,7 @@ module Backend:
                 # so the stack stays empty.
                 regions: mutable RegionStack = RegionStack{arenas: []}
                 regions.arenas.push(local_runtime.arena) if not threads_arena
-                parameter_index: mutable u32 = 0
+                parameter_index: mutable u32 = error_param_offset
                 for parameter in params |local_scope, parameter_index, fn, ctx, builder|:
                     parameter_type: ValueType = annotation_value_type(parameter.type_expression, structs)
                     name_storage: mutable darray[u8] = []
@@ -3638,7 +3774,10 @@ module Backend:
 
             structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
             structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
-            emitted: bool = emit_function_body(generics.decls[slot], handle, fns, structs, generics, runtime, m, ctx, builder)
+            # A generic template is never error-returning in the modeled subset (dict/set
+            # generics, which are, are blocked on catch), so no error lines apply here.
+            no_error_lines: darray[u32] = []
+            emitted: bool = emit_function_body(generics.decls[slot], handle, no_error_lines, fns, structs, generics, runtime, m, ctx, builder)
             _ = structs.binding_names.pop()
             _ = structs.binding_types.pop()
             return emitted
@@ -3812,7 +3951,7 @@ module Backend:
             # Templates must be known before any body is emitted: a call decides between
             # "ordinary function" and "instantiate a generic" by looking here.
             register_generics(file, generics)
-            fns: mutable FnTable = FnTable{names: [], owners: [], needs_arena: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
+            fns: mutable FnTable = FnTable{names: [], owners: [], needs_arena: [], is_error: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
             # THREE passes. Structs first: a function signature can name a struct, and a
@@ -3851,7 +3990,7 @@ module Backend:
                     for nested in module_body |fns, declined, structs, generics, m, ctx, module_name|:
                         continue if function_name_of(nested) == ""
                         continue if generic_index_of(generics, function_name_of(nested)) >= 0
-                        if not (declare_function(nested, module_name, fns, structs, generics, m, ctx) is declared_nested_fn):
+                        if not (declare_function(nested, module_name, file.error_set_func_lines, fns, structs, generics, m, ctx) is declared_nested_fn):
                             declined <- true
                     continue
                 # An EXTERN is declared, never defined: `declare i64 @strlen(ptr)`.
@@ -3863,7 +4002,7 @@ module Backend:
                 # so it is skipped here, not declined.
                 continue if generic_index_of(generics, function_name_of(declaration)) >= 0
                 # declare_function records the signature's types into `fns` itself.
-                if not (declare_function(declaration, "", fns, structs, generics, m, ctx) is declared_fn):
+                if not (declare_function(declaration, "", file.error_set_func_lines, fns, structs, generics, m, ctx) is declared_fn):
                     declined <- true
             -1 return if declined
 
@@ -3878,7 +4017,7 @@ module Backend:
                         if nested_index < 0:
                             declined <- true
                             continue
-                        nested_emitted: bool = emit_function_body(nested, fns.handles[nested_index.usize()], fns, structs, generics, runtime, m, ctx, builder)
+                        nested_emitted: bool = emit_function_body(nested, fns.handles[nested_index.usize()], file.error_set_func_lines, fns, structs, generics, runtime, m, ctx, builder)
                         emitted_count <- emitted_count + 1 if nested_emitted else emitted_count
                         declined <- true if not nested_emitted else declined
                     continue
@@ -3889,7 +4028,7 @@ module Backend:
                 if handle_index < 0:
                     declined <- true
                     continue
-                emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], fns, structs, generics, runtime, m, ctx, builder)
+                emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], file.error_set_func_lines, fns, structs, generics, runtime, m, ctx, builder)
                 emitted_count <- emitted_count + 1 if emitted else emitted_count
                 declined <- true if not emitted else declined
             -1 return if declined

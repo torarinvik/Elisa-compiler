@@ -705,6 +705,18 @@ diff_case common_field_int 'packed enum Expr:\n    common:\n        @storage(inl
 # The SECOND variant, proving the tag dispatches AND the payload word index (shifted past the
 # common) reads the right field.
 diff_case common_field_tag 'packed enum Expr:\n    common:\n        @storage(inline)\n        span: i64\n    Int(value: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Expr.Store[Local] = Expr.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        e: Expr = new Expr.Tag(span: 9, t: 21)\n        result <- match e:\n            Expr.Int(value): value\n            Expr.Tag(t): t * 2\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
+# ERROR UNIONS (return side). An `error[E]`-returning fn lowers to `i32 @f(ptr out, args)`:
+# an i32 code (0=success, ordinal+1=raised) with the T value written through a leading
+# out-pointer. `raise E.V` returns `ordinal+1`; `return x` stores x + returns 0. A non-error
+# fn consumes the union with `try CALL else FALLBACK` (call, check code==0, pick value or
+# fallback). Only `catch` (the handler) is blocked (task_c19cb583); this is everything else.
+diff_case error_union_try_else 'error MyErr:\n    Bad\n\ndef risky(n: i64) -> i64 error[MyErr]:\n    raise MyErr.Bad if n > 100\n    return n * 2\n\ndef main() -> i64:\n    ok: i64 = try risky(20) else 0\n    bad: i64 = try risky(200) else 1\n    return ok + bad + 1\n'
+# The SUCCESS path alone (no raise reached): the out-param value must come back intact.
+diff_case error_union_success 'error E:\n    X\n\ndef doubler(n: i64) -> i64 error[E]:\n    return n * 2\n\ndef main() -> i64:\n    return try doubler(21) else 0\n'
+# The RAISE path alone: the fallback must be taken and the value ignored.
+diff_case error_union_raise 'error E:\n    X\n    Y\n\ndef fails(n: i64) -> i64 error[E]:\n    raise E.Y\n\ndef main() -> i64:\n    return try fails(5) else 42\n'
+# A u8 success value round-trips through the out-param at its own width.
+diff_case error_union_u8 'error E:\n    X\n\ndef mk(n: u8) -> u8 error[E]:\n    return n\n\ndef main() -> i64:\n    v: u8 = try mk(200) else 0\n    return v.i64() - 158\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
