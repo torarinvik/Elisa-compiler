@@ -823,3 +823,36 @@ Note `arena_dict_get_mut` (collections.elisa:944) returns `mutable T&?` with NO 
 so a read-only dict subset looks tempting -- but emit_module declines a module if ANY
 declaration declines, and the allocating half of the file cannot compile. A partial
 collections.elisa is not a thing.
+
+## Error unions (#17) — RETURN+RAISE+TRY-ELSE is portable and TESTABLE; only `catch` is blocked
+
+Correction to the earlier "all of #17 is blocked" claim. Only the HANDLER (`catch`) is blocked
+(task_c19cb583: Stmt.Block has no Expr). The return side is fully portable AND behaviourally
+testable without catch, via `try EXPR else FALLBACK` (a non-error fn CAN consume an error
+union this way -- verified: `try risky(200) else 1` falls back to 1, exit 42).
+
+Complete ABI, read from stage0's -emit llvm:
+
+* An error SET `error MyErr:` parses to `Decl.Enum(name, variants, is_const=false, Absent)`
+  -- a payload-free enum. Variant ordinal (declaration order) is the raise code.
+* An error-returning fn `def f(...) -> T error[E]` lowers to `define i32 @f(ptr %out, <params>)`:
+  returns an i32 CODE (0 = success), and writes the T success value through a LEADING
+  out-pointer. Which fns are error-returning is recorded in `File.error_set_func_lines` (by
+  line); the return_type Expr itself is just T (the `error[E]` clause tokens are consumed and
+  only `parser.signature_has_error_set` is set).
+* `return x` in an error fn: `store x, ptr %out; ret i32 0`.
+* `raise E.V` (parses to `Expr.Call(Expr.Ident("raise"), [E.V], [""])`): `store <zero>, ptr
+  %out; ret i32 (ordinal + 1)`.
+* `try X else F` (parses via get_expression, same node family as `get`): call `%code = i32
+  @g(ptr %slot, args)`, `icmp eq i32 %code, 0`, branch value/fallback, `phi [load %slot,
+  F]`. A non-error caller uses this; an error caller without `else` PROPAGATES (store zero,
+  ret %code).
+
+Implementation touch list (all verifiable by exit code via try-else): register error sets
+(reuse the enum ordinal machinery); declare_function adds the i32-return + out-param when the
+fn's line is in error_set_func_lines; emit_function_body's `return` stores-to-out + ret 0;
+a `raise` Call-shape; the `try...else` node in emit_expression; and error-fn call sites.
+
+This does NOT unblock dict: collections.elisa uses `catch` 6x (converting/handling errors),
+and catch is blocked. But it takes #17 from "blocked" to "only the handler is blocked", and
+it is real, differentiable backend work whenever it is picked up.
