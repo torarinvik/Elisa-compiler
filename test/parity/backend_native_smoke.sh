@@ -375,6 +375,17 @@ diff_case ufcs_u8_receiver 'def widen(b: u8) -> i64:\n    return b.i64()\n\ndef 
 diff_case ufcs_void 'struct Acc:\n    total: mutable i64\n\ndef bump(a: mutable Acc&) -> void:\n    a.total <- a.total + 42\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    a.bump()\n    return a.total\n'
 # A cast is still a cast, not a UFCS call to a function that happens to be missing.
 diff_case ufcs_cast_unaffected 'def main() -> i64:\n    a: u8 = 200\n    return a.i64() - 158\n'
+# A `type` alias is a NAME for an existing type with no representation of its own, so it
+# resolves to the target and disappears. (`alias` is the EFFECT keyword, not this.)
+diff_case type_alias_return 'type Num = i64\n\ndef main() -> Num:\n    return 42\n'
+# An alias may name another alias, but only one already DECLARED: resolution is a single
+# in-order pass because stage0 rejects a forward reference ("unknown type B").
+diff_case type_alias_chain 'type B = i64\ntype A = B\n\ndef main() -> A:\n    return 42\n'
+diff_case type_alias_struct 'struct P:\n    x: i64\n\ntype Pt = P\n\ndef main() -> i64:\n    p: Pt = Pt{x: 42}\n    return p.x\n'
+# The alias carries the target's WIDTH and SIGNEDNESS: a u8 alias must stay a u8, not
+# silently become the i64 default.
+diff_case type_alias_u8 'type Byte = u8\n\ndef main() -> i64:\n    b: Byte = 200\n    return b.i64() - 158\n'
+diff_case type_alias_param 'type Num = i64\n\ndef add(a: Num, b: Num) -> Num:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -423,6 +434,13 @@ decline_case() {
 # non-`const` enum is not the backing scalar at all.
 decline_case enum_payload_variant 'enum Shape:\n    Circle(r: i64)\n    Square(s: i64)\n\ndef main() -> i64:\n    return match Shape.Circle(1):\n        Shape.Circle: 42\n        _: 0\n'
 decline_case enum_not_const 'enum Color of u8:\n    Red\n    Green\n\ndef main() -> i64:\n    return match Color.Red:\n        Color.Red: 42\n        _: 0\n'
+# A CYCLIC alias never resolves. Resolution iterates to a fixpoint rather than recursing
+# at each mention precisely so this DECLINES instead of recursing forever — a naive
+# resolver stack-overflows here.
+decline_case type_alias_cycle 'type A = B\ntype B = A\n\ndef main() -> A:\n    return 42\n'
+# A FORWARD reference is not a language feature — stage0 rejects it, so stage1 must not
+# quietly resolve it and emit code for a program the reference compiler refuses.
+decline_case type_alias_forward 'type A = B\ntype B = i64\n\ndef main() -> A:\n    return 42\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
