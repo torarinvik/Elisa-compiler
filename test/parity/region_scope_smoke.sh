@@ -24,6 +24,9 @@ out=$(printf 'def f() -> i64:\n    region r(64)\n    xs: array[i64, 4] @r = zero
 echo "$out" | grep -q "cannot carry a region" || fail "fixed-array region annotation was not flagged: $out"
 clean $'def id[T, @r](value: T& @r) -> T& @r:\n    return value\n'
 
+out=$(printf 'def f() -> void:\n    value: i32&? @missing = null\n' | "$RPT")
+echo "$out" | grep -q 'unknown region qualifier "missing"' || fail "unknown local region qualifier was not flagged: $out"
+
 out="$(printf '%s' $'def f() -> void:\n    destroy missing\n' | "$RPT")"
 echo "$out" | grep -q "undefined name 'missing'" || fail "destroy of unknown region was not resolved: $out"
 
