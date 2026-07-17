@@ -568,6 +568,12 @@ diff_case extern_strlen_literal 'extern strlen(s: cstr) -> usize\n\ndef main() -
 diff_case extern_strlen_empty 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return strlen("").i64() + 42\n'
 # Two args, and a return type that is not the i64 default.
 diff_case extern_two_args 'extern strncmp(a: cstr, b: cstr, n: usize) -> i32\n\ndef main() -> i64:\n    return strncmp("abc", "abc", 3).i64() + 42\n'
+# NAMED-FIELD construction: `Shape.Circle(r: 42)`, which stage0 accepts alongside the
+# positional form. The label is checked against the payload field's DECLARED name -- a label
+# naming something else is a different program. This is the last of the four prerequisites
+# for the packed-enum store (cab917f), where constructors are written `new Node.Leaf(v: 42)`.
+diff_case penum_named_field 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(r: 42)\n    return match s:\n        Shape.Circle(r): r\n'
+diff_case penum_named_field_u8 'enum Box:\n    Small(v: u8)\n\ndef main() -> i64:\n    b: Box = Box.Small(v: 200)\n    return match b:\n        Box.Small(v): v.i64() - 158\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -632,6 +638,9 @@ decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a:
 # A VARIADIC extern needs a different LLVMFunctionType flag and a call site that knows which
 # args are fixed; not modeled, so it declines rather than emitting a wrong signature.
 decline_case extern_variadic 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n'
+# A label that is NOT the payload field's declared name must decline rather than be emitted
+# as this constructor -- it names a different program.
+decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(bogus: 42)\n    return match s:\n        Shape.Circle(r): r\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'

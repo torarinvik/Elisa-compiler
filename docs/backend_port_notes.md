@@ -622,8 +622,12 @@ Prerequisites this needs that the backend does NOT have yet:
    region's NAME is bound as an Arena local, so `build(r)` goes through the ordinary Ident
    path and emits stage0's `load %Arena, ptr %r` with no special case. The asymmetry stands:
    passable, not annotatable (`-> darray[i64] @owner` is still rejected).
-3. `new T.Variant(field: value)` — NAMED-field construction, distinct from the positional
-   `Shape.Circle(42)` that payload enums use.
+3. ~~`new T.Variant(field: value)`~~ — DONE for the NAMED-FIELD half. `Shape.Circle(r: 42)`
+   emits, with the label checked against the payload field's declared name. Note the parser
+   LOWERS `new X(...)` to the constructor expression itself and DISCARDS both the `new`
+   keyword and the `[region]` bracket — so `new[Node.Store] X(...)` currently reaches the
+   backend indistinguishable from a plain `X(...)`. That bracket will matter for the store's
+   explicit form, and is an AST gap of the same family as the others.
 4. `in store:` — PARTIALLY DONE. `in NAME:` now activates an ARENA (borrowed: nothing frees
    it). The same construct must also accept a packed Store, which is what remains. Note
    activation is REQUIRED, not decorative: stage0 rejects a push in a function holding an
