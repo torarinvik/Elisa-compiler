@@ -271,6 +271,14 @@ run_case generic_multi_second 'def second[K, T](a: K, b: T) -> T:\n    return b\
 run_case generic_multi_widths 'def combine[K, T](a: K, b: T) -> i64:\n    return a.i64() + b.i64()\n\ndef main() -> i64:\n    return combine[u8, i64](40, 2)\n'  42
 # Two distinct instantiations of the SAME two-param template must be emitted once each.
 run_case generic_multi_two_insts 'def pick[K, T](a: K, b: T) -> K:\n    return a\n\ndef main() -> i64:\n    return pick[i64, i32](40, 1) + pick[i64, u8](2, 3)\n'  42
+# INFERENCE by UNIFICATION: a generic whose parameter is `Map[T]&`, called with a
+# `Map[i64]` argument, must infer T=i64 (unify the annotation against the arg's
+# instantiation) — NOT T=Map[i64] (the whole arg type). The dict `.put`/`.get` machinery:
+# infer K,T from the receiver's `dict[K,T]`.
+run_case generic_infer_struct 'struct Bucket[T]:\n    value: mutable T\n\nstruct Map[T]:\n    slot: mutable Bucket[T]\n\ndef peek[T](m: Map[T]&, dummy: T) -> T:\n    return m.slot.value\n\ndef main() -> i64:\n    m: mutable Map[i64] = Map[i64]{slot: Bucket[i64]{value: 42}}\n    return peek(m, 0)\n'  42
+# Inference PLUS a ref-optional return read through the binding — the whole dict read
+# shape: unify K/T, return `&field` as `T&?`, bind and deref.
+run_case generic_infer_refopt 'struct Bucket[T]:\n    value: mutable T\n    used: mutable u8\n\nstruct Map[T]:\n    slot: mutable Bucket[T]\n\ndef map_get[T](m: Map[T]&, dummy: T) -> T&?:\n    return &m.slot.value if m.slot.used == 1 else null\n\ndef main() -> i64:\n    m: mutable Map[i64] = Map[i64]{slot: Bucket[i64]{value: 42, used: 1}}\n    if map_get(m, 0) is v:\n        return v\n    return 0\n'  42
 
 # REFERENCES (`T&` / `mutable T&`), field assignment, and `void`.
 #
