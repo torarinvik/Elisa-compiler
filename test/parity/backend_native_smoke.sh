@@ -536,6 +536,19 @@ diff_case penum_plain_second 'enum Color:\n    Red\n    Green\n\ndef code(c: Col
 diff_case region_capacity 'def main() -> i64:\n    total: mutable i64 = 0\n    region r(4096):\n        xs: mutable darray[i64] = []\n        xs.push(42)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
 # The sized region must still serve REALLOCATION inside the scope.
 diff_case region_capacity_grows 'def main() -> i64:\n    total: mutable i64 = 0\n    region r(65536):\n        xs: mutable darray[i64] = []\n        for i in 0..<500:\n            xs.push(1)\n        for j in 0..<500:\n            total <- total + (xs[j] can Unsafe.UncheckedIndex)\n    return total - 458\n'
+# `Arena` as a PARAMETER type: the runtime's region carrier, `{ptr, ptr, i64, i64}`, passed
+# BY VALUE (stage0: `define i64 @build(%Arena %0)`, `%r1 = load %Arena, ptr %r` at the call
+# site). A region's NAME is bound as an Arena local, so `build(r)` resolves through the
+# ordinary Ident path and emits that same load with no special case.
+#
+# Note the asymmetry: `Arena` is legal HERE but rejected as a region ANNOTATION -- a
+# `-> darray[i64] @owner` return is "internal runtime carrier type ... not supported in
+# user-facing code". Passable, not annotatable. This is prerequisite 2 of 4 for the
+# packed-enum store (cab917f).
+diff_case arena_param 'def sink(owner: Arena) -> i64:\n    return 42\n\ndef main() -> i64:\n    region r(4096):\n        return sink(r)\n'
+# The callee must be able to BUILD in the arena it was handed -- that is the whole point of
+# passing one.
+diff_case arena_param_grows 'def fill(owner: Arena, out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef main() -> i64:\n    total: mutable i64 = 0\n    region r(4096):\n        xs: mutable darray[i64] = []\n        fill(r, xs)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
