@@ -295,6 +295,10 @@ run_case generic_multi_two_insts 'def pick[K, T](a: K, b: T) -> K:\n    return a
 run_case trusted_block 'def main() -> i64:\n    x: mutable i64 = 0\n    trusted Unsafe.AssumeProgress:\n        x <- 42\n    return x\n'  42
 run_case assert_holds  'def main() -> i64:\n    x: i64 = 42\n    assert x == 42\n    return x\n'  42
 run_case decreases_skip 'def main() -> i64:\n    r: mutable i64 = 5\n    total: mutable i64 = 0\n    while r > 0:\n        decreases r\n        total <- total + r\n        r <- r - 1\n    return total + 27\n'  42
+# `ctx_hash_value(key)` — the compiler-emitted hash builtin the runtime dict uses. A scalar
+# key zero-extends to u64 and runs ctx_hash_u64 (splitmix64, in elisacore_runtime.o). The hash
+# is deterministic, so two hashes of the same key are equal.
+run_case ctx_hash_value 'def main() -> i64:\n    k: i64 = 42\n    h1: u64 = ctx_hash_value(k)\n    h2: u64 = ctx_hash_value(k)\n    return 42 if h1 == h2 else 0\n'  42
 # INFERENCE by UNIFICATION: a generic whose parameter is `Map[T]&`, called with a
 # `Map[i64]` argument, must infer T=i64 (unify the annotation against the arg's
 # instantiation) — NOT T=Map[i64] (the whole arg type). The dict `.put`/`.get` machinery:
