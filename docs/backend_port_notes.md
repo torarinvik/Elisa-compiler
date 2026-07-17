@@ -704,3 +704,34 @@ absence "emits". `emit_native` exits **1 on a PARSE ERROR** and **2 on a decline
 parse error prints no `UNSUPPORTED` — so an invalid program reads as "EMITS". That is how
 `fold(+, [...])` (which stage0 rejects outright: "unexpected token + in expression") looked
 like a working feature for one probe. Check the EXIT CODE, not just the marker.
+
+## DWARF and `-Wperf` share ONE blocker: stage1 has no object/optimizer pipeline
+
+Both were on the remaining list as separate features. They are not: they are the same
+architectural gap, and neither is a codegen feature.
+
+stage1's backend is an **IR PRINTER**. `emit_native` builds a module and calls
+`LLVMPrintModuleToString`; the suite pipes that text through `llc` and `clang`. There is no
+target machine, no pass pipeline, no object emission — `llvm_c.elisa` binds neither
+`LLVMTargetMachineEmitToFile` nor `LLVMRunPasses`.
+
+Both features live on the far side of that gap:
+
+* **DWARF** — `-emit llvm -g` emits ZERO metadata (verified: 0 `!` lines, identical to
+  without `-g`), while `-emit obj -g` produces real DWARF (`DW_TAG_compile_unit`, via
+  dwarfdump). So debug info never appears in the reference's IR-text output.
+* **`-Wperf`** — same: no `!llvm.loop` / `elisa.autovec.expected` metadata in `-emit llvm`
+  output at `-O0` OR `-O2`. And its verification is inherently post-optimization:
+  `verifyAutovecExpectations` (llvm_autovec_verify.go:130) early-returns at
+  OptimizationLevel0, then walks every terminator's `!llvm.loop` metadata AFTER the passes
+  run, warning on loops marked `elisa.autovec.expected` that did not vectorize. stage1 does
+  not run the passes — `llc` does, downstream and out of process.
+
+So the real next step for both is a DRIVER capability: bind a target machine + pass pipeline
+and emit objects from stage1 itself. That is a different kind of work from every slice landed
+so far (all of which were "build the right IR"), and it also changes the test method — the
+IR-text oracle that drove all 241 checks cannot see either feature, and `diff_case` cannot
+either, since neither is observable in an exit code.
+
+Doing the metadata TAGGING half without the pipeline is possible but pointless in isolation:
+nothing in stage1 would consume it, and there is no stage0 IR to diff it against.
