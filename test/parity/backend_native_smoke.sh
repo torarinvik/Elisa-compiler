@@ -213,6 +213,10 @@ run_case generic_struct_nested 'struct Inner[T]:\n    v: mutable T\n\nstruct Out
 # One instantiation reused across two locals: emitted ONCE (a duplicate type would still
 # link, but the memo is what keeps `Box[i64]` a single type).
 run_case generic_struct_reuse  'struct Box[T]:\n    value: mutable T\n\ndef main() -> i64:\n    a: mutable Box[i64] = Box[i64]{value: 40}\n    b: mutable Box[i64] = Box[i64]{value: 2}\n    return a.value + b.value\n'  42
+# EMPTY DICT LITERAL `{}`: `dict[K,V]` is the runtime `DynDict[K,V]` template, and `{}` is
+# its zero value (null items, 0 count/…). A fresh dict reads count 0. (Full put/get needs the
+# std dict generics; this covers the type mapping + literal + field read.)
+run_case dict_empty_literal 'struct DynDict[K, T]:\n    items: mutable i64\n    count: mutable usize\n    used: mutable usize\n    capacity: mutable usize\n    arena: mutable i64\n\ndef main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return d.count.i64() + 42\n'  42
 
 # FIXED ARRAYS: `T[N]` types, literals, index read/write.
 run_case array_literal    'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'  42
