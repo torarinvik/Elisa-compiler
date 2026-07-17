@@ -879,3 +879,27 @@ So dict is: a frontend fix + catch codegen + std cross-file compilation + dict e
 The keystone is still (1), but calling it the ONLY thing was wrong. Everything downstream of
 (1) is real backend work that becomes doable -- and testable -- the moment catch can be
 represented. Error-union RETURN (8108739) already removed one layer; catch is the next.
+
+## Struct-composition gaps still open (found by probing, mapped for fast pickup)
+
+Both are the SAME shape as the ones already landed -- a receiver resolver that only handles
+a bare Ident, needing the recursive chain form. Neither is blocked on anything; both are
+straightforward.
+
+1. **Struct with a darray FIELD** (`struct Bag: items: darray[i64]`; `b.items.push(v)`,
+   `b.items[i]`). DECLARATION + construction already work (set_struct_body accepts a DArray
+   member; `Bag{items: []}` builds). Only the OPS decline: push/count/index resolve their
+   receiver via `darray_address_of(name)` / `darray_type_behind(name)`, which are Ident-only.
+   FIX: add `darray_address_of_expr(object)` / `darray_type_behind_expr(object)` -- for a
+   `Field(inner, f)`, get inner's struct address via struct_chain_address and GEP to f (the
+   darray header sits inline) -- and route the 3 op dispatch sites through them. Same move as
+   struct_chain_address (which already does exactly this for struct fields).
+
+2. **Nested fixed arrays** (`i64[2][2]`, `m[i][j]`). The array intern already rejects an Array
+   ELEMENT (codegen.elisa:228, `element.kind == TypeKind.Array`). Lift it the way the
+   darray-of-struct Struct decline was lifted, and let the Index chain (struct_chain_address's
+   Index case) compose for `m[i][j]`. Element stride is already handled (element_stride does
+   Array via LLVMSizeOf).
+
+Everything else probed (struct==, global struct const, `flags`) is a stage0 REJECT, i.e.
+stage1 correctly declines it too.
