@@ -91,7 +91,7 @@ module Backend:
 
         # The alloca backing `name`, or null when the name is not a local. Scanned back to
         # front so a later (shadowing) declaration wins.
-        def lookup_slot(local_scope: Scope&, name: sview) -> LLVMValueRef? can[Abort.Panic]:
+        def lookup_slot(local_scope: mutable Scope&, name: sview) -> LLVMValueRef? can[Abort.Panic]:
             index: mutable i64 = local_scope.names.count.i64() - 1
             while index >= 0 |local_scope, name, index|:
                 slot_index: usize = index.usize()
@@ -143,6 +143,81 @@ module Backend:
             return null
 
 
+        # Parse an integer pattern's literal TEXT (`Pattern.Literal` carries raw source
+        # text, not a value). False when it is not a plain decimal integer, so a
+        # char/string/float pattern DECLINES instead of being misread as a number.
+        def parse_int_literal(text: sview, out_value: mutable i64&) -> bool can[Abort.Panic]:
+            false return if sview_len(text) == 0
+            negative: bool = sview_at(text, 0) == 45
+            start: usize = 1 if negative else 0
+            false return if sview_len(text) == start
+            accumulated: mutable i64 = 0
+            ok: mutable bool = true
+            for index in start..<sview_len(text) |accumulated, ok, text|:
+                byte: u8 = sview_at(text, index)
+                if byte < 48 or byte > 57:
+                    ok <- false
+                else:
+                    accumulated <- accumulated * 10 + (byte.i64() - 48)
+            false return if not ok
+            out_value <- 0 - accumulated if negative else accumulated
+            return true
+
+
+        # Whether a pattern matches anything. ONLY `_` does: a BINDING arm is not legal in
+        # an integer match — stage0 rejects `other: other + 2` with "top-level integer
+        # match arm must use an integer literal or _" (and then "undefined identifier
+        # other"). Treating a binding as a catch-all made stage1 emit code for a program
+        # the language rejects; caught by the stage0 differential.
+        #
+        # Written as a `match`, NOT `pattern is Pattern.Wildcard`: `is` on a PAYLOAD-LESS
+        # packed-enum variant crashes stage0's backend with "unsupported expression
+        # *ast.TypeExprExpr" (the bare `Pattern.Wildcard` parses as a type path). `is` WITH
+        # a payload and `match` both work — filed with a 12-line repro. Keep this a match
+        # until that lands.
+        def is_catch_all_pattern(pattern: Pattern) -> bool can[Abort.Panic]:
+            return match pattern:
+                Pattern.Wildcard: true
+                _: false
+
+
+        # Whether an arm carries a guard (`0 if n > 1:`). A guard is a second per-arm
+        # condition and is NOT modeled, so a guarded arm must DECLINE: ignoring it emits
+        # the arm unconditionally, which is a silent miscompile (observed — stage1 gave
+        # 100 where stage0 gives 42).
+        #
+        # A `match`, not `guard is Expr.Absent`, for the same payload-less-variant ICE.
+        def arm_has_guard(guard: Expr) -> bool can[Abort.Panic]:
+            return match guard:
+                Expr.Absent: false
+                _: true
+
+
+
+        # The single value an arm body yields, for a value `match`. Only a one-expression
+        # body is modeled (`0: 100`).
+        #
+        # Returns `Expr?` rather than filling a `mutable Expr&` out-param: an out-param
+        # needs a placeholder to initialize (`Expr.Invalid`), and CONSTRUCTING a
+        # packed-enum node requires an active `in Ast.Expr.Store:` scope the backend does
+        # not have — it only ever READS the AST. Returning the existing handle constructs
+        # nothing.
+        def arm_value_expression(body: darray[Stmt]&) -> Expr? can[Abort.Panic]:
+            null return if body.count != 1
+            if body[0] is Stmt.Expr(arm_expression, arm_expression_line):
+                return arm_expression
+            return null
+
+
+        # Close a `match` that has no `_` arm. Nothing matching means the frontend's
+        # exhaustiveness proof was wrong, so `unreachable` is the honest terminator —
+        # inventing a default value would hide the gap. A guard helper, not a ternary: a
+        # VOID ternary ICEs stage0 (`%termp = phi void`).
+        def terminate_if_no_default(saw_default: bool, builder: LLVMBuilderRef) -> void can[Abort.Panic]:
+            return if saw_default
+            _ = LLVMBuildUnreachable(builder)
+
+
         # The binary operator a compound assignment applies (`+=` -> `+`), or `Eof` when
         # the token is not a compound assignment. (TokenKind has no Invalid; `Eof` can
         # never appear as a real operator, so it is the natural sentinel.) Keeps the
@@ -172,7 +247,7 @@ module Backend:
         #   br left ? rhs : done              ; `or` swaps the targets
         #   rhs:  result = (right != 0); br done
         #   done: load result
-        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
             is_and: bool = operator == TokenKind.And
 
@@ -204,7 +279,7 @@ module Backend:
         # is modeled: the callee must exist in the module (emit_module declares every
         # function before emitting any body, so definition order does not matter) and the
         # arity must match.
-        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if callee is Expr.Ident(callee_name, callee_line):
                 target_opt: LLVMValueRef? = lookup_function(fns, callee_name)
                 if target_opt is target:
@@ -231,7 +306,7 @@ module Backend:
 
 
         # Emit a value expression. `null` = unmodeled; the caller must decline.
-        def emit_expression(expression: Expr, local_scope: Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_expression(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if expression is Expr.IntLit(literal_value):
                 # sign_extend=1: Elisa's `i64` is signed, so a negative literal must
                 # sign-extend into LLVM's u64-shaped constant argument.
@@ -277,6 +352,70 @@ module Backend:
                     if right_value is right:
                         return emit_binary(binary_operator, left, right, ctx, builder)
                 return null
+            # A value `match` over an integer scrutinee: `match n: 0: 100 … _: 300`.
+            #
+            # Lowered as an ordered COMPARE CHAIN, not a switch: arms must be tried in
+            # source order, and turning a dense chain into a switch is llc's job.
+            # Modeled: literal arms and a catch-all. A variant/struct/tuple pattern needs
+            # the packed-enum or aggregate ABI, and a guard is a second per-arm condition
+            # — both decline.
+            if expression is Expr.Match(match_scrutinee, match_arms, match_line):
+                match_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                if emit_expression(match_scrutinee, local_scope, fns, m, ctx, builder) is scrutinee:
+                    function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                    result_slot: LLVMValueRef = LLVMBuildAlloca(builder, match_type, "match.result")
+                    done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.done")
+                    declined: mutable bool = false
+                    saw_default: mutable bool = false
+
+                    for arm in match_arms |declined, saw_default, scrutinee, result_slot, done_block, function, local_scope, fns, m, ctx, builder, match_type|:
+                        # Once a catch-all is emitted the chain is closed; anything after
+                        # it is unreachable.
+                        continue if declined or saw_default
+                        if arm_has_guard(arm.guard):
+                            declined <- true
+                            continue
+                        if arm_value_expression(arm.body) is arm_expression:
+                            arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.arm")
+                            if arm.pattern is Pattern.Literal(literal_text):
+                                literal_value: mutable i64 = 0
+                                if parse_int_literal(literal_text, literal_value):
+                                    next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.next")
+                                    # 32 = LLVMIntEQ.
+                                    hit: LLVMValueRef = LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(match_type, literal_value.u64(), 1), "match.cmp")
+                                    _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
+                                    LLVMPositionBuilderAtEnd(builder, arm_block)
+                                    if emit_expression(arm_expression, local_scope, fns, m, ctx, builder) is arm_value:
+                                        _ = LLVMBuildStore(builder, arm_value, result_slot)
+                                        _ = LLVMBuildBr(builder, done_block)
+                                    else:
+                                        declined <- true
+                                    LLVMPositionBuilderAtEnd(builder, next_block)
+                                else:
+                                    declined <- true
+                            else:
+                                if is_catch_all_pattern(arm.pattern):
+                                    _ = LLVMBuildBr(builder, arm_block)
+                                    LLVMPositionBuilderAtEnd(builder, arm_block)
+                                    if emit_expression(arm_expression, local_scope, fns, m, ctx, builder) is default_value:
+                                        _ = LLVMBuildStore(builder, default_value, result_slot)
+                                        _ = LLVMBuildBr(builder, done_block)
+                                        saw_default <- true
+                                    else:
+                                        declined <- true
+                                else:
+                                    declined <- true
+                        else:
+                            declined <- true
+
+                    null return if declined
+                    # Fell off the chain with no `_`: unreachable (the frontend proves
+                    # exhaustiveness; inventing a value would hide a real gap).
+                    terminate_if_no_default(saw_default, builder)
+                    LLVMPositionBuilderAtEnd(builder, done_block)
+                    return LLVMBuildLoad2(builder, match_type, result_slot, "match")
+                return null
+
             # A value `if`: `a if cond else b`. Only ONE arm is evaluated, so it uses the
             # same result-slot lowering as `and`/`or` — emitting both and selecting could
             # divide by zero or recurse on the untaken side.
@@ -314,7 +453,7 @@ module Backend:
         # Narrow a modeled i64 value to an LLVM `i1` for a branch: `value != 0`. Both
         # `while x > 0:` (a zero-extended comparison) and a bare truthy int reduce to the
         # same test, so conditions need no per-operator special-casing.
-        def emit_condition(condition: Expr, local_scope: Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_condition(condition: Expr, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             condition_value: LLVMValueRef? = emit_expression(condition, local_scope, fns, m, ctx, builder)
             if condition_value is value:
                 zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)

@@ -121,6 +121,15 @@ run_case value_if         'def main() -> i64:\n    a: i64 = 5\n    return 42 if 
 run_case short_circuit_and 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'  42
 run_case short_circuit_or  'def main() -> i64:\n    a: i64 = 0\n    return 42 if a == 0 or (10 / a) > 0 else 1\n'  42
 
+# Integer `match`. Arms are an ORDERED compare chain: match_first proves the first
+# matching arm wins, not the last.
+run_case match_hit        'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        1: 42\n        _: 300\n\ndef main() -> i64:\n    return classify(1)\n'  42
+run_case match_first      'def classify(n: i64) -> i64:\n    return match n:\n        0: 42\n        1: 200\n        _: 300\n\ndef main() -> i64:\n    return classify(0)\n'  42
+run_case match_default    'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        _: 42\n\ndef main() -> i64:\n    return classify(99)\n'  42
+# A negative literal pattern: the sign must survive parse_int_literal + ConstInt.
+run_case match_negative   'def classify(n: i64) -> i64:\n    return match n:\n        -1: 42\n        _: 7\n\ndef main() -> i64:\n    return classify(-1)\n'  42
+run_case match_as_value   'def main() -> i64:\n    n: i64 = 2\n    v: i64 = match n:\n        1: 10\n        2: 40\n        _: 0\n    return v + 2\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -173,6 +182,8 @@ diff_case bitnot      'def main() -> i64:\n    a: i64 = 5\n    return ~a + 200\n
 diff_case and_or_not  'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'
 diff_case compound    'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'
 diff_case short_circuit 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'
+diff_case match_chain 'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        1: 200\n        -1: 300\n        _: 400\n\ndef main() -> i64:\n    return classify(-1) - classify(0)\n'
+
 
 # An UNSUPPORTED input must be DECLINED, never silently mis-emitted.
 decline_case() {
@@ -196,6 +207,14 @@ decline_case loop_captures 'def main() -> i64:\n    i: mutable i64 = 0\n    whil
 decline_case for_over_container 'def main() -> i64:\n    xs: darray[i64] = [1, 2]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total\n'
 # `break` outside any loop must decline, not branch to nowhere.
 decline_case break_outside_loop 'def main() -> i64:\n    break\n    return 0\n'
+# A match GUARD is a second per-arm condition; not modeled. Ignoring it emitted the arm
+# unconditionally — a silent MISCOMPILE (stage1 gave 100 where stage0 gives 42), caught by
+# this fixture.
+decline_case match_guard 'def classify(n: i64) -> i64:\n    return match n:\n        0 if n > 1: 100\n        _: 42\n\ndef main() -> i64:\n    return classify(0)\n'
+# A BINDING arm is INVALID Elisa in an integer match — stage0: "top-level integer match arm
+# must use an integer literal or _". Treating it as a catch-all made stage1 emit code for a
+# program the language rejects.
+decline_case match_binding_arm 'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        other: other + 2\n\ndef main() -> i64:\n    return classify(40)\n'
 
 if [ "$pass" -ne "$total" ]; then
     echo "backend_native_smoke FAILED: passed=$pass total=$total"
