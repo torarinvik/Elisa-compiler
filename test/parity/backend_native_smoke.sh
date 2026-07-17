@@ -330,6 +330,9 @@ run_case ref_addr_field   'struct Box:\n    value: mutable i64\n\ndef get_ref(b:
 run_case ref_optional     'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef get_ref(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 42, used: 1}\n    if get_ref(b) is v:\n        return v\n    return 0\n'  42
 # Absent case of a ref-optional: the null branch is taken, so the fallback returns.
 run_case ref_optional_absent 'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef get_ref(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 7, used: 0}\n    if get_ref(b) is v:\n        return v\n    return 42\n'  42
+# `opt == null` / `opt != null` — a PRESENCE test on the optional's tag (no binding, unlike
+# `is`). The std dict guards `m.items == null` this way. Both the present and absent branch.
+run_case opt_eq_null 'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef maybe(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    present: mutable Box = Box{value: 10, used: 1}\n    absent: mutable Box = Box{value: 20, used: 0}\n    total: mutable i64 = 0\n    total <- total + 40 if maybe(present) != null else total\n    total <- total + 2 if maybe(absent) == null else total\n    return total\n'  42
 # REF-AS-ARRAY-BASE indexing: `items[i]` where `items: Bucket&` is a C-style pointer base
 # (GEP by struct stride). How the std walks `DictBucket[K,T]&` rows. `&arr[0]` supplies the
 # base as a ref; `items[1].value` reads the second element in place.
