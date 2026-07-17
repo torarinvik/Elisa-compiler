@@ -542,6 +542,19 @@ that calls emit_expression must add `runtime` to its `|...|`), which is where th
 error-prone rather than merely tedious. Do that refactor as its own mechanical commit,
 verify smoke stays at 204/204, and only then add the arena param.
 
-Related and NOT the same thing: returning an owned container (see 95915b5) needs region
-RETURN inference, which is a further step — the callee would allocate in the caller's region
-rather than its own. Threading a param arena is the prerequisite.
+### Region-RETURN inference — LANDED (same mechanism)
+
+Returning an owned container turned out to be the SAME rule, not a further one. stage0 emits
+`def build() -> darray[i64]` as `define %DynArray__i64 @build(ptr %0)` — a container RETURN
+TYPE is simply a second trigger for the implicit trailing arena param, and the callee
+allocates the returned darray's backing from the CALLER's region, which the caller frees at
+its own return.
+
+So `signature_needs_arena(params, return_value_type, structs)` is true when EITHER a param is
+a growable container ref OR the return type is a container. That one predicate change lifted
+the 95915b5 decline: the case that used to exit 139 (SIGSEGV) now returns 42 and is a real
+differential rather than a decline fixture.
+
+Still ahead in the region model: region PARAMS / `@r` annotations and explicit region
+polymorphism, death-time, and the non-darray containers (dict/set, which are additionally
+blocked behind error unions).

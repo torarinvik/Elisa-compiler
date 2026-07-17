@@ -477,6 +477,21 @@ diff_case region_count_via_ref 'def size(xs: darray[i64]&) -> i64:\n    return x
 diff_case region_index_via_ref 'def first(xs: darray[i64]&) -> i64:\n    return xs[0] can Unsafe.UncheckedIndex\n\ndef main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(42)\n    return first(ys)\n'
 # Two levels: main's arena is threaded through outer into inner.
 diff_case region_two_levels 'def inner(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef outer(out: mutable darray[i64]&) -> void:\n    inner(out)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    outer(xs)\n    return xs[0]\n'
+# REGION-RETURN INFERENCE. A container RETURN type is the second trigger for the implicit
+# trailing arena param: stage0 emits `def build() -> darray[i64]` as
+# `define %DynArray__i64 @build(ptr %0)` and allocates the returned darray's backing from
+# the CALLER's region, which the caller frees at its own return.
+#
+# This case is why the trigger matters. Before region-return inference, stage1 EMITTED it
+# and the program exited 139 (SIGSEGV) where stage0 returns 42 -- the callee's region was
+# freed at return and the caller read the freed backing. It was declined (95915b5) until the
+# mechanism existed; now it is a real differential.
+diff_case region_return_owned 'def build() -> darray[i64]:\n    xs: mutable darray[i64] = []\n    xs.push(42)\n    return xs\n\ndef main() -> i64:\n    ys: darray[i64] = build()\n    return ys[0]\n'
+# The returned container must survive REALLOCATION inside the callee too.
+diff_case region_return_grown 'def build(n: i64) -> darray[i64]:\n    xs: mutable darray[i64] = []\n    for i in 0..<n:\n        xs.push(1)\n    return xs\n\ndef main() -> i64:\n    ys: darray[i64] = build(500)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + ys[j]\n    return total - 458\n'
+# A returned container passed straight into a function that GROWS it: the same region has to
+# reach both, or the push reallocates backing the caller still points at.
+diff_case region_return_then_fill 'def build() -> darray[i64]:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    return xs\n\ndef fill(out: mutable darray[i64]&) -> void:\n    out.push(2)\n\ndef main() -> i64:\n    ys: mutable darray[i64] = build()\n    fill(ys)\n    return ys[0] + ys[1]\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -554,14 +569,6 @@ decline_case cstr_count 'def main() -> i64:\n    s: cstr = "hi"\n    return s.co
 # is therefore the whole of what the backend can soundly do here.
 decline_case tuple_field_access 'def main() -> i64:\n    t: (a: i64, b: i64) = (40, 2)\n    return t.a + t.b\n'
 decline_case tuple_return 'def pair() -> (a: i64, b: i64):\n    return (40, 2)\n\ndef main() -> i64:\n    t: (a: i64, b: i64) = pair()\n    return t.a + t.b\n'
-# Returning an owned CONTAINER by value is UNSOUND without region-return inference. The
-# darray's backing is allocated in the CALLEE's region and freed when that region dies at
-# return, so the returned {ptr,count,cap} header points at freed memory. This is not a
-# hypothetical: before this decline, stage1 emitted a program that exited 139 (SIGSEGV)
-# where stage0 returns 42 -- a silent MISCOMPILE, which is exactly what declining exists to
-# prevent. stage0 makes it work by inferring a region for the return value and threading the
-# caller's arena in; until that is ported, this must decline rather than emit.
-decline_case return_owned_darray 'def build() -> darray[i64]:\n    xs: mutable darray[i64] = []\n    xs.push(42)\n    return xs\n\ndef main() -> i64:\n    ys: darray[i64] = build()\n    return ys[0]\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
