@@ -27,6 +27,10 @@ clean $'def id[T, @r](value: T& @r) -> T& @r:\n    return value\n'
 out=$(printf 'def f() -> void:\n    value: i32&? @missing = null\n' | "$RPT")
 echo "$out" | grep -q 'unknown region qualifier "missing"' || fail "unknown local region qualifier was not flagged: $out"
 
+out=$(printf 'def f() -> void:\n    region left(64)\n    region right(64)\n    value: i32& @left = new[left] 1\n    other: i32& @right = value\n' | "$RPT")
+echo "$out" | grep -q 'variable "other" expects i32& @right, got i32& @left' || fail "mismatched local regions were not flagged: $out"
+clean $'def f() -> void:\n    region same(64)\n    value: i32& @same = new[same] 1\n    alias: i32& @same = value\n'
+
 out="$(printf '%s' $'def f() -> void:\n    destroy missing\n' | "$RPT")"
 echo "$out" | grep -q "undefined name 'missing'" || fail "destroy of unknown region was not resolved: $out"
 
