@@ -12,6 +12,13 @@
 #   * `-emit c-archive` MIS-COMPILES this tree — the packed-store analysis fails on the
 #     unmodified test/breadth/parse_report.elisa too, so it is a pre-existing stage0 bug,
 #     not a backend one. Hence `-emit obj` + clang here.
+#
+# Every compiled binary runs under a TIMEOUT. A wrong loop does not fail, it HANGS, and an
+# untimed gate hangs with it (observed: a stage0-compiled `while` spun at 100% CPU
+# forever). A timeout turns that into an ordinary failure.
+RUN() {
+    if command -v timeout >/dev/null 2>&1; then timeout 10 "$@"; else "$@"; fi
+}
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -52,8 +59,9 @@ run_case() {
     if ! clang -o "$exe" "$obj" 2>/dev/null; then
         echo "  FAIL $name: link failed"; return
     fi
-    "$exe"
+    RUN "$exe"
     local got=$?
+    if [ "$got" -eq 124 ]; then echo "  FAIL $name: TIMED OUT (runaway loop?)"; return; fi
     if [ "$got" -ne "$want" ]; then
         echo "  FAIL $name: exit code $got, want $want"; return
     fi
@@ -76,6 +84,20 @@ run_case division         'def main() -> i64:\n    return 100 / 7\n'      14
 run_case remainder        'def main() -> i64:\n    return 100 % 7\n'       2
 run_case unary_minus      'def main() -> i64:\n    return -5 + 47\n'      42
 
+# Locals, assignment, control flow, calls.
+run_case local            'def main() -> i64:\n    x: i64 = 40\n    return x + 2\n'                                     42
+run_case assign           'def main() -> i64:\n    x: mutable i64 = 1\n    x <- 42\n    return x\n'                     42
+run_case if_then          'def main() -> i64:\n    x: i64 = 5\n    if x > 3:\n        return 42\n    return 0\n'       42
+# Both arms return: the join block is unreachable and must still be terminated.
+run_case if_else_both_ret 'def main() -> i64:\n    x: i64 = 1\n    if x > 3:\n        return 0\n    else:\n        return 42\n'  42
+# A real loop: sums 1..9 == 45, so an off-by-one or a mis-wired backedge shows up.
+run_case while_sum        'def main() -> i64:\n    i: mutable i64 = 0\n    total: mutable i64 = 0\n    while i < 9:\n        i <- i + 1\n        total <- total + i\n    return total\n'  45
+run_case call             'def double(n: i64) -> i64:\n    return n * 2\n\ndef main() -> i64:\n    return double(21)\n'  42
+# Forward reference: `main` calls a function declared LATER. Passes only because
+# emit_module declares every function before emitting any body.
+run_case call_forward     'def main() -> i64:\n    return helper(42)\n\ndef helper(n: i64) -> i64:\n    return n\n'      42
+run_case recursion        'def fact(n: i64) -> i64:\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\n\ndef main() -> i64:\n    return fact(5)\n'  120
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -91,15 +113,18 @@ diff_case() {
     fi
     "$LLC" -filetype=obj "$ll" -o "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: llc rejected stage1 IR"; return; }
     clang -o "$BUILD/diff_${name}_s1" "$BUILD/diff_$name.o" 2>/dev/null || { echo "  FAIL diff_$name: stage1 link"; return; }
-    "$BUILD/diff_${name}_s1"; local got1=$?
+    RUN "$BUILD/diff_${name}_s1"; local got1=$?
 
     printf '%b' "$src" > "$BUILD/diff_$name.elisa"
     if ! "$ELISACORE_BIN" -emit obj -o "$BUILD/diff_${name}_s0.o" "$BUILD/diff_$name.elisa" 2>/dev/null; then
         echo "  SKIP diff_$name: stage0 could not compile the reference"; total=$((total - 1)); return
     fi
     clang -o "$BUILD/diff_${name}_s0" "$BUILD/diff_${name}_s0.o" 2>/dev/null || { echo "  FAIL diff_$name: stage0 link"; return; }
-    "$BUILD/diff_${name}_s0"; local got0=$?
+    RUN "$BUILD/diff_${name}_s0"; local got0=$?
 
+    if [ "$got1" -eq 124 ] || [ "$got0" -eq 124 ]; then
+        echo "  FAIL diff_$name: TIMED OUT (stage1=$got1 stage0=$got0)"; return
+    fi
     if [ "$got1" -ne "$got0" ]; then
         echo "  FAIL diff_$name: stage1=$got1 stage0=$got0 (backends disagree)"; return
     fi
@@ -111,17 +136,28 @@ diff_case neg_div     'def main() -> i64:\n    return -7 / 2\n'
 diff_case rem_neg_rhs 'def main() -> i64:\n    return 7 % -2\n'
 diff_case precedence  'def main() -> i64:\n    return 2 + 3 * 4\n'
 diff_case div         'def main() -> i64:\n    return 100 / 7\n'
+diff_case while_sum   'def main() -> i64:\n    i: mutable i64 = 0\n    total: mutable i64 = 0\n    while i < 9:\n        i <- i + 1\n        total <- total + i\n    return total\n'
+diff_case recursion   'def fact(n: i64) -> i64:\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\n\ndef main() -> i64:\n    return fact(5)\n'
+diff_case call_fwd    'def main() -> i64:\n    return helper(42)\n\ndef helper(n: i64) -> i64:\n    return n\n'
 
-# An UNSUPPORTED input must be DECLINED, never silently mis-emitted. A call is outside
-# the modeled subset (no call emission yet), so the emitter must exit 2. Keep this case
-# pointed at something genuinely unmodeled as coverage grows.
-total=$((total + 1))
-printf '%b' 'def g() -> i64:\n    return 1\n\ndef main() -> i64:\n    return g()\n' | "$BUILD/emit_native" >/dev/null 2>&1
-if [ $? -eq 2 ]; then
-    pass=$((pass + 1))
-else
-    echo "  FAIL declines_unsupported: emitter did not decline an unmodeled construct"
-fi
+# An UNSUPPORTED input must be DECLINED, never silently mis-emitted.
+decline_case() {
+    local name="$1" src="$2"
+    total=$((total + 1))
+    printf '%b' "$src" | "$BUILD/emit_native" >/dev/null 2>&1
+    if [ $? -eq 2 ]; then pass=$((pass + 1)); else echo "  FAIL decline_$name: emitter did not decline"; fi
+}
+
+# `-> f64` is outside the modeled i64 subset.
+decline_case float_return 'def main() -> f64:\n    return 1\n'
+# `i = i + 1` is a DECLARATION, not a store: stage0 lowers a bare `name = value` to a fresh
+# VarDeclStmt, so in a loop body it declares a shadow and the outer `i` never moves — an
+# INFINITE LOOP with no diagnostic (observed). stage1's parser folds `<-` and `=` into the
+# same Stmt.Assign, so the backend must reject `=` explicitly rather than emit a store and
+# silently disagree with the reference compiler.
+decline_case eq_is_not_assign 'def main() -> i64:\n    i: mutable i64 = 0\n    while i < 3:\n        i = i + 1\n    return i\n'
+# A `|captures|` annotation on a loop is not modeled.
+decline_case loop_captures 'def main() -> i64:\n    i: mutable i64 = 0\n    while i < 3 |i|:\n        i <- i + 1\n    return i\n'
 
 if [ "$pass" -ne "$total" ]; then
     echo "backend_native_smoke FAILED: passed=$pass total=$total"

@@ -1,13 +1,19 @@
 # Stage1 backend — LLVM codegen (`module Backend`).
 #
 # The stage0 counterpart is compiler/src/backend/llvm_*.go (~54k lines of cgo). This is
-# the spine of that port: it walks the stage1 AST and drives LLVM-C (see llvm_c.elisa).
+# the growing port of that: it walks the stage1 AST and drives LLVM-C (see llvm_c.elisa).
 #
 # Sound SUBSET, mirroring how the frontend was ported: only firmly-modeled constructs
-# emit. `emit_function` returns false for anything it does not model yet, so the driver
-# can report an honest "unsupported" instead of emitting wrong code. Coverage grows one
-# construct at a time, each with a compile-and-run fixture that asserts real behavior
-# (an exit code / stdout), never just "it compiled".
+# emit. Every emitter returns a "declined" signal for anything it does not model, and
+# `emit_module` turns ANY decline into a whole-module decline, so the driver reports an
+# honest UNSUPPORTED instead of handing back a module that is quietly missing code.
+# Coverage grows one construct at a time, each with a compile-and-run fixture asserting
+# real behavior (an exit code), plus a differential against stage0 where the reference
+# compiler can compile the same source.
+#
+# Modeled today: `def f(a: i64, …) -> i64` over signed i64 — int literals, idents,
+# `+ - * / %`, unary `+`/`-`, comparisons, parens, locals (`x: i64 = …`), assignment,
+# `if`/`else`, `while`, `return`, and direct calls to other modeled functions.
 
 include "../semantic/semantic.elisa"
 include "llvm_c.elisa"
@@ -29,50 +35,367 @@ module Backend:
             return (&storage[0]).cast[cstr] can Unsafe.PointerCast
 
 
-        # An `i64` literal is the only value form the spine models. `null` means "not
-        # modeled" and the caller must decline to emit.
+        # A function's local slots: `names[i]` lives in the `alloca` at `slots[i]`.
+        # Parallel darrays rather than a dict: scopes are tiny (a handful of locals), a
+        # linear scan beats hashing, and it keeps the opaque extern handle out of a dict's
+        # key/value machinery.
+        struct Scope:
+            names: mutable darray[sview]
+            slots: mutable darray[LLVMValueRef]
+
+
+        # The module's functions by name. Built in emit_module's declare pass, so a call
+        # to a function defined LATER in the file still resolves.
         #
-        # Returns a bare `LLVMValueRef?` rather than a `(value, ok)` pair: `null` already
-        # carries "not modeled", so the companion flag was redundant.
-        def emit_expression(expression: Expr, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+        # Kept here rather than asking LLVMGetNamedFunction: that returns NULL-or-pointer,
+        # i.e. it needs `-> LLVMValueRef?`, and an extern returning an optional of an
+        # opaque extern type always binds null in stage0 (silent, no diagnostic). We
+        # already know every function we declared, so this is also just less work.
+        struct FnTable:
+            names: mutable darray[sview]
+            handles: mutable darray[LLVMValueRef]
+
+
+        # What emitting a statement did to control flow.
+        #
+        # `Terminated` means the statement ended the block (a `return`, or an `if` whose
+        # arms all returned). The emitter tracks this itself instead of asking
+        # LLVMGetBasicBlockTerminator — same optional-extern bug as FnTable — and it is
+        # the better design regardless: LLVM rejects a block with two terminators, so the
+        # emitter must know whether a block is still open BEFORE it appends a branch.
+        const enum EmitStatus of u8:
+            Declined
+            Open
+            Terminated
+
+
+        # The handle for `name`, or null when the module has no such function.
+        def lookup_function(fns: FnTable&, name: sview) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, name|:
+                fns.handles[index] return if fns.names[index] == name
+            return null
+
+
+        # The alloca backing `name`, or null when the name is not a local. Scanned back to
+        # front so a later (shadowing) declaration wins.
+        def lookup_slot(local_scope: Scope&, name: sview) -> LLVMValueRef? can[Abort.Panic]:
+            index: mutable i64 = local_scope.names.count.i64() - 1
+            while index >= 0 |local_scope, name, index|:
+                slot_index: usize = index.usize()
+                local_scope.slots[slot_index] return if local_scope.names[slot_index] == name
+                index <- index - 1
+            return null
+
+
+        # Map an Elisa comparison token to an LLVMIntPredicate, or -1 when the operator is
+        # not a comparison. Signed predicates (SLT/SLE/SGT/SGE): the subset is i64.
+        def int_predicate_of(operator: TokenKind) -> i32:
+            32 return if operator == TokenKind.EqEq
+            33 return if operator == TokenKind.BangEq
+            40 return if operator == TokenKind.Lt
+            41 return if operator == TokenKind.LtEq
+            38 return if operator == TokenKind.Gt
+            39 return if operator == TokenKind.GtEq
+            return -1
+
+
+        # Emit `left <op> right` for the modeled signed-i64 operators. `null` = unmodeled,
+        # so a bitwise/logical op declines rather than emitting something wrong.
+        #
+        # A comparison yields an `i1`; every modeled value is an i64, so the i1 is
+        # zero-extended back to i64. Conditions re-narrow with `!= 0` (emit_condition),
+        # which keeps ONE uniform value representation instead of tracking i1-vs-i64.
+        #
+        # SDiv/SRem (not UDiv/URem): the subset is signed. Elisa's `%` is LLVM's `srem`
+        # (sign follows the DIVIDEND: -7 % 2 == -1) — verified against stage0, which
+        # selects the same instruction for a signed operand type.
+        def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            LLVMBuildAdd(builder, left, right, "add") return if operator == TokenKind.Plus
+            LLVMBuildSub(builder, left, right, "sub") return if operator == TokenKind.Minus
+            LLVMBuildMul(builder, left, right, "mul") return if operator == TokenKind.Star
+            LLVMBuildSDiv(builder, left, right, "div") return if operator == TokenKind.Slash
+            LLVMBuildSRem(builder, left, right, "rem") return if operator == TokenKind.Percent
+
+            predicate: i32 = int_predicate_of(operator)
+            if predicate >= 0:
+                compared: LLVMValueRef = LLVMBuildICmp(builder, predicate, left, right, "cmp")
+                return LLVMBuildZExt(builder, compared, LLVMInt64TypeInContext(ctx), "cmp.i64")
+            return null
+
+
+        # Emit a call `f(args…)`. Only a direct call to a named, already-declared function
+        # is modeled: the callee must exist in the module (emit_module declares every
+        # function before emitting any body, so definition order does not matter) and the
+        # arity must match.
+        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if callee is Expr.Ident(callee_name, callee_line):
+                target_opt: LLVMValueRef? = lookup_function(fns, callee_name)
+                if target_opt is target:
+                    null return if LLVMCountParams(target).i64() != arguments.count.i64()
+
+                    argument_values: mutable darray[LLVMValueRef] = []
+                    declined: mutable bool = false
+                    for argument in arguments |argument_values, declined, local_scope, fns, m, ctx, builder|:
+                        argument_value: LLVMValueRef? = emit_expression(argument, local_scope, fns, m, ctx, builder)
+                        if argument_value is emitted_argument:
+                            argument_values.push(emitted_argument)
+                        else:
+                            declined <- true
+                    null return if declined
+
+                    # LLVMBuildCall2 needs the callee's FUNCTION type, not its pointer
+                    # type: LLVM pointers are opaque, so the type cannot be recovered from
+                    # the value itself.
+                    fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                    LLVMBuildCall2(builder, fn_type, target, null, 0, "call") return if arguments.count == 0
+                    args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMBuildCall2(builder, fn_type, target, args_pointer, arguments.count.u32(), "call")
+            return null
+
+
+        # Emit a value expression. `null` = unmodeled; the caller must decline.
+        def emit_expression(expression: Expr, local_scope: Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if expression is Expr.IntLit(literal_value):
-                int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
                 # sign_extend=1: Elisa's `i64` is signed, so a negative literal must
                 # sign-extend into LLVM's u64-shaped constant argument.
-                return LLVMConstInt(int64_type, literal_value.u64(), 1)
+                return LLVMConstInt(LLVMInt64TypeInContext(ctx), literal_value.u64(), 1)
+            # An ident is a local read: load from its slot. A name that is not a local (a
+            # global, a constant, a function used as a value) is unmodeled.
+            if expression is Expr.Ident(ident_name, ident_line):
+                slot_opt: LLVMValueRef? = lookup_slot(local_scope, ident_name)
+                if slot_opt is slot:
+                    return LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), slot, "load")
+                return null
             # `(inner)` is pure grouping — no value of its own.
             if expression is Expr.Paren(paren_inner, paren_line):
-                return emit_expression(paren_inner, ctx, builder)
+                return emit_expression(paren_inner, local_scope, fns, m, ctx, builder)
             if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
-                operand_value: LLVMValueRef? = emit_expression(unary_operand, ctx, builder)
+                operand_value: LLVMValueRef? = emit_expression(unary_operand, local_scope, fns, m, ctx, builder)
                 if operand_value is operand:
                     # Unary `+` is the identity; `-` negates. Anything else is unmodeled.
                     operand return if unary_operator == TokenKind.Plus
                     LLVMBuildNeg(builder, operand, "neg") return if unary_operator == TokenKind.Minus
                 return null
             if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
-                left_value: LLVMValueRef? = emit_expression(binary_left, ctx, builder)
-                right_value: LLVMValueRef? = emit_expression(binary_right, ctx, builder)
+                left_value: LLVMValueRef? = emit_expression(binary_left, local_scope, fns, m, ctx, builder)
+                right_value: LLVMValueRef? = emit_expression(binary_right, local_scope, fns, m, ctx, builder)
                 if left_value is left:
                     if right_value is right:
-                        return emit_binary(binary_operator, left, right, builder)
+                        return emit_binary(binary_operator, left, right, ctx, builder)
+                return null
+            if expression is Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
+                # A labelled argument is a different calling convention; not modeled.
+                for argument_name in call_argument_names:
+                    null return if argument_name != ""
+                return emit_call(call_callee, call_arguments, local_scope, fns, m, ctx, builder)
+            return null
+
+
+        # Narrow a modeled i64 value to an LLVM `i1` for a branch: `value != 0`. Both
+        # `while x > 0:` (a zero-extended comparison) and a bare truthy int reduce to the
+        # same test, so conditions need no per-operator special-casing.
+        def emit_condition(condition: Expr, local_scope: Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            condition_value: LLVMValueRef? = emit_expression(condition, local_scope, fns, m, ctx, builder)
+            if condition_value is value:
+                zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)
+                # 33 = LLVMIntNE.
+                return LLVMBuildICmp(builder, 33, value, zero, "cond")
+            return null
+
+
+        # Branch to `dest` only when the just-emitted region left the block OPEN. An arm
+        # that already returned must not also get a branch — LLVM rejects a block with two
+        # terminators.
+        def branch_if_open(status: EmitStatus, builder: LLVMBuilderRef, dest: LLVMBasicBlockRef) -> void can[Abort.Panic]:
+            return if status != EmitStatus.Open
+            _ = LLVMBuildBr(builder, dest)
+
+
+        # Emit a statement list. Declined if ANY statement declined; Terminated if the
+        # list ended the block.
+        #
+        # A statement AFTER a terminator is unreachable; the subset does not model dead
+        # code, so it declines rather than emitting into a closed block (which LLVM would
+        # reject anyway).
+        def emit_statements(body: darray[Stmt]&, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            status: mutable EmitStatus = EmitStatus.Open
+            for statement in body |status, local_scope, fns, m, ctx, builder|:
+                if status == EmitStatus.Open:
+                    status <- emit_statement(statement, local_scope, fns, m, ctx, builder)
+                else:
+                    status <- EmitStatus.Declined
+            return status
+
+
+        # Emit one statement. Returns false to DECLINE (unmodeled construct).
+        def emit_statement(statement: Stmt, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+
+            if statement is Stmt.Return(return_value_opt, return_line):
+                if return_value_opt is return_value:
+                    emitted: LLVMValueRef? = emit_expression(return_value, local_scope, fns, m, ctx, builder)
+                    if emitted is return_constant:
+                        _ = LLVMBuildRet(builder, return_constant)
+                        return EmitStatus.Terminated
+                # A bare `return` in an `-> i64` function is not modeled.
+                return EmitStatus.Declined
+
+            # `x: i64 = value` — a fresh slot plus the initializing store. The slot is
+            # allocated at the CURRENT position rather than hoisted to the entry block;
+            # mem2reg still promotes it, and the subset has no loop-allocated locals.
+            if statement is Stmt.VarDecl(var_name, var_type, var_value, var_line):
+                initial_value: LLVMValueRef? = emit_expression(var_value, local_scope, fns, m, ctx, builder)
+                if initial_value is initial:
+                    name_storage: mutable darray[u8] = []
+                    slot_name: cstr = sview_to_cstr(var_name, name_storage)
+                    slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, slot_name)
+                    _ = LLVMBuildStore(builder, initial, slot)
+                    local_scope.names <- local_scope.names.push(var_name)
+                    local_scope.slots <- local_scope.slots.push(slot)
+                    return EmitStatus.Open
+                return EmitStatus.Declined
+
+            # `x <- value`. `<-` is Elisa's ASSIGNMENT operator; `=` is DECLARATION
+            # (`x: T = v`, or bare `x = v` which stage0 lowers to a fresh VarDeclStmt —
+            # `x = 42` after `x: i64 = 1` is "duplicate local", not a store). stage1's
+            # parser currently folds BOTH `<-` and `=` into Stmt.Assign, so the operator
+            # must be checked here: modeling `=` as a store would silently contradict
+            # stage0, where `i = i + 1` in a loop body declares a fresh shadow and the
+            # outer `i` never moves (an infinite loop, no diagnostic — observed).
+            # Compound assignment (`+=`) and non-ident targets also decline.
+            if statement is Stmt.Assign(assign_target, assign_operator, assign_value, assign_line):
+                EmitStatus.Declined return if assign_operator != TokenKind.LArrow
+                if assign_target is Expr.Ident(target_name, target_line):
+                    slot_opt: LLVMValueRef? = lookup_slot(local_scope, target_name)
+                    if slot_opt is slot:
+                        new_value: LLVMValueRef? = emit_expression(assign_value, local_scope, fns, m, ctx, builder)
+                        if new_value is assigned:
+                            _ = LLVMBuildStore(builder, assigned, slot)
+                            return EmitStatus.Open
+                return EmitStatus.Declined
+
+            if statement is Stmt.If(if_condition, then_body, else_body, if_line):
+                condition_opt: LLVMValueRef? = emit_condition(if_condition, local_scope, fns, m, ctx, builder)
+                if condition_opt is condition_bit:
+                    function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                    then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "if.then")
+                    else_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "if.else")
+                    join_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "if.join")
+                    _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
+
+                    LLVMPositionBuilderAtEnd(builder, then_block)
+                    then_status: EmitStatus = emit_statements(then_body, local_scope, fns, m, ctx, builder)
+                    EmitStatus.Declined return if then_status == EmitStatus.Declined
+                    branch_if_open(then_status, builder, join_block)
+
+                    LLVMPositionBuilderAtEnd(builder, else_block)
+                    else_status: EmitStatus = emit_statements(else_body, local_scope, fns, m, ctx, builder)
+                    EmitStatus.Declined return if else_status == EmitStatus.Declined
+                    branch_if_open(else_status, builder, join_block)
+
+                    LLVMPositionBuilderAtEnd(builder, join_block)
+                    # Both arms returned: the join is unreachable. It still needs a
+                    # terminator or the module is invalid, and the `if` as a whole has
+                    # ended the block.
+                    if then_status == EmitStatus.Terminated and else_status == EmitStatus.Terminated:
+                        _ = LLVMBuildUnreachable(builder)
+                        return EmitStatus.Terminated
+                    return EmitStatus.Open
+                return EmitStatus.Declined
+
+            if statement is Stmt.While(while_condition, while_body, while_line):
+                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                head_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "while.head")
+                body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "while.body")
+                exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "while.exit")
+
+                # The condition is re-evaluated each iteration, so it lives in its own
+                # block that the body branches back to.
+                _ = LLVMBuildBr(builder, head_block)
+                LLVMPositionBuilderAtEnd(builder, head_block)
+                condition_opt: LLVMValueRef? = emit_condition(while_condition, local_scope, fns, m, ctx, builder)
+                if condition_opt is condition_bit:
+                    _ = LLVMBuildCondBr(builder, condition_bit, body_block, exit_block)
+                    LLVMPositionBuilderAtEnd(builder, body_block)
+                    body_status: EmitStatus = emit_statements(while_body, local_scope, fns, m, ctx, builder)
+                    EmitStatus.Declined return if body_status == EmitStatus.Declined
+                    # A body that returned does not loop back.
+                    branch_if_open(body_status, builder, head_block)
+                    # The loop may always exit via the condition, so the exit block is
+                    # reachable and OPEN regardless of what the body did.
+                    LLVMPositionBuilderAtEnd(builder, exit_block)
+                    return EmitStatus.Open
+                return EmitStatus.Declined
+
+            return EmitStatus.Declined
+
+
+        # A function declaration's name, or "" for any other declaration. (Only reached
+        # after declare_function accepted, i.e. it IS a Func.)
+        def function_name_of(declaration: Decl) -> sview can[Abort.Panic]:
+            if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                return function_name
+            return ""
+
+
+        # Whether a type annotation is the modeled `i64`. The subset is deliberately
+        # narrow: an unannotated or non-i64 parameter/return declines rather than being
+        # guessed at.
+        def is_modeled_int_type(type_expression: Expr) -> bool can[Abort.Panic]:
+            if type_expression is Expr.Ident(type_name, type_line):
+                return type_name == "i64" or type_name == "int"
+            return false
+
+
+        # Declare `def name(a: i64, …) -> i64` in the module WITHOUT a body. Null when the
+        # signature is outside the modeled subset.
+        def declare_function(declaration: Decl, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                if return_type_opt is return_type:
+                    null return if not is_modeled_int_type(return_type)
+
+                    int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                    param_types: mutable darray[LLVMTypeRef] = []
+                    declined: mutable bool = false
+                    for parameter in params |param_types, declined, int64_type|:
+                        declined <- true if not is_modeled_int_type(parameter.type_expression) else declined
+                        param_types.push(int64_type)
+                    null return if declined
+
+                    name_storage: mutable darray[u8] = []
+                    fn_name: cstr = sview_to_cstr(function_name, name_storage)
+                    LLVMAddFunction(m, fn_name, LLVMFunctionType(int64_type, null, 0, 0)) return if params.count == 0
+                    params_pointer: void& = (&param_types[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMAddFunction(m, fn_name, LLVMFunctionType(int64_type, params_pointer, params.count.u32(), 0))
                 return null
             return null
 
 
-        # The signed-`i64` arithmetic operators. `null` = unmodeled, so a comparison or a
-        # bitwise op still declines rather than silently emitting something wrong.
-        #
-        # SDiv/SRem (not UDiv/URem): the modeled subset is `i64`, which is signed. Elisa's
-        # `%` follows LLVM's `srem` (sign of the DIVIDEND: -7 % 2 == -1), matching stage0,
-        # which selects the same instruction for a signed operand type.
-        def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
-            LLVMBuildAdd(builder, left, right, "add") return if operator == TokenKind.Plus
-            LLVMBuildSub(builder, left, right, "sub") return if operator == TokenKind.Minus
-            LLVMBuildMul(builder, left, right, "mul") return if operator == TokenKind.Star
-            LLVMBuildSDiv(builder, left, right, "div") return if operator == TokenKind.Slash
-            LLVMBuildSRem(builder, left, right, "rem") return if operator == TokenKind.Percent
-            return null
+        # Emit the body of an already-declared function. False = declined.
+        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
+                LLVMPositionBuilderAtEnd(builder, entry)
+
+                # Each parameter gets a slot too, so a parameter reads and assigns exactly
+                # like a local and emit_expression's Ident path needs no param special
+                # case. mem2reg removes the copy.
+                local_scope: mutable Scope = Scope{names: [], slots: []}
+                parameter_index: mutable u32 = 0
+                for parameter in params |local_scope, parameter_index, fn, ctx, builder, int64_type|:
+                    name_storage: mutable darray[u8] = []
+                    slot_name: cstr = sview_to_cstr(parameter.name, name_storage)
+                    slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, slot_name)
+                    _ = LLVMBuildStore(builder, LLVMGetParam(fn, parameter_index), slot)
+                    local_scope.names <- local_scope.names.push(parameter.name)
+                    local_scope.slots <- local_scope.slots.push(slot)
+                    parameter_index <- parameter_index + 1
+
+                # A function that can run off the end is not modeled — rather than invent
+                # a return value, decline. (LLVM would reject the unterminated block.)
+                return emit_statements(body, local_scope, fns, m, ctx, builder) == EmitStatus.Terminated
+            return false
 
     public:
 
@@ -81,50 +404,37 @@ module Backend:
         #
         # All-or-nothing is the sound choice: a partially-emitted module is WORSE than no
         # module. If `main` is unmodeled but a helper emits, a count-based "did we emit
-        # anything?" check reports success and hands back a module that is quietly missing
-        # the program. Declining the whole module keeps "emitted" honest.
+        # anything?" check reports success and hands back a module quietly missing the
+        # program. Declining the whole module keeps "emitted" honest.
+        #
+        # TWO PASSES: declare every function before emitting any body, so a call to a
+        # function defined LATER in the file still resolves. A one-pass emitter would
+        # silently decline forward references, which stage0 accepts.
         #
         # Takes `file` BY REFERENCE, mirroring `Semantic::check(file: Ast::File&)` — the
         # AST is a large region-backed structure and there is no reason to copy it.
         #
-        # `emitted_count <- …`, NOT `=`: inside a `for … |captures|:` loop a captured
-        # scalar must be threaded with `<-`. A plain `=` compiles clean and silently does
-        # nothing, so the count stays 0 and every emitted function looks unsupported.
+        # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
+        # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            emitted_count: mutable i64 = 0
+            fns: mutable FnTable = FnTable{names: [], handles: []}
             declined: mutable bool = false
-            for declaration in file.top_decls |emitted_count, declined, m, ctx, builder|:
-                emitted: bool = emit_function(declaration, m, ctx, builder)
+
+            for declaration in file.top_decls |fns, declined, m, ctx|:
+                handle: LLVMValueRef? = declare_function(declaration, m, ctx)
+                if handle is declared_fn:
+                    fns.names <- fns.names.push(function_name_of(declaration))
+                    fns.handles <- fns.handles.push(declared_fn)
+                else:
+                    declined <- true
+            -1 return if declined
+
+            emitted_count: mutable i64 = 0
+            index: mutable usize = 0
+            for declaration in file.top_decls |emitted_count, declined, index, fns, m, ctx, builder|:
+                emitted: bool = emit_function_body(declaration, fns.handles[index], fns, m, ctx, builder)
                 emitted_count <- emitted_count + 1 if emitted else emitted_count
                 declined <- true if not emitted else declined
+                index <- index + 1
             -1 return if declined
             return emitted_count
-
-
-        # Emit one `def name() -> i64` whose body is a single `return <int literal>`.
-        # Deliberately narrow: this is the vertical slice that proves the whole toolchain
-        # (lex -> parse -> backend -> LLVM -> object -> link -> run), not a general emitter.
-        # Returns false when the declaration is outside the modeled subset.
-        def emit_function(declaration: Decl, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            if declaration is Decl.Func(function_name, params, return_type, body, effects, decorators, line):
-                false return if params.count != 0
-                false return if body.count != 1
-
-                statement: Stmt = body[0]
-                if statement is Stmt.Return(return_value_opt, return_line):
-                    if return_value_opt is return_value:
-                        emitted: LLVMValueRef? = emit_expression(return_value, ctx, builder)
-                        if emitted is return_constant:
-                            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                            # A parameterless function: null params pointer, count 0.
-                            fn_type: LLVMTypeRef = LLVMFunctionType(int64_type, null, 0, 0)
-                            name_storage: mutable darray[u8] = []
-                            fn_name: cstr = sview_to_cstr(function_name, name_storage)
-                            fn: LLVMValueRef = LLVMAddFunction(m, fn_name, fn_type)
-                            entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
-                            LLVMPositionBuilderAtEnd(builder, entry)
-                            _ = LLVMBuildRet(builder, return_constant)
-                            return true
-                return false
-            # Not a function declaration (a struct/enum/extern/…): not modeled.
-            return false
