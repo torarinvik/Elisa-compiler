@@ -342,6 +342,34 @@ if [[ "$got" != "3" ]]; then
 fi
 echo "resolve smoke OK: unresolved=3" >&2
 
+# REGRESSION (memory-safety): a loop-capture accumulator initialized by a CALL —
+# `while i > 0 |i = f(n)|:`. The parser helper that recorded the accumulator also took the
+# `captures` darray, so it had TWO regionless-ref container params. The region-adoption
+# that keeps a pushed region-VALUED result alive in the caller's region only fires for a
+# SINGLE-container void grower (soundness gate in analyzer_region_param_inference.go), so
+# adoption was skipped: the initializer `Expr`'s payload (a call's `arguments` darray)
+# landed in the helper's auto region and was freed on return. The resolver then walked a
+# dangling `arguments` and read a GARBAGE child handle, indexing the AoS store out of
+# bounds -- SIGSEGV under -O2, a bounds trap under -O0.
+#
+# It was layout-dependent, which is why it hid: `|i = name|` (no container payload) and
+# `|i = f()|` (empty arg list) never crashed, and adding an unrelated `def` to the file
+# made it vanish. It surfaced only as a whole-program self-resolve crash over 12+ files.
+# Assert the resolver SURVIVES; the unresolved count is not what is under test.
+for src in \
+	'def f(n: usize) -> usize:\n    while i > 0 |i: usize = nosuchfn(n)|:\n        i <- i - 1\n    return i\n' \
+	'def f(n: usize) -> usize:\n    for k in 0..<3 |i: usize = nosuchfn(n, n)|:\n        i <- i - 1\n    return i\n'
+do
+	printf "%b" "$src" > "$WORK/capture_uaf.elisa"
+	"$WORK/run" "$WORK/capture_uaf.elisa" >/dev/null 2>&1
+	rc=$?
+	if [[ "$rc" -ne 0 ]]; then
+		echo "resolve smoke FAILED: resolver crashed (rc=$rc) on a loop-capture accumulator initialized by a call" >&2
+		exit 1
+	fi
+done
+echo "resolve smoke OK: loop-capture call initializers resolve without a dangling payload" >&2
+
 # Self-resolve diagnostic: run the resolver over the frontend's OWN source —
 # WHOLE-PROGRAM (all files concatenated into one combined symbol table), so
 # cross-file and module-qualified references (`Lexer::foo`, `Ast::Node`) resolve.
