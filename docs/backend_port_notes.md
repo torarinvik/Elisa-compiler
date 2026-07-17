@@ -245,8 +245,8 @@ case has a deep call chain, several distinct `mutable&` tables live at once, and
 region-polymorphic frames in between. Reducing it is the next job — with a repro this is a
 stage0 bug worth filing, because a well-typed program must not be able to trap.
 
-### Workaround in place
+### RESOLVED (38b3f30)
 
-Nested generic calls DECLINE (`decline_case generic_chained`). Everything else about
-generics works. The decline is a guard on `structs.binding_names.count != 0` in
-`emit_generic_call` — i.e. "already inside an instantiation".
+Fixed by replacing the two `<- []` lines with pops. Nested generics now work, including
+three-deep chains and two type arguments; the decline fixture was promoted to real coverage.
+The pre-sizing refactor was NOT needed and was not applied.
