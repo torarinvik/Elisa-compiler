@@ -165,7 +165,39 @@ The remaining SIGSEGV is the other growing tables — `GenericTable`'s `pending_
 `inst_*` — which are pushed from `instantiate_generic`, itself running deep under
 `emit_function_body`.
 
-### The fix (not yet completed)
+### ROOT CAUSE FOUND: `x <- []` inside a callee is NOT a clear
+
+`instantiation_param_type` ended with:
+
+    _ = push_type_binding(structs, …)
+    resolved = annotation_value_type(…, structs)
+    structs.binding_names <- []          # <-- THIS
+    structs.binding_types <- []
+    return resolved
+
+`structs.binding_names <- []` does NOT clear the caller's darray. It REBINDS the caller's
+field to a **fresh empty darray allocated in THIS callee's auto region**, which is freed the
+moment the callee returns. Every later access to `structs.binding_names` then follows freed
+memory — hence SIGTRAP (bounds check against a garbage count), and SIGSEGV once the binding
+stack no longer grew. It also silently wiped any OUTER instantiation's bindings.
+
+Replacing it with a `pop` FIXES the nested-generic crash: `wrap[T]` calling `identity[T]`
+emits with rc=0 instead of trapping. **Confirmed.**
+
+To CLEAR a shared container from a callee, pop to the intended depth (or have the OWNER
+clear it). Never `<- []` a field you do not own — the empty literal is allocated where you
+are standing, not where the field lives. This is worth remembering well beyond generics: any
+`x.field <- []` inside a function that received `x` as a `mutable&` is this bug.
+
+### Still to do: the pre-sizing refactor is NOT the fix and broke things
+
+Pre-sizing (index stores + explicit counts) was an experiment to *prove* the growth theory,
+and it did — but as an implementation it regressed working generics: with the tables
+pre-sized, `generic_explicit` emitted only `@main` and no instantiations at all (invalid IR).
+It was reverted. Do NOT re-apply it wholesale; the `<- []` fix above is the real one and is
+independent of it.
+
+### The fix (superseded — kept for context)
 
 Pre-size EVERY table that is grown from inside a callee, in emit_module's region, and use
 index stores plus an explicit count:
