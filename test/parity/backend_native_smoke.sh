@@ -548,7 +548,10 @@ diff_case region_capacity_grows 'def main() -> i64:\n    total: mutable i64 = 0\
 diff_case arena_param 'def sink(owner: Arena) -> i64:\n    return 42\n\ndef main() -> i64:\n    region r(4096):\n        return sink(r)\n'
 # The callee must be able to BUILD in the arena it was handed -- that is the whole point of
 # passing one.
-diff_case arena_param_grows 'def fill(owner: Arena, out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef main() -> i64:\n    total: mutable i64 = 0\n    region r(4096):\n        xs: mutable darray[i64] = []\n        fill(r, xs)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
+# `in owner:` — ACTIVATING an arena. Passing an arena does not make it the allocation
+# target: stage0 rejects the push WITHOUT the in-block ("darray push requires an active in
+# <arena>: scope"). The arena is BORROWED inside it, so nothing frees it.
+diff_case arena_in_scope 'def fill(owner: Arena, out: mutable darray[i64]&) -> void:\n    in owner:\n        out.push(42)\n\ndef main() -> i64:\n    total: mutable i64 = 0\n    region r(4096):\n        xs: mutable darray[i64] = []\n        fill(r, xs)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
