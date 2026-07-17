@@ -27,4 +27,7 @@ printf '%s\n' "$guarded" | grep -q '^D 0$'
 decorated_guard=$(printf 'struct Box:\n    value: int\n@guard_nonnull(box)\ndef has_box(box: Box&?) -> bool:\n    return box != null\ndef read(box: Box&?) -> int:\n    if not has_box(box):\n        return 0\n    return box.value\n' | "$RPT")
 printf '%s\n' "$decorated_guard" | grep -q '^D 0$'
 
+invalid_guard=$(printf '@guard_nonnull(text)\ndef has_text(text: sview) -> bool:\n    return true\n' | "$RPT")
+printf '%s\n' "$invalid_guard" | grep -q '@guard_nonnull on function "has_text" requires a nullable reference or optional parameter, got sview'
+
 echo "nullable flow smoke OK" >&2
