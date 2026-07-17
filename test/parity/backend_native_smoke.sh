@@ -217,6 +217,13 @@ run_case generic_struct_reuse  'struct Box[T]:\n    value: mutable T\n\ndef main
 # its zero value (null items, 0 count/…). A fresh dict reads count 0. (Full put/get needs the
 # std dict generics; this covers the type mapping + literal + field read.)
 run_case dict_empty_literal 'struct DynDict[K, T]:\n    items: mutable i64\n    count: mutable usize\n    used: mutable usize\n    capacity: mutable usize\n    arena: mutable i64\n\ndef main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return d.count.i64() + 42\n'  42
+# DICT METHOD DISPATCH: `d.get(k)` / `d.put(k,v)` are SYNTHESIZED calls to the std generics
+# `arena_dict_get` / `arena_dict_put_or_panic` (NOT UFCS to a `get`/`put` fn), with the [K,T]
+# taken from the receiver's DynDict type and — for the mutating put — the region threaded as
+# the LEADING argument. A single-slot hand-written std proves the whole lowering: put writes,
+# get reads back through the returned `T&?`.
+run_case dict_get_dispatch 'struct Bucket[K, T]:\n    key: mutable K\n    value: mutable T\n    used: mutable u8\n\nstruct DynDict[K, T]:\n    slot: mutable Bucket[K, T]\n    count: mutable usize\n\ndef arena_dict_get[K, T](m: DynDict[K, T]&, key: K) -> T&?:\n    return &m.slot.value if m.slot.used == 1 and m.slot.key == key else null\n\ndef main() -> i64:\n    d: mutable DynDict[i64, i64] = DynDict[i64, i64]{slot: Bucket[i64, i64]{key: 5, value: 42, used: 1}, count: 1}\n    if d.get(5) is v:\n        return v\n    return 0\n'  42
+run_case dict_put_get_cycle 'struct Bucket[K, T]:\n    key: mutable K\n    value: mutable T\n    used: mutable u8\n\nstruct DynDict[K, T]:\n    slot: mutable Bucket[K, T]\n    count: mutable usize\n\ndef arena_dict_put_or_panic[K, T](a: mutable Arena&, m: mutable DynDict[K, T]&, key: K, value: T) -> T&?:\n    m.slot.key <- key\n    m.slot.value <- value\n    m.slot.used <- 1\n    return &m.slot.value\n\ndef arena_dict_get[K, T](m: DynDict[K, T]&, key: K) -> T&?:\n    return &m.slot.value if m.slot.used == 1 and m.slot.key == key else null\n\ndef main() -> i64:\n    d: mutable DynDict[i64, i64] = DynDict[i64, i64]{slot: Bucket[i64, i64]{key: 0, value: 0, used: 0}, count: 0}\n    d.put(5, 42)\n    if d.get(5) is v:\n        return v\n    return 0\n'  42
 
 # FIXED ARRAYS: `T[N]` types, literals, index read/write.
 run_case array_literal    'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'  42

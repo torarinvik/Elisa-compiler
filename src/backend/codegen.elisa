@@ -1257,6 +1257,14 @@ module Backend:
                     if cast_object is Expr.Ident(ctor_enum_name, ctor_enum_line):
                         ctor_index: i64 = penum_index_of(structs, ctor_enum_name)
                         ValueType{kind: TypeKind.PayloadEnum, bits: ctor_index.u32()} return if ctor_index >= 0
+                    # A dict receiver's `.get`/`.put`/… is a synthesized std-generic call —
+                    # its type is that helper's return annotation resolved under the receiver's
+                    # (K, T). Needed so `if d.get(k) is v:` can see the `T&?` it narrows.
+                    dict_return_args: darray[ValueType] = dict_type_args_of(cast_object, local_scope, fns, structs, generics)
+                    if dict_return_args.count != 0:
+                        dict_return_helper: sview = dict_method_helper(cast_name)
+                        if dict_return_helper != "":
+                            return generic_return_type(dict_return_helper, dict_return_args, generics, structs)
                     # A type name is a CAST and has that type; anything else is UFCS
                     # (`p.get()` == `get(p)`) and has the FUNCTION's return type. Without
                     # the second case a UFCS call reports Unmodeled and every
@@ -1777,6 +1785,80 @@ module Backend:
             return null
 
 
+        # Emit a synthesized dict-method call — stage0 lowers `d.get(k)` / `d.put(k, v)` to a
+        # call to a std generic (`arena_dict_get` / `arena_dict_put_or_panic`), NOT to a user
+        # `get`/`put` function. The RECEIVER is threaded separately (a `darray[Expr]` of
+        # receiver-then-args crashes stage0), and for a mutating helper the region leads the
+        # argument list (stage0: `arena_dict_put_or_panic(ptr %region, ptr %d, …)`).
+        def emit_dict_method_call(base: sview, type_args: darray[ValueType]&, receiver: Expr, arguments: darray[Expr]&, arena_leading: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instantiate_generic(base, type_args, generics, structs, m, ctx) is target:
+                dict_arg_values: mutable darray[LLVMValueRef] = []
+                param_index: mutable usize = 0
+                # The leading region for a mutating helper — hand over OUR arena.
+                if arena_leading:
+                    dict_arg_values.push(runtime.arena)
+                    param_index <- 1
+                # The receiver, emitted at its `dict[K,T]&` parameter type (a bare dict local
+                # auto-borrows to its slot).
+                receiver_wanted: ValueType = instantiation_param_type(base, type_args, param_index, generics, structs)
+                if emit_expression(receiver, receiver_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is receiver_value:
+                    dict_arg_values.push(receiver_value)
+                    param_index <- param_index + 1
+                    method_declined: mutable bool = false
+                    for method_argument in arguments |dict_arg_values, method_declined, param_index, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        method_wanted: ValueType = instantiation_param_type(base, type_args, param_index, generics, structs)
+                        if emit_expression(method_argument, method_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is method_argument_value:
+                            dict_arg_values.push(method_argument_value)
+                        else:
+                            method_declined <- true
+                        param_index <- param_index + 1
+                    null return if method_declined
+                    dict_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                    dict_result_name: cstr = call_result_name(generic_return_type(base, type_args, generics, structs))
+                    dict_args_pointer: void& = (&dict_arg_values[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMBuildCall2(builder, dict_fn_type, target, dict_args_pointer, dict_arg_values.count.u32(), dict_result_name)
+                return null
+            return null
+
+
+        # If `receiver` has a `DynDict[K, T]` type, return its type-argument tuple (K, T);
+        # otherwise an empty darray. Used to lower `d.get`/`d.put` to the arena_dict_* helpers.
+        def dict_type_args_of(receiver: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            empty: darray[ValueType] = []
+            receiver_type: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+            empty return if receiver_type.kind != TypeKind.Struct
+            receiver_base: mutable sview = ""
+            receiver_arg_start: mutable usize = 0
+            receiver_arg_count: mutable usize = 0
+            has_instantiation: bool = generic_struct_instantiation_of(structs, receiver_type, receiver_base, receiver_arg_start, receiver_arg_count)
+            empty return if not has_instantiation
+            empty return if receiver_base != "DynDict"
+            collected: mutable darray[ValueType] = []
+            for offset in 0..<receiver_arg_count |collected, structs, receiver_arg_start|:
+                collected.push(copied_type(structs.generic_struct_inst_args[receiver_arg_start + offset]))
+            return collected
+
+
+        # The std helper a dict method lowers to — the FRICTIONLESS (panic-on-OOM, no `can`)
+        # surface, matching stage0's synthetic `dict.<method>` lowering. Empty = not a dict
+        # method (fall through to ordinary UFCS).
+        def dict_method_helper(method_name: sview) -> sview can[Abort.Panic]:
+            return when method_name:
+                "get" -> "arena_dict_get"
+                "get_mut" -> "arena_dict_get_mut"
+                "put" -> "arena_dict_put_or_panic"
+                "get_or_insert" -> "arena_dict_get_or_insert_or_panic"
+                "reserve" -> "arena_dict_reserve_or_panic"
+                "contains" -> "arena_dict_contains"
+                "remove" -> "arena_dict_remove"
+                _ -> ""
+
+
+        # Whether a dict method mutates the map and therefore takes a LEADING region argument.
+        def dict_method_is_mutating(method_name: sview) -> bool can[Abort.Panic]:
+            return method_name in {"put", "get_or_insert", "reserve"}
+
+
         # Emit a call `f(args…)`. Only a direct call to a named, already-declared function
         # is modeled: the callee must exist in the module (emit_module declares every
         # function before emitting any body, so definition order does not matter) and the
@@ -1931,6 +2013,15 @@ module Backend:
             if callee is Expr.Field(receiver, method_name, method_line):
                 method_as_type: ValueType = scalar_type_of_name(method_name)
                 null return if method_as_type.kind != TypeKind.Unmodeled
+                # A dict receiver's `.get`/`.put`/… are SYNTHESIZED calls to std generics, not
+                # UFCS to a user function. Detected before the ordinary UFCS lookup because no
+                # `get`/`put` function exists to find.
+                dict_args: darray[ValueType] = dict_type_args_of(receiver, local_scope, fns, structs, generics)
+                if dict_args.count != 0:
+                    dict_helper: sview = dict_method_helper(method_name)
+                    if dict_helper != "":
+                        dict_arena_leading: bool = dict_method_is_mutating(method_name)
+                        return emit_dict_method_call(dict_helper, dict_args, receiver, arguments, dict_arena_leading, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 ufcs_target_opt: LLVMValueRef? = lookup_function(fns, "", method_name)
                 if ufcs_target_opt is ufcs_target:
                     return emit_direct_call("", method_name, receiver, true, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
