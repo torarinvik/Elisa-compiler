@@ -154,7 +154,46 @@ The value is already in a local by then, so it is neither the read nor an aliase
 It is `structs.binding_names.push(...)` on the SECOND instantiation, after the first has
 completed several balanced push/pop cycles.
 
-### Current best theory: cross-fn grower region
+### THEORY CONFIRMED by experiment (2026-07-17)
+
+Pre-sizing the binding stack — so a binding is an index STORE and a push never GROWS —
+changed the failure from **rc=133 (SIGTRAP, a bounds check)** to **rc=139 (SIGSEGV, reading
+freed memory)**. Removing one growth site MOVED the crash. That is the confirmation: the
+cause is a caller-owned darray being GROWN from inside a callee.
+
+The remaining SIGSEGV is the other growing tables — `GenericTable`'s `pending_*` and
+`inst_*` — which are pushed from `instantiate_generic`, itself running deep under
+`emit_function_body`.
+
+### The fix (not yet completed)
+
+Pre-size EVERY table that is grown from inside a callee, in emit_module's region, and use
+index stores plus an explicit count:
+
+* `StructTable.binding_names` / `binding_types` + `binding_depth`   (done in the experiment)
+* `GenericTable.inst_*`     + `inst_count`
+* `GenericTable.pending_*`  + `pending_count`
+
+Overflow should DECLINE, never grow — growing is precisely what breaks. Remaining work: the
+`*_handles` arrays hold `LLVMValueRef`, which has no default to prefill with, so
+`new_generic_table` needs `ctx` to seed them with `LLVMConstNull(pointer_type)`; and every
+`.push(...)` site must become an index store against the count.
+
+### Why this matters beyond generics
+
+This is the cross-fn "grower" lifetime machinery, and the shape is
+`region-byvalue-builder-uaf` (caller-owned struct field grown via a forwarded `mutable&`).
+A minimal repro of that exact shape runs CLEAN:
+
+    struct Table: names: mutable darray[sview]
+    def use_once(t: mutable Table&, n: sview): t.names <- t.names.push(n); _ = t.names.pop()
+    def outer(t: mutable Table&, n: sview):    t.names <- t.names.push(n); use_once(t, n); _ = t.names.pop()
+
+so the trigger needs more than that: a deep call chain, several live `mutable&` tables, and
+region-polymorphic frames between. Reducing it is worth real effort — a well-typed program
+must not be able to trap or segfault the emitter, so with a repro this is a stage0 bug.
+
+### Superseded theory: cross-fn grower region
 
 When `push` GROWS the darray, the new backing is allocated from the region inferred AT THE
 PUSH SITE — `emit_instantiation_body`'s auto region — which is freed when that function
