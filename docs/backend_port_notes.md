@@ -250,3 +250,40 @@ stage0 bug worth filing, because a well-typed program must not be able to trap.
 Fixed by replacing the two `<- []` lines with pops. Nested generics now work, including
 three-deep chains and two type arguments; the decline fixture was promoted to real coverage.
 The pre-sizing refactor was NOT needed and was not applied.
+
+## references (`T&`): started, not landed (2026-07-17)
+
+Attempted next, reverted rather than leave dead code. What is known:
+
+### stage0's lowering (read from `-emit llvm`)
+
+    def bump(n: mutable i64&) -> void       =>   define void @bump(ptr %0)
+    bump(x)                                 =>   call void @bump(ptr %x)
+
+A reference is just a `ptr`. The callee spills it (`%n = alloca ptr; store ptr %0`) and
+loads THROUGH it. This fits this backend well: locals are already allocas, so passing
+`&local` is passing the alloca. Mutability is a frontend concern — the backend needs only
+the referent type. `TypeKind.Ref` with `bits` indexing a `ref_targets` side-pool, and
+`llvm_type_of` returning `LLVMPointerTypeInContext(ctx, 0)`, is the right shape (it compiled
+cleanly).
+
+Both idiomatic forms work under stage0 and are the fixtures to aim at:
+
+    def total(p: P&) -> i64: return p.x + p.y                       # immutable struct ref
+    def bump(c: mutable Counter&) -> void: c.value <- c.value + 1   # mutable struct ref
+
+(`n <- n + 1` on a `mutable i64&` trips stage0's unsafe audit — "pointer arithmetic requires
+can[Unsafe]" — so prefer the struct-ref forms for fixtures.)
+
+### The open question: WHERE does `&` live in the stage1 AST?
+
+Not on `ParamDecl` (its fields are `name`, `type_expression`, `is_mutable`, `has_default` —
+there is no `is_ref`). And NOT reachable as `Expr.Unary(Ampersand, T)`: adding that case did
+not fire, and an end-of-function classifier probe in `annotation_value_type` never printed at
+all — meaning every annotation RESOLVES (so `p: P&` is resolving, presumably to plain
+`Struct P` with the `&` dropped) and the decline is somewhere else entirely.
+
+Next step is therefore NOT to guess the node again: dump the actual annotation for `p: P&`
+(e.g. teach test/breadth a mode that prints the parsed annotation, or probe the parser
+directly) and find where `&` is recorded. `parser_types.elisa:245` mentions
+`TokenKind.Ampersand` alongside `Lmut` under a `provenance` flag — that is the lead.
