@@ -286,6 +286,14 @@ run_case ref_mutate       'struct Counter:\n    value: mutable i64\n\ndef bump(c
 # Accumulate through a ref across a loop: 0+1+..+8 == 36, +6 == 42.
 run_case ref_accumulate   'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'  42
 run_case field_assign     'struct P:\n    x: mutable i64\n    y: i64\n\ndef main() -> i64:\n    p: mutable P = P{x: 1, y: 2}\n    p.x <- 40\n    return p.x + p.y\n'  42
+# EXPLICIT address-of `&place` + a REF used in a value context (auto-deref through the
+# pointer). The dict READ path: `arena_dict_get` returns `&bucket.value` as a `T&?`, and
+# `if d.get(k) is a: … a …` reads through the bound `mutable T&`.
+run_case ref_addr_field   'struct Box:\n    value: mutable i64\n\ndef get_ref(b: Box&) -> i64&:\n    return &b.value\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 42}\n    r: i64& = get_ref(b)\n    return r\n'  42
+# Ref-OPTIONAL `T&?`: `&place` when present, `null` when absent, `is` binds the ref.
+run_case ref_optional     'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef get_ref(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 42, used: 1}\n    if get_ref(b) is v:\n        return v\n    return 0\n'  42
+# Absent case of a ref-optional: the null branch is taken, so the fallback returns.
+run_case ref_optional_absent 'struct Box:\n    value: mutable i64\n    used: mutable u8\n\ndef get_ref(b: Box&) -> i64&?:\n    return &b.value if b.used == 1 else null\n\ndef main() -> i64:\n    b: mutable Box = Box{value: 7, used: 0}\n    if get_ref(b) is v:\n        return v\n    return 42\n'  42
 # `void`: a bare `return`, a void call in statement position (its result must be UNNAMED —
 # LLVM rejects a named void instruction), and a void body running off the end.
 run_case void_call        'def noop() -> void:\n    return\n\ndef main() -> i64:\n    noop()\n    return 42\n'  42
