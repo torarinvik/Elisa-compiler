@@ -855,6 +855,7 @@ run_case for_captures 'def main() -> i64:\n    total: mutable i64 = 0\n    for i
 # GEPs per level. Read, write, and loop-driven variable indexing.
 run_case nested_array_read 'def main() -> i64:\n    m: i64[2][2] = [[40, 0], [0, 2]]\n    return (m[0][0] can Unsafe.UncheckedIndex) + (m[1][1] can Unsafe.UncheckedIndex)\n' 42
 run_case nested_array_write 'def main() -> i64:\n    m: mutable i64[3][2] = [[1, 2, 3], [4, 5, 6]]\n    m[1][2] <- 40 can Unsafe.UncheckedIndex\n    return (m[1][2] can Unsafe.UncheckedIndex) + (m[0][1] can Unsafe.UncheckedIndex)\n' 42
+run_case nested_array_triple 'def main() -> i64:\n    t: mutable i64[2][2][2] = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]\n    t[1][0][1] <- 36 can Unsafe.UncheckedIndex\n    return (t[1][0][1] can Unsafe.UncheckedIndex) + (t[0][1][0] can Unsafe.UncheckedIndex) + (t[0][0][0] can Unsafe.UncheckedIndex) + 2\n' 42
 run_case nested_array_loop 'def main() -> i64:\n    m: mutable i64[4][3] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]\n    total: mutable i64 = 0\n    for r in 0..<3:\n        for c in 0..<4 |m, total, r|:\n            m[r][c] <- (r * 4 + c) can Unsafe.UncheckedIndex\n            total <- total + (m[r][c] can Unsafe.UncheckedIndex)\n    return total - 24\n' 42
 # Iterating a CONTAINER needs the container ABI; only integer ranges are modeled.
 decline_case for_over_container 'def main() -> i64:\n    xs: darray[i64] = [1, 2]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total\n'
