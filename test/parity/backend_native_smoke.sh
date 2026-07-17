@@ -546,9 +546,12 @@ diff_case region_capacity_grows 'def main() -> i64:\n    total: mutable i64 = 0\
 # user-facing code". Passable, not annotatable. This is prerequisite 2 of 4 for the
 # packed-enum store (cab917f).
 diff_case arena_param 'def sink(owner: Arena) -> i64:\n    return 42\n\ndef main() -> i64:\n    region r(4096):\n        return sink(r)\n'
-# The callee must be able to BUILD in the arena it was handed -- that is the whole point of
-# passing one.
-diff_case arena_param_grows 'def fill(owner: Arena, out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef main() -> i64:\n    total: mutable i64 = 0\n    region r(4096):\n        xs: mutable darray[i64] = []\n        fill(r, xs)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
+# `in owner:` — ACTIVATING an arena. Passing an arena does not make it the allocation
+# target: stage0 rejects a push in a function holding an explicit `Arena` param with "darray
+# push requires an active in <arena>: scope". The arena is BORROWED inside the block, so
+# nothing frees it -- it belongs to whoever opened it. This is prerequisite 4 of 4 for the
+# packed-enum store, where the same construct activates a Store rather than an Arena.
+diff_case arena_in_scope 'def fill(owner: Arena, out: mutable darray[i64]&) -> void:\n    in owner:\n        out.push(42)\n\ndef main() -> i64:\n    total: mutable i64 = 0\n    region r(4096):\n        xs: mutable darray[i64] = []\n        fill(r, xs)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -598,6 +601,9 @@ decline_case() {
 # MULTI-FIELD payload needs the widest-variant layout computed exactly as stage0 computes it,
 # and guessing it would silently misread every payload -- so it declines.
 decline_case enum_multi_field_payload 'enum Pair:\n    Both(a: i64, b: i64)\n\ndef main() -> i64:\n    return match Pair.Both(1, 2):\n        Pair.Both(a, b): a + b\n'
+# `in x:` on something that is not an Arena is not modeled (a packed-enum Store is the other
+# thing it can activate -- see cab917f), so it declines rather than guessing what to activate.
+decline_case in_non_arena 'def main() -> i64:\n    v: i64 = 1\n    in v:\n        return 42\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'

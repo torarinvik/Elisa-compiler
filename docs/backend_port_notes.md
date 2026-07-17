@@ -614,14 +614,17 @@ Prerequisites this needs that the backend does NOT have yet:
    SOURCE text (not an Expr), and is parsed back out. Emits `new_region_backend(cap, 0)` with
    `begin`/`end` both starting at the backing; the lazy strategy word stays 0 because the
    backing already exists.
-2. `Arena` as a PARAMETER type. Note the asymmetry: `def build(owner: Arena)` is accepted,
-   while `-> darray[i64] @owner` is rejected ("internal runtime carrier type ... not
-   supported in user-facing code"). So the carrier is passable but not annotatable.
+2. ~~`Arena` as a PARAMETER type~~ — DONE. `{ptr, ptr, i64, i64}` passed BY VALUE. A
+   region's NAME is bound as an Arena local, so `build(r)` goes through the ordinary Ident
+   path and emits stage0's `load %Arena, ptr %r` with no special case. The asymmetry stands:
+   passable, not annotatable (`-> darray[i64] @owner` is still rejected).
 3. `new T.Variant(field: value)` — NAMED-field construction, distinct from the positional
    `Shape.Circle(42)` that payload enums use.
-4. `in store:` — an in-block binding the ACTIVE store, which every constructor in scope
-   uses implicitly. Note the diagnostic is explicit that a packed constructor REQUIRES one:
-   "packed enum constructor Node.Leaf requires an active in Node.Store: scope or explicit
+4. `in store:` — PARTIALLY DONE. `in NAME:` now activates an ARENA (borrowed: nothing frees
+   it). The same construct must also accept a packed Store, which is what remains. Note
+   activation is REQUIRED, not decorative: stage0 rejects a push in a function holding an
+   explicit Arena param with "darray push requires an active in <arena>: scope", and a
+   packed constructor with "requires an active in Node.Store: scope or explicit
    new[Node.Store]".
 
 Beyond that, the full subsystem also has typestate (`Store[Local]` vs `Store[Frozen]`),
