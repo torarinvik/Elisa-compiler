@@ -92,3 +92,59 @@ design pass, not a patch.
 stage0 supports inferred (`identity(42)`) and explicit (`identity[i64](42)`) calls; the
 explicit form makes the callee an `Expr.Index`, not an `Expr.Ident`. Start with ONE type
 parameter and scalar type arguments; multi-parameter inference is separate.
+
+## nested generics: diagnosed to the exact line, not yet fixed (2026-07-17)
+
+A generic calling another generic DECLINES (pinned by `decline_case generic_chained`).
+Everything else about generics works — see 41638be. Diagnosis so far, so the next attempt
+does not start from zero:
+
+### Symptom
+
+The emitter TRAPS (SIGTRAP, rc=133) — it does not mis-emit. `identity(x)` called from inside
+`wrap[T]`'s instantiation. Both inferred and explicit (`identity[i64](42)`) forms trap. A
+generic calling a NON-generic is fine; a generic instantiated twice at top level is fine.
+
+### Where, exactly
+
+Traced with `perror` probes at each step. The queueing all succeeds:
+
+    instantiate wrap -> queued
+    drain 0: emit wrap body -> instantiate identity -> queued -> body done
+    drain 1: emit_instantiation_body ENTER -> ... -> TRAP
+
+and within `emit_instantiation_body` for the SECOND instantiation it reaches:
+
+    "F pushing binding"          <- printed
+    structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
+    "G pushed name"              <- NOT printed
+
+So the trap is on that one statement, on the second instantiation only. The first
+instantiation executes the identical statement fine. Every index involved is valid by
+construction (two templates => names/param_start/param_count all count 2, params count 2,
+slot == 1).
+
+### Ruled out
+
+* Not the drain loop capturing a by-value `generics`: moving the loop into
+  `drain_instantiations(generics: mutable GenericTable&, …)` so the capture copies a
+  REFERENCE did not help. (Worth keeping in mind anyway — that IS a real hazard, cf. the
+  `=` vs `<-` capture semantics.)
+* Not unbalanced binding push/pop: every push has a matching pop on every path
+  (instantiate_generic, generic_return_type, instantiation_param_type,
+  emit_instantiation_body).
+* Not recursion/non-termination: the drain trace shows it terminating into the trap.
+
+### Prime suspect
+
+Aliasing between the two mutable registry references. The statement reads through
+`generics` (a `mutable GenericTable&`) while writing through `structs` (a
+`mutable StructTable&`) in the same expression, at a point where BOTH have been mutated
+earlier in the same call chain. Try first: bind the name to a local before the push —
+
+    param_name: sview = generics.params[generics.param_start[slot]]
+    structs.binding_names <- structs.binding_names.push(param_name)
+
+If that fixes it, the read-through-one-ref-while-writing-through-another in a single
+statement is the trigger, and it is worth reducing to a minimal repro and filing as a
+stage0 bug: an emitter should not be able to trap from a well-typed program.
