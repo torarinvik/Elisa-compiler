@@ -74,4 +74,10 @@ echo "$out" | grep -q "non-exhaustive" && fail "false positive on wildcard catch
 out=$(printf "${E2}def f(e: E) -> i64:\n    match e:\n        E.A | E.B:\n            return 1\n" | "$RPT")
 echo "$out" | grep -q "non-exhaustive" && fail "false positive on or-pattern cover: $out"
 
+# 9. Sequence matches require a list pattern or wildcard, never an enum variant.
+out=$(printf 'def f(values: view[i32]) -> i64:\n    match values:\n        Token.Region:\n            return 0\n    return 0\n' | "$RPT")
+echo "$out" | grep -q 'unsupported top-level sequence match pattern \*ast.MatchVariantPattern' || fail "sequence variant pattern not flagged: $out"
+out=$(printf 'def f(values: view[i32]) -> i64:\n    match values:\n        [head, ...tail]:\n            return head\n        _:\n            return 0\n' | "$RPT")
+echo "$out" | grep -q 'unsupported top-level sequence match pattern' && fail "false positive on sequence list pattern: $out"
+
 echo "match-pattern smoke OK: all checks fire on violations and silent on correct code"
