@@ -143,6 +143,63 @@ module Backend:
             return null
 
 
+        # The binary operator a compound assignment applies (`+=` -> `+`), or `Eof` when
+        # the token is not a compound assignment. (TokenKind has no Invalid; `Eof` can
+        # never appear as a real operator, so it is the natural sentinel.) Keeps the
+        # lowering honest: `x op= v` is exactly `x <- x op v`, so it reuses emit_binary
+        # instead of re-deriving each operator.
+        def compound_operator_of(operator: TokenKind) -> TokenKind:
+            TokenKind.Plus return if operator == TokenKind.PlusEq
+            TokenKind.Minus return if operator == TokenKind.MinusEq
+            TokenKind.Star return if operator == TokenKind.StarEq
+            TokenKind.Slash return if operator == TokenKind.SlashEq
+            TokenKind.Percent return if operator == TokenKind.PercentEq
+            TokenKind.Ampersand return if operator == TokenKind.AmpEq
+            TokenKind.Pipe return if operator == TokenKind.PipeEq
+            TokenKind.Caret return if operator == TokenKind.CaretEq
+            TokenKind.LShift return if operator == TokenKind.LShiftEq
+            TokenKind.RShift return if operator == TokenKind.RShiftEq
+            return TokenKind.Eof
+
+
+        # `left and right` / `left or right`, SHORT-CIRCUITING.
+        #
+        # Lowered through a result SLOT rather than a phi: `right` may itself append
+        # blocks, so the join's predecessor is not necessarily `rhs_block` and a phi would
+        # need incoming-block bookkeeping. mem2reg turns the slot back into a phi at -O2.
+        #
+        #   result = <short-circuit answer>   ; `and` -> 0, `or` -> 1
+        #   br left ? rhs : done              ; `or` swaps the targets
+        #   rhs:  result = (right != 0); br done
+        #   done: load result
+        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            is_and: bool = operator == TokenKind.And
+
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, "sc.result")
+            if emit_condition(left_expression, local_scope, fns, m, ctx, builder) is left_bit:
+                # `false and _` is 0; `true or _` is 1.
+                short_value: LLVMValueRef = LLVMConstInt(int64_type, 0, 0) if is_and else LLVMConstInt(int64_type, 1, 0)
+                _ = LLVMBuildStore(builder, short_value, result_slot)
+
+                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                rhs_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "sc.rhs")
+                done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "sc.done")
+                # `and` runs the right side only when the left is TRUE; `or` only when FALSE.
+                if is_and:
+                    _ = LLVMBuildCondBr(builder, left_bit, rhs_block, done_block)
+                else:
+                    _ = LLVMBuildCondBr(builder, left_bit, done_block, rhs_block)
+
+                LLVMPositionBuilderAtEnd(builder, rhs_block)
+                if emit_condition(right_expression, local_scope, fns, m, ctx, builder) is right_bit:
+                    _ = LLVMBuildStore(builder, LLVMBuildZExt(builder, right_bit, int64_type, "sc.rhs.i64"), result_slot)
+                    _ = LLVMBuildBr(builder, done_block)
+                    LLVMPositionBuilderAtEnd(builder, done_block)
+                    return LLVMBuildLoad2(builder, int64_type, result_slot, "sc")
+            return null
+
+
         # Emit a call `f(args…)`. Only a direct call to a named, already-declared function
         # is modeled: the callee must exist in the module (emit_module declares every
         # function before emitting any body, so definition order does not matter) and the
@@ -201,13 +258,50 @@ module Backend:
                     operand return if unary_operator == TokenKind.Plus
                     LLVMBuildNeg(builder, operand, "neg") return if unary_operator == TokenKind.Minus
                     LLVMBuildNot(builder, operand, "bnot") return if unary_operator == TokenKind.Tilde
+                    # `not x` is LOGICAL negation (`x == 0`), distinct from the bitwise
+                    # `~`: every modeled value is an i64, so it re-widens to 1/0.
+                    if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang:
+                        # 32 = LLVMIntEQ.
+                        is_zero: LLVMValueRef = LLVMBuildICmp(builder, 32, operand, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "not.cmp")
+                        return LLVMBuildZExt(builder, is_zero, LLVMInt64TypeInContext(ctx), "not")
                 return null
             if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
+                # `and`/`or` SHORT-CIRCUIT, so they cannot go through emit_binary (which
+                # takes both operands already evaluated): the right side must only be
+                # emitted on the path that reaches it.
+                if binary_operator == TokenKind.And or binary_operator == TokenKind.Or:
+                    return emit_short_circuit(binary_left, binary_operator, binary_right, local_scope, fns, m, ctx, builder)
                 left_value: LLVMValueRef? = emit_expression(binary_left, local_scope, fns, m, ctx, builder)
                 right_value: LLVMValueRef? = emit_expression(binary_right, local_scope, fns, m, ctx, builder)
                 if left_value is left:
                     if right_value is right:
                         return emit_binary(binary_operator, left, right, ctx, builder)
+                return null
+            # A value `if`: `a if cond else b`. Only ONE arm is evaluated, so it uses the
+            # same result-slot lowering as `and`/`or` — emitting both and selecting could
+            # divide by zero or recurse on the untaken side.
+            if expression is Expr.If(ternary_condition, then_expression, else_expression, ternary_line):
+                ternary_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                result_slot: LLVMValueRef = LLVMBuildAlloca(builder, ternary_type, "if.result")
+                if emit_condition(ternary_condition, local_scope, fns, m, ctx, builder) is condition_bit:
+                    function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                    then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.then")
+                    else_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.else")
+                    done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.done")
+                    _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
+
+                    LLVMPositionBuilderAtEnd(builder, then_block)
+                    if emit_expression(then_expression, local_scope, fns, m, ctx, builder) is then_value:
+                        _ = LLVMBuildStore(builder, then_value, result_slot)
+                        _ = LLVMBuildBr(builder, done_block)
+                        LLVMPositionBuilderAtEnd(builder, else_block)
+                        # An `else` is mandatory in a value position; an Absent else
+                        # declines here (no value on one path).
+                        if emit_expression(else_expression, local_scope, fns, m, ctx, builder) is else_value:
+                            _ = LLVMBuildStore(builder, else_value, result_slot)
+                            _ = LLVMBuildBr(builder, done_block)
+                            LLVMPositionBuilderAtEnd(builder, done_block)
+                            return LLVMBuildLoad2(builder, ternary_type, result_slot, "ifx")
                 return null
             if expression is Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
                 # A labelled argument is a different calling convention; not modeled.
@@ -290,6 +384,17 @@ module Backend:
             # outer `i` never moves (an infinite loop, no diagnostic — observed).
             # Compound assignment (`+=`) and non-ident targets also decline.
             if statement is Stmt.Assign(assign_target, assign_operator, assign_value, assign_line):
+                # `x op= v` is exactly `x <- x op v`: load, apply, store.
+                compound: TokenKind = compound_operator_of(assign_operator)
+                if compound != TokenKind.Eof:
+                    if assign_target is Expr.Ident(compound_name, compound_name_line):
+                        if lookup_slot(local_scope, compound_name) is compound_slot:
+                            if emit_expression(assign_value, local_scope, fns, m, ctx, builder) is operand:
+                                current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, compound_slot, "aug.load")
+                                if emit_binary(compound, current, operand, ctx, builder) is combined:
+                                    _ = LLVMBuildStore(builder, combined, compound_slot)
+                                    return EmitStatus.Open
+                    return EmitStatus.Declined
                 EmitStatus.Declined return if assign_operator != TokenKind.LArrow
                 if assign_target is Expr.Ident(target_name, target_line):
                     slot_opt: LLVMValueRef? = lookup_slot(local_scope, target_name)

@@ -110,6 +110,17 @@ run_case while_true_break 'def main() -> i64:\n    i: mutable i64 = 0\n    while
 run_case bitwise          'def main() -> i64:\n    a: i64 = 12\n    b: i64 = 10\n    return (a & b) + (a | b) + (a ^ b) + (a << 1) + (a >> 2)\n'  55
 run_case bool_local       'def main() -> i64:\n    flag: bool = true\n    if flag:\n        return 42\n    return 0\n'  42
 
+# Logical operators, compound assignment, value-if.
+run_case and_or_not       'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'  7
+run_case compound_assign  'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'  39
+run_case compound_bitwise 'def main() -> i64:\n    x: mutable i64 = 12\n    x &= 10\n    x |= 5\n    x ^= 1\n    x <<= 2\n    return x\n'  48
+run_case value_if         'def main() -> i64:\n    a: i64 = 5\n    return 42 if a > 1 else 7\n'  42
+# SHORT-CIRCUIT proof: the right-hand side divides by zero. If `and`/`or` evaluated it
+# eagerly the process would die on SIGFPE (136) instead of returning 42, so these two
+# cases cannot pass unless the short-circuit is real.
+run_case short_circuit_and 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'  42
+run_case short_circuit_or  'def main() -> i64:\n    a: i64 = 0\n    return 42 if a == 0 or (10 / a) > 0 else 1\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -159,6 +170,9 @@ diff_case bitwise     'def main() -> i64:\n    a: i64 = 12\n    b: i64 = 10\n   
 # positive number, so this pins the signedness choice against the reference compiler.
 diff_case ashr_negative 'def main() -> i64:\n    a: i64 = -8\n    return (a >> 1) + 100\n'
 diff_case bitnot      'def main() -> i64:\n    a: i64 = 5\n    return ~a + 200\n'
+diff_case and_or_not  'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'
+diff_case compound    'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'
+diff_case short_circuit 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'
 
 # An UNSUPPORTED input must be DECLINED, never silently mis-emitted.
 decline_case() {
