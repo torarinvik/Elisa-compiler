@@ -741,6 +741,9 @@ diff_case struct_nested_two_fields 'struct P:\n    x: i64\n    y: i64\nstruct Li
 diff_case nested_field_write 'struct Inner:\n    v: mutable i64\nstruct Outer:\n    i: mutable Inner\n\ndef main() -> i64:\n    o: mutable Outer = Outer{i: Inner{v: 0}}\n    o.i.v <- 42\n    return o.i.v\n'
 diff_case array_of_struct_read 'struct P:\n    x: i64\n\ndef main() -> i64:\n    a: P[2] = [P{x: 40}, P{x: 2}]\n    return a[0].x + a[1].x\n'
 diff_case array_of_struct_write 'struct P:\n    x: mutable i64\n\ndef main() -> i64:\n    a: mutable P[2] = [P{x: 0}, P{x: 0}]\n    a[0].x <- 40\n    a[1].x <- 2\n    return a[0].x + a[1].x\n'
+# A field of a struct-valued RECEIVER with no address -- a call result (`mk().x`) or any
+# temporary. Emit the receiver as a value, spill to a temp, then GEP the field.
+diff_case call_result_field 'struct P:\n    x: i64\n    y: i64\n\ndef mk() -> P:\n    return P{x: 40, y: 2}\n\ndef main() -> i64:\n    return mk().x + mk().y\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
