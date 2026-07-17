@@ -1,0 +1,141 @@
+# Flow-sensitive single-use validation for affine values. The parser retains `move`
+# as a transparent unary node so this pass can distinguish ownership transfer from use.
+extend Semantic:
+    private:
+        def affine_type_expression(expression: Ast::Expr, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                true return if struct_is_affine(table, bare_type_name_through_ref(expression))
+                match expression:
+                    Expr.Index(head, argument, line):
+                        return affine_type_expression(argument, table)
+                    Expr.IndexN(head, arguments, line):
+                        return any argument in arguments where affine_type_expression(argument, table)
+                    Expr.Unary(operator, operand, line):
+                        return affine_type_expression(operand, table)
+                    Expr.Paren(inner, line):
+                        return affine_type_expression(inner, table)
+                    _:
+                        return false
+
+
+        def affine_root(expression: Ast::Expr) -> sview:
+            match expression:
+                Expr.Ident(name, line):
+                    return name
+                Expr.Field(object, field, line):
+                    return affine_root(object)
+                Expr.Index(object, index, line):
+                    return affine_root(object)
+                Expr.IndexN(object, arguments, line):
+                    return affine_root(object)
+                Expr.Paren(inner, line):
+                    return affine_root(inner)
+                _:
+                    return ""
+
+
+        def affine_local(names: darray[sview]&, flags: darray[bool]&, name: sview) -> bool:
+            can Abort.Panic:
+                while index > 0 |index: usize = names.count|:
+                    index <- index - 1
+                    flags[index] return if names[index] == name
+                return false
+
+
+        def affine_consumed(consumed: darray[sview]&, name: sview) -> bool:
+            return any item in consumed where item == name
+
+
+        def report_affine_consumed(root: sview, line: u32, consumed: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate:
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineUseAfterConsume, name: root, line: line, expected: "", actual: ""}) if root != "" and affine_consumed(consumed, root)
+
+
+        def walk_affine_expression(expression: Ast::Expr, names: darray[sview]&, flags: darray[bool]&, consumed: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Unary(operator, operand, line):
+                        table <- walk_affine_expression(operand, names, flags, consumed, table)
+                    Expr.Move(operand, line):
+                        root: sview = affine_root(operand)
+                        table <- report_affine_consumed(root, line, consumed, table)
+                        consumed.push(root) if root != "" and affine_local(names, flags, root) and not affine_consumed(consumed, root)
+                    Expr.Ident(name, line):
+                        table <- report_affine_consumed(name, line, consumed, table)
+                    Expr.Field(object, field, line):
+                        table <- report_affine_consumed(affine_root(object), line, consumed, table)
+                    Expr.Index(object, index, line):
+                        table <- report_affine_consumed(affine_root(object), line, consumed, table)
+                        table <- walk_affine_expression(index, names, flags, consumed, table)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        table <- walk_affine_expression(callee, names, flags, consumed, table)
+                        for argument in arguments |table, consumed| -> table:
+                            table <- walk_affine_expression(argument, names, flags, consumed, table)
+                    Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
+                        for field in fields |table, consumed| -> table:
+                            table <- walk_affine_expression(field.value, names, flags, consumed, table)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |table, consumed| -> table:
+                            table <- walk_affine_expression(element, names, flags, consumed, table)
+                    Expr.Binary(left, operator, right, line):
+                        table <- walk_affine_expression(left, names, flags, consumed, table)
+                        table <- walk_affine_expression(right, names, flags, consumed, table) if operator != TokenKind.Is and operator != TokenKind.As
+                    Expr.Paren(inner, line):
+                        table <- walk_affine_expression(inner, names, flags, consumed, table)
+                    _:
+                        pass
+
+
+        def walk_affine_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, flags, consumed, table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- walk_affine_expression(value, names, flags, consumed, table)
+                            names.push(name)
+                            flags.push(affine_type_expression(type_expression, table))
+                        Stmt.Assign(target, operator, value, line):
+                            table <- walk_affine_expression(value, names, flags, consumed, table)
+                        Stmt.Expr(expression, line):
+                            table <- walk_affine_expression(expression, names, flags, consumed, table)
+                        Stmt.Return(value, line):
+                            table <- walk_affine_expression(returned, names, flags, consumed, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- walk_affine_expression(condition, names, flags, consumed, table)
+                            then_consumed: mutable darray[sview] = []
+                            else_consumed: mutable darray[sview] = []
+                            then_consumed.extend(consumed)
+                            else_consumed.extend(consumed)
+                            table <- walk_affine_statements(then_body, names, flags, then_consumed, table)
+                            table <- walk_affine_statements(else_body, names, flags, else_consumed, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- walk_affine_statements(body, names, flags, consumed, table)
+                        Stmt.While(condition, body, line):
+                            table <- walk_affine_expression(condition, names, flags, consumed, table)
+                        _:
+                            pass
+
+
+        def check_affine_uses(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            names: mutable darray[sview] = []
+                            flags: mutable darray[bool] = []
+                            consumed: mutable darray[sview] = []
+                            for param in params |names, flags|:
+                                names.push(param.name)
+                                flags.push(affine_type_expression(param.type_expression, table))
+                            table <- walk_affine_statements(body, names, flags, consumed, table)
+                        Decl.Module(name, body, line):
+                            table <- check_affine_uses(body, table)
+                        Decl.Scoped(body, line):
+                            table <- check_affine_uses(body, table)
+                        _:
+                            pass
+
+    public:
+        def check_affine_use_flow(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_affine_uses(declarations, table)
