@@ -800,3 +800,27 @@ representation at all: `can[...]` and no annotation emit byte-identical IR) and 
 half of -Wperf. The pattern is worth stating: a feature living in `semantic/` rather than
 `backend/` is a strong signal there is nothing here to port -- check which directory the
 reference implements it in BEFORE estimating it.
+
+## dict/set — genuinely blocked, chain traced end to end
+
+Re-verified rather than assumed, because two other "blocked" items turned out not to be
+(externs came back fixed; the store's typestate needed no port at all).
+
+1. dict is NOT runtime-call based. Unlike the packed store (ctx_packed_store_*) and darray
+   (arena_alloc/realloc/free), there are ZERO dict symbols in elisacore_runtime.o. It is
+   pure Elisa std code compiled INTO the program -- which is why a three-line dict program
+   emits ~102 functions.
+2. So supporting dict means COMPILING `elisacore_std/collections.elisa`.
+3. collections.elisa's dict operations are declared `error[RuntimeError]` (8 signatures:
+   arena_dict_put, arena_dict_reserve, arena_dict_get_or_insert, ...), and the file uses
+   `catch` 6 times and `try` 12 times.
+4. `catch EXPR:` cannot be represented: `Ast::Stmt.Block(kind, clause, binding, body, line)`
+   has NO Expr field, so the caught expression is discarded by the parser (task_c19cb583).
+
+So the chain is dict -> collections.elisa -> error unions -> catch's missing subject. It is a
+FRONTEND fix, not backend work, and until it lands there is nothing here to port.
+
+Note `arena_dict_get_mut` (collections.elisa:944) returns `mutable T&?` with NO error union,
+so a read-only dict subset looks tempting -- but emit_module declines a module if ANY
+declaration declines, and the allocating half of the file cannot compile. A partial
+collections.elisa is not a thing.
