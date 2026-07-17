@@ -36,4 +36,11 @@ echo "$out" | grep -Fq 'is not generic' && fail "generic specialization rejected
 out=$(printf 'def item(value: int) -> int:\n    return value\ndef run(item: darray[int]&) -> int:\n    return item[0]\n' | "$RPT")
 echo "$out" | grep -Fq 'is not generic' && fail "shadowed local index treated as specialization: $out"
 
+# 7. Explicit generic type arguments must satisfy retained interface bounds.
+bounded_prefix='struct BuilderTag:\n    tag: int\n\nprotocol Builder:\n    type State\n    def state() -> State\n\nimpl Builder for BuilderTag:\n    type State = int\n\n    def state() -> int:\n        return 1\n\ndef build[B: Builder]() -> B.State:\n    return B.state()\n'
+out=$(printf "${bounded_prefix}\ndef bad() -> int:\n    return build[sview]()\n" | "$RPT")
+echo "$out" | grep -Fq 'type "sview" does not satisfy required interface fact "Builder" for type argument' || fail "unsatisfied interface bound accepted: $out"
+out=$(printf "${bounded_prefix}\ndef ok() -> int:\n    return build[BuilderTag]()\n" | "$RPT")
+echo "$out" | grep -Fq 'does not satisfy required interface fact' && fail "recorded interface implementation rejected: $out"
+
 echo "cast-typearg smoke OK: .cast/.ref/.specialize type args skipped, real undefined names + ordinary indexing still resolved"
