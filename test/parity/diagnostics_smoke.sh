@@ -62,6 +62,7 @@ NAMES=(
     const_enum_value
     raise_without_error_set
     region_annotation_scalar
+    region_param_inference_failure
     duplicate_bit_group_member
     named_states_without_derive
     flow_flag_state_machine
@@ -199,6 +200,7 @@ EXPECTS=(
     "value does not fit storage type u8"
     "raise requires the current function to return an error union"
     "the scalar type i32 cannot carry a region"
+    "cannot be returned with a region-less type"
     "duplicate packed group member 'b' in H.flags"
     "declares named states but is missing a derive state: block"
     "written in multiple branches and read after the join"
