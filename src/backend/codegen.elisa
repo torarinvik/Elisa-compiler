@@ -1818,6 +1818,94 @@ module Backend:
         # they only abort on a capacity that cannot occur in a modeled program, so their
         # absence is unobservable in the differential — but it does mean this lowering is
         # not a bit-for-bit clone, only a behavioural one.
+        # `[BODY for VAR in LOW..<HIGH]` — a list comprehension, lowered PRESIZE-AND-FILL the
+        # way stage0 does: compute the count, allocate the backing once, set count/capacity
+        # up front, then write each element BY INDEX.
+        #
+        # Not a push loop. A push loop is behaviourally identical and would pass every
+        # differential here, but it reallocates as it grows and defeats the vectorizer — and
+        # vectorization is the whole point of the construct (`-Wperf`'s autovec verifier tags
+        # exactly these loops and reports the ones that failed). Emitting the slow shape for
+        # a construct that exists to be fast would be a divergence the exit code cannot see.
+        #
+        # A FILTER (`if COND`) declines: it makes the output count unknown up front, so the
+        # presized form does not apply and stage0 itself says only the filter-free form
+        # auto-vectorizes.
+        def emit_comprehension(comprehension_var: sview, iterable: Expr, condition: Expr, body: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if expected.kind != TypeKind.DArray
+            # A quantifier (`any`/`all`) has no body; only the collection form is modeled.
+            null return if body is Expr.Absent
+            null return if not (condition is Expr.Absent)
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            element_type: ValueType = darray_element_of(expected, structs)
+            null return if element_type.kind == TypeKind.Unmodeled
+
+            # Only an integer RANGE iterable is modeled: its length is known before the loop,
+            # which is what makes the presize possible at all.
+            if iterable is Expr.Binary(range_low, range_operator, range_high, range_line):
+                null return if range_operator != TokenKind.RangeLt and range_operator != TokenKind.RangeLe
+                inclusive: bool = range_operator == TokenKind.RangeLe
+                index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                if emit_expression(range_low, index_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is low_value:
+                    if emit_expression(range_high, index_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is high_value:
+                        span: LLVMValueRef = LLVMBuildSub(builder, high_value, low_value, "comp.span")
+                        count: mutable LLVMValueRef = span
+                        count <- LLVMBuildAdd(builder, span, LLVMConstInt(int64_type, 1, 0), "comp.count") if inclusive
+                        # An empty or reversed range yields an empty darray, not a negative
+                        # allocation.
+                        positive: LLVMValueRef = LLVMBuildICmp(builder, 38, count, LLVMConstInt(int64_type, 0, 0), "comp.count.pos")
+                        count <- LLVMBuildSelect(builder, positive, count, LLVMConstInt(int64_type, 0, 0), "comp.count.clamped")
+
+                        header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                        result_slot: LLVMValueRef = LLVMBuildAlloca(builder, header, "list.comp.result")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(header), result_slot)
+                        stride: LLVMValueRef = LLVMConstInt(int64_type, scalar_byte_size(element_type), 0)
+                        bytes: LLVMValueRef = LLVMBuildMul(builder, count, stride, "comp.bytes")
+                        alloc_args: mutable darray[LLVMValueRef] = [runtime.arena, bytes]
+                        alloc_pointer: void& = (&alloc_args[0]).cast[void&] can Unsafe.PointerCast
+                        items: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "comp.alloc")
+                        items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, result_slot, 0, "comp.items.ptr")
+                        count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, result_slot, 1, "comp.count.ptr")
+                        capacity_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, result_slot, 2, "comp.cap.ptr")
+                        _ = LLVMBuildStore(builder, items, items_pointer)
+                        # count is set UP FRONT — the loop fills a sized array rather than
+                        # growing one.
+                        _ = LLVMBuildStore(builder, count, count_pointer)
+                        _ = LLVMBuildStore(builder, count, capacity_pointer)
+
+                        function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, "comp.i")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), index_slot)
+                        var_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(index_type, structs, ctx), "comp.var")
+                        declare_local(local_scope, comprehension_var, var_slot, index_type)
+
+                        condition_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.cond")
+                        body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.body")
+                        done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.done")
+                        _ = LLVMBuildBr(builder, condition_block)
+                        LLVMPositionBuilderAtEnd(builder, condition_block)
+                        current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, index_slot, "comp.i.cur")
+                        more: LLVMValueRef = LLVMBuildICmp(builder, 40, current, count, "comp.more")
+                        _ = LLVMBuildCondBr(builder, more, body_block, done_block)
+
+                        LLVMPositionBuilderAtEnd(builder, body_block)
+                        _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, low_value, current, "comp.var.value"), var_slot)
+                        if emit_expression(body, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_value:
+                            loaded_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "comp.items")
+                            # A darray indexes with a ONE-index GEP: `items` is already a T*.
+                            comp_indices: mutable darray[LLVMValueRef] = [current]
+                            comp_indices_pointer: void& = (&comp_indices[0]).cast[void&] can Unsafe.PointerCast
+                            slot_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), loaded_items, comp_indices_pointer, 1, "comp.slot")
+                            _ = LLVMBuildStore(builder, element_value, slot_pointer)
+                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, current, LLVMConstInt(int64_type, 1, 0), "comp.i.next"), index_slot)
+                            _ = LLVMBuildBr(builder, condition_block)
+                            LLVMPositionBuilderAtEnd(builder, done_block)
+                            return LLVMBuildLoad2(builder, header, result_slot, "list.comp.value")
+                        LLVMPositionBuilderAtEnd(builder, done_block)
+                        return null
+            return null
+
+
         def emit_darray_push(array_slot: LLVMValueRef, array_type: ValueType, value_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             element_type: ValueType = darray_element_of(array_type, structs)
             false return if element_type.kind == TypeKind.Unmodeled
@@ -1988,6 +2076,8 @@ module Backend:
             # `null` is an IDENT named "null" in the AST, not its own node. It is the
             # empty optional: `{false, undef}` — the payload half is never read when the
             # tag is false, so a zeroed struct is the whole value.
+            if expression is Expr.Comprehension(comp_var, comp_iterable, comp_condition, comp_body, comp_line):
+                return emit_comprehension(comp_var, comp_iterable, comp_condition, comp_body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             if expression is Expr.StringLit(string_text):
                 null return if expected.kind != TypeKind.CStr and expected.kind != TypeKind.Unmodeled
                 literal_storage: mutable darray[u8] = []

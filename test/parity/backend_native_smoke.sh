@@ -605,6 +605,24 @@ diff_case packed_store_two_rows 'packed enum Node:\n    Leaf(v: i64)\n\ndef buil
 diff_case effect_annotated 'def risky(n: i64) -> i64 can[Abort.Panic]:\n    return n * 2\n\ndef main() -> i64:\n    return risky(21)\n'
 diff_case effect_multi 'def f(n: i64) -> i64 can[Abort.Panic, Memory.Allocate]:\n    return n + 1\n\ndef main() -> i64:\n    return f(41)\n'
 diff_case effect_alias 'alias MyFx = Abort.Panic\n\ndef f(n: i64) -> i64 can[MyFx]:\n    return n + 1\n\ndef main() -> i64:\n    return f(41)\n'
+# LIST COMPREHENSIONS, lowered PRESIZE-AND-FILL the way stage0 does: compute the count,
+# allocate the backing once, set count/capacity UP FRONT, then write each element by index.
+#
+# Deliberately NOT a push loop. A push loop is behaviourally identical and would pass every
+# fixture here, but it reallocates as it grows and defeats the vectorizer -- and vectorization
+# is the whole point of the construct (`-Wperf`'s autovec verifier tags exactly these loops
+# and reports the ones that failed). Emitting the slow shape for a construct that exists to be
+# fast is a divergence no exit code can see, which is why the shape is chosen deliberately
+# rather than by whatever passes.
+diff_case comprehension_range 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n'
+diff_case comprehension_expr 'def main() -> i64:\n    xs: darray[i64] = [i * 2 for i in 0..<10]\n    return (xs[3] can Unsafe.UncheckedIndex) + 36\n'
+# Every element, not just the first: pins that the fill loop covers the whole range and that
+# `count` is the element count rather than the capacity.
+diff_case comprehension_sum 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    total: mutable i64 = 0\n    for j in 0..<xs.count:\n        total <- total + (xs[j] can Unsafe.UncheckedIndex)\n    return total - 3\n'
+diff_case comprehension_inclusive 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..=9]\n    return xs.count.i64() + 32\n'
+# An EMPTY range must yield an empty darray, not a negative allocation.
+diff_case comprehension_empty 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<0]\n    return xs.count.i64() + 42\n'
+diff_case comprehension_u8 'def main() -> i64:\n    xs: darray[u8] = [200 for i in 0..<3]\n    return (xs[2] can Unsafe.UncheckedIndex).i64() - 158\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -668,6 +686,9 @@ decline_case extern_variadic 'extern printf(fmt: cstr, ...) -> i32\n\ndef main()
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
 decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(bogus: 42)\n    return match s:\n        Shape.Circle(r): r\n'
+# A FILTERED comprehension declines: the output count is not known up front, so the presized
+# form does not apply -- and stage0 itself says only the filter-free form auto-vectorizes.
+decline_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
