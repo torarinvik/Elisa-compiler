@@ -249,6 +249,25 @@ run_case generic_nested_3  'def a3[T](x: T) -> T:\n    return a2(x)\n\ndef a2[T]
 # Nested AND two type arguments: wrap__u8 -> identity__u8, wrap__i64 -> identity__i64.
 run_case generic_nested_2t 'def wrap[T](x: T) -> T:\n    return identity(x)\n\ndef identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    a: u8 = 200\n    b: i64 = 2\n    return wrap(a).i64() - wrap(b) - 156\n'  42
 
+# REFERENCES (`T&` / `mutable T&`), field assignment, and `void`.
+#
+# A reference is just a `ptr` — stage0 lowers `def bump(n: mutable i64&)` to
+# `define void @bump(ptr)` and `bump(x)` to `call void @bump(ptr %x)`. That fits: locals are
+# already allocas, so passing `&local` IS passing the slot, and no `&` operator is needed at
+# the call site — the expected type drives it. Mutability stays a frontend concern.
+# In the AST `T&` is a POSTFIX Expr.Unary(Ampersand, T) (the parser tells it from infix
+# bitwise-and by looking past the whole `&` run).
+run_case ref_read         'struct P:\n    x: i64\n    y: i64\n\ndef total(p: P&) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: P = P{x: 40, y: 2}\n    return total(p)\n'  42
+# Mutation THROUGH a reference must be visible in the caller — a by-value copy returns 41.
+run_case ref_mutate       'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'  42
+# Accumulate through a ref across a loop: 0+1+..+8 == 36, +6 == 42.
+run_case ref_accumulate   'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'  42
+run_case field_assign     'struct P:\n    x: mutable i64\n    y: i64\n\ndef main() -> i64:\n    p: mutable P = P{x: 1, y: 2}\n    p.x <- 40\n    return p.x + p.y\n'  42
+# `void`: a bare `return`, a void call in statement position (its result must be UNNAMED —
+# LLVM rejects a named void instruction), and a void body running off the end.
+run_case void_call        'def noop() -> void:\n    return\n\ndef main() -> i64:\n    noop()\n    return 42\n'  42
+run_case void_fallthrough 'struct C:\n    v: mutable i64\n\ndef setit(c: mutable C&) -> void:\n    c.v <- 42\n\ndef main() -> i64:\n    c: mutable C = C{v: 0}\n    setit(c)\n    return c.v\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -317,6 +336,8 @@ diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n   
 diff_case array_literal 'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'
 diff_case array_u8      'def main() -> i64:\n    xs: u8[3] = [200, 100, 50]\n    return xs[0].i64() - xs[1].i64() - xs[2].i64() - 8\n'
 diff_case array_rw      'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0, 0, 0]\n    for i in 0..<5:\n        xs[i] <- i * 2\n    total: mutable i64 = 0\n    for j in 0..<5:\n        total <- total + xs[j]\n    return total + 22\n'
+diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
+diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
 diff_case struct_large 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n    e: i64\n\ndef sum(g: Big) -> i64:\n    return g.a + g.b + g.c + g.d + g.e\n\ndef main() -> i64:\n    g: Big = Big{a: 10, b: 10, c: 10, d: 10, e: 2}\n    return sum(g)\n'
 diff_case struct_mixed_abi 'struct M:\n    a: u8\n    b: f64\n\ndef total(m: M) -> i64:\n    return m.a.i64() + m.b.i64()\n\ndef main() -> i64:\n    return total(M{a: 40, b: 2.5})\n'

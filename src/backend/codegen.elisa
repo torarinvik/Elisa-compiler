@@ -47,6 +47,10 @@ module Backend:
             Unsigned
             Bool
             Float
+            # `void` — legal ONLY as a return type. It has no values, so nothing can be a
+            # `void` local, parameter, or operand; every other position rejects it because
+            # `unmodeled_type()` is what those paths test for and Void is not that.
+            Void
             # A user struct. `bits` is its index in the StructTable — a ValueType must stay
             # POD (an sview name would be fine, but an index also gives O(1) field lookup).
             Struct
@@ -54,6 +58,12 @@ module Backend:
             # (`array_elements` / `array_extents`) — same reason as Struct: ValueType is
             # POD, so a nested element type cannot live inline.
             Array
+            # A reference `T&` / `mutable T&`. `bits` indexes the REF side-pool
+            # (`ref_targets`). In LLVM it is just a `ptr` — stage0 lowers
+            # `def bump(n: mutable i64&)` to `define void @bump(ptr)` and `bump(x)` to
+            # `call void @bump(ptr %x)`. Mutability is a FRONTEND concern (it already
+            # rejects writes through a `T&`), so the backend models only the referent.
+            Ref
             # A `darray[T]`. `bits` indexes the DARRAY side-pool (`darray_elements`).
             # Represented exactly as stage0 does — `{ptr items, i64 count, i64 capacity}`,
             # backed by an Arena — because both link the SAME runtime, so the layout is
@@ -96,6 +106,7 @@ module Backend:
             ValueType{kind: TypeKind.Bool, bits: 1} return if name == "bool"
             ValueType{kind: TypeKind.Float, bits: 32} return if name == "f32"
             ValueType{kind: TypeKind.Float, bits: 64} return if name == "f64"
+            ValueType{kind: TypeKind.Void, bits: 0} return if name == "void"
             return unmodeled_type()
 
 
@@ -134,7 +145,13 @@ module Backend:
         # backend only needs the underlying type.
         def annotation_value_type(type_expression: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             if type_expression is Expr.Unary(qualifier, qualified_type, qualifier_line):
-                return annotation_value_type(qualified_type, structs) if qualifier == TokenKind.Mutable else unmodeled_type()
+                # `mutable T` — a QUALIFIER, not part of the type: mutability is the
+                # frontend's business, so the underlying type is what matters.
+                annotation_value_type(qualified_type, structs) return if qualifier == TokenKind.Mutable
+                # `T&` — a POSTFIX unary in the AST (the parser distinguishes it from infix
+                # bitwise-and by looking past the whole `&` run).
+                intern_ref_type(annotation_value_type(qualified_type, structs), structs) return if qualifier == TokenKind.Ampersand
+                return unmodeled_type()
             # `i64[3]` — a fixed array. The bracket holds an extent VALUE and the HEAD is
             # the element type. A NON-literal bracket (`cstr[shape]`) is a shape parameter,
             # not an array, and is not modeled.
@@ -170,11 +187,14 @@ module Backend:
 
         # The LLVM type backing a ValueType.
         def llvm_type_of(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
+            LLVMVoidTypeInContext(ctx) return if value_type.kind == TypeKind.Void
             LLVMInt1TypeInContext(ctx) return if value_type.kind == TypeKind.Bool
             structs.handles[value_type.bits.usize()] return if value_type.kind == TypeKind.Struct
             if value_type.kind == TypeKind.Array:
                 slot: usize = value_type.bits.usize()
                 return LLVMArrayType(llvm_type_of(structs.array_elements[slot], structs, ctx), structs.array_extents[slot])
+            # A reference is just a pointer; the referent matters only at the load/store.
+            LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.Ref
             # `{ptr items, i64 count, i64 capacity}` — stage0's DynArray layout, which the
             # shared runtime dictates.
             if value_type.kind == TypeKind.DArray:
@@ -207,6 +227,8 @@ module Backend:
             array_extents: mutable darray[u32]
             # `darray[T]` element types, interned the same way.
             darray_elements: mutable darray[ValueType]
+            # `T&` referent types, interned the same way.
+            ref_targets: mutable darray[ValueType]
             # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
             # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
             #
@@ -270,6 +292,23 @@ module Backend:
                     return ValueType{kind: TypeKind.DArray, bits: index.u32()}
             structs.darray_elements <- structs.darray_elements.push(element)
             return ValueType{kind: TypeKind.DArray, bits: (structs.darray_elements.count - 1).u32()}
+
+
+        # Intern a reference type `T&`.
+        def intern_ref_type(target: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if target.kind == TypeKind.Unmodeled
+            for index in 0..<structs.ref_targets.count |structs, target|:
+                existing: ValueType = structs.ref_targets[index]
+                if existing.kind == target.kind and existing.bits == target.bits:
+                    return ValueType{kind: TypeKind.Ref, bits: index.u32()}
+            structs.ref_targets <- structs.ref_targets.push(target)
+            return ValueType{kind: TypeKind.Ref, bits: (structs.ref_targets.count - 1).u32()}
+
+
+        # The referent type of a `T&`.
+        def ref_target_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.Ref
+            return copied_type(structs.ref_targets[value_type.bits.usize()])
 
 
         # The element type of a `darray[T]`.
@@ -565,7 +604,11 @@ module Backend:
             # `p.x` — a field READ has the field's declared type. (A cast `x.u8()` is a
             # Field under a Call, handled below, so a bare Field is always a field read.)
             if expression is Expr.Field(field_object, field_name, field_line):
-                object_type: ValueType = expression_type(field_object, local_scope, fns, structs, generics)
+                object_type: mutable ValueType = expression_type(field_object, local_scope, fns, structs, generics)
+                # AUTO-DEREF: `p.x` where `p: P&` reads P's field. A reference is
+                # transparent for member access — the frontend has already decided the
+                # access is legal, so the backend just looks through it.
+                object_type <- ref_target_of(object_type, structs) if object_type.kind == TypeKind.Ref
                 # `xs.count` is a usize-shaped i64.
                 ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "count"
                 unmodeled_type() return if object_type.kind != TypeKind.Struct
@@ -899,6 +942,12 @@ module Backend:
             return unmodeled_type()
 
 
+        # The IR name for a call's result. A VOID call must be UNNAMED — LLVM rejects
+        # "instructions returning void cannot have a name".
+        def call_result_name(return_type: ValueType) -> cstr:
+            return "" if return_type.kind == TypeKind.Void else "call"
+
+
         # Emit a call to a generic function, instantiating on first use.
         def emit_generic_call(base: sview, type_argument: ValueType, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if instantiate_generic(base, type_argument, generics, structs, m, ctx) is target:
@@ -917,9 +966,11 @@ module Backend:
                     argument_index <- argument_index + 1
                 null return if declined
                 fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
-                LLVMBuildCall2(builder, fn_type, target, null, 0, "gcall") return if arguments.count == 0
+                # A VOID call must be unnamed: "instructions returning void cannot have a name".
+                gresult_name: cstr = call_result_name(generic_return_type(base, type_argument, generics, structs))
+                LLVMBuildCall2(builder, fn_type, target, null, 0, gresult_name) return if arguments.count == 0
                 args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
-                return LLVMBuildCall2(builder, fn_type, target, args_pointer, arguments.count.u32(), "gcall")
+                return LLVMBuildCall2(builder, fn_type, target, args_pointer, arguments.count.u32(), gresult_name)
             return null
 
 
@@ -969,9 +1020,11 @@ module Backend:
                     # type: LLVM pointers are opaque, so the type cannot be recovered from
                     # the value itself.
                     fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
-                    LLVMBuildCall2(builder, fn_type, target, null, 0, "call") return if arguments.count == 0
+                    # A VOID call must be unnamed: "instructions returning void cannot have a name".
+                    result_name: cstr = call_result_name(lookup_return_type(fns, callee_name))
+                    LLVMBuildCall2(builder, fn_type, target, null, 0, result_name) return if arguments.count == 0
                     args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
-                    return LLVMBuildCall2(builder, fn_type, target, args_pointer, arguments.count.u32(), "call")
+                    return LLVMBuildCall2(builder, fn_type, target, args_pointer, arguments.count.u32(), result_name)
             return null
 
 
@@ -1163,6 +1216,29 @@ module Backend:
             return false
 
 
+        # The ADDRESS of a struct-typed local, and the struct's type.
+        #
+        # For a plain local that is its alloca. For a `P&` parameter the alloca holds a
+        # POINTER, so the address is that pointer LOADED — one indirection more. Everything
+        # downstream (field GEP, field store) is then identical, which is why field access
+        # needs no ref-specific path of its own.
+        def struct_address_of(name: sview, local_scope: mutable Scope&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            declared: ValueType = lookup_type(local_scope, name)
+            if lookup_slot(local_scope, name) is slot:
+                slot return if declared.kind == TypeKind.Struct
+                if declared.kind == TypeKind.Ref:
+                    null return if ref_target_of(declared, structs).kind != TypeKind.Struct
+                    return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), slot, "ref.deref")
+            return null
+
+
+        # The struct type behind a name, looking through one reference.
+        def struct_type_of_name(name: sview, local_scope: mutable Scope&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            declared: ValueType = lookup_type(local_scope, name)
+            declared return if declared.kind == TypeKind.Struct
+            return ref_target_of(declared, structs)
+
+
         # Emit a value expression, producing a value of `resolve_type(expression, expected)`.
         # `null` = unmodeled; the caller must decline.
         def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
@@ -1185,6 +1261,13 @@ module Backend:
                 ident_type: ValueType = lookup_type(local_scope, ident_name)
                 null return if ident_type.kind == TypeKind.Unmodeled
                 if lookup_slot(local_scope, ident_name) is slot:
+                    # A local passed where a REFERENCE is wanted: hand over its ADDRESS.
+                    # Locals are already allocas, so `&local` IS the slot — exactly what
+                    # stage0 emits (`call void @bump(ptr %x)`). No `&` operator is needed
+                    # at the call site; the expected type drives it.
+                    if expected.kind == TypeKind.Ref and ident_type.kind != TypeKind.Ref:
+                        null return if ref_target_of(expected, structs).kind != ident_type.kind
+                        return slot
                     return LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "load")
                 return null
             if expression is Expr.Paren(paren_inner, paren_line):
@@ -1414,15 +1497,16 @@ module Backend:
             # comes from the local's slot, so there is no need to spill a temporary.
             if expression is Expr.Field(field_object, field_name, field_line):
                 if field_object is Expr.Ident(object_name, object_line):
-                    object_type: ValueType = lookup_type(local_scope, object_name)
+                    # Looks through a reference: `p.x` works the same for `p: P` and `p: P&`.
+                    object_type: ValueType = struct_type_of_name(object_name, local_scope, structs)
                     null return if object_type.kind != TypeKind.Struct
                     struct_slot: usize = object_type.bits.usize()
                     position: i64 = field_index_of(structs, struct_slot, field_name)
                     null return if position < 0
-                    if lookup_slot(local_scope, object_name) is object_slot:
+                    if struct_address_of(object_name, local_scope, structs, ctx, builder) is object_address:
                         field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
                         struct_llvm: LLVMTypeRef = llvm_type_of(object_type, structs, ctx)
-                        pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, struct_llvm, object_slot, position.u32(), "field.ptr")
+                        pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, struct_llvm, object_address, position.u32(), "field.ptr")
                         return LLVMBuildLoad2(builder, llvm_type_of(field_type, structs, ctx), pointer, "field")
                 return null
 
@@ -1494,6 +1578,12 @@ module Backend:
                                 if lookup_slot(local_scope, push_name) is push_slot:
                                     if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, generics, runtime, m, ctx, builder):
                                         return EmitStatus.Open
+                                return EmitStatus.Declined
+                    # Any other call in STATEMENT position — typically a `-> void` call like
+                    # `bump(c)`. The result (if any) is simply discarded; `expected` is Void
+                    # because a statement wants no value.
+                    if emit_call(push_callee, push_arguments, local_scope, fns, structs, generics, m, ctx, builder) is discarded_result:
+                        return EmitStatus.Open
                 return EmitStatus.Declined
 
             if statement is Stmt.Return(return_value_opt, return_line):
@@ -1505,7 +1595,12 @@ module Backend:
                         emit_region_free(runtime, builder)
                         _ = LLVMBuildRet(builder, return_constant)
                         return EmitStatus.Terminated
-                # A bare `return` in an `-> i64` function is not modeled.
+                    return EmitStatus.Declined
+                # A bare `return` — only valid in a `-> void` function.
+                if return_type.kind == TypeKind.Void:
+                    emit_region_free(runtime, builder)
+                    _ = LLVMBuildRetVoid(builder)
+                    return EmitStatus.Terminated
                 return EmitStatus.Declined
 
             # `x: i64 = value` — a fresh slot plus the initializing store. The slot is
@@ -1545,6 +1640,25 @@ module Backend:
                                     _ = LLVMBuildStore(builder, combined, compound_slot)
                                     return EmitStatus.Open
                     return EmitStatus.Declined
+                # `p.x <- v` — a field assignment: address, then store. Goes through
+                # struct_address_of, so it works identically for a local struct and for a
+                # `mutable P&` parameter (the ref just adds one load).
+                if assign_target is Expr.Field(assign_object, assign_field, assign_field_line):
+                    EmitStatus.Declined return if assign_operator != TokenKind.LArrow
+                    if assign_object is Expr.Ident(assign_object_name, assign_object_name_line):
+                        assign_struct_type: ValueType = struct_type_of_name(assign_object_name, local_scope, structs)
+                        EmitStatus.Declined return if assign_struct_type.kind != TypeKind.Struct
+                        assign_struct_slot: usize = assign_struct_type.bits.usize()
+                        field_position: i64 = field_index_of(structs, assign_struct_slot, assign_field)
+                        EmitStatus.Declined return if field_position < 0
+                        if struct_address_of(assign_object_name, local_scope, structs, ctx, builder) is assign_address:
+                            assign_field_type: ValueType = structs.field_types[structs.field_start[assign_struct_slot] + field_position.usize()]
+                            field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(assign_struct_type, structs, ctx), assign_address, field_position.u32(), "field.ptr")
+                            if emit_expression(assign_value, assign_field_type, local_scope, fns, structs, generics, m, ctx, builder) is field_value:
+                                _ = LLVMBuildStore(builder, field_value, field_pointer)
+                                return EmitStatus.Open
+                    return EmitStatus.Declined
+
                 # `xs[i] <- v` — an index assignment: address, then store. Only a plain
                 # `<-` to a local array is modeled (a compound `xs[i] += v` would need the
                 # address computed once and reused, which is a separate lowering).
@@ -1914,9 +2028,18 @@ module Backend:
                     declare_local(local_scope, parameter.name, slot, parameter_type)
                     parameter_index <- parameter_index + 1
 
-                # A function that can run off the end is not modeled — rather than invent
-                # a return value, decline. (LLVM would reject the unterminated block.)
-                return emit_statements(body, return_value_type, local_scope, loops, fns, structs, generics, local_runtime, m, ctx, builder) == EmitStatus.Terminated
+                body_status: EmitStatus = emit_statements(body, return_value_type, local_scope, loops, fns, structs, generics, local_runtime, m, ctx, builder)
+                false return if body_status == EmitStatus.Declined
+                # A `-> void` function may legitimately run off the end: close it with
+                # `ret void` (and free the region first, like any other return path). A
+                # value-returning function that falls through is NOT modeled — rather than
+                # invent a return value, decline; LLVM would reject the open block anyway.
+                if body_status == EmitStatus.Open:
+                    false return if return_value_type.kind != TypeKind.Void
+                    emit_region_free(local_runtime, builder)
+                    _ = LLVMBuildRetVoid(builder)
+                    return true
+                return true
             return false
 
         # Emit the body of one queued instantiation, with its type parameter BOUND for the
@@ -1957,7 +2080,7 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], binding_names: [], binding_types: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], binding_names: [], binding_types: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
