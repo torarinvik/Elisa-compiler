@@ -48,6 +48,7 @@ NAMES=(
     match_arm_enum_mismatch
     ungranted_panic
     ungranted_effect_call
+    ungranted_extern_effect_call
     ungranted_inferred_effect_call
     contract_not_first
     contract_ensure_result_void
@@ -182,6 +183,7 @@ EXPECTS=(
     "match arm expects enum 'E', got 'G'"
     "panic performed with no enclosing effect grant"
     "call to 'g' requires an enclosing effect grant"
+    "call to 'emit' requires an enclosing effect grant"
     "call to 'h' requires an enclosing effect grant"
     "must be the first statements of the function body"
     "returns void (no result value to bind)"
