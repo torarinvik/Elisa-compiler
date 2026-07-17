@@ -75,5 +75,33 @@ obj_case darray   'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.
 obj_case comprehension 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[3] can Unsafe.UncheckedIndex) + 39\n' 42
 obj_case struct   'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 40, y: 2}\n    return p.x + p.y\n' 42
 
+# The comprehension actually VECTORIZES. This is the only check in the suite that asserts
+# Elisa's central performance claim rather than its behaviour: a comprehension exists to be
+# vectorized, and `-Wperf` exists to complain when one is not. No exit code can see this --
+# the loop computes the same answer scalar or not.
+#
+# It caught a real bug: with no datalayout on the module, LLVM assumed i64 was 32-bit
+# aligned, emitted `store i64 ... align 4`, and the vectorizer refused every comprehension.
+# All 244 behavioural checks were green throughout.
+vectorize_case() {
+    total=$((total + 1))
+    local dir="$BUILD/obj_vectorize"; rm -rf "$dir"; mkdir -p "$dir"
+    local src='def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<1000]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n'
+    local opt="$(dirname "$LLVM_CONFIG")/opt"
+    [ -x "$opt" ] || { echo "  SKIP obj_vectorize: no opt"; total=$((total - 1)); return; }
+    printf '%b' "$src" | RUN "$BUILD/../build/emit_native" > "$dir/in.ll" 2>/dev/null \
+      || { echo "  SKIP obj_vectorize: emit_native unavailable"; total=$((total - 1)); return; }
+    local optimized
+    optimized="$("$opt" -passes='default<O2>' -S "$dir/in.ll" 2>/dev/null)"
+    # `isvectorized` is what -Wperf itself looks for: LLVM adds it to the loop's metadata
+    # when the vectorizer succeeds, alongside our `elisa.autovec.expected` marker.
+    if echo "$optimized" | grep -q "isvectorized"; then
+        pass=$((pass + 1))
+    else
+        echo "  FAIL obj_vectorize: comprehension did NOT vectorize (no isvectorized marker)"
+    fi
+}
+vectorize_case
+
 if [ "$pass" -ne "$total" ]; then echo "backend_obj_smoke FAILED: passed=$pass total=$total"; exit 1; fi
-echo "backend_obj_smoke OK: $pass/$total objects emitted by stage1 (no llc)"
+echo "backend_obj_smoke OK: $pass/$total (objects emitted by stage1, no llc)"

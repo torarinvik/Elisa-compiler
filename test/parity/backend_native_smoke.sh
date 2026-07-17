@@ -339,14 +339,6 @@ stage1_ir_case() {
     fi
 }
 
-# The `-Wperf` autovec MARKER on a comprehension's latch branch. It rides in the IR so it
-# survives inlining, which is what lets a POST-optimization pass identify a build loop that
-# was lowered to be vectorizable and then was not -- the entire basis of -Wperf.
-stage1_ir_case autovec_marker 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' 'elisa.autovec.expected'
-# The self-reference is asserted SEPARATELY because LLVM requires a loop-ID node's operand 0
-# to be the node itself, and silently IGNORES a node that is not -- the marker would be
-# "present" and useless.
-stage1_ir_case autovec_loop_selfref 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' '^!0 = distinct .\{!0, !1\}'
 # The ABSENCE assertion needs its own helper: `grep -E` has no negative lookahead (that is
 # PCRE), so "must not contain" cannot be spelled as a pattern.
 stage1_ir_absent_case() {
@@ -363,6 +355,23 @@ stage1_ir_absent_case() {
     fi
 }
 
+# The module's TARGET. Without a datalayout LLVM assumes i64 is 32-BIT ALIGNED, so every
+# `store i64` is emitted `align 4` and the loop vectorizer refuses the loop outright. stage0
+# sets both; stage1 set NEITHER, which silently cost alignment and vectorization on ALL
+# emitted code while every one of the 244 behavioural checks stayed green. Nothing in this
+# suite could see it -- stage0's module header is what gave it away.
+stage1_ir_case module_datalayout 'def main() -> i64:\n    return 42\n' '^target datalayout = ".+i64:64'
+stage1_ir_case module_triple 'def main() -> i64:\n    return 42\n' '^target triple = "arm64'
+stage1_ir_absent_case store_not_underaligned 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' 'store i64 %comp.var.value, ptr %comp.var, align 4'
+
+# The `-Wperf` autovec MARKER on a comprehension's latch branch. It rides in the IR so it
+# survives inlining, which is what lets a POST-optimization pass identify a build loop that
+# was lowered to be vectorizable and then was not -- the entire basis of -Wperf.
+stage1_ir_case autovec_marker 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' 'elisa.autovec.expected'
+# The self-reference is asserted SEPARATELY because LLVM requires a loop-ID node's operand 0
+# to be the node itself, and silently IGNORES a node that is not -- the marker would be
+# "present" and useless.
+stage1_ir_case autovec_loop_selfref 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' '^!0 = distinct .\{!0, !1\}'
 # A plain for-loop is NOT a comprehension build loop and must NOT be tagged: a marker there
 # would make -Wperf demand vectorization of a loop the language never promised to vectorize.
 stage1_ir_absent_case autovec_not_plain_loop 'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 0..<10:\n        total <- total + i\n    return total - 3\n' 'elisa.autovec.expected'
