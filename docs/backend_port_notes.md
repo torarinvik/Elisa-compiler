@@ -856,3 +856,26 @@ a `raise` Call-shape; the `try...else` node in emit_expression; and error-fn cal
 This does NOT unblock dict: collections.elisa uses `catch` 6x (converting/handling errors),
 and catch is blocked. But it takes #17 from "blocked" to "only the handler is blocked", and
 it is real, differentiable backend work whenever it is picked up.
+
+## dict/set — the ACCURATE dependency chain (correcting "one AST field away")
+
+I overstated earlier that dict is "one AST field away". It is not. The full chain, verified:
+
+1. `catch`'s subject: `Stmt.Block` needs an Expr field (frontend, task_c19cb583). NOT landed.
+2. `catch` BACKEND codegen: handle an error union by running arms on the error variant.
+   Now plausibly portable given error-union return landed (8108739) -- but untestable until
+   (1), since a catch program can't even be represented.
+3. dict is compiled from `collections.elisa` SOURCE per-program (0 dict symbols in
+   elisacore_runtime.o), and that file uses `catch` 6x + `try` 12x + `error[]` 8 sigs. So it
+   cannot compile without (1)+(2).
+4. Pulling collections.elisa in is a std-IMPORT / cross-file concern: emit_native reads ONE
+   file from stdin. The real driver auto-imports the std via ELISA_CORE, but the test harness
+   here does not, so end-to-end dict also needs multi-file input in the harness.
+5. dict EXPRESSION modeling: `{}` literal, `d[k]`, `d[k] <- v` (note: `<-` does NOT insert;
+   insertion is arena_dict_put, which is error[]-returning -- so even reads/writes cross the
+   error-union boundary that catch guards).
+
+So dict is: a frontend fix + catch codegen + std cross-file compilation + dict expr shapes.
+The keystone is still (1), but calling it the ONLY thing was wrong. Everything downstream of
+(1) is real backend work that becomes doable -- and testable -- the moment catch can be
+represented. Error-union RETURN (8108739) already removed one layer; catch is the next.
