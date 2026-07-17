@@ -320,6 +320,15 @@ decline_case() {
 # A NESTED struct field needs the inner layout resolved first; only scalar fields are modeled.
 # A literal shorter than the declared extent would leave elements undef.
 # A non-empty darray literal would need a push (plus the grow path) per element.
+# `dict` is NOT the next container increment — it is gated behind GENERICS.
+#
+# stage0 does not lower a dict inline the way it does a darray (which needs only the
+# arena_alloc/arena_realloc primitives). It calls MONOMORPHIZED std generics —
+# `arena_dict_get_mut__i64__i64`, `arena_dict_find_index__i64__i64` — and pulls the std in:
+# a three-line dict program emits 102 functions. Supporting dict therefore requires generic
+# instantiation plus compiling elisacore_std/collections.elisa (error unions, refs,
+# optional-of-ref), not an ABI to mirror. Until then it must DECLINE, not half-emit.
+decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
 decline_case struct_nested 'struct Inner:\n    v: i64\n\nstruct Outer:\n    i: Inner\n\ndef main() -> i64:\n    o: Outer = Outer{i: Inner{v: 42}}\n    return o.i.v\n'
