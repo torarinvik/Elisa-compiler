@@ -316,6 +316,57 @@ ir_case() {
 ir_case cstr_global_shape 'def main() -> i64:\n    s: cstr = "hi"\n    return 42\n' '^@str = private unnamed_addr constant \[3 x i8\] c"hi\\00"'
 ir_case cstr_param_is_ptr 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n' 'define i64 @take\(ptr'
 
+# --- stage1-only IR assertions -------------------------------------------------------
+# The WEAKEST check in this suite, used only where a differential is IMPOSSIBLE rather than
+# merely inconvenient. Unlike ir_case (which requires stage0 to emit the same line), this
+# asserts stage1's IR alone -- because stage0 does NOT emit the autovec marker into
+# `-emit llvm` output at all, at -O0 or -O2 (verified). There is no reference IR to diff
+# against, so "both emit it" cannot be the assertion.
+#
+# The shape itself was still read out of stage0's SOURCE (llvm_autovec_verify.go), not
+# invented: `!llvm.loop !{<self>, !{"elisa.autovec.expected", pos, reason}}`.
+stage1_ir_case() {
+    local name="$1" src="$2" pattern="$3"
+    total=$((total + 1))
+    local ll="$BUILD/s1ir_$name.ll"
+    if ! printf '%b' "$src" | "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        echo "  FAIL s1ir_$name: stage1 declined"; return
+    fi
+    if grep -qE "$pattern" "$ll"; then
+        pass=$((pass + 1))
+    else
+        echo "  FAIL s1ir_$name: stage1 IR lacks /$pattern/"
+    fi
+}
+
+# The `-Wperf` autovec MARKER on a comprehension's latch branch. It rides in the IR so it
+# survives inlining, which is what lets a POST-optimization pass identify a build loop that
+# was lowered to be vectorizable and then was not -- the entire basis of -Wperf.
+stage1_ir_case autovec_marker 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' 'elisa.autovec.expected'
+# The self-reference is asserted SEPARATELY because LLVM requires a loop-ID node's operand 0
+# to be the node itself, and silently IGNORES a node that is not -- the marker would be
+# "present" and useless.
+stage1_ir_case autovec_loop_selfref 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' '^!0 = distinct .\{!0, !1\}'
+# The ABSENCE assertion needs its own helper: `grep -E` has no negative lookahead (that is
+# PCRE), so "must not contain" cannot be spelled as a pattern.
+stage1_ir_absent_case() {
+    local name="$1" src="$2" pattern="$3"
+    total=$((total + 1))
+    local ll="$BUILD/s1irabs_$name.ll"
+    if ! printf '%b' "$src" | "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        echo "  FAIL s1irabs_$name: stage1 declined"; return
+    fi
+    if grep -qE "$pattern" "$ll"; then
+        echo "  FAIL s1irabs_$name: stage1 IR unexpectedly contains /$pattern/"
+    else
+        pass=$((pass + 1))
+    fi
+}
+
+# A plain for-loop is NOT a comprehension build loop and must NOT be tagged: a marker there
+# would make -Wperf demand vectorization of a loop the language never promised to vectorize.
+stage1_ir_absent_case autovec_not_plain_loop 'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 0..<10:\n        total <- total + i\n    return total - 3\n' 'elisa.autovec.expected'
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
