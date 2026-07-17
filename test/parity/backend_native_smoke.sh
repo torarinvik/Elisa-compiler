@@ -454,6 +454,29 @@ diff_case cstr_param 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> 
 diff_case cstr_two_literals 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    a: cstr = "one"\n    b: cstr = "two"\n    return take(a) - take(b) + 42\n'
 diff_case cstr_empty 'def main() -> i64:\n    s: cstr = ""\n    return 42\n'
 diff_case cstr_reassign 'def main() -> i64:\n    s: mutable cstr = "a"\n    s <- "b"\n    return 42\n'
+# CROSS-FN REGION THREADING — the first real piece of region polymorphism. A function
+# taking a GROWABLE container by reference gets an implicit trailing `ptr` arena parameter
+# and grows through THAT, not through its own auto region: stage0 emits
+# `def fill(out: mutable darray[i64]&)` as `define void @fill(ptr, ptr)`, grows via
+# `arena_alloc(ptr %1, ...)`, and the call site passes the caller's arena. The backing
+# belongs to the CALLER, so a callee-local region would free it at return.
+diff_case region_fill_via_ref 'def fill(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    fill(xs)\n    return xs[0]\n'
+# 500 pushes force REALLOCATION inside the callee, through the caller's arena.
+diff_case region_fill_grows 'def fill(out: mutable darray[i64]&, n: i64) -> void:\n    for i in 0..<n:\n        out.push(1)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    fill(xs, 500)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'
+# Reading through a borrowed darray: the param slot holds a POINTER to the caller's header,
+# so count/index need one extra load that a local darray does not.
+diff_case region_count_via_ref 'def size(xs: darray[i64]&) -> i64:\n    return xs.count.i64()\n\ndef main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(1)\n    ys.push(2)\n    return size(ys) + 40\n'
+# `can[Unsafe.UncheckedIndex]` is REQUIRED here, and its absence is not a formality: nothing
+# bounds a bare `darray[i64]&`, so stage0's unsafe-permission audit rejects `xs[0]` in this
+# function while accepting the same index in main, where the count is provable. (The audit
+# runs under -emit c-archive but NOT -emit obj, which is why a bare `-emit obj` probe wrongly
+# suggests the unguarded form compiles.) The grant is the POSTFIX `can Unsafe.UncheckedIndex`,
+# not a signature `can[Unsafe.UncheckedIndex]` -- the bracketed form still fails the audit.
+# The checked spelling `get xs[0] else 0` also passes stage0, but stage1 cannot parse it yet:
+# `get` is an ungated contextual keyword there (task_66494fc2).
+diff_case region_index_via_ref 'def first(xs: darray[i64]&) -> i64:\n    return xs[0] can Unsafe.UncheckedIndex\n\ndef main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(42)\n    return first(ys)\n'
+# Two levels: main's arena is threaded through outer into inner.
+diff_case region_two_levels 'def inner(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef outer(out: mutable darray[i64]&) -> void:\n    inner(out)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    outer(xs)\n    return xs[0]\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'

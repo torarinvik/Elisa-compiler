@@ -498,7 +498,7 @@ on Expr.Tuple — closes both that diagnostic gap and this backend blocker.
 Spellings (verified against stage0): the TYPE is named-field `(a: i64, b: i64)`; the VALUE
 is POSITIONAL `(40, 2)`. `(a: 40, b: 2)` is rejected ("expected IDENT, got INT").
 
-## Region threading (cross-fn) — ABI mapped, NOT implemented. THE next region step.
+## Region threading (cross-fn) — LANDED
 
 This is the first real piece of region POLYMORPHISM, and stage0's shape is simple. For
 
@@ -527,8 +527,15 @@ Implementation sketch:
    building a fresh `auto.region` alloca, and skip the arena_free.
 4. `emit_direct_call` — append the caller's `runtime.arena` as the trailing argument.
 
-BLOCKER (the actual work): step 4 needs the runtime at the call site, and
-**`emit_expression` does not take `runtime` today** — `emit_statements` does, but
+DONE as sketched (5e85393 threaded runtime; this commit added the arena param). What the
+sketch MISSED: darray ops through a REF. A `darray[T]&` param's slot holds a POINTER to the
+caller's header, so push/count/index each needed one extra load — `darray_address_of` now
+resolves a local darray (its slot) and a borrowed one (load the slot) uniformly. Also
+`Runtime.owns_arena`: a threaded arena is BORROWED and must never be arena_free'd, or the
+callee destroys the caller's region on return.
+
+Historical note — the blocker that was: step 4 needed the runtime at the call site, and
+`emit_expression` did not take `runtime` — `emit_statements` does, but
 `emit_expression` / `emit_call` / `emit_direct_call` / `emit_generic_call` do not. Threading
 it through is ~33 `emit_expression(` call sites plus their Elisa CAPTURE LISTS (a loop body
 that calls emit_expression must add `runtime` to its `|...|`), which is where this gets

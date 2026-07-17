@@ -401,6 +401,44 @@ module Backend:
 
 
         # The referent type of a `T&`.
+        # A function that takes a GROWABLE container by reference gains an implicit trailing
+        # `ptr` arena parameter, and grows through THAT rather than its own auto region:
+        # stage0 emits `def fill(out: mutable darray[i64]&)` as `define void @fill(ptr, ptr)`
+        # and the call site passes the caller's arena. The container's backing belongs to
+        # the CALLER, so growing it from a callee-local region would free it at return.
+        def params_need_arena(params: darray[ParamDecl]&, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            for parameter in params |structs|:
+                parameter_type: ValueType = annotation_value_type(parameter.type_expression, structs)
+                continue if parameter_type.kind != TypeKind.Ref
+                true return if ref_target_of(parameter_type, structs).kind == TypeKind.DArray
+            return false
+
+
+        # The darray ValueType behind `name`, whether it is a local darray or a
+        # `darray[T]&` parameter — Unmodeled when it is neither.
+        def darray_type_behind(local_scope: mutable Scope&, name: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            bound: ValueType = lookup_type(local_scope, name)
+            bound return if bound.kind == TypeKind.DArray
+            unmodeled_type() return if bound.kind != TypeKind.Ref
+            target: ValueType = ref_target_of(bound, structs)
+            target return if target.kind == TypeKind.DArray
+            return unmodeled_type()
+
+
+        # The ADDRESS of the darray header named `name`. A local darray IS its slot; a
+        # `darray[T]&` parameter's slot holds a POINTER to the CALLER's darray, so it takes
+        # one extra load. Every darray operation goes through this so that push/count/index
+        # work identically on a local and on a borrowed one.
+        def darray_address_of(local_scope: mutable Scope&, name: sview, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            bound: ValueType = lookup_type(local_scope, name)
+            if lookup_slot(local_scope, name) is bound_slot:
+                bound_slot return if bound.kind == TypeKind.DArray
+                null return if bound.kind != TypeKind.Ref
+                null return if ref_target_of(bound, structs).kind != TypeKind.DArray
+                return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), bound_slot, "darray.ref")
+            return null
+
+
         def ref_target_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             unmodeled_type() return if value_type.kind != TypeKind.Ref
             return copied_type(structs.ref_targets[value_type.bits.usize()])
@@ -476,6 +514,10 @@ module Backend:
             # mutable field: the module-level Runtime carries a placeholder that
             # emit_function_body replaces with the function's own region slot.
             arena: mutable LLVMValueRef
+            # False when `arena` is the CALLER's, handed over as the implicit trailing
+            # parameter. Freeing it then would destroy a region this function does not own
+            # and the caller is still using -- so every arena_free is gated on this.
+            owns_arena: mutable bool
             arena_alloc: LLVMValueRef
             arena_realloc: LLVMValueRef
             arena_free: LLVMValueRef
@@ -506,6 +548,7 @@ module Backend:
             free_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), free_pointer, 1, 0)
 
             return Runtime{
+                owns_arena: true,
                 arena_alloc: LLVMAddFunction(m, "arena_alloc", alloc_type),
                 arena_realloc: LLVMAddFunction(m, "arena_realloc", realloc_type),
                 arena_free: LLVMAddFunction(m, "arena_free", free_type),
@@ -599,6 +642,9 @@ module Backend:
             # source text to point at — an sview into a growing darray would dangle. The
             # mangled form is built only as a temporary cstr for the LLVM symbol.
             owners: mutable darray[sview]
+            # True when the function has an implicit trailing arena parameter (it takes a
+            # growable container by reference). The CALL SITE must then pass its own arena.
+            needs_arena: mutable darray[bool]
             handles: mutable darray[LLVMValueRef]
             returns: mutable darray[ValueType]
             # Parameter types as a FLAT pool plus a per-function span (`param_start[i]`,
@@ -1211,7 +1257,12 @@ module Backend:
             target_opt: LLVMValueRef? = lookup_function(fns, callee_owner, callee_name)
             if target_opt is target:
                 total_arguments: usize = arguments.count + 1 if has_receiver else arguments.count
-                null return if LLVMCountParams(target).i64() != total_arguments.i64()
+                # LLVMCountParams counts the implicit trailing ARENA too, so the arity check
+                # must expect it — otherwise every call to an arena-threading function
+                # declines on a spurious mismatch.
+                wants_arena: bool = callee_needs_arena(fns, callee_owner, callee_name)
+                expected_params: usize = total_arguments + 1 if wants_arena else total_arguments
+                null return if LLVMCountParams(target).i64() != expected_params.i64()
 
                 argument_values: mutable darray[LLVMValueRef] = []
                 declined: mutable bool = false
@@ -1240,6 +1291,13 @@ module Backend:
                 fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
                 # A VOID call must be unnamed: "instructions returning void cannot have a name".
                 result_name: cstr = call_result_name(lookup_return_type(fns, callee_owner, callee_name))
+                # Hand the callee OUR region when its signature threads one: the container
+                # it grows is ours, so its backing must come from a region that outlives
+                # the call.
+                if wants_arena:
+                    argument_values.push(runtime.arena)
+                    arena_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMBuildCall2(builder, fn_type, target, arena_pointer, (total_arguments + 1).u32(), result_name)
                 LLVMBuildCall2(builder, fn_type, target, null, 0, result_name) return if total_arguments == 0
                 args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
                 return LLVMBuildCall2(builder, fn_type, target, args_pointer, total_arguments.u32(), result_name)
@@ -1325,6 +1383,7 @@ module Backend:
         # Copy a Runtime out of a reference (same borrow rule as copied_type).
         def copied_runtime(runtime: Runtime&) -> Runtime:
             return Runtime{
+                owns_arena: runtime.owns_arena,
                 arena_alloc: runtime.arena_alloc,
                 arena_realloc: runtime.arena_realloc,
                 arena_free: runtime.arena_free,
@@ -1339,6 +1398,8 @@ module Backend:
         # runtime and a no-op for a region that never allocated (strategy 2 is lazy), so
         # emitting it unconditionally on every return path is correct and cheap.
         def emit_region_free(runtime: Runtime&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A BORROWED region (the caller's, threaded in) is not ours to free.
+            return if not runtime.owns_arena
             arguments: mutable darray[LLVMValueRef] = [runtime.arena]
             arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
             _ = LLVMBuildCall2(builder, runtime.arena_free_type, runtime.arena_free, arguments_pointer, 1, "")
@@ -1773,6 +1834,15 @@ module Backend:
             if expression is Expr.Index(indexed_object, index_expression, index_line):
                 if indexed_object is Expr.Ident(array_name, array_name_line):
                     array_type: ValueType = lookup_type(local_scope, array_name)
+                    # A BORROWED darray (`darray[T]&`) indexes exactly like a local one once
+                    # its header address is loaded out of the parameter slot.
+                    borrowed_type: ValueType = darray_type_behind(local_scope, array_name, structs)
+                    if borrowed_type.kind == TypeKind.DArray and array_type.kind == TypeKind.Ref:
+                        if darray_address_of(local_scope, array_name, structs, ctx, builder) is borrowed_slot:
+                            if emit_darray_index_address(borrowed_slot, borrowed_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is borrowed_pointer:
+                                borrowed_element: ValueType = darray_element_of(borrowed_type, structs)
+                                return LLVMBuildLoad2(builder, llvm_type_of(borrowed_element, structs, ctx), borrowed_pointer, "darray.elem")
+                        return null
                     if lookup_slot(local_scope, array_name) is array_slot:
                         # A darray indexes through its `items` pointer; a fixed array
                         # indexes the storage directly.
@@ -1830,9 +1900,9 @@ module Backend:
             # `xs.count` — read the darray header's count field.
             if expression is Expr.Field(darray_object, darray_field, darray_field_line):
                 if darray_object is Expr.Ident(darray_name, darray_name_line):
-                    darray_type: ValueType = lookup_type(local_scope, darray_name)
+                    darray_type: ValueType = darray_type_behind(local_scope, darray_name, structs)
                     if darray_type.kind == TypeKind.DArray and darray_field == "count":
-                        if lookup_slot(local_scope, darray_name) is darray_slot:
+                        if darray_address_of(local_scope, darray_name, structs, ctx, builder) is darray_slot:
                             count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), darray_slot, 1, "darray.count.ptr")
                             return LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), count_pointer, "darray.count")
 
@@ -1917,9 +1987,9 @@ module Backend:
                 if statement_expression is Expr.Call(push_callee, push_arguments, push_argument_names, push_call_line):
                     if push_callee is Expr.Field(push_object, push_method, push_method_line):
                         if push_object is Expr.Ident(push_name, push_name_line):
-                            push_type: ValueType = lookup_type(local_scope, push_name)
+                            push_type: ValueType = darray_type_behind(local_scope, push_name, structs)
                             if push_type.kind == TypeKind.DArray and push_method == "push" and push_arguments.count == 1:
-                                if lookup_slot(local_scope, push_name) is push_slot:
+                                if darray_address_of(local_scope, push_name, structs, ctx, builder) is push_slot:
                                     if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, generics, runtime, m, ctx, builder):
                                         return EmitStatus.Open
                                 return EmitStatus.Declined
@@ -2185,6 +2255,13 @@ module Backend:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 return function_name
             return ""
+
+
+        # Does `owner::name` take the implicit trailing arena parameter?
+        def callee_needs_arena(fns: FnTable&, owner: sview, name: sview) -> bool can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.needs_arena[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return false
 
 
         # The index of function `owner::name` in the table, or -1.
@@ -2462,15 +2539,20 @@ module Backend:
 
                     name_storage: mutable darray[u8] = []
                     fn_name: cstr = qualified_name_cstr(owner, function_name, name_storage)
+                    # The implicit trailing arena parameter, if this signature needs one.
+                    wants_arena: bool = params_need_arena(params, structs)
+                    llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if wants_arena
+                    total_params: usize = params.count + 1 if wants_arena else params.count
                     llvm_return: LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
                     fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
-                    if params.count != 0:
+                    if total_params != 0:
                         params_pointer: void& = (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
-                        fn_type <- LLVMFunctionType(llvm_return, params_pointer, params.count.u32(), 0)
+                        fn_type <- LLVMFunctionType(llvm_return, params_pointer, total_params.u32(), 0)
                     handle: LLVMValueRef = LLVMAddFunction(m, fn_name, fn_type)
 
                     fns.names <- fns.names.push(function_name)
                     fns.owners <- fns.owners.push(owner)
+                    fns.needs_arena <- fns.needs_arena.push(wants_arena)
                     fns.handles <- fns.handles.push(handle)
                     fns.returns <- fns.returns.push(return_value_type)
                     fns.param_start <- fns.param_start.push(fns.param_types.count)
@@ -2500,12 +2582,21 @@ module Backend:
                 # with strategy 2 (lazy, so an untouched region costs no syscall), which
                 # backs any container the function builds and is arena_free'd on return.
                 local_runtime: mutable Runtime = copied_runtime(runtime)
-                arena_type: LLVMTypeRef = arena_llvm_type(ctx)
-                arena_slot: LLVMValueRef = LLVMBuildAlloca(builder, arena_type, "auto.region")
-                _ = LLVMBuildStore(builder, LLVMConstNull(arena_type), arena_slot)
-                strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, arena_type, arena_slot, 3, "region.strategy")
-                _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 2, 0), strategy_pointer)
-                local_runtime.arena <- arena_slot
+                # A function taking a growable container by reference grows the CALLER's
+                # region, handed over as the implicit trailing parameter, rather than its
+                # own: the container's backing outlives this call, so allocating it from a
+                # region freed at return would hand the caller freed memory.
+                threads_arena: bool = params_need_arena(params, structs)
+                if threads_arena:
+                    local_runtime.arena <- LLVMGetParam(fn, params.count.u32())
+                    local_runtime.owns_arena <- false
+                else:
+                    arena_type: LLVMTypeRef = arena_llvm_type(ctx)
+                    arena_slot: LLVMValueRef = LLVMBuildAlloca(builder, arena_type, "auto.region")
+                    _ = LLVMBuildStore(builder, LLVMConstNull(arena_type), arena_slot)
+                    strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, arena_type, arena_slot, 3, "region.strategy")
+                    _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 2, 0), strategy_pointer)
+                    local_runtime.arena <- arena_slot
 
                 # Each parameter gets a slot too, so a parameter reads and assigns exactly
                 # like a local and emit_expression's Ident path needs no param special
@@ -2581,7 +2672,7 @@ module Backend:
             # Templates must be known before any body is emitted: a call decides between
             # "ordinary function" and "instantiate a generic" by looking here.
             register_generics(file, generics)
-            fns: mutable FnTable = FnTable{names: [], owners: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
+            fns: mutable FnTable = FnTable{names: [], owners: [], needs_arena: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
             # THREE passes. Structs first: a function signature can name a struct, and a
