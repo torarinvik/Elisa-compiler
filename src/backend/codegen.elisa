@@ -99,6 +99,32 @@ module Backend:
             return unmodeled_type()
 
 
+        # What `name` is bound to in the CURRENT instantiation, or Unmodeled if it is not a
+        # type parameter (i.e. it is an ordinary type name).
+        def bound_type_of(structs: mutable StructTable&, name: sview) -> ValueType can[Abort.Panic]:
+            for index in 0..<structs.binding_names.count |structs, name|:
+                copied_type(structs.binding_types[index]) return if structs.binding_names[index] == name
+            return unmodeled_type()
+
+
+        # The return type of generic `base` instantiated at `type_argument`: its return
+        # annotation resolved under that binding.
+        def generic_return_type(base: sview, type_argument: ValueType, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            index: i64 = generic_index_of(generics, base)
+            unmodeled_type() return if index < 0
+            slot: usize = index.usize()
+            unmodeled_type() return if generics.param_count[slot] != 1
+            if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                if return_type_opt is declared_return:
+                    structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
+                    structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
+                    resolved: ValueType = annotation_value_type(declared_return, structs)
+                    _ = structs.binding_names.pop()
+                    _ = structs.binding_types.pop()
+                    return resolved
+            return unmodeled_type()
+
+
         # The type an annotation denotes. Only a bare scalar name is modeled.
         #
         # `mutable` is a QUALIFIER on the annotation, not part of the type: `x: mutable
@@ -130,6 +156,10 @@ module Backend:
                     return intern_array_type(element, extent_value.u32(), structs)
                 return unmodeled_type()
             if type_expression is Expr.Ident(type_name, type_line):
+                # A TYPE PARAMETER shadows everything: inside an instantiation of
+                # `identity[T]` with T=i64, the annotation `T` denotes i64.
+                bound: ValueType = bound_type_of(structs, type_name)
+                bound return if bound.kind != TypeKind.Unmodeled
                 scalar: ValueType = scalar_type_of_name(type_name)
                 scalar return if scalar.kind != TypeKind.Unmodeled
                 # A user STRUCT name: `bits` carries its registry index.
@@ -177,6 +207,16 @@ module Backend:
             array_extents: mutable darray[u32]
             # `darray[T]` element types, interned the same way.
             darray_elements: mutable darray[ValueType]
+            # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
+            # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
+            #
+            # These live in the registry rather than as their own threaded parameter: the
+            # registry already reaches every place a type is resolved, and constructing a
+            # fresh empty bindings table per call site is REGION-POLYMORPHIC (so illegal in
+            # a non-region-inferable context). Set on entry to an instantiation, cleared on
+            # exit. `binding_names` are sviews into the source buffer, so nothing dangles.
+            binding_names: mutable darray[sview]
+            binding_types: mutable darray[ValueType]
 
 
         # The LLVM type of ANY darray: `{ptr, i64, i64}` = {items, count, capacity}.
@@ -322,6 +362,61 @@ module Backend:
             }
 
 
+        # Generic function TEMPLATES, and the instantiations made from them.
+        #
+        # The instantiation cache is keyed by (base name, type argument) — NOT by mangled
+        # name. That is deliberate: an `sview` is a view, so a mangled name built into a
+        # local buffer would DANGLE the moment the buffer's region died (Elisa's region
+        # checker catches exactly this). `base_names` are sviews into the SOURCE buffer,
+        # which outlives everything, and ValueType is POD — so nothing here borrows.
+        #
+        # The mangled name is only ever needed transiently, to hand to LLVMAddFunction,
+        # which COPIES it. So it is built in a local buffer, used, and dropped.
+        #
+        # Generic parameter names come from the FILE-level side table
+        # (`generic_param_names` / `generic_param_lines`) keyed by the function's LINE —
+        # they are NOT on Decl.Func. A row whose line has the high bit set is a BOUND
+        # (`[T: Ord]`): metadata the backend never needs, since it only instantiates types
+        # the frontend already accepted.
+        struct GenericTable:
+            names: mutable darray[sview]
+            decls: mutable darray[Decl]
+            params: mutable darray[sview]
+            param_start: mutable darray[usize]
+            param_count: mutable darray[usize]
+            # Instantiations, keyed by (base name, type argument).
+            inst_bases: mutable darray[sview]
+            inst_types: mutable darray[ValueType]
+            inst_handles: mutable darray[LLVMValueRef]
+            # The WORKLIST: instantiations declared but whose BODY still needs emitting. A
+            # body cannot be emitted at the call site (the builder sits inside the caller),
+            # so emit_module drains this afterwards — and keeps draining, because a generic
+            # can call another generic.
+            pending_bases: mutable darray[sview]
+            pending_types: mutable darray[ValueType]
+            pending_handles: mutable darray[LLVMValueRef]
+
+
+        def new_generic_table() -> GenericTable can[Abort.Panic, Memory.Allocate]:
+            return GenericTable{names: [], decls: [], params: [], param_start: [], param_count: [], inst_bases: [], inst_types: [], inst_handles: [], pending_bases: [], pending_types: [], pending_handles: []}
+
+
+        # The index of generic template `name`, or -1.
+        def generic_index_of(generics: GenericTable&, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<generics.names.count |generics, name|:
+                index.i64() return if generics.names[index] == name
+            return -1
+
+
+        # The already-declared instantiation for (base, type), or null.
+        def instantiation_of(generics: GenericTable&, base: sview, type_argument: ValueType) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<generics.inst_bases.count |generics, base, type_argument|:
+                if generics.inst_bases[index] == base:
+                    existing: ValueType = generics.inst_types[index]
+                    generics.inst_handles[index] return if existing.kind == type_argument.kind and existing.bits == type_argument.bits
+            return null
+
+
         # A function's local slots: `names[i]` lives in the `alloca` at `slots[i]`.
         # Parallel darrays rather than a dict: scopes are tiny (a handful of locals), a
         # linear scan beats hashing, and it keeps the opaque extern handle out of a dict's
@@ -440,11 +535,11 @@ module Backend:
         # (Unmodeled) and adopts whatever its context supplies. That is why the emitters
         # thread an `expected` type downward — `a: u8 = 200` must make 200 a u8, not an
         # i64 that is then silently truncated.
-        def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+        def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic]:
             if expression is Expr.Ident(ident_name, ident_line):
                 return lookup_type(local_scope, ident_name)
             if expression is Expr.Paren(paren_inner, paren_line):
-                return expression_type(paren_inner, local_scope, fns, structs)
+                return expression_type(paren_inner, local_scope, fns, structs, generics)
             if expression is Expr.BoolLit(bool_value):
                 return ValueType{kind: TypeKind.Bool, bits: 1}
             # A FLOAT literal, like an int literal, defers to its context (`x: f32 = 1.5`),
@@ -452,25 +547,25 @@ module Backend:
             if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
                 # `not x` is a bool whatever `x` is; `-x` / `~x` keep the operand's type.
                 ValueType{kind: TypeKind.Bool, bits: 1} return if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang
-                return expression_type(unary_operand, local_scope, fns, structs)
+                return expression_type(unary_operand, local_scope, fns, structs, generics)
             if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
                 # A comparison or logical yields bool regardless of operand type.
                 ValueType{kind: TypeKind.Bool, bits: 1} return if int_predicate_of(binary_operator) >= 0
                 ValueType{kind: TypeKind.Bool, bits: 1} return if binary_operator == TokenKind.And or binary_operator == TokenKind.Or
                 # Arithmetic keeps the operands' type: take whichever side is known, since
                 # a literal contributes nothing.
-                left_type: ValueType = expression_type(binary_left, local_scope, fns, structs)
+                left_type: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
                 left_type return if left_type.kind != TypeKind.Unmodeled
-                return expression_type(binary_right, local_scope, fns, structs)
+                return expression_type(binary_right, local_scope, fns, structs, generics)
             # `xs[i]` — an index READ yields the element type of an array OR a darray.
             if expression is Expr.Index(indexed_object, index_expression, index_line):
-                indexed_type: ValueType = expression_type(indexed_object, local_scope, fns, structs)
+                indexed_type: ValueType = expression_type(indexed_object, local_scope, fns, structs, generics)
                 darray_element_of(indexed_type, structs) return if indexed_type.kind == TypeKind.DArray
                 return array_element_of(indexed_type, structs)
             # `p.x` — a field READ has the field's declared type. (A cast `x.u8()` is a
             # Field under a Call, handled below, so a bare Field is always a field read.)
             if expression is Expr.Field(field_object, field_name, field_line):
-                object_type: ValueType = expression_type(field_object, local_scope, fns, structs)
+                object_type: ValueType = expression_type(field_object, local_scope, fns, structs, generics)
                 # `xs.count` is a usize-shaped i64.
                 ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "count"
                 unmodeled_type() return if object_type.kind != TypeKind.Struct
@@ -486,7 +581,23 @@ module Backend:
                 # where Name is a type name is a conversion).
                 if call_callee is Expr.Field(cast_object, cast_name, cast_line):
                     return scalar_type_of_name(cast_name)
+                # `f[i64](x)` — an explicit generic call. Its type is the template's return
+                # annotation resolved under that binding, which for `-> T` is the type
+                # argument itself.
+                if call_callee is Expr.Index(generic_head, generic_type_argument, generic_head_line):
+                    if generic_head is Expr.Ident(generic_head_name, generic_head_name_line):
+                        if generic_index_of(generics, generic_head_name) >= 0:
+                            return generic_return_type(generic_head_name, annotation_value_type(generic_type_argument, structs), generics, structs)
                 if call_callee is Expr.Ident(callee_name, callee_line):
+                    # A GENERIC template is NOT in `fns` — only its instantiations are —
+                    # so it must be resolved through the template. Without this a generic
+                    # call reports Unmodeled and every type-directed check downstream
+                    # (operand typing, the mixed-width guard) silently stops applying.
+                    if generic_index_of(generics, callee_name) >= 0:
+                        unmodeled_type() return if call_arguments.count == 0
+                        inferred: ValueType = expression_type(call_arguments[0], local_scope, fns, structs, generics)
+                        unmodeled_type() return if inferred.kind == TypeKind.Unmodeled
+                        return generic_return_type(callee_name, inferred, generics, structs)
                     return lookup_return_type(fns, callee_name)
             return unmodeled_type()
 
@@ -682,12 +793,12 @@ module Backend:
         #   br left ? rhs : done              ; `or` swaps the targets
         #   rhs:  result = right; br done
         #   done: load result
-        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
             is_and: bool = operator == TokenKind.And
 
             result_slot: LLVMValueRef = LLVMBuildAlloca(builder, bool_type, "sc.result")
-            if emit_condition(left_expression, local_scope, fns, structs, m, ctx, builder) is left_bit:
+            if emit_condition(left_expression, local_scope, fns, structs, generics, m, ctx, builder) is left_bit:
                 # `false and _` is false; `true or _` is true.
                 short_value: LLVMValueRef = LLVMConstInt(bool_type, 0, 0) if is_and else LLVMConstInt(bool_type, 1, 0)
                 _ = LLVMBuildStore(builder, short_value, result_slot)
@@ -702,7 +813,7 @@ module Backend:
                     _ = LLVMBuildCondBr(builder, left_bit, done_block, rhs_block)
 
                 LLVMPositionBuilderAtEnd(builder, rhs_block)
-                if emit_condition(right_expression, local_scope, fns, structs, m, ctx, builder) is right_bit:
+                if emit_condition(right_expression, local_scope, fns, structs, generics, m, ctx, builder) is right_bit:
                     _ = LLVMBuildStore(builder, right_bit, result_slot)
                     _ = LLVMBuildBr(builder, done_block)
                     LLVMPositionBuilderAtEnd(builder, done_block)
@@ -710,12 +821,131 @@ module Backend:
             return null
 
 
+        # Declare an instantiation of a generic template, and queue its body.
+        #
+        # The SIGNATURE is built here — cheap, needs no builder, and yields the handle the
+        # call site needs immediately. The BODY is queued because emitting it needs the
+        # builder, which is currently positioned inside the caller.
+        def instantiate_generic(base: sview, type_argument: ValueType, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instantiation_of(generics, base, type_argument) is already_declared:
+                return already_declared
+
+            index: i64 = generic_index_of(generics, base)
+            null return if index < 0
+            slot: usize = index.usize()
+            # Only ONE type parameter is modeled; more needs per-parameter inference.
+            null return if generics.param_count[slot] != 1
+
+            if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                if return_type_opt is return_type:
+                    # Bind T for the duration of resolving this signature.
+                    structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
+                    structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
+
+                    return_value_type: ValueType = annotation_value_type(return_type, structs)
+                    llvm_params: mutable darray[LLVMTypeRef] = []
+                    declined: mutable bool = false
+                    for parameter in params |llvm_params, declined, structs, ctx|:
+                        parameter_type: ValueType = annotation_value_type(parameter.type_expression, structs)
+                        if parameter_type.kind == TypeKind.Unmodeled:
+                            declined <- true
+                        else:
+                            llvm_params.push(llvm_type_of(parameter_type, structs, ctx))
+
+                    _ = structs.binding_names.pop()
+                    _ = structs.binding_types.pop()
+                    null return if declined or return_value_type.kind == TypeKind.Unmodeled
+
+                    name_storage: mutable darray[u8] = []
+                    mangled: cstr = mangled_name_into(base, type_argument, name_storage)
+                    llvm_return: LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
+                    fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
+                    if params.count != 0:
+                        params_pointer: void& = (&llvm_params[0]).cast[void&] can Unsafe.PointerCast
+                        fn_type <- LLVMFunctionType(llvm_return, params_pointer, params.count.u32(), 0)
+                    handle: LLVMValueRef = LLVMAddFunction(m, mangled, fn_type)
+
+                    generics.inst_bases <- generics.inst_bases.push(base)
+                    generics.inst_types <- generics.inst_types.push(copied_type(type_argument))
+                    generics.inst_handles <- generics.inst_handles.push(handle)
+                    generics.pending_bases <- generics.pending_bases.push(base)
+                    generics.pending_types <- generics.pending_types.push(copied_type(type_argument))
+                    generics.pending_handles <- generics.pending_handles.push(handle)
+                    return handle
+            return null
+
+
+        # The declared type of instantiation (base, type)'s parameter `position`, resolved
+        # through the template's bindings.
+        def instantiation_param_type(base: sview, type_argument: ValueType, position: usize, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            index: i64 = generic_index_of(generics, base)
+            unmodeled_type() return if index < 0
+            slot: usize = index.usize()
+            if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                unmodeled_type() return if position >= params.count
+                structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
+                structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
+                resolved: ValueType = annotation_value_type(params[position].type_expression, structs)
+                structs.binding_names <- []
+                structs.binding_types <- []
+                return resolved
+            return unmodeled_type()
+
+
+        # Emit a call to a generic function, instantiating on first use.
+        def emit_generic_call(base: sview, type_argument: ValueType, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A generic calling ANOTHER generic is not modeled: instantiating while an
+            # instantiation is already in progress reenters the binding stack and the
+            # emitter traps (SIGTRAP, observed). DECLINE instead — an emitter that crashes
+            # is strictly worse than one that admits it cannot do something. Lifting this
+            # needs the nested case designed properly, not patched.
+            null return if structs.binding_names.count != 0
+            if instantiate_generic(base, type_argument, generics, structs, m, ctx) is target:
+                argument_values: mutable darray[LLVMValueRef] = []
+                declined: mutable bool = false
+                argument_index: mutable usize = 0
+                for argument in arguments |argument_values, declined, argument_index, base, type_argument, local_scope, fns, structs, generics, m, ctx, builder|:
+                    # Each argument is emitted at its PARAMETER's type, resolved through the
+                    # instantiation's bindings — so a literal argument to `f[u8]` becomes a
+                    # u8, not an i64.
+                    wanted: ValueType = instantiation_param_type(base, type_argument, argument_index, generics, structs)
+                    if emit_expression(argument, wanted, local_scope, fns, structs, generics, m, ctx, builder) is emitted_argument:
+                        argument_values.push(emitted_argument)
+                    else:
+                        declined <- true
+                    argument_index <- argument_index + 1
+                null return if declined
+                fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                LLVMBuildCall2(builder, fn_type, target, null, 0, "gcall") return if arguments.count == 0
+                args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildCall2(builder, fn_type, target, args_pointer, arguments.count.u32(), "gcall")
+            return null
+
+
         # Emit a call `f(args…)`. Only a direct call to a named, already-declared function
         # is modeled: the callee must exist in the module (emit_module declares every
         # function before emitting any body, so definition order does not matter) and the
         # arity must match.
-        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # `f[i64](x)` — an EXPLICIT type argument makes the callee an Index, not an
+            # Ident; the bracket holds a TYPE, so it resolves as an annotation.
+            if callee is Expr.Index(generic_callee, generic_argument, generic_call_line):
+                if generic_callee is Expr.Ident(explicit_name, explicit_name_line):
+                    explicit_type: ValueType = annotation_value_type(generic_argument, structs)
+                    null return if explicit_type.kind == TypeKind.Unmodeled
+                    null return if generic_index_of(generics, explicit_name) < 0
+                    return emit_generic_call(explicit_name, explicit_type, arguments, local_scope, fns, structs, generics, m, ctx, builder)
+                return null
             if callee is Expr.Ident(callee_name, callee_line):
+                # A GENERIC callee with an INFERRED type argument: `identity(42)`. The first
+                # argument's own type supplies it — enough for the single-type-parameter
+                # subset. A bare literal argument has no type of its own, so `identity(42)`
+                # with no other information declines rather than guessing i64.
+                if generic_index_of(generics, callee_name) >= 0:
+                    null return if arguments.count == 0
+                    inferred: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+                    null return if inferred.kind == TypeKind.Unmodeled
+                    return emit_generic_call(callee_name, inferred, arguments, local_scope, fns, structs, generics, m, ctx, builder)
                 target_opt: LLVMValueRef? = lookup_function(fns, callee_name)
                 if target_opt is target:
                     null return if LLVMCountParams(target).i64() != arguments.count.i64()
@@ -723,10 +953,10 @@ module Backend:
                     argument_values: mutable darray[LLVMValueRef] = []
                     declined: mutable bool = false
                     argument_index: mutable usize = 0
-                    for argument in arguments |argument_values, declined, argument_index, target, local_scope, fns, structs, m, ctx, builder|:
+                    for argument in arguments |argument_values, declined, argument_index, target, local_scope, fns, structs, generics, m, ctx, builder|:
                         # Each argument is emitted at its PARAMETER's declared type, so a
                         # literal argument adopts the parameter type rather than i64.
-                        argument_value: LLVMValueRef? = emit_expression(argument, param_type_of(fns, callee_name, argument_index), local_scope, fns, structs, m, ctx, builder)
+                        argument_value: LLVMValueRef? = emit_expression(argument, param_type_of(fns, callee_name, argument_index), local_scope, fns, structs, generics, m, ctx, builder)
                         if argument_value is emitted_argument:
                             argument_values.push(emitted_argument)
                         else:
@@ -747,8 +977,8 @@ module Backend:
         # The type a value will actually have: its own if known, else the context's.
         # An integer literal has no intrinsic type, so `expected` is what makes
         # `a: u8 = 200` a u8 rather than an i64 that is then truncated behind your back.
-        def resolve_type(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
-            own: ValueType = expression_type(expression, local_scope, fns, structs)
+        def resolve_type(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic]:
+            own: ValueType = expression_type(expression, local_scope, fns, structs, generics)
             own return if own.kind != TypeKind.Unmodeled
             return expected
 
@@ -787,12 +1017,12 @@ module Backend:
         #
         # ONE index, not two: `items` is already a `T*`, so there is no leading 0 to step
         # over the way a fixed array's pointer-to-array needs.
-        def emit_darray_index_address(array_slot: LLVMValueRef, array_type: ValueType, index_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_darray_index_address(array_slot: LLVMValueRef, array_type: ValueType, index_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             null return if array_type.kind != TypeKind.DArray
             element_type: ValueType = darray_element_of(array_type, structs)
             null return if element_type.kind == TypeKind.Unmodeled
             index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
-            if emit_expression(index_expression, index_type, local_scope, fns, structs, m, ctx, builder) is index_value:
+            if emit_expression(index_expression, index_type, local_scope, fns, structs, generics, m, ctx, builder) is index_value:
                 items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), array_slot, 0, "darray.items.ptr")
                 items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "darray.items")
                 indices: mutable darray[LLVMValueRef] = [index_value]
@@ -810,10 +1040,10 @@ module Backend:
         # NO BOUNDS CHECK: the subset does not model one. That matches `-emit obj` without
         # -fbounds-check, which is what the differential compares against; a checked build
         # is a separate feature, not a silent default.
-        def emit_index_address(array_slot: LLVMValueRef, array_type: ValueType, index_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_index_address(array_slot: LLVMValueRef, array_type: ValueType, index_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             null return if array_type.kind != TypeKind.Array
             index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
-            if emit_expression(index_expression, index_type, local_scope, fns, structs, m, ctx, builder) is index_value:
+            if emit_expression(index_expression, index_type, local_scope, fns, structs, generics, m, ctx, builder) is index_value:
                 indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), index_value]
                 indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
                 return LLVMBuildGEP2(builder, llvm_type_of(array_type, structs, ctx), array_slot, indices_pointer, 2, "elem.ptr")
@@ -858,7 +1088,7 @@ module Backend:
         # they only abort on a capacity that cannot occur in a modeled program, so their
         # absence is unobservable in the differential — but it does mean this lowering is
         # not a bit-for-bit clone, only a behavioural one.
-        def emit_darray_push(array_slot: LLVMValueRef, array_type: ValueType, value_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_darray_push(array_slot: LLVMValueRef, array_type: ValueType, value_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             element_type: ValueType = darray_element_of(array_type, structs)
             false return if element_type.kind == TypeKind.Unmodeled
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
@@ -919,7 +1149,7 @@ module Backend:
             _ = LLVMBuildBr(builder, store_block)
 
             LLVMPositionBuilderAtEnd(builder, store_block)
-            if emit_expression(value_expression, element_type, local_scope, fns, structs, m, ctx, builder) is pushed_value:
+            if emit_expression(value_expression, element_type, local_scope, fns, structs, generics, m, ctx, builder) is pushed_value:
                 items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "push.items.cur")
                 indices: mutable darray[LLVMValueRef] = [count]
                 indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
@@ -934,7 +1164,7 @@ module Backend:
 
         # Emit a value expression, producing a value of `resolve_type(expression, expected)`.
         # `null` = unmodeled; the caller must decline.
-        def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if expression is Expr.IntLit(literal_value):
                 # A literal takes the context's type. sign_extend=1 so a negative literal
                 # fills correctly at any width.
@@ -957,18 +1187,18 @@ module Backend:
                     return LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "load")
                 return null
             if expression is Expr.Paren(paren_inner, paren_line):
-                return emit_expression(paren_inner, expected, local_scope, fns, structs, m, ctx, builder)
+                return emit_expression(paren_inner, expected, local_scope, fns, structs, generics, m, ctx, builder)
             if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
                 # `not x` needs a bool operand, not `expected` (which is itself bool).
                 if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang:
                     bool_type_n: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
-                    if emit_expression(unary_operand, bool_type_n, local_scope, fns, structs, m, ctx, builder) is bool_operand:
+                    if emit_expression(unary_operand, bool_type_n, local_scope, fns, structs, generics, m, ctx, builder) is bool_operand:
                         # `not` on an i1 is XOR with 1.
                         return LLVMBuildXor(builder, bool_operand, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), "not")
                     return null
-                operand_type: ValueType = resolve_type(unary_operand, expected, local_scope, fns, structs)
+                operand_type: ValueType = resolve_type(unary_operand, expected, local_scope, fns, structs, generics)
                 null return if not is_numeric_type(operand_type)
-                if emit_expression(unary_operand, operand_type, local_scope, fns, structs, m, ctx, builder) is operand:
+                if emit_expression(unary_operand, operand_type, local_scope, fns, structs, generics, m, ctx, builder) is operand:
                     operand return if unary_operator == TokenKind.Plus
                     if unary_operator == TokenKind.Minus:
                         # `-x` on a float is fneg; `~x` has no float form.
@@ -981,12 +1211,12 @@ module Backend:
                 # `and`/`or` SHORT-CIRCUIT: the right side must only be emitted on the path
                 # that reaches it, so they cannot go through emit_binary.
                 if binary_operator == TokenKind.And or binary_operator == TokenKind.Or:
-                    return emit_short_circuit(binary_left, binary_operator, binary_right, local_scope, fns, structs, m, ctx, builder)
+                    return emit_short_circuit(binary_left, binary_operator, binary_right, local_scope, fns, structs, generics, m, ctx, builder)
                 # The OPERANDS' type is not the result type: `a < b` yields bool but must
                 # compare at a's type. Take whichever side is known; a literal defers.
-                operand_type: mutable ValueType = expression_type(binary_left, local_scope, fns, structs)
+                operand_type: mutable ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
                 if operand_type.kind == TypeKind.Unmodeled:
-                    operand_type <- expression_type(binary_right, local_scope, fns, structs)
+                    operand_type <- expression_type(binary_right, local_scope, fns, structs, generics)
                 if operand_type.kind == TypeKind.Unmodeled:
                     # Both sides are literals (`2 + 3`): fall back to the context, which
                     # for a comparison is bool — so use i64 there.
@@ -994,12 +1224,12 @@ module Backend:
                 null return if not is_numeric_type(operand_type)
                 # MIXED WIDTHS are not modeled: Elisa has no implicit numeric conversion
                 # in the subset, and silently extending one side would invent semantics.
-                left_own: ValueType = expression_type(binary_left, local_scope, fns, structs)
-                right_own: ValueType = expression_type(binary_right, local_scope, fns, structs)
+                left_own: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                right_own: ValueType = expression_type(binary_right, local_scope, fns, structs, generics)
                 null return if left_own.kind != TypeKind.Unmodeled and (left_own.bits != operand_type.bits or left_own.kind != operand_type.kind)
                 null return if right_own.kind != TypeKind.Unmodeled and (right_own.bits != operand_type.bits or right_own.kind != operand_type.kind)
-                if emit_expression(binary_left, operand_type, local_scope, fns, structs, m, ctx, builder) is left:
-                    if emit_expression(binary_right, operand_type, local_scope, fns, structs, m, ctx, builder) is right:
+                if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, m, ctx, builder) is left:
+                    if emit_expression(binary_right, operand_type, local_scope, fns, structs, generics, m, ctx, builder) is right:
                         return emit_binary(binary_operator, left, right, operand_type, structs, ctx, builder)
                 return null
             # A value `match` over an integer scrutinee: `match n: 0: 100 … _: 300`.
@@ -1007,18 +1237,18 @@ module Backend:
             # Lowered as an ordered COMPARE CHAIN, not a switch: arms must be tried in
             # source order, and turning a dense chain into a switch is llc's job.
             if expression is Expr.Match(match_scrutinee, match_arms, match_line):
-                scrutinee_type: ValueType = resolve_type(match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs)
+                scrutinee_type: ValueType = resolve_type(match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
                 null return if not is_integer_type(scrutinee_type)
                 match_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
                 null return if expected.kind == TypeKind.Unmodeled
-                if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, m, ctx, builder) is scrutinee:
+                if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, m, ctx, builder) is scrutinee:
                     function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                     result_slot: LLVMValueRef = LLVMBuildAlloca(builder, match_type, "match.result")
                     done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.done")
                     declined: mutable bool = false
                     saw_default: mutable bool = false
 
-                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, expected, result_slot, done_block, function, local_scope, fns, structs, m, ctx, builder|:
+                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, m, ctx, builder|:
                         # Once a catch-all is emitted the chain is closed.
                         continue if declined or saw_default
                         if arm_has_guard(arm.guard):
@@ -1034,7 +1264,7 @@ module Backend:
                                     hit: LLVMValueRef = LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(llvm_type_of(scrutinee_type, structs, ctx), literal_value.u64(), 1), "match.cmp")
                                     _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
                                     LLVMPositionBuilderAtEnd(builder, arm_block)
-                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, m, ctx, builder) is arm_value:
+                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, m, ctx, builder) is arm_value:
                                         _ = LLVMBuildStore(builder, arm_value, result_slot)
                                         _ = LLVMBuildBr(builder, done_block)
                                     else:
@@ -1046,7 +1276,7 @@ module Backend:
                                 if is_catch_all_pattern(arm.pattern):
                                     _ = LLVMBuildBr(builder, arm_block)
                                     LLVMPositionBuilderAtEnd(builder, arm_block)
-                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, m, ctx, builder) is default_value:
+                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, m, ctx, builder) is default_value:
                                         _ = LLVMBuildStore(builder, default_value, result_slot)
                                         _ = LLVMBuildBr(builder, done_block)
                                         saw_default <- true
@@ -1071,7 +1301,7 @@ module Backend:
                 null return if expected.kind == TypeKind.Unmodeled
                 ternary_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
                 result_slot: LLVMValueRef = LLVMBuildAlloca(builder, ternary_type, "if.result")
-                if emit_condition(ternary_condition, local_scope, fns, structs, m, ctx, builder) is condition_bit:
+                if emit_condition(ternary_condition, local_scope, fns, structs, generics, m, ctx, builder) is condition_bit:
                     function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                     then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.then")
                     else_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.else")
@@ -1079,13 +1309,13 @@ module Backend:
                     _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
 
                     LLVMPositionBuilderAtEnd(builder, then_block)
-                    if emit_expression(then_expression, expected, local_scope, fns, structs, m, ctx, builder) is then_value:
+                    if emit_expression(then_expression, expected, local_scope, fns, structs, generics, m, ctx, builder) is then_value:
                         _ = LLVMBuildStore(builder, then_value, result_slot)
                         _ = LLVMBuildBr(builder, done_block)
                         LLVMPositionBuilderAtEnd(builder, else_block)
                         # An `else` is mandatory in a value position; an Absent else
                         # declines (no value on one path).
-                        if emit_expression(else_expression, expected, local_scope, fns, structs, m, ctx, builder) is else_value:
+                        if emit_expression(else_expression, expected, local_scope, fns, structs, generics, m, ctx, builder) is else_value:
                             _ = LLVMBuildStore(builder, else_value, result_slot)
                             _ = LLVMBuildBr(builder, done_block)
                             LLVMPositionBuilderAtEnd(builder, done_block)
@@ -1110,11 +1340,11 @@ module Backend:
                 temporary: LLVMValueRef = LLVMBuildAlloca(builder, array_llvm, "array")
                 declined: mutable bool = false
                 position: mutable u32 = 0
-                for element_expression in array_elements |declined, position, element_type, array_llvm, temporary, local_scope, fns, structs, m, ctx, builder|:
+                for element_expression in array_elements |declined, position, element_type, array_llvm, temporary, local_scope, fns, structs, generics, m, ctx, builder|:
                     indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), LLVMConstInt(LLVMInt64TypeInContext(ctx), position.u64(), 0)]
                     indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
                     pointer: LLVMValueRef = LLVMBuildGEP2(builder, array_llvm, temporary, indices_pointer, 2, "init.ptr")
-                    if emit_expression(element_expression, element_type, local_scope, fns, structs, m, ctx, builder) is element_value:
+                    if emit_expression(element_expression, element_type, local_scope, fns, structs, generics, m, ctx, builder) is element_value:
                         _ = LLVMBuildStore(builder, element_value, pointer)
                     else:
                         declined <- true
@@ -1131,12 +1361,12 @@ module Backend:
                         # A darray indexes through its `items` pointer; a fixed array
                         # indexes the storage directly.
                         if array_type.kind == TypeKind.DArray:
-                            if emit_darray_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, m, ctx, builder) is darray_pointer:
+                            if emit_darray_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, generics, m, ctx, builder) is darray_pointer:
                                 darray_element: ValueType = darray_element_of(array_type, structs)
                                 return LLVMBuildLoad2(builder, llvm_type_of(darray_element, structs, ctx), darray_pointer, "darray.elem")
                             return null
                         null return if array_type.kind != TypeKind.Array
-                        if emit_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, m, ctx, builder) is pointer:
+                        if emit_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, generics, m, ctx, builder) is pointer:
                             element_type: ValueType = array_element_of(array_type, structs)
                             return LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), pointer, "elem")
                 return null
@@ -1157,13 +1387,13 @@ module Backend:
                 struct_llvm: LLVMTypeRef = llvm_type_of(built_type, structs, ctx)
                 temporary: LLVMValueRef = LLVMBuildAlloca(builder, struct_llvm, "construct")
                 declined: mutable bool = false
-                for field_init in construct_fields |declined, struct_slot, struct_llvm, temporary, local_scope, fns, structs, m, ctx, builder|:
+                for field_init in construct_fields |declined, struct_slot, struct_llvm, temporary, local_scope, fns, structs, generics, m, ctx, builder|:
                     position: i64 = field_index_of(structs, struct_slot, field_init.name)
                     if position < 0:
                         declined <- true
                     else:
                         field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
-                        if emit_expression(field_init.value, field_type, local_scope, fns, structs, m, ctx, builder) is field_value:
+                        if emit_expression(field_init.value, field_type, local_scope, fns, structs, generics, m, ctx, builder) is field_value:
                             _ = LLVMBuildStore(builder, field_value, LLVMBuildStructGEP2(builder, struct_llvm, temporary, position.u32(), "field.ptr"))
                         else:
                             declined <- true
@@ -1207,22 +1437,22 @@ module Backend:
                     null return if call_arguments.count != 0
                     # The source's own type decides; only a bare literal receiver needs a
                     # default, and `1.5.i64()` is not a form the subset needs to model.
-                    source_type: ValueType = resolve_type(cast_object, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs)
-                    if emit_expression(cast_object, source_type, local_scope, fns, structs, m, ctx, builder) is source_value:
+                    source_type: ValueType = resolve_type(cast_object, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
+                    if emit_expression(cast_object, source_type, local_scope, fns, structs, generics, m, ctx, builder) is source_value:
                         return emit_conversion(source_value, source_type, target_type, structs, ctx, builder)
                     return null
-                return emit_call(call_callee, call_arguments, local_scope, fns, structs, m, ctx, builder)
+                return emit_call(call_callee, call_arguments, local_scope, fns, structs, generics, m, ctx, builder)
             return null
 
 
         # Emit a branch condition: a modeled `bool` (i1). Elisa requires a bool condition,
         # so this simply emits at bool type — no `!= 0` narrowing, because a comparison
         # already yields i1 and a bool local is stored as i1.
-        def emit_condition(condition: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_condition(condition: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             bool_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
-            condition_type: ValueType = resolve_type(condition, bool_type, local_scope, fns, structs)
+            condition_type: ValueType = resolve_type(condition, bool_type, local_scope, fns, structs, generics)
             null return if condition_type.kind != TypeKind.Bool
-            return emit_expression(condition, bool_type, local_scope, fns, structs, m, ctx, builder)
+            return emit_expression(condition, bool_type, local_scope, fns, structs, generics, m, ctx, builder)
 
 
         # Branch to `dest` only when the just-emitted region left the block OPEN. An arm
@@ -1239,18 +1469,18 @@ module Backend:
         # A statement AFTER a terminator is unreachable; the subset does not model dead
         # code, so it declines rather than emitting into a closed block (which LLVM would
         # reject anyway).
-        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             status: mutable EmitStatus = EmitStatus.Open
-            for statement in body |status, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder|:
+            for statement in body |status, return_type, local_scope, loops, fns, structs, generics, runtime, m, ctx, builder|:
                 if status == EmitStatus.Open:
-                    status <- emit_statement(statement, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
+                    status <- emit_statement(statement, return_type, local_scope, loops, fns, structs, generics, runtime, m, ctx, builder)
                 else:
                     status <- EmitStatus.Declined
             return status
 
 
         # Emit one statement. Returns false to DECLINE (unmodeled construct).
-        def emit_statement(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_statement(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
 
             # `xs.push(v)` — a statement-position method call on a darray.
@@ -1261,13 +1491,13 @@ module Backend:
                             push_type: ValueType = lookup_type(local_scope, push_name)
                             if push_type.kind == TypeKind.DArray and push_method == "push" and push_arguments.count == 1:
                                 if lookup_slot(local_scope, push_name) is push_slot:
-                                    if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, runtime, m, ctx, builder):
+                                    if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, generics, runtime, m, ctx, builder):
                                         return EmitStatus.Open
                 return EmitStatus.Declined
 
             if statement is Stmt.Return(return_value_opt, return_line):
                 if return_value_opt is return_value:
-                    emitted: LLVMValueRef? = emit_expression(return_value, return_type, local_scope, fns, structs, m, ctx, builder)
+                    emitted: LLVMValueRef? = emit_expression(return_value, return_type, local_scope, fns, structs, generics, m, ctx, builder)
                     if emitted is return_constant:
                         # Free the auto region on the way out — EVERY return path, which is
                         # why this lives here rather than at one function exit.
@@ -1285,7 +1515,7 @@ module Backend:
                 # at that type — so `a: u8 = 200` stores a real u8.
                 declared_type: ValueType = annotation_value_type(var_type, structs)
                 EmitStatus.Declined return if declared_type.kind == TypeKind.Unmodeled
-                if emit_expression(var_value, declared_type, local_scope, fns, structs, m, ctx, builder) is initial:
+                if emit_expression(var_value, declared_type, local_scope, fns, structs, generics, m, ctx, builder) is initial:
                     name_storage: mutable darray[u8] = []
                     slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(declared_type, structs, ctx), sview_to_cstr(var_name, name_storage))
                     _ = LLVMBuildStore(builder, initial, slot)
@@ -1308,7 +1538,7 @@ module Backend:
                     if assign_target is Expr.Ident(compound_name, compound_name_line):
                         if lookup_slot(local_scope, compound_name) is compound_slot:
                             target_type: ValueType = lookup_type(local_scope, compound_name)
-                            if emit_expression(assign_value, target_type, local_scope, fns, structs, m, ctx, builder) is operand:
+                            if emit_expression(assign_value, target_type, local_scope, fns, structs, generics, m, ctx, builder) is operand:
                                 current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(target_type, structs, ctx), compound_slot, "aug.load")
                                 if emit_binary(compound, current, operand, target_type, structs, ctx, builder) is combined:
                                     _ = LLVMBuildStore(builder, combined, compound_slot)
@@ -1323,17 +1553,17 @@ module Backend:
                         assign_array_type: ValueType = lookup_type(local_scope, assign_array_name)
                         if lookup_slot(local_scope, assign_array_name) is darray_assign_slot:
                             if assign_array_type.kind == TypeKind.DArray:
-                                if emit_darray_index_address(darray_assign_slot, assign_array_type, assign_index, local_scope, fns, structs, m, ctx, builder) is darray_element_pointer:
+                                if emit_darray_index_address(darray_assign_slot, assign_array_type, assign_index, local_scope, fns, structs, generics, m, ctx, builder) is darray_element_pointer:
                                     darray_assign_element: ValueType = darray_element_of(assign_array_type, structs)
-                                    if emit_expression(assign_value, darray_assign_element, local_scope, fns, structs, m, ctx, builder) is darray_assigned:
+                                    if emit_expression(assign_value, darray_assign_element, local_scope, fns, structs, generics, m, ctx, builder) is darray_assigned:
                                         _ = LLVMBuildStore(builder, darray_assigned, darray_element_pointer)
                                         return EmitStatus.Open
                                 return EmitStatus.Declined
                         EmitStatus.Declined return if assign_array_type.kind != TypeKind.Array
                         if lookup_slot(local_scope, assign_array_name) is assign_array_slot:
-                            if emit_index_address(assign_array_slot, assign_array_type, assign_index, local_scope, fns, structs, m, ctx, builder) is element_pointer:
+                            if emit_index_address(assign_array_slot, assign_array_type, assign_index, local_scope, fns, structs, generics, m, ctx, builder) is element_pointer:
                                 element_type: ValueType = array_element_of(assign_array_type, structs)
-                                if emit_expression(assign_value, element_type, local_scope, fns, structs, m, ctx, builder) is element_value:
+                                if emit_expression(assign_value, element_type, local_scope, fns, structs, generics, m, ctx, builder) is element_value:
                                     _ = LLVMBuildStore(builder, element_value, element_pointer)
                                     return EmitStatus.Open
                     return EmitStatus.Declined
@@ -1342,14 +1572,14 @@ module Backend:
                 if assign_target is Expr.Ident(target_name, target_line):
                     slot_opt: LLVMValueRef? = lookup_slot(local_scope, target_name)
                     if slot_opt is slot:
-                        new_value: LLVMValueRef? = emit_expression(assign_value, lookup_type(local_scope, target_name), local_scope, fns, structs, m, ctx, builder)
+                        new_value: LLVMValueRef? = emit_expression(assign_value, lookup_type(local_scope, target_name), local_scope, fns, structs, generics, m, ctx, builder)
                         if new_value is assigned:
                             _ = LLVMBuildStore(builder, assigned, slot)
                             return EmitStatus.Open
                 return EmitStatus.Declined
 
             if statement is Stmt.If(if_condition, then_body, else_body, if_line):
-                condition_opt: LLVMValueRef? = emit_condition(if_condition, local_scope, fns, structs, m, ctx, builder)
+                condition_opt: LLVMValueRef? = emit_condition(if_condition, local_scope, fns, structs, generics, m, ctx, builder)
                 if condition_opt is condition_bit:
                     function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                     then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "if.then")
@@ -1358,12 +1588,12 @@ module Backend:
                     _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
 
                     LLVMPositionBuilderAtEnd(builder, then_block)
-                    then_status: EmitStatus = emit_statements(then_body, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
+                    then_status: EmitStatus = emit_statements(then_body, return_type, local_scope, loops, fns, structs, generics, runtime, m, ctx, builder)
                     EmitStatus.Declined return if then_status == EmitStatus.Declined
                     branch_if_open(then_status, builder, join_block)
 
                     LLVMPositionBuilderAtEnd(builder, else_block)
-                    else_status: EmitStatus = emit_statements(else_body, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
+                    else_status: EmitStatus = emit_statements(else_body, return_type, local_scope, loops, fns, structs, generics, runtime, m, ctx, builder)
                     EmitStatus.Declined return if else_status == EmitStatus.Declined
                     branch_if_open(else_status, builder, join_block)
 
@@ -1387,14 +1617,14 @@ module Backend:
                 # block that the body branches back to.
                 _ = LLVMBuildBr(builder, head_block)
                 LLVMPositionBuilderAtEnd(builder, head_block)
-                condition_opt: LLVMValueRef? = emit_condition(while_condition, local_scope, fns, structs, m, ctx, builder)
+                condition_opt: LLVMValueRef? = emit_condition(while_condition, local_scope, fns, structs, generics, m, ctx, builder)
                 if condition_opt is condition_bit:
                     _ = LLVMBuildCondBr(builder, condition_bit, body_block, exit_block)
                     LLVMPositionBuilderAtEnd(builder, body_block)
                     # A `while` continues to its CONDITION.
                     loops.exits <- loops.exits.push(exit_block)
                     loops.continues <- loops.continues.push(head_block)
-                    body_status: EmitStatus = emit_statements(while_body, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
+                    body_status: EmitStatus = emit_statements(while_body, return_type, local_scope, loops, fns, structs, generics, runtime, m, ctx, builder)
                     _ = loops.exits.pop()
                     _ = loops.continues.pop()
                     EmitStatus.Declined return if body_status == EmitStatus.Declined
@@ -1440,10 +1670,10 @@ module Backend:
 
                     # The loop variable's type comes from the range bounds; a bare
                     # `0..<10` is two literals, so it defaults to signed 64.
-                    loop_type: ValueType = resolve_type(range_low, resolve_type(range_high, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs), local_scope, fns, structs)
+                    loop_type: ValueType = resolve_type(range_low, resolve_type(range_high, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics), local_scope, fns, structs, generics)
                     EmitStatus.Declined return if not is_integer_type(loop_type)
-                    low_opt: LLVMValueRef? = emit_expression(range_low, loop_type, local_scope, fns, structs, m, ctx, builder)
-                    high_opt: LLVMValueRef? = emit_expression(range_high, loop_type, local_scope, fns, structs, m, ctx, builder)
+                    low_opt: LLVMValueRef? = emit_expression(range_low, loop_type, local_scope, fns, structs, generics, m, ctx, builder)
+                    high_opt: LLVMValueRef? = emit_expression(range_high, loop_type, local_scope, fns, structs, generics, m, ctx, builder)
                     if low_opt is low_value:
                         if high_opt is high_value:
                             name_storage: mutable darray[u8] = []
@@ -1470,7 +1700,7 @@ module Backend:
                             LLVMPositionBuilderAtEnd(builder, body_block)
                             loops.exits <- loops.exits.push(exit_block)
                             loops.continues <- loops.continues.push(step_block)
-                            body_status: EmitStatus = emit_statements(for_body, return_type, local_scope, loops, fns, structs, runtime, m, ctx, builder)
+                            body_status: EmitStatus = emit_statements(for_body, return_type, local_scope, loops, fns, structs, generics, runtime, m, ctx, builder)
                             _ = loops.exits.pop()
                             _ = loops.continues.pop()
                             EmitStatus.Declined return if body_status == EmitStatus.Declined
@@ -1503,6 +1733,55 @@ module Backend:
             for index in 0..<fns.names.count |fns, name|:
                 index.i64() return if fns.names[index] == name
             return -1
+
+
+        # Register every generic function TEMPLATE in the file.
+        def register_generics(file: Ast::File&, generics: mutable GenericTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for declaration in file.top_decls |generics, file|:
+                if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                    start: usize = generics.params.count
+                    for row in 0..<file.generic_param_lines.count |generics, file, line|:
+                        # High bit set => a BOUND row (`[T: Ord]`), not a type parameter.
+                        continue if file.generic_param_lines[row] >= 2147483648
+                        continue if file.generic_param_lines[row] != line
+                        generics.params <- generics.params.push(file.generic_param_names[row])
+                    added: usize = generics.params.count - start
+                    if added != 0:
+                        generics.names <- generics.names.push(function_name)
+                        generics.decls <- generics.decls.push(declaration)
+                        generics.param_start <- generics.param_start.push(start)
+                        generics.param_count <- generics.param_count.push(added)
+
+
+        # The source-level spelling a type contributes to a mangled name. Must agree with
+        # stage0's scheme (`identity__i64`), read from its emitted IR.
+        def push_type_name(value_type: ValueType, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            text: mutable sview = "unknown"
+            if value_type.kind == TypeKind.Bool:
+                text <- "bool"
+            if value_type.kind == TypeKind.Float:
+                text <- "f32" if value_type.bits == 32 else "f64"
+            if value_type.kind == TypeKind.Signed:
+                text <- "i8" if value_type.bits == 8 else ("i16" if value_type.bits == 16 else ("i32" if value_type.bits == 32 else "i64"))
+            if value_type.kind == TypeKind.Unsigned:
+                text <- "u8" if value_type.bits == 8 else ("u16" if value_type.bits == 16 else ("u32" if value_type.bits == 32 else "u64"))
+            for index in 0..<sview_len(text) |storage, text|:
+                storage.push(sview_at(text, index))
+
+
+        # Build `identity` + i64 -> "identity__i64" into `storage`, NUL-terminated.
+        #
+        # The result is transient by design: LLVMAddFunction COPIES the name, so the buffer
+        # can die immediately. Nothing keeps an sview to it — the instantiation cache is
+        # keyed by (base, type), precisely so no name has to outlive this call.
+        def mangled_name_into(base: sview, type_argument: ValueType, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<sview_len(base) |storage, base|:
+                storage.push(sview_at(base, index))
+            storage.push(95)
+            storage.push(95)
+            push_type_name(type_argument, storage)
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
 
 
         # Pass 1: create the NAMED (empty) LLVM type for a struct declaration and record
@@ -1556,7 +1835,7 @@ module Backend:
         # types in `fns`. Null when the signature is outside the modeled subset.
         #
         # Signature types are REAL now: any modeled scalar width/signedness, not just i64.
-        def declare_function(declaration: Decl, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_function(declaration: Decl, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 if return_type_opt is return_type:
                     return_value_type: ValueType = annotation_value_type(return_type, structs)
@@ -1596,9 +1875,14 @@ module Backend:
 
 
         # Emit the body of an already-declared function. False = declined.
-        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
-                return_value_type: ValueType = lookup_return_type(fns, function_name)
+                # From the ANNOTATION, not from `fns`: a generic TEMPLATE has no fns entry
+                # (only its instantiations do), and with bindings active the annotation
+                # already resolves `T` to this instantiation's concrete type.
+                return_value_type: mutable ValueType = unmodeled_type()
+                if return_type_opt is declared_return:
+                    return_value_type <- annotation_value_type(declared_return, structs)
                 false return if return_value_type.kind == TypeKind.Unmodeled
                 entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
                 LLVMPositionBuilderAtEnd(builder, entry)
@@ -1631,8 +1915,26 @@ module Backend:
 
                 # A function that can run off the end is not modeled — rather than invent
                 # a return value, decline. (LLVM would reject the unterminated block.)
-                return emit_statements(body, return_value_type, local_scope, loops, fns, structs, local_runtime, m, ctx, builder) == EmitStatus.Terminated
+                return emit_statements(body, return_value_type, local_scope, loops, fns, structs, generics, local_runtime, m, ctx, builder) == EmitStatus.Terminated
             return false
+
+        # Emit the body of one queued instantiation, with its type parameter BOUND for the
+        # whole emission — so every `T` inside resolves to the concrete type.
+        def emit_instantiation_body(index: usize, generics: mutable GenericTable&, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            base: sview = generics.pending_bases[index]
+            type_argument: ValueType = copied_type(generics.pending_types[index])
+            handle: LLVMValueRef = generics.pending_handles[index]
+            template_index: i64 = generic_index_of(generics, base)
+            false return if template_index < 0
+            slot: usize = template_index.usize()
+
+            structs.binding_names <- structs.binding_names.push(generics.params[generics.param_start[slot]])
+            structs.binding_types <- structs.binding_types.push(copied_type(type_argument))
+            emitted: bool = emit_function_body(generics.decls[slot], handle, fns, structs, generics, runtime, m, ctx, builder)
+            _ = structs.binding_names.pop()
+            _ = structs.binding_types.pop()
+            return emitted
+
 
     public:
 
@@ -1654,10 +1956,14 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], binding_names: [], binding_types: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
+            generics: mutable GenericTable = new_generic_table()
+            # Templates must be known before any body is emitted: a call decides between
+            # "ordinary function" and "instantiate a generic" by looking here.
+            register_generics(file, generics)
             fns: mutable FnTable = FnTable{names: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
@@ -1675,10 +1981,13 @@ module Backend:
             # its own (its type was built above), so it is skipped rather than declined.
             # The body pass looks its handle up by NAME — `fns` is no longer index-parallel
             # with `top_decls` now that non-function declarations exist.
-            for declaration in file.top_decls |fns, declined, structs, m, ctx|:
+            for declaration in file.top_decls |fns, declined, structs, generics, m, ctx|:
                 continue if function_name_of(declaration) == ""
+                # A generic TEMPLATE has no code of its own — only its instantiations do —
+                # so it is skipped here, not declined.
+                continue if generic_index_of(generics, function_name_of(declaration)) >= 0
                 # declare_function records the signature's types into `fns` itself.
-                if not (declare_function(declaration, fns, structs, m, ctx) is declared_fn):
+                if not (declare_function(declaration, fns, structs, generics, m, ctx) is declared_fn):
                     declined <- true
             -1 return if declined
 
@@ -1686,12 +1995,25 @@ module Backend:
             for declaration in file.top_decls |emitted_count, declined, fns, structs, m, ctx, builder|:
                 declaration_name: sview = function_name_of(declaration)
                 continue if declaration_name == ""
+                continue if generic_index_of(generics, declaration_name) >= 0
                 handle_index: i64 = function_index_of(fns, declaration_name)
                 if handle_index < 0:
                     declined <- true
                     continue
-                emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], fns, structs, runtime, m, ctx, builder)
+                emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], fns, structs, generics, runtime, m, ctx, builder)
                 emitted_count <- emitted_count + 1 if emitted else emitted_count
                 declined <- true if not emitted else declined
+            -1 return if declined
+
+            # Drain the instantiation worklist. A LOOP, not a single pass: emitting one
+            # instantiation's body can request another (a generic calling a generic), which
+            # appends to the queue while it is being drained.
+            drained: mutable usize = 0
+            while drained < generics.pending_bases.count |drained, generics, fns, structs, runtime, m, ctx, builder, declined, emitted_count|:
+                if emit_instantiation_body(drained, generics, fns, structs, runtime, m, ctx, builder):
+                    emitted_count <- emitted_count + 1
+                else:
+                    declined <- true
+                drained <- drained + 1
             -1 return if declined
             return emitted_count

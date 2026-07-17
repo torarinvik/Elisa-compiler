@@ -225,6 +225,20 @@ run_case darray_write     'def main() -> i64:\n    xs: mutable darray[i64] = []\
 # that never grew would pass the smaller cases and fail only here.
 run_case darray_grow      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'  42
 
+# GENERICS — monomorphization. The gate for dict/set/user generics.
+#
+# Generic parameters are NOT on Decl.Func: they live in a FILE-level side table keyed by the
+# function's LINE (a row whose line has the high bit set is a BOUND, not a parameter).
+# Instantiations are named `identity__i64`, matching stage0's scheme read from its IR.
+run_case generic_explicit  'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    return identity[i64](42)\n'  42
+run_case generic_inferred  'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    n: i64 = 42\n    return identity(n)\n'  42
+# TWO distinct instantiations of one template in one program: identity__u8 returns i8,
+# identity__i64 returns i64. Getting this wrong emits `sub i8 %a, i64 %b` — invalid IR.
+run_case generic_two_insts 'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    a: u8 = 200\n    b: i64 = 2\n    return identity[u8](a).i64() - identity[i64](b) - 156\n'  42
+# One instantiation, called twice: emitted ONCE (a duplicate definition would not link).
+run_case generic_reused    'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    a: i64 = 40\n    b: i64 = 2\n    return identity(a) + identity(b)\n'  42
+run_case generic_f64       'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    x: f64 = 42.5\n    return identity(x).i64()\n'  42
+
 # --- differential against stage0 -----------------------------------------------------
 # The strongest oracle available: compile the SAME source with the reference compiler and
 # require identical observable behavior. Hardcoding an expected value only checks what we
@@ -282,6 +296,9 @@ diff_case bitnot      'def main() -> i64:\n    a: i64 = 5\n    return ~a + 200\n
 diff_case and_or_not  'def main() -> i64:\n    a: i64 = 5\n    r: mutable i64 = 0\n    if a > 1 and a < 10:\n        r <- r + 1\n    if a > 100 or a == 5:\n        r <- r + 2\n    if not (a == 9):\n        r <- r + 4\n    return r\n'
 diff_case compound    'def main() -> i64:\n    x: mutable i64 = 10\n    x += 5\n    x -= 2\n    x *= 3\n    return x\n'
 diff_case short_circuit 'def main() -> i64:\n    a: i64 = 0\n    return 1 if a != 0 and (10 / a) > 0 else 42\n'
+diff_case generic_explicit  'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    return identity[i64](42)\n'
+diff_case generic_two_insts 'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    a: u8 = 200\n    b: i64 = 2\n    return identity[u8](a).i64() - identity[i64](b) - 156\n'
+diff_case generic_f64       'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    x: f64 = 42.5\n    return identity(x).i64()\n'
 diff_case darray_push  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'
 diff_case darray_grow  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'
 diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'
@@ -328,6 +345,9 @@ decline_case() {
 # a three-line dict program emits 102 functions. Supporting dict therefore requires generic
 # instantiation plus compiling elisacore_std/collections.elisa (error unions, refs,
 # optional-of-ref), not an ABI to mirror. Until then it must DECLINE, not half-emit.
+# A generic calling ANOTHER generic is not modeled yet (the worklist drains, but the inner
+# call's type does not resolve through the outer instantiation's bindings). Declines.
+decline_case generic_chained 'def wrap[T](x: T) -> T:\n    return identity(x)\n\ndef identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    n: i64 = 42\n    return wrap(n)\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
