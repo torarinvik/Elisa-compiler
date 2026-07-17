@@ -50,6 +50,7 @@ NAMES=(
     ungranted_effect_call
     ungranted_extern_effect_call
     unknown_permission_member
+    ungranted_forward_inferred_effect_call
     ungranted_inferred_effect_call
     contract_not_first
     contract_ensure_result_void
@@ -186,6 +187,7 @@ EXPECTS=(
     "call to 'g' requires an enclosing effect grant"
     "call to 'emit' requires an enclosing effect grant"
     "permission \"Console\" has no member \"Read\""
+    "call to 'callee' requires an enclosing effect grant"
     "call to 'h' requires an enclosing effect grant"
     "must be the first statements of the function body"
     "returns void (no result value to bind)"
