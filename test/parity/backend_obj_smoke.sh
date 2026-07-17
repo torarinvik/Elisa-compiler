@@ -103,5 +103,37 @@ vectorize_case() {
 }
 vectorize_case
 
+# `-Wperf` ITSELF: the post-pass verdict, tested in BOTH directions. One direction proves
+# nothing -- a verifier that never warns passes the "no false alarm" test, and one that always
+# warns passes the "catches it" test. Only both together say it works.
+#
+# The non-vectorizable case needs a trip count too large to UNROLL: at 20 iterations LLVM
+# unrolls the loop away entirely, the latch (and its metadata) disappears, and there is
+# correctly nothing left to warn about. That is what made my first attempt look like a
+# working verifier when it was silently broken.
+wperf_case() {
+    local name="$1" src="$2" want_warning="$3"
+    total=$((total + 1))
+    local dir="$BUILD/obj_wperf_$name"; rm -rf "$dir"; mkdir -p "$dir"
+    local out
+    out="$( cd "$dir" && printf '%b' "$src" | RUN "$BUILD/emit_obj" 2>&1 )"
+    local got=no
+    echo "$out" | grep -q "WPERF" && got=yes
+    if [ "$got" = "$want_warning" ]; then
+        pass=$((pass + 1))
+    else
+        echo "  FAIL obj_wperf_$name: warning=$got want=$want_warning"
+    fi
+}
+
+# A recursive call in the body: cannot vectorize, and 1000 iterations will not unroll.
+wperf_case warns 'def fib(n: i64) -> i64:\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n\ndef main() -> i64:\n    xs: darray[i64] = [fib(i % 8) for i in 0..<1000]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' yes
+# A plain fill: vectorizes, so NO warning. This is the direction that catches a verifier
+# which warns about everything.
+wperf_case silent 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<1000]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' no
+# An UNROLLED loop has no latch left to carry the marker, so there is nothing to judge and no
+# warning -- not a miss.
+wperf_case unrolled_is_silent 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<8]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' no
+
 if [ "$pass" -ne "$total" ]; then echo "backend_obj_smoke FAILED: passed=$pass total=$total"; exit 1; fi
 echo "backend_obj_smoke OK: $pass/$total (objects emitted by stage1, no llc)"

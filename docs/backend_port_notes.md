@@ -681,7 +681,7 @@ against. DWARF is also invisible to an exit code, so `diff_case` cannot see it a
 it needs `ir_case`-style checks against the metadata, or a dwarfdump comparison on the linked
 object. Worth doing deliberately rather than by analogy with the other slices.
 
-## `-Wperf` — a 260-line backend hook, GATED behind comprehensions
+## `-Wperf` — LANDED (tagging + post-pass verdict)
 
 `-Wperf` does not change codegen: `-emit llvm` with and without it is identical. But unlike
 effects it is not purely semantic — `compiler/src/backend/llvm_autovec_verify.go` (260 lines)
@@ -694,8 +694,23 @@ The reason the IR diff showed nothing: it only tags **comprehension build loops*
 
     xs: darray[i64] = [i for i in 0..<10]     # stage0: exit 42;  stage1: DECLINES
 
-That is the next real unblocked increment, and it is a prerequisite for `-Wperf` rather than
-a sibling of it.
+Comprehensions landed (b50e3d6), then the tagging (4707625), then the pass pipeline
+(3e11a20), and now the post-pass verdict: verify_autovec_expectations walks every
+terminator's `!llvm.loop` AFTER the passes and reports loops marked
+`elisa.autovec.expected` that LLVM did not mark `llvm.loop.isvectorized`.
+
+Gated in BOTH directions, which is the only test that means anything here: a verifier that
+never warns passes "no false alarms", and one that always warns passes "catches it". Only
+both together say it works.
+
+Two traps found by testing the warning direction:
+* An UNROLLED loop has no latch left, so the marker vanishes and there is correctly nothing
+  to warn about. At 20 iterations LLVM unrolls the comprehension away entirely -- which made
+  a silently-broken verifier look like a working one. The warning case needs a trip count
+  too large to unroll (1000) plus a body that cannot vectorize (a recursive call).
+* `false return if LLVMIsAMDNode(x) is node` is INVERTED -- `is` binds when PRESENT, so it
+  rejected every real MDNode and the verifier never warned. Same inversion as the early
+  lookup_function bug.
 
 ### Probe harness bug worth knowing
 
