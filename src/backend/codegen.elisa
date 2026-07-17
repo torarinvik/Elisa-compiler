@@ -47,6 +47,9 @@ module Backend:
             Unsigned
             Bool
             Float
+            # A user struct. `bits` is its index in the StructTable — a ValueType must stay
+            # POD (an sview name would be fine, but an index also gives O(1) field lookup).
+            Struct
 
 
         struct ValueType:
@@ -94,23 +97,57 @@ module Backend:
         # Unary node wrapping the type, so it is unwrapped here — mutability is the
         # frontend's business (it already rejects `x <- 1` on an immutable local), and the
         # backend only needs the underlying type.
-        def annotation_value_type(type_expression: Expr) -> ValueType can[Abort.Panic]:
+        def annotation_value_type(type_expression: Expr, structs: StructTable&) -> ValueType can[Abort.Panic]:
             if type_expression is Expr.Unary(qualifier, qualified_type, qualifier_line):
-                return annotation_value_type(qualified_type) if qualifier == TokenKind.Mutable else unmodeled_type()
+                return annotation_value_type(qualified_type, structs) if qualifier == TokenKind.Mutable else unmodeled_type()
             if type_expression is Expr.Ident(type_name, type_line):
-                return scalar_type_of_name(type_name)
+                scalar: ValueType = scalar_type_of_name(type_name)
+                scalar return if scalar.kind != TypeKind.Unmodeled
+                # A user STRUCT name: `bits` carries its registry index.
+                struct_index: i64 = struct_index_of(structs, type_name)
+                ValueType{kind: TypeKind.Struct, bits: struct_index.u32()} return if struct_index >= 0
             return unmodeled_type()
 
 
         # The LLVM type backing a ValueType.
-        def llvm_type_of(value_type: ValueType, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
+        def llvm_type_of(value_type: ValueType, structs: StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
             LLVMInt1TypeInContext(ctx) return if value_type.kind == TypeKind.Bool
+            structs.handles[value_type.bits.usize()] return if value_type.kind == TypeKind.Struct
             if value_type.kind == TypeKind.Float:
                 return LLVMFloatTypeInContext(ctx) if value_type.bits == 32 else LLVMDoubleTypeInContext(ctx)
             LLVMInt8TypeInContext(ctx) return if value_type.bits == 8
             LLVMInt16TypeInContext(ctx) return if value_type.bits == 16
             LLVMInt32TypeInContext(ctx) return if value_type.bits == 32
             return LLVMInt64TypeInContext(ctx)
+
+
+        # The module's struct types.
+        #
+        # Field names/types live in FLAT pools with a per-struct span, the same shape as
+        # FnTable's parameters — a nested `darray[darray[…]]` would make this
+        # region-polymorphic for no benefit.
+        struct StructTable:
+            names: mutable darray[sview]
+            handles: mutable darray[LLVMTypeRef]
+            field_names: mutable darray[sview]
+            field_types: mutable darray[ValueType]
+            field_start: mutable darray[usize]
+            field_count: mutable darray[usize]
+
+
+        # The registry index of struct `name`, or -1.
+        def struct_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<structs.names.count |structs, name|:
+                index.i64() return if structs.names[index] == name
+            return -1
+
+
+        # The position of `field` within struct `struct_index`, or -1. This IS the LLVM
+        # element index: fields are emitted in declaration order.
+        def field_index_of(structs: StructTable&, struct_index: usize, field: sview) -> i64 can[Abort.Panic]:
+            for offset in 0..<structs.field_count[struct_index] |structs, struct_index, field|:
+                offset.i64() return if structs.field_names[structs.field_start[struct_index] + offset] == field
+            return -1
 
 
         # A function's local slots: `names[i]` lives in the `alloca` at `slots[i]`.
@@ -231,11 +268,11 @@ module Backend:
         # (Unmodeled) and adopts whatever its context supplies. That is why the emitters
         # thread an `expected` type downward — `a: u8 = 200` must make 200 a u8, not an
         # i64 that is then silently truncated.
-        def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&) -> ValueType can[Abort.Panic]:
+        def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&) -> ValueType can[Abort.Panic]:
             if expression is Expr.Ident(ident_name, ident_line):
                 return lookup_type(local_scope, ident_name)
             if expression is Expr.Paren(paren_inner, paren_line):
-                return expression_type(paren_inner, local_scope, fns)
+                return expression_type(paren_inner, local_scope, fns, structs)
             if expression is Expr.BoolLit(bool_value):
                 return ValueType{kind: TypeKind.Bool, bits: 1}
             # A FLOAT literal, like an int literal, defers to its context (`x: f32 = 1.5`),
@@ -243,16 +280,28 @@ module Backend:
             if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
                 # `not x` is a bool whatever `x` is; `-x` / `~x` keep the operand's type.
                 ValueType{kind: TypeKind.Bool, bits: 1} return if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang
-                return expression_type(unary_operand, local_scope, fns)
+                return expression_type(unary_operand, local_scope, fns, structs)
             if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
                 # A comparison or logical yields bool regardless of operand type.
                 ValueType{kind: TypeKind.Bool, bits: 1} return if int_predicate_of(binary_operator) >= 0
                 ValueType{kind: TypeKind.Bool, bits: 1} return if binary_operator == TokenKind.And or binary_operator == TokenKind.Or
                 # Arithmetic keeps the operands' type: take whichever side is known, since
                 # a literal contributes nothing.
-                left_type: ValueType = expression_type(binary_left, local_scope, fns)
+                left_type: ValueType = expression_type(binary_left, local_scope, fns, structs)
                 left_type return if left_type.kind != TypeKind.Unmodeled
-                return expression_type(binary_right, local_scope, fns)
+                return expression_type(binary_right, local_scope, fns, structs)
+            # `p.x` — a field READ has the field's declared type. (A cast `x.u8()` is a
+            # Field under a Call, handled below, so a bare Field is always a field read.)
+            if expression is Expr.Field(field_object, field_name, field_line):
+                object_type: ValueType = expression_type(field_object, local_scope, fns, structs)
+                unmodeled_type() return if object_type.kind != TypeKind.Struct
+                struct_slot: usize = object_type.bits.usize()
+                position: i64 = field_index_of(structs, struct_slot, field_name)
+                unmodeled_type() return if position < 0
+                return structs.field_types[structs.field_start[struct_slot] + position.usize()]
+            # `Point{x: 1, y: 2}` — a brace construction has the constructed type.
+            if expression is Expr.Construct(construct_type, construct_fields, construct_line):
+                return annotation_value_type(construct_type, structs)
             if expression is Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
                 # `x.u8()` is a CAST (postfix call unifies cast and UFCS: `recv.Name()`
                 # where Name is a type name is a conversion).
@@ -310,7 +359,7 @@ module Backend:
             return -1
 
 
-        def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+        def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, structs: StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
             # Floats are a different instruction family end to end: fadd/fdiv/fcmp, never
             # add/sdiv/icmp. Bitwise and shifts have no float form and decline.
             if operand_type.kind == TypeKind.Float:
@@ -454,12 +503,12 @@ module Backend:
         #   br left ? rhs : done              ; `or` swaps the targets
         #   rhs:  result = right; br done
         #   done: load result
-        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
             is_and: bool = operator == TokenKind.And
 
             result_slot: LLVMValueRef = LLVMBuildAlloca(builder, bool_type, "sc.result")
-            if emit_condition(left_expression, local_scope, fns, m, ctx, builder) is left_bit:
+            if emit_condition(left_expression, local_scope, fns, structs, m, ctx, builder) is left_bit:
                 # `false and _` is false; `true or _` is true.
                 short_value: LLVMValueRef = LLVMConstInt(bool_type, 0, 0) if is_and else LLVMConstInt(bool_type, 1, 0)
                 _ = LLVMBuildStore(builder, short_value, result_slot)
@@ -474,7 +523,7 @@ module Backend:
                     _ = LLVMBuildCondBr(builder, left_bit, done_block, rhs_block)
 
                 LLVMPositionBuilderAtEnd(builder, rhs_block)
-                if emit_condition(right_expression, local_scope, fns, m, ctx, builder) is right_bit:
+                if emit_condition(right_expression, local_scope, fns, structs, m, ctx, builder) is right_bit:
                     _ = LLVMBuildStore(builder, right_bit, result_slot)
                     _ = LLVMBuildBr(builder, done_block)
                     LLVMPositionBuilderAtEnd(builder, done_block)
@@ -486,7 +535,7 @@ module Backend:
         # is modeled: the callee must exist in the module (emit_module declares every
         # function before emitting any body, so definition order does not matter) and the
         # arity must match.
-        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if callee is Expr.Ident(callee_name, callee_line):
                 target_opt: LLVMValueRef? = lookup_function(fns, callee_name)
                 if target_opt is target:
@@ -495,10 +544,10 @@ module Backend:
                     argument_values: mutable darray[LLVMValueRef] = []
                     declined: mutable bool = false
                     argument_index: mutable usize = 0
-                    for argument in arguments |argument_values, declined, argument_index, target, local_scope, fns, m, ctx, builder|:
+                    for argument in arguments |argument_values, declined, argument_index, target, local_scope, fns, structs, m, ctx, builder|:
                         # Each argument is emitted at its PARAMETER's declared type, so a
                         # literal argument adopts the parameter type rather than i64.
-                        argument_value: LLVMValueRef? = emit_expression(argument, param_type_of(fns, callee_name, argument_index), local_scope, fns, m, ctx, builder)
+                        argument_value: LLVMValueRef? = emit_expression(argument, param_type_of(fns, callee_name, argument_index), local_scope, fns, structs, m, ctx, builder)
                         if argument_value is emitted_argument:
                             argument_values.push(emitted_argument)
                         else:
@@ -519,8 +568,8 @@ module Backend:
         # The type a value will actually have: its own if known, else the context's.
         # An integer literal has no intrinsic type, so `expected` is what makes
         # `a: u8 = 200` a u8 rather than an i64 that is then truncated behind your back.
-        def resolve_type(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&) -> ValueType can[Abort.Panic]:
-            own: ValueType = expression_type(expression, local_scope, fns)
+        def resolve_type(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&) -> ValueType can[Abort.Panic]:
+            own: ValueType = expression_type(expression, local_scope, fns, structs)
             own return if own.kind != TypeKind.Unmodeled
             return expected
 
@@ -529,9 +578,9 @@ module Backend:
         # source and zero-extends an unsigned one (that IS the difference between
         # `u8 200 -> i64 200` and `i8 200 -> i64 -56`); narrowing truncates. Same width is
         # a no-op — a signed/unsigned reinterpretation costs no instruction.
-        def emit_conversion(value: LLVMValueRef, from_type: ValueType, to_type: ValueType, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+        def emit_conversion(value: LLVMValueRef, from_type: ValueType, to_type: ValueType, structs: StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
             null return if from_type.kind == TypeKind.Unmodeled or to_type.kind == TypeKind.Unmodeled
-            target: LLVMTypeRef = llvm_type_of(to_type, ctx)
+            target: LLVMTypeRef = llvm_type_of(to_type, structs, ctx)
             # bool <-> int needs an explicit widening decision; only int<->int, float, and
             # the identity are modeled.
             if from_type.kind == TypeKind.Bool or to_type.kind == TypeKind.Bool:
@@ -557,12 +606,12 @@ module Backend:
 
         # Emit a value expression, producing a value of `resolve_type(expression, expected)`.
         # `null` = unmodeled; the caller must decline.
-        def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if expression is Expr.IntLit(literal_value):
                 # A literal takes the context's type. sign_extend=1 so a negative literal
                 # fills correctly at any width.
                 null return if not is_integer_type(expected)
-                return LLVMConstInt(llvm_type_of(expected, ctx), literal_value.u64(), 1)
+                return LLVMConstInt(llvm_type_of(expected, structs, ctx), literal_value.u64(), 1)
             if expression is Expr.BoolLit(bool_value):
                 bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
                 return LLVMConstInt(bool_type, 1, 0) if bool_value else LLVMConstInt(bool_type, 0, 0)
@@ -571,27 +620,27 @@ module Backend:
             if expression is Expr.FloatLit(float_text):
                 null return if expected.kind != TypeKind.Float
                 text_storage: mutable darray[u8] = []
-                return LLVMConstRealOfString(llvm_type_of(expected, ctx), sview_to_cstr(float_text, text_storage))
+                return LLVMConstRealOfString(llvm_type_of(expected, structs, ctx), sview_to_cstr(float_text, text_storage))
             # An ident is a local read: load from its slot, at the slot's own type.
             if expression is Expr.Ident(ident_name, ident_line):
                 ident_type: ValueType = lookup_type(local_scope, ident_name)
                 null return if ident_type.kind == TypeKind.Unmodeled
                 if lookup_slot(local_scope, ident_name) is slot:
-                    return LLVMBuildLoad2(builder, llvm_type_of(ident_type, ctx), slot, "load")
+                    return LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "load")
                 return null
             if expression is Expr.Paren(paren_inner, paren_line):
-                return emit_expression(paren_inner, expected, local_scope, fns, m, ctx, builder)
+                return emit_expression(paren_inner, expected, local_scope, fns, structs, m, ctx, builder)
             if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
                 # `not x` needs a bool operand, not `expected` (which is itself bool).
                 if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang:
                     bool_type_n: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
-                    if emit_expression(unary_operand, bool_type_n, local_scope, fns, m, ctx, builder) is bool_operand:
+                    if emit_expression(unary_operand, bool_type_n, local_scope, fns, structs, m, ctx, builder) is bool_operand:
                         # `not` on an i1 is XOR with 1.
                         return LLVMBuildXor(builder, bool_operand, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), "not")
                     return null
-                operand_type: ValueType = resolve_type(unary_operand, expected, local_scope, fns)
+                operand_type: ValueType = resolve_type(unary_operand, expected, local_scope, fns, structs)
                 null return if not is_numeric_type(operand_type)
-                if emit_expression(unary_operand, operand_type, local_scope, fns, m, ctx, builder) is operand:
+                if emit_expression(unary_operand, operand_type, local_scope, fns, structs, m, ctx, builder) is operand:
                     operand return if unary_operator == TokenKind.Plus
                     if unary_operator == TokenKind.Minus:
                         # `-x` on a float is fneg; `~x` has no float form.
@@ -604,12 +653,12 @@ module Backend:
                 # `and`/`or` SHORT-CIRCUIT: the right side must only be emitted on the path
                 # that reaches it, so they cannot go through emit_binary.
                 if binary_operator == TokenKind.And or binary_operator == TokenKind.Or:
-                    return emit_short_circuit(binary_left, binary_operator, binary_right, local_scope, fns, m, ctx, builder)
+                    return emit_short_circuit(binary_left, binary_operator, binary_right, local_scope, fns, structs, m, ctx, builder)
                 # The OPERANDS' type is not the result type: `a < b` yields bool but must
                 # compare at a's type. Take whichever side is known; a literal defers.
-                operand_type: mutable ValueType = expression_type(binary_left, local_scope, fns)
+                operand_type: mutable ValueType = expression_type(binary_left, local_scope, fns, structs)
                 if operand_type.kind == TypeKind.Unmodeled:
-                    operand_type <- expression_type(binary_right, local_scope, fns)
+                    operand_type <- expression_type(binary_right, local_scope, fns, structs)
                 if operand_type.kind == TypeKind.Unmodeled:
                     # Both sides are literals (`2 + 3`): fall back to the context, which
                     # for a comparison is bool — so use i64 there.
@@ -617,31 +666,31 @@ module Backend:
                 null return if not is_numeric_type(operand_type)
                 # MIXED WIDTHS are not modeled: Elisa has no implicit numeric conversion
                 # in the subset, and silently extending one side would invent semantics.
-                left_own: ValueType = expression_type(binary_left, local_scope, fns)
-                right_own: ValueType = expression_type(binary_right, local_scope, fns)
+                left_own: ValueType = expression_type(binary_left, local_scope, fns, structs)
+                right_own: ValueType = expression_type(binary_right, local_scope, fns, structs)
                 null return if left_own.kind != TypeKind.Unmodeled and (left_own.bits != operand_type.bits or left_own.kind != operand_type.kind)
                 null return if right_own.kind != TypeKind.Unmodeled and (right_own.bits != operand_type.bits or right_own.kind != operand_type.kind)
-                if emit_expression(binary_left, operand_type, local_scope, fns, m, ctx, builder) is left:
-                    if emit_expression(binary_right, operand_type, local_scope, fns, m, ctx, builder) is right:
-                        return emit_binary(binary_operator, left, right, operand_type, ctx, builder)
+                if emit_expression(binary_left, operand_type, local_scope, fns, structs, m, ctx, builder) is left:
+                    if emit_expression(binary_right, operand_type, local_scope, fns, structs, m, ctx, builder) is right:
+                        return emit_binary(binary_operator, left, right, operand_type, structs, ctx, builder)
                 return null
             # A value `match` over an integer scrutinee: `match n: 0: 100 … _: 300`.
             #
             # Lowered as an ordered COMPARE CHAIN, not a switch: arms must be tried in
             # source order, and turning a dense chain into a switch is llc's job.
             if expression is Expr.Match(match_scrutinee, match_arms, match_line):
-                scrutinee_type: ValueType = resolve_type(match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns)
+                scrutinee_type: ValueType = resolve_type(match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs)
                 null return if not is_integer_type(scrutinee_type)
-                match_type: LLVMTypeRef = llvm_type_of(expected, ctx)
+                match_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
                 null return if expected.kind == TypeKind.Unmodeled
-                if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, m, ctx, builder) is scrutinee:
+                if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, m, ctx, builder) is scrutinee:
                     function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                     result_slot: LLVMValueRef = LLVMBuildAlloca(builder, match_type, "match.result")
                     done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.done")
                     declined: mutable bool = false
                     saw_default: mutable bool = false
 
-                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, expected, result_slot, done_block, function, local_scope, fns, m, ctx, builder|:
+                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, expected, result_slot, done_block, function, local_scope, fns, structs, m, ctx, builder|:
                         # Once a catch-all is emitted the chain is closed.
                         continue if declined or saw_default
                         if arm_has_guard(arm.guard):
@@ -654,10 +703,10 @@ module Backend:
                                 if parse_int_literal(literal_text, literal_value):
                                     next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.next")
                                     # 32 = LLVMIntEQ (equality needs no signedness).
-                                    hit: LLVMValueRef = LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(llvm_type_of(scrutinee_type, ctx), literal_value.u64(), 1), "match.cmp")
+                                    hit: LLVMValueRef = LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(llvm_type_of(scrutinee_type, structs, ctx), literal_value.u64(), 1), "match.cmp")
                                     _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
                                     LLVMPositionBuilderAtEnd(builder, arm_block)
-                                    if emit_expression(arm_expression, expected, local_scope, fns, m, ctx, builder) is arm_value:
+                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, m, ctx, builder) is arm_value:
                                         _ = LLVMBuildStore(builder, arm_value, result_slot)
                                         _ = LLVMBuildBr(builder, done_block)
                                     else:
@@ -669,7 +718,7 @@ module Backend:
                                 if is_catch_all_pattern(arm.pattern):
                                     _ = LLVMBuildBr(builder, arm_block)
                                     LLVMPositionBuilderAtEnd(builder, arm_block)
-                                    if emit_expression(arm_expression, expected, local_scope, fns, m, ctx, builder) is default_value:
+                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, m, ctx, builder) is default_value:
                                         _ = LLVMBuildStore(builder, default_value, result_slot)
                                         _ = LLVMBuildBr(builder, done_block)
                                         saw_default <- true
@@ -692,9 +741,9 @@ module Backend:
             # same result-slot lowering as `and`/`or`.
             if expression is Expr.If(ternary_condition, then_expression, else_expression, ternary_line):
                 null return if expected.kind == TypeKind.Unmodeled
-                ternary_type: LLVMTypeRef = llvm_type_of(expected, ctx)
+                ternary_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
                 result_slot: LLVMValueRef = LLVMBuildAlloca(builder, ternary_type, "if.result")
-                if emit_condition(ternary_condition, local_scope, fns, m, ctx, builder) is condition_bit:
+                if emit_condition(ternary_condition, local_scope, fns, structs, m, ctx, builder) is condition_bit:
                     function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                     then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.then")
                     else_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.else")
@@ -702,18 +751,63 @@ module Backend:
                     _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
 
                     LLVMPositionBuilderAtEnd(builder, then_block)
-                    if emit_expression(then_expression, expected, local_scope, fns, m, ctx, builder) is then_value:
+                    if emit_expression(then_expression, expected, local_scope, fns, structs, m, ctx, builder) is then_value:
                         _ = LLVMBuildStore(builder, then_value, result_slot)
                         _ = LLVMBuildBr(builder, done_block)
                         LLVMPositionBuilderAtEnd(builder, else_block)
                         # An `else` is mandatory in a value position; an Absent else
                         # declines (no value on one path).
-                        if emit_expression(else_expression, expected, local_scope, fns, m, ctx, builder) is else_value:
+                        if emit_expression(else_expression, expected, local_scope, fns, structs, m, ctx, builder) is else_value:
                             _ = LLVMBuildStore(builder, else_value, result_slot)
                             _ = LLVMBuildBr(builder, done_block)
                             LLVMPositionBuilderAtEnd(builder, done_block)
                             return LLVMBuildLoad2(builder, ternary_type, result_slot, "ifx")
                 return null
+            # `Point{x: 40, y: 2}` — build the value in a temporary slot, store each
+            # field, then load the whole struct back. mem2reg/SROA turn this into plain
+            # registers at -O2, so the temporary costs nothing in the output.
+            #
+            # Fields must be given by NAME and all of them present: the subset does not
+            # model shorthand or defaulted construction, so a missing field declines
+            # rather than silently leaving a slot undef.
+            if expression is Expr.Construct(construct_type, construct_fields, construct_line):
+                built_type: ValueType = annotation_value_type(construct_type, structs)
+                null return if built_type.kind != TypeKind.Struct
+                struct_slot: usize = built_type.bits.usize()
+                null return if construct_fields.count != structs.field_count[struct_slot]
+
+                struct_llvm: LLVMTypeRef = llvm_type_of(built_type, structs, ctx)
+                temporary: LLVMValueRef = LLVMBuildAlloca(builder, struct_llvm, "construct")
+                declined: mutable bool = false
+                for field_init in construct_fields |declined, struct_slot, struct_llvm, temporary, local_scope, fns, structs, m, ctx, builder|:
+                    position: i64 = field_index_of(structs, struct_slot, field_init.name)
+                    if position < 0:
+                        declined <- true
+                    else:
+                        field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
+                        if emit_expression(field_init.value, field_type, local_scope, fns, structs, m, ctx, builder) is field_value:
+                            _ = LLVMBuildStore(builder, field_value, LLVMBuildStructGEP2(builder, struct_llvm, temporary, position.u32(), "field.ptr"))
+                        else:
+                            declined <- true
+                null return if declined
+                return LLVMBuildLoad2(builder, struct_llvm, temporary, "constructed")
+
+            # `p.x` — a field READ. Only a local struct receiver is modeled: the address
+            # comes from the local's slot, so there is no need to spill a temporary.
+            if expression is Expr.Field(field_object, field_name, field_line):
+                if field_object is Expr.Ident(object_name, object_line):
+                    object_type: ValueType = lookup_type(local_scope, object_name)
+                    null return if object_type.kind != TypeKind.Struct
+                    struct_slot: usize = object_type.bits.usize()
+                    position: i64 = field_index_of(structs, struct_slot, field_name)
+                    null return if position < 0
+                    if lookup_slot(local_scope, object_name) is object_slot:
+                        field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
+                        struct_llvm: LLVMTypeRef = llvm_type_of(object_type, structs, ctx)
+                        pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, struct_llvm, object_slot, position.u32(), "field.ptr")
+                        return LLVMBuildLoad2(builder, llvm_type_of(field_type, structs, ctx), pointer, "field")
+                return null
+
             if expression is Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
                 # A labelled argument is a different calling convention; not modeled.
                 for argument_name in call_argument_names:
@@ -726,22 +820,22 @@ module Backend:
                     null return if call_arguments.count != 0
                     # The source's own type decides; only a bare literal receiver needs a
                     # default, and `1.5.i64()` is not a form the subset needs to model.
-                    source_type: ValueType = resolve_type(cast_object, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns)
-                    if emit_expression(cast_object, source_type, local_scope, fns, m, ctx, builder) is source_value:
-                        return emit_conversion(source_value, source_type, target_type, ctx, builder)
+                    source_type: ValueType = resolve_type(cast_object, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs)
+                    if emit_expression(cast_object, source_type, local_scope, fns, structs, m, ctx, builder) is source_value:
+                        return emit_conversion(source_value, source_type, target_type, structs, ctx, builder)
                     return null
-                return emit_call(call_callee, call_arguments, local_scope, fns, m, ctx, builder)
+                return emit_call(call_callee, call_arguments, local_scope, fns, structs, m, ctx, builder)
             return null
 
 
         # Emit a branch condition: a modeled `bool` (i1). Elisa requires a bool condition,
         # so this simply emits at bool type — no `!= 0` narrowing, because a comparison
         # already yields i1 and a bool local is stored as i1.
-        def emit_condition(condition: Expr, local_scope: mutable Scope&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_condition(condition: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             bool_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
-            condition_type: ValueType = resolve_type(condition, bool_type, local_scope, fns)
+            condition_type: ValueType = resolve_type(condition, bool_type, local_scope, fns, structs)
             null return if condition_type.kind != TypeKind.Bool
-            return emit_expression(condition, bool_type, local_scope, fns, m, ctx, builder)
+            return emit_expression(condition, bool_type, local_scope, fns, structs, m, ctx, builder)
 
 
         # Branch to `dest` only when the just-emitted region left the block OPEN. An arm
@@ -758,23 +852,23 @@ module Backend:
         # A statement AFTER a terminator is unreachable; the subset does not model dead
         # code, so it declines rather than emitting into a closed block (which LLVM would
         # reject anyway).
-        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             status: mutable EmitStatus = EmitStatus.Open
-            for statement in body |status, return_type, local_scope, loops, fns, m, ctx, builder|:
+            for statement in body |status, return_type, local_scope, loops, fns, structs, m, ctx, builder|:
                 if status == EmitStatus.Open:
-                    status <- emit_statement(statement, return_type, local_scope, loops, fns, m, ctx, builder)
+                    status <- emit_statement(statement, return_type, local_scope, loops, fns, structs, m, ctx, builder)
                 else:
                     status <- EmitStatus.Declined
             return status
 
 
         # Emit one statement. Returns false to DECLINE (unmodeled construct).
-        def emit_statement(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_statement(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
 
             if statement is Stmt.Return(return_value_opt, return_line):
                 if return_value_opt is return_value:
-                    emitted: LLVMValueRef? = emit_expression(return_value, return_type, local_scope, fns, m, ctx, builder)
+                    emitted: LLVMValueRef? = emit_expression(return_value, return_type, local_scope, fns, structs, m, ctx, builder)
                     if emitted is return_constant:
                         _ = LLVMBuildRet(builder, return_constant)
                         return EmitStatus.Terminated
@@ -787,11 +881,11 @@ module Backend:
             if statement is Stmt.VarDecl(var_name, var_type, var_value, var_line):
                 # The ANNOTATION decides the local's type, and the initializer is emitted
                 # at that type — so `a: u8 = 200` stores a real u8.
-                declared_type: ValueType = annotation_value_type(var_type)
+                declared_type: ValueType = annotation_value_type(var_type, structs)
                 EmitStatus.Declined return if declared_type.kind == TypeKind.Unmodeled
-                if emit_expression(var_value, declared_type, local_scope, fns, m, ctx, builder) is initial:
+                if emit_expression(var_value, declared_type, local_scope, fns, structs, m, ctx, builder) is initial:
                     name_storage: mutable darray[u8] = []
-                    slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(declared_type, ctx), sview_to_cstr(var_name, name_storage))
+                    slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(declared_type, structs, ctx), sview_to_cstr(var_name, name_storage))
                     _ = LLVMBuildStore(builder, initial, slot)
                     declare_local(local_scope, var_name, slot, declared_type)
                     return EmitStatus.Open
@@ -812,9 +906,9 @@ module Backend:
                     if assign_target is Expr.Ident(compound_name, compound_name_line):
                         if lookup_slot(local_scope, compound_name) is compound_slot:
                             target_type: ValueType = lookup_type(local_scope, compound_name)
-                            if emit_expression(assign_value, target_type, local_scope, fns, m, ctx, builder) is operand:
-                                current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(target_type, ctx), compound_slot, "aug.load")
-                                if emit_binary(compound, current, operand, target_type, ctx, builder) is combined:
+                            if emit_expression(assign_value, target_type, local_scope, fns, structs, m, ctx, builder) is operand:
+                                current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(target_type, structs, ctx), compound_slot, "aug.load")
+                                if emit_binary(compound, current, operand, target_type, structs, ctx, builder) is combined:
                                     _ = LLVMBuildStore(builder, combined, compound_slot)
                                     return EmitStatus.Open
                     return EmitStatus.Declined
@@ -822,14 +916,14 @@ module Backend:
                 if assign_target is Expr.Ident(target_name, target_line):
                     slot_opt: LLVMValueRef? = lookup_slot(local_scope, target_name)
                     if slot_opt is slot:
-                        new_value: LLVMValueRef? = emit_expression(assign_value, lookup_type(local_scope, target_name), local_scope, fns, m, ctx, builder)
+                        new_value: LLVMValueRef? = emit_expression(assign_value, lookup_type(local_scope, target_name), local_scope, fns, structs, m, ctx, builder)
                         if new_value is assigned:
                             _ = LLVMBuildStore(builder, assigned, slot)
                             return EmitStatus.Open
                 return EmitStatus.Declined
 
             if statement is Stmt.If(if_condition, then_body, else_body, if_line):
-                condition_opt: LLVMValueRef? = emit_condition(if_condition, local_scope, fns, m, ctx, builder)
+                condition_opt: LLVMValueRef? = emit_condition(if_condition, local_scope, fns, structs, m, ctx, builder)
                 if condition_opt is condition_bit:
                     function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                     then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "if.then")
@@ -838,12 +932,12 @@ module Backend:
                     _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
 
                     LLVMPositionBuilderAtEnd(builder, then_block)
-                    then_status: EmitStatus = emit_statements(then_body, return_type, local_scope, loops, fns, m, ctx, builder)
+                    then_status: EmitStatus = emit_statements(then_body, return_type, local_scope, loops, fns, structs, m, ctx, builder)
                     EmitStatus.Declined return if then_status == EmitStatus.Declined
                     branch_if_open(then_status, builder, join_block)
 
                     LLVMPositionBuilderAtEnd(builder, else_block)
-                    else_status: EmitStatus = emit_statements(else_body, return_type, local_scope, loops, fns, m, ctx, builder)
+                    else_status: EmitStatus = emit_statements(else_body, return_type, local_scope, loops, fns, structs, m, ctx, builder)
                     EmitStatus.Declined return if else_status == EmitStatus.Declined
                     branch_if_open(else_status, builder, join_block)
 
@@ -867,14 +961,14 @@ module Backend:
                 # block that the body branches back to.
                 _ = LLVMBuildBr(builder, head_block)
                 LLVMPositionBuilderAtEnd(builder, head_block)
-                condition_opt: LLVMValueRef? = emit_condition(while_condition, local_scope, fns, m, ctx, builder)
+                condition_opt: LLVMValueRef? = emit_condition(while_condition, local_scope, fns, structs, m, ctx, builder)
                 if condition_opt is condition_bit:
                     _ = LLVMBuildCondBr(builder, condition_bit, body_block, exit_block)
                     LLVMPositionBuilderAtEnd(builder, body_block)
                     # A `while` continues to its CONDITION.
                     loops.exits <- loops.exits.push(exit_block)
                     loops.continues <- loops.continues.push(head_block)
-                    body_status: EmitStatus = emit_statements(while_body, return_type, local_scope, loops, fns, m, ctx, builder)
+                    body_status: EmitStatus = emit_statements(while_body, return_type, local_scope, loops, fns, structs, m, ctx, builder)
                     _ = loops.exits.pop()
                     _ = loops.continues.pop()
                     EmitStatus.Declined return if body_status == EmitStatus.Declined
@@ -920,10 +1014,10 @@ module Backend:
 
                     # The loop variable's type comes from the range bounds; a bare
                     # `0..<10` is two literals, so it defaults to signed 64.
-                    loop_type: ValueType = resolve_type(range_low, resolve_type(range_high, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns), local_scope, fns)
+                    loop_type: ValueType = resolve_type(range_low, resolve_type(range_high, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs), local_scope, fns, structs)
                     EmitStatus.Declined return if not is_integer_type(loop_type)
-                    low_opt: LLVMValueRef? = emit_expression(range_low, loop_type, local_scope, fns, m, ctx, builder)
-                    high_opt: LLVMValueRef? = emit_expression(range_high, loop_type, local_scope, fns, m, ctx, builder)
+                    low_opt: LLVMValueRef? = emit_expression(range_low, loop_type, local_scope, fns, structs, m, ctx, builder)
+                    high_opt: LLVMValueRef? = emit_expression(range_high, loop_type, local_scope, fns, structs, m, ctx, builder)
                     if low_opt is low_value:
                         if high_opt is high_value:
                             name_storage: mutable darray[u8] = []
@@ -939,7 +1033,7 @@ module Backend:
 
                             _ = LLVMBuildBr(builder, head_block)
                             LLVMPositionBuilderAtEnd(builder, head_block)
-                            loop_llvm_type: LLVMTypeRef = llvm_type_of(loop_type, ctx)
+                            loop_llvm_type: LLVMTypeRef = llvm_type_of(loop_type, structs, ctx)
                             counter: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, slot, "for.i")
                             # 41 = SLE (`..=`), 40 = SLT (`..<`).
                             signed_predicate: i32 = 41 if inclusive else 40
@@ -950,7 +1044,7 @@ module Backend:
                             LLVMPositionBuilderAtEnd(builder, body_block)
                             loops.exits <- loops.exits.push(exit_block)
                             loops.continues <- loops.continues.push(step_block)
-                            body_status: EmitStatus = emit_statements(for_body, return_type, local_scope, loops, fns, m, ctx, builder)
+                            body_status: EmitStatus = emit_statements(for_body, return_type, local_scope, loops, fns, structs, m, ctx, builder)
                             _ = loops.exits.pop()
                             _ = loops.continues.pop()
                             EmitStatus.Declined return if body_status == EmitStatus.Declined
@@ -970,31 +1064,93 @@ module Backend:
 
         # A function declaration's name, or "" for any other declaration. (Only reached
         # after declare_function accepted, i.e. it IS a Func.)
+        # A function declaration's name, or "" for anything else (a struct, an enum, an
+        # extern). Used to skip non-function declarations in the function passes.
+        def function_name_of(declaration: Decl) -> sview can[Abort.Panic]:
+            if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                return function_name
+            return ""
+
+
+        # The index of function `name` in the table, or -1.
+        def function_index_of(fns: FnTable&, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, name|:
+                index.i64() return if fns.names[index] == name
+            return -1
+
+
+        # Pass 1: create the NAMED (empty) LLVM type for a struct declaration and record
+        # its name. Bodies are set separately so declaration order never matters.
+        def register_struct_name(declaration: Decl, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if declaration is Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                name_storage: mutable darray[u8] = []
+                handle: LLVMTypeRef = LLVMStructCreateNamed(ctx, sview_to_cstr(struct_name, name_storage))
+                structs.names <- structs.names.push(struct_name)
+                structs.handles <- structs.handles.push(handle)
+                structs.field_start <- structs.field_start.push(0)
+                structs.field_count <- structs.field_count.push(0)
+
+
+        # Pass 2: fill in a struct's field types and set its LLVM body. False = declined
+        # (a field whose type is outside the modeled subset).
+        #
+        # Fields are emitted in DECLARATION ORDER, so a field's position is its LLVM
+        # element index — which is what makes field_index_of usable directly in a GEP.
+        def set_struct_body(declaration: Decl, structs: mutable StructTable&, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if declaration is Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                index: i64 = struct_index_of(structs, struct_name)
+                false return if index < 0
+                slot: usize = index.usize()
+
+                element_types: mutable darray[LLVMTypeRef] = []
+                declined: mutable bool = false
+                start: usize = structs.field_names.count
+                for member in members |element_types, declined, structs, ctx|:
+                    member_type: ValueType = annotation_value_type(member.type_expression, structs)
+                    if member_type.kind == TypeKind.Unmodeled or member_type.kind == TypeKind.Struct:
+                        # A nested struct field would need the field's own layout resolved
+                        # first; only scalar fields are modeled.
+                        declined <- true
+                    else:
+                        element_types.push(llvm_type_of(member_type, structs, ctx))
+                        structs.field_names <- structs.field_names.push(member.name)
+                        structs.field_types <- structs.field_types.push(member_type)
+                false return if declined
+                false return if members.count == 0
+
+                structs.field_start[slot] <- start
+                structs.field_count[slot] <- members.count
+                elements_pointer: void& = (&element_types[0]).cast[void&] can Unsafe.PointerCast
+                LLVMStructSetBody(structs.handles[slot], elements_pointer, members.count.u32(), 0)
+                return true
+            return true
+
+
         # Declare `def name(a: T, …) -> R` in the module WITHOUT a body, recording its
         # types in `fns`. Null when the signature is outside the modeled subset.
         #
         # Signature types are REAL now: any modeled scalar width/signedness, not just i64.
-        def declare_function(declaration: Decl, fns: mutable FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_function(declaration: Decl, fns: mutable FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 if return_type_opt is return_type:
-                    return_value_type: ValueType = annotation_value_type(return_type)
+                    return_value_type: ValueType = annotation_value_type(return_type, structs)
                     null return if return_value_type.kind == TypeKind.Unmodeled
 
                     llvm_param_types: mutable darray[LLVMTypeRef] = []
                     declared_param_types: mutable darray[ValueType] = []
                     declined: mutable bool = false
                     for parameter in params |llvm_param_types, declared_param_types, declined, ctx|:
-                        parameter_type: ValueType = annotation_value_type(parameter.type_expression)
+                        parameter_type: ValueType = annotation_value_type(parameter.type_expression, structs)
                         if parameter_type.kind == TypeKind.Unmodeled:
                             declined <- true
                         else:
-                            llvm_param_types.push(llvm_type_of(parameter_type, ctx))
+                            llvm_param_types.push(llvm_type_of(parameter_type, structs, ctx))
                             declared_param_types.push(parameter_type)
                     null return if declined
 
                     name_storage: mutable darray[u8] = []
                     fn_name: cstr = sview_to_cstr(function_name, name_storage)
-                    llvm_return: LLVMTypeRef = llvm_type_of(return_value_type, ctx)
+                    llvm_return: LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
                     fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
                     if params.count != 0:
                         params_pointer: void& = (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
@@ -1014,7 +1170,7 @@ module Backend:
 
 
         # Emit the body of an already-declared function. False = declined.
-        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_function_body(declaration: Decl, fn: LLVMValueRef, fns: FnTable&, structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 return_value_type: ValueType = lookup_return_type(fns, function_name)
                 false return if return_value_type.kind == TypeKind.Unmodeled
@@ -1028,16 +1184,16 @@ module Backend:
                 loops: mutable LoopStack = LoopStack{exits: [], continues: []}
                 parameter_index: mutable u32 = 0
                 for parameter in params |local_scope, parameter_index, fn, ctx, builder|:
-                    parameter_type: ValueType = annotation_value_type(parameter.type_expression)
+                    parameter_type: ValueType = annotation_value_type(parameter.type_expression, structs)
                     name_storage: mutable darray[u8] = []
-                    slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(parameter_type, ctx), sview_to_cstr(parameter.name, name_storage))
+                    slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(parameter_type, structs, ctx), sview_to_cstr(parameter.name, name_storage))
                     _ = LLVMBuildStore(builder, LLVMGetParam(fn, parameter_index), slot)
                     declare_local(local_scope, parameter.name, slot, parameter_type)
                     parameter_index <- parameter_index + 1
 
                 # A function that can run off the end is not modeled — rather than invent
                 # a return value, decline. (LLVM would reject the unterminated block.)
-                return emit_statements(body, return_value_type, local_scope, loops, fns, m, ctx, builder) == EmitStatus.Terminated
+                return emit_statements(body, return_value_type, local_scope, loops, fns, structs, m, ctx, builder) == EmitStatus.Terminated
             return false
 
     public:
@@ -1060,21 +1216,41 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: []}
             fns: mutable FnTable = FnTable{names: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
-            for declaration in file.top_decls |fns, declined, m, ctx|:
+            # THREE passes. Structs first: a function signature can name a struct, and a
+            # struct field can name another struct, so every struct type must exist before
+            # any signature is resolved. Named-empty-then-set-body (see llvm_c.elisa) is
+            # what makes the field pass tolerate any declaration order.
+            for declaration in file.top_decls |structs, ctx|:
+                register_struct_name(declaration, structs, ctx)
+            for declaration in file.top_decls |structs, declined, ctx|:
+                declined <- true if not set_struct_body(declaration, structs, ctx) else declined
+            -1 return if declined
+
+            # Passes 3 and 4 cover FUNCTIONS only: a struct declaration emits no code of
+            # its own (its type was built above), so it is skipped rather than declined.
+            # The body pass looks its handle up by NAME — `fns` is no longer index-parallel
+            # with `top_decls` now that non-function declarations exist.
+            for declaration in file.top_decls |fns, declined, structs, m, ctx|:
+                continue if function_name_of(declaration) == ""
                 # declare_function records the signature's types into `fns` itself.
-                if not (declare_function(declaration, fns, m, ctx) is declared_fn):
+                if not (declare_function(declaration, fns, structs, m, ctx) is declared_fn):
                     declined <- true
             -1 return if declined
 
             emitted_count: mutable i64 = 0
-            index: mutable usize = 0
-            for declaration in file.top_decls |emitted_count, declined, index, fns, m, ctx, builder|:
-                emitted: bool = emit_function_body(declaration, fns.handles[index], fns, m, ctx, builder)
+            for declaration in file.top_decls |emitted_count, declined, fns, structs, m, ctx, builder|:
+                declaration_name: sview = function_name_of(declaration)
+                continue if declaration_name == ""
+                handle_index: i64 = function_index_of(fns, declaration_name)
+                if handle_index < 0:
+                    declined <- true
+                    continue
+                emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], fns, structs, m, ctx, builder)
                 emitted_count <- emitted_count + 1 if emitted else emitted_count
                 declined <- true if not emitted else declined
-                index <- index + 1
             -1 return if declined
             return emitted_count
