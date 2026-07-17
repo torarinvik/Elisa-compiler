@@ -645,8 +645,7 @@ Payload words are 1-BASED: word 0 is the tag, so the first payload field is
 `read_variant_sparse_word(index, state, 1)`. The runtime returns an i64, so a narrower
 payload is truncated to its own width.
 
-Still ahead: typestate (`Store[Local]` vs `Store[Frozen]`), `freeze(move store)`, and
-`common:` blocks with `@storage(inline)` — see the corpus in `Code/test_programs/`
+LANDED: typestate + freeze(move store) (152dd70, no port needed), and `common:` blocks — see the corpus in `Code/test_programs/`
 (compiler_parallel_fixture.elisa, packed_enum_common.elisa). The typestate is currently
 unmodeled and that is only sound because freeze/move themselves decline.
 
