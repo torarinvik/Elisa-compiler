@@ -574,6 +574,15 @@ diff_case extern_two_args 'extern strncmp(a: cstr, b: cstr, n: usize) -> i32\n\n
 # for the packed-enum store (cab917f), where constructors are written `new Node.Leaf(v: 42)`.
 diff_case penum_named_field 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(r: 42)\n    return match s:\n        Shape.Circle(r): r\n'
 diff_case penum_named_field_u8 'enum Box:\n    Small(v: u8)\n\ndef main() -> i64:\n    b: Box = Box.Small(v: 200)\n    return match b:\n        Box.Small(v): v.i64() - 158\n'
+# The AoS STORE, first half: `Node.Store(owner)` asks the runtime for its state and
+# assembles `{arena, row_bytes, state}` with three insertvalues -- stage0's exact shape,
+# `ctx_packed_store_state_new_variant_sparse(ptr %owner, i64 16)`. row_bytes is the
+# `{i32,[N x i64]}` handle at i64 alignment: 8 (tag, padded) + 8*words = 16 for one word.
+# The store is runtime-call based, not open-coded, which is why this is bindings + calls.
+#
+# `Node.Store[Local]`'s TYPESTATE is not modeled: [Local] and [Frozen] have the same layout
+# and the distinction is enforced by freeze/move, which still decline.
+diff_case packed_store_ctor 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    return 42\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'

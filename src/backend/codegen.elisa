@@ -72,6 +72,14 @@ module Backend:
             # (`array_elements` / `array_extents`) — same reason as Struct: ValueType is
             # POD, so a nested element type cannot live inline.
             Array
+            # A `packed enum`'s HANDLE. Same `{i32, [N x i64]}` shape as a payload enum, but
+            # the value is a row in an AoS store rather than inline data: the tag and payload
+            # are read back through ctx_packed_store_* rather than by extractvalue/GEP.
+            # `bits` indexes the PACKED side-pool.
+            PackedEnum
+            # `Node.Store[Local]` — `{ptr arena, i64 row_bytes, ptr state}`. `bits` indexes
+            # the PACKED side-pool of the enum it stores.
+            PackedStore
             # `Arena` — the runtime's region carrier, `{ptr, ptr, i64, i64}`, passed BY
             # VALUE (stage0: `define i64 @build(%Arena %0)` and `%r1 = load %Arena, ptr %r`
             # at the call site). Note the asymmetry: `Arena` is legal as a PARAMETER type
@@ -193,6 +201,17 @@ module Backend:
             # `i64[3]` — a fixed array. The bracket holds an extent VALUE and the HEAD is
             # the element type. A NON-literal bracket (`cstr[shape]`) is a shape parameter,
             # not an array, and is not modeled.
+            # `Node.Store[Local]` — Index(Field(Ident, "Store"), typestate). The TYPESTATE is
+            # not modeled: [Local] and [Frozen] have the same layout, and the distinction is
+            # a semantic one (freeze/move) the backend does not enforce. Accepting both here
+            # would be wrong only if the backend implemented freeze, which it does not -- so
+            # `freeze`/`move` themselves still decline.
+            if type_expression is Expr.Index(store_head, store_state, store_line):
+                if store_head is Expr.Field(store_enum_expr, store_member, store_member_line):
+                    if store_enum_expr is Expr.Ident(store_enum_name, store_enum_line):
+                        if store_member == "Store":
+                            store_index: i64 = packed_index_of(structs, store_enum_name)
+                            ValueType{kind: TypeKind.PackedStore, bits: store_index.u32()} return if store_index >= 0
             if type_expression is Expr.Index(array_head, array_extent, array_line):
                 # `darray[T]` — the head is a CONTAINER NAME, not an element type, and the
                 # bracket holds a TYPE rather than an extent.
@@ -226,6 +245,8 @@ module Backend:
                 # `c: Color` as an i8, so there is no distinct enum type to model.
                 enum_index: i64 = enum_index_of(structs, type_name)
                 copied_type(structs.enum_backings[enum_index.usize()]) return if enum_index >= 0
+                packed_annotation_index: i64 = packed_index_of(structs, type_name)
+                ValueType{kind: TypeKind.PackedEnum, bits: packed_annotation_index.u32()} return if packed_annotation_index >= 0
                 penum_index: i64 = penum_index_of(structs, type_name)
                 ValueType{kind: TypeKind.PayloadEnum, bits: penum_index.u32()} return if penum_index >= 0
                 # A user STRUCT name: `bits` carries its registry index.
@@ -242,6 +263,17 @@ module Backend:
             # @take(ptr)`).
             LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.CStr
             arena_llvm_type(ctx) return if value_type.kind == TypeKind.Arena
+            # A packed HANDLE has the same shape as a payload enum's value.
+            if value_type.kind == TypeKind.PackedEnum:
+                packed_words: u32 = structs.packed_payload_words[value_type.bits.usize()]
+                packed_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt64TypeInContext(ctx), packed_words)]
+                packed_pointer: void& = (&packed_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, packed_pointer, 2, 0)
+            # `{ptr arena, i64 row_bytes, ptr state}` — stage0's `%Node__Store`.
+            if value_type.kind == TypeKind.PackedStore:
+                store_fields: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), LLVMInt64TypeInContext(ctx), LLVMPointerTypeInContext(ctx, 0)]
+                store_pointer: void& = (&store_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, store_pointer, 3, 0)
             # `{ i32, [N x i64] }` — stage0's tagged-union layout for a payload enum.
             if value_type.kind == TypeKind.PayloadEnum:
                 words: u32 = structs.penum_payload_words[value_type.bits.usize()]
@@ -318,6 +350,18 @@ module Backend:
             # argument: `Shape.Circle(r: 42)` is only that constructor if `r` is the field's
             # real name -- otherwise it is a different program and must not be emitted.
             penum_field_names: mutable darray[sview]
+            # PACKED enums (`packed enum Node:`) — the same per-variant pools as penum_*, but
+            # a separate table because the REPRESENTATION differs: a packed value is a store
+            # row, not inline data. Kept apart so neither path can silently claim the other's
+            # enums (which is exactly the bug 5403a62 fixed).
+            packed_names: mutable darray[sview]
+            packed_variants: mutable darray[sview]
+            packed_payloads: mutable darray[ValueType]
+            packed_has_payload: mutable darray[bool]
+            packed_field_names: mutable darray[sview]
+            packed_variant_start: mutable darray[usize]
+            packed_variant_count: mutable darray[usize]
+            packed_payload_words: mutable darray[u32]
             penum_variant_start: mutable darray[usize]
             penum_variant_count: mutable darray[usize]
             # Payload words (i64 units) of the WIDEST variant — the `[N x i64]` extent.
@@ -577,6 +621,17 @@ module Backend:
             # instead of the lazy strategy an auto region uses.
             new_region_backend: LLVMValueRef
             new_region_backend_type: LLVMTypeRef
+            # The AoS store's runtime entry points. The store is RUNTIME-CALL based rather
+            # than open-coded, which is why porting it is declaring these and calling them.
+            packed_state_new: LLVMValueRef
+            packed_state_new_type: LLVMTypeRef
+            packed_alloc: LLVMValueRef
+            packed_alloc_type: LLVMTypeRef
+            packed_alloc_result_type: LLVMTypeRef
+            packed_read_tag: LLVMValueRef
+            packed_read_tag_type: LLVMTypeRef
+            packed_read_word: LLVMValueRef
+            packed_read_word_type: LLVMTypeRef
 
 
         # Declare the runtime entry points in the module. Signatures are dictated by
@@ -604,8 +659,38 @@ module Backend:
             backend_pointer: void& = (&backend_params[0]).cast[void&] can Unsafe.PointerCast
             backend_type: LLVMTypeRef = LLVMFunctionType(pointer_type, backend_pointer, 2, 0)
 
+            int32_type: LLVMTypeRef = LLVMInt32TypeInContext(ctx)
+            state_new_params: mutable darray[LLVMTypeRef] = [pointer_type, int64_type]
+            state_new_pointer: void& = (&state_new_params[0]).cast[void&] can Unsafe.PointerCast
+            state_new_type: LLVMTypeRef = LLVMFunctionType(pointer_type, state_new_pointer, 2, 0)
+
+            # `%PackedStoreIndexAllocResult = { ptr row, i32 index }`
+            alloc_result_fields: mutable darray[LLVMTypeRef] = [pointer_type, int32_type]
+            alloc_result_pointer: void& = (&alloc_result_fields[0]).cast[void&] can Unsafe.PointerCast
+            alloc_result_type: LLVMTypeRef = LLVMStructTypeInContext(ctx, alloc_result_pointer, 2, 0)
+            packed_alloc_params: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, int32_type]
+            packed_alloc_params_pointer: void& = (&packed_alloc_params[0]).cast[void&] can Unsafe.PointerCast
+            alloc_fn_type: LLVMTypeRef = LLVMFunctionType(alloc_result_type, packed_alloc_params_pointer, 3, 0)
+
+            read_tag_params: mutable darray[LLVMTypeRef] = [pointer_type, int32_type]
+            read_tag_pointer: void& = (&read_tag_params[0]).cast[void&] can Unsafe.PointerCast
+            read_tag_type: LLVMTypeRef = LLVMFunctionType(int32_type, read_tag_pointer, 2, 0)
+
+            read_word_params: mutable darray[LLVMTypeRef] = [int32_type, pointer_type, int64_type]
+            read_word_pointer: void& = (&read_word_params[0]).cast[void&] can Unsafe.PointerCast
+            read_word_type: LLVMTypeRef = LLVMFunctionType(int64_type, read_word_pointer, 3, 0)
+
             return Runtime{
                 owns_arena: true,
+                packed_state_new: LLVMAddFunction(m, "ctx_packed_store_state_new_variant_sparse", state_new_type),
+                packed_state_new_type: state_new_type,
+                packed_alloc: LLVMAddFunction(m, "ctx_packed_store_alloc_fixed_tagged_variant_sparse_result", alloc_fn_type),
+                packed_alloc_type: alloc_fn_type,
+                packed_alloc_result_type: alloc_result_type,
+                packed_read_tag: LLVMAddFunction(m, "ctx_packed_store_read_variant_sparse_tag", read_tag_type),
+                packed_read_tag_type: read_tag_type,
+                packed_read_word: LLVMAddFunction(m, "ctx_packed_store_read_variant_sparse_word", read_word_type),
+                packed_read_word_type: read_word_type,
                 new_region_backend: LLVMAddFunction(m, "new_region_backend", backend_type),
                 new_region_backend_type: backend_type,
                 arena_alloc: LLVMAddFunction(m, "arena_alloc", alloc_type),
@@ -893,6 +978,10 @@ module Backend:
                 # `x.u8()` is a CAST (postfix call unifies cast and UFCS: `recv.Name()`
                 # where Name is a type name is a conversion).
                 if call_callee is Expr.Field(cast_object, cast_name, cast_line):
+                    if cast_object is Expr.Ident(store_type_enum, store_type_enum_line):
+                        if cast_name == "Store":
+                            store_type_index: i64 = packed_index_of(structs, store_type_enum)
+                            ValueType{kind: TypeKind.PackedStore, bits: store_type_index.u32()} return if store_type_index >= 0
                     # `Shape.Circle(42)` is a payload-enum CONSTRUCTOR and has the enum's
                     # type. Checked before the cast/UFCS split: the head is an enum NAME, so
                     # neither of those readings applies.
@@ -1373,6 +1462,31 @@ module Backend:
                     null return if inferred.kind == TypeKind.Unmodeled
                     return emit_generic_call(callee_name, inferred, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 return emit_direct_call("", callee_name, callee, false, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            # `Node.Store(owner)` — build the AoS store: ask the runtime for its state, then
+            # assemble `{arena, row_bytes, state}` with three insertvalues (stage0's shape).
+            if callee is Expr.Field(store_ctor_head, store_ctor_member, store_ctor_line):
+                if store_ctor_head is Expr.Ident(store_ctor_enum, store_ctor_enum_line):
+                    if store_ctor_member == "Store":
+                        store_ctor_index: i64 = packed_index_of(structs, store_ctor_enum)
+                        if store_ctor_index >= 0:
+                            null return if arguments.count != 1
+                            # The owner is an Arena; the runtime takes it BY POINTER, so the
+                            # argument must be a name whose slot we can hand over rather than
+                            # a temporary.
+                            if arguments[0] is Expr.Ident(owner_name, owner_line):
+                                null return if lookup_type(local_scope, owner_name).kind != TypeKind.Arena
+                                if lookup_slot(local_scope, owner_name) is owner_slot:
+                                    row_bytes: i64 = packed_row_bytes(structs, store_ctor_index)
+                                    state_args: mutable darray[LLVMValueRef] = [owner_slot, LLVMConstInt(LLVMInt64TypeInContext(ctx), row_bytes.u64(), 0)]
+                                    state_pointer: void& = (&state_args[0]).cast[void&] can Unsafe.PointerCast
+                                    state: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_state_new_type, runtime.packed_state_new, state_pointer, 2, "packed.store.state")
+                                    store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: store_ctor_index.u32()}
+                                    store_llvm: LLVMTypeRef = llvm_type_of(store_type, structs, ctx)
+                                    with_arena: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetUndef(store_llvm), owner_slot, 0, "packed.store.arena")
+                                    with_row: LLVMValueRef = LLVMBuildInsertValue(builder, with_arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), row_bytes.u64(), 0), 1, "packed.store.row_bytes")
+                                    return LLVMBuildInsertValue(builder, with_row, state, 2, "packed.store.state1")
+                            return null
+
             # `Shape.Circle(42)` — a payload-enum CONSTRUCTOR. stage0 emits: alloca, store
             # zeroinitializer, store the tag at field 0, store the payload at field 1, load
             # the value. Only ONE payload argument is modeled, matching what
@@ -1559,6 +1673,15 @@ module Backend:
         def copied_runtime(runtime: Runtime&) -> Runtime:
             return Runtime{
                 owns_arena: runtime.owns_arena,
+                packed_state_new: runtime.packed_state_new,
+                packed_state_new_type: runtime.packed_state_new_type,
+                packed_alloc: runtime.packed_alloc,
+                packed_alloc_type: runtime.packed_alloc_type,
+                packed_alloc_result_type: runtime.packed_alloc_result_type,
+                packed_read_tag: runtime.packed_read_tag,
+                packed_read_tag_type: runtime.packed_read_tag_type,
+                packed_read_word: runtime.packed_read_word,
+                packed_read_word_type: runtime.packed_read_word_type,
                 new_region_backend: runtime.new_region_backend,
                 new_region_backend_type: runtime.new_region_backend_type,
                 arena_alloc: runtime.arena_alloc,
@@ -2781,6 +2904,71 @@ module Backend:
             return -1
 
 
+        def packed_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.packed_names.count |index, structs, name|:
+                index.i64() return if structs.packed_names[index] == name
+                index <- index + 1
+            return -1
+
+
+        def packed_variant_index(structs: StructTable&, enum_index: i64, variant_name: sview) -> i64 can[Abort.Panic]:
+            start: usize = structs.packed_variant_start[enum_index.usize()]
+            count: usize = structs.packed_variant_count[enum_index.usize()]
+            offset: mutable usize = 0
+            while offset < count |offset, structs, start, variant_name|:
+                offset.i64() return if structs.packed_variants[start + offset] == variant_name
+                offset <- offset + 1
+            return -1
+
+
+        # A store row's size in bytes: the `{i32, [N x i64]}` handle laid out at i64
+        # alignment, so the tag's 4 bytes pad to 8. stage0 passes 16 for a one-word payload
+        # (`state_new_variant_sparse(ptr %owner, i64 16)`), which this reproduces.
+        def packed_row_bytes(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
+            return 8 + 8 * structs.packed_payload_words[enum_index.usize()].i64()
+
+
+        # Register a `packed enum`. Same per-variant subset as register_payload_enum (at most
+        # one SCALAR payload field), but into the packed pools: the representation is a store
+        # row, not inline data.
+        def register_packed_enum(declaration: Decl, packed_enum_names: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if declaration is Decl.Enum(enum_name, variants, is_const, storage_type, enum_line):
+                return if is_const
+                return if variants.count == 0
+                is_packed: mutable bool = false
+                for packed_name in packed_enum_names |is_packed, enum_name|:
+                    is_packed <- true if packed_name == enum_name
+                return if not is_packed
+                start: usize = structs.packed_variants.count
+                declined: mutable bool = false
+                widest: mutable u32 = 0
+                for variant in variants |structs, declined, widest|:
+                    declined <- true if variant.fields.count > 1
+                    payload: mutable ValueType = unmodeled_type()
+                    if variant.fields.count == 1:
+                        payload <- annotation_value_type(variant.fields[0], structs)
+                        declined <- true if not is_numeric_type(payload) and payload.kind != TypeKind.Bool
+                        widest <- 1 if widest == 0
+                    field_name: mutable sview = ""
+                    field_name <- variant.field_names[0] if variant.field_names.count == 1
+                    structs.packed_variants <- structs.packed_variants.push(variant.name)
+                    structs.packed_payloads <- structs.packed_payloads.push(payload)
+                    structs.packed_has_payload <- structs.packed_has_payload.push(variant.fields.count == 1)
+                    structs.packed_field_names <- structs.packed_field_names.push(field_name)
+                if declined:
+                    while structs.packed_variants.count > start |structs|:
+                        _ = structs.packed_variants.pop()
+                        _ = structs.packed_payloads.pop()
+                        _ = structs.packed_has_payload.pop()
+                        _ = structs.packed_field_names.pop()
+                    return
+                structs.packed_names <- structs.packed_names.push(enum_name)
+                structs.packed_variant_start <- structs.packed_variant_start.push(start)
+                structs.packed_variant_count <- structs.packed_variant_count.push(variants.count)
+                structs.packed_payload_words <- structs.packed_payload_words.push(widest)
+
+
         def penum_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
             index: mutable usize = 0
             while index < structs.penum_names.count |index, structs, name|:
@@ -3119,7 +3307,7 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -3140,6 +3328,7 @@ module Backend:
                 # signature or field mentioning one is resolved.
                 register_enum(declaration, structs)
                 register_payload_enum(declaration, file.packed_enum_names, structs)
+                register_packed_enum(declaration, file.packed_enum_names, structs)
                 register_alias(declaration, structs)
             # Aliases resolve AFTER struct names and enums (an alias may name either) and
             # BEFORE struct bodies (a field may be alias-typed).
