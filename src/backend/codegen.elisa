@@ -112,6 +112,11 @@ module Backend:
             # backed by an Arena — because both link the SAME runtime, so the layout is
             # dictated, not chosen.
             DArray
+            # A `view[T]` — the runtime's `DynArrayView` fat pointer `{data, len}`. `bits`
+            # indexes the VIEW side-pool (`view_elements`), carrying the phantom element T
+            # so a generic call like `arena_da_fill(view, …)` can INFER T from the argument.
+            # Lowers to the one `DynArrayView` struct regardless of T (like darray).
+            View
 
 
         struct ValueType:
@@ -237,11 +242,12 @@ module Backend:
                         unmodeled_type() return if darray_element.kind == TypeKind.Unmodeled
                         unmodeled_type() return if darray_element.kind == TypeKind.Array or darray_element.kind == TypeKind.DArray
                         return intern_darray_type(darray_element, structs)
-                    # `view[T]` — the runtime's `DynArrayView` fat pointer `{data, len}`. The
-                    # element `T` is phantom (checking only), so it maps to the one struct.
+                    # `view[T]` — the runtime's `DynArrayView` fat pointer, interned with its
+                    # phantom element T so a generic call can infer T from a `view[T]` argument.
                     if container_name == "view":
-                        view_struct_index: i64 = struct_index_of(structs, "DynArrayView")
-                        ValueType{kind: TypeKind.Struct, bits: view_struct_index.u32()} return if view_struct_index >= 0
+                        view_element: ValueType = annotation_value_type(array_extent, structs)
+                        unmodeled_type() return if view_element.kind == TypeKind.Unmodeled
+                        return intern_view_type(view_element, structs)
                 if array_extent is Expr.IntLit(extent_value):
                     element: ValueType = annotation_value_type(array_head, structs)
                     unmodeled_type() return if element.kind == TypeKind.Unmodeled
@@ -335,6 +341,10 @@ module Backend:
             # shared runtime dictates.
             if value_type.kind == TypeKind.DArray:
                 return darray_llvm_type(structs, ctx)
+            # A `view[T]` lowers to the one `DynArrayView` struct regardless of its element.
+            if value_type.kind == TypeKind.View:
+                view_llvm_struct: ValueType = view_struct_type(value_type, structs)
+                return structs.handles[view_llvm_struct.bits.usize()] if view_llvm_struct.kind == TypeKind.Struct else LLVMPointerTypeInContext(ctx, 0)
             if value_type.kind == TypeKind.Float:
                 return LLVMFloatTypeInContext(ctx) if value_type.bits == 32 else LLVMDoubleTypeInContext(ctx)
             LLVMInt8TypeInContext(ctx) return if value_type.bits == 8
@@ -392,6 +402,9 @@ module Backend:
             array_extents: mutable darray[u32]
             # `darray[T]` element types, interned the same way.
             darray_elements: mutable darray[ValueType]
+            # `view[T]` element types, interned the same way — the phantom element the
+            # `DynArrayView` fat pointer carries for type checking / generic inference.
+            view_elements: mutable darray[ValueType]
             # `T&` referent types, interned the same way.
             ref_targets: mutable darray[ValueType]
             # `T?` payload types, interned the same way.
@@ -526,6 +539,31 @@ module Backend:
                     return ValueType{kind: TypeKind.DArray, bits: index.u32()}
             structs.darray_elements <- structs.darray_elements.push(element)
             return ValueType{kind: TypeKind.DArray, bits: (structs.darray_elements.count - 1).u32()}
+
+
+        # Intern a `view[T]` type — one interned entry per element, lowering to DynArrayView.
+        def intern_view_type(element: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<structs.view_elements.count |structs, element|:
+                existing: ValueType = structs.view_elements[index]
+                if existing.kind == element.kind and existing.bits == element.bits:
+                    return ValueType{kind: TypeKind.View, bits: index.u32()}
+            structs.view_elements <- structs.view_elements.push(element)
+            return ValueType{kind: TypeKind.View, bits: (structs.view_elements.count - 1).u32()}
+
+
+        def view_element_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.View
+            return copied_type(structs.view_elements[value_type.bits.usize()])
+
+
+        # A `view[T]` decays to the `DynArrayView` STRUCT for every representation purpose
+        # (LLVM type, field access) — only inference cares about the element. Unmodeled if
+        # DynArrayView is not in scope (a program using `view[T]` without the std).
+        def view_struct_type(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.View
+            view_struct_index: i64 = struct_index_of(structs, "DynArrayView")
+            unmodeled_type() return if view_struct_index < 0
+            return ValueType{kind: TypeKind.Struct, bits: view_struct_index.u32()}
 
 
         # Intern a reference type `T&`.
@@ -1000,6 +1038,14 @@ module Backend:
                     bindings[position.usize()] <- copied_type(actual)
                     bound_flags[position.usize()] <- true
                 return
+            # `view[T]` annotation against a `view[U]` argument — bind T from the view's
+            # interned element. Checked before the generic-struct branch (a View is not a
+            # struct instantiation), so `arena_da_fill(view, …)` recovers its element type.
+            if annotation is Expr.Index(view_annotation_head, view_annotation_arg, view_annotation_line):
+                if view_annotation_head is Expr.Ident(view_annotation_name, view_annotation_head_line):
+                    if view_annotation_name == "view" and actual.kind == TypeKind.View:
+                        unify_annotation(view_annotation_arg, copied_type(structs.view_elements[actual.bits.usize()]), generics, slot, structs, bindings, bound_flags)
+                        return
             # `Base[A]` / `Base[A, B]` — recurse into the argument's instantiation arguments
             # when the argument is that same generic struct.
             actual_base: mutable sview = ""
@@ -1302,6 +1348,8 @@ module Backend:
                 object_type <- ref_target_of(object_type, structs) if object_type.kind == TypeKind.Ref
                 # `xs.count` is a usize-shaped i64.
                 ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "count"
+                # A `view[T]` field read goes through its DynArrayView struct.
+                object_type <- view_struct_type(object_type, structs) if object_type.kind == TypeKind.View
                 unmodeled_type() return if object_type.kind != TypeKind.Struct
                 struct_slot: usize = object_type.bits.usize()
                 position: i64 = field_index_of(structs, struct_slot, field_name)
@@ -2538,8 +2586,11 @@ module Backend:
             declared: ValueType = lookup_type(local_scope, name)
             if lookup_slot(local_scope, name) is slot:
                 slot return if declared.kind == TypeKind.Struct
+                # A `view[T]` local IS its slot (it holds the DynArrayView value inline).
+                slot return if declared.kind == TypeKind.View
                 if declared.kind == TypeKind.Ref:
-                    null return if ref_target_of(declared, structs).kind != TypeKind.Struct
+                    ref_addr_target: ValueType = ref_target_of(declared, structs)
+                    null return if ref_addr_target.kind != TypeKind.Struct and ref_addr_target.kind != TypeKind.View
                     return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), slot, "ref.deref")
             return null
 
@@ -2548,6 +2599,9 @@ module Backend:
         def struct_type_of_name(name: sview, local_scope: mutable Scope&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             declared: ValueType = lookup_type(local_scope, name)
             declared return if declared.kind == TypeKind.Struct
+            # A `view[T]` accesses fields (`dst.data`, `dst.len`) through its DynArrayView.
+            view_struct_type(declared, structs) return if declared.kind == TypeKind.View
+            view_struct_type(ref_target_of(declared, structs), structs) return if declared.kind == TypeKind.Ref and ref_target_of(declared, structs).kind == TypeKind.View
             return ref_target_of(declared, structs)
 
 
@@ -3803,15 +3857,20 @@ module Backend:
                                         _ = LLVMBuildStore(builder, darray_assigned, darray_element_pointer)
                                         return EmitStatus.Open
                                 return EmitStatus.Declined
-                        EmitStatus.Declined return if assign_array_type.kind != TypeKind.Array
-                        if lookup_slot(local_scope, assign_array_name) is assign_array_slot:
-                            if emit_index_address(assign_array_slot, assign_array_type, assign_index, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_pointer:
-                                element_type: ValueType = array_element_of(assign_array_type, structs)
-                                if emit_expression(assign_value, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_value:
-                                    _ = LLVMBuildStore(builder, element_value, element_pointer)
-                                    return EmitStatus.Open
-                        return EmitStatus.Declined
-                    # A nested-index or field-chain target (`m[i][j] <- v`): the chain
+                        # A FIXED-array local indexes in place. A `Struct&`/`T&` base
+                        # (`items[i] <- v` on a `DictBucket[K,T]&`) is NOT an array — it falls
+                        # through to the chain path below, which addresses it as a C-style
+                        # pointer via struct_chain_address.
+                        if assign_array_type.kind == TypeKind.Array:
+                            if lookup_slot(local_scope, assign_array_name) is assign_array_slot:
+                                if emit_index_address(assign_array_slot, assign_array_type, assign_index, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_pointer:
+                                    element_type: ValueType = array_element_of(assign_array_type, structs)
+                                    if emit_expression(assign_value, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_value:
+                                        _ = LLVMBuildStore(builder, element_value, element_pointer)
+                                        return EmitStatus.Open
+                            return EmitStatus.Declined
+                    # A nested-index or field-chain target (`m[i][j] <- v`) OR a ref-base index
+                    # (`items[i] <- v`): the chain
                     # resolver yields the element's type and address; store through it.
                     chain_target_type: ValueType = struct_chain_type(assign_target, local_scope, structs)
                     EmitStatus.Declined return if chain_target_type.kind == TypeKind.Unmodeled
@@ -5140,7 +5199,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
