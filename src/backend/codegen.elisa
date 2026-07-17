@@ -3758,6 +3758,15 @@ module Backend:
                                 if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, generics, runtime, m, ctx, builder):
                                     return EmitStatus.Open
                             return EmitStatus.Declined
+                    # `try f(args)` (statement, propagating — the parser strips the `try` head,
+                    # leaving a bare call to an ERROR fn). It uses the error ABI (out-slot + i32
+                    # status), and on a NONZERO status propagates: unwind and return that code
+                    # from THIS (error-returning) function. The std dict's `try arena_dict_reserve
+                    # (…)` is exactly this. Without it the call omits the out-param and every
+                    # later argument shifts left (m gets a scalar → null-deref crash).
+                    if push_callee is Expr.Ident(propagate_name, propagate_name_line):
+                        if error_callee_is(fns, generics, propagate_name):
+                            return emit_propagating_try(propagate_name, push_arguments, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                     # Any other call in STATEMENT position — typically a `-> void` call like
                     # `bump(c)`. The result (if any) is simply discarded; `expected` is Void
                     # because a statement wants no value.
@@ -4209,6 +4218,44 @@ module Backend:
             true return if function_is_error(fns, "", name)
             generic_index: i64 = generic_index_of(generics, name)
             return generic_index >= 0 and generics.is_error[generic_index.usize()]
+
+
+        # `try f(args)` in statement position — call the error fn with a fresh out-slot; on a
+        # nonzero status code PROPAGATE it: unwind live regions and return that code from the
+        # (error-returning) caller. On success, fall through. The success value is discarded.
+        def emit_propagating_try(name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            propagate_value_type: ValueType = error_callee_value_type(name, arguments, local_scope, fns, structs, generics)
+            EmitStatus.Declined return if propagate_value_type.kind == TypeKind.Unmodeled
+            if error_callee_target(name, arguments, local_scope, fns, structs, generics, m, ctx) is propagate_target:
+                # The out-slot holds the success value; a VOID-success fn writes nothing there
+                # (its `raise` still stores an i64 0, so an i64 dummy is the safe minimum).
+                propagate_out_llvm: LLVMTypeRef = LLVMInt64TypeInContext(ctx) if propagate_value_type.kind == TypeKind.Void else llvm_type_of(propagate_value_type, structs, ctx)
+                propagate_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, propagate_out_llvm, "try.out")
+                propagate_args: mutable darray[LLVMValueRef] = [propagate_out_slot]
+                propagate_declined: mutable bool = false
+                propagate_index: mutable usize = 0
+                for propagate_arg in arguments |propagate_args, propagate_declined, propagate_index, name, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    propagate_wanted: ValueType = error_callee_param_type(name, arguments, propagate_index, local_scope, fns, structs, generics)
+                    if emit_expression(propagate_arg, propagate_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is propagate_arg_value:
+                        propagate_args.push(propagate_arg_value)
+                    else:
+                        propagate_declined <- true
+                    propagate_index <- propagate_index + 1
+                EmitStatus.Declined return if propagate_declined
+                propagate_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(propagate_target)
+                propagate_args_pointer: void& = (&propagate_args[0]).cast[void&] can Unsafe.PointerCast
+                propagate_status: LLVMValueRef = LLVMBuildCall2(builder, propagate_fn_type, propagate_target, propagate_args_pointer, propagate_args.count.u32(), "try.code")
+                propagate_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, propagate_status, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                propagate_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                propagate_cont_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, propagate_function, "try.cont")
+                propagate_fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, propagate_function, "try.propagate")
+                _ = LLVMBuildCondBr(builder, propagate_ok, propagate_cont_block, propagate_fail_block)
+                LLVMPositionBuilderAtEnd(builder, propagate_fail_block)
+                emit_region_unwind(regions, runtime, builder)
+                _ = LLVMBuildRet(builder, propagate_status)
+                LLVMPositionBuilderAtEnd(builder, propagate_cont_block)
+                return EmitStatus.Open
+            return EmitStatus.Declined
 
 
         def error_callee_value_type(name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
