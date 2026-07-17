@@ -135,16 +135,47 @@ slot == 1).
   emit_instantiation_body).
 * Not recursion/non-termination: the drain trace shows it terminating into the trap.
 
-### Prime suspect
+### Narrowed further: it is the PUSH, not the read
 
-Aliasing between the two mutable registry references. The statement reads through
-`generics` (a `mutable GenericTable&`) while writing through `structs` (a
-`mutable StructTable&`) in the same expression, at a point where BOTH have been mutated
-earlier in the same call chain. Try first: bind the name to a local before the push —
+Two hypotheses tested and DISPROVEN:
 
-    param_name: sview = generics.params[generics.param_start[slot]]
-    structs.binding_names <- structs.binding_names.push(param_name)
+1. *Single-statement aliasing* (reading through `generics` while writing through
+   `structs`). Binding the name to a local first does NOT fix it — still rc=133.
+2. *push/pop leaving a darray in a bad state.* A standalone push/pop/push cycle on a
+   struct-held `darray[sview]` through a `mutable&` works fine.
 
-If that fixes it, the read-through-one-ref-while-writing-through-another in a single
-statement is the trigger, and it is worth reducing to a minimal repro and filing as a
-stage0 bug: an emitter should not be able to trap from a well-typed program.
+A finer probe places it exactly:
+
+    2 read param_start   <- printed
+    3 read params[]      <- printed
+    4 pushed name        <- NOT printed   ** the push itself traps **
+
+The value is already in a local by then, so it is neither the read nor an aliased index.
+It is `structs.binding_names.push(...)` on the SECOND instantiation, after the first has
+completed several balanced push/pop cycles.
+
+### Current best theory: cross-fn grower region
+
+When `push` GROWS the darray, the new backing is allocated from the region inferred AT THE
+PUSH SITE — `emit_instantiation_body`'s auto region — which is freed when that function
+returns. The next call then reads a freed buffer. `StructTable` is a caller-owned struct
+whose field is grown through a forwarded `mutable&`, which is the shape of the known open
+bug `region-byvalue-builder-uaf` (region-poly struct builder, field grown via forwarded
+`mutable&` -> UAF), and touches the cross-fn "grower" lifetime machinery.
+
+A minimal repro of that shape does NOT reproduce it:
+
+    struct Table: names: mutable darray[sview]
+    def use_once(t: mutable Table&, n: sview): t.names <- t.names.push(n); _ = t.names.pop()
+    def outer(t: mutable Table&, n: sview):    t.names <- t.names.push(n); use_once(t, n); _ = t.names.pop()
+
+runs clean. So the trigger needs more than "callee grows a caller-owned field": the real
+case has a deep call chain, several distinct `mutable&` tables live at once, and
+region-polymorphic frames in between. Reducing it is the next job — with a repro this is a
+stage0 bug worth filing, because a well-typed program must not be able to trap.
+
+### Workaround in place
+
+Nested generic calls DECLINE (`decline_case generic_chained`). Everything else about
+generics works. The decline is a guard on `structs.binding_names.count != 0` in
+`emit_generic_call` — i.e. "already inside an instantiation".
