@@ -356,6 +356,14 @@ diff_case array_rw      'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0, 
 diff_case optional_return 'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(true)\n    if v is found:\n        return found\n    return 0\n'
 diff_case optional_absent 'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(false)\n    if v is found:\n        return found\n    return 42\n'
 diff_case optional_u8     'def main() -> i64:\n    v: u8? = 200\n    if v is found:\n        return found.i64() - 158\n    return 0\n'
+# A `const enum` IS its backing scalar (stage0 emits `def code(c: Color)` as
+# `define i64 @code(i8 %0)`), and a variant is its DECLARATION-ORDER ordinal — `Color.Red`
+# in an arm lowers to `icmp eq i8 %c, 0`. Nothing is boxed and there is no tag word.
+diff_case enum_match 'const enum Color of u8:\n    Red\n    Green\n    Blue\n\ndef code(c: Color) -> i64:\n    return match c:\n        Color.Red: 1\n        Color.Green: 42\n        _: 3\n\ndef main() -> i64:\n    return code(Color.Green)\n'
+diff_case enum_first 'const enum Color of u8:\n    Red\n    Green\n    Blue\n\ndef main() -> i64:\n    return match Color.Red:\n        Color.Red: 42\n        _: 0\n'
+diff_case enum_last  'const enum Color of u8:\n    Red\n    Green\n    Blue\n\ndef main() -> i64:\n    return match Color.Blue:\n        Color.Red: 0\n        Color.Green: 1\n        Color.Blue: 42\n'
+diff_case enum_local 'const enum Color of u8:\n    Red\n    Green\n    Blue\n\ndef main() -> i64:\n    c: Color = Color.Blue\n    return match c:\n        Color.Blue: 42\n        _: 0\n'
+diff_case enum_default 'const enum Color of u8:\n    Red\n    Green\n    Blue\n\ndef code(c: Color) -> i64:\n    return match c:\n        Color.Red: 1\n        _: 42\n\ndef main() -> i64:\n    return code(Color.Blue)\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -398,6 +406,12 @@ decline_case() {
 # a three-line dict program emits 102 functions. Supporting dict therefore requires generic
 # instantiation plus compiling elisacore_std/collections.elisa (error unions, refs,
 # optional-of-ref), not an ABI to mirror. Until then it must DECLINE, not half-emit.
+# A `const enum` is exactly its backing scalar, so it is modeled. The two enum forms that
+# are NOT scalars must decline rather than silently narrow to an ordinal compare:
+# a PAYLOAD-carrying variant is packed-store territory (register_enum skips it), and a
+# non-`const` enum is not the backing scalar at all.
+decline_case enum_payload_variant 'enum Shape:\n    Circle(r: i64)\n    Square(s: i64)\n\ndef main() -> i64:\n    return match Shape.Circle(1):\n        Shape.Circle: 42\n        _: 0\n'
+decline_case enum_not_const 'enum Color of u8:\n    Red\n    Green\n\ndef main() -> i64:\n    return match Color.Red:\n        Color.Red: 42\n        _: 0\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'

@@ -185,6 +185,10 @@ module Backend:
                 bound return if bound.kind != TypeKind.Unmodeled
                 scalar: ValueType = scalar_type_of_name(type_name)
                 scalar return if scalar.kind != TypeKind.Unmodeled
+                # A CONST ENUM name denotes its BACKING scalar — stage0 passes
+                # `c: Color` as an i8, so there is no distinct enum type to model.
+                enum_index: i64 = enum_index_of(structs, type_name)
+                copied_type(structs.enum_backings[enum_index.usize()]) return if enum_index >= 0
                 # A user STRUCT name: `bits` carries its registry index.
                 struct_index: i64 = struct_index_of(structs, type_name)
                 ValueType{kind: TypeKind.Struct, bits: struct_index.u32()} return if struct_index >= 0
@@ -243,6 +247,16 @@ module Backend:
             ref_targets: mutable darray[ValueType]
             # `T?` payload types, interned the same way.
             optional_targets: mutable darray[ValueType]
+            # CONST enums. A `const enum Color of u8` IS its backing scalar (stage0 lowers
+            # `def code(c: Color)` to `define i64 @code(i8 %0)`), and a variant is its
+            # ORDINAL — `match c: Color.Red:` is `icmp eq i8 %c, 0`. So the backend needs
+            # only name -> backing type, and (enum, variant) -> ordinal. Flat pools with a
+            # per-enum span, same shape as struct fields.
+            enum_names: mutable darray[sview]
+            enum_backings: mutable darray[ValueType]
+            enum_variants: mutable darray[sview]
+            enum_variant_start: mutable darray[usize]
+            enum_variant_count: mutable darray[usize]
             # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
             # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
             #
@@ -359,6 +373,29 @@ module Backend:
         def array_element_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             unmodeled_type() return if value_type.kind != TypeKind.Array
             return copied_type(structs.array_elements[value_type.bits.usize()])
+
+
+        # The index of const enum `name`, or -1.
+        def enum_index_of(structs: mutable StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<structs.enum_names.count |structs, name|:
+                index.i64() return if structs.enum_names[index] == name
+            return -1
+
+
+        # The ORDINAL of `variant` in const enum `slot`, or -1. Ordinals are declaration
+        # order — that is what stage0 compares against (`icmp eq i8 %c, 0` for the first).
+        def enum_ordinal_of(structs: mutable StructTable&, slot: usize, variant: sview) -> i64 can[Abort.Panic]:
+            for offset in 0..<structs.enum_variant_count[slot] |structs, slot, variant|:
+                offset.i64() return if structs.enum_variants[structs.enum_variant_start[slot] + offset] == variant
+            return -1
+
+
+        # Resolve `Color.Green` -> (backing type, ordinal). Ordinal -1 when it is not a
+        # const-enum member.
+        def enum_member_ordinal(structs: mutable StructTable&, enum_name: sview, variant: sview) -> i64 can[Abort.Panic]:
+            index: i64 = enum_index_of(structs, enum_name)
+            -1 return if index < 0
+            return enum_ordinal_of(structs, index.usize(), variant)
 
 
         # The registry index of struct `name`, or -1.
@@ -635,6 +672,12 @@ module Backend:
                 return array_element_of(indexed_type, structs)
             # `p.x` — a field READ has the field's declared type. (A cast `x.u8()` is a
             # Field under a Call, handled below, so a bare Field is always a field read.)
+            # `Color.Green` has the enum's BACKING type.
+            if expression is Expr.Field(enum_head, enum_member, enum_head_line):
+                if enum_head is Expr.Ident(enum_head_name, enum_head_name_line):
+                    enum_slot: i64 = enum_index_of(structs, enum_head_name)
+                    if enum_slot >= 0:
+                        copied_type(structs.enum_backings[enum_slot.usize()]) return if enum_ordinal_of(structs, enum_slot.usize(), enum_member) >= 0
             if expression is Expr.Field(field_object, field_name, field_line):
                 object_type: mutable ValueType = expression_type(field_object, local_scope, fns, structs, generics)
                 # AUTO-DEREF: `p.x` where `p: P&` reads P's field. A reference is
@@ -782,6 +825,33 @@ module Backend:
             false return if not ok
             out_value <- 0 - accumulated if negative else accumulated
             return true
+
+
+        # `Color.Red` -> its ordinal, or -1 if the path is not a const-enum member.
+        # Pattern.Variant carries the path as one dotted STRING, so it is split here.
+        def ordinal_of_dotted_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            # Match by comparing BYTES against each registered enum/variant rather than
+            # slicing `path` into two sviews: `&path[0]` is a `char&`, not the `u8&?` that
+            # `sview(...)` wants, and a view-into-a-view buys nothing here.
+            for enum_index in 0..<structs.enum_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.enum_names[enum_index], 0, dot)
+                for offset in 0..<structs.enum_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    variant: sview = structs.enum_variants[structs.enum_variant_start[enum_index] + offset]
+                    offset.i64() return if sview_matches_prefix(path, variant, dot + 1, sview_len(path).i64())
+            return -1
+
+
+        # Whether `path[start..end)` equals `candidate`, byte for byte.
+        def sview_matches_prefix(path: sview, candidate: sview, start: i64, end: i64) -> bool can[Abort.Panic]:
+            false return if (end - start) != sview_len(candidate).i64()
+            matched: mutable bool = true
+            for index in 0..<sview_len(candidate) |matched, path, candidate, start|:
+                matched <- false if sview_at(path, (start + index.i64()).usize()) != sview_at(candidate, index)
+            return matched
 
 
         # Whether a pattern matches anything. ONLY `_` does: a BINDING arm is not legal in
@@ -1453,6 +1523,26 @@ module Backend:
                             continue
                         if arm_value_expression(arm.body) is arm_expression:
                             arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.arm")
+                            # `Color.Red:` — a CONST ENUM variant arm is an ordinal
+                            # comparison, exactly like an integer-literal arm (stage0 emits
+                            # `icmp eq i8 %c, 0`). Resolved to its ordinal and folded into
+                            # the same compare chain.
+                            variant_ordinal: mutable i64 = -1
+                            if arm.pattern is Pattern.Variant(variant_path, variant_fields):
+                                if variant_fields.count == 0:
+                                    variant_ordinal <- ordinal_of_dotted_path(variant_path, structs)
+                            if variant_ordinal >= 0:
+                                next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.next")
+                                hit: LLVMValueRef = LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(llvm_type_of(scrutinee_type, structs, ctx), variant_ordinal.u64(), 0), "match.cmp")
+                                _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
+                                LLVMPositionBuilderAtEnd(builder, arm_block)
+                                if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, m, ctx, builder) is variant_value:
+                                    _ = LLVMBuildStore(builder, variant_value, result_slot)
+                                    _ = LLVMBuildBr(builder, done_block)
+                                else:
+                                    declined <- true
+                                LLVMPositionBuilderAtEnd(builder, next_block)
+                                continue
                             if arm.pattern is Pattern.Literal(literal_text):
                                 literal_value: mutable i64 = 0
                                 if parse_int_literal(literal_text, literal_value):
@@ -1596,6 +1686,17 @@ module Backend:
                             declined <- true
                 null return if declined
                 return LLVMBuildLoad2(builder, struct_llvm, temporary, "constructed")
+
+            # `Color.Green` — a CONST ENUM member is a constant of the enum's backing
+            # type: its declaration-order ordinal.
+            if expression is Expr.Field(enum_object, enum_variant, enum_field_line):
+                if enum_object is Expr.Ident(enum_type_name, enum_type_line):
+                    enum_slot: i64 = enum_index_of(structs, enum_type_name)
+                    if enum_slot >= 0:
+                        ordinal: i64 = enum_ordinal_of(structs, enum_slot.usize(), enum_variant)
+                        null return if ordinal < 0
+                        backing: ValueType = copied_type(structs.enum_backings[enum_slot.usize()])
+                        return LLVMConstInt(llvm_type_of(backing, structs, ctx), ordinal.u64(), 0)
 
             # `xs.count` — read the darray header's count field.
             if expression is Expr.Field(darray_object, darray_field, darray_field_line):
@@ -2024,6 +2125,27 @@ module Backend:
                 structs.field_count <- structs.field_count.push(0)
 
 
+        # Register a CONST enum: its backing scalar and its variants in declaration order
+        # (the ordinal IS the variant's value). Only `const enum … of <scalar>` is modeled —
+        # a payload-carrying enum is a packed AoS store, a different subsystem entirely.
+        def register_enum(declaration: Decl, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if declaration is Decl.Enum(enum_name, variants, is_const, storage_type, enum_line):
+                return if not is_const
+                backing: ValueType = annotation_value_type(storage_type, structs)
+                return if not is_integer_type(backing)
+                start: usize = structs.enum_variants.count
+                declined: mutable bool = false
+                for variant in variants |structs, declined|:
+                    # A variant with a PAYLOAD is not a const enum member.
+                    declined <- true if variant.fields.count != 0
+                    structs.enum_variants <- structs.enum_variants.push(variant.name)
+                return if declined or variants.count == 0
+                structs.enum_names <- structs.enum_names.push(enum_name)
+                structs.enum_backings <- structs.enum_backings.push(backing)
+                structs.enum_variant_start <- structs.enum_variant_start.push(start)
+                structs.enum_variant_count <- structs.enum_variant_count.push(variants.count)
+
+
         # Pass 2: fill in a struct's field types and set its LLVM body. False = declined
         # (a field whose type is outside the modeled subset).
         #
@@ -2193,7 +2315,7 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], binding_names: [], binding_types: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -2210,6 +2332,9 @@ module Backend:
             # what makes the field pass tolerate any declaration order.
             for declaration in file.top_decls |structs, ctx|:
                 register_struct_name(declaration, structs, ctx)
+                # Const enums resolve to a scalar, so they must be known before any
+                # signature or field mentioning one is resolved.
+                register_enum(declaration, structs)
             for declaration in file.top_decls |structs, declined, ctx|:
                 declined <- true if not set_struct_body(declaration, structs, ctx) else declined
             -1 return if declined
