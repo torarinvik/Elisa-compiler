@@ -270,6 +270,20 @@ module Backend:
             # A cycle simply never resolves, stays Unmodeled, and DECLINES.
             alias_names: mutable darray[sview]
             alias_types: mutable darray[ValueType]
+            # GLOBAL consts. stage0 INLINES them: `const LIMIT: i64 = 42` emits no `@LIMIT`
+            # global and no load — `LIMIT + NAME.i64()` lowers to `sadd(42, 7)` (read from
+            # its -emit llvm output). So a const is a compile-time VALUE substituted at the
+            # use site, and the backend needs only name -> (type, folded value).
+            #
+            # Folded to a FIXPOINT, unlike aliases: stage0 ACCEPTS a forward reference here
+            # (`const A: i64 = B + 2` before `const B` works — verified), so an in-order pass
+            # would decline a program the reference compiler compiles. A CYCLE never folds
+            # and stays unresolved, which declines — stage0 rejects it too ("const \"A\"
+            # initializer must be a compile-time i64 value").
+            const_names: mutable darray[sview]
+            const_types: mutable darray[ValueType]
+            const_values: mutable darray[i64]
+            const_resolved: mutable darray[bool]
             # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
             # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
             #
@@ -657,7 +671,12 @@ module Backend:
         # i64 that is then silently truncated.
         def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic]:
             if expression is Expr.Ident(ident_name, ident_line):
-                return lookup_type(local_scope, ident_name)
+                # A LOCAL shadows a global const, so the scope is consulted first.
+                local_type: ValueType = lookup_type(local_scope, ident_name)
+                local_type return if local_type.kind != TypeKind.Unmodeled
+                const_index: i64 = const_index_of(structs, ident_name)
+                copied_type(structs.const_types[const_index.usize()]) return if const_index >= 0 and structs.const_resolved[const_index.usize()]
+                return unmodeled_type()
             if expression is Expr.Paren(paren_inner, paren_line):
                 return expression_type(paren_inner, local_scope, fns, structs, generics)
             if expression is Expr.BoolLit(bool_value):
@@ -1471,6 +1490,15 @@ module Backend:
                     return LLVMConstNull(llvm_type_of(expected, structs, ctx))
             if expression is Expr.Ident(ident_name, ident_line):
                 ident_type: ValueType = lookup_type(local_scope, ident_name)
+                # A GLOBAL const is INLINED at its use site, exactly as stage0 does: no
+                # global, no load, just the folded value at the const's own type. Checked
+                # only when the name is not a local, so a local still shadows it.
+                if ident_type.kind == TypeKind.Unmodeled:
+                    const_index: i64 = const_index_of(structs, ident_name)
+                    if const_index >= 0 and structs.const_resolved[const_index.usize()]:
+                        const_type: ValueType = copied_type(structs.const_types[const_index.usize()])
+                        null return if not is_integer_type(const_type)
+                        return LLVMConstInt(llvm_type_of(const_type, structs, ctx), structs.const_values[const_index.usize()].u64(), 0)
                 null return if ident_type.kind == TypeKind.Unmodeled
                 if lookup_slot(local_scope, ident_name) is slot:
                     # A local passed where a REFERENCE is wanted: hand over its ADDRESS.
@@ -2177,6 +2205,88 @@ module Backend:
                 structs.field_count <- structs.field_count.push(0)
 
 
+        def const_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.const_names.count |index, structs, name|:
+                index.i64() return if structs.const_names[index] == name
+                index <- index + 1
+            return -1
+
+
+        # Register a global const's NAME and declared type; fold_consts fills in the value.
+        # `const A: mutable i64 = 42` is accepted by stage0, so is_mutable is not a decline.
+        def register_const(declaration: Decl, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                structs.const_names <- structs.const_names.push(const_name)
+                structs.const_types <- structs.const_types.push(annotation_value_type(const_type_expression, structs))
+                structs.const_values <- structs.const_values.push(0)
+                structs.const_resolved <- structs.const_resolved.push(false)
+
+
+        # Constant-FOLD an initializer to an integer. Only the forms stage0 itself calls a
+        # "compile-time value" are modeled: literals, other consts, and integer arithmetic.
+        # `ok` is false for anything else (a call, an unresolved const), which propagates
+        # outward as a decline rather than a guessed value.
+        def fold_const_expr(expression: Expr, structs: StructTable&, ok: mutable bool&) -> i64 can[Abort.Panic]:
+            if expression is Expr.IntLit(literal_value):
+                return literal_value
+            if expression is Expr.Paren(paren_inner, paren_line):
+                return fold_const_expr(paren_inner, structs, ok)
+            if expression is Expr.Ident(ident_name, ident_line):
+                const_index: i64 = const_index_of(structs, ident_name)
+                if const_index >= 0 and structs.const_resolved[const_index.usize()]:
+                    return structs.const_values[const_index.usize()]
+                ok <- false
+                return 0
+            if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
+                operand_value: i64 = fold_const_expr(unary_operand, structs, ok)
+                (0 - operand_value) return if unary_operator == TokenKind.Minus
+                ok <- false
+                return 0
+            if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
+                left_value: i64 = fold_const_expr(binary_left, structs, ok)
+                right_value: i64 = fold_const_expr(binary_right, structs, ok)
+                # `not ok` directly on the `mutable bool&` param is rejected ("not operator
+                # requires bool operand") — read it through a local first.
+                operands_ok: bool = ok
+                0 return if not operands_ok
+                (left_value + right_value) return if binary_operator == TokenKind.Plus
+                (left_value - right_value) return if binary_operator == TokenKind.Minus
+                (left_value * right_value) return if binary_operator == TokenKind.Star
+                if binary_operator == TokenKind.Slash:
+                    # Folding a division by zero would invent a value for a program that has
+                    # none; decline and let stage0's own diagnostic stand.
+                    ok <- false if right_value == 0 else ok
+                    0 return if right_value == 0
+                    return left_value / right_value
+                ok <- false
+                return 0
+            ok <- false
+            return 0
+
+
+        # Fold every global const to its value, iterating to a FIXPOINT so a const may
+        # reference one declared LATER (stage0 accepts that). Each pass must resolve at
+        # least one new const or nothing ever will, so `const_names.count` passes suffice.
+        def fold_consts(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            pass_index: mutable usize = 0
+            while pass_index < structs.const_names.count |pass_index, file, structs|:
+                progressed: mutable bool = false
+                for declaration in file.top_decls |progressed, structs|:
+                    if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                        const_index: i64 = const_index_of(structs, const_name)
+                        continue if const_index < 0
+                        continue if structs.const_resolved[const_index.usize()]
+                        folded_ok: mutable bool = true
+                        folded: i64 = fold_const_expr(const_value, structs, folded_ok)
+                        continue if not folded_ok
+                        structs.const_values[const_index.usize()] <- folded
+                        structs.const_resolved[const_index.usize()] <- true
+                        progressed <- true
+                break if not progressed
+                pass_index <- pass_index + 1
+
+
         # Register an alias NAME with a placeholder type; resolve_aliases fills it in.
         def register_alias(declaration: Decl, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             if declaration is Decl.Alias(alias_name, alias_target, alias_line):
@@ -2402,7 +2512,7 @@ module Backend:
         # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
         # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
         def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], alias_names: [], alias_types: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], array_elements: [], array_extents: [], darray_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -2426,6 +2536,11 @@ module Backend:
             # Aliases resolve AFTER struct names and enums (an alias may name either) and
             # BEFORE struct bodies (a field may be alias-typed).
             resolve_aliases(file, structs)
+            # Consts are registered after aliases so a const may be alias-typed, and folded
+            # in their own fixpoint pass.
+            for declaration in file.top_decls |structs|:
+                register_const(declaration, structs)
+            fold_consts(file, structs)
             for declaration in file.top_decls |structs, declined, ctx|:
                 declined <- true if not set_struct_body(declaration, structs, ctx) else declined
             -1 return if declined

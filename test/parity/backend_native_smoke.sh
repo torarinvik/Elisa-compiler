@@ -386,6 +386,20 @@ diff_case type_alias_struct 'struct P:\n    x: i64\n\ntype Pt = P\n\ndef main() 
 # silently become the i64 default.
 diff_case type_alias_u8 'type Byte = u8\n\ndef main() -> i64:\n    b: Byte = 200\n    return b.i64() - 158\n'
 diff_case type_alias_param 'type Num = i64\n\ndef add(a: Num, b: Num) -> Num:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n'
+# A GLOBAL const is INLINED at its use site — stage0 emits no `@LIMIT` global and no load
+# (`LIMIT + NAME.i64()` lowers to `sadd(42, 7)`), so the backend folds it to a value.
+diff_case const_basic 'const LIMIT: i64 = 42\n\ndef main() -> i64:\n    return LIMIT\n'
+diff_case const_refs_const 'const A: i64 = 40\nconst B: i64 = A + 2\n\ndef main() -> i64:\n    return B\n'
+# Consts allow a FORWARD reference (stage0 accepts this) — the exact opposite of `type`
+# aliases, which require declaration order. Hence a fixpoint fold here, one pass there.
+diff_case const_forward 'const A: i64 = B + 2\nconst B: i64 = 40\n\ndef main() -> i64:\n    return A\n'
+# The const carries its declared WIDTH: a u8 const must stay a u8, not the i64 default.
+diff_case const_u8 'const B: u8 = 200\n\ndef main() -> i64:\n    return B.i64() - 158\n'
+# A LOCAL shadows a global const of the same name.
+diff_case const_shadowed_by_local 'const V: i64 = 1\n\ndef main() -> i64:\n    V: i64 = 42\n    return V\n'
+diff_case const_in_arithmetic 'const A: i64 = 40\nconst B: i64 = 2\n\ndef main() -> i64:\n    return A + B\n'
+# `const A: mutable i64 = 42` is accepted by stage0, so `is_mutable` must not decline.
+diff_case const_mutable_global 'const A: mutable i64 = 42\n\ndef main() -> i64:\n    return A\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
@@ -441,6 +455,11 @@ decline_case type_alias_cycle 'type A = B\ntype B = A\n\ndef main() -> A:\n    r
 # A FORWARD reference is not a language feature — stage0 rejects it, so stage1 must not
 # quietly resolve it and emit code for a program the reference compiler refuses.
 decline_case type_alias_forward 'type A = B\ntype B = i64\n\ndef main() -> A:\n    return 42\n'
+# stage0 rejects both of these as not "a compile-time value", so stage1 must not fold them.
+# The cycle is why folding iterates to a fixpoint instead of substituting the initializer
+# expression at each use: substitution would recurse forever here.
+decline_case const_cycle 'const A: i64 = B\nconst B: i64 = A\n\ndef main() -> i64:\n    return A\n'
+decline_case const_from_call 'def f() -> i64:\n    return 42\n\nconst A: i64 = f()\n\ndef main() -> i64:\n    return A\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 decline_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0]\n'
 decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
