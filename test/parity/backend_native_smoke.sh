@@ -528,6 +528,14 @@ diff_case penum_mixed_variants 'enum Opt:\n    None\n    Some(v: i64)\n\ndef rea
 # IDENT(of)") -- `of` belongs to const enums only.
 diff_case penum_plain_enum 'enum Color:\n    Red\n    Green\n\ndef code(c: Color) -> i64:\n    return match c:\n        Color.Red: 42\n        Color.Green: 0\n\ndef main() -> i64:\n    return code(Color.Red) + code(Color.Green)\n'
 diff_case penum_plain_second 'enum Color:\n    Red\n    Green\n\ndef code(c: Color) -> i64:\n    return match c:\n        Color.Red: 0\n        Color.Green: 42\n\ndef main() -> i64:\n    return code(Color.Green)\n'
+# `region NAME(capacity):` takes its backing UP FRONT from the runtime
+# (`call ptr @new_region_backend(i64 4096, i64 0)`, with `begin` and `end` both starting at
+# it) instead of the lazy strategy an auto region uses. The parser captures the capacity as a
+# span of the SOURCE text, so it arrives as clause[1] and is parsed back out -- it is not an
+# Expr. This is a prerequisite for the packed-enum store, which needs a sized region.
+diff_case region_capacity 'def main() -> i64:\n    total: mutable i64 = 0\n    region r(4096):\n        xs: mutable darray[i64] = []\n        xs.push(42)\n        total <- xs[0] can Unsafe.UncheckedIndex\n    return total\n'
+# The sized region must still serve REALLOCATION inside the scope.
+diff_case region_capacity_grows 'def main() -> i64:\n    total: mutable i64 = 0\n    region r(65536):\n        xs: mutable darray[i64] = []\n        for i in 0..<500:\n            xs.push(1)\n        for j in 0..<500:\n            total <- total + (xs[j] can Unsafe.UncheckedIndex)\n    return total - 458\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'

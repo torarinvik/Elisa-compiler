@@ -610,8 +610,10 @@ into the returned row pointer, then write the payload words. A match reads the t
 read_variant_sparse_tag and each payload word with read_variant_sparse_word.
 
 Prerequisites this needs that the backend does NOT have yet:
-1. `region NAME(capacity):` — a region scope with a CAPACITY argument. The capacity lands in
-   `clause` alongside the name, so today's `clause.count != 1` check declines it (1e10f38).
+1. ~~`region NAME(capacity):`~~ — DONE. The capacity arrives as clause[1], a span of the
+   SOURCE text (not an Expr), and is parsed back out. Emits `new_region_backend(cap, 0)` with
+   `begin`/`end` both starting at the backing; the lazy strategy word stays 0 because the
+   backing already exists.
 2. `Arena` as a PARAMETER type. Note the asymmetry: `def build(owner: Arena)` is accepted,
    while `-> darray[i64] @owner` is rejected ("internal runtime carrier type ... not
    supported in user-facing code"). So the carrier is passable but not annotatable.
