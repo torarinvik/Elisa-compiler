@@ -409,3 +409,38 @@ same gap — check it when fixing.
 
 Only the single-error-set, non-generic case is needed to start; `collections.elisa` uses
 `error[RuntimeError]` throughout.
+
+## Modules — ABI mapped, not yet implemented
+
+Read from stage0's `-emit llvm`, not guessed:
+
+    module M:
+        def get() -> i64: ...
+    def main() -> i64:
+        return M::get()
+
+emits `define i64 @M.get()` and `%calltmp = call i64 @M.get()`. So the mangling is
+**dot-separated** (`M.get`), while the SOURCE spelling of a qualified call is `::`.
+`M::get` parses to `Expr.Scope(Expr.Ident("M"), "get", line)` — a node kind distinct from
+`Expr.Field` (parser_expr_ops.elisa ~132), so the call path can tell a qualified call from
+UFCS without ambiguity.
+
+Design constraint that decides the shape: `FnTable.names` holds **sviews into the source
+buffer**. A mangled `"M.get"` has no source text to point at, so keying the table by the
+mangled string would need synthesized storage that outlives every lookup — and an sview
+into a growing `darray[u8]` DANGLES on realloc.
+
+So: add an `owners: mutable darray[sview]` column to FnTable (module name, `""` for
+top-level) and key lookups on the (owner, name) PAIR. Nothing is synthesized except the
+LLVM symbol name itself, which is a temporary cstr built at declaration time exactly as
+`register_struct_name` already does via `sview_to_cstr(name, name_storage)`.
+
+Touch list (16 call sites total): `lookup_function` (3), `function_index_of` (2),
+`param_type_of` (3), `lookup_return_type` (4), `function_name_of` (4) — each gains an owner
+argument, `""` at existing call sites. `emit_module`'s four passes must also walk into
+`Decl.Module(name, body, line)` bodies rather than skipping them (`function_name_of` returns
+"" for a module today, so a module's functions are silently never emitted — which is why a
+qualified call declines).
+
+Nested modules (`A::B::get`) are NOT covered by a single owner column; either flatten the
+owner to a dotted path or decline them.
