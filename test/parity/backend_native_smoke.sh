@@ -594,6 +594,17 @@ diff_case packed_store_leaf 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64
 diff_case packed_store_tag 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        n: Node = new Node.Tag(t: 21)\n        result <- match n:\n            Node.Leaf(v): v\n            Node.Tag(t): t * 2\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
 # TWO rows in one store: the second allocation must get its own index, not overwrite the first.
 diff_case packed_store_two_rows 'packed enum Node:\n    Leaf(v: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        a: Node = new Node.Leaf(v: 40)\n        b: Node = new Node.Leaf(v: 2)\n        av: mutable i64 = 0\n        bv: mutable i64 = 0\n        av <- match a:\n            Node.Leaf(v): v\n        bv <- match b:\n            Node.Leaf(v): v\n        result <- av + bv\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
+# EFFECTS have NO backend representation. Verified by diffing stage0's own IR: `def risky(n:
+# i64) -> i64 can[Abort.Panic]` and the same function WITHOUT the annotation emit byte-
+# identical modules (only source_filename differs). Effects are a SEMANTIC feature, enforced
+# entirely before codegen -- there is nothing for a backend to port, and these fixtures exist
+# to pin that rather than to exercise machinery.
+#
+# What they DO pin: the annotation must not make the emitter decline a function it would
+# otherwise emit, and an `alias` for an effect must not either.
+diff_case effect_annotated 'def risky(n: i64) -> i64 can[Abort.Panic]:\n    return n * 2\n\ndef main() -> i64:\n    return risky(21)\n'
+diff_case effect_multi 'def f(n: i64) -> i64 can[Abort.Panic, Memory.Allocate]:\n    return n + 1\n\ndef main() -> i64:\n    return f(41)\n'
+diff_case effect_alias 'alias MyFx = Abort.Panic\n\ndef f(n: i64) -> i64 can[MyFx]:\n    return n + 1\n\ndef main() -> i64:\n    return f(41)\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'

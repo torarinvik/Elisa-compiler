@@ -653,3 +653,30 @@ unmodeled and that is only sound because freeze/move themselves decline.
 Sharp edge worth knowing: a RECURSIVE plain enum is auto-promoted to packed. `enum Node:
 Leaf(v: i64) / Pair(a: Node, b: Node)` fails with "packed enum constructor Node.Leaf
 requires an active in Node.Store: scope" even though it was never declared `packed`.
+
+## Effects — NOTHING TO PORT (verified, not assumed)
+
+`can[...]` has **no backend representation**. Verified by diffing stage0's own IR:
+
+    def risky(n: i64) -> i64 can[Abort.Panic]:   ->  define i64 @risky(i64 %0) #0 { ... }
+    def risky(n: i64) -> i64:                    ->  define i64 @risky(i64 %0) #0 { ... }
+
+byte-identical modules; only `source_filename` differs. Effects are a SEMANTIC feature,
+enforced entirely before codegen. "Port effects" was on the remaining list and is not backend
+work at all — the only backend obligation is to NOT decline an effect-annotated function,
+which is pinned by three fixtures (plain, multi-effect, and an `alias`ed effect).
+
+## DWARF — scoped: one 490-line file, and `-g` does NOT reach `-emit llvm`
+
+`compiler/src/backend/llvm_debuginfo.go` is 490 lines — a contained chunk, not a subsystem.
+
+The sharp edge: **`-emit llvm -g` emits NO metadata** (0 `!` lines, same as without `-g`),
+while `-emit obj -g` produces real DWARF (`DW_TAG_compile_unit`, verified with dwarfdump). So
+the reference's IR-text path cannot be used as the oracle here the way it was for every other
+feature — the ABI has to be read out of the OBJECT, or out of llvm_debuginfo.go directly.
+
+That also breaks this port's test method: `emit_native` prints IR text, and the suite pipes it
+through llc. Debug metadata WOULD survive that pipe, but there is no stage0 IR to diff it
+against. DWARF is also invisible to an exit code, so `diff_case` cannot see it at all --
+it needs `ir_case`-style checks against the metadata, or a dwarfdump comparison on the linked
+object. Worth doing deliberately rather than by analogy with the other slices.
