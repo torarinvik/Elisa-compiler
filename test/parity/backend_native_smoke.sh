@@ -937,7 +937,7 @@ run_case struct_partial 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:
 decline_case float_bitwise 'def main() -> i64:\n    x: f64 = 2.0\n    y: f64 = x & x\n    return y.i64()\n'
 # MIXED WIDTHS have no implicit conversion in the subset: silently extending one side
 # would invent semantics the language does not have.
-decline_case mixed_widths 'def main() -> i64:\n    a: i32 = 1\n    b: i64 = 2\n    c: i64 = a + b\n    return c\n'
+run_case mixed_widths 'def main() -> i64:\n    a: i32 = 1\n    b: i64 = 2\n    c: i64 = a + b\n    return c\n' 3
 # `i = i + 1` is a DECLARATION, not a store: stage0 lowers a bare `name = value` to a fresh
 # VarDeclStmt, so in a loop body it declares a shadow and the outer `i` never moves — an
 # INFINITE LOOP with no diagnostic (observed). stage1's parser folds `<-` and `=` into the
