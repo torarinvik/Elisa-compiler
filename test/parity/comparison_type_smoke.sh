@@ -33,7 +33,7 @@ echo "$out" | grep -q "cannot compare" && fail "false positive on char==int: $ou
 
 # 6. A string slice compares as text, so slice == int MUST be flagged.
 out=$(printf 'def f(text: cstr[row]) -> bool:\n    return text[0:1] == 1\n' | "$RPT")
-echo "$out" | grep -q "cannot compare sview with int" || fail "sview==int not flagged with surface type: $out"
+echo "$out" | grep -q "cannot compare sview and int" || fail "sview==int not flagged with surface type: $out"
 
 # 7. String views and strings remain mutually comparable.
 out=$(printf 'def f(view: sview, text: cstr[row]) -> bool:\n    return view == text\n' | "$RPT")
