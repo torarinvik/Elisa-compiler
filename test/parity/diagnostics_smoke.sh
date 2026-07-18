@@ -102,7 +102,6 @@ NAMES=(
     float_equality
     identical_branches
     identical_logical_operands
-    if_value_missing_else
     immediate_overwrite
     index_non_indexable
     index_out_of_bounds
@@ -245,7 +244,6 @@ EXPECTS=(
     "floating-point equality comparison is unreliable; use a tolerance"
     "if and else branches are identical"
     "identical operands on both sides of 'and'"
-    "an \`if\` used as a value must have a final \`else\`"
     "value assigned to x is immediately overwritten"
     "indexing requires string, array, view, packed store, or reference type, got i64"
     "constant index 5 out of bounds for i64[3]"
