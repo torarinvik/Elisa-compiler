@@ -935,9 +935,9 @@ run_case comprehension_const_filter 'def main() -> i64:\n    xs: darray[i64] = [
 run_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [40, 0]\n    return xs[0] + xs[1] + xs[2] + 2\n' 42
 run_case struct_partial 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 40}\n    return p.x + p.y + 2\n' 42
 decline_case float_bitwise 'def main() -> i64:\n    x: f64 = 2.0\n    y: f64 = x & x\n    return y.i64()\n'
-# MIXED WIDTHS have no implicit conversion in the subset: silently extending one side
-# would invent semantics the language does not have.
 run_case mixed_widths 'def main() -> i64:\n    a: i32 = 1\n    b: i64 = 2\n    c: i64 = a + b\n    return c\n' 3
+run_case mixed_widths_direct 'def main() -> i64:\n    a: i32 = 1\n    b: i64 = 2\n    return a + b\n' 3
+# Direct result-context widening is also covered by this mixed-width case.
 # `i = i + 1` is a DECLARATION, not a store: stage0 lowers a bare `name = value` to a fresh
 # VarDeclStmt, so in a loop body it declares a shadow and the outer `i` never moves — an
 # INFINITE LOOP with no diagnostic (observed). stage1's parser folds `<-` and `=` into the
