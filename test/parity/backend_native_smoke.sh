@@ -248,6 +248,7 @@ run_case array_write_loop 'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0
 # 256 initial capacity and the grow rule are all stage0's, read out of its own `-emit llvm`
 # output — they are dictated by the shared runtime, not chosen here.
 run_case darray_push      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'  42
+run_case darray_literal   'def main() -> i64:\n    xs: darray[i64] = [40, 2, 99]\n    return xs[0] + xs[1]\n'  42
 run_case darray_count     'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(7)\n    xs.push(7)\n    xs.push(7)\n    return xs.count * 14\n'  42
 run_case darray_loop      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<10:\n        xs.push(i)\n    total: mutable i64 = 0\n    for j in 0..<10:\n        total <- total + xs[j]\n    return total - 3\n'  42
 run_case darray_u8        'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'  42
