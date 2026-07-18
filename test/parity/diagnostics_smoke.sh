@@ -204,7 +204,7 @@ EXPECTS=(
     "storage type must be an explicit integer type, got bool"
     "value 300 does not fit storage type u8"
     "raise requires the current function to return an error union"
-    "the scalar type i32 cannot carry a region"
+    "region annotation `@owner` is only supported on container, generic, and reference types"
     "cannot be returned with a region-less type"
     "return type expects row[0], got shape_out[0]"
     "return type expects pair[0], got pair[0]"
