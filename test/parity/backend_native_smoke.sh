@@ -930,6 +930,7 @@ decline_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [
 stripped_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 run_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0] + xs[1] + 39\n' 42
+run_case for_over_darray 'def main() -> i64:\n    xs: darray[i64] = [1, 2, 3]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total + 36\n' 42
 run_case comprehension_const_filter 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if false]\n    return xs.count + 42\n' 42
 run_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [40, 0]\n    return xs[0] + xs[1] + xs[2] + 2\n' 42
 run_case struct_partial 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 40}\n    return p.x + p.y + 2\n' 42
@@ -969,8 +970,8 @@ run_case catch_bind_use 'error ParseError:\n    BadDigit\n\ndef parse_num(x: i64
 run_case catch_wildcard 'error ParseError:\n    BadDigit\n\ndef parse_num(x: i64) -> i64 error[ParseError]:\n    raise ParseError.BadDigit if x < 0\n    return x * 2\n\ndef main() -> i64:\n    v: i64 = catch parse_num(-5):\n        n: n\n        _: 42\n    return v\n' 42
 run_case nested_array_triple 'def main() -> i64:\n    t: mutable i64[2][2][2] = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]\n    t[1][0][1] <- 36 can Unsafe.UncheckedIndex\n    return (t[1][0][1] can Unsafe.UncheckedIndex) + (t[0][1][0] can Unsafe.UncheckedIndex) + (t[0][0][0] can Unsafe.UncheckedIndex) + 2\n' 42
 run_case nested_array_loop 'def main() -> i64:\n    m: mutable i64[4][3] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]\n    total: mutable i64 = 0\n    for r in 0..<3:\n        for c in 0..<4 |m, total, r|:\n            m[r][c] <- (r * 4 + c) can Unsafe.UncheckedIndex\n            total <- total + (m[r][c] can Unsafe.UncheckedIndex)\n    return total - 24\n' 42
-# Iterating a CONTAINER needs the container ABI; only integer ranges are modeled.
-decline_case for_over_container 'def main() -> i64:\n    xs: darray[i64] = [1, 2]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total\n'
+# Darray iteration uses the container header ABI and binds each element by value.
+run_case for_over_container 'def main() -> i64:\n    xs: darray[i64] = [1, 2]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total + 39\n' 42
 # `break` outside any loop must decline, not branch to nowhere.
 decline_case break_outside_loop 'def main() -> i64:\n    break\n    return 0\n'
 # A match GUARD is a second per-arm condition; not modeled. Ignoring it emitted the arm
