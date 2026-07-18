@@ -13,11 +13,11 @@ fail() { echo "comparison-type smoke FAIL: $1" >&2; exit 1; }
 
 # 1. int == string MUST be flagged.
 out=$(printf 'def f(n: i64) -> bool:\n    return n == "s"\n' | "$RPT")
-echo "$out" | grep -q "cannot compare int with string" || fail "int==string not flagged: $out"
+echo "$out" | grep -q "cannot compare int and string" || fail "int==string not flagged: $out"
 
 # 2. bool == int MUST be flagged.
 out=$(printf 'def f(b: bool, n: i64) -> bool:\n    return b == n\n' | "$RPT")
-echo "$out" | grep -q "cannot compare bool with int" || fail "bool==int not flagged: $out"
+echo "$out" | grep -q "cannot compare bool and int" || fail "bool==int not flagged: $out"
 
 # 3. int == int must NOT be flagged.
 out=$(printf 'def f(n: i64, m: i64) -> bool:\n    return n == m\n' | "$RPT")
