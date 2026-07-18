@@ -14,7 +14,7 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 normalize() {
     sed -E \
-        -e 's/^[^:]*:[0-9]+:[0-9]+(-[0-9]+)?:[[:space:]]*//' \
+        -e 's/^[^:]*:[0-9]+:[0-9]+(-[0-9]+(:[0-9]+)?)?:[[:space:]]*//' \
         -e 's/^  L[0-9]+[[:space:]]*//' \
         -e 's/[^[:alnum:]_]+/ /g' \
         -e 's/[[:space:]]+/ /g' \

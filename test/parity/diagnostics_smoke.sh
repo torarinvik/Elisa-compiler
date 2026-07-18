@@ -297,7 +297,7 @@ EXPECTS=(
     "'M' is a namespace; write M::member"
     "expression statement has no effect; its result is discarded"
     "argument 1 to 'take' expects i64, got void"
-    "collection element cannot be void"
+    "darray literal element expects i64, got void"
     "field access requires struct type, got void"
     "indexing requires string, array, view, packed store, or reference type, got void"
     "match requires an enum, const enum, error set, optional, integer, string, tuple, sequence, or struct value, got void"
