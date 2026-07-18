@@ -930,7 +930,7 @@ decline_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [
 stripped_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 run_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0] + xs[1] + 39\n' 42
-decline_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [1, 2]\n    return xs[0]\n'
+run_case array_short_literal 'def main() -> i64:\n    xs: i64[3] = [40, 0]\n    return xs[0] + xs[1] + xs[2] + 2\n' 42
 run_case struct_partial 'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 40}\n    return p.x + p.y + 2\n' 42
 decline_case float_bitwise 'def main() -> i64:\n    x: f64 = 2.0\n    y: f64 = x & x\n    return y.i64()\n'
 # MIXED WIDTHS have no implicit conversion in the subset: silently extending one side
