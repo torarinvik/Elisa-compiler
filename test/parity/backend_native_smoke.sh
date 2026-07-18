@@ -924,7 +924,7 @@ run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef mai
 decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(bogus: 42)\n    return match s:\n        Shape.Circle(r): r\n'
 # A FILTERED comprehension declines: the output count is not known up front, so the presized
 # form does not apply -- and stage0 itself says only the filter-free form auto-vectorizes.
-decline_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n'
+run_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n' 4
 # `ensure` is a POSTCONDITION over `result`, which is not bound until the return; modeled
 # only as a decline (requires -- the precondition over params -- is the portable half).
 stripped_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n'

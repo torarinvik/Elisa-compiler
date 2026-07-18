@@ -2434,8 +2434,6 @@ module Backend:
             if condition is Expr.BoolLit(filter_value):
                 if not filter_value:
                     return LLVMConstNull(darray_llvm_type(structs, ctx))
-            else:
-                null return if not (condition is Expr.Absent)
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
             element_type: ValueType = darray_element_of(expected, structs)
             null return if element_type.kind == TypeKind.Unmodeled
@@ -2468,10 +2466,19 @@ module Backend:
                         count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, result_slot, 1, "comp.count.ptr")
                         capacity_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, result_slot, 2, "comp.cap.ptr")
                         _ = LLVMBuildStore(builder, items, items_pointer)
-                        # count is set UP FRONT — the loop fills a sized array rather than
-                        # growing one.
-                        _ = LLVMBuildStore(builder, count, count_pointer)
-                        _ = LLVMBuildStore(builder, count, capacity_pointer)
+                        # Capacity is the range bound; count is the number of values that
+                        # actually pass a dynamic filter and starts at zero.
+                        filtered: mutable bool = true
+                        if condition is Expr.Absent:
+                            filtered <- false
+                        elif condition is Expr.BoolLit:
+                            filtered <- false
+                        if filtered:
+                            _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), count_pointer)
+                        else:
+                            _ = LLVMBuildStore(builder, count, count_pointer)
+                        output_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, "comp.out.i")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), output_index_slot)
 
                         function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                         index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, "comp.i")
@@ -2480,7 +2487,10 @@ module Backend:
                         declare_local(local_scope, comprehension_var, var_slot, index_type)
 
                         condition_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.cond")
-                        body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.body")
+                        body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.input")
+                        write_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.write")
+                        skip_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.skip")
+                        latch_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.latch")
                         done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.done")
                         _ = LLVMBuildBr(builder, condition_block)
                         LLVMPositionBuilderAtEnd(builder, condition_block)
@@ -2490,18 +2500,39 @@ module Backend:
 
                         LLVMPositionBuilderAtEnd(builder, body_block)
                         _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, low_value, current, "comp.var.value"), var_slot)
+                        if filtered:
+                            if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is predicate:
+                                _ = LLVMBuildCondBr(builder, predicate, write_block, skip_block)
+                            else:
+                                LLVMPositionBuilderAtEnd(builder, done_block)
+                                return null
+                            LLVMPositionBuilderAtEnd(builder, write_block)
                         if emit_expression(body, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_value:
                             loaded_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "comp.items")
                             # A darray indexes with a ONE-index GEP: `items` is already a T*.
-                            comp_indices: mutable darray[LLVMValueRef] = [current]
+                            output_index: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, output_index_slot, "comp.out.i.cur") if filtered else current
+                            comp_indices: mutable darray[LLVMValueRef] = [output_index]
                             comp_indices_pointer: void& = (&comp_indices[0]).cast[void&] can Unsafe.PointerCast
                             slot_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), loaded_items, comp_indices_pointer, 1, "comp.slot")
                             _ = LLVMBuildStore(builder, element_value, slot_pointer)
+                            if filtered:
+                                _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, output_index, LLVMConstInt(int64_type, 1, 0), "comp.out.i.next"), output_index_slot)
+                                _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, output_index, LLVMConstInt(int64_type, 1, 0), "comp.count.next"), count_pointer)
                             _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, current, LLVMConstInt(int64_type, 1, 0), "comp.i.next"), index_slot)
                             # The LATCH is what carries the marker: this branch is the loop's
                             # back-edge, and `!llvm.loop` belongs on it.
+                            _ = LLVMBuildBr(builder, latch_block)
+                            LLVMPositionBuilderAtEnd(builder, skip_block)
+                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, current, LLVMConstInt(int64_type, 1, 0), "comp.i.skip"), index_slot)
+                            _ = LLVMBuildBr(builder, latch_block)
+                            LLVMPositionBuilderAtEnd(builder, latch_block)
                             latch: LLVMValueRef = LLVMBuildBr(builder, condition_block)
                             tag_autovec_loop(latch, "comprehension", ctx)
+                            if not filtered:
+                                LLVMPositionBuilderAtEnd(builder, write_block)
+                                _ = LLVMBuildUnreachable(builder)
+                                LLVMPositionBuilderAtEnd(builder, skip_block)
+                                _ = LLVMBuildUnreachable(builder)
                             LLVMPositionBuilderAtEnd(builder, done_block)
                             return LLVMBuildLoad2(builder, header, result_slot, "list.comp.value")
                         LLVMPositionBuilderAtEnd(builder, done_block)
