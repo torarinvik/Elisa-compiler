@@ -972,6 +972,8 @@ run_case nested_array_triple 'def main() -> i64:\n    t: mutable i64[2][2][2] = 
 run_case nested_array_loop 'def main() -> i64:\n    m: mutable i64[4][3] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]\n    total: mutable i64 = 0\n    for r in 0..<3:\n        for c in 0..<4 |m, total, r|:\n            m[r][c] <- (r * 4 + c) can Unsafe.UncheckedIndex\n            total <- total + (m[r][c] can Unsafe.UncheckedIndex)\n    return total - 24\n' 42
 # Darray iteration uses the container header ABI and binds each element by value.
 run_case for_over_container 'def main() -> i64:\n    xs: darray[i64] = [1, 2]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total + 39\n' 42
+run_case for_darray_continue 'def main() -> i64:\n    xs: darray[i64] = [1, 2, 3, 4]\n    total: mutable i64 = 0\n    for x in xs:\n        continue if x == 2\n        total <- total + x\n    return total + 34\n' 42
+run_case for_darray_break 'def main() -> i64:\n    xs: darray[i64] = [1, 2, 3, 4]\n    total: mutable i64 = 0\n    for x in xs:\n        break if x == 3\n        total <- total + x\n    return total + 39\n' 42
 # `break` outside any loop must decline, not branch to nowhere.
 decline_case break_outside_loop 'def main() -> i64:\n    break\n    return 0\n'
 # A match GUARD is a second per-arm condition; not modeled. Ignoring it emitted the arm
