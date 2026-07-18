@@ -21,8 +21,99 @@ extend Semantic:
                     _:
                         return (-1)
 
+        # Whether a type expression denotes a sequence (`darray[T]`, `array[T, N]`, or a
+        # fixed-size `T[N]`) — used to decide whether a bare `xs = []` returned from the
+        # function can adopt the return type's element type.
+        def type_is_sequence(type_expr: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expr:
+                    Expr.Index(object, index, line):
+                        # `darray[T]` / `array[T]`, or a fixed-size `T[N]` (integer-literal size).
+                        base_is_container: bool = ident_name_of(object) == "darray" or ident_name_of(object) == "array"
+                        is_fixed_array: bool = match index:
+                            Expr.IntLit(size_value): true
+                            _: false
+                        return base_is_container or is_fixed_array
+                    Expr.IndexN(object, indices, line):
+                        return ident_name_of(object) == "darray" or ident_name_of(object) == "array"
+                    _:
+                        return false
+
+        # Whether `name` is grown by `name.push(...)` / `name.extend(...)` anywhere in
+        # `statements` (recursing into nested bodies). Such a mutation determines the
+        # element type of a bare `name = []`, so stage0 accepts it — the diagnostic is
+        # suppressed. Mirrors stage0's "infer element type from a later grow" rule.
+        def name_is_grown(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            true return if expression_grows_name(expression, name)
+                        Stmt.VarDecl(var_name, type_expression, value, line):
+                            true return if expression_grows_name(value, name)
+                        Stmt.Assign(target, operator, value, line):
+                            true return if expression_grows_name(value, name)
+                        Stmt.If(condition, then_body, else_body, line):
+                            true return if name_is_grown(then_body, name) or name_is_grown(else_body, name)
+                        Stmt.While(condition, body, line):
+                            true return if name_is_grown(body, name)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            true return if name_is_grown(body, name)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            true return if name_is_grown(body, name)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                true return if name_is_grown(arm.body, name)
+                        _:
+                            pass
+                return false
+
+        # Whether `expression` is (or contains) a `name.push(...)` / `name.extend(...)` call.
+        def expression_grows_name(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        if callee is Expr.Field(receiver, method, field_line):
+                            grows: bool = (method == "push" or method == "extend") and ident_name_of(receiver) == name
+                            true return if grows
+                        return any argument in arguments where expression_grows_name(argument, name)
+                    Expr.Binary(left, operator, right, line):
+                        return expression_grows_name(left, name) or expression_grows_name(right, name)
+                    Expr.Paren(inner, line):
+                        return expression_grows_name(inner, name)
+                    _:
+                        return false
+
+        # Whether `name` is returned (`return name`) somewhere in `statements` — the second
+        # element-type-determining use stage0 recognizes when the function return type is a
+        # sequence.
+        def name_is_returned(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned_value:
+                                returns_name: bool = match returned_value:
+                                    Expr.Ident(returned_name, ident_line): returned_name == name
+                                    _: false
+                                true return if returns_name
+                        Stmt.If(condition, then_body, else_body, line):
+                            true return if name_is_returned(then_body, name) or name_is_returned(else_body, name)
+                        Stmt.While(condition, body, line):
+                            true return if name_is_returned(body, name)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            true return if name_is_returned(body, name)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            true return if name_is_returned(body, name)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                true return if name_is_returned(arm.body, name)
+                        _:
+                            pass
+                return false
+
         # Walk through statements and check array literal arities.
-        def walk_array_arity_check(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+        def walk_array_arity_check(statements: darray[Ast::Stmt], func_body: darray[Ast::Stmt], func_return: Ast::Expr, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
@@ -41,19 +132,23 @@ extend Semantic:
                                         pass
                         Stmt.Assign(target, operator, value, line):
                             if target is Expr.Ident(name, target_line) and value is Expr.Array(elements, array_line):
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EmptyArrayWithoutContext, name: name, line: line, expected: "", actual: ""}) if operator == TokenKind.Assign and elements.count == 0
+                                # A bare `xs = []` has no expected element type — UNLESS a later
+                                # `xs.push(...)`/`xs.extend(...)` grow or a `return xs` (with a
+                                # sequence return type) determines it (stage0's inference rule).
+                                determined: bool = name_is_grown(func_body, name) or (name_is_returned(func_body, name) and type_is_sequence(func_return))
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EmptyArrayWithoutContext, name: name, line: line, expected: "", actual: ""}) if operator == TokenKind.Assign and elements.count == 0 and not determined
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- walk_array_arity_check(then_body, table)
-                            table <- walk_array_arity_check(else_body, table)
+                            table <- walk_array_arity_check(then_body, func_body, func_return, table)
+                            table <- walk_array_arity_check(else_body, func_body, func_return, table)
                         Stmt.While(condition, body, line):
-                            table <- walk_array_arity_check(body, table)
+                            table <- walk_array_arity_check(body, func_body, func_return, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- walk_array_arity_check(body, table)
+                            table <- walk_array_arity_check(body, func_body, func_return, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- walk_array_arity_check(body, table)
+                            table <- walk_array_arity_check(body, func_body, func_return, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table| -> table:
-                                table <- walk_array_arity_check(arm.body, table)
+                                table <- walk_array_arity_check(arm.body, func_body, func_return, table)
                         _:
                             pass
 
@@ -64,7 +159,8 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
-                            table <- walk_array_arity_check(body, table)
+                            func_return: Ast::Expr = get return_type else (Ast::Expr.Invalid)
+                            table <- walk_array_arity_check(body, body, func_return, table)
                         Decl.Module(name, body, line):
                             table <- check_array_literal_arity(body, table)
                         Decl.Scoped(body, line):
