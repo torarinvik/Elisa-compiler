@@ -13,7 +13,7 @@ fail() { echo "field-type smoke FAIL: $1" >&2; exit 1; }
 
 # 1. a struct int field used as an if-condition MUST flag NonBoolCondition.
 out=$(printf 'struct Point:\n    x: i64\n    y: i64\n\ndef f(p: Point) -> i64:\n    if p.x:\n        return 1\n    return 0\n' | "$RPT")
-echo "$out" | grep -q "if condition must be bool, got int" || fail "int field-as-condition not flagged: $out"
+echo "$out" | grep -q "if condition must be bool, got i64" || fail "int field-as-condition not flagged: $out"
 
 # 2. a struct int field as a logical operand MUST flag NonBoolOperand.
 out=$(printf 'struct Point:\n    x: i64\n\ndef f(p: Point) -> bool:\n    return p.x and p.x\n' | "$RPT")

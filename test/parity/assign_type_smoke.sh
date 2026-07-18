@@ -15,7 +15,7 @@ fail() { echo "assign-type smoke FAIL: $1" >&2; exit 1; }
 
 # 1. VarDecl with bool expecting literal int MUST flag TypeMismatch.
 out=$(printf 'def f() -> void:\n    x: bool = 5\n' | "$RPT")
-echo "$out" | grep -q "expects bool, got int" || fail "VarDecl literal mismatch not flagged: $out"
+echo "$out" | grep -q "expects bool, got i64" || fail "VarDecl literal mismatch not flagged: $out"
 
 # 2. VarDecl with i64 expecting literal bool MUST flag TypeMismatch.
 out=$(printf 'def f() -> void:\n    y: i64 = true\n' | "$RPT")
@@ -27,7 +27,7 @@ echo "$out" | grep -q "expects i64" && fail "false positive on matching VarDecl:
 
 # 4. Assignment rebind with <- and type mismatch MUST flag.
 out=$(printf 'def f() -> void:\n    a: mutable bool = false\n    a <- 10\n' | "$RPT")
-echo "$out" | grep -q "expects bool, got int" || fail "Assign <- mismatch not flagged: $out"
+echo "$out" | grep -q "expects bool, got i64" || fail "Assign <- mismatch not flagged: $out"
 
 # 5. Assignment rebind with matching type must NOT flag.
 out=$(printf 'def f() -> void:\n    b: mutable i64 = 0\n    b <- 10\n' | "$RPT")
@@ -53,7 +53,7 @@ echo "$out" | grep -q "return type expects bool" && fail "false positive on matc
 
 # 8. Field assignment type mismatch MUST flag.
 out=$(printf 'struct S:\n    x: bool\ndef f() -> void:\n    s: S = S{}\n    s.x <- 5\n' | "$RPT")
-echo "$out" | grep -q "expects bool, got int" || fail "Field assign mismatch not flagged: $out"
+echo "$out" | grep -q "expects bool, got i64" || fail "Field assign mismatch not flagged: $out"
 
 # 9. Structural generic-container mismatch MUST flag (darray <- dict).
 out=$(printf 'def f() -> void:\n    a: mutable darray[i64] = []\n    b: dict[cstr, i64] = {}\n    a <- b\n' | "$RPT")

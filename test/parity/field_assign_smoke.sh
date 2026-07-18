@@ -12,7 +12,7 @@ fail() { echo "field-assign smoke FAIL: $1" >&2; exit 1; }
 
 # 1. a string assigned to an i64 field MUST be flagged.
 out=$(printf 'struct C:\n    count: i64\n\ndef f(c: mutable C) -> void:\n    c.count <- "s"\n' | "$RPT")
-echo "$out" | grep -q "'count' expects i64, got string" || fail "string-to-i64-field not flagged: $out"
+echo "$out" | grep -q "'count' expects i64, got static u8" || fail "string-to-i64-field not flagged: $out"
 
 # 2. a bool assigned to a string field MUST be flagged.
 out=$(printf 'struct C:\n    name: sview\n\ndef f(c: mutable C) -> void:\n    c.name <- true\n' | "$RPT")

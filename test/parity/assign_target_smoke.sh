@@ -20,7 +20,7 @@ echo "$out" | grep -q "undefined assignment target" && fail "false positive on d
 
 # 2b. `<-` to an immutable const is rejected; to a `global mutable` is fine.
 out=$(printf 'const K: i64 = 5\ndef f() -> i64:\n    K <- 10\n    return K\n' | "$RPT")
-echo "$out" | grep -q "cannot assign to immutable 'K'" || fail "const write not flagged: $out"
+echo "$out" | grep -q "cannot assign to immutable local 'K'" || fail "const write not flagged: $out"
 out=$(printf 'global mutable G: i64 = 0\ndef f() -> i64:\n    G <- 10\n    return G\n' | "$RPT")
 echo "$out" | grep -q "cannot assign to immutable" && fail "false positive on global mutable write: $out"
 

@@ -13,7 +13,7 @@ fail() { echo "call-return smoke FAIL: $1" >&2; exit 1; }
 
 # 1. an int-returning call used as an if-condition MUST flag NonBoolCondition.
 out=$(printf 'def g(n: i64) -> i64:\n    return n\n\ndef f() -> i64:\n    if g(1):\n        return 1\n    return 0\n' | "$RPT")
-echo "$out" | grep -q "if condition must be bool, got int" || fail "int-returning call-as-condition not flagged: $out"
+echo "$out" | grep -q "if condition must be bool, got i64" || fail "int-returning call-as-condition not flagged: $out"
 
 # 2. an int-returning call as a logical operand MUST flag NonBoolOperand.
 out=$(printf 'def g() -> i64:\n    return 1\n\ndef f() -> bool:\n    return g() and g()\n' | "$RPT")
