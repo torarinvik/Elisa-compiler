@@ -983,7 +983,7 @@ run_case match_guard 'def classify(n: i64) -> i64:\n    return match n:\n       
 # A BINDING arm is INVALID Elisa in an integer match — stage0: "top-level integer match arm
 # must use an integer literal or _". Treating it as a catch-all made stage1 emit code for a
 # program the language rejects.
-stripped_case match_binding_arm 'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        other: other + 2\n\ndef main() -> i64:\n    return classify(40)\n'
+run_case match_binding_arm 'def classify(n: i64) -> i64:\n    return match n:\n        0: 100\n        other: other + 2\n\ndef main() -> i64:\n    return classify(40)\n' 42
 
 if [ "$pass" -ne "$total" ]; then
     echo "backend_native_smoke FAILED: passed=$pass total=$total"
