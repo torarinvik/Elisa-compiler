@@ -116,6 +116,68 @@ extend Semantic:
                 return ""
 
 
+        # Whether `family` appears among the granted refs of a block-grant clause.
+        def clause_covers_family(clause: darray[sview]&, family: sview) -> bool:
+            can Abort.Panic:
+                for clause_ref in clause:
+                    true return if effect_ref_family(clause_ref) == family
+                return false
+
+        # One-hop effect propagation (stage0 parity): a call inside a `can` BLOCK
+        # whose clause omits one of the callee's declared families leaves that
+        # family REQUIRED by the enclosing function — register it as a declared
+        # effect row so caller-side grant checks see it (arena_free's Unsafe.Alias).
+        def register_block_grant_gaps(owner: sview, statements: darray[Ast::Stmt], enclosing_clause: darray[sview], in_can_block: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table|:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- register_block_grant_gaps(owner, body, clause, true, table) if kind == "can"
+                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, table) if kind != "can" and kind != "trusted"
+                        Stmt.Expr(expression, line):
+                            continue if not in_can_block
+                            gap_callee: sview = called_function_name(expression)
+                            continue if gap_callee == "" or gap_callee == owner or direct_function_count(table, gap_callee) != 1
+                            # Snapshot the row count: pushes below grow the table and must
+                            # not extend this scan (self-feeding loop).
+                            row_count: usize = table.function_effect_owner.count
+                            while ref_index < row_count |ref_index: usize = 0, table|:
+                                if table.function_effect_owner[ref_index] == gap_callee:
+                                    required_ref: sview = table.function_effect_name[ref_index]
+                                    if not clause_covers_family(enclosing_clause, effect_ref_family(required_ref)):
+                                        already_registered: bool =
+                                            for known_index in 0..<table.function_effect_owner.count |already_registered: bool = false| -> already_registered:
+                                                already_registered <- true if table.function_effect_owner[known_index] == owner and table.function_effect_name[known_index] == required_ref
+                                        if not already_registered:
+                                            table.function_effect_owner <- table.function_effect_owner.push(owner)
+                                            table.function_effect_name <- table.function_effect_name.push(required_ref)
+                                ref_index <- ref_index + 1
+                        Stmt.Assign(target, operator, value, line):
+                            # A reinterpret-assign (`x as ! <- v` / `x as & <- v`) is an
+                            # Unsafe.Alias operation; inside a `can` block that omits the
+                            # Unsafe family it leaves Unsafe.Alias required by the
+                            # enclosing function (stage0's arena_free warning).
+                            target_is_reinterpret: bool = match target:
+                                Expr.Binary(as_left, as_operator, as_right, as_line): as_operator == TokenKind.As
+                                _: false
+                            if target_is_reinterpret and in_can_block and not clause_covers_family(enclosing_clause, "Unsafe"):
+                                already: bool =
+                                    for row_index in 0..<table.function_effect_owner.count |already: bool = false| -> already:
+                                        already <- true if table.function_effect_owner[row_index] == owner and table.function_effect_name[row_index] == "Unsafe.Alias"
+                                if not already:
+                                    table.function_effect_owner <- table.function_effect_owner.push(owner)
+                                    table.function_effect_name <- table.function_effect_name.push("Unsafe.Alias")
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- register_block_grant_gaps(owner, then_body, enclosing_clause, in_can_block, table)
+                            table <- register_block_grant_gaps(owner, else_body, enclosing_clause, in_can_block, table)
+                        Stmt.While(condition, body, line):
+                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, table)
+                        _:
+                            pass
+
+
         # Populate the effect-source registry from untrusted panic operations and direct
         # calls to already-known effect-bearing functions. Runs before call-site checking.
         def collect_effect_sources(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
@@ -123,6 +185,7 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            table <- register_block_grant_gaps(name, body, [], false, table)
                             inferred_source: bool = body_has_untrusted_panic(body, false) or body_has_untrusted_effect_call(body, false, table)
                             table.function_effect_source_owner <- table.function_effect_source_owner.push(name) if inferred_source
                             table.function_effect_source_ref <- table.function_effect_source_ref.push(body_first_untrusted_effect_ref(body, false, table)) if inferred_source
@@ -153,6 +216,28 @@ extend Semantic:
                 true return if candidate_name == target
             return false
 
+
+        # Whether the postfix grant on `line` covers `family` (a required permission
+        # family like "Unsafe"): any recorded granted ref on that line whose family
+        # prefix matches. The bare "__inline_can" marker itself never matches.
+        def line_inline_grant_covers(names: darray[sview]&, lines: darray[u32]&, line: u32, family: sview) -> bool:
+            can Abort.Panic:
+                false return if family == ""
+                while index < lines.count |index: usize = 0|:
+                    true return if lines[index] == line and names[index] != "__inline_can" and effect_ref_family(names[index]) == family
+                    index <- index + 1
+                return false
+
+        # The first DECLARED effect ref of `owner` whose family is NOT covered by
+        # the postfix grant on `line` ("" when every declared family is granted).
+        def first_uncovered_declared_ref(table: SymbolTable&, owner: sview, names: darray[sview]&, lines: darray[u32]&, line: u32) -> sview:
+            can Abort.Panic:
+                while declared_index < table.function_effect_owner.count |declared_index: usize = 0|:
+                    if table.function_effect_owner[declared_index] == owner:
+                        candidate: sview = table.function_effect_name[declared_index]
+                        candidate return if not line_inline_grant_covers(names, lines, line, effect_ref_family(candidate))
+                    declared_index <- declared_index + 1
+                return ""
 
         def line_has_inline_grant(names: darray[sview]&, lines: darray[u32]&, line: u32) -> bool:
             can Abort.Panic:
@@ -273,26 +358,32 @@ extend Semantic:
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: callee_name, line: line, expected: function_first_effect_ref(table, callee_name), actual: effect_ref_family(function_first_effect_ref(table, callee_name))}) if not names_contains(bound_names, callee_name) and direct_function_count(table, callee_name) == 1 and function_has_effect(table, callee_name)
 
 
-        def check_ungranted_panic_statements(statements: darray[Ast::Stmt], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, function_line: u32, in_grant: bool, bound_names: darray[sview], table: lmut SymbolTable) -> void:
+        def check_ungranted_panic_statements(statements: darray[Ast::Stmt], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, function_line: u32, in_grant: bool, strict_unsafe: bool, bound_names: darray[sview], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
                             if not in_grant and not line_has_inline_grant(allocation_names, allocation_lines, line):
                                 table <- check_ungranted_call_expression(expression, line, function_line, annotations, bound_names, table)
+                            # A postfix grant that OMITS a required family still leaves
+                            # the call ungranted for that family (stage0 parity).
+                            if not in_grant and line_has_inline_grant(allocation_names, allocation_lines, line):
+                                grant_callee: sview = called_function_name(expression)
+                                uncovered_ref: sview = first_uncovered_declared_ref(table, grant_callee, allocation_names, allocation_lines, line) if grant_callee != "" else ""
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: grant_callee, line: line, expected: uncovered_ref, actual: effect_ref_family(uncovered_ref)}) if uncovered_ref != "" and (strict_unsafe or effect_ref_family(uncovered_ref) != "Unsafe")
                         Stmt.Block(kind, clause, binding, body, line):
                             block_grant: bool = in_grant or kind == "can" or kind == "trusted"
-                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, block_grant, bound_names, table)
+                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, block_grant, strict_unsafe, bound_names, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_ungranted_panic_statements(then_body, allocation_names, allocation_lines, annotations, function_line, in_grant, bound_names, table)
-                            table <- check_ungranted_panic_statements(else_body, allocation_names, allocation_lines, annotations, function_line, in_grant, bound_names, table)
+                            table <- check_ungranted_panic_statements(then_body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
+                            table <- check_ungranted_panic_statements(else_body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
                         Stmt.While(condition, body, line):
-                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, in_grant, bound_names, table)
+                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, in_grant, bound_names, table)
+                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table| -> table:
-                                table <- check_ungranted_panic_statements(arm.body, allocation_names, allocation_lines, annotations, function_line, in_grant, bound_names, table)
+                                table <- check_ungranted_panic_statements(arm.body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
                         Stmt.Return(value, line):
                             if value is return_expression:
                                 needs_local_grant: bool = not in_grant or calls_concrete_effect_wrapper(return_expression, table, annotations)
@@ -314,7 +405,7 @@ extend Semantic:
         # Recurse through every function body (descending Module/Scoped). Signature effects
         # remain a conservative grant except for concrete effect-bearing callback wrappers,
         # whose callback invocation participates in local authority checking.
-        def check_ungranted_panic(declarations: darray[Ast::Decl], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        def check_ungranted_panic(declarations: darray[Ast::Decl], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, strict_unsafe: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -324,10 +415,10 @@ extend Semantic:
                             for parameter in parameters:
                                 bound_names.push(parameter.name)
                             collect_bound_names(body, bound_names)
-                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, line, signature_grant, bound_names, table)
+                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, line, signature_grant, strict_unsafe, bound_names, table)
                         Decl.Module(name, body, line):
-                            table <- check_ungranted_panic(body, allocation_names, allocation_lines, annotations, table)
+                            table <- check_ungranted_panic(body, allocation_names, allocation_lines, annotations, strict_unsafe, table)
                         Decl.Scoped(body, line):
-                            table <- check_ungranted_panic(body, allocation_names, allocation_lines, annotations, table)
+                            table <- check_ungranted_panic(body, allocation_names, allocation_lines, annotations, strict_unsafe, table)
                         _:
                             pass
