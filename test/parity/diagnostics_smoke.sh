@@ -248,14 +248,14 @@ EXPECTS=(
     "an \`if\` used as a value must have a final \`else\`"
     "value assigned to x is immediately overwritten"
     "indexing requires string, array, view, packed store, or reference type, got i64"
-    "index out of bounds: 'xs' has 3 elements, index is 5"
+    "constant index 5 out of bounds for i64[3]"
     "'while true' loop never exits (no break or return in its body)"
     "argument 1 to 'g' expects i64, got static u8"
     "integer literal 300 does not fit in u8"
     "logical operator with constant boolean operand"
     "modulo by zero"
     "negated equality comparison; use the opposite operator"
-    "negative index -1 on sequence ''"
+    "constant index -1 out of bounds for int[3]"
     "shift count is negative"
     "match guard must be bool, got i64"
     "operator requires numeric operands"
@@ -319,7 +319,7 @@ EXPECTS=(
     "comparison requires numeric operands"
     "variable 'y' expects i64, got optional"
     "variable 'n' expects bool, got usize"
-    "logical 'and' requires bool operands, got optional"
+    "logical operator requires bool operands"
 )
 
 total=0

@@ -286,7 +286,7 @@ int main(int argc, char **argv) {
                 return 7;
             }
         }
-        if (strncmp(msg[0], "undefined name", 14) != 0) {
+        if (strncmp(msg[0], "undefined identifier", 14) != 0) {
             fprintf(stderr, "diag message probe FAILED: UndefinedName wording=%s\n", msg[0]);
             return 7;
         }

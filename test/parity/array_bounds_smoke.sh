@@ -18,7 +18,7 @@ check_case() {
   }
 }
 
-check_case $'const IDX: usize = 4\n\ndef bad() -> u8:\n    buf: u8[4] = zeroed\n    return buf[IDX]\n' "index out of bounds: 'buf' has 4 elements, index is 4"
+check_case $'const IDX: usize = 4\n\ndef bad() -> u8:\n    buf: u8[4] = zeroed\n    return buf[IDX]\n' "constant index 4 out of bounds for u8[4]"
 check_case $'def bad() -> view[u8]:\n    buf: u8[4] = zeroed\n    return buf[2:5]\n' 'constant slice end 5 out of bounds for array of length 4'
 check_case $'def bad() -> view[u8]:\n    buf: u8[4] = zeroed\n    return buf[3:1]\n' 'constant slice start 3 is after end 1'
 check_case $'def bad(n: usize) -> void:\n    buf: u8[n] = zeroed\n' 'array size must be a compile-time integer'

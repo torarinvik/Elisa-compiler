@@ -18,8 +18,8 @@ p=$(printf "${E}def f(e: E) -> i64:\n    return match e:\n        E.A: 1\n      
 p=$(printf "${E}def f(e: E) -> i64:\n    x: i64 = match e:\n        E.A: 1\n        E.B: 2\n    return x\n" | "$RPT" | head -1 | awk '{print $2}')
 [ "$p" = "0" ] || fail "assign-match still has parse errors: P=$p"
 
-# 3. resolution descends into arms: an undefined name in an arm body is flagged.
+# 3. resolution descends into arms: an undefined identifier in an arm body is flagged.
 out=$(printf "${E}def f(e: E, k: i64) -> i64:\n    return match e:\n        E.A: k\n        E.B: nope\n" | "$RPT")
-echo "$out" | grep -q "undefined name 'nope'" || fail "arm body not resolved: $out"
+echo "$out" | grep -q "undefined identifier 'nope'" || fail "arm body not resolved: $out"
 
 echo "match-expr smoke OK: return/assign match-expressions parse, arms resolve"

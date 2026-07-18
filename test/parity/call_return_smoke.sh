@@ -17,7 +17,7 @@ echo "$out" | grep -q "if condition must be bool, got i64" || fail "int-returnin
 
 # 2. an int-returning call as a logical operand MUST flag NonBoolOperand.
 out=$(printf 'def g() -> i64:\n    return 1\n\ndef f() -> bool:\n    return g() and g()\n' | "$RPT")
-echo "$out" | grep -q "logical 'and' requires bool operands, got int" || fail "int-returning call-as-operand not flagged: $out"
+echo "$out" | grep -q "logical operator requires bool operands" || fail "int-returning call-as-operand not flagged: $out"
 
 # 3. a bool-returning call as a condition must NOT be flagged.
 out=$(printf 'def ok() -> bool:\n    return true\n\ndef f() -> i64:\n    if ok():\n        return 1\n    return 0\n' | "$RPT")

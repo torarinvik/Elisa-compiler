@@ -17,7 +17,7 @@ echo "$out" | grep -q "if condition must be bool, got i64" || fail "int field-as
 
 # 2. a struct int field as a logical operand MUST flag NonBoolOperand.
 out=$(printf 'struct Point:\n    x: i64\n\ndef f(p: Point) -> bool:\n    return p.x and p.x\n' | "$RPT")
-echo "$out" | grep -q "logical 'and' requires bool operands, got int" || fail "int field-as-operand not flagged: $out"
+echo "$out" | grep -q "logical operator requires bool operands" || fail "int field-as-operand not flagged: $out"
 
 # 3. a bool field used as a condition must NOT be flagged.
 out=$(printf 'struct Flags:\n    on: bool\n\ndef f(fl: Flags) -> i64:\n    if fl.on:\n        return 1\n    return 0\n' | "$RPT")

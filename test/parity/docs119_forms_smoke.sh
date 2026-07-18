@@ -2,7 +2,7 @@
 # Behavioral smoke for docs/119 expression-unification forms (stage1 parity with
 # stage0): bare block expressions, multi-line if/match value forms, loop-expression
 # headers `|acc = 0| -> yield` with `|capture|`, and the `rebind` statement. Each must
-# parse with zero parse errors, resolve cleanly, and flag an undefined name inside the
+# parse with zero parse errors, resolve cleanly, and flag an undefined identifier inside the
 # new construct — while a bitwise `|` in an iterable is never misread as a header, and
 # there are zero parse false positives across the frontend + stdlib. The form
 # contract is documented in docs/119_expression_unification.md.
@@ -42,10 +42,10 @@ perr() { printf "$1" | "$RPT" | head -1 | awk '{print $2}'; }
 # 6. a bitwise `|` in an iterable is NOT misread as a header.
 [ "$(perr 'def f(a: i64, b: i64) -> i64:\n    s: mutable i64 = 0\n    for x in 0..<(a | b):\n        s <- s + x\n    return s\n')" = "0" ] || fail "bitwise | in iterable misread as header"
 
-# 7. resolution descends into the new constructs: an undefined name in a block/loop-
+# 7. resolution descends into the new constructs: an undefined identifier in a block/loop-
 #    header body is flagged.
 out=$(printf 'def f(xs: darray[i64]) -> i64:\n    s: i64 =\n        for x in xs |acc = 0| -> acc:\n            acc <- acc + nope\n    return s\n' | "$RPT")
-echo "$out" | grep -q "undefined name 'nope'" || fail "loop-header body not resolved: $out"
+echo "$out" | grep -q "undefined identifier 'nope'" || fail "loop-header body not resolved: $out"
 
 # 8. zero parse false positives across frontend + stdlib.
 t=0

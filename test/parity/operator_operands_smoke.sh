@@ -14,7 +14,7 @@ fail() { echo "operator-operands smoke FAIL: $1" >&2; exit 1; }
 
 # 1. int operand to a logical `and` MUST be flagged.
 out=$(printf 'def f(n: i64, m: i64) -> bool:\n    return n and m\n' | "$RPT")
-echo "$out" | grep -q "logical 'and' requires bool operands, got int" || fail "int-to-and not flagged: $out"
+echo "$out" | grep -q "logical operator requires bool operands" || fail "int-to-and not flagged: $out"
 
 # 2. string operand to `+` MUST be flagged as non-numeric.
 out=$(printf 'def f(s: sview, n: i64) -> i64:\n    x: i64 = s + n\n    return x\n' | "$RPT")
