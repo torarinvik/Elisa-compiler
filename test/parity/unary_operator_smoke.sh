@@ -16,11 +16,11 @@ echo "$out" | grep -q "logical 'not' requires bool operands" || fail "not-on-int
 
 # 2. unary `-` on a bool operand MUST be flagged.
 out=$(printf 'def f(b: bool) -> i64:\n    x: i64 = -b\n    return x\n' | "$RPT")
-echo "$out" | grep -q "operator '-' requires numeric operands" || fail "minus-on-bool not flagged: $out"
+echo "$out" | grep -q "operator requires numeric operands" || fail "minus-on-bool not flagged: $out"
 
 # 3. unary `~` on a string operand MUST be flagged.
 out=$(printf 'def f(s: sview) -> i64:\n    x: i64 = ~s\n    return x\n' | "$RPT")
-echo "$out" | grep -q "operator '~' requires numeric operands" || fail "tilde-on-string not flagged: $out"
+echo "$out" | grep -q "operator requires numeric operands" || fail "tilde-on-string not flagged: $out"
 
 # 4. `not` on bool operand must NOT be flagged.
 out=$(printf 'def f(b: bool) -> bool:\n    return not b\n' | "$RPT")

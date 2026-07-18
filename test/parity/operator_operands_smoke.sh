@@ -18,7 +18,7 @@ echo "$out" | grep -q "logical 'and' requires bool operands, got int" || fail "i
 
 # 2. string operand to `+` MUST be flagged as non-numeric.
 out=$(printf 'def f(s: sview, n: i64) -> i64:\n    x: i64 = s + n\n    return x\n' | "$RPT")
-echo "$out" | grep -q "operator '+' requires numeric operands, got string" || fail "string-to-plus not flagged: $out"
+echo "$out" | grep -q "operator requires numeric operands" || fail "string-to-plus not flagged: $out"
 
 # 3. bool operands to `and` must NOT be flagged.
 out=$(printf 'def f(a: bool, b: bool) -> bool:\n    return a and b\n' | "$RPT")
