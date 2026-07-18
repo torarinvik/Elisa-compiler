@@ -979,7 +979,7 @@ decline_case break_outside_loop 'def main() -> i64:\n    break\n    return 0\n'
 # A match GUARD is a second per-arm condition; not modeled. Ignoring it emitted the arm
 # unconditionally — a silent MISCOMPILE (stage1 gave 100 where stage0 gives 42), caught by
 # this fixture.
-stripped_case match_guard 'def classify(n: i64) -> i64:\n    return match n:\n        0 if n > 1: 100\n        _: 42\n\ndef main() -> i64:\n    return classify(0)\n'
+run_case match_guard 'def classify(n: i64) -> i64:\n    return match n:\n        0 if n > 1: 100\n        _: 42\n\ndef main() -> i64:\n    return classify(0)\n' 42
 # A BINDING arm is INVALID Elisa in an integer match — stage0: "top-level integer match arm
 # must use an integer literal or _". Treating it as a catch-all made stage1 emit code for a
 # program the language rejects.
