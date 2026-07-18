@@ -46,6 +46,8 @@ run_one "self-hostable (0 unresolved / 132 files)" "$REPO_ROOT/test/parity/check
 run_one "lexer parity (stage1 == stage0)"          "$REPO_ROOT/test/parity/run_parity.sh"
 run_one "stage0 parser reference inventory"        "$REPO_ROOT/test/parity/parser_reference_inventory_smoke.sh"
 run_one "parser acceptance parity (stage1 == stage0)" "$REPO_ROOT/test/parity/parser_acceptance_diff.sh"
+run_one "semantic acceptance parity (stage1 == stage0)" "$REPO_ROOT/test/parity/semantic_acceptance_diff.sh"
+run_one "diagnostics message parity (stage1 covers stage0)" "$REPO_ROOT/test/parity/diagnostics_diff.sh"
 run_one "diagnostic breadth baseline"              "$REPO_ROOT/test/breadth/run.sh" --baseline "$REPO_ROOT/test/fixtures/diagnostics.baseline.tsv" "$REPO_ROOT/test/fixtures/diagnostics"
 
 echo "stage1 parity gate — behavioral smokes:"
