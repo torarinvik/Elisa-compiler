@@ -232,7 +232,7 @@ EXPECTS=(
     "division by zero"
     "double negation has no effect; use the value directly"
     "duplicate condition: this branch repeats an earlier condition and can never run"
-    "duplicate decorator 'hot'"
+    "duplicate @hot annotation on function \"f\" (first seen at line 1:2)"
     "dict literal has a duplicate key ''"
     "match arm '1' is unreachable because an earlier arm already matches it"
     "name x bound more than once in pattern"
