@@ -287,7 +287,7 @@ EXPECTS=(
     "return type expects darray[i64], got int"
     "membership operator requires a list literal or tokenset on the right-hand side, got darray[cstr]"
     "darray push expects i64, got static u8"
-    "dict index expects key of type i64, got string"
+    "dict index expects key of type i64, got static u8"
     "if condition must be bool, got darray"
     "cannot compare darray[i64] and int"
     "invalid cast from int to bool"
