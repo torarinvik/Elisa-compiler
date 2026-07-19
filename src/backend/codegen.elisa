@@ -153,6 +153,46 @@ module Backend:
             return LLVMBuildAnd(builder, lo_hit, hi_hit, "range.in")
 
 
+        # The i1 test for ONE simple, binding-free arm pattern against an already-lowered
+        # `scrutinee` (a raw integer, or a payload-enum's extracted i32 tag when `penum`).
+        # Handles integer/const-enum-ordinal literals, field-less variant paths, and integer
+        # ranges — the sub-patterns an OR-pattern (`0 | 2 | 4`, `E.A | E.B`) is built from.
+        # Returns null for anything with a binding or payload (an OR alternative cannot bind).
+        def emit_simple_pattern_hit(pattern: Pattern, scrutinee: LLVMValueRef, scrutinee_type: ValueType, penum: bool, compare_type: LLVMTypeRef, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            if pattern is Pattern.Literal(literal_text):
+                literal_value: mutable i64 = 0
+                null return if not parse_int_literal(literal_text, literal_value)
+                return LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(compare_type, literal_value.u64(), 1), "or.cmp")
+            if pattern is Pattern.Variant(variant_path, variant_fields):
+                null return if variant_fields.count != 0
+                ordinal: mutable i64 = penum_variant_index_of_path(variant_path, structs) if penum else ordinal_of_dotted_path(variant_path, structs)
+                null return if ordinal < 0
+                return LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(compare_type, ordinal.u64(), 1), "or.cmp")
+            if pattern is Pattern.Range(range_lo, range_hi, range_inclusive):
+                null return if penum
+                return emit_range_test(scrutinee, scrutinee_type, range_lo, range_hi, range_inclusive, compare_type, ctx, builder)
+            return null
+
+
+        # The combined i1 test for an OR-pattern's option list: hit if ANY option hits.
+        # Returns null if any option is not a simple binding-free pattern.
+        def emit_or_pattern_hit(options: darray[Pattern], scrutinee: LLVMValueRef, scrutinee_type: ValueType, penum: bool, compare_type: LLVMTypeRef, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            null return if options.count == 0
+            combined: mutable LLVMValueRef = zeroed
+            have: mutable bool = false
+            failed: mutable bool = false
+            for option in options |combined, have, failed, scrutinee, scrutinee_type, penum, compare_type, structs, ctx, builder|:
+                continue if failed
+                if emit_simple_pattern_hit(option, scrutinee, scrutinee_type, penum, compare_type, structs, ctx, builder) is option_hit:
+                    combined <- option_hit if not have
+                    combined <- LLVMBuildOr(builder, combined, option_hit, "or.any") if have
+                    have <- true
+                else:
+                    failed <- true
+            null return if failed or not have
+            return combined
+
+
         def is_numeric_type(value_type: ValueType) -> bool:
             return is_integer_type(value_type) or value_type.kind == TypeKind.Float
 
@@ -3373,6 +3413,28 @@ module Backend:
                                     LLVMPositionBuilderAtEnd(builder, next_block)
                                 else:
                                     declined <- true
+                            elif arm.pattern is Pattern.Or(or_options):
+                                # `0 | 2 | 4:` / `E.A | E.B:` — hit if ANY binding-free option hits.
+                                next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.next")
+                                if emit_or_pattern_hit(or_options, scrutinee, scrutinee_type, penum_scrutinee, compare_type, structs, ctx, builder) is or_hit:
+                                    _ = LLVMBuildCondBr(builder, or_hit, arm_block, next_block)
+                                    LLVMPositionBuilderAtEnd(builder, arm_block)
+                                    if arm_has_guard(arm.guard):
+                                        if emit_condition(arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is guard_bit:
+                                            guarded_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.guard")
+                                            _ = LLVMBuildCondBr(builder, guard_bit, guarded_body, next_block)
+                                            LLVMPositionBuilderAtEnd(builder, guarded_body)
+                                        else:
+                                            declined <- true
+                                            continue
+                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is or_arm_value:
+                                        _ = LLVMBuildStore(builder, or_arm_value, result_slot)
+                                        _ = LLVMBuildBr(builder, done_block)
+                                    else:
+                                        declined <- true
+                                    LLVMPositionBuilderAtEnd(builder, next_block)
+                                else:
+                                    declined <- true
                             else:
                                 if is_catch_all_pattern(arm.pattern):
                                     _ = LLVMBuildBr(builder, arm_block)
@@ -4292,6 +4354,8 @@ module Backend:
                         sm_range_lo: mutable sview = ""
                         sm_range_hi: mutable sview = ""
                         sm_range_inclusive: mutable bool = false
+                        sm_is_or: mutable bool = false
+                        sm_or_options: mutable darray[Pattern] = []
                         if sm_arm.pattern is Pattern.Literal(sm_literal_text):
                             sm_literal_value: mutable i64 = 0
                             if parse_int_literal(sm_literal_text, sm_literal_value):
@@ -4319,8 +4383,11 @@ module Backend:
                             sm_range_lo <- sm_rlo
                             sm_range_hi <- sm_rhi
                             sm_range_inclusive <- sm_rincl
+                        if sm_arm.pattern is Pattern.Or(sm_opts):
+                            sm_is_or <- true
+                            sm_or_options <- sm_opts
                         sm_is_default <- true if is_catch_all_pattern(sm_arm.pattern)
-                        sm_declined <- true if sm_ordinal < 0 and not sm_is_default and not sm_is_range
+                        sm_declined <- true if sm_ordinal < 0 and not sm_is_default and not sm_is_range and not sm_is_or
                         continue if sm_declined
                         sm_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sm_function, "smatch.arm")
                         if sm_is_default:
@@ -4337,6 +4404,11 @@ module Backend:
                             if sm_is_range:
                                 if emit_range_test(sm_scrutinee, sm_scrutinee_type, sm_range_lo, sm_range_hi, sm_range_inclusive, sm_compare_type, ctx, builder) is sm_range_hit:
                                     sm_hit <- sm_range_hit
+                                else:
+                                    sm_declined <- true
+                            elif sm_is_or:
+                                if emit_or_pattern_hit(sm_or_options, sm_scrutinee, sm_scrutinee_type, sm_penum, sm_compare_type, structs, ctx, builder) is sm_or_hit:
+                                    sm_hit <- sm_or_hit
                                 else:
                                     sm_declined <- true
                             else:
