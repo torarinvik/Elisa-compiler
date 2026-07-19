@@ -1,0 +1,110 @@
+# Nested-region store-escape (sound subset of stage0's region_containers escape check).
+#
+# Storing a value that lives in an INNER `region NAME:` scope into a container that lives
+# in an OUTER (longer-lived) region leaves a dangling reference once the inner region is
+# freed: `region outer: big @outer …; region inner: small @inner …; big.push(small)`.
+#
+# Stage0's full check uses region-stamped types + an outlives lattice + adoption/region-
+# polymorphic exceptions. This sound subset relies ONLY on the lexical region-block nesting
+# and explicit `@region` local annotations: a store `container.push(value)` where BOTH the
+# container's and the value's regions are function-local `region` blocks on the current
+# nesting nesting, and the container's region strictly ENCLOSES the value's, is an
+# unconditional escape (the exception cases — region-polymorphic params, adopted arenas —
+# use param regions that are NOT on the local block nesting, so they never match here).
+extend Semantic:
+    private:
+        # The declared @region of a local, or "" when it carries none.
+        def local_region_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, before_line: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                annotation_option: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, name, before_line)
+                region_name: mutable sview = sview("", 0, 0)
+                region_name <- present.region if annotation_option is present
+                return region_name
+
+        # The nesting position of REGION on the nesting (outer regions have smaller indices),
+        # with found=false when it is not an enclosing function-local region.
+        def region_stack_position(nesting: darray[sview]&, region_name: sview) -> (found: bool, position: usize):
+            can Memory.Allocate, Abort.Panic:
+                found_here: mutable bool = false
+                position_here: mutable usize = 0
+                while probe < nesting.count |probe: usize = 0, found_here, position_here|:
+                    matched: bool = nesting[probe] == region_name
+                    found_here <- true if matched
+                    position_here <- probe if matched
+                    probe <- probe + 1
+                return (found_here, position_here)
+
+        # The ident name of a call's first argument, or "".
+        def first_argument_name(arguments: darray[Ast::Expr]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return ident_name_of(arguments[0]) if arguments.count > 0 else sview("", 0, 0)
+
+        # Report a `container.push/extend(value)` whose value region is nested strictly
+        # inside (shorter-lived than) the container region.
+        def region_escape_check_store(expression: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        container_name: sview = grow_receiver_name(callee)
+                        value_name: sview = first_argument_name(arguments)
+                        return if container_name == "" or value_name == ""
+                        container_region: sview = local_region_name(annotations, container_name, line)
+                        value_region: sview = local_region_name(annotations, value_name, line)
+                        return if container_region == "" or value_region == "" or container_region == value_region
+                        container_position: (found: bool, position: usize) = region_stack_position(nesting, container_region)
+                        value_position: (found: bool, position: usize) = region_stack_position(nesting, value_region)
+                        escapes: bool = container_position.found and value_position.found and container_position.position < value_position.position
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: container_region, actual: value_region}) if escapes
+                    _:
+                        pass
+
+        # The receiver name of a `RECV.push(...)` / `RECV.extend(...)` growth call, or "".
+        def grow_receiver_name(callee: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match callee:
+                    Expr.Field(receiver, method, field_line): ident_name_of(receiver) if method == "push" or method == "extend" else sview("", 0, 0)
+                    _: sview("", 0, 0)
+
+        def region_escape_walk(statements: darray[Ast::Stmt], nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            is_region_block: bool = kind == "region" and clause.count > 0
+                            region_label: sview = clause[0] if clause.count > 0 else sview("", 0, 0)
+                            child_stack: mutable darray[sview] = [entry for entry in nesting]
+                            child_stack.push(region_label) if is_region_block
+                            table <- region_escape_walk(body, child_stack, annotations, table)
+                        Stmt.Expr(expression, line):
+                            table <- region_escape_check_store(expression, line, nesting, annotations, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- region_escape_check_store(value, line, nesting, annotations, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- region_escape_check_store(value, line, nesting, annotations, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- region_escape_walk(then_body, nesting, annotations, table)
+                            table <- region_escape_walk(else_body, nesting, annotations, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- region_escape_walk(while_body, nesting, annotations, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- region_escape_walk(for_body, nesting, annotations, table)
+                        _:
+                            pass
+
+        def check_region_escape_walk(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            empty_stack: darray[sview] = []
+                            table <- region_escape_walk(body, empty_stack, annotations, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_region_escape_walk(module_body, annotations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_region_escape_walk(scoped_body, annotations, table)
+                        _:
+                            pass
+
+        def check_region_escape(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_region_escape_walk(file.top_decls, file.local_region_annotations, table)
