@@ -140,6 +140,11 @@ module Backend:
             # so a generic call like `arena_da_fill(view, …)` can INFER T from the argument.
             # Lowers to the one `DynArrayView` struct regardless of T (like darray).
             View
+            # `sview` — a string VIEW, stage0's `%StringView = type { ptr, i64 }` (a byte
+            # pointer plus a length). Distinct from `cstr` (bare `ptr`, NUL-terminated) and
+            # from `view[T]` (DynArrayView). A literal `s: sview = "hi"` is the aggregate
+            # `{ptr @str, i64 2}`; equality goes through `ctx_string_views_eq` BY VALUE.
+            SView
 
 
         struct ValueType:
@@ -234,6 +239,7 @@ module Backend:
         # target triple).
         def scalar_type_of_name(name: sview) -> ValueType:
             ValueType{kind: TypeKind.CStr, bits: 0} return if name == "cstr"
+            ValueType{kind: TypeKind.SView, bits: 0} return if name == "sview"
             ValueType{kind: TypeKind.Signed, bits: 8} return if name == "i8"
             ValueType{kind: TypeKind.Signed, bits: 16} return if name == "i16"
             ValueType{kind: TypeKind.Signed, bits: 32} return if name == "i32"
@@ -435,6 +441,11 @@ module Backend:
             if value_type.kind == TypeKind.View:
                 view_llvm_struct: ValueType = view_struct_type(value_type, structs)
                 return structs.handles[view_llvm_struct.bits.usize()] if view_llvm_struct.kind == TypeKind.Struct else LLVMPointerTypeInContext(ctx, 0)
+            # `%StringView = type { ptr, i64 }` — stage0's byte-pointer + length pair.
+            if value_type.kind == TypeKind.SView:
+                sview_fields: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), LLVMInt64TypeInContext(ctx)]
+                sview_pointer: void& = (&sview_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, sview_pointer, 2, 0)
             if value_type.kind == TypeKind.Float:
                 return LLVMFloatTypeInContext(ctx) if value_type.bits == 32 else LLVMDoubleTypeInContext(ctx)
             LLVMInt8TypeInContext(ctx) return if value_type.bits == 8
@@ -950,6 +961,10 @@ module Backend:
             # same content comparison stage0 emits — NOT a pointer compare.
             streq: LLVMValueRef
             streq_type: LLVMTypeRef
+            # `sview == sview` / `!=` lower to `ctx_string_views_eq(a, b)` (i64, nonzero =
+            # equal), taking two `%StringView` values BY VALUE.
+            sview_eq: LLVMValueRef
+            sview_eq_type: LLVMTypeRef
 
 
         # Declare the runtime entry points in the module. Signatures are dictated by
@@ -1002,9 +1017,18 @@ module Backend:
             streq_pointer: void& = (&streq_params[0]).cast[void&] can Unsafe.PointerCast
             streq_type: LLVMTypeRef = LLVMFunctionType(int64_type, streq_pointer, 2, 0)
 
+            sview_struct_fields: mutable darray[LLVMTypeRef] = [pointer_type, int64_type]
+            sview_struct_pointer: void& = (&sview_struct_fields[0]).cast[void&] can Unsafe.PointerCast
+            sview_struct_llvm: LLVMTypeRef = LLVMStructTypeInContext(ctx, sview_struct_pointer, 2, 0)
+            sview_eq_params: mutable darray[LLVMTypeRef] = [sview_struct_llvm, sview_struct_llvm]
+            sview_eq_pointer: void& = (&sview_eq_params[0]).cast[void&] can Unsafe.PointerCast
+            sview_eq_type: LLVMTypeRef = LLVMFunctionType(int64_type, sview_eq_pointer, 2, 0)
+
             return Runtime{
                 streq: LLVMAddFunction(m, "ctx_streq", streq_type),
                 streq_type: streq_type,
+                sview_eq: LLVMAddFunction(m, "ctx_string_views_eq", sview_eq_type),
+                sview_eq_type: sview_eq_type,
                 owns_arena: true,
                 active_store: LLVMConstNull(pointer_type),
                 active_store_enum: -1,
@@ -2437,6 +2461,8 @@ module Backend:
                 in_error_fn: runtime.in_error_fn,
                 streq: runtime.streq,
                 streq_type: runtime.streq_type,
+                sview_eq: runtime.sview_eq,
+                sview_eq_type: runtime.sview_eq_type,
                 packed_state_new: runtime.packed_state_new,
                 packed_state_new_type: runtime.packed_state_new_type,
                 packed_alloc: runtime.packed_alloc,
@@ -3089,9 +3115,17 @@ module Backend:
                             return LLVMBuildLoad2(builder, catch_value_llvm, catch_result_slot, "catch.value")
                 return null
             if expression is Expr.StringLit(string_text):
-                null return if expected.kind != TypeKind.CStr and expected.kind != TypeKind.Unmodeled
+                null return if expected.kind != TypeKind.CStr and expected.kind != TypeKind.SView and expected.kind != TypeKind.Unmodeled
                 literal_storage: mutable darray[u8] = []
-                return LLVMBuildGlobalStringPtr(builder, sview_to_cstr(string_text, literal_storage), "str")
+                string_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, sview_to_cstr(string_text, literal_storage), "str")
+                # An `sview` context wants the `{ptr, i64 len}` aggregate, not the bare ptr.
+                if expected.kind == TypeKind.SView:
+                    sview_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                    sview_undef: LLVMValueRef = LLVMGetUndef(sview_llvm)
+                    sview_with_ptr: LLVMValueRef = LLVMBuildInsertValue(builder, sview_undef, string_global, 0, "sview.ptr")
+                    sview_len_value: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), sview_len(string_text).u64(), 0)
+                    return LLVMBuildInsertValue(builder, sview_with_ptr, sview_len_value, 1, "sview.len")
+                return string_global
             if expression is Expr.Ident(null_name, null_line):
                 if null_name == "null":
                     null return if expected.kind != TypeKind.Optional
@@ -3254,6 +3288,23 @@ module Backend:
                             streq_result_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
                             if emit_binary(streq_inner_op, streq_code, streq_zero, streq_int64, structs, ctx, builder) is streq_value:
                                 return emit_conversion(streq_value, streq_result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != streq_result_type.kind or expected.bits != streq_result_type.bits) else streq_value
+                            return null
+                        return null
+                    return null
+                # `sview == sview` / `!=`: `ctx_string_views_eq(a, b)` (BY VALUE, i64 nonzero =
+                # equal), then the same `code <op> 0` reduction as the cstr path.
+                if operand_type.kind == TypeKind.SView and (binary_operator == TokenKind.EqEq or binary_operator == TokenKind.BangEq):
+                    if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sveq_left:
+                        if emit_expression(binary_right, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sveq_right:
+                            sveq_args: mutable darray[LLVMValueRef] = [sveq_left, sveq_right]
+                            sveq_args_pointer: void& = (&sveq_args[0]).cast[void&] can Unsafe.PointerCast
+                            sveq_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, sveq_args_pointer, 2, "sview.eq")
+                            sveq_inner_op: TokenKind = TokenKind.BangEq if binary_operator == TokenKind.EqEq else TokenKind.EqEq
+                            sveq_zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)
+                            sveq_int64: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                            sveq_result_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                            if emit_binary(sveq_inner_op, sveq_code, sveq_zero, sveq_int64, structs, ctx, builder) is sveq_value:
+                                return emit_conversion(sveq_value, sveq_result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != sveq_result_type.kind or expected.bits != sveq_result_type.bits) else sveq_value
                             return null
                         return null
                     return null
@@ -3790,6 +3841,14 @@ module Backend:
                         if darray_address_of_expr(darray_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is darray_slot:
                             count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), darray_slot, 1, "darray.count.ptr")
                             return LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), count_pointer, "darray.count")
+
+            # `s.len` on an sview — field 1 of `{ptr, i64}`. (stage0 exposes `.len`, not
+            # `.count`, on a string view.)
+            if expression is Expr.Field(sview_object, sview_field, sview_field_line):
+                sview_recv_type: ValueType = expression_type(sview_object, local_scope, fns, structs, generics)
+                if sview_recv_type.kind == TypeKind.SView and sview_field == "len":
+                    if emit_expression(sview_object, sview_recv_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_value:
+                        return LLVMBuildExtractValue(builder, sview_value, 1, "sview.len")
 
             # `p.x` — a field READ. Only a local struct receiver is modeled: the address
             # comes from the local's slot, so there is no need to spill a temporary.
