@@ -205,6 +205,207 @@ extend Semantic:
                         _:
                             pass
 
+        # ---- Guard-interval arg proving (additive) ---------------------------------------
+        # When a refinement-free param `x` is passed to a refined position inside an
+        # `if x >= A and x <= B:` guard, the main pass stays silent (x is a "fact name"), but
+        # stage0 still WARNS when [A,B] is not contained in the required bounds [C,D]. This
+        # additive pass computes the intersected enclosing-guard interval, the required
+        # self-bounds, and warns only on PROVABLE non-containment. Sound: intersected guards
+        # give an interval tighter-or-equal to the true value set, so `⊄` implies stage0 also
+        # cannot prove it. Args that are reassigned or named by a signature contract (facts
+        # this interval reasoning cannot see) are excluded.
+        def apply_bound_comparison(operator: TokenKind, value: i64, lo_ref: mutable i64&, hi_ref: mutable i64&, any_ref: mutable bool&) -> void:
+            can Abort.Panic:
+                lo_ref <- value if operator == TokenKind.GtEq and value > lo_ref
+                lo_ref <- (value + 1) if operator == TokenKind.Gt and (value + 1) > lo_ref
+                hi_ref <- value if operator == TokenKind.LtEq and value < hi_ref
+                hi_ref <- (value - 1) if operator == TokenKind.Lt and (value - 1) < hi_ref
+                any_ref <- true if operator == TokenKind.GtEq or operator == TokenKind.Gt or operator == TokenKind.LtEq or operator == TokenKind.Lt
+
+        def flip_comparison(operator: TokenKind) -> TokenKind:
+            can Abort.Panic:
+                return when operator:
+                    TokenKind.GtEq -> TokenKind.LtEq
+                    TokenKind.Gt -> TokenKind.Lt
+                    TokenKind.LtEq -> TokenKind.GtEq
+                    TokenKind.Lt -> TokenKind.Gt
+                    _ -> operator
+
+        def accumulate_subject_bounds(expression: Ast::Expr, subject: sview, lo_ref: mutable i64&, hi_ref: mutable i64&, any_ref: mutable bool&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        accumulate_subject_bounds(inner, subject, lo_ref, hi_ref, any_ref)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            accumulate_subject_bounds(left, subject, lo_ref, hi_ref, any_ref)
+                            accumulate_subject_bounds(right, subject, lo_ref, hi_ref, any_ref)
+                        else:
+                            left_name: sview = ident_name_of(left)
+                            right_name: sview = ident_name_of(right)
+                            right_literal: (found: bool, value: i64) = signed_int_literal(right)
+                            left_literal: (found: bool, value: i64) = signed_int_literal(left)
+                            apply_bound_comparison(operator, right_literal.value, lo_ref, hi_ref, any_ref) if left_name == subject and left_name != "" and right_literal.found
+                            apply_bound_comparison(flip_comparison(operator), left_literal.value, lo_ref, hi_ref, any_ref) if right_name == subject and right_name != "" and left_literal.found
+                    _:
+                        pass
+
+        def subject_interval(expression: Ast::Expr, subject: sview) -> (found: bool, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                lo: mutable i64 = -9223372036854775807 - 1
+                hi: mutable i64 = 9223372036854775807
+                any_bound: mutable bool = false
+                accumulate_subject_bounds(expression, subject, lo, hi, any_bound)
+                return (any_bound, lo, hi)
+
+        def collect_guard_subject_names(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        collect_guard_subject_names(inner, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            collect_guard_subject_names(left, out)
+                            collect_guard_subject_names(right, out)
+                        else:
+                            left_name: sview = ident_name_of(left)
+                            right_name: sview = ident_name_of(right)
+                            out.push(left_name) if left_name != "" and not name_in(out, left_name)
+                            out.push(right_name) if right_name != "" and not name_in(out, right_name)
+                    _:
+                        pass
+
+        def merge_guard_condition(condition: Ast::Expr, names: mutable darray[sview]&, los: mutable darray[i64]&, his: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                subjects: mutable darray[sview] = []
+                collect_guard_subject_names(condition, subjects)
+                for subject in subjects |names, los, his|:
+                    interval: (found: bool, lo: i64, hi: i64) = subject_interval(condition, subject)
+                    if interval.found:
+                        existing: mutable i64 = -1
+                        index: mutable usize = 0
+                        while index < names.count |existing, index|:
+                            existing <- index.i64() if names[index] == subject
+                            index <- index + 1
+                        if existing < 0:
+                            names.push(subject)
+                            los.push(interval.lo)
+                            his.push(interval.hi)
+                        else:
+                            los[existing.usize()] <- interval.lo if interval.lo > los[existing.usize()]
+                            his[existing.usize()] <- interval.hi if interval.hi < his[existing.usize()]
+
+        def argument_base_name(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        return name
+                    Expr.Paren(inner, paren_line):
+                        return argument_base_name(inner)
+                    Expr.Unary(operator, operand, unary_line):
+                        return argument_base_name(operand)
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_base: sview = argument_base_name(left)
+                        return left_base if left_base != "" else argument_base_name(right)
+                    _:
+                        return sview("", 0, 0)
+
+        def guard_interval_check_expression(expression: Ast::Expr, line: u32, guard_names: darray[sview]&, guard_lo: darray[i64]&, guard_hi: darray[i64]&, excluded: darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&, param_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        probe: mutable usize = 0
+                        while probe < param_functions.count |table, probe| -> table:
+                            if callee_name != "" and param_functions[probe] == callee_name and param_indices[probe] < arguments.count:
+                                argument: Ast::Expr = arguments[param_indices[probe]]
+                                base_name: sview = argument_base_name(argument)
+                                required: (found: bool, lo: i64, hi: i64) = subject_interval(param_predicates[probe], "self")
+                                actual: (found: bool, lo: i64, hi: i64) = argument_interval(argument, guard_names, guard_lo, guard_hi)
+                                escapes: bool = required.found and actual.found and base_name != "" and not name_in(excluded, base_name) and (actual.lo < required.lo or actual.hi > required.hi)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementArgNotProven, name: callee_name, line: line, expected: "", actual: "", expected_count: (param_indices[probe] + 1).u32()}) if escapes
+                            probe <- probe + 1
+                        for argument in arguments |table| -> table:
+                            table <- guard_interval_check_expression(argument, line, guard_names, guard_lo, guard_hi, excluded, param_functions, param_indices, param_predicates, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- guard_interval_check_expression(inner, line, guard_names, guard_lo, guard_hi, excluded, param_functions, param_indices, param_predicates, table)
+                    _:
+                        pass
+
+        def guard_interval_check_statements(statements: darray[Ast::Stmt], guard_names: darray[sview]&, guard_lo: darray[i64]&, guard_hi: darray[i64]&, excluded: darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&, param_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- guard_interval_check_expression(returned, line, guard_names, guard_lo, guard_hi, excluded, param_functions, param_indices, param_predicates, table)
+                        Stmt.Expr(expression, line):
+                            table <- guard_interval_check_expression(expression, line, guard_names, guard_lo, guard_hi, excluded, param_functions, param_indices, param_predicates, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- guard_interval_check_expression(value, line, guard_names, guard_lo, guard_hi, excluded, param_functions, param_indices, param_predicates, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            child_names: mutable darray[sview] = [existing_name for existing_name in guard_names]
+                            child_lo: mutable darray[i64] = [existing_lo for existing_lo in guard_lo]
+                            child_hi: mutable darray[i64] = [existing_hi for existing_hi in guard_hi]
+                            merge_guard_condition(condition, child_names, child_lo, child_hi)
+                            table <- guard_interval_check_statements(then_body, child_names, child_lo, child_hi, excluded, param_functions, param_indices, param_predicates, table)
+                            table <- guard_interval_check_statements(else_body, guard_names, guard_lo, guard_hi, excluded, param_functions, param_indices, param_predicates, table)
+                        Stmt.While(condition, while_body, line):
+                            child_names_w: mutable darray[sview] = [existing_name_w for existing_name_w in guard_names]
+                            child_lo_w: mutable darray[i64] = [existing_lo_w for existing_lo_w in guard_lo]
+                            child_hi_w: mutable darray[i64] = [existing_hi_w for existing_hi_w in guard_hi]
+                            merge_guard_condition(condition, child_names_w, child_lo_w, child_hi_w)
+                            table <- guard_interval_check_statements(while_body, child_names_w, child_lo_w, child_hi_w, excluded, param_functions, param_indices, param_predicates, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- guard_interval_check_statements(block_body, guard_names, guard_lo, guard_hi, excluded, param_functions, param_indices, param_predicates, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- guard_interval_check_statements(for_body, guard_names, guard_lo, guard_hi, excluded, param_functions, param_indices, param_predicates, table)
+                        _:
+                            pass
+
+        def collect_guard_excluded_names(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            target_name: sview = ident_name_of(target)
+                            out.push(target_name) if target_name != "" and not name_in(out, target_name)
+                        Stmt.Contract(kind, expression, line):
+                            collect_idents_in_expr(expression, out)
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_guard_excluded_names(then_body, out)
+                            collect_guard_excluded_names(else_body, out)
+                        Stmt.While(condition, while_body, line):
+                            collect_guard_excluded_names(while_body, out)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            collect_guard_excluded_names(block_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            collect_guard_excluded_names(for_body, out)
+                        _:
+                            pass
+
+        def guard_interval_walk(declarations: darray[Ast::Decl], signature_contract_exprs: darray[Ast::Expr], signature_contract_lines: darray[u32], param_functions: darray[sview]&, param_indices: darray[usize]&, param_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            excluded: mutable darray[sview] = []
+                            collect_guard_excluded_names(body, excluded)
+                            sig_index: mutable usize = 0
+                            while sig_index < signature_contract_exprs.count |excluded, sig_index|:
+                                collect_idents_in_expr(signature_contract_exprs[sig_index], excluded) if signature_contract_lines[sig_index] == line
+                                sig_index <- sig_index + 1
+                            empty_names: mutable darray[sview] = []
+                            empty_lo: mutable darray[i64] = []
+                            empty_hi: mutable darray[i64] = []
+                            table <- guard_interval_check_statements(body, empty_names, empty_lo, empty_hi, excluded, param_functions, param_indices, param_predicates, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- guard_interval_walk(module_body, signature_contract_exprs, signature_contract_lines, param_functions, param_indices, param_predicates, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- guard_interval_walk(scoped_body, signature_contract_exprs, signature_contract_lines, param_functions, param_indices, param_predicates, table)
+                        _:
+                            pass
+
     public:
         def check_refinement_arg_unproven(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -219,6 +420,7 @@ extend Semantic:
                 param_predicates: mutable darray[Ast::Expr] = []
                 collect_law_params(file.top_decls, law_names, law_predicates, alias_names, alias_predicates, param_functions, param_indices, param_predicates)
                 table <- unproven_arg_walk(file.top_decls, file.signature_contract_exprs, file.signature_contract_lines, law_names, law_predicates, alias_names, alias_predicates, param_functions, param_indices, table)
+                table <- guard_interval_walk(file.top_decls, file.signature_contract_exprs, file.signature_contract_lines, param_functions, param_indices, param_predicates, table)
 
     private:
         def unproven_arg_walk(declarations: darray[Ast::Decl], signature_contract_exprs: darray[Ast::Expr], signature_contract_lines: darray[u32], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, alias_names: darray[sview]&, alias_predicates: darray[Ast::Expr]&, param_functions: darray[sview]&, param_indices: darray[usize]&, table: lmut SymbolTable) -> void:
