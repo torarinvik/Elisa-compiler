@@ -1,0 +1,169 @@
+# Multi-parameter precondition violation at call sites. A function's signature `requires PRED`
+# (read from the file side-channel) constrains its parameters; a call whose CONSTANT arguments
+# (literals or immutable global consts) provably break PRED is rejected ("precondition of f is
+# violated"). SOUND: build the param->constant environment positionally and evaluate PRED via the
+# field-env evaluator; a parameter bound to a non-constant argument stays undecidable (no emit).
+extend Semantic:
+    private:
+        # Immutable global consts (`const NAME: T = <literal>`) as (name, value) rows.
+        def collect_global_consts(declarations: darray[Ast::Decl], names: mutable darray[sview]&, values: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, values|:
+                    match declaration:
+                        Decl.Const(const_name, type_expression, value, is_mutable, const_line):
+                            const_value: (found: bool, value: i64) = fold_const_int(value)
+                            names.push(const_name) if const_value.found
+                            values.push(const_value.value) if const_value.found
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_global_consts(module_body, names, values)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_global_consts(scoped_body, names, values)
+                        _:
+                            pass
+
+        # The requires predicate declared on FUNCTION_LINE's signature, or Absent.
+        def signature_requires_of(function_line: u32, contract_lines: darray[u32]&, contract_kinds: darray[sview]&, contract_exprs: darray[Ast::Expr]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                probe: mutable usize = 0
+                result: mutable Ast::Expr = (Ast::Expr.Absent)
+                while probe < contract_lines.count |probe, result|:
+                    result <- contract_exprs[probe] if contract_lines[probe] == function_line and contract_kinds[probe] == "requires"
+                    probe <- probe + 1
+                return result
+
+        # A constant argument: folded literal, or an immutable global const.
+        def precondition_arg_const(argument: Ast::Expr, global_names: darray[sview]&, global_values: darray[i64]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                folded: (found: bool, value: i64) = fold_const_int(argument)
+                folded return if folded.found
+                name: sview = ident_name_of(argument)
+                (false, 0) return if name == ""
+                probe: mutable usize = 0
+                got: mutable bool = false
+                result: mutable i64 = 0
+                while probe < global_names.count |probe, got, result|:
+                    matched: bool = global_names[probe] == name
+                    got <- true if matched
+                    result <- global_values[probe] if matched
+                    probe <- probe + 1
+                return (got, result)
+
+        # Collect callee-signature preconditions. Parameter names are stored FLAT (a nested
+        # darray[darray] would region-escape), addressed by per-signature (start, count) offsets.
+        def collect_requires_signatures(declarations: darray[Ast::Decl], contract_lines: darray[u32]&, contract_kinds: darray[sview]&, contract_exprs: darray[Ast::Expr]&, names: mutable darray[sview]&, param_starts: mutable darray[usize]&, param_counts: mutable darray[usize]&, flat_params: mutable darray[sview]&, predicates: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, param_starts, param_counts, flat_params, predicates|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            requires_predicate: Ast::Expr = signature_requires_of(line, contract_lines, contract_kinds, contract_exprs)
+                            has_requires: bool = match requires_predicate:
+                                Expr.Absent: false
+                                _: true
+                            if has_requires:
+                                names.push(function_name)
+                                param_starts.push(flat_params.count)
+                                param_counts.push(parameters.count)
+                                predicates.push(requires_predicate)
+                                for parameter in parameters |flat_params|:
+                                    flat_params.push(parameter.name)
+                            # Body-leading `requires PRED` clauses (Stmt.Contract) too.
+                            for body_statement in body |names, param_starts, param_counts, flat_params, predicates|:
+                                match body_statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        if kind == "requires":
+                                            names.push(function_name)
+                                            param_starts.push(flat_params.count)
+                                            param_counts.push(parameters.count)
+                                            predicates.push(expression)
+                                            for parameter in parameters |flat_params|:
+                                                flat_params.push(parameter.name)
+                                    _:
+                                        pass
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_requires_signatures(module_body, contract_lines, contract_kinds, contract_exprs, names, param_starts, param_counts, flat_params, predicates)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_requires_signatures(scoped_body, contract_lines, contract_kinds, contract_exprs, names, param_starts, param_counts, flat_params, predicates)
+                        _:
+                            pass
+
+        def precondition_check_call(callee_name: sview, arguments: darray[Ast::Expr], line: u32, names: darray[sview]&, param_starts: darray[usize]&, param_counts: darray[usize]&, flat_params: darray[sview]&, predicates: darray[Ast::Expr]&, global_names: darray[sview]&, global_values: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while probe < names.count |probe: usize = 0, table| -> table:
+                    if names[probe] == callee_name:
+                        env_names: mutable darray[sview] = []
+                        env_values: mutable darray[i64] = []
+                        argument_index: mutable usize = 0
+                        while argument_index < param_counts[probe] |argument_index, env_names, env_values|:
+                            argument_const: (found: bool, value: i64) = precondition_arg_const(arguments[argument_index], global_names, global_values) if argument_index < arguments.count else (false, 0)
+                            env_names.push(flat_params[param_starts[probe] + argument_index]) if argument_const.found
+                            env_values.push(argument_const.value) if argument_const.found
+                            argument_index <- argument_index + 1
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionViolated, name: callee_name, line: line, expected: "", actual: ""}) if predicate_violated_env(predicates[probe], env_names, env_values)
+                    probe <- probe + 1
+
+        def precondition_walk_expression(expression: Ast::Expr, line: u32, names: darray[sview]&, param_starts: darray[usize]&, param_counts: darray[usize]&, flat_params: darray[sview]&, predicates: darray[Ast::Expr]&, global_names: darray[sview]&, global_values: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        table <- precondition_check_call(callee_name, arguments, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table) if callee_name != ""
+                        for argument in arguments |table| -> table:
+                            table <- precondition_walk_expression(argument, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- precondition_walk_expression(inner, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- precondition_walk_expression(left, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        table <- precondition_walk_expression(right, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                    _:
+                        pass
+
+        def precondition_walk_statements(statements: darray[Ast::Stmt], names: darray[sview]&, param_starts: darray[usize]&, param_counts: darray[usize]&, flat_params: darray[sview]&, predicates: darray[Ast::Expr]&, global_names: darray[sview]&, global_values: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- precondition_walk_expression(value, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- precondition_walk_expression(value, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Stmt.Expr(expression, line):
+                            table <- precondition_walk_expression(expression, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- precondition_walk_expression(returned, line, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- precondition_walk_statements(then_body, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                            table <- precondition_walk_statements(else_body, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- precondition_walk_statements(while_body, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- precondition_walk_statements(for_body, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- precondition_walk_statements(block_body, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        _:
+                            pass
+
+        def precondition_multiparam_walk(declarations: darray[Ast::Decl], names: darray[sview]&, param_starts: darray[usize]&, param_counts: darray[usize]&, flat_params: darray[sview]&, predicates: darray[Ast::Expr]&, global_names: darray[sview]&, global_values: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- precondition_walk_statements(body, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- precondition_multiparam_walk(module_body, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- precondition_multiparam_walk(scoped_body, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table)
+                        _:
+                            pass
+
+        def check_precondition_multiparam(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                param_starts: mutable darray[usize] = []
+                param_counts: mutable darray[usize] = []
+                flat_params: mutable darray[sview] = []
+                predicates: mutable darray[Ast::Expr] = []
+                collect_requires_signatures(file.top_decls, file.signature_contract_lines, file.signature_contract_kinds, file.signature_contract_exprs, names, param_starts, param_counts, flat_params, predicates)
+                global_names: mutable darray[sview] = []
+                global_values: mutable darray[i64] = []
+                collect_global_consts(file.top_decls, global_names, global_values)
+                table <- precondition_multiparam_walk(file.top_decls, names, param_starts, param_counts, flat_params, predicates, global_names, global_values, table) if names.count > 0
