@@ -60,13 +60,74 @@ extend Semantic:
                     _:
                         pass
 
-        def frame_write_walk(statements: darray[Ast::Stmt], function_name: sview, changes_fields: darray[sview]&, params: darray[sview]&, table: lmut SymbolTable) -> void:
+        # If EXPRESSION is `&PARAM.field` (address-of a parameter field, through a paren), the
+        # (root, field) it borrows, else found=false.
+        def frame_addr_field(expression: Ast::Expr, params: darray[sview]&) -> (found: bool, root: sview, field: sview):
+            can Memory.Allocate, Abort.Panic:
+                empty: (found: bool, root: sview, field: sview) = (false, sview("", 0, 0), sview("", 0, 0))
+                match expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        empty return if operator != TokenKind.Ampersand
+                        return frame_write_target(operand, params)
+                    Expr.Paren(inner, paren_line):
+                        return frame_addr_field(inner, params)
+                    _:
+                        return empty
+
+        # Collect locals bound to `&PARAM.field` (`h = &r.health`): a write THROUGH such an alias
+        # (`h <- v`) writes PARAM.field. Recorded as parallel (name, root, field) arrays.
+        def frame_collect_field_aliases(statements: darray[Ast::Stmt], params: darray[sview]&, out_names: mutable darray[sview]&, out_roots: mutable darray[sview]&, out_fields: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_names, out_roots, out_fields|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            addr: (found: bool, root: sview, field: sview) = frame_addr_field(value, params)
+                            if addr.found:
+                                out_names.push(name)
+                                out_roots.push(addr.root)
+                                out_fields.push(addr.field)
+                        Stmt.Assign(target, operator, value, line):
+                            assign_addr: (found: bool, root: sview, field: sview) = frame_addr_field(value, params)
+                            assign_name: sview = ident_name_of(target)
+                            if assign_addr.found and assign_name != "":
+                                out_names.push(assign_name)
+                                out_roots.push(assign_addr.root)
+                                out_fields.push(assign_addr.field)
+                        Stmt.If(condition, then_body, else_body, line):
+                            frame_collect_field_aliases(then_body, params, out_names, out_roots, out_fields)
+                            frame_collect_field_aliases(else_body, params, out_names, out_roots, out_fields)
+                        Stmt.While(condition, body, line):
+                            frame_collect_field_aliases(body, params, out_names, out_roots, out_fields)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            frame_collect_field_aliases(body, params, out_names, out_roots, out_fields)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            frame_collect_field_aliases(body, params, out_names, out_roots, out_fields)
+                        _:
+                            pass
+
+        # The (root, field) a local field-alias name resolves to, or found=false.
+        def frame_alias_target(alias_names: darray[sview]&, alias_roots: darray[sview]&, alias_fields: darray[sview]&, name: sview) -> (found: bool, root: sview, field: sview):
+            can Abort.Panic:
+                index: mutable usize = 0
+                result: mutable (found: bool, root: sview, field: sview) = (false, sview("", 0, 0), sview("", 0, 0))
+                while index < alias_names.count |result, index|:
+                    result <- (true, alias_roots[index], alias_fields[index]) if alias_names[index] == name and not result.found
+                    index <- index + 1
+                return result
+
+        def frame_write_walk(statements: darray[Ast::Stmt], function_name: sview, changes_fields: darray[sview]&, params: darray[sview]&, alias_names: darray[sview]&, alias_roots: darray[sview]&, alias_fields: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Assign(target, operator, value, line):
                             write: (found: bool, root: sview, field: sview) = frame_write_target(target, params)
                             table <- frame_report_write(write.root, write.field, function_name, line, changes_fields, params, table) if write.found
+                            # A write THROUGH a `&PARAM.field` alias local (`h <- v`) writes PARAM.field —
+                            # but the alias-establishing binding itself (`h = &r.f`, whose value is an
+                            # address-of) is not a write, so skip when the RHS is another `&field`.
+                            rebinds_alias: bool = frame_addr_field(value, params).found
+                            alias: (found: bool, root: sview, field: sview) = frame_alias_target(alias_names, alias_roots, alias_fields, ident_name_of(target))
+                            table <- frame_report_write(alias.root, alias.field, function_name, line, changes_fields, params, table) if alias.found and not write.found and not rebinds_alias
                         Stmt.Expr(expression, line):
                             # A mutating method on a param field: `p.f.push(...)`.
                             if expression is Expr.Call(callee, arguments, argument_names, call_line):
@@ -77,14 +138,14 @@ extend Semantic:
                             # `&PARAM.field` passed into any call may write that field.
                             table <- frame_scan_addr_writes(expression, function_name, changes_fields, params, line, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- frame_write_walk(then_body, function_name, changes_fields, params, table)
-                            table <- frame_write_walk(else_body, function_name, changes_fields, params, table)
+                            table <- frame_write_walk(then_body, function_name, changes_fields, params, alias_names, alias_roots, alias_fields, table)
+                            table <- frame_write_walk(else_body, function_name, changes_fields, params, alias_names, alias_roots, alias_fields, table)
                         Stmt.While(condition, while_body, line):
-                            table <- frame_write_walk(while_body, function_name, changes_fields, params, table)
+                            table <- frame_write_walk(while_body, function_name, changes_fields, params, alias_names, alias_roots, alias_fields, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- frame_write_walk(for_body, function_name, changes_fields, params, table)
+                            table <- frame_write_walk(for_body, function_name, changes_fields, params, alias_names, alias_roots, alias_fields, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- frame_write_walk(body, function_name, changes_fields, params, table)
+                            table <- frame_write_walk(body, function_name, changes_fields, params, alias_names, alias_roots, alias_fields, table)
                         _:
                             pass
 
@@ -102,7 +163,11 @@ extend Semantic:
                             collect_changes_fields(enum_annotations, function_name, changes_fields)
                             if changes_fields.count > 0:
                                 params: mutable darray[sview] = [parameter.name for parameter in parameters]
-                                table <- frame_write_walk(body, function_name, changes_fields, params, table)
+                                alias_names: mutable darray[sview] = []
+                                alias_roots: mutable darray[sview] = []
+                                alias_fields: mutable darray[sview] = []
+                                frame_collect_field_aliases(body, params, alias_names, alias_roots, alias_fields)
+                                table <- frame_write_walk(body, function_name, changes_fields, params, alias_names, alias_roots, alias_fields, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- check_frame_write_walk(module_body, enum_annotations, table)
                         Decl.Scoped(scoped_body, scoped_line):
