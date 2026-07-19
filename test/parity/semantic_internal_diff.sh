@@ -68,6 +68,9 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64; do
     hdr=""
     case "$opts" in
         *FlowLintMode:2*) hdr+=$'# flow-strict\n' ;;
+        *FlowLintMode:1*) hdr+=$'# flow\n' ;;
+    esac
+    case "$opts" in
         *EnforceUnsafePermissions:true*|*EnforceStrictProofs:true*) hdr+=$'# strict\n' ;;
     esac
     fname="$(printf '%s' "$fname_b64" | openssl base64 -d -A 2>/dev/null)"
