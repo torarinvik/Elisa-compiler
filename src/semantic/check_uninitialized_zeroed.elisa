@@ -1,0 +1,152 @@
+# Uninitialized `= zeroed` read (stage0 analyzer_flow_definite_assign). A local declared
+# `x: T = zeroed` where zero is an OPERATIONALLY INVALID value for T (a borrowed string cstr/
+# dstr, or a handle id[T]) is seeded uninitialized; reading it before any assignment is a
+# null-deref / garbage-handle hazard. SOUND syntactic subset: fire when such a local is NEVER
+# assigned/field-assigned/address-taken anywhere in the body (stage0's clear-on-assign is not
+# branch-scoped, so "assigned anywhere" clears it — this matches) and IS returned. Types with a
+# usable zero (scalars/structs/containers/optionals) are never seeded (stage0 keeps FP near zero).
+extend Semantic:
+    private:
+        # Whether `zeroed` produces an operationally invalid value for this type: a borrowed
+        # string (cstr/dstr) or a handle id[T]. (Non-null refs also qualify in stage0 but are
+        # left out here to keep the subset conservative.)
+        def zeroed_invalid_type(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Index(head, argument, line):
+                        return ident_name_of(head) == "id"
+                    Expr.IndexN(head, arguments, line):
+                        return ident_name_of(head) == "id"
+                    Expr.Unary(operator, operand, unary_line):
+                        return zeroed_invalid_type(operand)
+                    Expr.Paren(inner, paren_line):
+                        return zeroed_invalid_type(inner)
+                    _:
+                        base: sview = bare_type_name(type_expression)
+                        return base == "cstr" or base == "dstr"
+
+        def zeroed_value_is_zeroed(value: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match value:
+                    Expr.Ident(name, line):
+                        return name == "zeroed"
+                    _:
+                        return false
+
+        # Record every name that is initialized somewhere: an assignment target root, or a name
+        # whose address is taken (`&x`). Both clear the zeroed-uninitialized seed in stage0.
+        def zeroed_collect_initialized(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            root: sview = target_root_ident(target)
+                            out.push(root) if root != ""
+                            zeroed_collect_addressed_expression(value, out)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            zeroed_collect_addressed_expression(value, out)
+                        Stmt.Expr(expression, line):
+                            zeroed_collect_addressed_expression(expression, out)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                zeroed_collect_addressed_expression(returned, out)
+                        Stmt.If(condition, then_body, else_body, line):
+                            zeroed_collect_initialized(then_body, out)
+                            zeroed_collect_initialized(else_body, out)
+                        Stmt.While(condition, body, line):
+                            zeroed_collect_initialized(body, out)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            zeroed_collect_initialized(body, out)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            zeroed_collect_initialized(body, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out|:
+                                zeroed_collect_initialized(arm.body, out)
+                        _:
+                            pass
+
+        # Record the target of every address-of (`&x`) in an expression (initializes x).
+        def zeroed_collect_addressed_expression(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Unary(operator, operand, line):
+                        root: sview = ident_name_of(operand)
+                        out.push(root) if operator == TokenKind.Ampersand and root != ""
+                        zeroed_collect_addressed_expression(operand, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments |out|:
+                            zeroed_collect_addressed_expression(argument, out)
+                    Expr.Binary(left, operator, right, line):
+                        zeroed_collect_addressed_expression(left, out)
+                        zeroed_collect_addressed_expression(right, out)
+                    Expr.Paren(inner, line):
+                        zeroed_collect_addressed_expression(inner, out)
+                    _:
+                        pass
+
+        def zeroed_name_present(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                return any name in names where name == wanted
+
+        # Emit for every `return <ident>` whose ident is an uninitialized zeroed candidate.
+        def zeroed_check_returns(statements: darray[Ast::Stmt], candidates: darray[sview]&, initialized: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                returned_name: sview = ident_name_of(returned)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UninitializedZeroedRead, name: returned_name, line: line, expected: "", actual: ""}) if returned_name != "" and zeroed_name_present(candidates, returned_name) and not zeroed_name_present(initialized, returned_name)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- zeroed_check_returns(then_body, candidates, initialized, table)
+                            table <- zeroed_check_returns(else_body, candidates, initialized, table)
+                        Stmt.While(condition, body, line):
+                            table <- zeroed_check_returns(body, candidates, initialized, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- zeroed_check_returns(body, candidates, initialized, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- zeroed_check_returns(body, candidates, initialized, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- zeroed_check_returns(arm.body, candidates, initialized, table)
+                        _:
+                            pass
+
+        # Collect must-init `= zeroed` local declarations (recursively).
+        def zeroed_collect_candidates(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            out.push(name) if zeroed_value_is_zeroed(value) and zeroed_invalid_type(type_expression)
+                        Stmt.If(condition, then_body, else_body, line):
+                            zeroed_collect_candidates(then_body, out)
+                            zeroed_collect_candidates(else_body, out)
+                        Stmt.While(condition, body, line):
+                            zeroed_collect_candidates(body, out)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            zeroed_collect_candidates(body, out)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            zeroed_collect_candidates(body, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out|:
+                                zeroed_collect_candidates(arm.body, out)
+                        _:
+                            pass
+
+        def check_uninitialized_zeroed(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            candidates: mutable darray[sview] = []
+                            zeroed_collect_candidates(body, candidates)
+                            initialized: mutable darray[sview] = []
+                            zeroed_collect_initialized(body, initialized)
+                            table <- zeroed_check_returns(body, candidates, initialized, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_uninitialized_zeroed(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_uninitialized_zeroed(scoped_body, table)
+                        _:
+                            pass
