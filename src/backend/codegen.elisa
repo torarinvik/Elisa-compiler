@@ -4212,25 +4212,39 @@ module Backend:
                                 _ = LLVMBuildUnreachable(builder)
                                 return EmitStatus.Terminated
                             return EmitStatus.Open
-                # A plain `match SCRUTINEE:` STATEMENT over an integer / const-enum scrutinee,
-                # where each arm is a statement block (the value-position form is handled by
-                # emit_expression's Expr.Match; here the arm bodies are statements that may
+                # A plain `match SCRUTINEE:` STATEMENT over an integer / const-enum / payload-enum
+                # scrutinee, where each arm is a statement block (the value-position form is handled
+                # by emit_expression's Expr.Match; here the arm bodies are statements that may
                 # `return`/`break` or fall through to the shared done block).
                 sm_scrutinee_type: ValueType = resolve_type(stmt_match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
-                EmitStatus.Declined return if not is_integer_type(sm_scrutinee_type)
-                if emit_expression(stmt_match_scrutinee, sm_scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sm_scrutinee:
+                # A bare `enum Color:` with variants is a PAYLOAD enum (kind PayloadEnum) even when
+                # every variant is field-less: its scrutinee is a `{i32, [N x i64]}` value whose TAG
+                # (extractvalue 0) drives the compare and whose payload is spilled to a temp so an
+                # arm's `is`-binding can load it. Packed enums (store handles) are NOT handled here.
+                sm_penum: bool = sm_scrutinee_type.kind == TypeKind.PayloadEnum
+                EmitStatus.Declined return if not is_integer_type(sm_scrutinee_type) and not sm_penum
+                if emit_expression(stmt_match_scrutinee, sm_scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sm_scrutinee_raw:
                     sm_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                    sm_compare_type: LLVMTypeRef = llvm_type_of(sm_scrutinee_type, structs, ctx)
+                    sm_scrutinee: mutable LLVMValueRef = sm_scrutinee_raw
+                    sm_compare_type: mutable LLVMTypeRef = llvm_type_of(sm_scrutinee_type, structs, ctx)
+                    sm_penum_slot: mutable LLVMValueRef = sm_scrutinee_raw
+                    if sm_penum:
+                        sm_scrutinee <- LLVMBuildExtractValue(builder, sm_scrutinee_raw, 0, "smatch.tag")
+                        sm_compare_type <- LLVMInt32TypeInContext(ctx)
+                        sm_penum_slot <- LLVMBuildAlloca(builder, llvm_type_of(sm_scrutinee_type, structs, ctx), "smatch.payload.tmp")
+                        _ = LLVMBuildStore(builder, sm_scrutinee_raw, sm_penum_slot)
                     sm_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sm_function, "smatch.done")
                     sm_declined: mutable bool = false
                     sm_saw_default: mutable bool = false
                     sm_any_open: mutable bool = false
-                    for sm_arm in stmt_match_arms |sm_declined, sm_saw_default, sm_any_open, sm_scrutinee, sm_compare_type, sm_function, sm_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                    for sm_arm in stmt_match_arms |sm_declined, sm_saw_default, sm_any_open, sm_penum, sm_scrutinee, sm_compare_type, sm_penum_slot, sm_scrutinee_type, sm_function, sm_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
                         continue if sm_declined or sm_saw_default
                         sm_declined <- true if arm_has_guard(sm_arm.guard)
                         continue if arm_has_guard(sm_arm.guard)
                         sm_ordinal: mutable i64 = -1
                         sm_is_default: mutable bool = false
+                        sm_payload_binding: mutable sview = ""
+                        sm_payload_path: mutable sview = ""
                         if sm_arm.pattern is Pattern.Literal(sm_literal_text):
                             sm_literal_value: mutable i64 = 0
                             if parse_int_literal(sm_literal_text, sm_literal_value):
@@ -4238,9 +4252,19 @@ module Backend:
                             else:
                                 sm_declined <- true
                         if sm_arm.pattern is Pattern.Variant(sm_path, sm_fields):
-                            sm_declined <- true if sm_fields.count != 0
-                            sm_ordinal <- ordinal_of_dotted_path(sm_path, structs) if sm_fields.count == 0
-                            sm_declined <- true if sm_fields.count == 0 and sm_ordinal < 0
+                            sm_payload_path <- sm_path
+                            if sm_penum:
+                                sm_ordinal <- penum_variant_index_of_path(sm_path, structs)
+                                sm_declined <- true if sm_fields.count > 1
+                                if sm_fields.count == 1:
+                                    if sm_fields[0] is Pattern.Binding(sm_bound):
+                                        sm_payload_binding <- sm_bound
+                                    else:
+                                        sm_declined <- true
+                            else:
+                                sm_declined <- true if sm_fields.count != 0
+                                sm_ordinal <- ordinal_of_dotted_path(sm_path, structs) if sm_fields.count == 0
+                            sm_declined <- true if sm_ordinal < 0
                         sm_is_default <- true if is_catch_all_pattern(sm_arm.pattern)
                         sm_declined <- true if sm_ordinal < 0 and not sm_is_default
                         continue if sm_declined
@@ -4258,11 +4282,27 @@ module Backend:
                             sm_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, sm_scrutinee, LLVMConstInt(sm_compare_type, sm_ordinal.u64(), 1), "smatch.cmp")
                             _ = LLVMBuildCondBr(builder, sm_hit, sm_arm_block, sm_next_block)
                             LLVMPositionBuilderAtEnd(builder, sm_arm_block)
-                            sm_arm_status: EmitStatus = emit_statements(sm_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                            sm_declined <- true if sm_arm_status == EmitStatus.Declined
-                            sm_any_open <- true if sm_arm_status == EmitStatus.Open
-                            branch_if_open(sm_arm_status, builder, sm_done)
-                            LLVMPositionBuilderAtEnd(builder, sm_next_block)
+                            # `Shape.Circle(r):` — spill-and-load the single payload field so the
+                            # arm body can read `r`, exactly as the value-position emitter does.
+                            if sm_penum and sm_payload_binding != "":
+                                sm_payload_type: ValueType = penum_payload_of_path(sm_payload_path, structs)
+                                if sm_payload_type.kind == TypeKind.Unmodeled:
+                                    sm_declined <- true
+                                else:
+                                    sm_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(sm_scrutinee_type, structs, ctx), sm_penum_slot, 1, "smatch.payload.ptr")
+                                    sm_payload_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(sm_payload_type, structs, ctx), sm_payload_pointer, "smatch.payload")
+                                    sm_payload_storage: mutable darray[u8] = []
+                                    sm_payload_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(sm_payload_type, structs, ctx), sview_to_cstr(sm_payload_binding, sm_payload_storage))
+                                    _ = LLVMBuildStore(builder, sm_payload_value, sm_payload_slot)
+                                    declare_local(local_scope, sm_payload_binding, sm_payload_slot, sm_payload_type)
+                            if sm_declined:
+                                LLVMPositionBuilderAtEnd(builder, sm_next_block)
+                            else:
+                                sm_arm_status: EmitStatus = emit_statements(sm_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                sm_declined <- true if sm_arm_status == EmitStatus.Declined
+                                sm_any_open <- true if sm_arm_status == EmitStatus.Open
+                                branch_if_open(sm_arm_status, builder, sm_done)
+                                LLVMPositionBuilderAtEnd(builder, sm_next_block)
                     EmitStatus.Declined return if sm_declined
                     # No `_` arm: the frontend proved exhaustiveness, so a fall-through of the
                     # last arm's next-block is unreachable.
