@@ -120,7 +120,7 @@ extend Semantic:
                     is_forwardable: bool = type_contains_operator(parameter.type_expression, TokenKind.Ampersand) and not type_contains_operator(parameter.type_expression, TokenKind.Static) and not type_contains_heap(parameter.type_expression)
                     out.push(parameter.name) if is_forwardable
 
-        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, table: lmut SymbolTable) -> void:
+        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 target_name: sview = ident_name_of(target)
                 return if target_name == ""
@@ -143,6 +143,16 @@ extend Semantic:
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: value_region, actual: value_region})
                     return
                 target_region: sview = local_region_name(annotations, target_name, line)
+                # Outlives escape: a value living in an active inner `region` block stored into a
+                # plain local declared in an ENCLOSING scope (outside that region block). The outer
+                # local outlives the region, so once the region is freed the stored reference
+                # dangles ("stored into X, which outlives the region"). Only un-annotated outer
+                # locals participate — a region-annotated target goes through the nesting comparison
+                # below; an inner local (declared inside the region body) is not in outer_locals.
+                target_is_outer_local: bool = any outer_name in outer_locals where outer_name == target_name
+                if value_position.found and target_region == "" and target_is_outer_local:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: value_region, actual: value_region})
+                    return
                 return if target_region == "" or target_region == value_region
                 target_position: (found: bool, position: usize) = region_stack_position(nesting, target_region)
                 escapes: bool = target_position.found and value_position.found and target_position.position < value_position.position
@@ -163,8 +173,26 @@ extend Semantic:
                     _:
                         return (false, sview("", 0, 0), 0)
 
-        def region_escape_walk(statements: darray[Ast::Stmt], nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, table: lmut SymbolTable) -> void:
+        # Direct-level local names (VarDecls at this statement list's own level, no recursion).
+        # Ordering is not tracked: a later-declared local can never be an assign target inside an
+        # earlier region block (it is not yet in scope there), so the full set is a safe superset.
+        def collect_level_local_names(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            out.push(name)
+                        _:
+                            pass
+
+        def region_escape_walk(statements: darray[Ast::Stmt], nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Locals visible from a child scope = the enclosing set plus every local declared
+                # directly at this level. Passed as the `outer_locals` of child region/control blocks
+                # so the outlives check can tell a region-enclosed value stored into an enclosing
+                # local (escape) from one stored into a region-body local (fine).
+                child_outer_locals: mutable darray[sview] = [name for name in outer_locals]
+                collect_level_local_names(statements, child_outer_locals)
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Block(kind, clause, binding, body, line):
@@ -172,26 +200,26 @@ extend Semantic:
                             region_label: sview = clause[0] if clause.count > 0 else sview("", 0, 0)
                             child_stack: mutable darray[sview] = [entry for entry in nesting]
                             child_stack.push(region_label) if is_region_block
-                            table <- region_escape_walk(body, child_stack, annotations, mutable_globals, ref_params, table)
+                            table <- region_escape_walk(body, child_stack, annotations, mutable_globals, ref_params, child_outer_locals, table)
                         Stmt.Expr(expression, line):
                             table <- region_escape_check_store(expression, line, nesting, annotations, table)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- region_escape_check_store(value, line, nesting, annotations, table)
                         Stmt.Assign(target, operator, value, line):
                             table <- region_escape_check_store(value, line, nesting, annotations, table)
-                            table <- region_escape_check_assign(target, value, line, nesting, annotations, mutable_globals, ref_params, table)
+                            table <- region_escape_check_assign(target, value, line, nesting, annotations, mutable_globals, ref_params, outer_locals, table)
                         Stmt.Return(value, line):
                             if value is returned:
                                 returned_region: sview = stored_value_region(returned, annotations, line)
                                 returned_position: (found: bool, position: usize) = region_stack_position(nesting, returned_region)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionReturnEscape, name: "", line: line, expected: "", actual: returned_region}) if returned_region != "" and returned_position.found
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- region_escape_walk(then_body, nesting, annotations, mutable_globals, ref_params, table)
-                            table <- region_escape_walk(else_body, nesting, annotations, mutable_globals, ref_params, table)
+                            table <- region_escape_walk(then_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, table)
+                            table <- region_escape_walk(else_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, table)
                         Stmt.While(condition, while_body, line):
-                            table <- region_escape_walk(while_body, nesting, annotations, mutable_globals, ref_params, table)
+                            table <- region_escape_walk(while_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- region_escape_walk(for_body, nesting, annotations, mutable_globals, ref_params, table)
+                            table <- region_escape_walk(for_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, table)
                         _:
                             pass
 
@@ -203,7 +231,8 @@ extend Semantic:
                             empty_stack: darray[sview] = []
                             ref_params: mutable darray[sview] = []
                             collect_forwardable_ref_params(parameters, ref_params)
-                            table <- region_escape_walk(body, empty_stack, annotations, mutable_globals, ref_params, table)
+                            empty_outer_locals: darray[sview] = []
+                            table <- region_escape_walk(body, empty_stack, annotations, mutable_globals, ref_params, empty_outer_locals, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- check_region_escape_walk(module_body, annotations, mutable_globals, table)
                         Decl.Scoped(scoped_body, scoped_line):
