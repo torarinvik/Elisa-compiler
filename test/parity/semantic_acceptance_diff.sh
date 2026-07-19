@@ -24,12 +24,31 @@ case_count="$(wc -l < "$ORACLE" | tr -d ' ')"
     exit 1
 }
 
+# Trusted-stdlib basenames (mirrors semantic/permissions_validation.go's runtimeStdBaseNames):
+# a source with one of these names, or living under an elisacore_std/ directory, is exempt
+# from user-only passes (raw-atomic-surface removal). Replayed via a `# std` header.
+is_runtime_std() {
+    local path="$1"
+    case "$(dirname -- "$path")" in
+        */elisacore_std|elisacore_std) return 0 ;;
+    esac
+    case "$(basename -- "$path")" in
+        allocator.elisa|arena.elisa|collections.elisa|debug_referee.elisa|deque.elisa|\
+        elisacore_runtime.elisa|elisacore_runtime_concurrency.elisa|elisacore_runtime_prelude.elisa|\
+        elisacore_runtime_strings.elisa|elisacore_runtime_system_bridge.elisa|heap.elisa|names.elisa|\
+        native_runtime_support.elisa|runtime.elisa|stores.elisa|stores_core.elisa|\
+        stores_packed_dense.elisa|stores_packed_encoding.elisa|stores_packed_sparse.elisa|\
+        stores_rows.elisa|stores_types.elisa|test.elisa) return 0 ;;
+    esac
+    return 1
+}
+
 while IFS=$'\t' read -r name expected_errors expected_warnings encoded_filename encoded_source; do
-    if [[ "$name" == TestAnalyzeStrict* ]]; then
-        out="$({ printf '# strict\n'; printf '%s' "$encoded_source" | openssl base64 -d -A; } | "$RPT")"
-    else
-        out="$(printf '%s' "$encoded_source" | openssl base64 -d -A | "$RPT")"
-    fi
+    filename="$(printf '%s' "$encoded_filename" | openssl base64 -d -A 2>/dev/null)"
+    header=""
+    [[ "$name" == TestAnalyzeStrict* ]] && header+=$'# strict\n'
+    is_runtime_std "$filename" && header+=$'# std\n'
+    out="$({ printf '%s' "$header"; printf '%s' "$encoded_source" | openssl base64 -d -A; } | "$RPT")"
     parse_errors="$(printf '%s\n' "$out" | awk '$1 == "P" { print $2; exit }')"
     diagnostics="$(printf '%s\n' "$out" | awk '$1 == "D" { print $2; exit }')"
     [[ -n "$parse_errors" ]] || parse_errors=999999

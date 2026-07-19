@@ -1,0 +1,121 @@
+# Legacy raw-atomic surface removal. Raw atomic operations (`load`, `store`, `exchange`,
+# `compare_exchange`, `fetch_add`/`sub`/`or`/`and`/`xor`) applied to an `atomic[T]&` slot are
+# no longer part of the public surface — user code goes through `AtomicCell[T]` helpers or a
+# named protocol type. Stage0 rejects any CALL to one of those names whose first argument is
+# statically typed `atomic[T]&`, EXCEPT inside the trusted stdlib (which owns the raw slot
+# helpers). This SOUND syntactic approximation collects the names of parameters and locals
+# whose declared type is built on `atomic[...]`, and emits on a slot-op call whose first
+# argument is one of them — so it can only fire on a real raw-atomic slot op. The trusted-
+# stdlib exemption is the caller's responsibility: this pass runs only when the compilation
+# unit is NOT a runtime-std source (mirroring stage0's isRuntimeStdPermissionInternal).
+extend Semantic:
+    private:
+        def is_atomic_slot_call_name(name: sview) -> bool:
+            can Abort.Panic:
+                return name == "load" or name == "store" or name == "exchange" or name == "compare_exchange" or name == "fetch_add" or name == "fetch_sub" or name == "fetch_or" or name == "fetch_and" or name == "fetch_xor"
+
+        # Whether a type expression is built on `atomic[...]`, looking through mutable/lmut/&
+        # wrappers, parentheses, and refinements.
+        def type_mentions_atomic(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Index(head, argument, line):
+                        return ident_name_of(head) == "atomic"
+                    Expr.Unary(operator, operand, line):
+                        return type_mentions_atomic(operand)
+                    Expr.Paren(inner, line):
+                        return type_mentions_atomic(inner)
+                    Expr.Refinement(base, predicate, line):
+                        return type_mentions_atomic(base)
+                    _:
+                        return false
+
+        def atomic_name_exists(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                return any name in names where name == wanted
+
+        # Record every local VarDecl whose declared type is atomic-typed.
+        def collect_atomic_locals(statements: darray[Ast::Stmt], atomic_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |atomic_names|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            atomic_names.push(name) if type_mentions_atomic(type_expression)
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_atomic_locals(then_body, atomic_names)
+                            collect_atomic_locals(else_body, atomic_names)
+                        Stmt.While(condition, body, line):
+                            collect_atomic_locals(body, atomic_names)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            collect_atomic_locals(body, atomic_names)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            collect_atomic_locals(body, atomic_names)
+                        _:
+                            pass
+
+        def raw_atomic_check_expression(expression: Ast::Expr, atomic_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        if is_atomic_slot_call_name(callee_name) and arguments.count > 0:
+                            match arguments[0]:
+                                Expr.Ident(argument_name, argument_line):
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RawConcurrencySurfaceRemoved, name: callee_name, line: call_line, expected: "", actual: ""}) if atomic_name_exists(atomic_names, argument_name)
+                                _:
+                                    pass
+                        for argument in arguments |table| -> table:
+                            table <- raw_atomic_check_expression(argument, atomic_names, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- raw_atomic_check_expression(left, atomic_names, table)
+                        table <- raw_atomic_check_expression(right, atomic_names, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- raw_atomic_check_expression(inner, atomic_names, table)
+                    _:
+                        pass
+
+        def raw_atomic_check_statements(statements: darray[Ast::Stmt], atomic_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- raw_atomic_check_expression(expression, atomic_names, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- raw_atomic_check_expression(value, atomic_names, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- raw_atomic_check_expression(value, atomic_names, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- raw_atomic_check_expression(returned, atomic_names, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- raw_atomic_check_statements(then_body, atomic_names, table)
+                            table <- raw_atomic_check_statements(else_body, atomic_names, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- raw_atomic_check_statements(while_body, atomic_names, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- raw_atomic_check_statements(block_body, atomic_names, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- raw_atomic_check_statements(for_body, atomic_names, table)
+                        _:
+                            pass
+
+        def raw_atomic_check_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            atomic_names: mutable darray[sview] = []
+                            for parameter in parameters |atomic_names|:
+                                atomic_names.push(parameter.name) if type_mentions_atomic(parameter.type_expression)
+                            collect_atomic_locals(body, atomic_names)
+                            table <- raw_atomic_check_statements(body, atomic_names, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- raw_atomic_check_walk(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- raw_atomic_check_walk(scoped_body, table)
+                        _:
+                            pass
+
+        def check_raw_atomic_surface(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- raw_atomic_check_walk(declarations, table)

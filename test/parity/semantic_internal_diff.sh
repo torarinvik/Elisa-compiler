@@ -43,19 +43,36 @@ sort -t$'\t' -k4,4 -k5,5 -u "$ORACLE" > "$WORK/deduped.tsv"
 total=0
 mismatches=0
 : > "$WORK/mismatches.tsv"
+
+# Trusted-stdlib basenames (mirrors semantic/permissions_validation.go's runtimeStdBaseNames):
+# a source with one of these names, or under an elisacore_std/ directory, is exempt from
+# user-only passes (raw-atomic-surface removal). Replayed via a `# std` header.
+is_runtime_std() {
+    local path="$1"
+    case "$(dirname -- "$path")" in
+        */elisacore_std|elisacore_std) return 0 ;;
+    esac
+    case "$(basename -- "$path")" in
+        allocator.elisa|arena.elisa|collections.elisa|debug_referee.elisa|deque.elisa|\
+        elisacore_runtime.elisa|elisacore_runtime_concurrency.elisa|elisacore_runtime_prelude.elisa|\
+        elisacore_runtime_strings.elisa|elisacore_runtime_system_bridge.elisa|heap.elisa|names.elisa|\
+        native_runtime_support.elisa|runtime.elisa|stores.elisa|stores_core.elisa|\
+        stores_packed_dense.elisa|stores_packed_encoding.elisa|stores_packed_sparse.elisa|\
+        stores_rows.elisa|stores_types.elisa|test.elisa) return 0 ;;
+    esac
+    return 1
+}
 while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64; do
     total=$((total + 1))
     opts="$(printf '%s' "$opts_b64" | openssl base64 -d -A)"
     hdr=""
     case "$opts" in
-        *FlowLintMode:2*) hdr="# flow-strict" ;;
-        *EnforceUnsafePermissions:true*|*EnforceStrictProofs:true*) hdr="# strict" ;;
+        *FlowLintMode:2*) hdr+=$'# flow-strict\n' ;;
+        *EnforceUnsafePermissions:true*|*EnforceStrictProofs:true*) hdr+=$'# strict\n' ;;
     esac
-    if [[ -n "$hdr" ]]; then
-        out="$({ printf '%s\n' "$hdr"; printf '%s' "$src_b64" | openssl base64 -d -A; } | "$RPT")"
-    else
-        out="$(printf '%s' "$src_b64" | openssl base64 -d -A | "$RPT")"
-    fi
+    fname="$(printf '%s' "$fname_b64" | openssl base64 -d -A 2>/dev/null)"
+    is_runtime_std "$fname" && hdr+=$'# std\n'
+    out="$({ printf '%s' "$hdr"; printf '%s' "$src_b64" | openssl base64 -d -A; } | "$RPT")"
     parse_errors="$(printf '%s\n' "$out" | awk '$1 == "P" { print $2; exit }')"
     diagnostics="$(printf '%s\n' "$out" | awk '$1 == "D" { print $2; exit }')"
     [[ -n "$parse_errors" ]] || parse_errors=999999
