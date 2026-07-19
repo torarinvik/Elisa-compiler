@@ -361,7 +361,7 @@ extend Semantic:
                         pass
 
 
-        def walk_affine_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def walk_affine_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, flags: mutable darray[bool]&, consumed: mutable darray[sview]&, linear_names: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |names, flags, consumed, table| -> table:
                     match statement:
@@ -371,6 +371,12 @@ extend Semantic:
                             flags.push(affine_type_expression(type_expression, table))
                         Stmt.Assign(target, operator, value, line):
                             table <- walk_affine_expression(value, names, flags, consumed, table)
+                            # An un-annotated `t = Ticket.new(...)` binds a fresh linear local (parsed
+                            # as Assign, not VarDecl); register it so a later `move t` is tracked.
+                            assign_name: sview = ident_name_of(target)
+                            assign_is_linear: bool = assign_name != "" and linear_local_type((Ast::Expr.Absent), value, linear_names, table) != ""
+                            names.push(assign_name) if assign_is_linear
+                            flags.push(true) if assign_is_linear
                         Stmt.Expr(expression, line):
                             table <- walk_affine_expression(expression, names, flags, consumed, table)
                         Stmt.Return(value, line):
@@ -387,13 +393,13 @@ extend Semantic:
                             else_consumed: mutable darray[sview] = []
                             then_consumed.extend(consumed)
                             else_consumed.extend(consumed)
-                            table <- walk_affine_statements(then_body, names, flags, then_consumed, table)
-                            table <- walk_affine_statements(else_body, names, flags, else_consumed, table)
+                            table <- walk_affine_statements(then_body, names, flags, then_consumed, linear_names, table)
+                            table <- walk_affine_statements(else_body, names, flags, else_consumed, linear_names, table)
                             for consumed_name in then_consumed |consumed|:
                                 consumed.push(consumed_name) if affine_consumed(else_consumed, consumed_name) and not affine_consumed(consumed, consumed_name)
                         Stmt.Block(kind, clause, binding, body, line):
                             moved_root: sview = move_block_root(kind, body)
-                            table <- walk_affine_statements(body, names, flags, consumed, table)
+                            table <- walk_affine_statements(body, names, flags, consumed, linear_names, table)
                             consumed.push(moved_root) if moved_root != "" and affine_local(names, flags, moved_root) and not affine_consumed(consumed, moved_root)
                         Stmt.While(condition, body, line):
                             table <- walk_affine_expression(condition, names, flags, consumed, table)
@@ -402,7 +408,7 @@ extend Semantic:
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineUseAfterConsume, name: matched_root, line: line, expected: "match", actual: ""}) if matched_root != "" and affine_consumed(consumed, matched_root)
                             table <- walk_affine_expression(scrutinee, names, flags, consumed, table)
                             for arm in arms |table, consumed| -> table:
-                                table <- walk_affine_statements(arm.body, names, flags, consumed, table)
+                                table <- walk_affine_statements(arm.body, names, flags, consumed, linear_names, table)
                             consumed.push(matched_root) if matched_root != "" and affine_local(names, flags, matched_root) and not affine_consumed(consumed, matched_root)
                         _:
                             pass
@@ -429,7 +435,37 @@ extend Semantic:
 
         # The linear type name of a local (from its `: Linear` / `: Linear[State]` annotation or a
         # `Linear.new(...)` initializer), or "" when the local is not linear-typed.
-        def linear_local_type(type_expression: Ast::Expr, value: Ast::Expr, linear_names: darray[sview]&) -> sview:
+        # Whether WHOLE equals PREFIX ++ MIDDLE ++ SUFFIX byte-for-byte.
+        def linear_sview_wrapped(whole: sview, prefix: sview, middle: sview, suffix: sview) -> bool:
+            can Abort.Panic:
+                prefix_len: usize = sview_len(prefix)
+                middle_len: usize = sview_len(middle)
+                suffix_len: usize = sview_len(suffix)
+                false return if sview_len(whole) != prefix_len + middle_len + suffix_len
+                prefix_ok: bool =
+                    for probe in 0..<prefix_len |ok: bool = true| -> ok:
+                        ok <- false if sview_at(whole, probe) != sview_at(prefix, probe)
+                false return if not prefix_ok
+                middle_ok: bool =
+                    for probe in 0..<middle_len |ok: bool = true| -> ok:
+                        ok <- false if sview_at(whole, prefix_len + probe) != sview_at(middle, probe)
+                false return if not middle_ok
+                return for probe in 0..<suffix_len |ok: bool = true| -> ok:
+                    ok <- false if sview_at(whole, prefix_len + middle_len + probe) != sview_at(suffix, probe)
+
+        # The linear type T of a synthesized typestate constructor call `__typestate_T_new(...)`
+        # (the lowering of `T.new(...)` for a `linear typestate T`), else "". T must be a known
+        # linear type name.
+        def linear_typestate_new_type(callee_name: sview, linear_names: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                prefix: sview = sview("__typestate_", 0, -1)
+                suffix: sview = sview("_new", 0, -1)
+                found: mutable sview = sview("", 0, 0)
+                for candidate in linear_names |found|:
+                    found <- candidate if found == "" and linear_sview_wrapped(callee_name, prefix, candidate, suffix)
+                return found
+
+        def linear_local_type(type_expression: Ast::Expr, value: Ast::Expr, linear_names: darray[sview]&, table: SymbolTable&) -> sview:
             can Memory.Allocate, Abort.Panic:
                 head_name: sview = match type_expression:
                     Expr.Index(head, argument, index_line): ident_name_of(head)
@@ -443,31 +479,38 @@ extend Semantic:
                                 ctor_type: sview = ident_name_of(object)
                                 return ctor_type if field == "new" and linear_type_name_present(linear_names, ctor_type) else sview("", 0, 0)
                             _:
-                                return sview("", 0, 0)
+                                return linear_typestate_new_type(ident_name_of(callee), linear_names)
                     _:
                         return sview("", 0, 0)
 
         # Collect (linear-local name, decl line) declared in a statement list (recursively).
-        def collect_linear_locals(statements: darray[Ast::Stmt], linear_names: darray[sview]&, out_names: mutable darray[sview]&, out_lines: mutable darray[u32]&) -> void:
+        def collect_linear_locals(statements: darray[Ast::Stmt], linear_names: darray[sview]&, table: SymbolTable&, out_names: mutable darray[sview]&, out_lines: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |out_names, out_lines|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            linear_type: sview = linear_local_type(type_expression, value, linear_names)
+                            linear_type: sview = linear_local_type(type_expression, value, linear_names, table)
                             out_names.push(name) if linear_type != ""
                             out_lines.push(line) if linear_type != ""
+                        Stmt.Assign(target, operator, value, line):
+                            # An un-annotated first binding `t = Ticket.new(...)` parses as Assign,
+                            # not VarDecl; detect a linear-valued one by its target ident.
+                            assign_name: sview = ident_name_of(target)
+                            assign_type: sview = linear_local_type((Ast::Expr.Absent), value, linear_names, table) if assign_name != "" else sview("", 0, 0)
+                            out_names.push(assign_name) if assign_type != ""
+                            out_lines.push(line) if assign_type != ""
                         Stmt.If(condition, then_body, else_body, line):
-                            collect_linear_locals(then_body, linear_names, out_names, out_lines)
-                            collect_linear_locals(else_body, linear_names, out_names, out_lines)
+                            collect_linear_locals(then_body, linear_names, table, out_names, out_lines)
+                            collect_linear_locals(else_body, linear_names, table, out_names, out_lines)
                         Stmt.While(condition, body, line):
-                            collect_linear_locals(body, linear_names, out_names, out_lines)
+                            collect_linear_locals(body, linear_names, table, out_names, out_lines)
                         Stmt.For(bind, variables, iterable, body, line):
-                            collect_linear_locals(body, linear_names, out_names, out_lines)
+                            collect_linear_locals(body, linear_names, table, out_names, out_lines)
                         Stmt.Block(kind, clause, binding, body, line):
-                            collect_linear_locals(body, linear_names, out_names, out_lines)
+                            collect_linear_locals(body, linear_names, table, out_names, out_lines)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |out_names, out_lines|:
-                                collect_linear_locals(arm.body, linear_names, out_names, out_lines)
+                                collect_linear_locals(arm.body, linear_names, table, out_names, out_lines)
                         _:
                             pass
 
@@ -486,13 +529,13 @@ extend Semantic:
                             for param in params |names, flags|:
                                 names.push(param.name)
                                 flags.push(affine_type_expression(param.type_expression, table))
-                            table <- walk_affine_statements(body, names, flags, consumed, table)
+                            table <- walk_affine_statements(body, names, flags, consumed, linear_names, table)
                             # Linear locals must be consumed on every path. The affine `consumed`
                             # set (built above, with branch-merge) is the sound consumption model;
                             # a linear local absent from it is leaked at scope exit.
                             linear_local_names: mutable darray[sview] = []
                             linear_local_lines: mutable darray[u32] = []
-                            collect_linear_locals(body, linear_names, linear_local_names, linear_local_lines)
+                            collect_linear_locals(body, linear_names, table, linear_local_names, linear_local_lines)
                             while linear_probe < linear_local_names.count |linear_probe: usize = 0, table| -> table:
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LinearScopeExit, name: linear_local_names[linear_probe], line: linear_local_lines[linear_probe], expected: "", actual: ""}) if not affine_consumed(consumed, linear_local_names[linear_probe])
                                 linear_probe <- linear_probe + 1
