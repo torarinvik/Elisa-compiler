@@ -408,7 +408,70 @@ extend Semantic:
                             pass
 
 
-        def check_affine_uses(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        # Names of `linear struct`/`linear typestate` types (affinity "linear"): a value of such
+        # a type must be consumed exactly once, so an unconsumed local is a leak.
+        def collect_linear_type_names(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                            out.push(struct_name) if affinity == "linear"
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_linear_type_names(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_linear_type_names(scoped_body, out)
+                        _:
+                            pass
+
+        def linear_type_name_present(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                return any name in names where name == wanted
+
+        # The linear type name of a local (from its `: Linear` / `: Linear[State]` annotation or a
+        # `Linear.new(...)` initializer), or "" when the local is not linear-typed.
+        def linear_local_type(type_expression: Ast::Expr, value: Ast::Expr, linear_names: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                head_name: sview = match type_expression:
+                    Expr.Index(head, argument, index_line): ident_name_of(head)
+                    Expr.IndexN(head, arguments, index_n_line): ident_name_of(head)
+                    _: bare_type_name(type_expression)
+                head_name return if head_name != "" and linear_type_name_present(linear_names, head_name)
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        match callee:
+                            Expr.Field(object, field, field_line):
+                                ctor_type: sview = ident_name_of(object)
+                                return ctor_type if field == "new" and linear_type_name_present(linear_names, ctor_type) else sview("", 0, 0)
+                            _:
+                                return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # Collect (linear-local name, decl line) declared in a statement list (recursively).
+        def collect_linear_locals(statements: darray[Ast::Stmt], linear_names: darray[sview]&, out_names: mutable darray[sview]&, out_lines: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_names, out_lines|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            linear_type: sview = linear_local_type(type_expression, value, linear_names)
+                            out_names.push(name) if linear_type != ""
+                            out_lines.push(line) if linear_type != ""
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_linear_locals(then_body, linear_names, out_names, out_lines)
+                            collect_linear_locals(else_body, linear_names, out_names, out_lines)
+                        Stmt.While(condition, body, line):
+                            collect_linear_locals(body, linear_names, out_names, out_lines)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            collect_linear_locals(body, linear_names, out_names, out_lines)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            collect_linear_locals(body, linear_names, out_names, out_lines)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out_names, out_lines|:
+                                collect_linear_locals(arm.body, linear_names, out_names, out_lines)
+                        _:
+                            pass
+
+        def check_affine_uses(declarations: darray[Ast::Decl], linear_names: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -424,6 +487,15 @@ extend Semantic:
                                 names.push(param.name)
                                 flags.push(affine_type_expression(param.type_expression, table))
                             table <- walk_affine_statements(body, names, flags, consumed, table)
+                            # Linear locals must be consumed on every path. The affine `consumed`
+                            # set (built above, with branch-merge) is the sound consumption model;
+                            # a linear local absent from it is leaked at scope exit.
+                            linear_local_names: mutable darray[sview] = []
+                            linear_local_lines: mutable darray[u32] = []
+                            collect_linear_locals(body, linear_names, linear_local_names, linear_local_lines)
+                            while linear_probe < linear_local_names.count |linear_probe: usize = 0, table| -> table:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LinearScopeExit, name: linear_local_names[linear_probe], line: linear_local_lines[linear_probe], expected: "", actual: ""}) if not affine_consumed(consumed, linear_local_names[linear_probe])
+                                linear_probe <- linear_probe + 1
                             lifecycle: u32 = lifecycle_statement_flags(body)
                             table <- walk_thread_pool_lifecycle(body, alias_names, alias_roots, shutdown_names, shutdown_flags, table) if (lifecycle & 8) != 0
                             for param in params |table| -> table:
@@ -432,13 +504,15 @@ extend Semantic:
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineScopeExit, name: "group", line: line, expected: "task group with pending tasks", actual: ""}) if (lifecycle & 1) != 0 and (lifecycle & 2) == 0
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineScopeExit, name: "pool", line: line, expected: "thread pool requiring shutdown", actual: ""}) if (lifecycle & 4) != 0 and (lifecycle & 8) == 0
                         Decl.Module(name, body, line):
-                            table <- check_affine_uses(body, table)
+                            table <- check_affine_uses(body, linear_names, table)
                         Decl.Scoped(body, line):
-                            table <- check_affine_uses(body, table)
+                            table <- check_affine_uses(body, linear_names, table)
                         _:
                             pass
 
     public:
         def check_affine_use_flow(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                table <- check_affine_uses(declarations, table)
+                linear_names: mutable darray[sview] = []
+                collect_linear_type_names(declarations, linear_names)
+                table <- check_affine_uses(declarations, linear_names, table)
