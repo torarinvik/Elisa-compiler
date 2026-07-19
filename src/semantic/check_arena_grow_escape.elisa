@@ -1,0 +1,140 @@
+# Non-local darray grown from a function-local arena (sound subset of stage0
+# checkDarrayGrowthRegionEscape). A darray records no "home" arena — each push/extend/
+# reserve/resize grows its backing from whatever `in <arena>:` scope is active. So growing a
+# darray whose storage OUTLIVES the function (here: a parameter) while the ambient arena is a
+# by-value local `arena: Arena = zeroed` puts the new buffer in that local arena, which is
+# freed on return — a use-after-free.
+#
+# Stage0's full rule flags any receiver whose storage outlives the function (param, global, or
+# a field/element reached THROUGH a reference). This sound subset fires only on the clearest
+# case — a receiver rooted at a PARAMETER — inside an `in ARENA:` block whose ARENA is a
+# by-value local of type `Arena` (a `Arena&` param arena is persistent and never flagged).
+extend Semantic:
+    private:
+        # Root ident of an lvalue path (walk Field/Index/Slice/Paren/Move to the base), "" if none.
+        def arena_root_ident(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return name
+                    Expr.Paren(inner, line):
+                        return arena_root_ident(inner)
+                    Expr.Field(object, field, line):
+                        return arena_root_ident(object)
+                    Expr.Index(head, argument, line):
+                        return arena_root_ident(head)
+                    Expr.Slice(object, low, high, line):
+                        return arena_root_ident(object)
+                    Expr.Move(inner, line):
+                        return arena_root_ident(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        # The (found, receiver-expr, op-name) of a darray growth call, else found=false.
+        def arena_grow_call_op(callee: Ast::Expr) -> (found: bool, op: sview):
+            can Abort.Panic:
+                match callee:
+                    Expr.Field(receiver, method, line):
+                        is_grow: bool = method == "push" or method == "extend" or method == "reserve" or method == "resize"
+                        return (is_grow, method)
+                    _:
+                        return (false, sview("", 0, 0))
+
+        def arena_grow_check_expression(expression: Ast::Expr, arena_name: sview, params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        op: (found: bool, op: sview) = arena_grow_call_op(callee)
+                        if op.found and callee is Expr.Field(receiver, method, field_line):
+                            root: sview = arena_root_ident(receiver)
+                            receiver_is_param: bool = root != "" and (any parameter_name in params where parameter_name == root)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArenaGrowEscape, name: op.op, line: line, expected: arena_name, actual: ""}) if receiver_is_param
+                    _:
+                        pass
+
+        # Walk a body inside an active local-arena `in ARENA:` scope, flagging param-rooted grows.
+        def arena_grow_walk_active(statements: darray[Ast::Stmt], arena_name: sview, arena_locals: darray[sview]&, params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- arena_grow_check_expression(expression, arena_name, params, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- arena_grow_check_expression(value, arena_name, params, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- arena_grow_check_expression(value, arena_name, params, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- arena_grow_walk_active(then_body, arena_name, arena_locals, params, table)
+                            table <- arena_grow_walk_active(else_body, arena_name, arena_locals, params, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- arena_grow_walk_active(while_body, arena_name, arena_locals, params, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- arena_grow_walk_active(for_body, arena_name, arena_locals, params, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            # A nested `in OTHER:` block re-binds the ambient arena; otherwise the
+                            # current arena stays ambient through the nested scope.
+                            inner_arena: mutable sview = arena_name
+                            inner_arena <- clause[0] if kind == "in" and clause.count > 0 and (any local_name in arena_locals where local_name == clause[0])
+                            table <- arena_grow_walk_active(body, inner_arena, arena_locals, params, table)
+                        _:
+                            pass
+
+        def arena_grow_walk(statements: darray[Ast::Stmt], arena_locals: darray[sview]&, params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            enters_local_arena: bool = kind == "in" and clause.count > 0 and (any local_name in arena_locals where local_name == clause[0])
+                            if enters_local_arena:
+                                table <- arena_grow_walk_active(body, clause[0], arena_locals, params, table)
+                            else:
+                                table <- arena_grow_walk(body, arena_locals, params, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- arena_grow_walk(then_body, arena_locals, params, table)
+                            table <- arena_grow_walk(else_body, arena_locals, params, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- arena_grow_walk(while_body, arena_locals, params, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- arena_grow_walk(for_body, arena_locals, params, table)
+                        _:
+                            pass
+
+        # by-value `Arena` locals (VarDecls typed bare `Arena`; a `Arena&` yields "" from
+        # ident_name_of, so ref-arena locals are naturally excluded).
+        def collect_arena_value_locals(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            out.push(name) if ident_name_of(type_expression) == "Arena"
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_arena_value_locals(then_body, out)
+                            collect_arena_value_locals(else_body, out)
+                        Stmt.While(condition, while_body, line):
+                            collect_arena_value_locals(while_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            collect_arena_value_locals(for_body, out)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            collect_arena_value_locals(body, out)
+                        _:
+                            pass
+
+        def check_arena_grow_escape_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            arena_locals: mutable darray[sview] = []
+                            collect_arena_value_locals(body, arena_locals)
+                            params: mutable darray[sview] = [parameter.name for parameter in parameters]
+                            table <- arena_grow_walk(body, arena_locals, params, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_arena_grow_escape_walk(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_arena_grow_escape_walk(scoped_body, table)
+                        _:
+                            pass
+
+        def check_arena_grow_escape(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_arena_grow_escape_walk(file.top_decls, table)
