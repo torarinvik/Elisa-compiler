@@ -1,0 +1,154 @@
+# Push-loop → extend lint (stage0 analyzer_push_loop_extend_lint, docs/70). A plain forward
+# loop `for x in src: dst.push(f(x))` (optionally a single `if cond:` filter) grows a darray
+# `dst` one element at a time; the declarative `dst.extend([f(x) for x in src])` fuses into a
+# presize-and-fill. A default-mode WARNING. SOUND syntactic subset matching stage0's
+# flagPushLoopExtendable conditions: plain `for name in srcIdent:` (a `where`/`if`/`move`/
+# `reverse` iterator wraps the source in a Refinement/Move, so requiring a bare Ident source
+# excludes them), body is exactly one `dst.push(value)` (or `if cond: dst.push(value)`), `dst`
+# is a darray-typed local/param, `dst != src`, and `value` mentions the loop variable.
+extend Semantic:
+    private:
+        def push_darray_name_present(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                return any name in names where name == wanted
+
+        # Whether a type expression is (a ref/mutable to) `darray[...]`. `bare_type_name`
+        # returns "" for a generic `darray[T]` (an Index node), so match the head directly and
+        # look through mutable/lmut/& wrappers.
+        def is_darray_type(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Index(head, argument, line):
+                        return ident_name_of(head) == "darray"
+                    Expr.IndexN(head, arguments, line):
+                        return ident_name_of(head) == "darray"
+                    Expr.Unary(operator, operand, line):
+                        return is_darray_type(operand)
+                    Expr.Paren(inner, line):
+                        return is_darray_type(inner)
+                    _:
+                        return false
+
+        # Whether NAME appears as an identifier anywhere in EXPRESSION.
+        def expr_mentions_name(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(ident_name, line):
+                        return ident_name == name
+                    Expr.Field(object, field, line):
+                        return expr_mentions_name(object, name)
+                    Expr.Index(object, index, line):
+                        return expr_mentions_name(object, name) or expr_mentions_name(index, name)
+                    Expr.IndexN(object, arguments, line):
+                        true return if expr_mentions_name(object, name)
+                        return any argument in arguments where expr_mentions_name(argument, name)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        true return if expr_mentions_name(callee, name)
+                        return any argument in arguments where expr_mentions_name(argument, name)
+                    Expr.Binary(left, operator, right, line):
+                        return expr_mentions_name(left, name) or expr_mentions_name(right, name)
+                    Expr.Unary(operator, operand, line):
+                        return expr_mentions_name(operand, name)
+                    Expr.Paren(inner, line):
+                        return expr_mentions_name(inner, name)
+                    _:
+                        return false
+
+        # A single `dst.push(value)` statement's destination name + pushed value, or ("", Absent).
+        def push_call_shape(statement: Ast::Stmt) -> (dst: sview, value: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, line):
+                        match expression:
+                            Expr.Call(callee, arguments, argument_names, call_line):
+                                match callee:
+                                    Expr.Field(object, field, field_line):
+                                        if field == "push" and arguments.count == 1:
+                                            match object:
+                                                Expr.Ident(dst_name, ident_line):
+                                                    return (dst_name, arguments[0])
+                                                _:
+                                                    return (sview("", 0, 0), (Ast::Expr.Absent))
+                                        return (sview("", 0, 0), (Ast::Expr.Absent))
+                                    _:
+                                        return (sview("", 0, 0), (Ast::Expr.Absent))
+                            _:
+                                return (sview("", 0, 0), (Ast::Expr.Absent))
+                    _:
+                        return (sview("", 0, 0), (Ast::Expr.Absent))
+
+        # The loop body's push shape: exactly one `dst.push(value)`, or a single unguarded-else
+        # `if cond: dst.push(value)`. Returns dst + value ("" dst when it doesn't match).
+        def push_loop_body_shape(body: darray[Ast::Stmt]) -> (dst: sview, value: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                (sview("", 0, 0), (Ast::Expr.Absent)) return if body.count != 1
+                match body[0]:
+                    Stmt.If(condition, then_body, else_body, line):
+                        (sview("", 0, 0), (Ast::Expr.Absent)) return if else_body.count != 0 or then_body.count != 1
+                        return push_call_shape(then_body[0])
+                    _:
+                        return push_call_shape(body[0])
+
+        def push_loop_walk(statements: darray[Ast::Stmt], darray_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.For(bind, variables, iterable, body, line):
+                            plain: bool = bind == "" and variables.count == 1
+                            loop_var: sview = variables[0] if variables.count == 1 else sview("", 0, 0)
+                            source_name: sview = ident_name_of(iterable)
+                            shape: (dst: sview, value: Ast::Expr) = push_loop_body_shape(body)
+                            flagged: bool = plain and loop_var != "" and loop_var != "_" and source_name != "" and shape.dst != "" and shape.dst != source_name and push_darray_name_present(darray_names, shape.dst) and expr_mentions_name(shape.value, loop_var)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PushLoopExtendable, name: shape.dst, line: line, expected: "", actual: ""}) if flagged
+                            table <- push_loop_walk(body, darray_names, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- push_loop_walk(then_body, darray_names, table)
+                            table <- push_loop_walk(else_body, darray_names, table)
+                        Stmt.While(condition, body, line):
+                            table <- push_loop_walk(body, darray_names, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- push_loop_walk(body, darray_names, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- push_loop_walk(arm.body, darray_names, table)
+                        _:
+                            pass
+
+        # Collect names declared as `darray[...]` (params + local VarDecls, recursively).
+        def collect_darray_names(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            out.push(name) if is_darray_type(type_expression)
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_darray_names(then_body, out)
+                            collect_darray_names(else_body, out)
+                        Stmt.While(condition, body, line):
+                            collect_darray_names(body, out)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            collect_darray_names(body, out)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            collect_darray_names(body, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out|:
+                                collect_darray_names(arm.body, out)
+                        _:
+                            pass
+
+        def check_push_loop_lint(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            darray_names: mutable darray[sview] = []
+                            for parameter in parameters |darray_names|:
+                                darray_names.push(parameter.name) if is_darray_type(parameter.type_expression)
+                            collect_darray_names(body, darray_names)
+                            table <- push_loop_walk(body, darray_names, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_push_loop_lint(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_push_loop_lint(scoped_body, table)
+                        _:
+                            pass
