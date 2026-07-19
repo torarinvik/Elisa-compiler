@@ -1,0 +1,128 @@
+# `where`-refinement reassignment violation. A local `x: T where PRED = init` carries the
+# invariant PRED over x; a later `x <- V` that provably breaks PRED (V a constant that
+# makes PRED false) is rejected by stage0 ("where refinement on reassignment is violated").
+# Decidable subset: PRED is a constant comparison (or and/or of them) on x, and V is an
+# integer literal — then the violation is evaluated directly. Non-constant reassignments and
+# richer predicates are left unreported (a sound miss).
+extend Semantic:
+    private:
+        # A SIGNED integer literal value with a found flag (`5`, `-1` = Unary(Minus, IntLit)).
+        def where_signed_literal(expression: Ast::Expr) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.IntLit(value):
+                        return (true, value)
+                    Expr.Paren(inner, line):
+                        return where_signed_literal(inner)
+                    Expr.Unary(operator, operand, line):
+                        inner_literal: (found: bool, value: i64) = where_signed_literal(operand)
+                        return (inner_literal.found and operator == TokenKind.Minus, 0 - inner_literal.value)
+                    _:
+                        return (false, 0)
+
+        # Evaluate `a <op> b` for the comparison operators.
+        def evaluate_comparison(a: i64, operator: TokenKind, b: i64) -> bool:
+            can Abort.Panic:
+                return when operator:
+                    TokenKind.EqEq -> a == b
+                    TokenKind.BangEq -> a != b
+                    TokenKind.Lt -> a < b
+                    TokenKind.Gt -> a > b
+                    TokenKind.LtEq -> a <= b
+                    TokenKind.GtEq -> a >= b
+                    _ -> true
+
+        # Whether substituting `variable = value` into PREDICATE makes it provably FALSE.
+        # Handles `x <op> k` / `k <op> x` constant comparisons and their and/or combinations.
+        def predicate_violated_by(predicate: Ast::Expr, variable: sview, value: i64) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return predicate_violated_by(inner, variable, value)
+                    Expr.Binary(left, operator, right, line):
+                        left_is_var: bool = match left:
+                            Expr.Ident(name, ident_line): name == variable
+                            _: false
+                        right_is_var: bool = match right:
+                            Expr.Ident(name, ident_line): name == variable
+                            _: false
+                        # `x <op> k`
+                        right_literal: (found: bool, value: i64) = where_signed_literal(right)
+                        (not evaluate_comparison(value, operator, right_literal.value)) return if left_is_var and right_literal.found and is_where_comparison(operator)
+                        # `k <op> x`
+                        left_literal: (found: bool, value: i64) = where_signed_literal(left)
+                        (not evaluate_comparison(left_literal.value, operator, value)) return if right_is_var and left_literal.found and is_where_comparison(operator)
+                        # `A and B` is violated if EITHER conjunct is; `A or B` only if BOTH are.
+                        (predicate_violated_by(left, variable, value) or predicate_violated_by(right, variable, value)) return if operator == TokenKind.And
+                        (predicate_violated_by(left, variable, value) and predicate_violated_by(right, variable, value)) return if operator == TokenKind.Or
+                        return false
+                    _:
+                        return false
+
+        def is_where_comparison(operator: TokenKind) -> bool:
+            can Abort.Panic:
+                return operator == TokenKind.EqEq or operator == TokenKind.BangEq or operator == TokenKind.Lt or operator == TokenKind.Gt or operator == TokenKind.LtEq or operator == TokenKind.GtEq
+
+        # The `where` predicate of a refined local declaration type, or Absent.
+        def where_predicate_of_type(type_expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Refinement(base, predicate, line):
+                        return predicate
+                    Expr.Unary(operator, operand, unary_line):
+                        return where_predicate_of_type(operand)
+                    _:
+                        return (Ast::Expr.Absent)
+
+        def where_reassign_statements(statements: darray[Ast::Stmt], refined_names: mutable darray[sview]&, refined_predicates: mutable darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, refined_names, refined_predicates| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            predicate: Ast::Expr = where_predicate_of_type(type_expression)
+                            has_predicate: bool = match predicate:
+                                Expr.Absent: false
+                                _: true
+                            refined_names.push(name) if has_predicate
+                            refined_predicates.push(predicate) if has_predicate
+                        Stmt.Assign(target, operator, value, line):
+                            table <- check_where_reassign(target, operator, value, line, refined_names, refined_predicates, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- where_reassign_statements(then_body, refined_names, refined_predicates, table)
+                            table <- where_reassign_statements(else_body, refined_names, refined_predicates, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- where_reassign_statements(while_body, refined_names, refined_predicates, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- where_reassign_statements(for_body, refined_names, refined_predicates, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- where_reassign_statements(block_body, refined_names, refined_predicates, table)
+                        _:
+                            pass
+
+        # Emit when `target <- value` reassigns a where-refined local to a constant that
+        # provably violates its predicate.
+        def check_where_reassign(target: Ast::Expr, operator: TokenKind, value: Ast::Expr, line: u32, refined_names: darray[sview]&, refined_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                target_name: sview = ident_name_of(target)
+                return if target_name == "" or operator != TokenKind.LArrow
+                value_literal: (found: bool, value: i64) = where_signed_literal(value)
+                return if not value_literal.found
+                while probe < refined_names.count |probe: usize = 0, table| -> table:
+                    matched: bool = refined_names[probe] == target_name and predicate_violated_by(refined_predicates[probe], target_name, value_literal.value)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.WhereRefinementReassignViolated, name: target_name, line: line, expected: "", actual: ""}) if matched
+                    probe <- probe + 1
+
+        def check_where_reassign_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            refined_names: mutable darray[sview] = []
+                            refined_predicates: mutable darray[Ast::Expr] = []
+                            table <- where_reassign_statements(body, refined_names, refined_predicates, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_where_reassign_walk(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_where_reassign_walk(scoped_body, table)
+                        _:
+                            pass
