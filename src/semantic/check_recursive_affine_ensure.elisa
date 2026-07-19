@@ -1,0 +1,141 @@
+# Structural slice of stage0's inductive prover for the affine tail-recursion pattern:
+#   def f(n: i64) -> i64:
+#       requires n >= 0
+#       ensure result == n [+ K]
+#       ...
+#       if n == 0: return B
+#       return f(n - 1) + C
+# The closed form is f(n) = B + C*n, so the postcondition `result == n + K` holds iff
+# C == 1 and B == K. When it does NOT, stage0 cannot discharge the callee `requires` at the
+# recursive call (the false inductive hypothesis) and declines the proof; stage1 mirrors that
+# with RecursiveProofDeclined. SOUND: fires only when B, C, and K are all constant-folded and
+# the equation is provably false — a genuinely-provable (C==1, B==K) function stays clean.
+extend Semantic:
+    private:
+        # From an ensure predicate `result == n + K` (or `result == n`), the constant K.
+        def affine_ensure_constant(predicate: Ast::Expr) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Binary(left, operator, right, line):
+                        (false, 0) return if operator != TokenKind.EqEq
+                        (false, 0) return if ident_name_of(left) != "result"
+                        return affine_rhs_constant(right)
+                    _:
+                        return (false, 0)
+
+        # The constant K of an affine RHS `n + K`, or `n` (K = 0). Requires the variable term
+        # to be a bare identifier with coefficient 1.
+        def affine_rhs_constant(rhs: Ast::Expr) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match rhs:
+                    Expr.Ident(name, line):
+                        return (true, 0)
+                    Expr.Paren(inner, line):
+                        return affine_rhs_constant(inner)
+                    Expr.Binary(left, operator, right, line):
+                        (false, 0) return if operator != TokenKind.Plus and operator != TokenKind.Minus
+                        (false, 0) return if ident_name_of(left) == ""
+                        constant: (found: bool, value: i64) = where_signed_literal(right)
+                        (false, 0) return if not constant.found
+                        return (true, constant.value) if operator == TokenKind.Plus else (true, 0 - constant.value)
+                    _:
+                        return (false, 0)
+
+        # The name of the function called by EXPR (`f(...)`), or "".
+        def affine_call_name(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                return match expression:
+                    Expr.Call(callee, arguments, argument_names, line): ident_name_of(callee)
+                    _: ""
+
+        # The base-case constant B: a `return <literal>` anywhere in the body.
+        def affine_base_constant(statements: darray[Ast::Stmt]) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                result: mutable (found: bool, value: i64) = (false, 0)
+                for statement in statements |result|:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                literal: (found: bool, value: i64) = where_signed_literal(returned)
+                                result <- literal if literal.found and not result.found
+                        Stmt.If(condition, then_body, else_body, line):
+                            nested_then: (found: bool, value: i64) = affine_base_constant(then_body)
+                            result <- nested_then if nested_then.found and not result.found
+                            nested_else: (found: bool, value: i64) = affine_base_constant(else_body)
+                            result <- nested_else if nested_else.found and not result.found
+                        _:
+                            pass
+                return result
+
+        # The tail increment C: a `return f(...) + <literal>` self-recursive tail.
+        def affine_tail_increment(statements: darray[Ast::Stmt], function_name: sview) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                result: mutable (found: bool, value: i64) = (false, 0)
+                for statement in statements |result|:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                increment: (found: bool, value: i64) = affine_tail_of_expr(returned, function_name)
+                                result <- increment if increment.found and not result.found
+                        Stmt.If(condition, then_body, else_body, line):
+                            nested_then: (found: bool, value: i64) = affine_tail_increment(then_body, function_name)
+                            result <- nested_then if nested_then.found and not result.found
+                            nested_else: (found: bool, value: i64) = affine_tail_increment(else_body, function_name)
+                            result <- nested_else if nested_else.found and not result.found
+                        _:
+                            pass
+                return result
+
+        def affine_tail_of_expr(expression: Ast::Expr, function_name: sview) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Binary(left, operator, right, line):
+                        (false, 0) return if operator != TokenKind.Plus and operator != TokenKind.Minus
+                        (false, 0) return if affine_call_name(left) != function_name
+                        constant: (found: bool, value: i64) = where_signed_literal(right)
+                        (false, 0) return if not constant.found
+                        return (true, constant.value) if operator == TokenKind.Plus else (true, 0 - constant.value)
+                    _:
+                        return (false, 0)
+
+        # The affine constant K of the first body `ensure result == n + K` contract, if any.
+        def affine_body_ensure_constant(statements: darray[Ast::Stmt]) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                result: mutable (found: bool, value: i64) = (false, 0)
+                for statement in statements |result|:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            candidate: (found: bool, value: i64) = affine_ensure_constant(expression) if kind == "ensure" or kind == "ensures" else (false, 0)
+                            result <- candidate if candidate.found and not result.found
+                        _:
+                            pass
+                return result
+
+    public:
+        def check_recursive_affine_ensure(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_recursive_affine_ensure_walk(file.top_decls, file.signature_contract_exprs, file.signature_contract_kinds, file.signature_contract_lines, table)
+
+    private:
+        def check_recursive_affine_ensure_walk(declarations: darray[Ast::Decl], sig_exprs: darray[Ast::Expr], sig_kinds: darray[sview], sig_lines: darray[u32], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            # `ensure` may be a body contract (indented) or a signature clause.
+                            ensure_k: mutable (found: bool, value: i64) = affine_body_ensure_constant(body)
+                            sig_index: mutable usize = 0
+                            while sig_index < sig_exprs.count |ensure_k, sig_index|:
+                                candidate: (found: bool, value: i64) = affine_ensure_constant(sig_exprs[sig_index]) if sig_lines[sig_index] == line and sig_kinds[sig_index] == "ensure" else (false, 0)
+                                ensure_k <- candidate if candidate.found and not ensure_k.found
+                                sig_index <- sig_index + 1
+                            base: (found: bool, value: i64) = affine_base_constant(body)
+                            increment: (found: bool, value: i64) = affine_tail_increment(body, function_name)
+                            provably_false: bool = ensure_k.found and base.found and increment.found and not (increment.value == 1 and base.value == ensure_k.value)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RecursiveProofDeclined, name: function_name, line: 0, expected: "", actual: ""}) if provably_false
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_recursive_affine_ensure_walk(module_body, sig_exprs, sig_kinds, sig_lines, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_recursive_affine_ensure_walk(scoped_body, sig_exprs, sig_kinds, sig_lines, table)
+                        _:
+                            pass
