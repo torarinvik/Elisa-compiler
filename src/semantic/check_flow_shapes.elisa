@@ -1,9 +1,12 @@
-# Flow-shape lints (stage0 analyzer_flow_function, docs/121/125 -Wflow). Runs under `# flow`
-# (FlowLintMode 1) and `# flow-strict` (mode 2). First lint ported: the shadow-elif table — an
-# `if/elif` chain of >= 3 arms whose every condition tests the SAME scrutinee for equality
-# against literals is a decision table wearing a ladder; `when scrut:` states the disjointness
-# the ladder only implies. SOUND syntactic subset: scrutinee is a bare identifier, literals are
-# int/char/string (enum-tag rows need type info and are a sound miss).
+# Flow-shape lints (stage0 analyzer_flow_function / analyzer_flow_complexity, docs/121/125
+# -Wflow). Runs under `# flow` (FlowLintMode 1) and `# flow-strict` (mode 2). A `can ComplexFlow:`
+# block is the escape hatch — its body is exempt (in_complex_flow). Lints ported:
+#  - Shadow-elif table: an if/elif chain of >= 3 arms all testing the same bare-ident scrutinee
+#    for equality against int/char/string literals — a decision table; use `when`.
+#  - Nesting budget (R1): a loop body whose conditional nesting exceeds 3 levels — a decision
+#    tree hiding a state machine. `if`-chains/`match`/block-wrappers collapse; nested loops reset;
+#    an `if true:` scoped-loop wrapper is transparent.
+# SOUND syntactic subsets: enum-tag literals + field-path scrutinees are sound misses.
 extend Semantic:
     private:
         def flow_line_seen(seen: darray[u32]&, line: u32) -> bool:
@@ -21,6 +24,20 @@ extend Semantic:
                         return true
                     _:
                         return false
+
+        def flow_is_const_true(condition: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match condition:
+                    Expr.Ident(name, line):
+                        return name == "true"
+                    Expr.Paren(inner, paren_line):
+                        return flow_is_const_true(inner)
+                    _:
+                        return false
+
+        def flow_clause_grants_complex_flow(clause: darray[sview]&) -> bool:
+            can Abort.Panic:
+                return any grant in clause where grant == "ComplexFlow"
 
         # The bare-identifier scrutinee a condition tests for equality against a literal, for
         # `X == LIT` / `LIT == X` and or-chains `X == L1 or X == L2` over one X; "" otherwise.
@@ -41,8 +58,6 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
-        # Walk the elif chain from a head If, returning the arm count, the shared scrutinee, and
-        # the member lines (for de-heading). Stops at the first arm not testing the same scrutinee.
         def flow_elif_chain(condition: Ast::Expr, else_body: darray[Ast::Stmt], head_line: u32, member_lines: mutable darray[u32]&) -> (length: usize, scrutinee: sview):
             can Memory.Allocate, Abort.Panic:
                 scrutinee: sview = flow_equality_scrutinee(condition)
@@ -68,28 +83,96 @@ extend Semantic:
                                 pass
                 return (length, scrutinee)
 
-        def flow_shapes_walk(statements: darray[Ast::Stmt], seen: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+        # Maximum conditional-nesting depth of a statement list. An if-chain/`match` collapses to
+        # one level plus its deepest body; block wrappers and `if true:` are transparent; nested
+        # loops reset to 0.
+        def flow_block_depth(statements: darray[Ast::Stmt]) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                deepest: mutable usize = 0
+                for statement in statements |deepest|:
+                    d: usize = flow_stmt_depth(statement)
+                    deepest <- d if d > deepest
+                return deepest
+
+        def flow_stmt_depth(statement: Ast::Stmt) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.If(condition, then_body, else_body, line):
+                        if flow_is_const_true(condition):
+                            then_depth: usize = flow_block_depth(then_body)
+                            else_depth: usize = flow_block_depth(else_body)
+                            return then_depth if then_depth > else_depth else else_depth
+                        inner: mutable usize = flow_block_depth(then_body)
+                        current_else: mutable darray[Ast::Stmt] = []
+                        current_else.extend(else_body)
+                        while continuing |continuing: bool = true, inner, current_else|:
+                            continuing <- false
+                            if current_else.count == 1:
+                                match current_else[0]:
+                                    Stmt.If(chain_condition, chain_then, chain_else, chain_line):
+                                        chain_then_depth: usize = flow_block_depth(chain_then)
+                                        inner <- chain_then_depth if chain_then_depth > inner
+                                        chain_else_copy: mutable darray[Ast::Stmt] = []
+                                        chain_else_copy.extend(chain_else)
+                                        current_else <- chain_else_copy
+                                        continuing <- true
+                                    _:
+                                        pass
+                        tail_depth: usize = flow_block_depth(current_else)
+                        inner <- tail_depth if tail_depth > inner
+                        return 1 + inner
+                    Stmt.Match(scrutinee, arms, line):
+                        deepest_arm: mutable usize = 0
+                        for arm in arms |deepest_arm|:
+                            d: usize = flow_block_depth(arm.body)
+                            deepest_arm <- d if d > deepest_arm
+                        return deepest_arm
+                    Stmt.Block(kind, clause, binding, body, line):
+                        return flow_block_depth(body)
+                    Stmt.Expr(expression, line):
+                        # A scoped-loop header desugars to `Stmt.Expr(Expr.Block([decls, loop]))`;
+                        # the value-block wrapper is transparent to nesting.
+                        match expression:
+                            Expr.Block(block_statements, value, captures, block_line):
+                                return flow_block_depth(block_statements)
+                            _:
+                                return 0
+                    _:
+                        return 0
+
+        def flow_shapes_walk(statements: darray[Ast::Stmt], in_complex_flow: bool, seen: mutable darray[u32]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |seen, table| -> table:
                     match statement:
                         Stmt.If(condition, then_body, else_body, line):
-                            if not flow_line_seen(seen, line):
+                            if not in_complex_flow and not flow_line_seen(seen, line):
                                 member_lines: mutable darray[u32] = []
                                 chain: (length: usize, scrutinee: sview) = flow_elif_chain(condition, else_body, line, member_lines)
                                 for member_line in member_lines |seen|:
                                     seen.push(member_line)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowElifLadder, name: chain.scrutinee, line: line, expected: "", actual: "", expected_count: chain.length.u32()}) if chain.length >= 3
-                            table <- flow_shapes_walk(then_body, seen, table)
-                            table <- flow_shapes_walk(else_body, seen, table)
+                            table <- flow_shapes_walk(then_body, in_complex_flow, seen, table)
+                            table <- flow_shapes_walk(else_body, in_complex_flow, seen, table)
                         Stmt.While(condition, body, line):
-                            table <- flow_shapes_walk(body, seen, table)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowNestingDepth, name: "", line: line, expected: "", actual: ""}) if not in_complex_flow and flow_block_depth(body) > 3
+                            table <- flow_shapes_walk(body, in_complex_flow, seen, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- flow_shapes_walk(body, seen, table)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowNestingDepth, name: "", line: line, expected: "", actual: ""}) if not in_complex_flow and flow_block_depth(body) > 3
+                            table <- flow_shapes_walk(body, in_complex_flow, seen, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- flow_shapes_walk(body, seen, table)
+                            block_complex_flow: bool = in_complex_flow or (kind == "can" and flow_clause_grants_complex_flow(clause))
+                            table <- flow_shapes_walk(body, block_complex_flow, seen, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |seen, table| -> table:
-                                table <- flow_shapes_walk(arm.body, seen, table)
+                                table <- flow_shapes_walk(arm.body, in_complex_flow, seen, table)
+                        Stmt.Expr(expression, line):
+                            # Descend into a scoped-loop header wrapper `Stmt.Expr(Expr.Block([...]))`
+                            # so the loop/ladders inside a value block are still checked.
+                            match expression:
+                                Expr.Block(block_statements, value, captures, block_line):
+                                    table <- flow_shapes_walk(block_statements, in_complex_flow, seen, table)
+                                _:
+                                    pass
                         _:
                             pass
 
@@ -99,7 +182,7 @@ extend Semantic:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             seen: mutable darray[u32] = []
-                            table <- flow_shapes_walk(body, seen, table)
+                            table <- flow_shapes_walk(body, false, seen, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- check_flow_shapes(module_body, table)
                         Decl.Scoped(scoped_body, scoped_line):
