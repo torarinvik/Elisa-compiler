@@ -1,0 +1,218 @@
+# Refinement argument that is a plain UNCONSTRAINED variable — stage0 cannot prove the
+# refinement and emits "refinement R on argument N of F could not be proven statically".
+# This is the disjoint companion to check_refinement_arg_violated (which fires only on a
+# CONSTANT argument that provably violates the predicate); this pass fires only on a
+# NON-constant bare parameter reference with NO possible refinement fact.
+#
+# MAXIMALLY CONSERVATIVE (only ever CLOSES rows, never over-warns on a provable case): fire
+# only when the argument is a bare identifier naming a parameter of the current function
+# whose declared type carries NO refinement, and whose name appears in NO fact context —
+# not an `is`-guard, not a `requires`/`ensures` predicate (body or signature), not an
+# assignment target, and not a refinement-typed binding. Any of those means a fact MIGHT
+# exist (guard-established, contract-assumed, or reassigned), so stage0 could prove it and we
+# stay silent. Frame-fact-dropped cases (a guard whose fact a later `changes` invalidates)
+# are conservatively MISSED here — they remain mismatched, never wrongly matched.
+extend Semantic:
+    private:
+        def collect_idents_in_expr(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Binary(left, operator, right, line):
+                        collect_idents_in_expr(left, out)
+                        collect_idents_in_expr(right, out)
+                    Expr.Unary(operator, operand, line):
+                        collect_idents_in_expr(operand, out)
+                    Expr.Paren(inner, line):
+                        collect_idents_in_expr(inner, out)
+                    Expr.Field(object, field, line):
+                        collect_idents_in_expr(object, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments |out|:
+                            collect_idents_in_expr(argument, out)
+                    Expr.Index(object, index, line):
+                        collect_idents_in_expr(object, out)
+                        collect_idents_in_expr(index, out)
+                    Expr.IndexN(object, arguments, line):
+                        collect_idents_in_expr(object, out)
+                        for argument in arguments |out|:
+                            collect_idents_in_expr(argument, out)
+                    _:
+                        pass
+
+        # Names that MIGHT carry a refinement fact in this function body: `is`-guard subjects,
+        # every identifier in a body contract, and assignment targets (a reassigned value is
+        # unknown, so never warn on it).
+        def collect_body_fact_names(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            collect_idents_in_expr(expression, out)
+                        Stmt.Assign(target, operator, value, line):
+                            out.push(ident_name_of(target))
+                        Stmt.Expr(expression, line):
+                            collect_fact_names_in_expr(expression, out)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                collect_fact_names_in_expr(returned, out)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            collect_fact_names_in_expr(value, out)
+                        Stmt.If(condition, then_body, else_body, line):
+                            # ANY identifier in a guard condition (`if x >= 3 and x <= 7`,
+                            # `if x is R`) may establish a fact for that name — never warn on it.
+                            collect_idents_in_expr(condition, out)
+                            collect_body_fact_names(then_body, out)
+                            collect_body_fact_names(else_body, out)
+                        Stmt.While(condition, while_body, line):
+                            collect_idents_in_expr(condition, out)
+                            collect_body_fact_names(while_body, out)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            collect_body_fact_names(block_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            collect_body_fact_names(for_body, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            out.push(ident_name_of(scrutinee))
+                            for arm in arms |out|:
+                                collect_body_fact_names(arm.body, out)
+                        _:
+                            pass
+
+        # `X is R` guard subjects anywhere in an expression carry a fact for X.
+        def collect_fact_names_in_expr(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Binary(left, operator, right, line):
+                        out.push(ident_name_of(left)) if operator == TokenKind.Is
+                        collect_fact_names_in_expr(left, out)
+                        collect_fact_names_in_expr(right, out)
+                    Expr.Unary(operator, operand, line):
+                        # `&NAME` passed to a call — a mutable-ref out-param can re-establish a
+                        # range/refinement fact for NAME (docs: refinement-range-via-mut-ref).
+                        out.push(ident_name_of(operand)) if operator == TokenKind.Ampersand
+                        collect_fact_names_in_expr(operand, out)
+                    Expr.Paren(inner, line):
+                        collect_fact_names_in_expr(inner, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments |out|:
+                            collect_fact_names_in_expr(argument, out)
+                    _:
+                        pass
+
+        def name_in(names: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                return any candidate in names where candidate == name and name != ""
+
+        # Whether a parameter is safe to WARN about when passed unconstrained: it must carry
+        # no refinement AND not be an unsigned integer (unsigned entails lower bounds like
+        # `>= 0`, which stage0 proves from the type) AND not mention any law name (a
+        # parametric refinement like `is InRange[1, 100]` still entails other refinements).
+        def param_is_warnable(type_expression: Ast::Expr, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, alias_names: darray[sview]&, alias_predicates: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                predicate: Ast::Expr = param_refinement_predicate(type_expression, law_names, law_predicates, alias_names, alias_predicates)
+                has_predicate: bool = match predicate:
+                    Expr.Absent: false
+                    _: true
+                false return if has_predicate
+                # Any known law/alias name mentioned ANYWHERE in the type (including a
+                # parametric refinement `is InRange[1, 100]`, which param_refinement_predicate
+                # cannot fold) means the parameter is refinement-typed and may subsume the target.
+                type_idents: mutable darray[sview] = []
+                collect_idents_in_expr(type_expression, type_idents)
+                false return if any ident in type_idents where name_in(law_names, ident) or name_in(alias_names, ident)
+                bare: sview = bare_type_name(type_expression)
+                false return if bare in {"u8", "u16", "u32", "u64", "usize", "uintptr", "uint"}
+                return true
+
+        # Warn at `f(arg)` for a refinement param position whose argument is an unconstrained
+        # refinement-free parameter of the current function.
+        def unproven_arg_check_expression(expression: Ast::Expr, line: u32, param_functions: darray[sview]&, param_indices: darray[usize]&, refinement_free_params: darray[sview]&, fact_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        probe: mutable usize = 0
+                        while probe < param_functions.count |table, probe| -> table:
+                            fires: bool = callee_name != "" and param_functions[probe] == callee_name and param_indices[probe] < arguments.count and unproven_arg_at(arguments[param_indices[probe]], refinement_free_params, fact_names)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementArgNotProven, name: callee_name, line: line, expected: "", actual: "", expected_count: (param_indices[probe] + 1).u32()}) if fires
+                            probe <- probe + 1
+                        for argument in arguments |table| -> table:
+                            table <- unproven_arg_check_expression(argument, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- unproven_arg_check_expression(left, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        table <- unproven_arg_check_expression(right, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- unproven_arg_check_expression(inner, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                    _:
+                        pass
+
+        def unproven_arg_at(argument: Ast::Expr, refinement_free_params: darray[sview]&, fact_names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                arg_name: sview = ident_name_of(argument)
+                return arg_name != "" and name_in(refinement_free_params, arg_name) and not name_in(fact_names, arg_name)
+
+        def unproven_arg_check_statements(statements: darray[Ast::Stmt], line_context: u32, param_functions: darray[sview]&, param_indices: darray[usize]&, refinement_free_params: darray[sview]&, fact_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- unproven_arg_check_expression(returned, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        Stmt.Expr(expression, line):
+                            table <- unproven_arg_check_expression(expression, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- unproven_arg_check_expression(value, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- unproven_arg_check_expression(value, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- unproven_arg_check_statements(then_body, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                            table <- unproven_arg_check_statements(else_body, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- unproven_arg_check_statements(while_body, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- unproven_arg_check_statements(block_body, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- unproven_arg_check_statements(for_body, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        _:
+                            pass
+
+    public:
+        def check_refinement_arg_unproven(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(file.top_decls, law_names, law_predicates)
+                alias_names: mutable darray[sview] = []
+                alias_predicates: mutable darray[Ast::Expr] = []
+                collect_refine_aliases(file.top_decls, alias_names, alias_predicates)
+                param_functions: mutable darray[sview] = []
+                param_indices: mutable darray[usize] = []
+                param_predicates: mutable darray[Ast::Expr] = []
+                collect_law_params(file.top_decls, law_names, law_predicates, alias_names, alias_predicates, param_functions, param_indices, param_predicates)
+                table <- unproven_arg_walk(file.top_decls, file.signature_contract_exprs, file.signature_contract_lines, law_names, law_predicates, alias_names, alias_predicates, param_functions, param_indices, table)
+
+    private:
+        def unproven_arg_walk(declarations: darray[Ast::Decl], signature_contract_exprs: darray[Ast::Expr], signature_contract_lines: darray[u32], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, alias_names: darray[sview]&, alias_predicates: darray[Ast::Expr]&, param_functions: darray[sview]&, param_indices: darray[usize]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            refinement_free_params: mutable darray[sview] = []
+                            for parameter in parameters |refinement_free_params|:
+                                refinement_free_params.push(parameter.name) if param_is_warnable(parameter.type_expression, law_names, law_predicates, alias_names, alias_predicates)
+                            fact_names: mutable darray[sview] = []
+                            collect_body_fact_names(body, fact_names)
+                            # Every identifier named by a signature contract of THIS function
+                            # carries a potential assumed fact — never warn on it.
+                            sig_index: mutable usize = 0
+                            while sig_index < signature_contract_exprs.count |fact_names, sig_index|:
+                                collect_idents_in_expr(signature_contract_exprs[sig_index], fact_names) if signature_contract_lines[sig_index] == line
+                                sig_index <- sig_index + 1
+                            table <- unproven_arg_check_statements(body, line, param_functions, param_indices, refinement_free_params, fact_names, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- unproven_arg_walk(module_body, signature_contract_exprs, signature_contract_lines, law_names, law_predicates, alias_names, alias_predicates, param_functions, param_indices, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- unproven_arg_walk(scoped_body, signature_contract_exprs, signature_contract_lines, law_names, law_predicates, alias_names, alias_predicates, param_functions, param_indices, table)
+                        _:
+                            pass
