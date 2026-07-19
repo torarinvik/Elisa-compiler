@@ -132,6 +132,27 @@ module Backend:
             return value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned
 
 
+        # The i1 test for a `Pattern.Range` arm (`lo..<hi` / `lo..=hi`) over an INTEGER
+        # scrutinee: `scrutinee >= lo AND scrutinee </<= hi`. Signed/unsigned drives the
+        # predicate (a u8 range must compare with U* predicates). Returns null when either
+        # bound is not an integer literal (e.g. a char-literal range) so the caller declines.
+        # LLVM IntPredicate: UGE=35 ULT=36 ULE=37 SGE=39 SLT=40 SLE=41.
+        def emit_range_test(scrutinee: LLVMValueRef, scrutinee_type: ValueType, lo_text: sview, hi_text: sview, inclusive: bool, compare_type: LLVMTypeRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            lo_value: mutable i64 = 0
+            hi_value: mutable i64 = 0
+            null return if not parse_int_literal(lo_text, lo_value)
+            null return if not parse_int_literal(hi_text, hi_value)
+            unsigned: bool = scrutinee_type.kind == TypeKind.Unsigned
+            lo_pred: u32 = 35 if unsigned else 39
+            hi_pred: mutable u32 = 40
+            hi_pred <- 41 if inclusive
+            if unsigned:
+                hi_pred <- 37 if inclusive else 36
+            lo_hit: LLVMValueRef = LLVMBuildICmp(builder, lo_pred, scrutinee, LLVMConstInt(compare_type, lo_value.u64(), 1), "range.lo")
+            hi_hit: LLVMValueRef = LLVMBuildICmp(builder, hi_pred, scrutinee, LLVMConstInt(compare_type, hi_value.u64(), 1), "range.hi")
+            return LLVMBuildAnd(builder, lo_hit, hi_hit, "range.in")
+
+
         def is_numeric_type(value_type: ValueType) -> bool:
             return is_integer_type(value_type) or value_type.kind == TypeKind.Float
 
@@ -3330,6 +3351,28 @@ module Backend:
                                     LLVMPositionBuilderAtEnd(builder, next_block)
                                 else:
                                     declined <- true
+                            elif arm.pattern is Pattern.Range(range_lo, range_hi, range_inclusive):
+                                # `0..<5:` / `0..=127:` — a two-sided integer bound test.
+                                next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.next")
+                                if emit_range_test(scrutinee, scrutinee_type, range_lo, range_hi, range_inclusive, llvm_type_of(scrutinee_type, structs, ctx), ctx, builder) is range_hit:
+                                    _ = LLVMBuildCondBr(builder, range_hit, arm_block, next_block)
+                                    LLVMPositionBuilderAtEnd(builder, arm_block)
+                                    if arm_has_guard(arm.guard):
+                                        if emit_condition(arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is guard_bit:
+                                            guarded_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.guard")
+                                            _ = LLVMBuildCondBr(builder, guard_bit, guarded_body, next_block)
+                                            LLVMPositionBuilderAtEnd(builder, guarded_body)
+                                        else:
+                                            declined <- true
+                                            continue
+                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is range_arm_value:
+                                        _ = LLVMBuildStore(builder, range_arm_value, result_slot)
+                                        _ = LLVMBuildBr(builder, done_block)
+                                    else:
+                                        declined <- true
+                                    LLVMPositionBuilderAtEnd(builder, next_block)
+                                else:
+                                    declined <- true
                             else:
                                 if is_catch_all_pattern(arm.pattern):
                                     _ = LLVMBuildBr(builder, arm_block)
@@ -4245,6 +4288,10 @@ module Backend:
                         sm_is_default: mutable bool = false
                         sm_payload_binding: mutable sview = ""
                         sm_payload_path: mutable sview = ""
+                        sm_is_range: mutable bool = false
+                        sm_range_lo: mutable sview = ""
+                        sm_range_hi: mutable sview = ""
+                        sm_range_inclusive: mutable bool = false
                         if sm_arm.pattern is Pattern.Literal(sm_literal_text):
                             sm_literal_value: mutable i64 = 0
                             if parse_int_literal(sm_literal_text, sm_literal_value):
@@ -4265,8 +4312,15 @@ module Backend:
                                 sm_declined <- true if sm_fields.count != 0
                                 sm_ordinal <- ordinal_of_dotted_path(sm_path, structs) if sm_fields.count == 0
                             sm_declined <- true if sm_ordinal < 0
+                        if sm_arm.pattern is Pattern.Range(sm_rlo, sm_rhi, sm_rincl):
+                            # Range arms are integer-only; a payload-enum tag has no range.
+                            sm_declined <- true if sm_penum
+                            sm_is_range <- true if not sm_penum
+                            sm_range_lo <- sm_rlo
+                            sm_range_hi <- sm_rhi
+                            sm_range_inclusive <- sm_rincl
                         sm_is_default <- true if is_catch_all_pattern(sm_arm.pattern)
-                        sm_declined <- true if sm_ordinal < 0 and not sm_is_default
+                        sm_declined <- true if sm_ordinal < 0 and not sm_is_default and not sm_is_range
                         continue if sm_declined
                         sm_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sm_function, "smatch.arm")
                         if sm_is_default:
@@ -4279,7 +4333,15 @@ module Backend:
                             sm_saw_default <- true if sm_default_status != EmitStatus.Declined
                         else:
                             sm_next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sm_function, "smatch.next")
-                            sm_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, sm_scrutinee, LLVMConstInt(sm_compare_type, sm_ordinal.u64(), 1), "smatch.cmp")
+                            sm_hit: mutable LLVMValueRef = zeroed
+                            if sm_is_range:
+                                if emit_range_test(sm_scrutinee, sm_scrutinee_type, sm_range_lo, sm_range_hi, sm_range_inclusive, sm_compare_type, ctx, builder) is sm_range_hit:
+                                    sm_hit <- sm_range_hit
+                                else:
+                                    sm_declined <- true
+                            else:
+                                sm_hit <- LLVMBuildICmp(builder, 32, sm_scrutinee, LLVMConstInt(sm_compare_type, sm_ordinal.u64(), 1), "smatch.cmp")
+                            continue if sm_declined
                             _ = LLVMBuildCondBr(builder, sm_hit, sm_arm_block, sm_next_block)
                             LLVMPositionBuilderAtEnd(builder, sm_arm_block)
                             # `Shape.Circle(r):` — spill-and-load the single payload field so the
