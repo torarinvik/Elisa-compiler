@@ -1,0 +1,143 @@
+# Mutable aliasing through a LOCAL borrow (strict mode). `check_strict_unsafe_ops` catches a
+# direct double mutable borrow (`mutate(x, x)`) and a one-level ref-returning wrapper
+# (`mutate(get_ref(x), x)`); this catches the residual where the wrapper's result is bound to a
+# local first: `r: mutable i32& = get_ref(x); mutate_pair(r, x)` — r aliases x, so passing both is
+# two live mutable borrows of x and needs `can Unsafe.Alias`. SOUND subset: r must be a `mutable
+# T&`-typed local bound to a call carrying a mutable-ref parameter (that call forwards the borrow);
+# an alias is reported only when at least one of the colliding arguments is such a local (so the
+# direct cases the other pass already handles are never double-reported).
+extend Semantic:
+    private:
+        def mal_call_forwarded_param(value: Ast::Expr, mutable_params: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        found: mutable sview = sview("", 0, 0)
+                        for argument in arguments |found|:
+                            argument_name: sview = ident_name_of(argument)
+                            found <- argument_name if found == "" and argument_name != "" and (any p in mutable_params where p == argument_name)
+                        return found
+                    Expr.Paren(inner, line):
+                        return mal_call_forwarded_param(inner, mutable_params)
+                    _:
+                        return sview("", 0, 0)
+
+        # Collect `r: mutable T& = <call carrying a mutable param>` local aliases (r -> that param).
+        def mal_collect_local_aliases(statements: darray[Ast::Stmt], mutable_params: darray[sview]&, out_names: mutable darray[sview]&, out_bases: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_names, out_bases|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            base: sview = mal_call_forwarded_param(value, mutable_params) if type_marker_present(type_expression, TokenKind.Ampersand) else sview("", 0, 0)
+                            if base != "":
+                                out_names.push(name)
+                                out_bases.push(base)
+                        Stmt.If(condition, then_body, else_body, line):
+                            mal_collect_local_aliases(then_body, mutable_params, out_names, out_bases)
+                            mal_collect_local_aliases(else_body, mutable_params, out_names, out_bases)
+                        Stmt.While(condition, body, line):
+                            mal_collect_local_aliases(body, mutable_params, out_names, out_bases)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            mal_collect_local_aliases(body, mutable_params, out_names, out_bases)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            mal_collect_local_aliases(body, mutable_params, out_names, out_bases)
+                        _:
+                            pass
+
+        def mal_local_base(alias_names: darray[sview]&, alias_bases: darray[sview]&, name: sview) -> sview:
+            can Abort.Panic:
+                found: mutable sview = sview("", 0, 0)
+                index: mutable usize = 0
+                while index < alias_names.count |found, index|:
+                    found <- alias_bases[index] if alias_names[index] == name and found == ""
+                    index <- index + 1
+                return found
+
+        # Detect a call two of whose arguments alias the same mutable param, with at least one via a
+        # local alias. Emits MutableAliasUngranted once per such call.
+        def mal_check_call(arguments: darray[Ast::Expr], mutable_params: darray[sview]&, alias_names: darray[sview]&, alias_bases: darray[sview]&, line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                seen_bases: mutable darray[sview] = []
+                seen_local: mutable darray[bool] = []
+                aliased: mutable bool = false
+                for argument in arguments |seen_bases, seen_local, aliased|:
+                    argument_name: sview = ident_name_of(argument)
+                    local_base: sview = mal_local_base(alias_names, alias_bases, argument_name)
+                    direct_base: sview = argument_name if argument_name != "" and (any p in mutable_params where p == argument_name) else sview("", 0, 0)
+                    base: sview = local_base if local_base != "" else direct_base
+                    via_local: bool = local_base != ""
+                    if base != "":
+                        collide: bool =
+                            for probe in 0..<seen_bases.count |hit: bool = false| -> hit:
+                                hit <- true if seen_bases[probe] == base and (via_local or seen_local[probe])
+                        aliased <- true if collide
+                        seen_bases.push(base)
+                        seen_local.push(via_local)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableAliasUngranted, name: "", line: line, expected: "", actual: ""}) if aliased
+
+        def mal_walk(statements: darray[Ast::Stmt], mutable_params: darray[sview]&, alias_names: darray[sview]&, alias_bases: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- mal_expr(expression, mutable_params, alias_names, alias_bases, in_grant, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- mal_expr(value, mutable_params, alias_names, alias_bases, in_grant, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- mal_expr(value, mutable_params, alias_names, alias_bases, in_grant, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- mal_expr(returned, mutable_params, alias_names, alias_bases, in_grant, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- mal_walk(then_body, mutable_params, alias_names, alias_bases, in_grant, table)
+                            table <- mal_walk(else_body, mutable_params, alias_names, alias_bases, in_grant, table)
+                        Stmt.While(condition, body, line):
+                            table <- mal_walk(body, mutable_params, alias_names, alias_bases, in_grant, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- mal_walk(body, mutable_params, alias_names, alias_bases, in_grant, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            grant_here: bool = in_grant or kind == "can" or kind == "trusted"
+                            table <- mal_walk(body, mutable_params, alias_names, alias_bases, grant_here, table)
+                        _:
+                            pass
+
+        def mal_expr(expression: Ast::Expr, mutable_params: darray[sview]&, alias_names: darray[sview]&, alias_bases: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if in_grant
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        table <- mal_check_call(arguments, mutable_params, alias_names, alias_bases, line, table)
+                        for argument in arguments |table| -> table:
+                            table <- mal_expr(argument, mutable_params, alias_names, alias_bases, in_grant, table)
+                    Expr.Binary(left, operator, right, line):
+                        table <- mal_expr(left, mutable_params, alias_names, alias_bases, in_grant, table)
+                        table <- mal_expr(right, mutable_params, alias_names, alias_bases, in_grant, table)
+                    Expr.Paren(inner, line):
+                        table <- mal_expr(inner, mutable_params, alias_names, alias_bases, in_grant, table)
+                    _:
+                        pass
+
+        def check_mutable_alias_local_decls(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            continue if effects.count > 0
+                            mutable_params: mutable darray[sview] = []
+                            for parameter in parameters |mutable_params|:
+                                mutable_params.push(parameter.name) if param_is_mutable_ref(parameter)
+                            alias_names: mutable darray[sview] = []
+                            alias_bases: mutable darray[sview] = []
+                            mal_collect_local_aliases(body, mutable_params, alias_names, alias_bases)
+                            table <- mal_walk(body, mutable_params, alias_names, alias_bases, false, table) if alias_names.count > 0
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_mutable_alias_local_decls(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_mutable_alias_local_decls(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_mutable_alias_local(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_mutable_alias_local_decls(declarations, table)
