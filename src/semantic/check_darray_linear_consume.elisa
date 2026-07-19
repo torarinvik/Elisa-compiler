@@ -1,0 +1,138 @@
+# A `darray` (or `set`) whose element type is a `linear` struct holds must-consume values; the
+# container itself must be consumed before scope exit — drained with `for x in move c:`, moved,
+# or returned. An un-consumed such local leaks its linear elements. stage0:
+# "darray of must-consume elements (drain with `for x in move c:`) 'gs' must be consumed before
+# scope exit". SOUND subset: flag a darray/set-of-linear LOCAL that is NEVER the operand of a
+# `move` (which covers `for x in move c`, `f(move c)`, `x <- move c`) and is NEVER returned. Any
+# move/return anywhere is treated as possible consumption (a conservative miss), so a drained or
+# handed-off container is never falsely flagged.
+extend Semantic:
+    private:
+        def darray_linear_type_names(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                            out.push(struct_name) if affinity == "linear"
+                        Decl.Module(module_name, module_body, module_line):
+                            darray_linear_type_names(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            darray_linear_type_names(scoped_body, out)
+                        _:
+                            pass
+
+        def darray_linear_name_present(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                return any name in names where name == wanted
+
+        # Whether TYPE_EXPRESSION is `darray[E]`/`set[E]` (optionally mutable-wrapped) whose element
+        # E is a linear struct name.
+        def darray_linear_element(type_expression: Ast::Expr, linear_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Index(head, argument, index_line):
+                        head_name: sview = ident_name_of(head)
+                        return (head_name == "darray" or head_name == "set") and darray_linear_name_present(linear_names, ident_name_of(argument))
+                    Expr.IndexN(head, arguments, index_n_line):
+                        head_name_n: sview = ident_name_of(head)
+                        element_n: sview = ident_name_of(arguments[0]) if arguments.count > 0 else sview("", 0, 0)
+                        return (head_name_n == "darray" or head_name_n == "set") and darray_linear_name_present(linear_names, element_n)
+                    Expr.Unary(operator, operand, unary_line):
+                        return darray_linear_element(operand, linear_names)
+                    Expr.Paren(inner, paren_line):
+                        return darray_linear_element(inner, linear_names)
+                    _:
+                        return false
+
+        # Whether NAME is the operand of any `move` in an expression (covers `for x in move c`,
+        # `f(move c)`, `x <- move c`, `return move c`).
+        def darray_expr_moves_name(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Move(operand, move_line):
+                        return ident_name_of(operand) == name or darray_expr_moves_name(operand, name)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        return any argument in arguments where darray_expr_moves_name(argument, name)
+                    Expr.Binary(left, operator, right, binary_line):
+                        return darray_expr_moves_name(left, name) or darray_expr_moves_name(right, name)
+                    Expr.Unary(operator, operand, unary_line):
+                        return darray_expr_moves_name(operand, name)
+                    Expr.Paren(inner, paren_line):
+                        return darray_expr_moves_name(inner, name)
+                    Expr.Index(object, index, index_line):
+                        return darray_expr_moves_name(object, name) or darray_expr_moves_name(index, name)
+                    _:
+                        return false
+
+        # Whether NAME is moved or (bare/`move`) returned anywhere in the statement list — the
+        # consumption avenues for a container owner.
+        def darray_name_consumed(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return any statement in statements where darray_statement_consumes(statement, name)
+
+        def darray_return_consumes(value: Ast::Expr?, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                returned: Ast::Expr = get value else return false
+                return ident_name_of(returned) == name or darray_expr_moves_name(returned, name)
+
+        def darray_statement_consumes(statement: Ast::Stmt, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match statement:
+                    Stmt.Expr(expression, line): darray_expr_moves_name(expression, name)
+                    Stmt.VarDecl(decl_name, type_expression, value, line): darray_expr_moves_name(value, name)
+                    Stmt.Assign(target, operator, value, line): darray_expr_moves_name(value, name)
+                    Stmt.Return(value, line): darray_return_consumes(value, name)
+                    Stmt.If(condition, then_body, else_body, line): darray_expr_moves_name(condition, name) or darray_name_consumed(then_body, name) or darray_name_consumed(else_body, name)
+                    Stmt.While(condition, body, line): darray_expr_moves_name(condition, name) or darray_name_consumed(body, name)
+                    Stmt.For(bind, variables, iterable, body, line): darray_expr_moves_name(iterable, name) or darray_name_consumed(body, name)
+                    Stmt.Block(kind, clause, binding, body, line): darray_name_consumed(body, name)
+                    Stmt.Match(scrutinee, arms, line): darray_expr_moves_name(scrutinee, name) or (any arm in arms where darray_name_consumed(arm.body, name))
+                    _: false
+
+        # Collect (darray/set-of-linear local name, decl line) declared in a statement list.
+        def darray_collect_linear_locals(statements: darray[Ast::Stmt], linear_names: darray[sview]&, out_names: mutable darray[sview]&, out_lines: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_names, out_lines|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            if darray_linear_element(type_expression, linear_names):
+                                out_names.push(name)
+                                out_lines.push(line)
+                        Stmt.If(condition, then_body, else_body, line):
+                            darray_collect_linear_locals(then_body, linear_names, out_names, out_lines)
+                            darray_collect_linear_locals(else_body, linear_names, out_names, out_lines)
+                        Stmt.While(condition, body, line):
+                            darray_collect_linear_locals(body, linear_names, out_names, out_lines)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            darray_collect_linear_locals(body, linear_names, out_names, out_lines)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            darray_collect_linear_locals(body, linear_names, out_names, out_lines)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out_names, out_lines|:
+                                darray_collect_linear_locals(arm.body, linear_names, out_names, out_lines)
+                        _:
+                            pass
+
+        def darray_linear_consume_funcs(declarations: darray[Ast::Decl], linear_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            local_names: mutable darray[sview] = []
+                            local_lines: mutable darray[u32] = []
+                            darray_collect_linear_locals(body, linear_names, local_names, local_lines)
+                            for probe in 0..<local_names.count |table| -> table:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DarrayLinearMustConsume, name: local_names[probe], line: local_lines[probe], expected: "", actual: ""}) if not darray_name_consumed(body, local_names[probe])
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- darray_linear_consume_funcs(module_body, linear_names, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- darray_linear_consume_funcs(scoped_body, linear_names, table)
+                        _:
+                            pass
+
+    public:
+        def check_darray_linear_consume(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                linear_names: mutable darray[sview] = []
+                darray_linear_type_names(declarations, linear_names)
+                table <- darray_linear_consume_funcs(declarations, linear_names, table)
