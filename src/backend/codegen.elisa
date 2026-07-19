@@ -35,6 +35,29 @@ module Backend:
             return (&storage[0]).cast[cstr] can Unsafe.PointerCast
 
 
+        # The INNER bytes of a string-literal pattern span, which arrives quote-INCLUSIVE
+        # (`"yes"`) because a pattern literal keeps its raw source text. Strips the surrounding
+        # double quotes and returns a NUL-terminated cstr of the content. Declines (null) on a
+        # backslash: escape decoding would have to match stage0's exactly, so a `"a\n"` pattern
+        # is left to decline rather than risk a mis-encoded compare.
+        def string_pattern_content_cstr(text: sview, storage: mutable darray[u8]&) -> cstr? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            length: usize = sview_len(text)
+            null return if length == 0
+            # The span may or may not include the surrounding double quotes depending on how
+            # the pattern lexer captured it; strip a matched pair when present.
+            quoted: bool = length >= 2 and sview_at(text, 0) == 34 and sview_at(text, length - 1) == 34
+            start: usize = 1 if quoted else 0
+            stop: usize = length - 1 if quoted else length
+            index: mutable usize = start
+            while index < stop |storage, index|:
+                byte: u8 = sview_at(text, index)
+                null return if byte == 92
+                storage.push(byte)
+                index <- index + 1
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
         # The LLVM SYMBOL name for `owner::name`: stage0 emits `module M: def get()` as
         # `define i64 @M.get` — DOT-separated, even though the call spelling is `M::get()`.
         # An empty owner is a top-level function and keeps its bare name.
@@ -3291,8 +3314,10 @@ module Backend:
                 # A PACKED scrutinee is an i32 store INDEX: its tag and payload are read back
                 # through the runtime rather than out of the value.
                 packed_scrutinee: bool = scrutinee_type.kind == TypeKind.PackedEnum
+                # A CSTR scrutinee's arms are string-literal patterns compared with ctx_streq.
+                cstr_scrutinee: bool = scrutinee_type.kind == TypeKind.CStr
                 null return if packed_scrutinee and runtime.active_store_enum != scrutinee_type.bits.i64()
-                null return if not is_integer_type(scrutinee_type) and not penum_scrutinee and not packed_scrutinee
+                null return if not is_integer_type(scrutinee_type) and not penum_scrutinee and not packed_scrutinee and not cstr_scrutinee
                 match_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
                 null return if expected.kind == TypeKind.Unmodeled
                 if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scrutinee_raw:
@@ -3322,11 +3347,51 @@ module Backend:
                     declined: mutable bool = false
                     saw_default: mutable bool = false
 
-                    for arm in match_arms |declined, saw_default, scrutinee, scrutinee_type, penum_scrutinee, packed_scrutinee, scrutinee_raw, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    for arm in match_arms |declined, saw_default, cstr_scrutinee, scrutinee, scrutinee_type, penum_scrutinee, packed_scrutinee, scrutinee_raw, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
                         # Once a catch-all is emitted the chain is closed.
                         continue if declined or saw_default
                         if arm_value_expression(arm.body) is arm_expression:
                             arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.arm")
+                            # `match s: "yes":` — a CSTR scrutinee compares each string-literal
+                            # arm with `ctx_streq(s, "lit") != 0`; `_`/binder is the catch-all.
+                            if cstr_scrutinee:
+                                if arm.pattern is Pattern.Literal(cstr_pat_text):
+                                    cstr_pat_storage: mutable darray[u8] = []
+                                    if string_pattern_content_cstr(cstr_pat_text, cstr_pat_storage) is cstr_pat_cstr:
+                                        cstr_pat_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, cstr_pat_cstr, "strpat")
+                                        cstr_next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.next")
+                                        cstr_streq_args: mutable darray[LLVMValueRef] = [scrutinee, cstr_pat_global]
+                                        cstr_streq_pointer: void& = (&cstr_streq_args[0]).cast[void&] can Unsafe.PointerCast
+                                        cstr_streq_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.streq_type, runtime.streq, cstr_streq_pointer, 2, "match.streq")
+                                        cstr_hit: LLVMValueRef = LLVMBuildICmp(builder, 33, cstr_streq_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "match.streq.hit")
+                                        _ = LLVMBuildCondBr(builder, cstr_hit, arm_block, cstr_next_block)
+                                        LLVMPositionBuilderAtEnd(builder, arm_block)
+                                        if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cstr_arm_value:
+                                            _ = LLVMBuildStore(builder, cstr_arm_value, result_slot)
+                                            _ = LLVMBuildBr(builder, done_block)
+                                        else:
+                                            declined <- true
+                                        LLVMPositionBuilderAtEnd(builder, cstr_next_block)
+                                    else:
+                                        declined <- true
+                                    continue
+                                if is_catch_all_pattern(arm.pattern):
+                                    _ = LLVMBuildBr(builder, arm_block)
+                                    LLVMPositionBuilderAtEnd(builder, arm_block)
+                                    if arm.pattern is Pattern.Binding(cstr_bind_name):
+                                        cstr_bind_storage: mutable darray[u8] = []
+                                        cstr_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(scrutinee_type, structs, ctx), sview_to_cstr(cstr_bind_name, cstr_bind_storage))
+                                        _ = LLVMBuildStore(builder, scrutinee_raw, cstr_bind_slot)
+                                        declare_local(local_scope, cstr_bind_name, cstr_bind_slot, scrutinee_type)
+                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cstr_default_value:
+                                        _ = LLVMBuildStore(builder, cstr_default_value, result_slot)
+                                        _ = LLVMBuildBr(builder, done_block)
+                                        saw_default <- true
+                                    else:
+                                        declined <- true
+                                    continue
+                                declined <- true
+                                continue
                             # `Color.Red:` — a CONST ENUM variant arm is an ordinal
                             # comparison, exactly like an integer-literal arm (stage0 emits
                             # `icmp eq i8 %c, 0`). Resolved to its ordinal and folded into
@@ -4380,6 +4445,63 @@ module Backend:
                 # every variant is field-less: its scrutinee is a `{i32, [N x i64]}` value whose TAG
                 # (extractvalue 0) drives the compare and whose payload is spilled to a temp so an
                 # arm's `is`-binding can load it. Packed enums (store handles) are NOT handled here.
+                # A CSTR scrutinee statement-match: each string-literal arm branches on
+                # `ctx_streq(s, "lit") != 0`; `_`/binder is the catch-all. Bodies are statements
+                # that may return/break or fall through to the shared done block.
+                if sm_scrutinee_type.kind == TypeKind.CStr:
+                    if emit_expression(stmt_match_scrutinee, sm_scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scstr_scrutinee:
+                        scstr_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        scstr_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, scstr_function, "scstr.done")
+                        scstr_declined: mutable bool = false
+                        scstr_saw_default: mutable bool = false
+                        scstr_any_open: mutable bool = false
+                        for scstr_arm in stmt_match_arms |scstr_declined, scstr_saw_default, scstr_any_open, scstr_scrutinee, sm_scrutinee_type, scstr_function, scstr_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                            continue if scstr_declined or scstr_saw_default
+                            scstr_declined <- true if arm_has_guard(scstr_arm.guard)
+                            continue if arm_has_guard(scstr_arm.guard)
+                            scstr_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, scstr_function, "scstr.arm")
+                            if scstr_arm.pattern is Pattern.Literal(scstr_lit_text):
+                                scstr_storage: mutable darray[u8] = []
+                                if string_pattern_content_cstr(scstr_lit_text, scstr_storage) is scstr_lit_cstr:
+                                    scstr_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, scstr_lit_cstr, "strpat")
+                                    scstr_next: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, scstr_function, "scstr.next")
+                                    scstr_args: mutable darray[LLVMValueRef] = [scstr_scrutinee, scstr_global]
+                                    scstr_args_pointer: void& = (&scstr_args[0]).cast[void&] can Unsafe.PointerCast
+                                    scstr_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.streq_type, runtime.streq, scstr_args_pointer, 2, "scstr.streq")
+                                    scstr_hit: LLVMValueRef = LLVMBuildICmp(builder, 33, scstr_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "scstr.hit")
+                                    _ = LLVMBuildCondBr(builder, scstr_hit, scstr_arm_block, scstr_next)
+                                    LLVMPositionBuilderAtEnd(builder, scstr_arm_block)
+                                    scstr_status: EmitStatus = emit_statements(scstr_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                    scstr_declined <- true if scstr_status == EmitStatus.Declined
+                                    scstr_any_open <- true if scstr_status == EmitStatus.Open
+                                    branch_if_open(scstr_status, builder, scstr_done)
+                                    LLVMPositionBuilderAtEnd(builder, scstr_next)
+                                else:
+                                    scstr_declined <- true
+                            elif is_catch_all_pattern(scstr_arm.pattern):
+                                _ = LLVMBuildBr(builder, scstr_arm_block)
+                                LLVMPositionBuilderAtEnd(builder, scstr_arm_block)
+                                if scstr_arm.pattern is Pattern.Binding(scstr_bind_name):
+                                    scstr_bind_storage: mutable darray[u8] = []
+                                    scstr_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(sm_scrutinee_type, structs, ctx), sview_to_cstr(scstr_bind_name, scstr_bind_storage))
+                                    _ = LLVMBuildStore(builder, scstr_scrutinee, scstr_bind_slot)
+                                    declare_local(local_scope, scstr_bind_name, scstr_bind_slot, sm_scrutinee_type)
+                                scstr_default_status: EmitStatus = emit_statements(scstr_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                scstr_declined <- true if scstr_default_status == EmitStatus.Declined
+                                scstr_any_open <- true if scstr_default_status == EmitStatus.Open
+                                branch_if_open(scstr_default_status, builder, scstr_done)
+                                scstr_saw_default <- true if scstr_default_status != EmitStatus.Declined
+                            else:
+                                scstr_declined <- true
+                        EmitStatus.Declined return if scstr_declined
+                        if not scstr_saw_default:
+                            _ = LLVMBuildUnreachable(builder)
+                        LLVMPositionBuilderAtEnd(builder, scstr_done)
+                        if not scstr_any_open:
+                            _ = LLVMBuildUnreachable(builder)
+                            return EmitStatus.Terminated
+                        return EmitStatus.Open
+                    return EmitStatus.Declined
                 sm_penum: bool = sm_scrutinee_type.kind == TypeKind.PayloadEnum
                 EmitStatus.Declined return if not is_integer_type(sm_scrutinee_type) and not sm_penum
                 if emit_expression(stmt_match_scrutinee, sm_scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sm_scrutinee_raw:
