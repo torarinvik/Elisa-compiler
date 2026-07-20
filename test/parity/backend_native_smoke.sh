@@ -1011,9 +1011,16 @@ decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() ->
 # A FILTERED comprehension declines: the output count is not known up front, so the presized
 # form does not apply -- and stage0 itself says only the filter-free form auto-vectorizes.
 run_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n' 4
-# `ensure` is a POSTCONDITION over `result`, which is not bound until the return; modeled
-# only as a decline (requires -- the precondition over params -- is the portable half).
-stripped_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n'
+# `ensure` is a POSTCONDITION over `result`. It is checked at every RETURN, which is where
+# `result` exists and where stage0 checks it too (stage0 allocates a `%result` slot, stores
+# the returned value, then branches per clause). A holding predicate costs nothing after the
+# optimizer, so the success path stays bit-comparable.
+run_case contract_ensure 'def inc(n: i64) -> i64:\n    ensure result > n\n    return n + 1\n\ndef main() -> i64:\n    return inc(41)\n' 42
+# MULTIPLE clauses chain, and the predicate may read parameters as well as `result`.
+run_case contract_ensure_multi 'def maxi(a: i64, b: i64) -> i64:\n    ensure result >= a\n    ensure result >= b\n    return a if a > b else b\n\ndef main() -> i64:\n    return maxi(9, 33) + maxi(7, 2)\n' 40
+# A `-> void` fn has no `result` to bind: it must DECLINE rather than drop the check --
+# an unenforced contract is worse than an unsupported one.
+stripped_case contract_ensure_void 'def touch(n: i64) -> void:\n    ensure n > 0\n    return\n\ndef main() -> i64:\n    touch(1)\n    return 42\n'
 decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
 run_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0] + xs[1] + 39\n' 42
 run_case for_over_darray 'def main() -> i64:\n    xs: darray[i64] = [1, 2, 3]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total + 36\n' 42

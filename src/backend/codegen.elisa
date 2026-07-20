@@ -628,6 +628,13 @@ module Backend:
             # a bare `static:` block (line in neither) emits unconditionally.
             static_branch_lines: mutable darray[u32]
             static_taken_lines: mutable darray[u32]
+            # The `ensure PRED` postconditions of the function CURRENTLY being emitted.
+            # Refilled per function by emit_function_body and read at every `return`, which
+            # is where stage0 checks them: it allocates `%result`, stores the returned value
+            # into it, then branches on each predicate. Threaded on StructTable rather than
+            # Runtime because Runtime is COPIED per function (copied_runtime) and this is a
+            # container -- the side-table channel static_branch_lines already uses.
+            pending_ensures: mutable darray[Expr]
             # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
             # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
             #
@@ -4451,6 +4458,53 @@ module Backend:
             _ = LLVMBuildBr(builder, dest)
 
 
+        # Emit a runtime contract guard: branch on `condition`, abort on false, and leave
+        # the builder positioned on the success path. Shared by `requires`/`assert` (checked
+        # where they are written) and `ensure` (checked at every return).
+        def emit_contract_guard(condition: LLVMValueRef, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic]:
+            guard_fn: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            guard_ok: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, guard_fn, "contract.ok")
+            guard_fail: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, guard_fn, "contract.fail")
+            _ = LLVMBuildCondBr(builder, condition, guard_ok, guard_fail)
+            LLVMPositionBuilderAtEnd(builder, guard_fail)
+            guard_abort_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+            guard_abort_fn: LLVMValueRef = declare_or_get_abort(m, guard_abort_type)
+            _ = LLVMBuildCall2(builder, guard_abort_type, guard_abort_fn, null, 0, "")
+            _ = LLVMBuildUnreachable(builder)
+            LLVMPositionBuilderAtEnd(builder, guard_ok)
+
+
+        # Check the current function's `ensure` postconditions against the value it is about
+        # to return. Mirrors stage0's shape: bind the returned value as `result` (stage0
+        # allocates a `%result` slot and stores into it), then guard on each predicate.
+        # Called on the return path, BEFORE the regions are unwound -- a predicate may read a
+        # container the auto region still backs.
+        #
+        # False = DECLINE (a predicate the expression emitter cannot model). Never silently
+        # skips a check: a contract that is not emitted is a contract that is not enforced.
+        def emit_ensure_checks(return_value: LLVMValueRef, return_type: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            ensure_count: usize = structs.pending_ensures.count
+            true return if ensure_count == 0
+            false return if return_type.kind == TypeKind.Void
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(return_type, structs, ctx), "result")
+            _ = LLVMBuildStore(builder, return_value, result_slot)
+            # `result` is an ordinary local from here, so the predicate's `result >= a` needs
+            # no special case in the expression emitter.
+            declare_local(local_scope, "result", result_slot, return_type)
+            ensure_bool: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+            ensure_index: mutable usize = 0
+            while ensure_index < ensure_count |ensure_index, ensure_count, ensure_bool, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                # Copied OUT of the table: emit_expression takes `structs` mutably, so a
+                # borrow held across the call would conflict.
+                ensure_pred: Expr = structs.pending_ensures[ensure_index]
+                if emit_expression(ensure_pred, ensure_bool, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ensure_value:
+                    emit_contract_guard(ensure_value, m, ctx, builder)
+                else:
+                    return false
+                ensure_index <- ensure_index + 1
+            return true
+
+
         # Emit a statement list. Declined if ANY statement declined; Terminated if the
         # list ended the block.
         #
@@ -4585,8 +4639,10 @@ module Backend:
             # provably-true predicate is optimized away (stage0's -O2 drops it entirely), so
             # the success path costs nothing after the optimizer runs.
             #
-            # Only `requires` (a PRECONDITION over the parameters) is modeled. `ensure` is a
-            # postcondition over `result`, which is not bound until the return; it declines.
+            # `requires` (a PRECONDITION over the parameters) is checked HERE. `ensure` is a
+            # postcondition over `result`, which is not bound until the return -- so it is
+            # only RECORDED here and checked on every return path (emit_ensure_checks),
+            # which is where stage0 checks it too.
             # The fail path calls libc `abort()` rather than reproducing stage0's
             # printf+backtrace panic verbatim -- the SUCCESS path (predicate holds) is then
             # bit-identical to stage0, and a FAILING contract aborts in both.
@@ -4596,21 +4652,19 @@ module Backend:
                 # discharges — NO runtime lowering, so skip it. (The std dict probe loops
                 # carry `decreases`.)
                 EmitStatus.Open return if contract_kind == "decreases" or contract_kind == "decreases*"
+                # `ensure` is a POSTCONDITION: record it and check it at every return, where
+                # `result` exists. Recording (rather than a pre-scan in emit_function_body)
+                # keeps the clause's meaning lexical — a return placed BEFORE it is not
+                # governed by it, which is also how stage0 reads the prologue.
+                if contract_kind == "ensure":
+                    structs.pending_ensures.push(contract_pred)
+                    return EmitStatus.Open
                 # `requires` (precondition) and `assert` both lower to a runtime check that
                 # aborts on a false predicate — bit-identical to stage0 on the success path.
                 declined_contract return if contract_kind != "requires" and contract_kind != "assert"
                 bool_type_c: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
                 if emit_expression(contract_pred, bool_type_c, local_scope, fns, structs, generics, runtime, m, ctx, builder) is contract_value:
-                    contract_fn: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                    contract_ok: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, contract_fn, "contract.ok")
-                    contract_fail: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, contract_fn, "contract.fail")
-                    _ = LLVMBuildCondBr(builder, contract_value, contract_ok, contract_fail)
-                    LLVMPositionBuilderAtEnd(builder, contract_fail)
-                    abort_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
-                    abort_fn: LLVMValueRef = declare_or_get_abort(m, abort_type)
-                    _ = LLVMBuildCall2(builder, abort_type, abort_fn, null, 0, "")
-                    _ = LLVMBuildUnreachable(builder)
-                    LLVMPositionBuilderAtEnd(builder, contract_ok)
+                    emit_contract_guard(contract_value, m, ctx, builder)
                     return EmitStatus.Open
                 return declined_contract
 
@@ -4686,6 +4740,7 @@ module Backend:
                         if ret_try_callee is Expr.Ident(ret_try_name, ret_try_name_line):
                             if error_callee_is(fns, generics, ret_try_name):
                                 if emit_propagating_try_value(ret_try_name, ret_try_args, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) is ret_try_value:
+                                    EmitStatus.Declined return if not emit_ensure_checks(ret_try_value, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                                     emit_region_unwind(regions, runtime, builder)
                                     if runtime.in_error_fn:
                                         _ = LLVMBuildStore(builder, ret_try_value, runtime.error_out)
@@ -4696,6 +4751,9 @@ module Backend:
                                 return EmitStatus.Declined
                     emitted: LLVMValueRef? = emit_expression(return_value, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                     if emitted is return_constant:
+                        # Postconditions run BEFORE the unwind: a predicate may read a
+                        # container the auto region still backs.
+                        EmitStatus.Declined return if not emit_ensure_checks(return_constant, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                         # Unwind EVERY live owned region on the way out — the function's auto
                         # region AND any enclosing `region NAME:` scopes. This lives on the
                         # return path rather than at one function exit because a return can
@@ -4713,6 +4771,9 @@ module Backend:
                 # A bare `return` — only valid in a `-> void` function. A `void error[E]` fn
                 # still uses the i32-status ABI, so success returns the 0 code, not `ret void`.
                 if return_type.kind == TypeKind.Void:
+                    # A `-> void` fn with an `ensure` has no `result` to bind. Rather than
+                    # drop the check (an unenforced contract), decline the function.
+                    EmitStatus.Declined return if structs.pending_ensures.count > 0
                     emit_region_unwind(regions, runtime, builder)
                     if runtime.in_error_fn:
                         _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0))
@@ -6524,6 +6585,9 @@ module Backend:
                 if return_type_opt is declared_return:
                     return_value_type <- annotation_value_type(declared_return, structs)
                 false return if return_value_type.kind == TypeKind.Unmodeled
+                # `ensure` clauses are per-FUNCTION: drop the previous function's.
+                while structs.pending_ensures.count > 0 |structs|:
+                    _ = structs.pending_ensures.pop()
                 entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
                 LLVMPositionBuilderAtEnd(builder, entry)
 
@@ -6802,7 +6866,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: [], pending_ensures: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
