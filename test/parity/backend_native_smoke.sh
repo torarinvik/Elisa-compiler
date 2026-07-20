@@ -929,6 +929,10 @@ run_case const_array_of_enum 'const enum C of u8:\n    R\n    G\n    B\n\nconst 
 # cstr byte indexing lowers to ctx_string_index(s, i) -> i64 (stage0's shape).
 run_case cstr_index_const 'def main() -> i64:\n    s: cstr = "ABC"\n    return s[0].i64() + s[2].i64()\n'   132
 run_case cstr_index_dynamic 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", 1)\n'   89
+# Nested darray[darray[i64]]: elements are 24-byte inner headers; the container's element
+# stride must be sizeof(header), not the scalar-fallback 0 that corrupted every push.
+run_case darray_nested_index 'def main() -> i64:\n    m: darray[darray[i64]] = [[1, 2], [3, 4]]\n    return m[0][0] + m[0][1] + m[1][0] + m[1][1]\n'   10
+run_case darray_nested_uneven 'def main() -> i64:\n    m: darray[darray[i64]] = [[1, 2, 3], [40, 50]]\n    return m[0][2] + m[1][1]\n'   53
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
