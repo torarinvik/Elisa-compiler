@@ -940,6 +940,10 @@ run_case penum_equality 'enum C:\n    R\n    G\n\ndef same(x: C, y: C) -> i64:\n
 # `get OPT else FALLBACK`: yield the optional's payload if present, else the fallback.
 run_case get_else_absent 'def main() -> i64:\n    x: i64? = null\n    return get x else 42\n'   42
 run_case get_else_present 'def find(n: i64) -> i64?:\n    return n if n > 0 else null\n\ndef main() -> i64:\n    return get find(8) else 99\n'   8
+# Implicit-void helper (no `-> void`) that mutates THROUGH a `mutable T&` — must be declared
+# (previously the whole declaration was gated on a present return type) and assign through the ref.
+run_case implicit_void_ref_assign 'def setto(a: mutable i64&, v: i64):\n    a <- v\n\ndef main() -> i64:\n    x: mutable i64 = 3\n    setto(&x, 9)\n    return x\n'   9
+run_case implicit_void_field_mut 'struct P:\n    x: mutable i64\n\ndef bump(p: mutable P&):\n    p.x <- p.x + 1\n\ndef main() -> i64:\n    p: mutable P = P{x: 5}\n    bump(&p)\n    return p.x\n'   6
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
