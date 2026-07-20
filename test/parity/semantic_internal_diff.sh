@@ -73,7 +73,7 @@ is_runtime_std() {
     esac
     return 1
 }
-while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64; do
+while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 overlay_b64; do
     total=$((total + 1))
     opts="$(printf '%s' "$opts_b64" | openssl base64 -d -A)"
     hdr=""
@@ -89,7 +89,27 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64; do
     esac
     fname="$(printf '%s' "$fname_b64" | openssl base64 -d -A 2>/dev/null)"
     is_runtime_std "$fname" && hdr+=$'# std\n'
-    out="$({ printf '%s' "$hdr"; printf '%s' "$src_b64" | openssl base64 -d -A; } | "$RPT")"
+    # Option-injected overlay layouts (7th column) are replayed as their IN-SOURCE
+    # spelling: `struct L layout(guest[, size: N]):` with `field: u<W*8> at OFF` lines.
+    overlay_src=""
+    if [[ -n "${overlay_b64:-}" ]]; then
+        overlay_src="$(printf '%s' "$overlay_b64" | openssl base64 -d -A 2>/dev/null | awk -F'|' 'NF>=4 {
+            hdr = "struct " $1 " layout(guest"
+            if ($2+0 > 0) hdr = hdr ", size: " $2
+            if ($3+0 > 0) hdr = hdr ", stride: " $3
+            print hdr "):"
+            n = split($4, fs, ",")
+            for (i = 1; i <= n; i++) {
+                split(fs[i], parts, ":")
+                w = parts[3] + 0; bits = (w > 0 ? w * 8 : 64)
+                line = "\t" parts[1] ": u" bits " at " parts[2]
+                if (parts[4] + 0 > 0) line = line " requires size >= " parts[4]
+                print line
+            }
+            print ""
+        }')"
+    fi
+    out="$({ printf '%s' "$hdr"; if [[ -n "$overlay_src" ]]; then printf '%s\n' "$overlay_src"; fi; printf '%s' "$src_b64" | openssl base64 -d -A; } | "$RPT")"
     parse_errors="$(printf '%s\n' "$out" | awk '$1 == "P" { print $2; exit }')"
     diagnostics="$(printf '%s\n' "$out" | awk '$1 == "D" { print $2; exit }')"
     [[ -n "$parse_errors" ]] || parse_errors=999999

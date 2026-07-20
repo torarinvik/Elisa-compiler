@@ -1,0 +1,206 @@
+# Typed guest-memory overlays (docs/107). A `struct L layout(guest, size: N):` declares
+# fields with byte offsets (`mem_param: u64 at 64 [requires size >= N]`); a
+# `GuestVAddr[L]` carrier's `p.field[mem]` access desugars to MemoryManager_ReadU<W>.
+# The parser records the layout data (owner "__overlay_struct" / "__overlay_field" with
+# the offset in `line` / "__overlay_reqsize"), and the checks ported here are:
+#
+#   * overlay-unknown-field:        the accessed field is not declared in the layout
+#   * overlay-field-width-mismatch: the field's width has no ReadU<N> form (1/2/4/8)
+#   * overlay-field-needs-size-guard: a `requires size >= N` field accessed without a
+#     dominating size guard
+extend Semantic:
+    private:
+        # The byte width of a field type name (`u64` -> 8, `u24` -> 3); 0 unknown.
+        def go_type_width(type_expression: Ast::Expr) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                name: sview = ident_name_of(type_expression)
+                (0) return if name == ""
+                (1) return if name == "u8" or name == "i8"
+                (2) return if name == "u16" or name == "i16"
+                (4) return if name == "u32" or name == "i32"
+                (8) return if name == "u64" or name == "i64"
+                (3) return if name == "u24"
+                (5) return if name == "u40"
+                (6) return if name == "u48"
+                (7) return if name == "u56"
+                return 0
+
+
+        # The layout name a `GuestVAddr[L]` annotation carries, or "".
+        def go_carrier_layout(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Index(object, argument, line):
+                        (ident_name_of(argument)) return if ident_name_of(object) == "GuestVAddr"
+                        return sview("", 0, 0)
+                    Expr.Unary(operator, operand, unary_line):
+                        return go_carrier_layout(operand)
+                    Expr.Paren(inner, paren_line):
+                        return go_carrier_layout(inner)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # Field lookup in a layout struct's members: (declared, width, reqsize).
+        def go_field_info(layout: sview, field: sview, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, annotations: darray[Ast::EnumAnnotation]&) -> (declared: bool, width: i64, reqsize: i64):
+            can Memory.Allocate, Abort.Panic:
+                member: (found: bool, annotation: Ast::Expr) = struct_field_annotation(layout, field, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types)
+                (false, 0, 0) return if not member.found
+                width: i64 = go_type_width(field_annotation_base(member.annotation))
+                reqsize: mutable i64 = 0
+                for annotation in annotations |reqsize, field|:
+                    reqsize <- annotation.line.i64() if annotation.owner == "__overlay_reqsize" and annotation.name == field
+                return (true, width, reqsize)
+
+
+        def go_check_expression(expression: Ast::Expr, line: u32, carriers: darray[sview]&, carrier_layouts: darray[sview]&, overlay_structs: darray[sview]&, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, annotations: darray[Ast::EnumAnnotation]&, guard_lo: i64, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    # `p.field[mem]` / `p.field[mem, i]` overlay accessor.
+                    Expr.Index(object, index_argument, index_line):
+                        table <- go_check_accessor(object, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                        table <- go_check_expression(index_argument, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                    Expr.IndexN(object_n, arguments_n, line_n):
+                        table <- go_check_accessor(object_n, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- go_check_expression(left, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                        table <- go_check_expression(right, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- go_check_expression(inner, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- go_check_expression(operand, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |table| -> table:
+                            table <- go_check_expression(argument, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                    _:
+                        pass
+
+
+        def go_check_accessor(object: Ast::Expr, line: u32, carriers: darray[sview]&, carrier_layouts: darray[sview]&, overlay_structs: darray[sview]&, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, annotations: darray[Ast::EnumAnnotation]&, guard_lo: i64, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match object:
+                    Expr.Field(base, field, field_line):
+                        base_name: sview = ident_name_of(base)
+                        return if base_name == ""
+                        layout: mutable sview = sview("", 0, 0)
+                        probe: mutable usize = 0
+                        while probe < carriers.count |probe, layout, base_name, carriers, carrier_layouts|:
+                            layout <- carrier_layouts[probe] if carriers[probe] == base_name and layout == ""
+                            probe <- probe + 1
+                        return if layout == ""
+                        return if not (any o in overlay_structs where o == layout)
+                        info: (declared: bool, width: i64, reqsize: i64) = go_field_info(layout, field, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations)
+                        # Unknown fields belong to check_overlay_field (pre-existing).
+                        return if not info.declared
+                        width_ok: bool = info.width == 1 or info.width == 2 or info.width == 4 or info.width == 8
+                        if not width_ok:
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OverlayFieldWidthMismatch, name: field, line: line, expected: layout, actual: "", expected_count: info.width.u32()})
+                            return
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OverlayFieldNeedsSizeGuard, name: field, line: line, expected: layout, actual: "", expected_count: info.reqsize.u32()}) if info.reqsize > 0 and guard_lo < info.reqsize
+                    _:
+                        pass
+
+
+        def go_walk(statements: darray[Ast::Stmt], carriers: darray[sview]&, carrier_layouts: darray[sview]&, overlay_structs: darray[sview]&, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, annotations: darray[Ast::EnumAnnotation]&, entry_guard_lo: i64, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                guard_lo: mutable i64 = entry_guard_lo
+                for statement in statements |guard_lo, table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- go_check_expression(expression, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- go_check_expression(returned, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- go_check_expression(value, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- go_check_expression(target, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                            table <- go_check_expression(value, line, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            # A `size` guard establishes a LOWER BOUND on its branch: the
+                            # THEN of `if p.size[mem] >= 48:` (and the ELSE of `< 48`)
+                            # carry size >= 48; the wrong-direction branch carries none.
+                            bound: (found: bool, then_lo: i64, else_lo: i64) = go_condition_size_bound(condition)
+                            then_guard: i64 = bound.then_lo if bound.found and bound.then_lo > guard_lo else guard_lo
+                            else_guard: i64 = bound.else_lo if bound.found and bound.else_lo > guard_lo else guard_lo
+                            table <- go_walk(then_body, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, then_guard, table)
+                            table <- go_walk(else_body, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, else_guard, table)
+                            # An early-return guard (`if size <= 47: return 0`) leaves its
+                            # ELSE floor in force for everything after the `if`.
+                            guard_lo <- else_guard if else_guard > guard_lo and body_terminates(then_body)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- go_walk(while_body, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- go_walk(block_body, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, guard_lo, table)
+                        _:
+                            pass
+
+
+        # (found, then-branch size floor, else-branch size floor) from a comparison of
+        # the layout's `size` accessor against a constant (-1 = no floor).
+        def go_condition_size_bound(condition: Ast::Expr) -> (found: bool, then_lo: i64, else_lo: i64):
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, paren_line):
+                        return go_condition_size_bound(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_is_size: bool = go_expr_is_size_access(left)
+                        bound: (found: bool, value: i64) = fold_const_int(right)
+                        (false, 0 - 1, 0 - 1) return if not left_is_size or not bound.found
+                        (true, bound.value, 0 - 1) return if operator == TokenKind.GtEq
+                        (true, bound.value + 1, 0 - 1) return if operator == TokenKind.Gt
+                        (true, 0 - 1, bound.value) return if operator == TokenKind.Lt
+                        (true, 0 - 1, bound.value + 1) return if operator == TokenKind.LtEq
+                        return (false, 0 - 1, 0 - 1)
+                    _:
+                        return (false, 0 - 1, 0 - 1)
+
+
+        def go_expr_is_size_access(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, line):
+                        return field == "size"
+                    Expr.Index(object, argument, index_line):
+                        return go_expr_is_size_access(object)
+                    Expr.Paren(inner, paren_line):
+                        return go_expr_is_size_access(inner)
+                    _:
+                        return false
+
+
+        def go_decls(declarations: darray[Ast::Decl], overlay_structs: darray[sview]&, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            carriers: mutable darray[sview] = []
+                            carrier_layouts: mutable darray[sview] = []
+                            for parameter in parameters |carriers, carrier_layouts|:
+                                layout: sview = go_carrier_layout(parameter.type_expression)
+                                continue if layout == ""
+                                carriers.push(parameter.name)
+                                carrier_layouts.push(layout)
+                            continue if carriers.count == 0
+                            table <- go_walk(body, carriers, carrier_layouts, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, 0 - 1, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- go_decls(module_body, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- go_decls(scoped_body, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, annotations, table)
+                        _:
+                            pass
+
+    public:
+        def check_guest_overlay(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                overlay_structs: mutable darray[sview] = []
+                for annotation in file.enum_annotations |overlay_structs|:
+                    overlay_structs.push(annotation.name) if annotation.owner == "__overlay_struct"
+                return if overlay_structs.count == 0
+                sm_struct_names: mutable darray[sview] = []
+                sm_field_starts: mutable darray[usize] = []
+                sm_field_counts: mutable darray[usize] = []
+                all_sm_field_names: mutable darray[sview] = []
+                all_sm_field_types: mutable darray[Ast::Expr] = []
+                collect_struct_member_tables(file.top_decls, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types)
+                table <- go_decls(file.top_decls, overlay_structs, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, file.enum_annotations, table)
