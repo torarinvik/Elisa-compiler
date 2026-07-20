@@ -1088,6 +1088,13 @@ module Backend:
             # BY VALUE.
             sview_index: LLVMValueRef
             sview_index_type: LLVMTypeRef
+            # DWARF. A variable DIE only reaches the object when a DECLARE record ties it to
+            # its storage, so these must be available AT the alloca -- carried on Runtime
+            # (already threaded everywhere) rather than in a separate later pass.
+            # `debug_active` is false for a `-g`-less build, where every declare is skipped.
+            debug_builder: mutable LLVMDIBuilderRef
+            debug_file: mutable LLVMMetadataRef
+            debug_active: mutable bool
 
 
         # Declare the runtime entry points in the module. Signatures are dictated by
@@ -1158,6 +1165,11 @@ module Backend:
                 sview_eq_type: sview_eq_type,
                 sview_index: LLVMAddFunction(m, "ctx_string_view_index", sview_index_type),
                 sview_index_type: sview_index_type,
+                # Filled in by emit_module_with_debug when `-g` is on; `debug_active` gates
+                # every use, so the placeholders are never dereferenced otherwise.
+                debug_builder: zeroed,
+                debug_file: zeroed,
+                debug_active: false,
                 owns_arena: true,
                 active_store: LLVMConstNull(pointer_type),
                 active_store_enum: -1,
@@ -2703,6 +2715,9 @@ module Backend:
                 sview_eq_type: runtime.sview_eq_type,
                 sview_index: runtime.sview_index,
                 sview_index_type: runtime.sview_index_type,
+                debug_builder: runtime.debug_builder,
+                debug_file: runtime.debug_file,
+                debug_active: runtime.debug_active,
                 packed_state_new: runtime.packed_state_new,
                 packed_state_new_type: runtime.packed_state_new_type,
                 packed_alloc: runtime.packed_alloc,
@@ -5011,6 +5026,8 @@ module Backend:
                     slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(declared_type, structs, ctx), sview_to_cstr(var_name, name_storage))
                     _ = LLVMBuildStore(builder, initial, slot)
                     declare_local(local_scope, var_name, slot, declared_type)
+                    # arg_no 0 = a LOCAL (DW_TAG_variable), not a formal parameter.
+                    declare_debug_variable(var_name, slot, declared_type, 0, var_line, LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)), runtime, structs, ctx, builder)
                     return EmitStatus.Open
                 return EmitStatus.Declined
 
@@ -6872,6 +6889,10 @@ module Backend:
                     slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(parameter_type, structs, ctx), sview_to_cstr(parameter.name, name_storage))
                     _ = LLVMBuildStore(builder, LLVMGetParam(fn, parameter_index), slot)
                     declare_local(local_scope, parameter.name, slot, parameter_type)
+                    # DWARF argument numbers start at 1, and count DECLARED parameters --
+                    # the error out-param and the threaded arena are ABI additions the
+                    # source never named, so they are not numbered here.
+                    declare_debug_variable(parameter.name, slot, parameter_type, parameter_index + 1 - error_param_offset, line, fn, local_runtime, structs, ctx, builder)
                     parameter_index <- parameter_index + 1
 
                 body_status: EmitStatus = emit_statements(body, return_value_type, local_scope, loops, regions, fns, structs, generics, local_runtime, m, ctx, builder)
@@ -6967,8 +6988,28 @@ module Backend:
             return LLVMDIBuilderCreateBasicType(dib, "void", 4, 0, 7, 0)
 
 
+        # Attach a DWARF variable to its storage. `arg_no` > 0 makes it a formal PARAMETER
+        # (DW_TAG_formal_parameter); 0 makes it a local (DW_TAG_variable). Without the
+        # DECLARE record the variable metadata is created and then dropped -- the DIE never
+        # reaches the object.
+        def declare_debug_variable(name: sview, slot: LLVMValueRef, value_type: ValueType, arg_no: u32, line: u32, fn: LLVMValueRef, runtime: Runtime&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not runtime.debug_active
+            subprogram: LLVMMetadataRef = LLVMGetSubprogram(fn)
+            variable_storage: mutable darray[u8] = []
+            variable_name: cstr = sview_to_cstr(name, variable_storage)
+            variable_type: LLVMMetadataRef = debug_basic_type(value_type, runtime.debug_builder)
+            variable: mutable LLVMMetadataRef = zeroed
+            if arg_no > 0:
+                variable <- LLVMDIBuilderCreateParameterVariable(runtime.debug_builder, subprogram, variable_name, sview_len(name), arg_no, runtime.debug_file, line, variable_type, 1, 0)
+            else:
+                variable <- LLVMDIBuilderCreateAutoVariable(runtime.debug_builder, subprogram, variable_name, sview_len(name), runtime.debug_file, line, variable_type, 1, 0, 0)
+            empty_expression: LLVMMetadataRef = LLVMDIBuilderCreateExpression(runtime.debug_builder, null, 0)
+            location: LLVMMetadataRef = LLVMDIBuilderCreateDebugLocation(ctx, line, 0, subprogram, null)
+            _ = LLVMDIBuilderInsertDeclareRecordAtEnd(runtime.debug_builder, slot, variable, empty_expression, location, LLVMGetInsertBlock(builder))
+
+
         # `-g` off costs nothing: the builder is never created and no flags are set.
-        def emit_debug_info(file: Ast::File&, top: darray[Decl]&, m: LLVMModuleRef, fns: FnTable&, structs: mutable StructTable&, source_name: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_debug_info(file: Ast::File&, top: darray[Decl]&, m: LLVMModuleRef, fns: FnTable&, structs: mutable StructTable&, runtime: mutable Runtime&, source_name: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # LLVM emits NO DWARF unless these module flags are present -- and it does not
             # warn if they are missing, it just silently drops the debug info.
             # 1 = LLVMModuleFlagBehaviorWarning, matching stage0.
@@ -7007,8 +7048,11 @@ module Backend:
                     subprogram: LLVMMetadataRef = LLVMDIBuilderCreateFunction(builder, unit, subprogram_name, sview_len(function_name), subprogram_name, sview_len(function_name), di_file, line, subroutine, 0, 1, line, 0, 0)
                     LLVMSetSubprogram(fns.handles[handle_index.usize()], subprogram)
 
-            # Without Finalize the metadata is left unresolved and LLVM asserts or drops it.
-            LLVMDIBuilderFinalize(builder)
+            # Handed to the emitter so each alloca can attach its variable. Finalize runs
+            # after the bodies, once those declares exist.
+            runtime.debug_builder <- builder
+            runtime.debug_file <- di_file
+            runtime.debug_active <- true
 
 
         # Does this MDNode's operand 0 spell `name`?
@@ -7306,6 +7350,11 @@ module Backend:
                 else:
                     record_declined_function(function_name_of(declaration), m, ctx) if function_name_of(declaration) != ""
 
+            # BEFORE the bodies: each alloca needs its function's subprogram already
+            # attached to hang a parameter/local variable off. (The declare pass above has
+            # run, so every handle is in `fns`.)
+            emit_debug_info(file, top, m, fns, structs, runtime, source_name, ctx) if want_debug
+
             emitted_count: mutable i64 = 0
             main_ok: mutable bool = false
             for declaration in top |emitted_count, main_ok, fns, structs, m, ctx, builder|:
@@ -7346,8 +7395,10 @@ module Backend:
                 drained <- drained + 1
             # Without a successfully emitted `main` the module is not a program: decline.
             -1 return if not main_ok
-            # AFTER the bodies: every function must already have its handle in `fns`.
-            emit_debug_info(file, top, m, fns, structs, source_name, ctx) if want_debug
+            # Finalize AFTER the bodies: the declares added during emission must exist
+            # before the metadata is resolved. Creation itself ran BEFORE them (below the
+            # declare pass), so each alloca had its subprogram to hang a variable off.
+            LLVMDIBuilderFinalize(runtime.debug_builder) if want_debug and runtime.debug_active
             return emitted_count
 
 

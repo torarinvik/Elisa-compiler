@@ -180,6 +180,39 @@ dwarf_case base_type 'DW_TAG_base_type'
 dwarf_case names_i64 'DW_AT_name.*"i64"'
 dwarf_case subprogram_has_type 'DW_AT_type'
 
+# Local-variable debug info, checked in the PRE-PASS IR rather than in the object.
+# `-O2` deletes it: stage0's own `-emit obj -O2 -g` has no DW_TAG_formal_parameter or
+# DW_TAG_variable either, so an optimized object cannot distinguish "never emitted" from
+# "optimizer removed it". The IR before the pipeline can.
+debug_ir_case() {
+    local name="$1" pattern="$2"
+    total=$((total + 1))
+    local dir="$BUILD/obj_dbgir"; mkdir -p "$dir"
+    if [ ! -f "$BUILD/emit_obj_debug_ir" ]; then
+        if ! "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj_debug_ir.o" "$ROOT/test/breadth/emit_obj_debug_ir.elisa" 2>/dev/null \
+           || ! clang -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
+            echo "  FAIL obj_dbgir_$name: could not build emit_obj_debug_ir"; return
+        fi
+    fi
+    if [ ! -f "$dir/ir.txt" ]; then
+        local src='def add(a: i64, b: i64) -> i64:\n    total: i64 = a + b\n    return total\n\ndef main() -> i64:\n    return add(40, 2)\n'
+        ( cd "$dir" && printf '%b' "$src" | "$BUILD/emit_obj_debug_ir" > ir.txt 2>/dev/null ) || true
+    fi
+    if grep -qE "$pattern" "$dir/ir.txt" 2>/dev/null; then
+        pass=$((pass + 1))
+    else
+        echo "  FAIL obj_dbgir_$name: no /$pattern/ in pre-pass debug IR"
+    fi
+}
+rm -rf "$BUILD/obj_dbgir"
+# Parameters carry their DWARF argument NUMBER (1-based) and their type.
+debug_ir_case param_a 'DILocalVariable\(name: "a", arg: 1'
+debug_ir_case param_b 'DILocalVariable\(name: "b", arg: 2'
+# A LOCAL has no `arg:` field -- that is what distinguishes DW_TAG_variable from
+# DW_TAG_formal_parameter.
+debug_ir_case local_total 'DILocalVariable\(name: "total", scope'
+debug_ir_case declare_record '#dbg_declare|llvm.dbg.declare' 
+
 wperf_case unrolled_is_silent 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<8]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' no
 
 if [ "$pass" -ne "$total" ]; then echo "backend_obj_smoke FAILED: passed=$pass total=$total"; exit 1; fi
