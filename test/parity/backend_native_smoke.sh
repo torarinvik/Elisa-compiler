@@ -1004,6 +1004,12 @@ decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a:
 # args are fixed; not modeled, so it declines rather than emitting a wrong signature.
 # An UNUSED variadic extern no longer poisons the module (per-fn tolerance): the
 # program runs. stage0 compiles this program too, so this is parity, not permissiveness.
+# A const's type ANNOTATION is optional: `const A = 0x20` takes its type from the
+# initializer (stage0's default integer type is `int`). The arena writes every
+# ELISA_ARENA_PROT_* / MAP_* flag this way, so leaving these Unmodeled declined every
+# function that read one.
+run_case const_untyped_int 'const MASK = 0x20\nconst SHIFT = 1\n\ndef main() -> i64:\n    return (MASK >> SHIFT) + 26\n' 42
+run_case const_untyped_bool 'const DEBUG = false\n\ndef main() -> i64:\n    return 7 if DEBUG else 42\n' 42
 # `x.cast[T]` from an INTEGER source is a real reinterpret (`inttoptr`), not a no-op --
 # `arena_region_from_uintptr(raw: uintptr)` in the std is exactly this shape.
 # Casting to an OPTIONAL pointer target wraps, and the tag comes from a NULL TEST on the
