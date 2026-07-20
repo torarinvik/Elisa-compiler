@@ -532,6 +532,16 @@ module Backend:
             # argument: `Shape.Circle(r: 42)` is only that constructor if `r` is the field's
             # real name -- otherwise it is a different program and must not be emitted.
             penum_field_names: mutable darray[sview]
+            # MULTI-FIELD payload variants (`Rect(i64, i64)`): each variant's field types and
+            # declared names in a flat pool, spanned per variant-slot by _start/_count. A
+            # single-field variant keeps its proven single-value path (penum_payloads /
+            # penum_has_payload above); a variant with COUNT>1 fields is emitted through these
+            # pools instead (tuple store on construction, tuple extract on match). Every
+            # variant-slot gets a span (0 fields = empty span) so the pools stay index-parallel.
+            penum_field_types: mutable darray[ValueType]
+            penum_field_flat_names: mutable darray[sview]
+            penum_field_type_start: mutable darray[usize]
+            penum_field_type_count: mutable darray[usize]
             # PACKED enums (`packed enum Node:`) — the same per-variant pools as penum_*, but
             # a separate table because the REPRESENTATION differs: a packed value is a store
             # row, not inline data. Kept apart so neither path can silently claim the other's
@@ -1783,6 +1793,31 @@ module Backend:
                     return copied_type(structs.penum_payloads[slot])
             return unmodeled_type()
 
+        # The variant-slot for `Enum.Variant` (an index into the per-variant pools), or -1.
+        def penum_slot_of_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
+                for offset in 0..<structs.penum_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    slot: usize = structs.penum_variant_start[enum_index] + offset
+                    (structs.penum_variant_start[enum_index] + offset).i64() return if sview_matches_prefix(path, structs.penum_variants[slot], dot + 1, sview_len(path).i64())
+            return -1
+
+        # The `{T0, T1, …}` tuple LLVM type over a MULTI-FIELD variant-slot's fields — the
+        # value stored into (and loaded from) the `[N x i64]` payload blob. Only meaningful
+        # when `penum_field_type_count[slot] > 1`.
+        def penum_field_tuple_type(slot: usize, structs: mutable StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            field_count: usize = structs.penum_field_type_count[slot]
+            field_start: usize = structs.penum_field_type_start[slot]
+            field_llvm: mutable darray[LLVMTypeRef] = []
+            for field_index in 0..<field_count |field_llvm, field_start, structs, ctx|:
+                field_llvm.push(llvm_type_of(copied_type(structs.penum_field_types[field_start + field_index]), structs, ctx))
+            field_pointer: void& = (&field_llvm[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, field_pointer, field_count.u32(), 0)
+
 
         # `Shape.Circle` -> the enclosing enum's ValueType, or Unmodeled.
         def penum_type_of_path(path: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
@@ -2294,6 +2329,31 @@ module Backend:
                     if ctor_enum_index >= 0:
                         ctor_tag: i64 = penum_variant_index(structs, ctor_enum_index, ctor_variant)
                         null return if ctor_tag < 0
+                        ctor_variant_slot: usize = structs.penum_variant_start[ctor_enum_index.usize()] + ctor_tag.usize()
+                        # `Shape.Rect(4, 5)` — a MULTI-FIELD variant: build the field tuple and
+                        # store it at the payload pointer (stage0's `store {i64,i64} …`).
+                        if structs.penum_field_type_count[ctor_variant_slot] > 1:
+                            null return if arguments.count != structs.penum_field_type_count[ctor_variant_slot]
+                            multi_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: ctor_enum_index.u32()}
+                            multi_llvm: LLVMTypeRef = llvm_type_of(multi_type, structs, ctx)
+                            multi_slot_alloca: LLVMValueRef = LLVMBuildAlloca(builder, multi_llvm, "enum.ctor")
+                            _ = LLVMBuildStore(builder, LLVMConstNull(multi_llvm), multi_slot_alloca)
+                            multi_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, multi_llvm, multi_slot_alloca, 0, "enum.tag.ptr")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), ctor_tag.u64(), 0), multi_tag_pointer)
+                            multi_tuple_llvm: LLVMTypeRef = penum_field_tuple_type(ctor_variant_slot, structs, ctx)
+                            multi_field_start: usize = structs.penum_field_type_start[ctor_variant_slot]
+                            multi_tuple_value: mutable LLVMValueRef = LLVMGetUndef(multi_tuple_llvm)
+                            multi_declined: mutable bool = false
+                            for multi_index in 0..<arguments.count |multi_tuple_value, multi_declined, multi_field_start, arguments, structs, local_scope, fns, generics, runtime, m, ctx, builder|:
+                                multi_field_type: ValueType = copied_type(structs.penum_field_types[multi_field_start + multi_index])
+                                if emit_expression(arguments[multi_index], multi_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is multi_field_value:
+                                    multi_tuple_value <- LLVMBuildInsertValue(builder, multi_tuple_value, multi_field_value, multi_index.u32(), "enum.field")
+                                else:
+                                    multi_declined <- true
+                            null return if multi_declined
+                            multi_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, multi_llvm, multi_slot_alloca, 1, "enum.payload.ptr")
+                            _ = LLVMBuildStore(builder, multi_tuple_value, multi_payload_pointer)
+                            return LLVMBuildLoad2(builder, multi_llvm, multi_slot_alloca, "enum.value")
                         null return if arguments.count != 1
                         ctor_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: ctor_enum_index.u32()}
                         ctor_payload_type: ValueType = copied_type(structs.penum_payloads[structs.penum_variant_start[ctor_enum_index.usize()] + ctor_tag.usize()])
@@ -3476,6 +3536,10 @@ module Backend:
                             variant_ordinal: mutable i64 = -1
                             payload_binding: mutable sview = ""
                             payload_declined: mutable bool = false
+                            # A MULTI-FIELD variant arm (`Rect(w, h)`) binds one name per field;
+                            # collected here so the tuple-extract at the bind site can reach them
+                            # (`variant_fields` is scoped to the pattern match below).
+                            payload_multi_bindings: mutable darray[sview] = []
                             # The `is` binding is scoped to its branch, so the path is copied
                             # out for the payload load further down.
                             payload_path: mutable sview = ""
@@ -3491,14 +3555,19 @@ module Backend:
                                             payload_declined <- true
                                 if penum_scrutinee:
                                     # `Shape.Circle(r)` — the tag is the variant's index in
-                                    # its own enum, and the arm may bind ONE payload field.
+                                    # its own enum, and the arm binds ONE name per payload field.
                                     variant_ordinal <- penum_variant_index_of_path(variant_path, structs)
-                                    payload_declined <- true if variant_fields.count > 1
                                     if variant_fields.count == 1:
                                         if variant_fields[0] is Pattern.Binding(bound_name):
                                             payload_binding <- bound_name
                                         else:
                                             payload_declined <- true
+                                    if variant_fields.count > 1:
+                                        for multi_field in variant_fields |payload_multi_bindings, payload_declined|:
+                                            if multi_field is Pattern.Binding(multi_bound):
+                                                payload_multi_bindings.push(multi_bound)
+                                            else:
+                                                payload_declined <- true
                                 else:
                                     if variant_fields.count == 0:
                                         variant_ordinal <- ordinal_of_dotted_path(variant_path, structs)
@@ -3556,6 +3625,24 @@ module Backend:
                                     payload_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(payload_type, structs, ctx), sview_to_cstr(payload_binding, payload_name_storage))
                                     _ = LLVMBuildStore(builder, payload_value, payload_slot)
                                     declare_local(local_scope, payload_binding, payload_slot, payload_type)
+                                # `Rect(w, h)` — load the field tuple from the payload blob and
+                                # bind each field by extractvalue (stage0's `extractvalue {i64,i64}`).
+                                if penum_scrutinee and payload_multi_bindings.count > 1:
+                                    multi_arm_slot: i64 = penum_slot_of_path(payload_path, structs)
+                                    if multi_arm_slot < 0:
+                                        declined <- true
+                                        continue
+                                    multi_arm_tuple: LLVMTypeRef = penum_field_tuple_type(multi_arm_slot.usize(), structs, ctx)
+                                    multi_arm_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(scrutinee_type, structs, ctx), penum_slot, 1, "enum.payload.ptr")
+                                    multi_arm_value: LLVMValueRef = LLVMBuildLoad2(builder, multi_arm_tuple, multi_arm_pointer, "match.payload")
+                                    multi_arm_start: usize = structs.penum_field_type_start[multi_arm_slot.usize()]
+                                    for multi_bind_index in 0..<payload_multi_bindings.count |payload_multi_bindings, multi_arm_start, multi_arm_value, structs, local_scope, ctx, builder|:
+                                        multi_bind_type: ValueType = copied_type(structs.penum_field_types[multi_arm_start + multi_bind_index])
+                                        multi_bind_value: LLVMValueRef = LLVMBuildExtractValue(builder, multi_arm_value, multi_bind_index.u32(), "match.field")
+                                        multi_bind_storage: mutable darray[u8] = []
+                                        multi_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(multi_bind_type, structs, ctx), sview_to_cstr(payload_multi_bindings[multi_bind_index], multi_bind_storage))
+                                        _ = LLVMBuildStore(builder, multi_bind_value, multi_bind_slot)
+                                        declare_local(local_scope, payload_multi_bindings[multi_bind_index], multi_bind_slot, multi_bind_type)
                                 if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is variant_value:
                                     _ = LLVMBuildStore(builder, variant_value, result_slot)
                                     _ = LLVMBuildBr(builder, done_block)
@@ -5442,19 +5529,32 @@ module Backend:
                 for packed_name in packed_names |enum_name|:
                     return if packed_name == enum_name
                 start: usize = structs.penum_variants.count
+                flat_start: usize = structs.penum_field_types.count
                 declined: mutable bool = false
                 widest: mutable u32 = 0
                 for variant in variants |structs, declined, widest|:
-                    declined <- true if variant.fields.count > 1
+                    # Each scalar field occupies one i64 slot of the `[N x i64]` blob, so the
+                    # widest variant's FIELD COUNT is the blob extent.
+                    widest <- variant.fields.count.u32() if variant.fields.count.u32() > widest
                     payload: mutable ValueType = unmodeled_type()
                     if variant.fields.count == 1:
                         payload <- annotation_value_type(variant.fields[0], structs)
                         # Only a scalar payload: it must fit the `[N x i64]` slot and be read
                         # back by a plain load at the payload pointer.
                         declined <- true if not is_numeric_type(payload) and payload.kind != TypeKind.Bool
-                        widest <- 1 if widest == 0
                     field_name: mutable sview = ""
                     field_name <- variant.field_names[0] if variant.field_names.count == 1
+                    # Flat per-field pools (used by the COUNT>1 tuple path; harmless for others).
+                    field_span_start: usize = structs.penum_field_types.count
+                    for field_index in 0..<variant.fields.count |structs, declined, variant|:
+                        field_type: ValueType = annotation_value_type(variant.fields[field_index], structs)
+                        declined <- true if not is_numeric_type(field_type) and field_type.kind != TypeKind.Bool
+                        structs.penum_field_types <- structs.penum_field_types.push(field_type)
+                        flat_name: mutable sview = ""
+                        flat_name <- variant.field_names[field_index] if field_index < variant.field_names.count
+                        structs.penum_field_flat_names <- structs.penum_field_flat_names.push(flat_name)
+                    structs.penum_field_type_start <- structs.penum_field_type_start.push(field_span_start)
+                    structs.penum_field_type_count <- structs.penum_field_type_count.push(variant.fields.count)
                     structs.penum_variants <- structs.penum_variants.push(variant.name)
                     structs.penum_payloads <- structs.penum_payloads.push(payload)
                     structs.penum_has_payload <- structs.penum_has_payload.push(variant.fields.count == 1)
@@ -5466,6 +5566,11 @@ module Backend:
                         _ = structs.penum_payloads.pop()
                         _ = structs.penum_has_payload.pop()
                         _ = structs.penum_field_names.pop()
+                        _ = structs.penum_field_type_start.pop()
+                        _ = structs.penum_field_type_count.pop()
+                    while structs.penum_field_types.count > flat_start |structs|:
+                        _ = structs.penum_field_types.pop()
+                        _ = structs.penum_field_flat_names.pop()
                     return
                 structs.penum_names <- structs.penum_names.push(enum_name)
                 structs.penum_variant_start <- structs.penum_variant_start.push(start)
@@ -5939,7 +6044,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)

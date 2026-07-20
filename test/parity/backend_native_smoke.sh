@@ -901,11 +901,13 @@ stripped_case() {
 # optional-of-ref), not an ABI to mirror. Until then it must DECLINE, not half-emit.
 # A `const enum` is exactly its backing scalar. A PAYLOAD-carrying enum is a TAGGED UNION
 # `{ i32, [N x i64] }` (stage0's `%Shape = type { i32, [1 x i64] }`) -- NOT the AoS packed
-# store, which is `packed enum`, a different subsystem. Only the subset whose layout is
-# trivially reproducible is modeled: at most ONE scalar payload field per variant. A
-# MULTI-FIELD payload needs the widest-variant layout computed exactly as stage0 computes it,
-# and guessing it would silently misread every payload -- so it declines.
-decline_case enum_multi_field_payload 'enum Pair:\n    Both(a: i64, b: i64)\n\ndef main() -> i64:\n    return match Pair.Both(1, 2):\n        Pair.Both(a, b): a + b\n'
+# store, which is `packed enum`, a different subsystem. MULTI-FIELD payload variants
+# (`Both(i64, i64)`) lay the fields out as a `{T0, T1, …}` tuple in the `[N x i64]` blob
+# (N = widest variant's field count): the constructor stores the tuple at the payload ptr and
+# a match arm extracts each field -- verified bit-for-bit against stage0's IR + native runs.
+run_case enum_multi_field_payload 'enum Pair:\n    Both(a: i64, b: i64)\n\ndef main() -> i64:\n    return match Pair.Both(1, 2):\n        Pair.Both(a, b): a + b\n'   3
+run_case enum_multi_field_mixed_width 'enum P:\n    Pt(i32, i64)\n    None\n\ndef f(p: P) -> i64:\n    return match p:\n        P.Pt(a, b): a.i64() + b\n        _: 0\n\ndef main() -> i64:\n    return f(P.Pt(7, 35))\n'   42
+run_case enum_multi_field_three 'enum V:\n    A(i64, i64, i64)\n\ndef s(v: V) -> i64:\n    return match v:\n        V.A(x, y, z): x + y + z\n        _: 0\n\ndef main() -> i64:\n    return s(V.A(10, 20, 30))\n'   60
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
