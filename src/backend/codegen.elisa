@@ -5516,8 +5516,8 @@ module Backend:
 
 
         # Register every generic function TEMPLATE in the file.
-        def register_generics(file: Ast::File&, generics: mutable GenericTable&) -> void can[Abort.Panic, Memory.Allocate]:
-            for declaration in file.top_decls |generics, file|:
+        def register_generics(file: Ast::File&, top: darray[Decl]&, generics: mutable GenericTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for declaration in top |generics, file|:
                 if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                     start: usize = generics.params.count
                     for row in 0..<file.generic_param_lines.count |generics, file, line|:
@@ -5619,8 +5619,8 @@ module Backend:
         # by instantiate_generic_struct. Type-parameter names come from the line-keyed
         # generic side table the parser fills (the same one function generics use), so a
         # struct is generic exactly when it has at least one non-bound row on its line.
-        def register_generic_structs(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            for declaration in file.top_decls |structs, file|:
+        def register_generic_structs(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration in top |structs, file|:
                 if declaration is Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
                     start: usize = structs.generic_struct_param_names.count
                     for row in 0..<file.generic_param_lines.count |structs, file, struct_line|:
@@ -5747,6 +5747,18 @@ module Backend:
         def register_const(declaration: Decl, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
                 const_declared: ValueType = annotation_value_type(const_type_expression, structs)
+                # IDEMPOTENT: static-if selection registers consts repeatedly as it iterates
+                # to a fixpoint (a branch condition may name a const declared in an earlier
+                # branch), and a second ROW for the same name would shadow the folded first.
+                #
+                # It re-resolves the TYPE rather than returning early, because selection runs
+                # BEFORE enums exist -- so a `const cs: C[2]` first registers with an
+                # unresolved element type, and skipping here would freeze that provisional
+                # answer even after `C` is known. (Caught by const_array_of_enum.)
+                existing_const: i64 = const_index_of(structs, const_name)
+                if existing_const >= 0:
+                    structs.const_types[existing_const.usize()] <- const_declared
+                    return
                 structs.const_names <- structs.const_names.push(const_name)
                 structs.const_types <- structs.const_types.push(const_declared)
                 structs.const_values <- structs.const_values.push(0)
@@ -5803,6 +5815,16 @@ module Backend:
                 # requires bool operand") — read it through a local first.
                 operands_ok: bool = ok
                 0 return if not operands_ok
+                # COMPARISONS fold to 0/1. Needed for `static if` selection, whose conditions
+                # are predicates (`ARENA_BACKEND == ARENA_BACKEND_LINUX_MMAP`), not values.
+                (1 if left_value == right_value else 0) return if binary_operator == TokenKind.EqEq
+                (1 if left_value != right_value else 0) return if binary_operator == TokenKind.BangEq
+                (1 if left_value < right_value else 0) return if binary_operator == TokenKind.Lt
+                (1 if left_value > right_value else 0) return if binary_operator == TokenKind.Gt
+                (1 if left_value <= right_value else 0) return if binary_operator == TokenKind.LtEq
+                (1 if left_value >= right_value else 0) return if binary_operator == TokenKind.GtEq
+                (1 if left_value != 0 and right_value != 0 else 0) return if binary_operator == TokenKind.And
+                (1 if left_value != 0 or right_value != 0 else 0) return if binary_operator == TokenKind.Or
                 (left_value + right_value) return if binary_operator == TokenKind.Plus
                 (left_value - right_value) return if binary_operator == TokenKind.Minus
                 (left_value * right_value) return if binary_operator == TokenKind.Star
@@ -5818,14 +5840,89 @@ module Backend:
             return 0
 
 
+        # Seed the TARGET predefines a `static if` selects on. Mirrors stage0's
+        # populateTargetConstValues (semantic/target_consts.go); the host triple is the only
+        # one stage1 emits for, so these are fixed rather than derived from a -target flag.
+        # Registered as ordinary resolved consts so fold_const_expr reaches them by name.
+        def register_target_consts(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            bool_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+            names: darray[sview] = ["ELISA_TARGET_OS_MACOS", "ELISA_TARGET_OS_LINUX", "ELISA_TARGET_OS_WINDOWS", "ELISA_TARGET_OS_FREEBSD", "ELISA_TARGET_OS_POSIX", "ELISA_TARGET_ARCH_X86_64", "ELISA_TARGET_ARCH_ARM64", "PLATFORM_WINDOWS", "PLATFORM_APPLE", "PLATFORM_DARWIN", "PLATFORM_LINUX", "PLATFORM_FREEBSD", "ARCH_X86_64", "ARCH_ARM64"]
+            values: darray[i64] = [1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1]
+            for index in 0..<names.count |structs, names, values, bool_type|:
+                continue if const_index_of(structs, names[index]) >= 0
+                structs.const_names <- structs.const_names.push(names[index])
+                structs.const_types <- structs.const_types.push(bool_type)
+                structs.const_values <- structs.const_values.push(values[index])
+                structs.const_resolved <- structs.const_resolved.push(true)
+                structs.const_float_text <- structs.const_float_text.push("")
+                structs.const_globals <- structs.const_globals.push(zeroed)
+                structs.const_global_ok <- structs.const_global_ok.push(false)
+
+
+        # Which `static if` BRANCH bodies are live. The parser keeps every branch (a name
+        # declared in two branches is not a duplicate), so without this the backend sees a
+        # per-target `const ARENA_BACKEND` declared once per branch -- and everything reading
+        # one declines. Returns the head lines of the branches to KEEP.
+        #
+        # Rows are in source order and carry a kind: 0 opens a chain, 1 continues it, 2 is the
+        # fallback. A chain takes its FIRST true branch; `static else` is taken only when no
+        # earlier branch in the same chain was. A condition that will not fold is treated as
+        # FALSE rather than guessed -- the same decline-don't-invent rule fold_const_expr uses.
+        def selected_static_if_lines(file: Ast::File&, structs: mutable StructTable&) -> darray[u32] can[Abort.Panic, Memory.Allocate]:
+            taken: mutable darray[u32] = []
+            chain_satisfied: mutable bool = false
+            for row in 0..<file.static_if_lines.count |taken, chain_satisfied, file, structs|:
+                chain_satisfied <- false if file.static_if_kinds[row] == 0
+                continue if chain_satisfied
+                if file.static_if_kinds[row] == 2:
+                    taken.push(file.static_if_lines[row])
+                    chain_satisfied <- true
+                    continue
+                condition_ok: mutable bool = true
+                condition_value: i64 = fold_const_expr(file.static_if_conds[row], structs, condition_ok)
+                continue if not condition_ok or condition_value == 0
+                taken.push(file.static_if_lines[row])
+                chain_satisfied <- true
+            return taken
+
+
+        # The EFFECTIVE top-level declarations: `file.top_decls` with each `Decl.Scoped`
+        # (one `static if` branch body) replaced by its contents when the branch is taken,
+        # and dropped when it is not. Every later pass iterates this instead of
+        # `file.top_decls`, so branch selection is decided in ONE place rather than being
+        # re-derived (inconsistently) by each of the nine passes.
+        #
+        # Recursive: `static if` blocks nest (arena.elisa selects a backend, then selects
+        # again on the chosen backend's constant).
+        # `Decl.Scoped` is NOT exclusively a static-if branch -- an `impl` block produces one
+        # too (parser_decl.elisa:420). Dropping a Scoped merely because it is not in
+        # `taken_lines` would silently delete every impl in the program, so a Scoped whose
+        # line is not a static-if branch line at all is inlined UNCONDITIONALLY. Only a
+        # genuine branch (its line appears in `branch_lines`) is subject to selection.
+        def flatten_static_branches(decls: darray[Decl]&, branch_lines: darray[u32]&, taken_lines: darray[u32]&, out: mutable darray[Decl]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for declaration in decls |out, branch_lines, taken_lines|:
+                if declaration is Decl.Scoped(scoped_body, scoped_line):
+                    is_branch: bool = static_branch_is_taken(branch_lines, scoped_line)
+                    keep: bool = static_branch_is_taken(taken_lines, scoped_line) if is_branch else true
+                    flatten_static_branches(scoped_body, branch_lines, taken_lines, out) if keep
+                    continue
+                out.push(declaration)
+
+
+        def static_branch_is_taken(taken_lines: darray[u32]&, line: u32) -> bool can[Abort.Panic]:
+            for taken_line in taken_lines |line|:
+                true return if taken_line == line
+            return false
+
+
         # Fold every global const to its value, iterating to a FIXPOINT so a const may
         # reference one declared LATER (stage0 accepts that). Each pass must resolve at
         # least one new const or nothing ever will, so `const_names.count` passes suffice.
-        def fold_consts(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+        def fold_consts(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             pass_index: mutable usize = 0
             while pass_index < structs.const_names.count |pass_index, file, structs|:
                 progressed: mutable bool = false
-                for declaration in file.top_decls |progressed, structs|:
+                for declaration in top |progressed, structs|:
                     if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
                         const_index: i64 = const_index_of(structs, const_name)
                         continue if const_index < 0
@@ -5886,8 +5983,8 @@ module Backend:
         # (`i64[2][2]` -> `[2 x [2 x i64]]`) so long as the initializer is a fully-foldable
         # literal of exactly the declared shape; anything else leaves const_global_ok false and
         # the const stays declined at its use sites.
-        def materialize_const_aggregates(file: Ast::File&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            for declaration in file.top_decls |structs, m, ctx|:
+        def materialize_const_aggregates(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration in top |structs, m, ctx|:
                 if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
                     const_index: i64 = const_index_of(structs, const_name)
                     continue if const_index < 0
@@ -6474,7 +6571,7 @@ module Backend:
         # numbers -- honest about what it gives rather than half-emitting a wrong line table.
         #
         # `-g` off costs nothing: the builder is never created and no flags are set.
-        def emit_debug_info(file: Ast::File&, m: LLVMModuleRef, fns: FnTable&, source_name: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_debug_info(file: Ast::File&, top: darray[Decl]&, m: LLVMModuleRef, fns: FnTable&, source_name: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # LLVM emits NO DWARF unless these module flags are present -- and it does not
             # warn if they are missing, it just silently drops the debug info.
             # 1 = LLVMModuleFlagBehaviorWarning, matching stage0.
@@ -6493,7 +6590,7 @@ module Backend:
             # Nothing errors on a wrong enum here; only dwarfdump shows it.
             unit: LLVMMetadataRef = LLVMDIBuilderCreateCompileUnit(builder, 11, di_file, "elisacore", 9, 0, "", 0, 0, "", 0, 1, 0, 0, 0, "", 0, "", 0)
 
-            for declaration in file.top_decls |builder, di_file, unit, fns|:
+            for declaration in top |builder, di_file, unit, fns|:
                 if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                     handle_index: i64 = function_index_of(fns, "", function_name)
                     continue if handle_index < 0
@@ -6647,9 +6744,36 @@ module Backend:
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
             generics: mutable GenericTable = new_generic_table()
+            # `static if` selection, BEFORE anything else looks at a declaration. The target
+            # predefines seed the const table so a condition naming one folds; the branch
+            # conditions themselves may then reference ordinary consts, which fold_consts
+            # resolves in its own fixpoint below. Every later pass iterates `top` (the taken
+            # branches, flattened) rather than `file.top_decls`, so a branch is selected once
+            # instead of nine times.
+            register_target_consts(structs)
+            static_branch_lines: darray[u32] = file.static_if_lines
+            top: mutable darray[Decl] = []
+            # FIXPOINT, not one pass: a branch condition may name a const declared in an
+            # EARLIER branch (arena.elisa picks a backend, then selects again on the constant
+            # that branch defined). Selecting once left the inner condition unfoldable, so it
+            # fell to `static else` and the wrong backend was compiled -- silently, since both
+            # branches are valid code. Each round selects, flattens, then registers and folds
+            # the consts the newly-taken branches brought into scope; a round that selects
+            # nothing new is the fixpoint. Bounded by the branch count.
+            for _selection_round in 0..<(file.static_if_lines.count + 1) |top, structs, file, static_branch_lines|:
+                round_taken: darray[u32] = selected_static_if_lines(file, structs)
+                round_top: mutable darray[Decl] = []
+                flatten_static_branches(file.top_decls, static_branch_lines, round_taken, round_top)
+                settled: bool = round_top.count == top.count
+                top <- round_top
+                break if settled
+                for round_declaration in top |structs|:
+                    register_const(round_declaration, structs)
+                fold_consts(file, top, structs)
+
             # Templates must be known before any body is emitted: a call decides between
             # "ordinary function" and "instantiate a generic" by looking here.
-            register_generics(file, generics)
+            register_generics(file, top, generics)
             fns: mutable FnTable = FnTable{names: [], owners: [], needs_arena: [], is_error: [], handles: [], returns: [], param_types: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
@@ -6660,8 +6784,8 @@ module Backend:
             # Generic struct templates first: a concrete struct's field may name a
             # `Base[args]` application, and register_struct_name must know to SKIP a template
             # rather than register it as a (fieldless) concrete type.
-            register_generic_structs(file, structs)
-            for declaration in file.top_decls |structs, ctx|:
+            register_generic_structs(file, top, structs)
+            for declaration in top |structs, ctx|:
                 register_struct_name(declaration, structs, ctx)
                 # Const enums resolve to a scalar, so they must be known before any
                 # signature or field mentioning one is resolved.
@@ -6674,14 +6798,14 @@ module Backend:
             resolve_aliases(file, structs)
             # Consts are registered after aliases so a const may be alias-typed, and folded
             # in their own fixpoint pass.
-            for declaration in file.top_decls |structs|:
+            for declaration in top |structs|:
                 register_const(declaration, structs)
-            fold_consts(file, structs)
-            materialize_const_aggregates(file, structs, m, ctx)
+            fold_consts(file, top, structs)
+            materialize_const_aggregates(file, top, structs, m, ctx)
             # A struct whose body cannot be modeled stays OPAQUE (named, no body): every
             # function touching it then declines individually and is stripped below. An
             # unreachable use never runs; a reachable one fails llc/link LOUDLY.
-            for declaration in file.top_decls |structs, ctx|:
+            for declaration in top |structs, ctx|:
                 _ = set_struct_body(declaration, structs, ctx)
 
             # Passes 3 and 4 cover FUNCTIONS only: a struct declaration emits no code of
@@ -6691,7 +6815,7 @@ module Backend:
             # A function whose SIGNATURE cannot be modeled is simply not declared: it has
             # no entry in `fns`, so every call to it declines its CALLER (which is then
             # stripped below). Only `main` failing is fatal to the module.
-            for declaration in file.top_decls |fns, structs, generics, m, ctx|:
+            for declaration in top |fns, structs, generics, m, ctx|:
                 # A MODULE's functions are declared under the module's name as their owner
                 # (stage0 emits `module M: def get()` as `@M.get`). Without this a module's
                 # functions were never declared at all and every qualified call declined.
@@ -6722,7 +6846,7 @@ module Backend:
 
             emitted_count: mutable i64 = 0
             main_ok: mutable bool = false
-            for declaration in file.top_decls |emitted_count, main_ok, fns, structs, m, ctx, builder|:
+            for declaration in top |emitted_count, main_ok, fns, structs, m, ctx, builder|:
                 if declaration is Decl.Module(module_name, module_body, module_line):
                     for nested in module_body |emitted_count, fns, structs, m, ctx, builder, module_name|:
                         nested_name: sview = function_name_of(nested)
@@ -6759,7 +6883,7 @@ module Backend:
             # Without a successfully emitted `main` the module is not a program: decline.
             -1 return if not main_ok
             # AFTER the bodies: every function must already have its handle in `fns`.
-            emit_debug_info(file, m, fns, source_name, ctx) if want_debug
+            emit_debug_info(file, top, m, fns, source_name, ctx) if want_debug
             return emitted_count
 
 

@@ -948,6 +948,18 @@ run_case const_array_2d_asym 'const g: i64[2][3] = [[1, 2], [3, 4], [5, 6]]\n\nd
 # A const array of CONST-ENUM values: each variant folds to its ordinal, so the global is a
 # `[N x i8]` of ordinals (stage0's `@cs = internal constant [2 x i8] c"\00\02"`).
 run_case const_array_of_enum 'const enum C of u8:\n    R\n    G\n    B\n\nconst cs: C[2] = [C.R, C.B]\n\ndef main() -> i64:\n    return match cs[1]:\n        C.B: 2\n        _: 0\n'   2
+
+# `static if` branch SELECTION. The parser keeps every branch (a name declared in two
+# branches is not a duplicate), so the backend must pick exactly one -- before it did, a
+# per-target const was declared once per branch and everything reading one declined.
+# POSIX is true on this host, so the elif wins over both the false if and the else.
+run_case static_if_selects_branch 'static if ELISA_TARGET_OS_WINDOWS:\n    const PICK: int = 1\nstatic elif ELISA_TARGET_OS_POSIX:\n    const PICK: int = 42\nstatic else:\n    const PICK: int = 3\n\ndef main() -> i64:\n    return PICK.i64()\n' 42
+# NESTED selection: the second chain's condition names a const the FIRST chain declared,
+# so selection must iterate to a fixpoint. One pass left `BACKEND` unfoldable, fell to the
+# else, and compiled the wrong function -- silently, since both branches are valid code.
+run_case static_if_nested_const_chain 'const B_MMAP: int = 1\nconst B_MALLOC: int = 2\n\nstatic if ELISA_TARGET_OS_POSIX:\n    const BACKEND: int = B_MMAP\nstatic else:\n    const BACKEND: int = B_MALLOC\n\nstatic if BACKEND == B_MMAP:\n    def pick() -> i64:\n        return 40\nstatic else:\n    def pick() -> i64:\n        return 7\n\ndef main() -> i64:\n    return pick() + 2\n' 42
+# A FUNCTION declared in the untaken branch must not shadow or duplicate the taken one.
+run_case static_if_untaken_fn_dropped 'static if ELISA_TARGET_OS_WINDOWS:\n    def who() -> i64:\n        return 1\nstatic else:\n    def who() -> i64:\n        return 42\n\ndef main() -> i64:\n    return who()\n' 42
 # cstr byte indexing lowers to ctx_string_index(s, i) -> i64 (stage0's shape).
 run_case cstr_index_const 'def main() -> i64:\n    s: cstr = "ABC"\n    return s[0].i64() + s[2].i64()\n'   132
 run_case cstr_index_dynamic 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", 1)\n'   89
