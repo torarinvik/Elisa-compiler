@@ -1,0 +1,117 @@
+# Loop-invariant PRESERVATION (docs/90 tier). An `invariant P` established on entry must
+# be re-established by every iteration; stage0 warns when the body provably cannot (or
+# cannot be shown to) preserve it. The decidable core, pinned against stage0:
+#
+#     invariant i < 5;   i <- i + 1     -> flags   (i can be 4; 5 is not < 5)
+#     invariant i >= 100; i <- i + 1    -> clean   (a non-negative step preserves >=)
+#     invariant i >= 100; i <- 0        -> flags   (a constant that fails the bound —
+#                                                   including via a NESTED loop's body)
+#
+# Only `var cmp const` invariants over a variable whose body updates are constants or
+# `var + const` steps are judged; anything else (quantifiers, cross-variable bounds)
+# stays with the real prover.
+extend Semantic:
+    private:
+        # The invariant's (variable, operator, bound) when it has the judged shape.
+        def invariant_shape(predicate: Ast::Expr) -> (found: bool, name: sview, operator: TokenKind, bound: i64):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return invariant_shape(inner)
+                    Expr.Binary(left, operator, right, line):
+                        (false, sview("", 0, 0), operator, 0) return if not is_comparison_operator(operator)
+                        left_name: sview = ident_name_of(left)
+                        bound: (found: bool, value: i64) = fold_const_int(right)
+                        (true, left_name, operator, bound.value) return if left_name != "" and bound.found
+                        return (false, sview("", 0, 0), operator, 0)
+                    _:
+                        return (false, sview("", 0, 0), TokenKind.EqEq, 0)
+
+
+        # Whether the BODY (recursively, nested control flow included) provably breaks
+        # the invariant: a constant store failing the bound, or a step in the bound's
+        # losing direction (strictly positive against an upper bound; strictly negative
+        # against a lower bound — the invariant alone cannot absorb it).
+        def invariant_body_breaks(statements: darray[Ast::Stmt], name: sview, operator: TokenKind, bound: i64) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |name, operator, bound|:
+                    match statement:
+                        Stmt.Assign(target, assign_operator, value, line):
+                            continue if ident_name_of(target) != name
+                            value_names: mutable darray[sview] = []
+                            value_coeffs: mutable darray[i64] = []
+                            value_konst: mutable i64 = 0
+                            value_linear: bool = lin_add(value, 1, value_names, value_coeffs, value_konst, Ast::Expr.Invalid, false, 0)
+                            continue if not value_linear
+                            self_coeff: mutable i64 = 0
+                            other_vars: mutable bool = false
+                            term: mutable usize = 0
+                            while term < value_names.count |self_coeff, other_vars, term, name, value_names, value_coeffs|:
+                                is_self: bool = value_names[term] == name
+                                self_coeff <- value_coeffs[term] if is_self
+                                other_vars <- true if not is_self and value_coeffs[term] != 0
+                                term <- term + 1
+                            continue if other_vars
+                            # `v <- CONST`: violated outright when the constant fails.
+                            if self_coeff == 0:
+                                true return if operator == TokenKind.Lt and not (value_konst < bound)
+                                true return if operator == TokenKind.LtEq and not (value_konst <= bound)
+                                true return if operator == TokenKind.Gt and not (value_konst > bound)
+                                true return if operator == TokenKind.GtEq and not (value_konst >= bound)
+                                continue
+                            continue if self_coeff != 1
+                            # `v <- v + d`: the losing direction cannot be re-proven from
+                            # the invariant alone.
+                            true return if value_konst > 0 and (operator == TokenKind.Lt or operator == TokenKind.LtEq)
+                            true return if value_konst < 0 and (operator == TokenKind.Gt or operator == TokenKind.GtEq)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if invariant_body_breaks(then_body, name, operator, bound)
+                            true return if invariant_body_breaks(else_body, name, operator, bound)
+                        Stmt.While(condition, while_body, while_line):
+                            true return if invariant_body_breaks(while_body, name, operator, bound)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            true return if invariant_body_breaks(block_body, name, operator, bound)
+                        _:
+                            pass
+                return false
+
+
+        def loop_invariant_walk(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.While(condition, while_body, line):
+                            for body_statement in while_body |table| -> table:
+                                match body_statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        continue if kind != "invariant"
+                                        shape: (found: bool, name: sview, operator: TokenKind, bound: i64) = invariant_shape(expression)
+                                        continue if not shape.found
+                                        breaks: bool = invariant_body_breaks(while_body, shape.name, shape.operator, shape.bound)
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LoopInvariantNotPreserved, name: shape.name, line: contract_line, expected: "", actual: ""}) if breaks
+                                    _:
+                                        pass
+                            table <- loop_invariant_walk(while_body, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- loop_invariant_walk(then_body, table)
+                            table <- loop_invariant_walk(else_body, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- loop_invariant_walk(for_body, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- loop_invariant_walk(block_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_loop_invariant_preserved(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            table <- loop_invariant_walk(body, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_loop_invariant_preserved(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_loop_invariant_preserved(scoped_body, table)
+                        _:
+                            pass
