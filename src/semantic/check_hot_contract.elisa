@@ -9,6 +9,72 @@ extend Semantic:
             can Abort.Panic:
                 return any decorator in decorators where decorator.name == "hot"
 
+        # Collect the root identifiers used as an INDEX receiver (`p[i]`) anywhere in a body.
+        def hot_collect_indexed_idents(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            hot_indexed_in_expr(expression, out)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            hot_indexed_in_expr(value, out)
+                        Stmt.Assign(target, operator, value, line):
+                            hot_indexed_in_expr(target, out)
+                            hot_indexed_in_expr(value, out)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                hot_indexed_in_expr(returned, out)
+                        Stmt.If(condition, then_body, else_body, line):
+                            hot_indexed_in_expr(condition, out)
+                            hot_collect_indexed_idents(then_body, out)
+                            hot_collect_indexed_idents(else_body, out)
+                        Stmt.While(condition, while_body, line):
+                            hot_indexed_in_expr(condition, out)
+                            hot_collect_indexed_idents(while_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            hot_collect_indexed_idents(for_body, out)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            hot_collect_indexed_idents(block_body, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out|:
+                                hot_collect_indexed_idents(arm.body, out)
+                        _:
+                            pass
+
+        def hot_indexed_in_expr(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Index(object, argument, line):
+                        out.push(ident_name_of(object)) if ident_name_of(object) != ""
+                        hot_indexed_in_expr(object, out)
+                        hot_indexed_in_expr(argument, out)
+                    Expr.Binary(left, operator, right, line):
+                        hot_indexed_in_expr(left, out)
+                        hot_indexed_in_expr(right, out)
+                    Expr.Unary(operator, operand, line):
+                        hot_indexed_in_expr(operand, out)
+                    Expr.Paren(inner, line):
+                        hot_indexed_in_expr(inner, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments |out|:
+                            hot_indexed_in_expr(argument, out)
+                    _:
+                        pass
+
+        # The count of DISTINCT mutable-`darray[T]&` parameters that are indexed in the body.
+        # Two or more such buffers are never provably disjoint (they are forwarded, not fresh
+        # `[]`/`clone` locals), so LLVM keeps a runtime alias-guard and the kernel will not
+        # vectorize — stage0's `@hot` vectorization warning.
+        def hot_aliasing_darray_params(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt]) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                indexed: mutable darray[sview] = []
+                hot_collect_indexed_idents(body, indexed)
+                count: mutable usize = 0
+                for parameter in parameters |count, indexed|:
+                    is_mutable_darray_ref: bool = is_darray_type(parameter.type_expression) and type_marker_present(parameter.type_expression, TokenKind.Ampersand) and type_marker_present(parameter.type_expression, TokenKind.Mutable)
+                    count <- count + 1 if is_mutable_darray_ref and (any indexed_name in indexed where indexed_name == parameter.name)
+                return count
+
         # Accumulate every granted effect name from `can ...:` blocks in a body (recursively).
         def collect_block_effects(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -40,7 +106,110 @@ extend Semantic:
                     true return if is_bad
                 return false
 
-        def check_hot_contract(declarations: darray[Ast::Decl], annotation_args: darray[sview]&, table: lmut SymbolTable) -> void:
+        # `[]`/`[…]` list literal or `clone[…](…)` — a FRESH buffer local whose address the
+        # aliasing analyzer proves distinct from every other fresh buffer.
+        def hot_value_is_fresh(value: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Array(elements, line):
+                        return true
+                    Expr.Call(callee, arguments, argument_names, line):
+                        return ident_name_of(callee) == "clone"
+                    Expr.Index(head, argument, line):
+                        return ident_name_of(head) == "clone"
+                    Expr.Paren(inner, line):
+                        return hot_value_is_fresh(inner)
+                    _:
+                        return false
+
+        # Every `&x` address-of argument targets a fresh local (non-address args are ignored;
+        # scalars never alias a buffer).
+        def hot_call_all_fresh(arguments: darray[Ast::Expr], fresh_locals: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for argument in arguments:
+                    match argument:
+                        Expr.Unary(operator, operand, line):
+                            if operator == TokenKind.Ampersand:
+                                false return if not (any fresh_name in fresh_locals where fresh_name == ident_name_of(operand))
+                        _:
+                            pass
+                return true
+
+        # Record, per callee, whether every call site passes only fresh buffers. A hot kernel
+        # whose EVERY caller passes fresh `[]`/`clone` locals is proven disjoint (silent);
+        # one non-fresh caller (or no caller) leaves it not-provably-disjoint (warns).
+        def hot_scan_calls(statements: darray[Ast::Stmt], fresh_locals: mutable darray[sview]&, callees: mutable darray[sview]&, callee_all_fresh: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |fresh_locals, callees, callee_all_fresh|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            fresh_locals.push(name) if hot_value_is_fresh(value)
+                            hot_scan_call_expr(value, fresh_locals, callees, callee_all_fresh)
+                        Stmt.Expr(expression, line):
+                            hot_scan_call_expr(expression, fresh_locals, callees, callee_all_fresh)
+                        Stmt.Assign(target, operator, value, line):
+                            hot_scan_call_expr(value, fresh_locals, callees, callee_all_fresh)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                hot_scan_call_expr(returned, fresh_locals, callees, callee_all_fresh)
+                        Stmt.If(condition, then_body, else_body, line):
+                            hot_scan_calls(then_body, fresh_locals, callees, callee_all_fresh)
+                            hot_scan_calls(else_body, fresh_locals, callees, callee_all_fresh)
+                        Stmt.While(condition, while_body, line):
+                            hot_scan_calls(while_body, fresh_locals, callees, callee_all_fresh)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            hot_scan_calls(for_body, fresh_locals, callees, callee_all_fresh)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            hot_scan_calls(block_body, fresh_locals, callees, callee_all_fresh)
+                        _:
+                            pass
+
+        def hot_scan_call_expr(expression: Ast::Expr, fresh_locals: darray[sview]&, callees: mutable darray[sview]&, callee_all_fresh: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        name: sview = ident_name_of(callee)
+                        if name != "":
+                            callees.push(name)
+                            callee_all_fresh.push(hot_call_all_fresh(arguments, fresh_locals))
+                        for argument in arguments |callees, callee_all_fresh, fresh_locals|:
+                            hot_scan_call_expr(argument, fresh_locals, callees, callee_all_fresh)
+                    Expr.Binary(left, operator, right, line):
+                        hot_scan_call_expr(left, fresh_locals, callees, callee_all_fresh)
+                        hot_scan_call_expr(right, fresh_locals, callees, callee_all_fresh)
+                    Expr.Paren(inner, line):
+                        hot_scan_call_expr(inner, fresh_locals, callees, callee_all_fresh)
+                    _:
+                        pass
+
+        # Names of hot kernels whose EVERY call site passes only fresh buffers (≥1 call).
+        def hot_collect_proven_disjoint(declarations: darray[Ast::Decl], callees: mutable darray[sview]&, callee_all_fresh: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |callees, callee_all_fresh|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            fresh_locals: mutable darray[sview] = []
+                            hot_scan_calls(body, fresh_locals, callees, callee_all_fresh)
+                        Decl.Module(module_name, module_body, module_line):
+                            hot_collect_proven_disjoint(module_body, callees, callee_all_fresh)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            hot_collect_proven_disjoint(scoped_body, callees, callee_all_fresh)
+                        _:
+                            pass
+
+        def hot_is_proven_disjoint(name: sview, callees: darray[sview]&, callee_all_fresh: darray[bool]&) -> bool:
+            can Abort.Panic:
+                seen: mutable bool = false
+                all_fresh: mutable bool = true
+                probe: mutable usize = 0
+                while probe < callees.count |probe, seen, all_fresh, name, callees, callee_all_fresh|:
+                    if callees[probe] == name:
+                        seen <- true
+                        all_fresh <- false if not callee_all_fresh[probe]
+                    probe <- probe + 1
+                return seen and all_fresh
+
+        def hot_contract_walk(declarations: darray[Ast::Decl], annotation_args: darray[sview]&, callees: darray[sview]&, callee_all_fresh: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -53,9 +222,18 @@ extend Semantic:
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.HotContract, name: function_name, line: line, expected: "pointer", actual: ""}) if chases
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.HotContract, name: function_name, line: line, expected: "alloc", actual: ""}) if allocates and not chases
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.HotArgument, name: function_name, line: line, expected: "", actual: ""}) if hot_argument_invalid(decorators, annotation_args)
+                                aliasing: bool = hot_aliasing_darray_params(parameters, body) >= 2 and not hot_is_proven_disjoint(function_name, callees, callee_all_fresh)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.HotVectorize, name: function_name, line: line, expected: "", actual: ""}) if aliasing
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_hot_contract(module_body, annotation_args, table)
+                            table <- hot_contract_walk(module_body, annotation_args, callees, callee_all_fresh, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_hot_contract(scoped_body, annotation_args, table)
+                            table <- hot_contract_walk(scoped_body, annotation_args, callees, callee_all_fresh, table)
                         _:
                             pass
+
+        def check_hot_contract(declarations: darray[Ast::Decl], annotation_args: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                callees: mutable darray[sview] = []
+                callee_all_fresh: mutable darray[bool] = []
+                hot_collect_proven_disjoint(declarations, callees, callee_all_fresh)
+                table <- hot_contract_walk(declarations, annotation_args, callees, callee_all_fresh, table)
