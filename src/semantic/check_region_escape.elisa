@@ -13,6 +13,50 @@
 # use param regions that are NOT on the local block nesting, so they never match here).
 extend Semantic:
     private:
+        # Peel `&v` to the borrowed base.
+        def view_arg_base(argument: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Unary(operator, operand, line):
+                        return view_arg_base(operand) if operator == TokenKind.Ampersand else argument
+                    Expr.Paren(inner, paren_line):
+                        return view_arg_base(inner)
+                    _:
+                        return argument
+
+
+        # Free functions whose RETURN type is a view family (`view[u8]`, `sview`) — the
+        # result aliases an argument's backing.
+        def collect_view_returning_fns(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            if return_type is declared_return:
+                                out.push(name) if return_type_is_view(declared_return)
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_view_returning_fns(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_view_returning_fns(scoped_body, out)
+                        _:
+                            pass
+
+
+        def return_type_is_view(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, line):
+                        return name == "sview"
+                    Expr.Index(object, element, index_line):
+                        return ident_name_of(object) == "view"
+                    Expr.Unary(operator, operand, unary_line):
+                        return return_type_is_view(operand)
+                    Expr.Paren(inner, paren_line):
+                        return return_type_is_view(inner)
+                    _:
+                        return false
+
+
         # The declared @region of a local, or "" when it carries none.
         def local_region_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, before_line: u32) -> sview:
             can Memory.Allocate, Abort.Panic:
@@ -38,53 +82,64 @@ extend Semantic:
         # literal `[v, …]` — the (single) inner region shared by its element idents. Returns
         # "" when no region-annotated value is found. Sound: only explicitly-annotated
         # idents contribute, so a region-less element yields no false region.
-        def stored_value_region(value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, line: u32) -> sview:
+        def stored_value_region(value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, line: u32) -> sview:
             can Memory.Allocate, Abort.Panic:
                 match value:
                     Expr.Ident(name, ident_line):
                         return local_region_name(annotations, name, line)
                     Expr.Paren(inner, paren_line):
-                        return stored_value_region(inner, annotations, line)
+                        return stored_value_region(inner, annotations, view_fns, line)
                     Expr.Index(head, argument, index_line):
                         # A view/element of a region-local (`v[i]`) lives in the base's region.
-                        return stored_value_region(head, annotations, line)
+                        return stored_value_region(head, annotations, view_fns, line)
                     Expr.Slice(object, low, high, slice_line):
                         # A slice `v[0:n]` is a view into the base's region.
-                        return stored_value_region(object, annotations, line)
+                        return stored_value_region(object, annotations, view_fns, line)
                     Expr.Field(object, field, field_line):
                         # A field of a region-local lives in the same region.
-                        return stored_value_region(object, annotations, line)
+                        return stored_value_region(object, annotations, view_fns, line)
                     Expr.Call(callee, arguments, argument_names, call_line):
                         # A view-producing method on a region-local (`d.as_sview()`,
                         # `d.as_cstr()`, `d.as_view()`, `d.as_slice()`) aliases the region's
                         # backing. Other methods (`d.count()`) return owned values → not a region
                         # dependency, so only these whitelisted borrows carry the region.
-                        return stored_view_method_region(callee, annotations, line)
+                        method_region: sview = stored_view_method_region(callee, annotations, view_fns, line)
+                        method_region return if method_region != ""
+                        # A VIEW-returning free function's result aliases its argument's
+                        # backing (`escaped <- head(&v, 1)` with v @inner ties the view
+                        # to inner) — cross-function view provenance.
+                        called: sview = ident_name_of(callee)
+                        return_region: mutable sview = sview("", 0, 0)
+                        if called != "" and (any vf in view_fns where vf == called):
+                            for argument in arguments |return_region|:
+                                candidate2: sview = stored_value_region(view_arg_base(argument), annotations, view_fns, line)
+                                return_region <- candidate2 if return_region == "" and candidate2 != ""
+                        return return_region
                     Expr.Move(inner, move_line):
-                        return stored_value_region(inner, annotations, line)
+                        return stored_value_region(inner, annotations, view_fns, line)
                     Expr.Array(elements, array_line):
                         element_region: mutable sview = sview("", 0, 0)
                         for element in elements |element_region|:
-                            candidate: sview = stored_value_region(element, annotations, line)
+                            candidate: sview = stored_value_region(element, annotations, view_fns, line)
                             element_region <- candidate if candidate != ""
                         return element_region
                     Expr.Comprehension(variable, iterable, condition, body, comprehension_line):
-                        return stored_value_region(body, annotations, line)
+                        return stored_value_region(body, annotations, view_fns, line)
                     Expr.If(condition, then_expression, else_expression, if_line):
                         # A conditional value `v if c else w` escapes if EITHER branch carries
                         # an inner region.
-                        then_region: sview = stored_value_region(then_expression, annotations, line)
-                        return then_region if then_region != "" else stored_value_region(else_expression, annotations, line)
+                        then_region: sview = stored_value_region(then_expression, annotations, view_fns, line)
+                        return then_region if then_region != "" else stored_value_region(else_expression, annotations, view_fns, line)
                     _:
                         return sview("", 0, 0)
 
         # The region of the receiver of a whitelisted view-producing method call, else "".
-        def stored_view_method_region(callee: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, line: u32) -> sview:
+        def stored_view_method_region(callee: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, line: u32) -> sview:
             can Memory.Allocate, Abort.Panic:
                 match callee:
                     Expr.Field(object, method, field_line):
                         is_view_method: bool = method == "as_sview" or method == "as_cstr" or method == "as_view" or method == "as_slice" or method == "as_str"
-                        stored_value_region(object, annotations, line) return if is_view_method
+                        stored_value_region(object, annotations, view_fns, line) return if is_view_method
                         return sview("", 0, 0)
                     _:
                         return sview("", 0, 0)
@@ -130,7 +185,7 @@ extend Semantic:
 
         # Report a `container.push/extend(value)` whose value region is nested strictly
         # inside (shorter-lived than) the container region.
-        def region_escape_check_store(expression: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+        def region_escape_check_store(expression: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
@@ -141,7 +196,7 @@ extend Semantic:
                         is_extend: bool = grow_call_is_extend(callee)
                         return if is_extend and not receiver_elements_are_containers(annotations, grow.receiver, line)
                         container_region: sview = local_region_name(annotations, grow.receiver, line)
-                        value_region: sview = stored_value_region(arguments[grow.value_index], annotations, line)
+                        value_region: sview = stored_value_region(arguments[grow.value_index], annotations, view_fns, line)
                         return if container_region == "" or value_region == "" or container_region == value_region
                         container_position: (found: bool, position: usize) = region_stack_position(nesting, container_region)
                         value_position: (found: bool, position: usize) = region_stack_position(nesting, value_region)
@@ -163,7 +218,7 @@ extend Semantic:
                     is_forwardable: bool = type_contains_operator(parameter.type_expression, TokenKind.Ampersand) and not type_contains_operator(parameter.type_expression, TokenKind.Static) and not type_contains_heap(parameter.type_expression)
                     out.push(parameter.name) if is_forwardable
 
-        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, table: lmut SymbolTable) -> void:
+        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 target_name: sview = ident_name_of(target)
                 return if target_name == ""
@@ -174,7 +229,7 @@ extend Semantic:
                 if target_is_global_mutable and value_is_ref_param:
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: "", actual: ""})
                     return
-                value_region: sview = stored_value_region(value, annotations, line)
+                value_region: sview = stored_value_region(value, annotations, view_fns, line)
                 return if value_region == ""
                 value_position: (found: bool, position: usize) = region_stack_position(nesting, value_region)
                 # Store of a function-local region value into a GLOBAL is an unconditional escape:
@@ -228,7 +283,7 @@ extend Semantic:
                         _:
                             pass
 
-        def region_escape_walk(statements: darray[Ast::Stmt], nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, table: lmut SymbolTable) -> void:
+        def region_escape_walk(statements: darray[Ast::Stmt], nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 # Locals visible from a child scope = the enclosing set plus every local declared
                 # directly at this level. Passed as the `outer_locals` of child region/control blocks
@@ -247,30 +302,30 @@ extend Semantic:
                             # forwarded-ref-into-global escape inside its body.
                             grants_stale: bool = (kind == "can" or kind == "trusted") and (any grant in clause where grant == "Unsafe.StaleRef" or grant == "StaleRef")
                             granted_ref_params: darray[sview] = [] if grants_stale else [ref_name for ref_name in ref_params]
-                            table <- region_escape_walk(body, child_stack, annotations, mutable_globals, granted_ref_params, child_outer_locals, table)
+                            table <- region_escape_walk(body, child_stack, annotations, mutable_globals, granted_ref_params, child_outer_locals, view_fns, table)
                         Stmt.Expr(expression, line):
-                            table <- region_escape_check_store(expression, line, nesting, annotations, table)
+                            table <- region_escape_check_store(expression, line, nesting, annotations, view_fns, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- region_escape_check_store(value, line, nesting, annotations, table)
+                            table <- region_escape_check_store(value, line, nesting, annotations, view_fns, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- region_escape_check_store(value, line, nesting, annotations, table)
-                            table <- region_escape_check_assign(target, value, line, nesting, annotations, mutable_globals, ref_params, outer_locals, table)
+                            table <- region_escape_check_store(value, line, nesting, annotations, view_fns, table)
+                            table <- region_escape_check_assign(target, value, line, nesting, annotations, mutable_globals, ref_params, outer_locals, view_fns, table)
                         Stmt.Return(value, line):
                             if value is returned:
-                                returned_region: sview = stored_value_region(returned, annotations, line)
+                                returned_region: sview = stored_value_region(returned, annotations, view_fns, line)
                                 returned_position: (found: bool, position: usize) = region_stack_position(nesting, returned_region)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionReturnEscape, name: "", line: line, expected: "", actual: returned_region}) if returned_region != "" and returned_position.found
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- region_escape_walk(then_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, table)
-                            table <- region_escape_walk(else_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, table)
+                            table <- region_escape_walk(then_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, table)
+                            table <- region_escape_walk(else_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, table)
                         Stmt.While(condition, while_body, line):
-                            table <- region_escape_walk(while_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, table)
+                            table <- region_escape_walk(while_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- region_escape_walk(for_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, table)
+                            table <- region_escape_walk(for_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, table)
                         _:
                             pass
 
-        def check_region_escape_walk(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_region_escape_walk(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, view_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -279,11 +334,11 @@ extend Semantic:
                             ref_params: mutable darray[sview] = []
                             collect_forwardable_ref_params(parameters, ref_params)
                             empty_outer_locals: darray[sview] = []
-                            table <- region_escape_walk(body, empty_stack, annotations, mutable_globals, ref_params, empty_outer_locals, table)
+                            table <- region_escape_walk(body, empty_stack, annotations, mutable_globals, ref_params, empty_outer_locals, view_fns, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_region_escape_walk(module_body, annotations, mutable_globals, table)
+                            table <- check_region_escape_walk(module_body, annotations, mutable_globals, view_fns, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_region_escape_walk(scoped_body, annotations, mutable_globals, table)
+                            table <- check_region_escape_walk(scoped_body, annotations, mutable_globals, view_fns, table)
                         _:
                             pass
 
@@ -291,4 +346,6 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 mutable_globals: mutable darray[sview] = []
                 collect_mutable_globals(file.top_decls, mutable_globals)
-                table <- check_region_escape_walk(file.top_decls, file.local_region_annotations, mutable_globals, table)
+                view_fns: mutable darray[sview] = []
+                collect_view_returning_fns(file.top_decls, view_fns)
+                table <- check_region_escape_walk(file.top_decls, file.local_region_annotations, mutable_globals, view_fns, table)
