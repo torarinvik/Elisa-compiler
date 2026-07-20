@@ -20,6 +20,13 @@ RUN() {
     if command -v timeout >/dev/null 2>&1; then timeout 10 "$@"; else "$@"; fi
 }
 set -u
+# A MISSPELLED or not-yet-defined check helper is `command not found` -- which bash reports
+# on stderr and then keeps going, so the check never runs, `total` never increments, and the
+# gate still prints OK. That is a gate that silently stops testing. Trap it: any unknown
+# command marks the run failed (observed with a `stage1_ir_case` call placed above its own
+# definition, which cost two checks with a green result).
+command_not_found_handle() { echo "  FAIL: unknown command '$1' -- a check did not run"; helper_missing=1; }
+helper_missing=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
@@ -393,6 +400,13 @@ ir_case() {
 ir_case cstr_global_shape 'def main() -> i64:\n    s: cstr = "hi"\n    return 42\n' '^@str = private unnamed_addr constant \[3 x i8\] c"hi\\00"'
 ir_case cstr_param_is_ptr 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n' 'define i64 @take\(ptr'
 
+# An extern returning a POINTER must declare as `ptr`. The `return_type_name` side table
+# keeps only the bare head name (`void`), so before the `__extern_return_ptr` annotation
+# this lowered to a `void` return and every FFI allocator was undeclarable.
+ir_case extern_ptr_return 'extern malloc(n: usize) -> mutable heap void&\n\ndef main() -> i64:\n    p: mutable heap void& = malloc(64)\n    return 42\n' '^declare ptr @malloc\(i64\)'
+ir_case extern_optional_ptr_return 'extern malloc(n: usize) -> mutable heap void&?\n\ndef main() -> i64:\n    p: mutable heap void&? = malloc(64)\n    return 42\n' '^declare ptr @malloc\(i64\)'
+# (the heap-optional TAG shape is asserted below, once stage1_ir_case is defined)
+
 # --- stage1-only IR assertions -------------------------------------------------------
 # The WEAKEST check in this suite, used only where a differential is IMPOSSIBLE rather than
 # merely inconvenient. Unlike ir_case (which requires stage0 to emit the same line), this
@@ -438,6 +452,14 @@ stage1_ir_absent_case() {
 # emitted code while every one of the 244 behavioural checks stayed green. Nothing in this
 # suite could see it -- stage0's module header is what gave it away.
 stage1_ir_case module_datalayout 'def main() -> i64:\n    return 42\n' '^target datalayout = ".+i64:64'
+
+# For a HEAP pointer, null IS the absent case, so the optional's tag must be a real null
+# test. A hardcoded `true` tag reports a FAILED allocation as present and hands the program
+# a null it believes is real -- unobservable in any exit code that does not allocate.
+stage1_ir_case extern_optional_ptr_null_tag 'extern malloc(n: usize) -> mutable heap void&?\n\ndef main() -> i64:\n    p: mutable heap void&? = malloc(64)\n    if p is real:\n        return 7\n    return 3\n' 'icmp ne ptr %call, null'
+# An ordinary (never-null) ref keeps the CONSTANT tag -- the null test is for heap pointers
+# only, and widening it to all refs would be a silent behavior change.
+stage1_ir_case optional_plain_ref_const_tag 'def main() -> i64:\n    v: i64 = 5\n    r: i64&? = &v\n    if r is real:\n        return 7\n    return 3\n' 'store i1 true'
 stage1_ir_case module_triple 'def main() -> i64:\n    return 42\n' '^target triple = "arm64'
 stage1_ir_absent_case store_not_underaligned 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' 'store i64 %comp.var.value, ptr %comp.var, align 4'
 
@@ -1039,6 +1061,10 @@ run_case match_binding_arm 'def classify(n: i64) -> i64:\n    return match n:\n 
 
 if [ "$pass" -ne "$total" ]; then
     echo "backend_native_smoke FAILED: passed=$pass total=$total"
+    exit 1
+fi
+if [ "$helper_missing" -ne 0 ]; then
+    echo "backend_native_smoke FAILED: a check helper was undefined, so some checks never ran"
     exit 1
 fi
 echo "backend_native_smoke OK: $pass/$total native compile-and-run checks"
