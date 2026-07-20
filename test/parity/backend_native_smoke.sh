@@ -909,6 +909,11 @@ run_case enum_multi_field_payload 'enum Pair:\n    Both(a: i64, b: i64)\n\ndef m
 run_case enum_multi_field_mixed_width 'enum P:\n    Pt(i32, i64)\n    None\n\ndef f(p: P) -> i64:\n    return match p:\n        P.Pt(a, b): a.i64() + b\n        _: 0\n\ndef main() -> i64:\n    return f(P.Pt(7, 35))\n'   42
 run_case enum_multi_field_three 'enum V:\n    A(i64, i64, i64)\n\ndef s(v: V) -> i64:\n    return match v:\n        V.A(x, y, z): x + y + z\n        _: 0\n\ndef main() -> i64:\n    return s(V.A(10, 20, 30))\n'   60
 run_case enum_multi_field_stmt_match 'enum Shape:\n    Rect(i64, i64)\n    None\n\ndef f(s: Shape) -> i64:\n    match s:\n        Shape.Rect(w, h):\n            return w * h\n        _:\n            return 0\n\ndef main() -> i64:\n    return f(Shape.Rect(4, 5))\n'   20
+# `if EXPR is Enum.Variant(binders…):` narrowing — the tag test is the condition and each
+# payload field binds into the then-block (single-field and multi-field).
+run_case penum_is_narrow_single 'enum B:\n    V(i64)\n    None\n\ndef main() -> i64:\n    b: B = B.V(42)\n    if b is B.V(n):\n        return n\n    return 0\n'   42
+run_case penum_is_narrow_nomatch 'enum B:\n    V(i64)\n    None\n\ndef main() -> i64:\n    b: B = B.None\n    if b is B.V(n):\n        return n\n    return 7\n'   7
+run_case penum_is_narrow_multi 'enum Shape:\n    Rect(i64, i64)\n    None\n\ndef main() -> i64:\n    s: Shape = Shape.Rect(4, 5)\n    if s is Shape.Rect(w, h):\n        return w * h\n    return 0\n'   20
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
