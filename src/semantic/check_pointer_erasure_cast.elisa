@@ -71,52 +71,121 @@ extend Semantic:
                     _:
                         return false
 
-        def check_pointer_erasure_expression(expression: Ast::Expr, in_trusted: bool, enforce_unsafe_permissions: bool, signature_granted: bool, legacy_walk: bool, immutable_params: darray[sview]&, table: lmut SymbolTable) -> void:
+        # `static u8&` / `mutable static u8&` — an UNBOUNDED string target. Casting an
+        # interior pointer to one erases the container's length, so a C-string scan can run
+        # off the end. Distinct from the ungranted-effect diagnostic: stage0 reports this
+        # even INSIDE a `can`/`trusted` block (verified for both), because the grant says
+        # "I accept the pointer cast", not "I accept losing the bound".
+        def unbounded_string_target(target: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                is_static: bool = type_marker_present_here(target, TokenKind.Static)
+                is_ref: bool = type_marker_present_here(target, TokenKind.Ampersand)
+                # NOT bare_type_name_through_ref: that returns "" the moment it meets a
+                # marker outside {mutable, &, lmut}, and `static` is exactly such a marker,
+                # so it reports "" for every `static u8&` and the check never fired.
+                base: sview = erasure_base_type_name(target)
+                empty_target: sview = sview("", 0, 0)
+                empty_target return if not (is_static and is_ref and base == "u8")
+                return "static mutable u8&" if type_marker_present_here(target, TokenKind.Mutable) else "static u8&"
+
+
+        # The base type name, walking through EVERY unary type marker (`static`, `mutable`,
+        # `&`, `lmut`).
+        def erasure_base_type_name(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        return erasure_base_type_name(operand)
+                    Expr.Paren(inner, paren_line):
+                        return erasure_base_type_name(inner)
+                    Expr.Ident(name, ident_line):
+                        return name
+                    _:
+                        return sview("", 0, 0)
+
+
+        def type_marker_present_here(type_expression: Ast::Expr, marker: TokenKind) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        true return if operator == marker
+                        return type_marker_present_here(operand, marker)
+                    _:
+                        return false
+
+
+        # Whether RECEIVER is an address-of an INDEX (`&self.data[off]`) -- an interior
+        # pointer into a container, which is what makes the length meaningful to lose.
+        def receiver_is_interior_pointer(receiver: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match receiver:
+                    Expr.Unary(operator, operand, line):
+                        false return if operator != TokenKind.Ampersand
+                        return match operand:
+                            Expr.Index(object, index, index_line): true
+                            _: false
+                    Expr.Paren(inner, paren_line):
+                        return receiver_is_interior_pointer(inner)
+                    _:
+                        return false
+
+
+        def check_pointer_erasure_expression(expression: Ast::Expr, in_trusted: bool, enforce_unsafe_permissions: bool, signature_granted: bool, block_granted: bool, legacy_walk: bool, immutable_params: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Index(Expr.Field(receiver, selector, field_line), target, line):
                         field_receiver: bool = pointer_erasure_field_receiver(receiver)
-                        strict_pointer_cast: bool = enforce_unsafe_permissions and (cast_target_is_pointer(target) or cast_receiver_is_address(receiver) or field_receiver)
+                        # A `can`/`trusted` BLOCK grants the effect and suppresses THIS diagnostic; a
+                        # SIGNATURE `can[...]` does not (stage0 verified both ways), which is why
+                        # this is `block_granted` and not `signature_granted` (seeded from the
+                        # signature's effect list). The length-erasure warning above is separate
+                        # and deliberately NOT suppressed -- a grant accepts the cast, not the
+                        # loss of the bound.
+                        strict_pointer_cast: bool = enforce_unsafe_permissions and not block_granted and (cast_target_is_pointer(target) or cast_receiver_is_address(receiver) or field_receiver)
                         # Default (non-strict) mode still WARNS on a visible
                         # pointer reinterpretation: a ref-typed cast target over an
                         # address-of receiver (`(&x).cast[mutable T&]`).
                         address_base: sview = address_of_base_name(receiver)
                         default_pointer_cast: bool = not enforce_unsafe_permissions and not signature_granted and cast_target_is_mutable_ref(target) and address_base != "" and (any p in immutable_params where p == address_base)
+                        # The length-erasure warning, INDEPENDENT of any grant.
+                        erasure_target: sview = unbounded_string_target(target)
+                        erases_length: bool = selector == "cast" and erasure_target != "" and receiver_is_interior_pointer(receiver)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnboundedStringErasure, name: "", line: line, expected: "", actual: erasure_target}) if erases_length
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedPointerCast, name: "", line: line, expected: "", actual: "", detail: "warn" if default_pointer_cast else ""}) if not in_trusted and selector == "cast" and (strict_pointer_cast or default_pointer_cast or (legacy_walk and field_receiver and pointer_erasure_target(target)))
-                        table <- check_pointer_erasure_expression(receiver, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                        table <- check_pointer_erasure_expression(receiver, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                     Expr.Call(callee, arguments, argument_names, line):
                         for argument in arguments |table|:
-                            table <- check_pointer_erasure_expression(argument, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_expression(argument, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                     Expr.Binary(left, operator, right, line):
-                        table <- check_pointer_erasure_expression(left, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
-                        table <- check_pointer_erasure_expression(right, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                        table <- check_pointer_erasure_expression(left, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
+                        table <- check_pointer_erasure_expression(right, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                     Expr.Paren(inner, line) | Expr.Unary(_, inner, line):
-                        table <- check_pointer_erasure_expression(inner, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                        table <- check_pointer_erasure_expression(inner, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                     Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
                         for field in fields |table|:
-                            table <- check_pointer_erasure_expression(field.value, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_expression(field.value, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                     _:
                         pass
 
 
-        def check_pointer_erasure_statements(statements: darray[Ast::Stmt], in_trusted: bool, enforce_unsafe_permissions: bool, signature_granted: bool, legacy_walk: bool, immutable_params: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_pointer_erasure_statements(statements: darray[Ast::Stmt], in_trusted: bool, enforce_unsafe_permissions: bool, signature_granted: bool, block_granted: bool, legacy_walk: bool, immutable_params: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line) | Stmt.Assign(type_expression, _, value, line):
-                            table <- check_pointer_erasure_expression(value, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_expression(value, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                         Stmt.Expr(expression, line):
-                            table <- check_pointer_erasure_expression(expression, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_expression(expression, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                         Stmt.Return(value, line):
-                            table <- check_pointer_erasure_expression(returned, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table) if value is returned
+                            table <- check_pointer_erasure_expression(returned, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table) if value is returned
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_pointer_erasure_expression(condition, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
-                            table <- check_pointer_erasure_statements(then_body, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
-                            table <- check_pointer_erasure_statements(else_body, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_expression(condition, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_statements(then_body, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_statements(else_body, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_pointer_erasure_statements(body, in_trusted or kind == "trusted", enforce_unsafe_permissions, signature_granted or kind == "can" or kind == "trusted", legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_statements(body, in_trusted or kind == "trusted", enforce_unsafe_permissions, signature_granted or kind == "can" or kind == "trusted", block_granted or kind == "can" or kind == "trusted", legacy_walk, immutable_params, table)
                         Stmt.While(_, body, line) | Stmt.For(_, _, _, body, line):
-                            table <- check_pointer_erasure_statements(body, in_trusted, enforce_unsafe_permissions, signature_granted, legacy_walk, immutable_params, table)
+                            table <- check_pointer_erasure_statements(body, in_trusted, enforce_unsafe_permissions, signature_granted, block_granted, legacy_walk, immutable_params, table)
                         _:
                             pass
 
@@ -137,7 +206,7 @@ extend Semantic:
                             for parameter in params |immutable_params|:
                                 is_mutable_binding: bool = parameter.is_mutable or type_marker_present(parameter.type_expression, TokenKind.Mutable)
                                 immutable_params.push(parameter.name) if not is_mutable_binding
-                            table <- check_pointer_erasure_statements(body, false, enforce_unsafe_permissions, effects.count > 0, enforce_unsafe_permissions or pointer_erasure_generic_line(generic_lines, line), immutable_params, table)
+                            table <- check_pointer_erasure_statements(body, false, enforce_unsafe_permissions, effects.count > 0, false, enforce_unsafe_permissions or pointer_erasure_generic_line(generic_lines, line), immutable_params, table)
                         Decl.Module(name, body, line) | Decl.Scoped(body, line):
                             table <- check_pointer_erasure_declarations(body, generic_lines, enforce_unsafe_permissions, table)
                         _:
