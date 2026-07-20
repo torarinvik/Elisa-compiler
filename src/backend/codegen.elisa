@@ -5441,10 +5441,52 @@ module Backend:
                 pass_index <- pass_index + 1
 
 
+        # Build the LLVM constant for a const aggregate initializer, RECURSIVELY: a scalar
+        # element folds to a ConstInt, an array element (`[[1,2],[3,4]]`) builds a nested
+        # ConstArray. `ok` goes false on any non-foldable element, extent mismatch, or
+        # unmodeled element type — the caller then declines the whole global.
+        def const_aggregate_value(value_expression: Expr, value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, ok: mutable bool&) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            aggregate_failure: LLVMValueRef = zeroed
+            if value_type.kind == TypeKind.Array:
+                if value_expression is Expr.Array(aggregate_elements, aggregate_line):
+                    aggregate_element_type: ValueType = copied_type(structs.array_elements[value_type.bits.usize()])
+                    aggregate_extent: u32 = structs.array_extents[value_type.bits.usize()]
+                    if aggregate_elements.count.u32() != aggregate_extent:
+                        ok <- false
+                        return aggregate_failure
+                    aggregate_element_llvm: LLVMTypeRef = llvm_type_of(aggregate_element_type, structs, ctx)
+                    aggregate_values: mutable darray[LLVMValueRef] = []
+                    aggregate_all_ok: mutable bool = true
+                    for aggregate_element in aggregate_elements |aggregate_values, aggregate_all_ok, aggregate_element_type, structs, ctx|:
+                        aggregate_child_ok: mutable bool = true
+                        aggregate_child: LLVMValueRef = const_aggregate_value(aggregate_element, aggregate_element_type, structs, ctx, aggregate_child_ok)
+                        if aggregate_child_ok:
+                            aggregate_values.push(aggregate_child)
+                        else:
+                            aggregate_all_ok <- false
+                    if not aggregate_all_ok or aggregate_values.count == 0:
+                        ok <- false
+                        return aggregate_failure
+                    aggregate_values_pointer: void& = (&aggregate_values[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMConstArray2(aggregate_element_llvm, aggregate_values_pointer, aggregate_values.count.u64())
+                ok <- false
+                return aggregate_failure
+            if is_numeric_type(value_type) or value_type.kind == TypeKind.Bool:
+                scalar_folded_ok: mutable bool = true
+                scalar_folded: i64 = fold_const_expr(value_expression, structs, scalar_folded_ok)
+                if not scalar_folded_ok:
+                    ok <- false
+                    return aggregate_failure
+                return LLVMConstInt(llvm_type_of(value_type, structs, ctx), scalar_folded.u64(), 0)
+            ok <- false
+            return aggregate_failure
+
+
         # Materialize a global const ARRAY as a real module global (`@xs = internal constant
-        # [N x i64] […]`), the way stage0 does. Only a scalar-element array whose initializer
-        # is a fully-foldable list literal of EXACTLY the declared extent is modeled; anything
-        # else leaves const_global_ok false and the const stays declined at its use sites.
+        # [N x i64] […]`), the way stage0 does. Scalar- AND nested-array elements are modeled
+        # (`i64[2][2]` -> `[2 x [2 x i64]]`) so long as the initializer is a fully-foldable
+        # literal of exactly the declared shape; anything else leaves const_global_ok false and
+        # the const stays declined at its use sites.
         def materialize_const_aggregates(file: Ast::File&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             for declaration in file.top_decls |structs, m, ctx|:
                 if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
@@ -5452,34 +5494,18 @@ module Backend:
                     continue if const_index < 0
                     const_type: ValueType = copied_type(structs.const_types[const_index.usize()])
                     continue if const_type.kind != TypeKind.Array
-                    element_type: ValueType = copied_type(structs.array_elements[const_type.bits.usize()])
-                    array_extent: u32 = structs.array_extents[const_type.bits.usize()]
-                    continue if not is_numeric_type(element_type) and element_type.kind != TypeKind.Bool
-                    if const_value is Expr.Array(literal_elements, literal_line):
-                        continue if literal_elements.count.u32() != array_extent
-                        element_llvm: LLVMTypeRef = llvm_type_of(element_type, structs, ctx)
-                        element_values: mutable darray[LLVMValueRef] = []
-                        elements_ok: mutable bool = true
-                        for literal_element in literal_elements |element_values, elements_ok, element_llvm, structs, ctx|:
-                            element_folded_ok: mutable bool = true
-                            element_folded: i64 = fold_const_expr(literal_element, structs, element_folded_ok)
-                            if element_folded_ok:
-                                element_values.push(LLVMConstInt(element_llvm, element_folded.u64(), 0))
-                            else:
-                                elements_ok <- false
-                        continue if not elements_ok
-                        continue if element_values.count == 0
-                        element_values_pointer: void& = (&element_values[0]).cast[void&] can Unsafe.PointerCast
-                        const_array_value: LLVMValueRef = LLVMConstArray2(element_llvm, element_values_pointer, element_values.count.u64())
-                        array_llvm: LLVMTypeRef = llvm_type_of(const_type, structs, ctx)
-                        const_name_storage: mutable darray[u8] = []
-                        const_global: LLVMValueRef = LLVMAddGlobal(m, array_llvm, sview_to_cstr(const_name, const_name_storage))
-                        LLVMSetInitializer(const_global, const_array_value)
-                        # LLVMInternalLinkage == 8; a `constant` global is immutable.
-                        LLVMSetLinkage(const_global, 8)
-                        LLVMSetGlobalConstant(const_global, 1)
-                        structs.const_globals[const_index.usize()] <- const_global
-                        structs.const_global_ok[const_index.usize()] <- true
+                    aggregate_ok: mutable bool = true
+                    const_aggregate: LLVMValueRef = const_aggregate_value(const_value, const_type, structs, ctx, aggregate_ok)
+                    continue if not aggregate_ok
+                    array_llvm: LLVMTypeRef = llvm_type_of(const_type, structs, ctx)
+                    const_name_storage: mutable darray[u8] = []
+                    const_global: LLVMValueRef = LLVMAddGlobal(m, array_llvm, sview_to_cstr(const_name, const_name_storage))
+                    LLVMSetInitializer(const_global, const_aggregate)
+                    # LLVMInternalLinkage == 8; a `constant` global is immutable.
+                    LLVMSetLinkage(const_global, 8)
+                    LLVMSetGlobalConstant(const_global, 1)
+                    structs.const_globals[const_index.usize()] <- const_global
+                    structs.const_global_ok[const_index.usize()] <- true
 
 
         # Register an alias NAME with a placeholder type; resolve_aliases fills it in.

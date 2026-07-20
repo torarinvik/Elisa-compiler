@@ -919,6 +919,10 @@ run_case penum_is_narrow_multi 'enum Shape:\n    Rect(i64, i64)\n    None\n\ndef
 run_case const_array_literal_index 'const xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    return xs[0] + xs[2]\n'   40
 run_case const_array_dynamic_index 'const xs: i64[3] = [10, 20, 30]\n\ndef get(i: i64) -> i64:\n    return xs[i]\n\ndef main() -> i64:\n    return get(1)\n'   20
 run_case const_array_u8_elem 'const bs: u8[4] = [1, 2, 3, 4]\n\ndef main() -> i64:\n    return bs[3].i64()\n'   4
+# Nested const arrays: `i64[2][3]` -> `[3 x [2 x i64]]` (extents inside-out), a recursively
+# built constant global, indexed level by level.
+run_case const_array_2d_square 'const g: i64[2][2] = [[1, 2], [3, 4]]\n\ndef main() -> i64:\n    return g[0][1] + g[1][1]\n'   6
+run_case const_array_2d_asym 'const g: i64[2][3] = [[1, 2], [3, 4], [5, 6]]\n\ndef main() -> i64:\n    return g[2][1]\n'   6
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
