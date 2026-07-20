@@ -40,17 +40,19 @@ extend Semantic:
 
         # Names of top-level functions whose declared return type is a container, so a call
         # to one produces a value living in the CALLEE's inferred region.
-        def collect_container_returning_fns(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+        def collect_container_returning_fns(declarations: darray[Ast::Decl], enum_names: darray[sview]&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |out|:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, effects, decorators, line):
                             if return_type is declared_return:
-                                out.push(name) if annotation_is_container(declared_return)
+                                returns_container: bool = annotation_is_container(declared_return)
+                                returns_enum: bool = any enum_name in enum_names where enum_name == bare_type_name(declared_return)
+                                out.push(name) if returns_container or returns_enum
                         Decl.Module(module_name, module_body, module_line):
-                            collect_container_returning_fns(module_body, out)
+                            collect_container_returning_fns(module_body, enum_names, out)
                         Decl.Scoped(scoped_body, scoped_line):
-                            collect_container_returning_fns(scoped_body, out)
+                            collect_container_returning_fns(scoped_body, enum_names, out)
                         _:
                             pass
 
@@ -64,25 +66,44 @@ extend Semantic:
                         return any local_name in local_containers where local_name == name
                     Expr.Call(callee, arguments, argument_names, line):
                         callee_name: sview = ident_name_of(callee)
-                        return any fn_name in container_fns where fn_name == callee_name
+                        true return if any fn_name in container_fns where fn_name == callee_name
+                        # An enum-VARIANT construction (`Item.Row(make_vals(10))`) whose
+                        # payload is locally created lives in this function's region too.
+                        is_variant: bool = match callee:
+                            Expr.Field(variant_owner, variant_name, variant_line): true
+                            Expr.Scope(scope_owner, scope_name, scope_line): true
+                            _: false
+                        false return if not is_variant
+                        return any argument in arguments where value_is_locally_created(argument, local_containers, container_fns)
+                    Expr.Paren(inner, paren_line):
+                        return value_is_locally_created(inner, local_containers, container_fns)
+                    Expr.Array(elements, array_line):
+                        # A literal wrapping locally-created values (`[Item.Row(...)]`)
+                        # is itself a fresh local container of those values.
+                        return any element in elements where value_is_locally_created(element, local_containers, container_fns)
                     _:
                         return false
 
 
         # Local container declarations in a body, including nested blocks.
-        def collect_local_containers(body: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+        def collect_local_containers(body: darray[Ast::Stmt], container_fns: darray[sview]&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in body |out|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            out.push(name) if annotation_is_container(type_expression)
+                            is_container_typed: bool = annotation_is_container(type_expression)
+                            # A local INITIALIZED from a locally-created value carries the
+                            # provenance whatever its declared type (`node: Item =
+                            # Item.Row(make_vals(10))`).
+                            initializer_local: bool = value_is_locally_created(value, out, container_fns)
+                            out.push(name) if is_container_typed or initializer_local
                         Stmt.Block(kind, clause, binding, block_body, line):
-                            collect_local_containers(block_body, out)
+                            collect_local_containers(block_body, container_fns, out)
                         Stmt.If(condition, then_body, else_body, if_line):
-                            collect_local_containers(then_body, out)
-                            collect_local_containers(else_body, out)
+                            collect_local_containers(then_body, container_fns, out)
+                            collect_local_containers(else_body, container_fns, out)
                         Stmt.While(condition, while_body, while_line):
-                            collect_local_containers(while_body, out)
+                            collect_local_containers(while_body, container_fns, out)
                         _:
                             pass
 
@@ -136,8 +157,8 @@ extend Semantic:
                                 receiver: sview = ident_name_of(object)
                                 return if receiver == ""
                                 return if not (any p in caller_params where p == receiver)
-                                # `push` takes the stored value first; `put` takes it second.
-                                stored_index: i64 = 0 if method == "push" and arguments.count == 1 else (1 if method == "put" and arguments.count == 2 else -1)
+                                # `push`/`extend` take the stored value first; `put` second.
+                                stored_index: i64 = 0 if (method == "push" or method == "extend") and arguments.count == 1 else (1 if method == "put" and arguments.count == 2 else -1)
                                 return if stored_index < 0
                                 escaping: bool = value_is_locally_created(arguments[stored_index.usize()], local_containers, container_fns)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", line: line, expected: "", actual: ""}) if escaping
@@ -159,7 +180,7 @@ extend Semantic:
                                 caller_params.push(parameter.name) if param_is_mutable_ref(parameter)
                             continue if caller_params.count == 0
                             local_containers: mutable darray[sview] = []
-                            collect_local_containers(body, local_containers)
+                            collect_local_containers(body, container_fns, local_containers)
                             table <- auto_escape_walk(body, caller_params, local_containers, container_fns, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- check_auto_region_escape_walk(module_body, container_fns, table)
@@ -171,6 +192,8 @@ extend Semantic:
     public:
         def check_auto_region_escape(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
+                enum_names: mutable darray[sview] = []
+                collect_enum_type_names(declarations, enum_names)
                 container_fns: mutable darray[sview] = []
-                collect_container_returning_fns(declarations, container_fns)
+                collect_container_returning_fns(declarations, enum_names, container_fns)
                 table <- check_auto_region_escape_walk(declarations, container_fns, table)
