@@ -914,6 +914,11 @@ run_case enum_multi_field_stmt_match 'enum Shape:\n    Rect(i64, i64)\n    None\
 run_case penum_is_narrow_single 'enum B:\n    V(i64)\n    None\n\ndef main() -> i64:\n    b: B = B.V(42)\n    if b is B.V(n):\n        return n\n    return 0\n'   42
 run_case penum_is_narrow_nomatch 'enum B:\n    V(i64)\n    None\n\ndef main() -> i64:\n    b: B = B.None\n    if b is B.V(n):\n        return n\n    return 7\n'   7
 run_case penum_is_narrow_multi 'enum Shape:\n    Rect(i64, i64)\n    None\n\ndef main() -> i64:\n    s: Shape = Shape.Rect(4, 5)\n    if s is Shape.Rect(w, h):\n        return w * h\n    return 0\n'   20
+# Global const ARRAY: materialized as `@xs = internal constant [N x i64] […]`, indexed by
+# GEP at each use (constant and dynamic index; narrower element widths).
+run_case const_array_literal_index 'const xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    return xs[0] + xs[2]\n'   40
+run_case const_array_dynamic_index 'const xs: i64[3] = [10, 20, 30]\n\ndef get(i: i64) -> i64:\n    return xs[i]\n\ndef main() -> i64:\n    return get(1)\n'   20
+run_case const_array_u8_elem 'const bs: u8[4] = [1, 2, 3, 4]\n\ndef main() -> i64:\n    return bs[3].i64()\n'   4
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.

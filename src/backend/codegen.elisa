@@ -587,6 +587,12 @@ module Backend:
             const_types: mutable darray[ValueType]
             const_values: mutable darray[i64]
             const_resolved: mutable darray[bool]
+            # A global const AGGREGATE (array) is backed by a real module GLOBAL rather than a
+            # folded scalar: `const_globals[i]` is its `@name` handle (indexed by GEP at use)
+            # and `const_global_ok[i]` marks the slot as materialized. Scalar consts leave the
+            # handle null and stay on the fold path above.
+            const_globals: mutable darray[LLVMValueRef]
+            const_global_ok: mutable darray[bool]
             # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
             # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
             #
@@ -1440,6 +1446,8 @@ module Backend:
                 local_type return if local_type.kind != TypeKind.Unmodeled
                 const_index: i64 = const_index_of(structs, ident_name)
                 copied_type(structs.const_types[const_index.usize()]) return if const_index >= 0 and structs.const_resolved[const_index.usize()]
+                # A global const AGGREGATE is not scalar-folded but still has a known type.
+                copied_type(structs.const_types[const_index.usize()]) return if const_index >= 0 and structs.const_global_ok[const_index.usize()]
                 return unmodeled_type()
             if expression is Expr.Paren(paren_inner, paren_line):
                 return expression_type(paren_inner, local_scope, fns, structs, generics)
@@ -2873,7 +2881,13 @@ module Backend:
                 # `m[i][j]`, a field chain `s.grid[i]`) resolves recursively.
                 container_type: mutable ValueType = struct_chain_type(indexed_container, local_scope, structs)
                 if indexed_container is Expr.Ident(container_name, container_name_line):
-                    container_type <- lookup_type(local_scope, container_name)
+                    local_container_type: ValueType = lookup_type(local_scope, container_name)
+                    container_type <- local_container_type if local_container_type.kind != TypeKind.Unmodeled
+                    # A global const ARRAY (`const xs: i64[3]`) is not a local: take its type
+                    # from the const table so `xs[i]` resolves its element type.
+                    if local_container_type.kind == TypeKind.Unmodeled:
+                        const_container_index: i64 = const_index_of(structs, container_name)
+                        container_type <- copied_type(structs.const_types[const_container_index.usize()]) if const_container_index >= 0 and structs.const_global_ok[const_container_index.usize()]
                 darray_element_of(container_type, structs) return if container_type.kind == TypeKind.DArray
                 array_element_of(container_type, structs) return if container_type.kind == TypeKind.Array
                 # `items[i]` where `items: Struct&` — a C-style pointer base. The element is
@@ -2924,6 +2938,12 @@ module Backend:
                                     ref_indices_pointer: void& = (&ref_indices[0]).cast[void&] can Unsafe.PointerCast
                                     return LLVMBuildGEP2(builder, element_llvm, base_pointer, ref_indices_pointer, 1, "ref.index.ptr")
                                 return null
+                    # `xs[i]` where `xs` is a global const ARRAY — the base "slot" is the
+                    # `@xs` global itself, GEP'd exactly like a local fixed array.
+                    const_array_index: i64 = const_index_of(structs, container_name)
+                    if const_array_index >= 0 and structs.const_global_ok[const_array_index.usize()]:
+                        const_array_type: ValueType = copied_type(structs.const_types[const_array_index.usize()])
+                        return emit_index_address(structs.const_globals[const_array_index.usize()], const_array_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                     return null
                 # A NESTED index (`m[i][j]`): address the inner element recursively, then
                 # index into it.
@@ -5353,6 +5373,8 @@ module Backend:
                 structs.const_types <- structs.const_types.push(annotation_value_type(const_type_expression, structs))
                 structs.const_values <- structs.const_values.push(0)
                 structs.const_resolved <- structs.const_resolved.push(false)
+                structs.const_globals <- structs.const_globals.push(zeroed)
+                structs.const_global_ok <- structs.const_global_ok.push(false)
 
 
         # Constant-FOLD an initializer to an integer. Only the forms stage0 itself calls a
@@ -5417,6 +5439,47 @@ module Backend:
                         progressed <- true
                 break if not progressed
                 pass_index <- pass_index + 1
+
+
+        # Materialize a global const ARRAY as a real module global (`@xs = internal constant
+        # [N x i64] […]`), the way stage0 does. Only a scalar-element array whose initializer
+        # is a fully-foldable list literal of EXACTLY the declared extent is modeled; anything
+        # else leaves const_global_ok false and the const stays declined at its use sites.
+        def materialize_const_aggregates(file: Ast::File&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration in file.top_decls |structs, m, ctx|:
+                if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                    const_index: i64 = const_index_of(structs, const_name)
+                    continue if const_index < 0
+                    const_type: ValueType = copied_type(structs.const_types[const_index.usize()])
+                    continue if const_type.kind != TypeKind.Array
+                    element_type: ValueType = copied_type(structs.array_elements[const_type.bits.usize()])
+                    array_extent: u32 = structs.array_extents[const_type.bits.usize()]
+                    continue if not is_numeric_type(element_type) and element_type.kind != TypeKind.Bool
+                    if const_value is Expr.Array(literal_elements, literal_line):
+                        continue if literal_elements.count.u32() != array_extent
+                        element_llvm: LLVMTypeRef = llvm_type_of(element_type, structs, ctx)
+                        element_values: mutable darray[LLVMValueRef] = []
+                        elements_ok: mutable bool = true
+                        for literal_element in literal_elements |element_values, elements_ok, element_llvm, structs, ctx|:
+                            element_folded_ok: mutable bool = true
+                            element_folded: i64 = fold_const_expr(literal_element, structs, element_folded_ok)
+                            if element_folded_ok:
+                                element_values.push(LLVMConstInt(element_llvm, element_folded.u64(), 0))
+                            else:
+                                elements_ok <- false
+                        continue if not elements_ok
+                        continue if element_values.count == 0
+                        element_values_pointer: void& = (&element_values[0]).cast[void&] can Unsafe.PointerCast
+                        const_array_value: LLVMValueRef = LLVMConstArray2(element_llvm, element_values_pointer, element_values.count.u64())
+                        array_llvm: LLVMTypeRef = llvm_type_of(const_type, structs, ctx)
+                        const_name_storage: mutable darray[u8] = []
+                        const_global: LLVMValueRef = LLVMAddGlobal(m, array_llvm, sview_to_cstr(const_name, const_name_storage))
+                        LLVMSetInitializer(const_global, const_array_value)
+                        # LLVMInternalLinkage == 8; a `constant` global is immutable.
+                        LLVMSetLinkage(const_global, 8)
+                        LLVMSetGlobalConstant(const_global, 1)
+                        structs.const_globals[const_index.usize()] <- const_global
+                        structs.const_global_ok[const_index.usize()] <- true
 
 
         # Register an alias NAME with a placeholder type; resolve_aliases fills it in.
@@ -6117,7 +6180,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_globals: [], const_global_ok: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -6152,6 +6215,7 @@ module Backend:
             for declaration in file.top_decls |structs|:
                 register_const(declaration, structs)
             fold_consts(file, structs)
+            materialize_const_aggregates(file, structs, m, ctx)
             # A struct whose body cannot be modeled stays OPAQUE (named, no body): every
             # function touching it then declines individually and is stripped below. An
             # unreachable use never runs; a reachable one fails llc/link LOUDLY.
