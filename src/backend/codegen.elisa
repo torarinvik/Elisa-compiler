@@ -303,10 +303,15 @@ module Backend:
                 # `mutable T` — a QUALIFIER, not part of the type: mutability is the
                 # frontend's business, so the underlying type is what matters.
                 annotation_value_type(qualified_type, structs) return if qualifier == TokenKind.Mutable
-                # `heap T` / `stack T` — a STORAGE qualifier the region checker uses; it has
-                # no bearing on the type's representation, so it is transparent here (a
-                # `heap void&` is just a pointer). The std alloc helpers annotate `heap void&`.
-                annotation_value_type(qualified_type, structs) return if qualifier == TokenKind.Heap or qualifier == TokenKind.Stack
+                # `heap T` / `stack T` — a STORAGE qualifier the region checker uses. `stack` is
+                # transparent (representation-identical). `heap T&` marks a RAW pointer: keep it
+                # a Ref (same `ptr`, same deref/field/index) but flag it heap so `+`/`-` become
+                # pointer arithmetic — the arena allocator walks its backing store this way.
+                annotation_value_type(qualified_type, structs) return if qualifier == TokenKind.Stack
+                if qualifier == TokenKind.Heap:
+                    heap_qualified: ValueType = annotation_value_type(qualified_type, structs)
+                    intern_heap_ref_type(ref_target_of(heap_qualified, structs), structs) return if heap_qualified.kind == TypeKind.Ref
+                    return heap_qualified
                 # `T&` — a POSTFIX unary in the AST (the parser distinguishes it from infix
                 # bitwise-and by looking past the whole `&` run).
                 intern_ref_type(annotation_value_type(qualified_type, structs), structs) return if qualifier == TokenKind.Ampersand
@@ -508,6 +513,11 @@ module Backend:
             view_elements: mutable darray[ValueType]
             # `T&` referent types, interned the same way.
             ref_targets: mutable darray[ValueType]
+            # Parallel to ref_targets: whether each interned ref is a RAW HEAP pointer (`heap
+            # T&`) rather than a safe reference. A heap ref does POINTER arithmetic on `+`/`-`
+            # (advance by stride); a safe ref value-adds (deref then add). The `kind` stays Ref
+            # for both, so deref / field / index handling is identical — only arithmetic asks.
+            ref_is_heap: mutable darray[bool]
             # `T?` payload types, interned the same way.
             optional_targets: mutable darray[ValueType]
             # CONST enums. A `const enum Color of u8` IS its backing scalar (stage0 lowers
@@ -688,10 +698,27 @@ module Backend:
             unmodeled_type() return if target.kind == TypeKind.Unmodeled
             for index in 0..<structs.ref_targets.count |structs, target|:
                 existing: ValueType = structs.ref_targets[index]
-                if existing.kind == target.kind and existing.bits == target.bits:
+                if existing.kind == target.kind and existing.bits == target.bits and not structs.ref_is_heap[index]:
                     return ValueType{kind: TypeKind.Ref, bits: index.u32()}
             structs.ref_targets <- structs.ref_targets.push(target)
+            structs.ref_is_heap <- structs.ref_is_heap.push(false)
             return ValueType{kind: TypeKind.Ref, bits: (structs.ref_targets.count - 1).u32()}
+
+        # Intern a RAW HEAP pointer `heap T&` — a Ref (same LLVM `ptr`, same deref/field/index
+        # handling) distinguished only by its heap flag, which makes `+`/`-` pointer arithmetic.
+        def intern_heap_ref_type(target: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if target.kind == TypeKind.Unmodeled
+            for index in 0..<structs.ref_targets.count |structs, target|:
+                existing: ValueType = structs.ref_targets[index]
+                if existing.kind == target.kind and existing.bits == target.bits and structs.ref_is_heap[index]:
+                    return ValueType{kind: TypeKind.Ref, bits: index.u32()}
+            structs.ref_targets <- structs.ref_targets.push(target)
+            structs.ref_is_heap <- structs.ref_is_heap.push(true)
+            return ValueType{kind: TypeKind.Ref, bits: (structs.ref_targets.count - 1).u32()}
+
+        # Whether a value type is a raw heap pointer (`heap T&`) — the query arithmetic asks.
+        def ref_is_heap_ref(value_type: ValueType, structs: StructTable&) -> bool can[Abort.Panic]:
+            return value_type.kind == TypeKind.Ref and structs.ref_is_heap[value_type.bits.usize()]
 
 
         # Intern an optional type `T?`.
@@ -3474,6 +3501,21 @@ module Backend:
                     # Both sides are literals (`2 + 3`): fall back to the context, which
                     # for a comparison is bool — so use i64 there.
                     operand_type <- expected if is_numeric_type(expected) else ValueType{kind: TypeKind.Signed, bits: 64}
+                # `heap T& + int` / `- int` — RAW-pointer arithmetic: advance by `int` elements
+                # of T (a GEP at T's stride). The heap flag (not the kind) distinguishes this
+                # from a SAFE `T&`, which value-adds below. The arena allocator (arena.elisa)
+                # walks its backing store as `heap u8&`. A void pointee strides by bytes (i8).
+                if ref_is_heap_ref(operand_type, structs) and (binary_operator == TokenKind.Plus or binary_operator == TokenKind.Minus):
+                    heap_ptr_pointee: ValueType = ref_target_of(operand_type, structs)
+                    heap_ptr_stride: LLVMTypeRef = LLVMInt8TypeInContext(ctx) if heap_ptr_pointee.kind == TypeKind.Void else llvm_type_of(heap_ptr_pointee, structs, ctx)
+                    if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is heap_ptr_base:
+                        if emit_expression(binary_right, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is heap_ptr_offset:
+                            heap_ptr_index: LLVMValueRef = heap_ptr_offset if binary_operator == TokenKind.Plus else LLVMBuildNeg(builder, heap_ptr_offset, "heap.ptr.neg")
+                            heap_ptr_indices: mutable darray[LLVMValueRef] = [heap_ptr_index]
+                            heap_ptr_indices_pointer: void& = (&heap_ptr_indices[0]).cast[void&] can Unsafe.PointerCast
+                            return LLVMBuildGEP2(builder, heap_ptr_stride, heap_ptr_base, heap_ptr_indices_pointer, 1, "heap.ptr.arith")
+                        return null
+                    return null
                 # `ptr + int` / `ptr - int` on an opaque `void&` is BYTE pointer arithmetic (a
                 # GEP over i8), NOT a deref-then-add — the std's collections_void_from_data_at
                 # walks raw bytes this way. A `void& + i8` emitted as an integer `add` is invalid
@@ -6316,7 +6358,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_globals: [], const_global_ok: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_globals: [], const_global_ok: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
