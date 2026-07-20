@@ -1004,6 +1004,11 @@ decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a:
 # args are fixed; not modeled, so it declines rather than emitting a wrong signature.
 # An UNUSED variadic extern no longer poisons the module (per-fn tolerance): the
 # program runs. stage0 compiles this program too, so this is parity, not permissiveness.
+# `get OPT else return X` — the CONTROL-FLOW recovery form. The parser used to consume the
+# else-clause and THROW IT AWAY, which turned this into `v: i64 = find(n)` (a `T?` bound to
+# a `T`, early return gone). The recovery is now retained on the node and lowered: present
+# unwraps, absent runs the recovery, which terminates. 6*10+7 -- stage0 agrees.
+run_case get_else_control_flow 'def find(n: i64) -> i64?:\n    return 5 if n > 0 else null\n\ndef use(n: i64) -> i64:\n    v: i64 = get find(n) else return 7\n    return v + 1\n\ndef main() -> i64:\n    return use(1) * 10 + use(-1)\n' 67
 # `assert PATH != null` NARROWS the optional for what follows, so a plain-ref local may be
 # initialized from an optional-ref field. stage0 does this and REJECTS the same assignment
 # without the assert (verified both ways); the std dict's find/get/put all depend on it.
