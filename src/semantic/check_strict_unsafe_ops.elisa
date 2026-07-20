@@ -59,31 +59,152 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
-        def strict_unsafe_walk(statements: darray[Ast::Stmt], array_params: darray[sview]&, index_params: darray[sview]&, mutable_params: darray[sview]&, ref_params: darray[sview]&, mutable_globals: darray[sview]&, local_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+        # Whether BODY does anything that could break a bounds proof about NAME: reassigning
+        # the index, or any call (which may mutate the container the bound was taken from).
+        def body_invalidates_bounds(body: darray[Ast::Stmt], name: sview) -> bool:
+            can Abort.Panic, Memory.Allocate:
+                false return if name == ""
+                for statement in body:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            true return if ident_name_of(target) == name
+                        Stmt.Expr(expression, line):
+                            true return if expression_contains_call(expression)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            true return if body_invalidates_bounds(block_body, name)
+                        _:
+                            pass
+                return false
+
+
+        # Whether EXPRESSION performs a call anywhere within it.
+        def expression_contains_call(expression: Ast::Expr) -> bool:
+            can Abort.Panic, Memory.Allocate:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        return true
+                    Expr.Binary(left, operator, right, line):
+                        return expression_contains_call(left) or expression_contains_call(right)
+                    Expr.Paren(inner, line):
+                        return expression_contains_call(inner)
+                    Expr.Index(object, index, line):
+                        return expression_contains_call(object) or expression_contains_call(index)
+                    _:
+                        return false
+
+
+        # `idx < recv.count` (or `recv.count > idx`) proves IDX in bounds for the rest of the
+        # guarded region; `idx >= recv.count` proves it for the code AFTER an early return.
+        # Returns the index NAME the comparison bounds, or "".
+        #
+        # The comparison must be against a `.count` FIELD, not a literal: stage0 proves
+        # `index < items.count` and does NOT prove `index < 3` even for `array[T, 3]`
+        # (verified against `-emit unsafe` both ways). Matching that exactly is what keeps
+        # this from silently over-proving.
+        def bounds_guard_name(condition: Ast::Expr, want_less: bool, unsigned_indexes: darray[sview]&) -> sview:
+            can Abort.Panic, Memory.Allocate:
+                match condition:
+                    Expr.Binary(left, operator, right, line):
+                        left_name: sview = ident_name_of(left)
+                        right_is_count: bool = expression_is_count_field(right)
+                        left_is_count: bool = expression_is_count_field(left)
+                        right_name: sview = ident_name_of(right)
+                        # `idx < recv.count` / `idx >= recv.count`
+                        # A SIGNED index is not proven by an upper bound alone: `i < xs.count`
+                        # says nothing about `i >= 0`. stage0 flags `i: int` here and accepts
+                        # `i: usize` (verified both ways) -- only unsigned narrows.
+                        wanted: TokenKind = TokenKind.Lt if want_less else TokenKind.GtEq
+                        left_unsigned: bool = any u in unsigned_indexes where u == left_name
+                        right_unsigned: bool = any u in unsigned_indexes where u == right_name
+                        left_name return if operator == wanted and right_is_count and left_name != "" and left_unsigned
+                        # Mirrored: `recv.count > idx` / `recv.count <= idx`
+                        mirrored: TokenKind = TokenKind.Gt if want_less else TokenKind.LtEq
+                        right_name return if operator == mirrored and left_is_count and right_name != "" and right_unsigned
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # Whether EXPRESSION is a `.count` field access (`items.count`).
+        def expression_is_count_field(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, line):
+                        return field == "count"
+                    _:
+                        return false
+
+
+        # Whether a body ENDS in a terminator, so control cannot reach the statements after
+        # the `if` on that path -- which is what makes an `idx >= count` guard a proof for
+        # everything below it.
+        def body_terminates(body: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic, Memory.Allocate:
+                false return if body.count == 0
+                match body[body.count - 1]:
+                    Stmt.Return(value, line):
+                        return true
+                    Stmt.Break(label, line):
+                        return true
+                    Stmt.Continue(label, line):
+                        return true
+                    _:
+                        return false
+
+
+        # The index list with NAME removed -- the name is now proven in bounds, so an access
+        # through it is no longer unchecked.
+        def index_params_without(index_params: darray[sview]&, name: sview) -> darray[sview]:
+            can Abort.Panic, Memory.Allocate:
+                kept: mutable darray[sview] = []
+                for candidate in index_params |kept, name|:
+                    kept.push(candidate) if candidate != name
+                return kept
+
+
+        def strict_unsafe_walk(statements: darray[Ast::Stmt], array_params: darray[sview]&, index_params: darray[sview]&, unsigned_indexes: darray[sview]&, mutable_params: darray[sview]&, ref_params: darray[sview]&, mutable_globals: darray[sview]&, local_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table| -> table:
+                # Shrinks as bounds guards prove index names: `if i >= xs.count: return`
+                # makes `i` proven for every statement below it.
+                live_index_params: mutable darray[sview] = []
+                for carried in index_params |live_index_params|:
+                    live_index_params.push(carried)
+                for statement in statements |table, live_index_params| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- strict_unsafe_expression(expression, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            table <- strict_unsafe_expression(expression, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- strict_unsafe_expression(value, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            table <- strict_unsafe_expression(value, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- strict_unsafe_expression(target, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
-                            table <- strict_unsafe_expression(value, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            table <- strict_unsafe_expression(target, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            table <- strict_unsafe_expression(value, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
                         Stmt.Return(value, line):
                             if value is returned:
-                                table <- strict_unsafe_expression(returned, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                                table <- strict_unsafe_expression(returned, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- strict_unsafe_expression(condition, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
-                            table <- strict_unsafe_walk(then_body, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
-                            table <- strict_unsafe_walk(else_body, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            table <- strict_unsafe_expression(condition, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            # Inside the THEN arm, `i < xs.count` holds.
+                            # The proof survives only a body that neither REASSIGNS the index
+                            # nor CALLS anything: `i <- i + 99` moves the index out of range,
+                            # and `xs.truncate(0)` shrinks the container the bound was about.
+                            # stage0 flags both (verified); this is the conservative form of
+                            # its dataflow -- it can lose a benign call, never over-prove.
+                            guarded_now: mutable sview = bounds_guard_name(condition, true, unsigned_indexes)
+                            guarded_now <- sview("", 0, 0) if body_invalidates_bounds(then_body, guarded_now)
+                            then_index_params: darray[sview] = index_params_without(live_index_params, guarded_now)
+                            table <- strict_unsafe_walk(then_body, array_params, then_index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            table <- strict_unsafe_walk(else_body, array_params, live_index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            # `if i >= xs.count: return` — below the guard, `i` is in bounds
+                            # on the only path that reaches there.
+                            early_guarded: sview = bounds_guard_name(condition, false, unsigned_indexes)
+                            live_index_params <- index_params_without(live_index_params, early_guarded) if early_guarded != "" and body_terminates(then_body)
                         Stmt.While(condition, body, line):
-                            table <- strict_unsafe_expression(condition, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
-                            table <- strict_unsafe_walk(body, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            table <- strict_unsafe_expression(condition, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
+                            table <- strict_unsafe_walk(body, array_params, live_index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, in_grant, table)
                         Stmt.Block(kind, clause, binding, body, line):
                             block_kind: sview = kind
                             grant_here: bool = in_grant or block_kind == "can" or block_kind == "trusted"
-                            table <- strict_unsafe_walk(body, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, grant_here, table)
+                            table <- strict_unsafe_walk(body, array_params, live_index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, grant_here, table)
                         _:
                             pass
 
@@ -234,6 +355,7 @@ extend Semantic:
                             continue if any generic_line in table.generic_param_lines where generic_line == line or generic_line == line + 2147483648
                             array_params: mutable darray[sview] = []
                             index_params: mutable darray[sview] = []
+                            unsigned_indexes: mutable darray[sview] = []
                             mutable_params: mutable darray[sview] = []
                             ref_params: mutable darray[sview] = []
                             local_names: mutable darray[sview] = []
@@ -245,16 +367,18 @@ extend Semantic:
                                         collect_expression_idents(expression, requires_names) if contract_kind == "requires"
                                     _:
                                         pass
-                            for parameter in parameters |array_params, index_params, mutable_params, ref_params, local_names|:
+                            for parameter in parameters |array_params, index_params, unsigned_indexes, mutable_params, ref_params, local_names|:
                                 array_params.push(parameter.name) if is_fixed_array_annotation(parameter.type_expression)
                                 is_plain_integer: bool = bare_type_name(parameter.type_expression) == "i64" or bare_type_name(parameter.type_expression) == "usize" or bare_type_name(parameter.type_expression) == "u64" or bare_type_name(parameter.type_expression) == "int" or bare_type_name(parameter.type_expression) == "u32" or bare_type_name(parameter.type_expression) == "i32"
                                 unconstrained: bool = not (any r in requires_names where r == parameter.name)
                                 index_params.push(parameter.name) if is_plain_integer and unconstrained
+                                is_unsigned: bool = bare_type_name(parameter.type_expression) == "usize" or bare_type_name(parameter.type_expression) == "u64" or bare_type_name(parameter.type_expression) == "u32"
+                                unsigned_indexes.push(parameter.name) if is_unsigned
                                 mutable_params.push(parameter.name) if param_is_mutable_ref(parameter)
                                 ref_params.push(parameter.name) if type_marker_present(parameter.type_expression, TokenKind.Ampersand)
                                 local_names.push(parameter.name)
                             collect_local_names(body, local_names)
-                            table <- strict_unsafe_walk(body, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, false, table)
+                            table <- strict_unsafe_walk(body, array_params, index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, false, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- strict_unsafe_decls(module_body, mutable_globals, table)
                         Decl.Scoped(scoped_body, scoped_line):
