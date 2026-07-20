@@ -240,12 +240,177 @@ extend Semantic:
                         _:
                             pass
 
+        # --- Implication-requires subsumption at calls ------------------------------
+        # A callee `requires x > c1 implies y > c2` (desugared `(not A) or B`) obliges
+        # each call: the caller must hold an implication over the same argument pair
+        # whose ANTECEDENT is no stronger and CONSEQUENT no weaker:
+        #
+        #     callee: x > 0 implies y > 0
+        #     caller: a > 5 implies b > 0     -> warn   (a in (0,5] gives no fact)
+        #     caller: a > 0 implies b > 0     -> silent
+        #     caller: a > -5 implies b > 0    -> silent (weaker antecedent still covers)
+        def imp_parts(predicate: Ast::Expr) -> (found: bool, antecedent: Ast::Expr, consequent: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return imp_parts(inner)
+                    Expr.Binary(left, operator, right, line):
+                        (false, Ast::Expr.Absent, Ast::Expr.Absent) return if operator != TokenKind.Or
+                        match left:
+                            Expr.Unary(unary_operator, operand, unary_line):
+                                (true, operand, right) return if unary_operator == TokenKind.Not
+                                return (false, Ast::Expr.Absent, Ast::Expr.Absent)
+                            _:
+                                return (false, Ast::Expr.Absent, Ast::Expr.Absent)
+                    _:
+                        return (false, Ast::Expr.Absent, Ast::Expr.Absent)
+
+
+        # `VAR > C`-shape lower-bound: (var, lo) with `>` normalized to `>= C+1`.
+        def imp_lower_bound(predicate: Ast::Expr) -> (found: bool, name: sview, lo: i64):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return imp_lower_bound(inner)
+                    Expr.Binary(left, operator, right, line):
+                        var_name: sview = ident_name_of(left)
+                        bound: (found: bool, value: i64) = fold_const_int(right)
+                        (false, sview("", 0, 0), 0) return if var_name == "" or not bound.found
+                        (true, var_name, bound.value + 1) return if operator == TokenKind.Gt
+                        (true, var_name, bound.value) return if operator == TokenKind.GtEq
+                        return (false, sview("", 0, 0), 0)
+                    _:
+                        return (false, sview("", 0, 0), 0)
+
+
+        def imp_collect_callee(declarations: darray[Ast::Decl], out_names: mutable darray[sview]&, out_ante_pos: mutable darray[usize]&, out_ante_lo: mutable darray[i64]&, out_cons_pos: mutable darray[usize]&, out_cons_lo: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_names, out_ante_pos, out_ante_lo, out_cons_pos, out_cons_lo|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            for statement in body |out_names, out_ante_pos, out_ante_lo, out_cons_pos, out_cons_lo, function_name, parameters|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        continue if kind != "requires"
+                                        parts: (found: bool, antecedent: Ast::Expr, consequent: Ast::Expr) = imp_parts(expression)
+                                        continue if not parts.found
+                                        ante: (found: bool, name: sview, lo: i64) = imp_lower_bound(parts.antecedent)
+                                        cons: (found: bool, name: sview, lo: i64) = imp_lower_bound(parts.consequent)
+                                        continue if not ante.found or not cons.found
+                                        ante_position: mutable i64 = -1
+                                        cons_position: mutable i64 = -1
+                                        param_index: mutable usize = 0
+                                        for parameter in parameters |ante_position, cons_position, param_index, ante, cons|:
+                                            ante_position <- param_index.i64() if parameter.name == ante.name and ante_position < 0
+                                            cons_position <- param_index.i64() if parameter.name == cons.name and cons_position < 0
+                                            param_index <- param_index + 1
+                                        continue if ante_position < 0 or cons_position < 0
+                                        out_names.push(function_name)
+                                        out_ante_pos.push(ante_position.usize())
+                                        out_ante_lo.push(ante.lo)
+                                        out_cons_pos.push(cons_position.usize())
+                                        out_cons_lo.push(cons.lo)
+                                    _:
+                                        pass
+                        Decl.Module(module_name, module_body, module_line):
+                            imp_collect_callee(module_body, out_names, out_ante_pos, out_ante_lo, out_cons_pos, out_cons_lo)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            imp_collect_callee(scoped_body, out_names, out_ante_pos, out_ante_lo, out_cons_pos, out_cons_lo)
+                        _:
+                            pass
+
+
+        def imp_check_expression(expression: Ast::Expr, line: u32, caller_requires: darray[Ast::Expr]&, imp_names: darray[sview]&, imp_ante_pos: darray[usize]&, imp_ante_lo: darray[i64]&, imp_cons_pos: darray[usize]&, imp_cons_lo: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        called: sview = ident_name_of(callee)
+                        probe: mutable usize = 0
+                        while probe < imp_names.count |probe, table| -> table:
+                            applies: bool = called != "" and imp_names[probe] == called and imp_ante_pos[probe] < arguments.count and imp_cons_pos[probe] < arguments.count
+                            if applies:
+                                ante_arg: sview = ident_name_of(arguments[imp_ante_pos[probe]])
+                                cons_arg: sview = ident_name_of(arguments[imp_cons_pos[probe]])
+                                if ante_arg != "" and cons_arg != "":
+                                    satisfied: mutable bool = false
+                                    for required in caller_requires |satisfied, ante_arg, cons_arg, probe, imp_ante_lo, imp_cons_lo|:
+                                        caller_parts: (found: bool, antecedent: Ast::Expr, consequent: Ast::Expr) = imp_parts(required)
+                                        continue if not caller_parts.found
+                                        caller_ante: (found: bool, name: sview, lo: i64) = imp_lower_bound(caller_parts.antecedent)
+                                        caller_cons: (found: bool, name: sview, lo: i64) = imp_lower_bound(caller_parts.consequent)
+                                        continue if not caller_ante.found or not caller_cons.found
+                                        continue if caller_ante.name != ante_arg or caller_cons.name != cons_arg
+                                        # Antecedent no STRONGER; consequent no WEAKER.
+                                        satisfied <- true if caller_ante.lo <= imp_ante_lo[probe] and caller_cons.lo >= imp_cons_lo[probe]
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: called, line: line, expected: "", actual: ""}) if not satisfied
+                            probe <- probe + 1
+                        for argument in arguments |table| -> table:
+                            table <- imp_check_expression(argument, line, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- imp_check_expression(left, line, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        table <- imp_check_expression(right, line, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- imp_check_expression(inner, line, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                    _:
+                        pass
+
+
+        def imp_walk_statements(statements: darray[Ast::Stmt], caller_requires: darray[Ast::Expr]&, imp_names: darray[sview]&, imp_ante_pos: darray[usize]&, imp_ante_lo: darray[i64]&, imp_cons_pos: darray[usize]&, imp_cons_lo: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- imp_check_expression(expression, line, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- imp_check_expression(returned, line, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- imp_check_expression(value, line, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- imp_walk_statements(then_body, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                            table <- imp_walk_statements(else_body, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- imp_walk_statements(while_body, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- imp_walk_statements(block_body, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        _:
+                            pass
+
+
+        def imp_walk_decls(declarations: darray[Ast::Decl], imp_names: darray[sview]&, imp_ante_pos: darray[usize]&, imp_ante_lo: darray[i64]&, imp_cons_pos: darray[usize]&, imp_cons_lo: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            caller_requires: mutable darray[Ast::Expr] = []
+                            for statement in body |caller_requires|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        caller_requires.push(expression) if kind == "requires"
+                                    _:
+                                        pass
+                            table <- imp_walk_statements(body, caller_requires, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- imp_walk_decls(module_body, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- imp_walk_decls(scoped_body, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table)
+                        _:
+                            pass
+
+
     public:
         def check_field_fact_precondition(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 pre_functions: mutable darray[sview] = []
                 pre_indices: mutable darray[usize] = []
                 ff_collect_requires(file.top_decls, pre_functions, pre_indices)
+                imp_names: mutable darray[sview] = []
+                imp_ante_pos: mutable darray[usize] = []
+                imp_ante_lo: mutable darray[i64] = []
+                imp_cons_pos: mutable darray[usize] = []
+                imp_cons_lo: mutable darray[i64] = []
+                imp_collect_callee(file.top_decls, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo)
+                table <- imp_walk_decls(file.top_decls, imp_names, imp_ante_pos, imp_ante_lo, imp_cons_pos, imp_cons_lo, table) if imp_names.count > 0
                 return if pre_functions.count == 0
                 invariant_fields: mutable darray[sview] = []
                 ff_collect_invariant_fields(file.top_decls, invariant_fields)
