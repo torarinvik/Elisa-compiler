@@ -923,6 +923,9 @@ run_case const_array_u8_elem 'const bs: u8[4] = [1, 2, 3, 4]\n\ndef main() -> i6
 # built constant global, indexed level by level.
 run_case const_array_2d_square 'const g: i64[2][2] = [[1, 2], [3, 4]]\n\ndef main() -> i64:\n    return g[0][1] + g[1][1]\n'   6
 run_case const_array_2d_asym 'const g: i64[2][3] = [[1, 2], [3, 4], [5, 6]]\n\ndef main() -> i64:\n    return g[2][1]\n'   6
+# A const array of CONST-ENUM values: each variant folds to its ordinal, so the global is a
+# `[N x i8]` of ordinals (stage0's `@cs = internal constant [2 x i8] c"\00\02"`).
+run_case const_array_of_enum 'const enum C of u8:\n    R\n    G\n    B\n\nconst cs: C[2] = [C.R, C.B]\n\ndef main() -> i64:\n    return match cs[1]:\n        C.B: 2\n        _: 0\n'   2
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
