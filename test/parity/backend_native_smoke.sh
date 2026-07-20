@@ -934,6 +934,9 @@ run_case cstr_index_dynamic 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\
 run_case darray_nested_index 'def main() -> i64:\n    m: darray[darray[i64]] = [[1, 2], [3, 4]]\n    return m[0][0] + m[0][1] + m[1][0] + m[1][1]\n'   10
 run_case darray_nested_uneven 'def main() -> i64:\n    m: darray[darray[i64]] = [[1, 2, 3], [40, 50]]\n    return m[0][2] + m[1][1]\n'   53
 run_case darray_nested_count 'def main() -> i64:\n    m: darray[darray[i64]] = [[1, 2, 3], [4]]\n    return m[0].count.i64() + m[1].count.i64()\n'   4
+# Payload-enum value equality: compare the tag fields (a payloadless plain enum is this
+# {i32,...} representation, and == / != is the one op not already covered by match/ctor).
+run_case penum_equality 'enum C:\n    R\n    G\n\ndef same(x: C, y: C) -> i64:\n    return 1 if x == y else 0\n\ndef main() -> i64:\n    return same(C.G, C.G) * 10 + same(C.R, C.G)\n'   10
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
