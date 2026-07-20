@@ -84,6 +84,9 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64; do
     case "$opts" in
         *EnforceUnsafePermissions:true*|*EnforceStrictProofs:true*) hdr+=$'# strict\n' ;;
     esac
+    case "$opts" in
+        *EnableSMT:true*) hdr+=$'# smt\n' ;;
+    esac
     fname="$(printf '%s' "$fname_b64" | openssl base64 -d -A 2>/dev/null)"
     is_runtime_std "$fname" && hdr+=$'# std\n'
     out="$({ printf '%s' "$hdr"; printf '%s' "$src_b64" | openssl base64 -d -A; } | "$RPT")"
