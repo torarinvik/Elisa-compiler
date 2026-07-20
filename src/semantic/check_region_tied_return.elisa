@@ -1,0 +1,161 @@
+# Region-tied returns (docs/74/75). A value derived from a BY-REF parameter (a field
+# container, a view/slice of it, a reference into it) lives in the caller's region for
+# that parameter; returning it with a REGION-LESS type erases the tie:
+#
+#     def leak(m: mutable Mod&) -> view[u8]:        # -> flagged (__rg_m tie erased)
+#         return m.bits[0:1]
+#     def ok[@r](m: mutable Mod& @r) -> view[u8] @r:  # -> silent (tie declared)
+#         return m.bits[0:1]
+#
+# The parser records `-> T @r` as a "__region_return" annotation on the function's
+# line; a region-kind return type without one, returning a param-rooted value, is the
+# stage0 diagnostic ported here.
+extend Semantic:
+    private:
+        # Whether a return TYPE names a region-carrying kind: a view family, a growable
+        # container, or a reference.
+        def rtr_type_is_region_kind(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if return_type_is_view(type_expression)
+                true return if annotation_is_container(type_expression)
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        (true) return if operator == TokenKind.Ampersand
+                        return rtr_type_is_region_kind(operand)
+                    Expr.Paren(inner, paren_line):
+                        return rtr_type_is_region_kind(inner)
+                    _:
+                        return false
+
+
+        # The by-ref PARAM a returned value roots at (through fields/slices/indexes and
+        # `&` borrows), or "".
+        def rtr_return_root(expression: Ast::Expr, ref_params: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    # Returning the PARAM ITSELF — or a direct slice/element of a
+                    # CONTAINER param — is reference forwarding (the view still names
+                    # the caller's own container). Only a STRUCT-FIELD hop erases the
+                    # tie (`m.bits[0:1]` hides which region backs the bits).
+                    Expr.Field(object, field, field_line):
+                        return rtr_derived_base(object, ref_params)
+                    Expr.Index(object, index_argument, index_line):
+                        return rtr_field_hopped_base(object, ref_params)
+                    Expr.Slice(object, low, high, slice_line):
+                        return rtr_field_hopped_base(object, ref_params)
+                    Expr.Unary(operator, operand, unary_line):
+                        return rtr_return_root(operand, ref_params)
+                    Expr.Paren(inner, paren_line):
+                        return rtr_return_root(inner, ref_params)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # The ref param a DERIVED chain bottoms out at (the ident itself, or deeper
+        # field/slice/index hops).
+        def rtr_derived_base(expression: Ast::Expr, ref_params: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        name return if any p in ref_params where p == name
+                        return sview("", 0, 0)
+                    Expr.Field(object, field, field_line):
+                        return rtr_derived_base(object, ref_params)
+                    Expr.Index(object, index_argument, index_line):
+                        return rtr_derived_base(object, ref_params)
+                    Expr.Slice(object, low, high, slice_line):
+                        return rtr_derived_base(object, ref_params)
+                    Expr.Paren(inner, paren_line):
+                        return rtr_derived_base(inner, ref_params)
+                    Expr.Unary(operator, operand, unary_line):
+                        return rtr_derived_base(operand, ref_params)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # A base that reaches the param THROUGH at least one field hop.
+        def rtr_field_hopped_base(expression: Ast::Expr, ref_params: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, field_line):
+                        return rtr_derived_base(object, ref_params)
+                    Expr.Paren(inner, paren_line):
+                        return rtr_field_hopped_base(inner, ref_params)
+                    Expr.Index(object, index_argument, index_line):
+                        return rtr_field_hopped_base(object, ref_params)
+                    Expr.Slice(object, low, high, slice_line):
+                        return rtr_field_hopped_base(object, ref_params)
+                    _:
+                        return sview("", 0, 0)
+
+
+        def rtr_check_returns(statements: darray[Ast::Stmt], ref_params: darray[sview]&, param_regions: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                root: sview = rtr_return_root(returned, ref_params)
+                                if root != "":
+                                    # The tied region name: the param's declared @r, or
+                                    # the implicit __rg_<param> spelled by the renderer.
+                                    declared: mutable sview = sview("", 0, 0)
+                                    probe: mutable usize = 0
+                                    while probe < ref_params.count |probe, declared, root, ref_params, param_regions|:
+                                        declared <- param_regions[probe] if ref_params[probe] == root and declared == ""
+                                        probe <- probe + 1
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionTiedReturn, name: root, line: line, expected: declared, actual: ""})
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- rtr_check_returns(then_body, ref_params, param_regions, table)
+                            table <- rtr_check_returns(else_body, ref_params, param_regions, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- rtr_check_returns(while_body, ref_params, param_regions, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- rtr_check_returns(block_body, ref_params, param_regions, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- rtr_check_returns(arm.body, ref_params, param_regions, table)
+                        _:
+                            pass
+
+
+        def rtr_walk(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            region_kind: mutable bool = false
+                            if return_type is declared_return:
+                                region_kind <- rtr_type_is_region_kind(declared_return)
+                            continue if not region_kind
+                            # A declared `-> T @r` tie is the ACCEPTED spelling.
+                            has_return_region: bool = any annotation in annotations where annotation.name == "__region_return" and annotation.line == line
+                            continue if has_return_region
+                            ref_params: mutable darray[sview] = []
+                            param_regions: mutable darray[sview] = []
+                            for parameter in parameters |ref_params, param_regions, annotations, line|:
+                                # Only MUTABLE borrows participate: an immutable `Token&`
+                                # handing out an sview is everywhere in real code and
+                                # stage0 accepts it; the tie diagnostic is about mutable
+                                # aliased state.
+                                is_ref: bool = type_contains_operator(parameter.type_expression, TokenKind.Ampersand) and type_contains_operator(parameter.type_expression, TokenKind.Mutable) and not type_contains_heap(parameter.type_expression)
+                                continue if not is_ref
+                                ref_params.push(parameter.name)
+                                declared_region: mutable sview = sview("", 0, 0)
+                                for annotation in annotations |declared_region, parameter, line|:
+                                    matches: bool = annotation.name == parameter.name and annotation.line == line
+                                    declared_region <- annotation.region if matches and declared_region == ""
+                                param_regions.push(declared_region)
+                            continue if ref_params.count == 0
+                            table <- rtr_check_returns(body, ref_params, param_regions, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- rtr_walk(module_body, annotations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- rtr_walk(scoped_body, annotations, table)
+                        _:
+                            pass
+
+    public:
+        def check_region_tied_return(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- rtr_walk(file.top_decls, file.local_region_annotations, table)
