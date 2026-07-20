@@ -47,7 +47,7 @@ pass=0; total=0
 dict_case() {
     local name="$1" body="$2" want="$3"; total=$((total + 1))
     local src="$BUILD/dictreal_$name.elisa" ll="$BUILD/dictreal_$name.ll" obj="$BUILD/dictreal_$name.o" exe="$BUILD/dictreal_$name"
-    python3 - "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
+    python3 - "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
 import sys, re
 out = []
 for path in sys.argv[1:]:
@@ -60,9 +60,24 @@ for ln in lines:
         if ln and not ln[0].isspace(): skip = False
         else: continue
     res.append(ln)
+# The two hash DEFINITIONS are stripped above (elisacore_runtime.o already provides them,
+# so keeping the std copies duplicate-symbol at link). Stripping alone is not enough:
+# stage0 then reports 'missing runtime function "ctx_hash_cstr"'. Re-declare them as
+# EXTERNs so both compilers see a signature and neither emits a body.
+print('extern ctx_hash_cstr(s: cstr) -> u64')
+print('extern ctx_hash_u64(value: u64) -> u64')
 print('\n'.join(res))
 print('''$body''')
 PY
+    # The fixture must be a program stage0 ACCEPTS before stage1's output means anything.
+    # Without this the concat silently dropped arena.elisa (which defines RuntimeError),
+    # so every case fed stage1 a program stage0 rejects outright -- and the gate reported
+    # backend failures ("llc rejected the IR") for a broken FIXTURE, pointing at the wrong
+    # compiler for as long as it was red.
+    if ! "$ELISACORE_BIN" -emit llvm -o /dev/null "$src" 2>"$BUILD/dictreal_$name.s0log"; then
+        echo "  FAIL $name: FIXTURE INVALID -- stage0 rejects the concatenated std:"
+        grep -v warning "$BUILD/dictreal_$name.s0log" | head -3 | sed 's/^/      /'
+        return; fi
     if ! "$EMIT" < "$src" > "$ll" 2>/dev/null || head -1 "$ll" | grep -q UNSUPPORTED; then
         echo "  FAIL $name: stage1 declined the real-std dict program"; return; fi
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then

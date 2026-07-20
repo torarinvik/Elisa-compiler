@@ -2603,6 +2603,19 @@ module Backend:
                 value return if from_type.bits == to_type.bits
                 return LLVMBuildFPTrunc(builder, value, target, "fptrunc") if to_type.bits < from_type.bits else LLVMBuildFPExt(builder, value, target, "fpext")
 
+            # POINTER <-> INTEGER is a distinct cast, not a width change: `zext ptr .. to i64`
+            # is invalid IR llc rejects. The std takes a pointer DIFFERENCE this way --
+            # arena_tail_offset_slots is `(ptr.cast[heap u8&].usize() - base.usize()) / stride`
+            # -- so every dict program went through here.
+            from_is_pointer: bool = from_type.kind == TypeKind.Ref or from_type.kind == TypeKind.CStr
+            to_is_pointer: bool = to_type.kind == TypeKind.Ref or to_type.kind == TypeKind.CStr
+            if from_is_pointer or to_is_pointer:
+                LLVMBuildPtrToInt(builder, value, target, "ptrtoint") return if from_is_pointer and is_integer_type(to_type)
+                LLVMBuildIntToPtr(builder, value, target, "inttoptr") return if to_is_pointer and is_integer_type(from_type)
+                # ptr -> ptr is a no-op under opaque pointers; anything else is unmodeled.
+                value return if from_is_pointer and to_is_pointer
+                return null
+
             value return if from_type.bits == to_type.bits
             LLVMBuildTrunc(builder, value, target, "trunc") return if to_type.bits < from_type.bits
             return LLVMBuildSExt(builder, value, target, "sext") if from_type.kind == TypeKind.Signed else LLVMBuildZExt(builder, value, target, "zext")
@@ -3616,12 +3629,19 @@ module Backend:
                             return LLVMBuildGEP2(builder, heap_ptr_stride, heap_ptr_base, heap_ptr_indices_pointer, 1, "heap.ptr.arith")
                         return null
                     return null
-                # `ptr + int` / `ptr - int` on an opaque `void&` is BYTE pointer arithmetic (a
-                # GEP over i8), NOT a deref-then-add — the std's collections_void_from_data_at
-                # walks raw bytes this way. A `void& + i8` emitted as an integer `add` is invalid
-                # IR (llc rejects it). Only a VOID ref target is pointer arithmetic; a `i64&`
-                # still dereferences and adds values below.
-                if operand_type.kind == TypeKind.Ref and ref_target_of(operand_type, structs).kind == TypeKind.Void and (binary_operator == TokenKind.Plus or binary_operator == TokenKind.Minus):
+                # `ptr + int` / `ptr - int` on a BYTE pointer — `void&` or `u8&` — is pointer
+                # arithmetic (a GEP over i8), NOT a deref-then-add. The std's
+                # collections_void_from_data_at walks raw bytes as `data.cast[u8&] + offset`,
+                # and a `u8& + i8` emitted as an integer `add` is invalid IR that llc rejects
+                # outright (it also truncated the offset to i8, silently capping it at 255).
+                #
+                # `u8&` and `void&` ONLY — verified against stage0 across referents: u8 GEPs,
+                # while i8/u16/i32/u64/f64 all dereference and value-add. `u8&` is stage0's
+                # designated raw-byte-pointer type, and the asymmetry with `i8&` is deliberate,
+                # so this cannot be generalized to "any small integer referent".
+                byte_ptr_target: ValueType = ref_target_of(operand_type, structs)
+                is_byte_pointer: bool = byte_ptr_target.kind == TypeKind.Void or (byte_ptr_target.kind == TypeKind.Unsigned and byte_ptr_target.bits == 8)
+                if operand_type.kind == TypeKind.Ref and is_byte_pointer and (binary_operator == TokenKind.Plus or binary_operator == TokenKind.Minus):
                     if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ptr_arith_base:
                         if emit_expression(binary_right, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ptr_arith_offset:
                             ptr_arith_index: LLVMValueRef = ptr_arith_offset if binary_operator == TokenKind.Plus else LLVMBuildNeg(builder, ptr_arith_offset, "ptr.neg")
@@ -6437,6 +6457,7 @@ module Backend:
             template_error_lines.push(function_line_of(generics.decls[slot])) if generics.is_error[slot]
             emitted: bool = emit_function_body(generics.decls[slot], handle, template_error_lines, fns, structs, generics, runtime, m, ctx, builder)
             pop_type_bindings(structs, bound)
+            record_declined_function(generics.pending_bases[index], m, ctx) if not emitted
             return emitted
 
 
@@ -6608,6 +6629,18 @@ module Backend:
                 LLVMDeleteBasicBlock(first_block)
 
 
+        # Name a declined function in `!elisa.declined`. Without this a decline is SILENT:
+        # the body is stripped to a bare `declare`, and the first symptom is a link error
+        # naming a mangled symbol with no indication of which function the backend gave up
+        # on. (Chasing four such symbols by hand through the real-std dict is what motivated
+        # this.) Recorded in the IR itself so `emit_native` output carries it.
+        def record_declined_function(name: sview, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            declined_cstr: cstr = sview_to_cstr(name, name_storage)
+            declined_string: LLVMValueRef = LLVMMetadataAsValue(ctx, LLVMMDStringInContext2(ctx, declined_cstr, sview_len(name)))
+            LLVMAddNamedMetadataOperand(m, "elisa.declined", declined_string)
+
+
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: []}
             # The runtime is declared once per module; each function gets its own arena
@@ -6677,7 +6710,15 @@ module Backend:
                 # so it is skipped here, not declined.
                 continue if generic_index_of(generics, function_name_of(declaration)) >= 0
                 # declare_function records the signature's types into `fns` itself.
-                _ = declare_function(declaration, "", file.error_set_func_lines, fns, structs, generics, m, ctx)
+                # A declined SIGNATURE is the quieter half of the problem: with no `fns` entry
+                # the body loop skips the function entirely, so it is never recorded as
+                # declined either -- yet a call site still emits a bare `declare`, and the
+                # only symptom is an undefined symbol at link. Record it here too.
+                declared_handle: LLVMValueRef? = declare_function(declaration, "", file.error_set_func_lines, fns, structs, generics, m, ctx)
+                if declared_handle is declared_ok:
+                    _ = declared_ok
+                else:
+                    record_declined_function(function_name_of(declaration), m, ctx) if function_name_of(declaration) != ""
 
             emitted_count: mutable i64 = 0
             main_ok: mutable bool = false
@@ -6692,6 +6733,7 @@ module Backend:
                         nested_emitted: bool = emit_function_body(nested, fns.handles[nested_index.usize()], file.error_set_func_lines, fns, structs, generics, runtime, m, ctx, builder)
                         emitted_count <- emitted_count + 1 if nested_emitted else emitted_count
                         strip_function_body(fns.handles[nested_index.usize()]) if not nested_emitted
+                        record_declined_function(nested_name, m, ctx) if not nested_emitted
                     continue
                 declaration_name: sview = function_name_of(declaration)
                 continue if declaration_name == ""
@@ -6701,6 +6743,7 @@ module Backend:
                 emitted: bool = emit_function_body(declaration, fns.handles[handle_index.usize()], file.error_set_func_lines, fns, structs, generics, runtime, m, ctx, builder)
                 emitted_count <- emitted_count + 1 if emitted else emitted_count
                 strip_function_body(fns.handles[handle_index.usize()]) if not emitted
+                record_declined_function(declaration_name, m, ctx) if not emitted
                 main_ok <- true if emitted and declaration_name == "main"
 
             # Drain the instantiation worklist. A LOOP, not a single pass: emitting one
