@@ -926,6 +926,9 @@ run_case const_array_2d_asym 'const g: i64[2][3] = [[1, 2], [3, 4], [5, 6]]\n\nd
 # A const array of CONST-ENUM values: each variant folds to its ordinal, so the global is a
 # `[N x i8]` of ordinals (stage0's `@cs = internal constant [2 x i8] c"\00\02"`).
 run_case const_array_of_enum 'const enum C of u8:\n    R\n    G\n    B\n\nconst cs: C[2] = [C.R, C.B]\n\ndef main() -> i64:\n    return match cs[1]:\n        C.B: 2\n        _: 0\n'   2
+# cstr byte indexing lowers to ctx_string_index(s, i) -> i64 (stage0's shape).
+run_case cstr_index_const 'def main() -> i64:\n    s: cstr = "ABC"\n    return s[0].i64() + s[2].i64()\n'   132
+run_case cstr_index_dynamic 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", 1)\n'   89
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
