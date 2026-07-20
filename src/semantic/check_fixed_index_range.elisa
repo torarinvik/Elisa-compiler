@@ -1,0 +1,228 @@
+# Fixed-extent index range proofs (strict-unsafe tier). For receivers whose extent is
+# statically known — a fixed-array parameter (`array[u32, 128]&`, `i32[16]`) or a LOCAL
+# bound to a literal-bounds slice (`s = data[0:8]`, extent 8) — stage0 judges the index
+# expression's RANGE against the extent:
+#
+#   s[5]                 (literal in range)                    -> clean
+#   s[10]                (literal out of range)                -> unchecked index
+#   regs[d.k]            (field refined `is InRange[0, 100]`)  -> clean (100 <= 127)
+#   regs[d.k]            (field refined `is Even` — unbounded) -> unchecked index
+#   sgprs[idx + 1]       (idx `is InRange[0, 126]`, 127 fits)  -> clean
+#   sgprs[idx + 2]       (128 does not)                        -> unchecked index
+#
+# Plain-ident indexes into fixed arrays stay with check_strict_unsafe_ops (its
+# index_params model); this check owns the literal/refined/field/affine shapes and ALL
+# indexes into slice locals, so the two never double-report.
+extend Semantic:
+    private:
+        # Slice locals with literal bounds: name -> extent.
+        def collect_slice_locals(statements: darray[Ast::Stmt], out_names: mutable darray[sview]&, out_extents: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_names, out_extents|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            match value:
+                                Expr.Slice(object, low, high, slice_line):
+                                    low_literal: (found: bool, value: i64) = fold_const_int(low)
+                                    high_literal: (found: bool, value: i64) = fold_const_int(high)
+                                    if low_literal.found and high_literal.found and high_literal.value >= low_literal.value:
+                                        out_names.push(name)
+                                        out_extents.push(high_literal.value - low_literal.value)
+                                _:
+                                    pass
+                        # `s = data[0:8]` parses as an ASSIGN-shaped declaration.
+                        Stmt.Assign(target, operator, value, assign_line):
+                            target_name: sview = ident_name_of(target)
+                            continue if target_name == ""
+                            match value:
+                                Expr.Slice(slice_object, slice_low, slice_high, assign_slice_line):
+                                    assign_low: (found: bool, value: i64) = fold_const_int(slice_low)
+                                    assign_high: (found: bool, value: i64) = fold_const_int(slice_high)
+                                    if assign_low.found and assign_high.found and assign_high.value >= assign_low.value:
+                                        out_names.push(target_name)
+                                        out_extents.push(assign_high.value - assign_low.value)
+                                _:
+                                    pass
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            collect_slice_locals(then_body, out_names, out_extents)
+                            collect_slice_locals(else_body, out_names, out_extents)
+                        Stmt.While(condition, while_body, while_line):
+                            collect_slice_locals(while_body, out_names, out_extents)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            collect_slice_locals(block_body, out_names, out_extents)
+                        _:
+                            pass
+
+
+        # The index expression's RANGE, when this check can bound it:
+        #   kind 0 = not a shape this check owns (leave to the plain-ident model)
+        #   kind 1 = bounded [lo, hi]
+        #   kind 2 = provably UNBOUNDED for this purpose (refined-unbounded field/ident)
+        def fixed_index_window(index_expression: Ast::Expr, parameters: darray[Ast::ParamDecl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, is_slice_receiver: bool) -> (kind: i64, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                literal: (found: bool, value: i64) = fold_const_int(index_expression)
+                (1, literal.value, literal.value) return if literal.found
+                match index_expression:
+                    Expr.Paren(inner, line):
+                        return fixed_index_window(inner, parameters, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, is_slice_receiver)
+                    Expr.Ident(name, line):
+                        for parameter in parameters |name, law_names, law_predicates, is_slice_receiver|:
+                            continue if parameter.name != name
+                            window: (refined: bool, found: bool, lo: i64, hi: i64) = index_annotation_window(parameter.type_expression, law_names, law_predicates)
+                            (1, window.lo, window.hi) return if window.found
+                            (2, 0, 0) return if window.refined
+                            # A PLAIN param index into a SLICE local is this check's (the
+                            # strict pass does not know slice receivers).
+                            (2, 0, 0) return if is_slice_receiver
+                            return (0, 0, 0)
+                        (2, 0, 0) return if is_slice_receiver
+                        return (0, 0, 0)
+                    Expr.Field(object, field, field_line):
+                        base: sview = ident_name_of(object)
+                        (0, 0, 0) return if base == ""
+                        for parameter in parameters |base, field, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types|:
+                            continue if parameter.name != base
+                            struct_name: sview = erasure_base_type_name(parameter.type_expression)
+                            annotation: (found: bool, annotation: Ast::Expr) = struct_field_annotation(struct_name, field, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types)
+                            (0, 0, 0) return if not annotation.found
+                            field_window: (refined: bool, found: bool, lo: i64, hi: i64) = index_annotation_window(field_annotation_base(annotation.annotation), law_names, law_predicates)
+                            (1, field_window.lo, field_window.hi) return if field_window.found
+                            (2, 0, 0) return if field_window.refined
+                            return (0, 0, 0)
+                        return (0, 0, 0)
+                    Expr.Binary(left, operator, right, line):
+                        (0, 0, 0) return if operator != TokenKind.Plus and operator != TokenKind.Minus
+                        offset: (found: bool, value: i64) = fold_const_int(right)
+                        (0, 0, 0) return if not offset.found
+                        base_window: (kind: i64, lo: i64, hi: i64) = fixed_index_window(left, parameters, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, is_slice_receiver)
+                        (0, 0, 0) return if base_window.kind != 1
+                        delta: i64 = offset.value if operator == TokenKind.Plus else (0 - offset.value)
+                        return (1, base_window.lo + delta, base_window.hi + delta)
+                    _:
+                        return (0, 0, 0)
+
+
+        # Peel `mutable` off a struct-field annotation (`mutable u32 is Even`).
+        def field_annotation_base(annotation: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match annotation:
+                    Expr.Unary(operator, operand, line):
+                        return field_annotation_base(operand) if operator == TokenKind.Mutable else annotation
+                    _:
+                        return annotation
+
+
+        def fixed_index_check_expression(expression: Ast::Expr, line: u32, parameters: darray[Ast::ParamDecl], extent_names: darray[sview]&, extents: darray[i64]&, slice_names: darray[sview]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Index(object, index_expression, index_line):
+                        receiver: sview = ident_name_of(object)
+                        slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < extent_names.count |slot, probe, receiver, extent_names|:
+                            slot <- probe.i64() if extent_names[probe] == receiver and slot < 0
+                            probe <- probe + 1
+                        if slot >= 0:
+                            extent: i64 = extents[slot.usize()]
+                            is_slice: bool = any s in slice_names where s == receiver
+                            window: (kind: i64, lo: i64, hi: i64) = fixed_index_window(index_expression, parameters, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, is_slice)
+                            out_of_range: bool = (window.kind == 1 and (window.hi > extent - 1 or window.lo < 0)) or window.kind == 2
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UncheckedIndexUngranted, name: receiver, line: line, expected: "", actual: ""}) if out_of_range
+                        table <- fixed_index_check_expression(object, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- fixed_index_check_expression(left, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        table <- fixed_index_check_expression(right, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- fixed_index_check_expression(inner, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- fixed_index_check_expression(operand, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |table| -> table:
+                            table <- fixed_index_check_expression(argument, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                    _:
+                        pass
+
+
+        def fixed_index_walk(statements: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl], extent_names: darray[sview]&, extents: darray[i64]&, slice_names: darray[sview]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- fixed_index_check_expression(expression, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- fixed_index_check_expression(value, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- fixed_index_check_expression(target, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                            table <- fixed_index_check_expression(value, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- fixed_index_check_expression(returned, line, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- fixed_index_walk(then_body, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                            table <- fixed_index_walk(else_body, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- fixed_index_walk(while_body, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            block_kind: sview = kind
+                            granted: bool = block_kind == "can" or block_kind == "trusted"
+                            table <- fixed_index_walk(block_body, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table) if not granted
+                        _:
+                            pass
+
+
+        def collect_struct_member_tables(declarations: darray[Ast::Decl], sm_struct_names: mutable darray[sview]&, sm_field_starts: mutable darray[usize]&, sm_field_counts: mutable darray[usize]&, all_sm_field_names: mutable darray[sview]&, all_sm_field_types: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types|:
+                    match declaration:
+                        Decl.Struct(name, members, affinity, has_named_states, has_derive, invariants, line):
+                            sm_struct_names.push(name)
+                            sm_field_starts.push(all_sm_field_names.count)
+                            sm_field_counts.push(members.count)
+                            for member in members |all_sm_field_names, all_sm_field_types|:
+                                all_sm_field_names.push(member.name)
+                                all_sm_field_types.push(member.type_expression)
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_struct_member_tables(module_body, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_struct_member_tables(scoped_body, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types)
+                        _:
+                            pass
+
+
+        def check_fixed_index_range_walk(declarations: darray[Ast::Decl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, sm_struct_names: darray[sview]&, sm_field_starts: darray[usize]&, sm_field_counts: darray[usize]&, all_sm_field_names: darray[sview]&, all_sm_field_types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            extent_names: mutable darray[sview] = []
+                            extents: mutable darray[i64] = []
+                            slice_names: mutable darray[sview] = []
+                            for parameter in parameters |extent_names, extents|:
+                                param_extent: i64 = fixed_array_extent(parameter.type_expression)
+                                continue if param_extent < 0
+                                extent_names.push(parameter.name)
+                                extents.push(param_extent)
+                            collect_slice_locals(body, slice_names, extents)
+                            for slice_name in slice_names |extent_names|:
+                                extent_names.push(slice_name)
+                            table <- fixed_index_walk(body, parameters, extent_names, extents, slice_names, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_fixed_index_range_walk(module_body, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_fixed_index_range_walk(scoped_body, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
+                        _:
+                            pass
+
+    public:
+        def check_fixed_index_range(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(declarations, law_names, law_predicates)
+                sm_struct_names: mutable darray[sview] = []
+                sm_field_starts: mutable darray[usize] = []
+                sm_field_counts: mutable darray[usize] = []
+                all_sm_field_names: mutable darray[sview] = []
+                all_sm_field_types: mutable darray[Ast::Expr] = []
+                collect_struct_member_tables(declarations, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types)
+                table <- check_fixed_index_range_walk(declarations, law_names, law_predicates, sm_struct_names, sm_field_starts, sm_field_counts, all_sm_field_names, all_sm_field_types, table)
