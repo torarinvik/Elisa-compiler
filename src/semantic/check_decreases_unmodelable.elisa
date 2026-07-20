@@ -58,24 +58,93 @@ extend Semantic:
                     Expr.Ident(name, line): false
                     _: true
 
-        # Whether a single loop-body statement is something the measure analyzer cannot model:
-        # control flow, a call, or a non-arithmetic write. `decreases`/other contracts are the
-        # measure clauses themselves and never count.
-        def decreases_statement_unmodelable(statement: Ast::Stmt) -> bool:
+        # Identifiers a measure expression mentions — the FOCUS set. stage0's capture is
+        # focused: only effects touching a measure variable can make the body unmodelable
+        # (`captureLoopBodyEffectForTerminationFocused`), and guard-`if` bodies go through
+        # per-path modeling (a DIFFERENT, prover-bound message when that proof fails).
+        def decreases_measure_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Binary(left, operator, right, line):
+                        decreases_measure_idents(left, out)
+                        decreases_measure_idents(right, out)
+                    Expr.Unary(operator, operand, line):
+                        decreases_measure_idents(operand, out)
+                    Expr.Paren(inner, line):
+                        decreases_measure_idents(inner, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        decreases_measure_idents(cast_receiver_of(callee), out)
+                    _:
+                        pass
+
+
+        # The base identifier a store target writes through (`arr[j]` -> arr, `x.f` -> x).
+        def decreases_target_base(target: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, line):
+                        return name
+                    Expr.Index(object, index, line):
+                        return decreases_target_base(object)
+                    Expr.Field(object, field, line):
+                        return decreases_target_base(object)
+                    Expr.Paren(inner, line):
+                        return decreases_target_base(inner)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # An OPAQUE statement: a call in any value position, or a non-arithmetic write.
+        # The measure analyzer cannot model its effect.
+        def decreases_statement_opaque(statement: Ast::Stmt) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return match statement:
-                    Stmt.If(condition, then_body, else_body, line): true
-                    Stmt.While(condition, while_body, while_line): true
-                    Stmt.For(bind, variables, iterable, for_body, for_line): true
-                    Stmt.Match(scrutinee, arms, match_line): true
-                    Stmt.Block(kind, clause, binding, body, block_line): true
-                    Stmt.Break(label, break_line): true
-                    Stmt.Continue(label, continue_line): true
-                    Stmt.Return(value, return_line): true
                     Stmt.Assign(target, operator, value, assign_line): decreases_target_is_nonlocal(target) or decreases_expr_has_call(value)
                     Stmt.Expr(expression, expr_line): decreases_expr_has_call(expression)
                     Stmt.VarDecl(name, type_expression, value, decl_line): decreases_expr_has_call(value)
                     _: false
+
+
+        # Whether a branch EXITS the loop/function (contains a return/break) — an exiting
+        # path never re-tests the measure, so opaque statements on it are tolerated
+        # (pinned: `if …: _ = hit(j); return` is clean, the same without `return` bails).
+        def decreases_branch_exits(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Return(value, line):
+                            return true
+                        Stmt.Break(label, line):
+                            return true
+                        _:
+                            pass
+                return false
+
+
+        # Whether a BRANCH (the loop's fall-through body, or an if arm) is unmodelable:
+        # a nested loop/match/block anywhere, or — on a NON-exiting branch — any opaque
+        # statement. Guard-`if` arms recurse (stage0's per-path modeling); calls in the
+        # guard CONDITION itself are fine.
+        def decreases_branch_unmodelable(statements: darray[Ast::Stmt], exits: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |exits|:
+                    match statement:
+                        Stmt.While(condition, while_body, while_line):
+                            return true
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            return true
+                        Stmt.Match(scrutinee, arms, match_line):
+                            return true
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            return true
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if decreases_branch_unmodelable(then_body, decreases_branch_exits(then_body))
+                            true return if decreases_branch_unmodelable(else_body, decreases_branch_exits(else_body))
+                        _:
+                            true return if not exits and decreases_statement_opaque(statement)
+                return false
 
         # The `decreases` clause line in a loop body (its first `decreases` contract), or 0 when
         # none. `decreases*` is the unbounded escape hatch (its own check) and is excluded.
@@ -88,10 +157,71 @@ extend Semantic:
                             _: line
                 return found
 
-        # Whether any loop-body statement is unmodelable.
+        # Whether the loop body is unmodelable. The fall-through body never exits (the
+        # loop re-tests), so top-level opaque statements always bail.
         def decreases_body_unmodelable(statements: darray[Ast::Stmt]) -> bool:
             can Memory.Allocate, Abort.Panic:
-                return any statement in statements where decreases_statement_unmodelable(statement)
+                return decreases_branch_unmodelable(statements, false)
+
+
+        # PER-PATH decrease proof (the port of stage0's straight-line capture + guard-`if`
+        # path enumeration): every NON-EXITING path through the body must move the
+        # measure by <= -1. An `if` forks into `then + rest` / `else + rest` (flattening
+        # handles nesting); return/break end a path with no obligation; `continue`
+        # re-tests immediately, so its path carries the obligation. An assignment to a
+        # measure variable not of the `v <- v + c` shape makes the body unmodeled
+        # (prover territory — stay silent).
+        def decreases_paths_decrease(statements: darray[Ast::Stmt], index: usize, delta: i64, measure_names: darray[sview]&, measure_coeffs: darray[i64]&, modeled: mutable bool&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                # Recursive per-statement walk (index-carried), so every exit is a plain
+                # boolean and the fall-through obligation is the tail case.
+                (delta <= (0 - 1)) return if index >= statements.count
+                match statements[index]:
+                    Stmt.Return(value, line):
+                        return true
+                    Stmt.Break(label, line):
+                        return true
+                    Stmt.Continue(label, line):
+                        return delta <= (0 - 1)
+                    Stmt.If(condition, then_body, else_body, if_line):
+                        rest: mutable darray[Ast::Stmt] = []
+                        rest_index: mutable usize = index + 1
+                        while rest_index < statements.count |rest, rest_index, statements|:
+                            rest.push(statements[rest_index])
+                            rest_index <- rest_index + 1
+                        then_seq: mutable darray[Ast::Stmt] = []
+                        for then_statement in then_body |then_seq|:
+                            then_seq.push(then_statement)
+                        then_seq.extend(rest)
+                        else_seq: mutable darray[Ast::Stmt] = []
+                        for else_statement in else_body |else_seq|:
+                            else_seq.push(else_statement)
+                        else_seq.extend(rest)
+                        false return if not decreases_paths_decrease(then_seq, 0, delta, measure_names, measure_coeffs, modeled)
+                        return decreases_paths_decrease(else_seq, 0, delta, measure_names, measure_coeffs, modeled)
+                    Stmt.Assign(target, operator, value, line):
+                        assigned: sview = ident_name_of(target)
+                        slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < measure_names.count |slot, probe, assigned, measure_names|:
+                            slot <- probe.i64() if measure_names[probe] == assigned and slot < 0
+                            probe <- probe + 1
+                        (decreases_paths_decrease(statements, index + 1, delta, measure_names, measure_coeffs, modeled)) return if slot < 0 or assigned == ""
+                        value_names: mutable darray[sview] = []
+                        value_coeffs: mutable darray[i64] = []
+                        value_konst: mutable i64 = 0
+                        value_linear: bool = lin_add(value, 1, value_names, value_coeffs, value_konst, Ast::Expr.Invalid, false, 0)
+                        self_shape: mutable bool = value_linear
+                        term: mutable usize = 0
+                        while term < value_names.count |self_shape, term, assigned, value_names, value_coeffs|:
+                            keeps_self: bool = value_names[term] == assigned and value_coeffs[term] == 1
+                            self_shape <- false if value_coeffs[term] != 0 and not keeps_self
+                            term <- term + 1
+                        modeled <- false if not self_shape
+                        (true) return if not self_shape
+                        return decreases_paths_decrease(statements, index + 1, delta + measure_coeffs[slot.usize()] * value_konst, measure_names, measure_coeffs, modeled)
+                    _:
+                        return decreases_paths_decrease(statements, index + 1, delta, measure_names, measure_coeffs, modeled)
 
         def decreases_unmodelable_statements(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -99,7 +229,29 @@ extend Semantic:
                     match statement:
                         Stmt.While(condition, while_body, line):
                             decreases_line: u32 = decreases_body_line(while_body)
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DecreasesRuntimeUnmodelable, name: "", line: decreases_line, expected: "", actual: ""}) if decreases_line != 0 and decreases_body_unmodelable(while_body)
+                            unmodelable: bool = decreases_line != 0 and decreases_body_unmodelable(while_body)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DecreasesRuntimeUnmodelable, name: "", line: decreases_line, expected: "", actual: ""}) if unmodelable
+                            # A MODELABLE body gets the per-path decrease proof; a
+                            # refuted or stagnant measure gets stage0's prover message.
+                            measure_expression: mutable Ast::Expr = Ast::Expr.Absent
+                            has_measure: mutable bool = false
+                            for body_statement in while_body |measure_expression, has_measure|:
+                                match body_statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        if kind == "decreases" and not has_measure:
+                                            measure_expression <- expression
+                                            has_measure <- true
+                                    _:
+                                        pass
+                            judge: bool = decreases_line != 0 and not unmodelable and has_measure
+                            measure_names: mutable darray[sview] = []
+                            measure_coeffs: mutable darray[i64] = []
+                            measure_konst: mutable i64 = 0
+                            measure_linear: bool = judge and lin_add(measure_expression, 1, measure_names, measure_coeffs, measure_konst, Ast::Expr.Invalid, false, 0)
+                            modeled: mutable bool = true
+                            all_paths_decrease: bool = measure_linear and decreases_paths_decrease(while_body, 0, 0, measure_names, measure_coeffs, modeled)
+                            non_decreasing: bool = judge and measure_linear and modeled and not all_paths_decrease
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DecreasesLoopNotDecreasing, name: "", line: decreases_line, expected: "", actual: ""}) if non_decreasing
                             table <- decreases_unmodelable_statements(while_body, table)
                         Stmt.If(condition, then_body, else_body, line):
                             table <- decreases_unmodelable_statements(then_body, table)
