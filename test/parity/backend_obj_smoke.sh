@@ -173,6 +173,12 @@ dwarf_case producer 'DW_AT_producer.*elisacore'
 dwarf_case language_is_c99 'DW_AT_language.*DW_LANG_C99'
 dwarf_case subprogram 'DW_TAG_subprogram'
 dwarf_case names_the_function 'DW_AT_name.*"add"'
+# The subprogram's TYPE. Without a subroutine type carrying real parameter/return types a
+# debugger shows a signature-less symbol, and the object contains no DW_TAG_base_type at
+# all -- which is exactly what stage1 emitted before (stage0's object has them).
+dwarf_case base_type 'DW_TAG_base_type'
+dwarf_case names_i64 'DW_AT_name.*"i64"'
+dwarf_case subprogram_has_type 'DW_AT_type'
 
 wperf_case unrolled_is_silent 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<8]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' no
 
