@@ -1,0 +1,233 @@
+# A local declared with a refinement (`y: T is Law = SOURCE`) where nothing establishes the
+# law for SOURCE. stage0 reports it as unprovable, and the value carries no runtime check
+# either, so the refinement is simply not enforced.
+#
+# The provability boundary, pinned against stage0 in both directions:
+#
+#   y: i64 is Positive = 5                     LITERAL      -> clean (evaluated elsewhere)
+#   requires x > 0; y: i64 is Positive = x     fact         -> clean
+#   y: i64 is Positive = x                     no facts     -> UNPROVEN
+#
+# A first version keyed only on "no `requires` mentions the source" and measured 14 fixed /
+# 12 BROKEN. Every false positive was a fact this check could not see, in four families:
+#
+#   1. `requires forall i in xs.indices: xs[i] > 0`  — reached only through field/index
+#   2. `if a >= 10 and a <= 20:`                     — an enclosing GUARD, not a requires
+#   3. `law CountIsFour(self) = self.count == 4` on `array[i64, 4]` — from the TYPE
+#   4. `Bounded[0..=500]` under a guard                — guard plus law arguments
+#
+# So the fact layer below collects all four sources. It is deliberately CONSERVATIVE: any
+# mention of the source in a requires-clause or an enclosing guard counts as establishing
+# the law, and a matching type-derived extent counts. That can only cause MISSES, never a
+# false positive — and a false positive (warning where stage0 accepts) is the worse failure
+# for a port.
+extend Semantic:
+    private:
+        # The law NAME applied by a type annotation `T is Law` / `T is Law[args]`, or "".
+        def local_refinement_law_name(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Binary(left, operator, right, line):
+                        empty_name: sview = sview("", 0, 0)
+                        empty_name return if operator != TokenKind.Is
+                        return match right:
+                            Expr.Ident(law_name, ident_line): law_name
+                            Expr.Index(applied, argument, index_line): ident_name_of(applied)
+                            Expr.IndexN(applied_n, arguments_n, index_n_line): ident_name_of(applied_n)
+                            Expr.Call(callee, arguments, argument_names, call_line): ident_name_of(callee)
+                            _: sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # Every identifier an expression mentions, reaching through FIELD and INDEX access so
+        # `forall i in xs.indices: xs[i] > 0` counts as mentioning `xs` (family 1).
+        def refinement_mentions(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Field(object, field, field_line):
+                        refinement_mentions(object, out)
+                    Expr.Index(object, index, index_line):
+                        refinement_mentions(object, out)
+                        refinement_mentions(index, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        refinement_mentions(left, out)
+                        refinement_mentions(right, out)
+                    Expr.Paren(inner, paren_line):
+                        refinement_mentions(inner, out)
+                    Expr.Unary(operator, operand, unary_line):
+                        refinement_mentions(operand, out)
+                    Expr.Comprehension(variable, iterable, condition, body, q_line):
+                        refinement_mentions(iterable, out)
+                        refinement_mentions(condition, out)
+                        refinement_mentions(body, out)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |out|:
+                            refinement_mentions(argument, out)
+                    _:
+                        pass
+
+
+        # Facts from `requires` clauses (family 1).
+        def refinement_requires_facts(body: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |out|:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            contract_kind: sview = kind
+                            refinement_mentions(expression, out) if contract_kind == "requires"
+                        _:
+                            pass
+
+
+        # The extent N of an `array[T, N]` annotation, or -1.
+        def refinement_array_extent(type_expression: Ast::Expr) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        return refinement_array_extent(operand)
+                    Expr.Paren(inner, paren_line):
+                        return refinement_array_extent(inner)
+                    Expr.IndexN(object, arguments, index_line):
+                        (-1) return if ident_name_of(object) != "array" or arguments.count != 2
+                        extent: (found: bool, value: i64) = fold_const_int(arguments[1])
+                        return extent.value if extent.found else -1
+                    _:
+                        return (-1)
+
+
+        # Whether LAW's predicate is `self.count == N` for the given extent (family 3): the
+        # fact then comes from the TYPE and needs no other evidence.
+        def refinement_count_law_holds(predicate: Ast::Expr, extent: i64) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if extent < 0
+                match predicate:
+                    Expr.Binary(left, operator, right, line):
+                        false return if operator != TokenKind.EqEq
+                        counts_self: bool = match left:
+                            Expr.Field(object, field, field_line): field == "count" and ident_name_of(object) == "self"
+                            _: false
+                        false return if not counts_self
+                        bound: (found: bool, value: i64) = fold_const_int(right)
+                        return bound.found and bound.value == extent
+                    _:
+                        return false
+
+
+        # A law whose TOP-LEVEL predicate is an implication (`A implies B`, desugared by the
+        # parser to `(not A) or B`) holds without any facts about the value: it is either
+        # vacuous or a logical consequence. stage0 proves all of these.
+        #
+        # Only at the TOP level. An implication nested inside a quantifier -- as in
+        # `forall i: (0 <= i and i < self.count) implies self[i] == self[0]` -- is a real
+        # obligation about the elements and still needs facts.
+        def law_is_top_level_implication(predicate: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Binary(left, operator, right, line):
+                        false return if operator != TokenKind.Or
+                        return match left:
+                            Expr.Unary(unary_operator, operand, unary_line): unary_operator == TokenKind.Not
+                            _: false
+                    Expr.Paren(inner, paren_line):
+                        return law_is_top_level_implication(inner)
+                    _:
+                        return false
+
+
+        # A law the check cannot classify (a multi-statement law body parses to no usable
+        # predicate expression) is left alone rather than reported.
+        def law_predicate_is_opaque(predicate: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if predicate is Expr.Invalid
+                true return if predicate is Expr.Absent
+                return false
+
+
+        def local_refinement_unproven_statements(statements: darray[Ast::Stmt], parameters: darray[sview]&, parameter_types: darray[Ast::Expr]&, established: darray[sview]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            law_name: sview = local_refinement_law_name(type_expression)
+                            continue if law_name == ""
+                            source: sview = ident_name_of(value)
+                            # Only a bare identifier naming a PARAMETER is decided here; any
+                            # other initializer shape stays silent.
+                            continue if source == ""
+                            source_slot: mutable i64 = -1
+                            probe: mutable usize = 0
+                            while probe < parameters.count |source_slot, probe, source, parameters|:
+                                source_slot <- probe.i64() if parameters[probe] == source and source_slot < 0
+                                probe <- probe + 1
+                            continue if source_slot < 0
+                            # A fact mentioning the source (requires or enclosing guard).
+                            continue if any e in established where e == source
+                            # The source's own type already carries this law.
+                            source_type: Ast::Expr = parameter_types[source_slot.usize()]
+                            continue if local_refinement_law_name(source_type) == law_name
+                            # Type-derived: a `self.count == N` law on an `array[T, N]`.
+                            extent: i64 = refinement_array_extent(source_type)
+                            derived: mutable bool = false
+                            law_probe: mutable usize = 0
+                            while law_probe < law_names.count |derived, law_probe, law_name, extent, law_names, law_predicates|:
+                                derived <- refinement_count_law_holds(law_predicates[law_probe], extent) if law_names[law_probe] == law_name
+                                law_probe <- law_probe + 1
+                            continue if derived
+                            # A top-level implication, or a law whose predicate this check
+                            # cannot classify, is not reported.
+                            skip_law: mutable bool = false
+                            shape_probe: mutable usize = 0
+                            while shape_probe < law_names.count |skip_law, shape_probe, law_name, law_names, law_predicates|:
+                                if law_names[shape_probe] == law_name:
+                                    skip_law <- law_is_top_level_implication(law_predicates[shape_probe]) or law_predicate_is_opaque(law_predicates[shape_probe])
+                                shape_probe <- shape_probe + 1
+                            continue if skip_law
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRefinementUnproven, name: law_name, line: line, expected: "", actual: name})
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            # An enclosing GUARD establishes facts about what it mentions
+                            # (family 2/4), for the guarded arm only.
+                            guarded: mutable darray[sview] = []
+                            for carried in established |guarded|:
+                                guarded.push(carried)
+                            refinement_mentions(condition, guarded)
+                            table <- local_refinement_unproven_statements(then_body, parameters, parameter_types, guarded, law_names, law_predicates, table)
+                            table <- local_refinement_unproven_statements(else_body, parameters, parameter_types, established, law_names, law_predicates, table)
+                        Stmt.While(while_condition, while_body, while_line):
+                            table <- local_refinement_unproven_statements(while_body, parameters, parameter_types, established, law_names, law_predicates, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- local_refinement_unproven_statements(block_body, parameters, parameter_types, established, law_names, law_predicates, table)
+                        _:
+                            pass
+
+
+        def check_local_refinement_unproven_walk(declarations: darray[Ast::Decl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            parameter_names: mutable darray[sview] = []
+                            parameter_types: mutable darray[Ast::Expr] = []
+                            for parameter in parameters |parameter_names, parameter_types|:
+                                parameter_names.push(parameter.name)
+                                parameter_types.push(parameter.type_expression)
+                            established: mutable darray[sview] = []
+                            refinement_requires_facts(body, established)
+                            table <- local_refinement_unproven_statements(body, parameter_names, parameter_types, established, law_names, law_predicates, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_local_refinement_unproven_walk(module_body, law_names, law_predicates, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_local_refinement_unproven_walk(scoped_body, law_names, law_predicates, table)
+                        _:
+                            pass
+
+    public:
+        def check_local_refinement_unproven(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(declarations, law_names, law_predicates)
+                return if law_names.count == 0
+                table <- check_local_refinement_unproven_walk(declarations, law_names, law_predicates, table)
