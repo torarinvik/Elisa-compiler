@@ -1,0 +1,306 @@
+# Quantified law refinements on locals (`x: i64 is NotDouble[5] = 4` with
+# `law NotDouble(self, n) = forall k in 0 ..< n: self != k * 2`). stage0 EVALUATES the
+# quantifier for a constant value over a literal-resolved range:
+#
+#     NotDouble[5] = 4    -> flagged  (k = 2 refutes: 4 == 2 * 2)
+#     NotDouble[5] = 5    -> clean    (all k hold)
+#     HardNonlinear[...]  -> flagged  (a body nonlinear in self cannot be judged)
+#
+# The evaluation is bounded; anything outside the decidable shape emits the same
+# could-not-be-proven warning stage0 does.
+extend Semantic:
+    private:
+        # The quantifier inside a law predicate: Comprehension(var, iterable, condition,
+        # body) — the `forall k in LO ..< HI: BODY` and bare-`forall k:` forms.
+        # (found, binder, body): the parser lowers `forall k in LO ..< HI: BODY` in a
+        # law RHS to an Expr.Block of binder VarDecls with BODY as the value — the range
+        # is erased, so evaluation uses the conservative law-args window.
+        def qr_quantifier_of(predicate: Ast::Expr) -> (found: bool, binder: sview, body: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Comprehension(variable, iterable, condition, body, line):
+                        return (true, variable, body)
+                    Expr.Paren(inner, paren_line):
+                        return qr_quantifier_of(inner)
+                    Expr.Block(statements, value, captures, block_line):
+                        binder: mutable sview = sview("", 0, 0)
+                        for statement in statements |binder|:
+                            match statement:
+                                Stmt.VarDecl(name, type_expression, decl_value, decl_line):
+                                    binder <- name if binder == ""
+                                _:
+                                    pass
+                        (true, binder, value) return if binder != ""
+                        return qr_quantifier_of(value)
+                    _:
+                        return (false, sview("", 0, 0), Ast::Expr.Absent)
+
+
+        # Evaluate BODY (a comparison linear in `self` and the binder) at self=V, k=K.
+        # kind: 0 undecidable, 1 holds, 2 violated.
+        def qr_eval_body(body: Ast::Expr, self_name: sview, binder: sview, self_value: i64, k_value: i64, law_params: darray[sview]&, law_args: darray[i64]&) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                match body:
+                    Expr.Paren(inner, line):
+                        return qr_eval_body(inner, self_name, binder, self_value, k_value, law_params, law_args)
+                    Expr.Binary(left, operator, right, line):
+                        # The desugared implication `(not GUARD) or BODY`: judged as the
+                        # implication — guard false => holds; else judge BODY.
+                        if operator == TokenKind.Or:
+                            match left:
+                                Expr.Unary(not_operator, guard, not_line):
+                                    if not_operator == TokenKind.Not:
+                                        guard_result: i64 = qr_eval_body(guard, self_name, binder, self_value, k_value, law_params, law_args)
+                                        (1) return if guard_result == 2
+                                        (0) return if guard_result == 0
+                                        return qr_eval_body(right, self_name, binder, self_value, k_value, law_params, law_args)
+                                _:
+                                    pass
+                            return 0
+                        if operator == TokenKind.And:
+                            left_result: i64 = qr_eval_body(left, self_name, binder, self_value, k_value, law_params, law_args)
+                            right_result: i64 = qr_eval_body(right, self_name, binder, self_value, k_value, law_params, law_args)
+                            (0) return if left_result == 0 or right_result == 0
+                            (1) return if left_result == 1 and right_result == 1
+                            return 2
+                        (0) return if not is_comparison_operator(operator)
+                        left_value: (ok: bool, value: i64) = qr_eval_term(left, self_name, binder, self_value, k_value, law_params, law_args)
+                        right_value: (ok: bool, value: i64) = qr_eval_term(right, self_name, binder, self_value, k_value, law_params, law_args)
+                        (0) return if not left_value.ok or not right_value.ok
+                        holds: mutable bool = false
+                        holds <- left_value.value == right_value.value if operator == TokenKind.EqEq
+                        holds <- left_value.value != right_value.value if operator == TokenKind.BangEq
+                        holds <- left_value.value < right_value.value if operator == TokenKind.Lt
+                        holds <- left_value.value <= right_value.value if operator == TokenKind.LtEq
+                        holds <- left_value.value > right_value.value if operator == TokenKind.Gt
+                        holds <- left_value.value >= right_value.value if operator == TokenKind.GtEq
+                        return 1 if holds else 2
+                    _:
+                        return 0
+
+
+        # Arithmetic term over `self`, the binder, and literals: +, -, and * with at most
+        # ONE non-literal factor (linear; `self * self` is undecidable here).
+        def qr_eval_term(term: Ast::Expr, self_name: sview, binder: sview, self_value: i64, k_value: i64, law_params: darray[sview]&, law_args: darray[i64]&) -> (ok: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match term:
+                    Expr.IntLit(value):
+                        return (true, value)
+                    Expr.Ident(name, line):
+                        (true, self_value) return if name == self_name or name == "self"
+                        (true, k_value) return if name == binder
+                        # A law VALUE parameter resolves to its instantiation argument.
+                        param_probe: mutable usize = 0
+                        param_slot: mutable i64 = -1
+                        while param_probe < law_params.count |param_probe, param_slot, name, law_params|:
+                            param_slot <- param_probe.i64() if law_params[param_probe] == name and param_slot < 0
+                            param_probe <- param_probe + 1
+                        (true, law_args[param_slot.usize()]) return if param_slot >= 0 and param_slot.usize() < law_args.count
+                        return (false, 0)
+                    Expr.Paren(inner, paren_line):
+                        return qr_eval_term(inner, self_name, binder, self_value, k_value, law_params, law_args)
+                    Expr.Unary(operator, operand, unary_line):
+                        (false, 0) return if operator != TokenKind.Minus
+                        inner_value: (ok: bool, value: i64) = qr_eval_term(operand, self_name, binder, self_value, k_value, law_params, law_args)
+                        return (inner_value.ok, 0 - inner_value.value)
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_value: (ok: bool, value: i64) = qr_eval_term(left, self_name, binder, self_value, k_value, law_params, law_args)
+                        right_value: (ok: bool, value: i64) = qr_eval_term(right, self_name, binder, self_value, k_value, law_params, law_args)
+                        (false, 0) return if not left_value.ok or not right_value.ok
+                        (true, left_value.value + right_value.value) return if operator == TokenKind.Plus
+                        (true, left_value.value - right_value.value) return if operator == TokenKind.Minus
+                        if operator == TokenKind.Star:
+                            left_literal: bool = qr_is_literal(left)
+                            right_literal: bool = qr_is_literal(right)
+                            (true, left_value.value * right_value.value) return if left_literal or right_literal
+                            return (false, 0)
+                        return (false, 0)
+                    _:
+                        return (false, 0)
+
+
+        def qr_is_literal(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                constant: (found: bool, value: i64) = fold_const_int(expression)
+                return constant.found
+
+
+        # Substitute a law parameter name for its instantiation constant inside range
+        # bounds (`0 ..< n` with n = 5).
+        def qr_bound_value(expression: Ast::Expr, param_names: darray[sview]&, param_values: darray[i64]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                literal: (found: bool, value: i64) = fold_const_int(expression)
+                literal return if literal.found
+                name: sview = ident_name_of(expression)
+                (false, 0) return if name == ""
+                probe: mutable usize = 0
+                found_slot: mutable i64 = -1
+                while probe < param_names.count |probe, found_slot, name, param_names|:
+                    found_slot <- probe.i64() if param_names[probe] == name and found_slot < 0
+                    probe <- probe + 1
+                (true, param_values[found_slot.usize()]) return if found_slot >= 0
+                return (false, 0)
+
+
+        # Judge one declaration `x: T is Law[args] = CONST` against a quantified law.
+        # verdict: 0 = not this shape / holds, 1 = emit.
+        def qr_judge(law_predicate: Ast::Expr, law_params: darray[sview]&, law_args: darray[i64]&, self_value: i64) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                quantifier: (found: bool, binder: sview, body: Ast::Expr) = qr_quantifier_of(law_predicate)
+                false return if not quantifier.found
+                variable: sview = quantifier.binder
+                self_name: sview = sview("self", 0, 4)
+                # The binder window: [-1, widest-arg]; the guard implication in the body
+                # makes out-of-window k vacuous, and the parser erased any explicit range
+                # (its bounds are the same law args).
+                widest: mutable i64 = 0
+                for arg_value in law_args |widest|:
+                    widest <- arg_value if arg_value > widest
+                lo: i64 = 0 - 1
+                hi: i64 = widest + 1
+                # An oversized window cannot be evaluated — emit, as stage0 does.
+                (true) return if hi - lo > 65536
+                k: mutable i64 = lo
+                while k < hi |k|:
+                    verdict: i64 = qr_eval_body(quantifier.body, self_name, variable, self_value, k, law_params, law_args)
+                    (true) return if verdict != 1
+                    k <- k + 1
+                return false
+
+        def qr_walk_statements(statements: darray[Ast::Stmt], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, law_param_starts: darray[usize]&, law_param_counts: darray[usize]&, all_law_params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            constant: (found: bool, value: i64) = fold_const_int(value)
+                            continue if not constant.found
+                            # `T is Law[args]` with literal args.
+                            match type_expression:
+                                Expr.Binary(base, is_operator, application, is_line):
+                                    continue if is_operator != TokenKind.Is
+                                    law_name: mutable sview = sview("", 0, 0)
+                                    arg_values: mutable darray[i64] = []
+                                    args_ok: mutable bool = true
+                                    match application:
+                                        Expr.IndexN(law_object, law_arguments, law_line):
+                                            law_name <- ident_name_of(law_object)
+                                            for law_argument in law_arguments |arg_values, args_ok|:
+                                                argument_literal: (found: bool, value: i64) = fold_const_int(law_argument)
+                                                args_ok <- false if not argument_literal.found
+                                                arg_values.push(argument_literal.value)
+                                        Expr.Index(single_object, single_argument, single_line):
+                                            law_name <- ident_name_of(single_object)
+                                            single_literal: (found: bool, value: i64) = fold_const_int(single_argument)
+                                            args_ok <- single_literal.found
+                                            arg_values.push(single_literal.value)
+                                        _:
+                                            pass
+                                    continue if law_name == "" or not args_ok
+                                    slot: mutable i64 = -1
+                                    probe: mutable usize = 0
+                                    while probe < law_names.count |slot, probe, law_name, law_names|:
+                                        slot <- probe.i64() if law_names[probe] == law_name and slot < 0
+                                        probe <- probe + 1
+                                    continue if slot < 0
+                                    index: usize = slot.usize()
+                                    law_params: mutable darray[sview] = []
+                                    param_offset: mutable usize = 0
+                                    while param_offset < law_param_counts[index] |law_params, param_offset, index, law_param_starts, all_law_params|:
+                                        law_params.push(all_law_params[law_param_starts[index] + param_offset])
+                                        param_offset <- param_offset + 1
+                                    qr_flagged: bool = qr_judge(law_predicates[index], law_params, arg_values, constant.value)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.QuantifiedRefinementUnproven, name: law_name, line: line, expected: "", actual: name}) if qr_flagged
+                                _:
+                                    pass
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- qr_walk_statements(then_body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params, table)
+                            table <- qr_walk_statements(else_body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- qr_walk_statements(while_body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- qr_walk_statements(block_body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params, table)
+                        _:
+                            pass
+
+
+        # Decl.Law carries only (name, predicate): the VALUE-parameter names are the
+        # predicate's free identifiers excluding `self` and the quantifier binder, in
+        # first-appearance order (matching the declaration's parameter order).
+        def qr_free_value_params(predicate: Ast::Expr, binder: sview, out: mutable darray[sview]&, start: usize) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Ident(name, line):
+                        return if name == "self" or name == binder
+                        seen: mutable bool = false
+                        probe: mutable usize = start
+                        while probe < out.count |probe, seen, name, out|:
+                            seen <- true if out[probe] == name
+                            probe <- probe + 1
+                        out.push(name) if not seen
+                    Expr.Binary(left, operator, right, binary_line):
+                        qr_free_value_params(left, binder, out, start)
+                        qr_free_value_params(right, binder, out, start)
+                    Expr.Unary(operator, operand, unary_line):
+                        qr_free_value_params(operand, binder, out, start)
+                    Expr.Paren(inner, paren_line):
+                        qr_free_value_params(inner, binder, out, start)
+                    Expr.Comprehension(variable, iterable, condition, body, comp_line):
+                        qr_free_value_params(iterable, variable, out, start)
+                        qr_free_value_params(body, variable, out, start)
+                    # The Block-lowered quantifier: binder VarDecls + the body value.
+                    Expr.Block(statements, value, captures, block_line):
+                        block_binder: mutable sview = binder
+                        for statement in statements |block_binder|:
+                            match statement:
+                                Stmt.VarDecl(decl_name, decl_type, decl_value, decl_line):
+                                    block_binder <- decl_name if block_binder == ""
+                                _:
+                                    pass
+                        qr_free_value_params(value, block_binder, out, start)
+                    _:
+                        pass
+
+
+        def qr_collect_laws(declarations: darray[Ast::Decl], law_names: mutable darray[sview]&, law_predicates: mutable darray[Ast::Expr]&, law_param_starts: mutable darray[usize]&, law_param_counts: mutable darray[usize]&, all_law_params: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |law_names, law_predicates, law_param_starts, law_param_counts, all_law_params|:
+                    match declaration:
+                        Decl.Law(name, predicate, line):
+                            law_names.push(name)
+                            law_predicates.push(predicate)
+                            start_count: usize = all_law_params.count
+                            law_param_starts.push(start_count)
+                            qr_free_value_params(predicate, sview("", 0, 0), all_law_params, start_count)
+                            law_param_counts.push(all_law_params.count - start_count)
+                        Decl.Module(module_name, module_body, module_line):
+                            qr_collect_laws(module_body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            qr_collect_laws(scoped_body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params)
+                        _:
+                            pass
+
+
+        def qr_walk_decls(declarations: darray[Ast::Decl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, law_param_starts: darray[usize]&, law_param_counts: darray[usize]&, all_law_params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            table <- qr_walk_statements(body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- qr_walk_decls(module_body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- qr_walk_decls(scoped_body, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params, table)
+                        _:
+                            pass
+
+    public:
+        def check_quantified_refinement(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                law_param_starts: mutable darray[usize] = []
+                law_param_counts: mutable darray[usize] = []
+                all_law_params: mutable darray[sview] = []
+                qr_collect_laws(declarations, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params)
+                return if law_names.count == 0
+                table <- qr_walk_decls(declarations, law_names, law_predicates, law_param_starts, law_param_counts, all_law_params, table)
