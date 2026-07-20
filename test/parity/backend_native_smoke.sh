@@ -945,6 +945,7 @@ run_case get_else_present 'def find(n: i64) -> i64?:\n    return n if n > 0 else
 run_case implicit_void_ref_assign 'def setto(a: mutable i64&, v: i64):\n    a <- v\n\ndef main() -> i64:\n    x: mutable i64 = 3\n    setto(&x, 9)\n    return x\n'   9
 run_case implicit_void_field_mut 'struct P:\n    x: mutable i64\n\ndef bump(p: mutable P&):\n    p.x <- p.x + 1\n\ndef main() -> i64:\n    p: mutable P = P{x: 5}\n    bump(&p)\n    return p.x\n'   6
 run_case pass_statement 'def note(x: i64):\n    if x < 0:\n        pass\n\ndef main() -> i64:\n    note(5)\n    return 7\n'   7
+run_case generic_returns_darray 'def pair[T](a: T, b: T) -> darray[T]:\n    return [a, b]\n\ndef main() -> i64:\n    xs: darray[i64] = pair(10, 20)\n    return xs[0] + xs[1]\n'   30
 run_case struct_field_push_through_ref 'struct Bag:\n    items: mutable darray[i64]\n\ndef add(b: mutable Bag&, v: i64):\n    b.items.push(v)\n\ndef main() -> i64:\n    bag: mutable Bag = Bag{items: []}\n    add(&bag, 7)\n    add(&bag, 8)\n    return bag.items[0] + bag.items[1]\n'   15
 run_case struct_with_darray_return 'struct Buf:\n    data: darray[i64]\n    tag: i64\n\ndef make(t: i64) -> Buf:\n    return Buf{data: [10, 20, 30], tag: t}\n\ndef main() -> i64:\n    b: Buf = make(5)\n    return b.data[1] + b.tag\n'   25
 run_case const_float 'const HALF: f64 = 0.5\n\ndef area(r: f64) -> f64:\n    return HALF * r * r\n\ndef main() -> i64:\n    return area(4.0).i64()\n'   8
