@@ -1,0 +1,252 @@
+# FIELD-fact flow into call preconditions (docs/87 frame conditions). An
+# `assert s.size > 0` establishes a fact about a field; passing `s.size` to a callee
+# requiring positivity is then proven. The fact DIES at an intervening call that takes
+# `s` — unless that callee declares a `changes` clause naming only OTHER fields:
+#
+#     assert s.size > 0
+#     bump_size(s)            # changes s.size      -> fact dead   -> warn at need_pos
+#     touch(s)                # (no changes clause) -> fact dead   -> warn
+#     poke(s)                 # changes s.flags     -> fact LIVES  -> silent
+#     return need_pos(s.size)
+#
+# The parser records each signature's changed FIELDS under annotation sentinel
+# 3900000003 (owner = function name) and changes ROOTS under 3900000006.
+extend Semantic:
+    private:
+        # Whether CALLEE declares any `changes` clause at all.
+        def ff_callee_has_changes(annotations: darray[Ast::EnumAnnotation]&, callee: sview) -> bool:
+            can Abort.Panic:
+                return any annotation in annotations where annotation.owner == callee and (annotation.line == 3900000003 or annotation.line == 3900000006)
+
+
+        # Whether CALLEE's `changes` clause names FIELD.
+        def ff_callee_changes_field(annotations: darray[Ast::EnumAnnotation]&, callee: sview, field: sview) -> bool:
+            can Abort.Panic:
+                return any annotation in annotations where annotation.owner == callee and annotation.line == 3900000003 and annotation.name == field
+
+
+        # The `ROOT.FIELD` positive-fact subject of an assert predicate (`s.size > 0`),
+        # or ("", ""). Only the shapes the callee-requires check consumes.
+        def ff_assert_fact(predicate: Ast::Expr) -> (root: sview, field: sview):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return ff_assert_fact(inner)
+                    Expr.Binary(left, operator, right, line):
+                        (sview("", 0, 0), sview("", 0, 0)) return if not is_comparison_operator(operator)
+                        match left:
+                            Expr.Field(object, field, field_line):
+                                root: sview = ident_name_of(object)
+                                (root, field) return if root != ""
+                                return (sview("", 0, 0), sview("", 0, 0))
+                            _:
+                                return (sview("", 0, 0), sview("", 0, 0))
+                    _:
+                        return (sview("", 0, 0), sview("", 0, 0))
+
+
+        # Whether EXPRESSION passes ROOT as a bare argument to any call (the aliasing
+        # event that can invalidate the root's field facts).
+        def ff_call_passes_root(expression: Ast::Expr, root: sview, callee_out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        called: sview = ident_name_of(callee)
+                        for argument in arguments |callee_out, root, called|:
+                            callee_out.push(called) if ident_name_of(argument) == root and called != ""
+                        for argument in arguments |callee_out, root|:
+                            ff_call_passes_root(argument, root, callee_out)
+                    Expr.Binary(left, operator, right, line):
+                        ff_call_passes_root(left, root, callee_out)
+                        ff_call_passes_root(right, root, callee_out)
+                    Expr.Paren(inner, line):
+                        ff_call_passes_root(inner, root, callee_out)
+                    Expr.Unary(operator, operand, line):
+                        ff_call_passes_root(operand, root, callee_out)
+                    _:
+                        pass
+
+
+        # Fields covered by a declared STRUCT INVARIANT (`invariant self.idx >= 0`):
+        # the invariant holds at every call boundary, so such a field is always proven.
+        def ff_collect_invariant_fields(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Struct(name, members, affinity, has_named_states, has_derive, invariants, line):
+                            for invariant_predicate in invariants |out|:
+                                fact: (root: sview, field: sview) = ff_assert_fact(invariant_predicate)
+                                out.push(fact.field) if fact.root == "self" and fact.field != ""
+                        Decl.Module(module_name, module_body, module_line):
+                            ff_collect_invariant_fields(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            ff_collect_invariant_fields(scoped_body, out)
+                        _:
+                            pass
+
+
+        # Report calls whose FIELD argument sits at a requires-constrained position with
+        # no LIVE fact for it.
+        def ff_check_expression(expression: Ast::Expr, line: u32, pre_functions: darray[sview]&, pre_indices: darray[usize]&, fact_roots: darray[sview]&, fact_fields: darray[sview]&, fact_live: darray[bool]&, invariant_fields: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        called: sview = ident_name_of(callee)
+                        probe: mutable usize = 0
+                        while probe < pre_functions.count |probe, table| -> table:
+                            applies: bool = called != "" and pre_functions[probe] == called and pre_indices[probe] < arguments.count
+                            if applies:
+                                match arguments[pre_indices[probe]]:
+                                    Expr.Field(field_object, field_name, field_line):
+                                        root: sview = ident_name_of(field_object)
+                                        if root != "":
+                                            live: mutable bool = false
+                                            fact_probe: mutable usize = 0
+                                            while fact_probe < fact_roots.count |live, fact_probe, root, field_name, fact_roots, fact_fields, fact_live|:
+                                                live <- true if fact_roots[fact_probe] == root and fact_fields[fact_probe] == field_name and fact_live[fact_probe]
+                                                fact_probe <- fact_probe + 1
+                                            covered: bool = any inv_field in invariant_fields where inv_field == field_name
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: called, line: line, expected: "", actual: ""}) if not live and not covered
+                                    _:
+                                        pass
+                            probe <- probe + 1
+                        for argument in arguments |table| -> table:
+                            table <- ff_check_expression(argument, line, pre_functions, pre_indices, fact_roots, fact_fields, fact_live, invariant_fields, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- ff_check_expression(left, line, pre_functions, pre_indices, fact_roots, fact_fields, fact_live, invariant_fields, table)
+                        table <- ff_check_expression(right, line, pre_functions, pre_indices, fact_roots, fact_fields, fact_live, invariant_fields, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- ff_check_expression(inner, line, pre_functions, pre_indices, fact_roots, fact_fields, fact_live, invariant_fields, table)
+                    _:
+                        pass
+
+
+        def ff_walk(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, pre_functions: darray[sview]&, pre_indices: darray[usize]&, invariant_fields: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fact_roots: mutable darray[sview] = []
+                fact_fields: mutable darray[sview] = []
+                fact_live: mutable darray[bool] = []
+                for statement in statements |fact_roots, fact_fields, fact_live, table| -> table:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            if kind == "assert":
+                                fact: (root: sview, field: sview) = ff_assert_fact(expression)
+                                if fact.root != "":
+                                    fact_roots.push(fact.root)
+                                    fact_fields.push(fact.field)
+                                    fact_live.push(true)
+                        Stmt.Expr(expression, line):
+                            # `assert(EXPR)` call form establishes the same fact.
+                            match expression:
+                                Expr.Call(assert_callee, assert_arguments, assert_names, assert_line):
+                                    if ident_name_of(assert_callee) == "assert" and assert_arguments.count == 1:
+                                        call_fact: (root: sview, field: sview) = ff_assert_fact(assert_arguments[0])
+                                        if call_fact.root != "":
+                                            fact_roots.push(call_fact.root)
+                                            fact_fields.push(call_fact.field)
+                                            fact_live.push(true)
+                                _:
+                                    pass
+                            table <- ff_check_expression(expression, line, pre_functions, pre_indices, fact_roots, fact_fields, fact_live, invariant_fields, table)
+                            ff_invalidate(expression, annotations, fact_roots, fact_fields, fact_live)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- ff_check_expression(value, line, pre_functions, pre_indices, fact_roots, fact_fields, fact_live, invariant_fields, table)
+                            ff_invalidate(value, annotations, fact_roots, fact_fields, fact_live)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- ff_check_expression(value, line, pre_functions, pre_indices, fact_roots, fact_fields, fact_live, invariant_fields, table)
+                            ff_invalidate(value, annotations, fact_roots, fact_fields, fact_live)
+                            # A direct store to the field kills its old fact; a CONSTANT
+                            # store establishes a fresh one (the stored value is known at
+                            # the following call).
+                            match target:
+                                Expr.Field(store_object, store_field, store_line):
+                                    store_root: sview = ident_name_of(store_object)
+                                    kill_probe: mutable usize = 0
+                                    while kill_probe < fact_roots.count |kill_probe, store_root, store_field, fact_roots, fact_fields, fact_live|:
+                                        fact_live[kill_probe] <- false if fact_roots[kill_probe] == store_root and fact_fields[kill_probe] == store_field
+                                        kill_probe <- kill_probe + 1
+                                    stored_const: (found: bool, value: i64) = fold_const_int(value)
+                                    if stored_const.found and store_root != "":
+                                        fact_roots.push(store_root)
+                                        fact_fields.push(store_field)
+                                        fact_live.push(true)
+                                _:
+                                    pass
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- ff_check_expression(returned, line, pre_functions, pre_indices, fact_roots, fact_fields, fact_live, invariant_fields, table)
+                        _:
+                            pass
+
+
+        # Kill facts whose root is passed to a call that may change the field.
+        def ff_invalidate(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, fact_roots: darray[sview]&, fact_fields: darray[sview]&, fact_live: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fact_probe: mutable usize = 0
+                while fact_probe < fact_roots.count |fact_probe, fact_live|:
+                    if fact_live[fact_probe]:
+                        callees: mutable darray[sview] = []
+                        ff_call_passes_root(expression, fact_roots[fact_probe], callees)
+                        for called in callees |fact_probe, fact_live, annotations, fact_fields|:
+                            preserved: bool = ff_callee_has_changes(annotations, called) and not ff_callee_changes_field(annotations, called, fact_fields[fact_probe])
+                            fact_live[fact_probe] <- false if not preserved
+                    fact_probe <- fact_probe + 1
+
+
+        def ff_collect_requires(declarations: darray[Ast::Decl], pre_functions: mutable darray[sview]&, pre_indices: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |pre_functions, pre_indices|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            for statement in body |pre_functions, pre_indices, function_name, parameters|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        continue if kind != "requires"
+                                        # A requires naming exactly one parameter marks
+                                        # that argument position as constrained.
+                                        mentioned: mutable darray[sview] = []
+                                        refinement_mentions(expression, mentioned)
+                                        position: mutable i64 = -1
+                                        multiple: mutable bool = false
+                                        param_probe: mutable usize = 0
+                                        for parameter in parameters |position, multiple, param_probe, mentioned|:
+                                            is_mentioned: bool = any m in mentioned where m == parameter.name
+                                            multiple <- true if is_mentioned and position >= 0
+                                            position <- param_probe.i64() if is_mentioned and position < 0
+                                            param_probe <- param_probe + 1
+                                        if position >= 0 and not multiple:
+                                            pre_functions.push(function_name)
+                                            pre_indices.push(position.usize())
+                                    _:
+                                        pass
+                        Decl.Module(module_name, module_body, module_line):
+                            ff_collect_requires(module_body, pre_functions, pre_indices)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            ff_collect_requires(scoped_body, pre_functions, pre_indices)
+                        _:
+                            pass
+
+
+        def ff_decls(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, pre_functions: darray[sview]&, pre_indices: darray[usize]&, invariant_fields: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- ff_walk(body, annotations, pre_functions, pre_indices, invariant_fields, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- ff_decls(module_body, annotations, pre_functions, pre_indices, invariant_fields, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- ff_decls(scoped_body, annotations, pre_functions, pre_indices, invariant_fields, table)
+                        _:
+                            pass
+
+    public:
+        def check_field_fact_precondition(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                pre_functions: mutable darray[sview] = []
+                pre_indices: mutable darray[usize] = []
+                ff_collect_requires(file.top_decls, pre_functions, pre_indices)
+                return if pre_functions.count == 0
+                invariant_fields: mutable darray[sview] = []
+                ff_collect_invariant_fields(file.top_decls, invariant_fields)
+                table <- ff_decls(file.top_decls, file.enum_annotations, pre_functions, pre_indices, invariant_fields, table)
