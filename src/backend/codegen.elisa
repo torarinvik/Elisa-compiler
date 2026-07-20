@@ -622,6 +622,12 @@ module Backend:
             # handle null and stay on the fold path above.
             const_globals: mutable darray[LLVMValueRef]
             const_global_ok: mutable darray[bool]
+            # `static if` selection results, stashed here because StructTable already
+            # reaches every emitter: branch head lines (all of them) and the taken subset.
+            # A Stmt.Block("static") whose line is a branch line emits only when taken;
+            # a bare `static:` block (line in neither) emits unconditionally.
+            static_branch_lines: mutable darray[u32]
+            static_taken_lines: mutable darray[u32]
             # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
             # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
             #
@@ -1592,8 +1598,15 @@ module Backend:
                 object_type: mutable ValueType = expression_type(field_object, local_scope, fns, structs, generics)
                 # AUTO-DEREF: `p.x` where `p: P&` reads P's field. A reference is
                 # transparent for member access — the frontend has already decided the
-                # access is legal, so the backend just looks through it.
+                # access is legal, so the backend just looks through it. An optional HEAP
+                # ref (`heap T&?`) is looked through too: stage0 represents it as a bare
+                # ptr and permits flow-guarded access without narrowing.
+                if object_type.kind == TypeKind.Optional:
+                    field_opt_payload: ValueType = optional_payload_of(object_type, structs)
+                    object_type <- field_opt_payload if field_opt_payload.kind == TypeKind.Ref and ref_is_heap_ref(field_opt_payload, structs)
                 object_type <- ref_target_of(object_type, structs) if object_type.kind == TypeKind.Ref
+                # An arena CARRIER's fields read the user-declared `struct Arena`.
+                object_type <- arena_user_struct(structs) if object_type.kind == TypeKind.Arena
                 # `xs.count` is a usize-shaped i64.
                 ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "count"
                 # A `view[T]` field read goes through its DynArrayView struct.
@@ -2949,6 +2962,20 @@ module Backend:
             return false
 
 
+        # The user-defined `struct Arena`, when the program declares one. The NAME `Arena`
+        # always annotates as TypeKind.Arena (the runtime carrier -- `in` blocks and arena
+        # threading key on it), but the std DEFINES the struct itself, with fields the
+        # allocator walks (`a.begin`). The two are layout-identical by construction (the
+        # backend's auto-region {ptr,ptr,i64,i64} IS the std's {begin,end,end_index,
+        # strategy}), so FIELD ACCESS resolves through the declared struct while the type
+        # stays Arena everywhere else. Without this, every std function touching an arena
+        # field declined -- arena_used_slots was the observable casualty.
+        def arena_user_struct(structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            for index in 0..<structs.names.count |structs|:
+                ValueType{kind: TypeKind.Struct, bits: index.u32()} return if structs.names[index] == "Arena"
+            return unmodeled_type()
+
+
         # The ADDRESS of a struct-typed local, and the struct's type.
         #
         # For a plain local that is its alloca. For a `P&` parameter the alloca holds a
@@ -2962,9 +2989,26 @@ module Backend:
                 # A `view[T]` local IS its slot (it holds the DynArrayView value inline).
                 slot return if declared.kind == TypeKind.View
                 if declared.kind == TypeKind.Ref:
-                    ref_addr_target: ValueType = ref_target_of(declared, structs)
+                    ref_addr_target: mutable ValueType = ref_target_of(declared, structs)
+                    # `a.begin` where `a: mutable Arena&` -- field access through the arena
+                    # CARRIER reads the user-declared `struct Arena` (see arena_user_struct).
+                    ref_addr_target <- arena_user_struct(structs) if ref_addr_target.kind == TypeKind.Arena
                     null return if ref_addr_target.kind != TypeKind.Struct and ref_addr_target.kind != TypeKind.View
                     return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), slot, "ref.deref")
+                # `cursor.count` where `cursor: heap Node&?` -- field access through an
+                # UN-NARROWED optional heap ref. stage0 represents `heap T&?` as a bare ptr
+                # and emits the load unconditionally (the null case is guarded by program
+                # flow, e.g. `while cursor != null`), so stage1 matches by reading the
+                # optional's ptr payload out of its `{i1, ptr}` slot. Heap refs only: a
+                # plain `T&?` has no such stage0 precedent.
+                if declared.kind == TypeKind.Optional:
+                    opt_payload: ValueType = optional_payload_of(declared, structs)
+                    if opt_payload.kind == TypeKind.Ref and ref_is_heap_ref(opt_payload, structs):
+                        opt_addr_target: ValueType = ref_target_of(opt_payload, structs)
+                        null return if opt_addr_target.kind != TypeKind.Struct
+                        opt_llvm: LLVMTypeRef = llvm_type_of(declared, structs, ctx)
+                        opt_value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, opt_llvm, slot, 1, "opt.heap.ptr")
+                        return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), opt_value_pointer, "opt.heap.deref")
             return null
 
 
@@ -2975,7 +3019,14 @@ module Backend:
             # A `view[T]` accesses fields (`dst.data`, `dst.len`) through its DynArrayView.
             view_struct_type(declared, structs) return if declared.kind == TypeKind.View
             view_struct_type(ref_target_of(declared, structs), structs) return if declared.kind == TypeKind.Ref and ref_target_of(declared, structs).kind == TypeKind.View
-            return ref_target_of(declared, structs)
+            # An optional HEAP ref looks through both wrappers (see struct_address_of).
+            if declared.kind == TypeKind.Optional:
+                opt_name_payload: ValueType = optional_payload_of(declared, structs)
+                ref_target_of(opt_name_payload, structs) return if opt_name_payload.kind == TypeKind.Ref and ref_is_heap_ref(opt_name_payload, structs)
+            behind_ref: ValueType = ref_target_of(declared, structs)
+            # An arena CARRIER's fields read the user-declared `struct Arena`.
+            arena_user_struct(structs) return if behind_ref.kind == TypeKind.Arena
+            return behind_ref
 
 
         # The struct type of a field-access CHAIN (`o`, `o.i`, `o.i.j`, ...). Recurses so
@@ -4434,6 +4485,18 @@ module Backend:
             # lands in `clause` alongside the name and is not modeled.
             if statement is Stmt.Block(block_kind, block_clause, block_binding, block_body, block_line):
                 declined_status: EmitStatus = EmitStatus.Declined
+                # `static if/elif/else` in statement position: the parser keeps every
+                # branch's body, so an UNTAKEN branch must emit NOTHING -- its body may
+                # declare the same locals as the taken one, or call externs that only exist
+                # on another target. A taken branch (and a bare `static:` block, whose line
+                # is in neither table) emits inline into the enclosing scope, which is
+                # stage0's scoping: a local declared in a taken branch is visible after
+                # the chain (arena.elisa binds `r` this way).
+                if block_kind == "static":
+                    is_static_branch: bool = static_branch_is_taken(structs.static_branch_lines, block_line)
+                    static_kept: bool = static_branch_is_taken(structs.static_taken_lines, block_line) if is_static_branch else true
+                    EmitStatus.Open return if not static_kept
+                    return emit_statements(block_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                 # `in owner:` — make an EXISTING arena the active one for the block. stage0
                 # requires this before a container can be built from an explicit `Arena`
                 # parameter ("darray push requires an active in <arena>: scope"): passing an
@@ -6739,7 +6802,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -6770,6 +6833,10 @@ module Backend:
                 for round_declaration in top |structs|:
                     register_const(round_declaration, structs)
                 fold_consts(file, top, structs)
+            # Statement-level `static if` branches select on the SAME tables, but inside
+            # function bodies -- stash the verdicts where the statement emitter can see them.
+            structs.static_branch_lines <- file.static_if_lines
+            structs.static_taken_lines <- selected_static_if_lines(file, structs)
 
             # Templates must be known before any body is emitted: a call decides between
             # "ordinary function" and "instantiate a generic" by looking here.
