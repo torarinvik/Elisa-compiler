@@ -1,0 +1,117 @@
+# An `lmut T` parameter is a LINEAR mutable value: a call that threads it (the callee declares
+# the argument `lmut`, tracked in lmut_param_owner/pos) consumes the value and produces its
+# successor, so the call MUST rebind the argument's name — `x <- x.step()`, `x, _ <- x.step()`,
+# or a `rebind ... x = ...`. A bare statement call (`p.advance()`), a discard (`_ = bump(c)`), or
+# a fresh binding that keeps only a side result (`c: i64 = advance_char(lx)`) drops the threaded
+# successor — stage0 flags it (docs/120 §10). SOUND, structural subset: a threading call whose
+# lmut argument is a bare Ident is a violation unless that name appears among the enclosing
+# assignment's targets. UFCS `recv.m(...)` threads its RECEIVER at position 0.
+extend Semantic:
+    private:
+        def lmut_threads_position(table: SymbolTable&, callee: sview, position: u32) -> bool:
+            can Abort.Panic:
+                index: mutable usize = 0
+                found: mutable bool = false
+                while index < table.lmut_param_owner.count |found, index, callee, position, table|:
+                    found <- true if table.lmut_param_owner[index] == callee and table.lmut_param_pos[index] == position
+                    index <- index + 1
+                return found
+
+        # The bare-Ident name threaded by a call at an lmut position ("" when the call threads
+        # nothing rebindable). Direct `f(a, b)`: an argument at an lmut position. UFCS
+        # `recv.m(a)`: the receiver is position 0, the written arguments shift to 1+.
+        def lmut_threaded_arg_name(expression: Ast::Expr, table: SymbolTable&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        if callee is Expr.Ident(direct_name, direct_line):
+                            position: mutable u32 = 0
+                            result: mutable sview = sview("", 0, 0)
+                            for argument in arguments |result, position, direct_name, table|:
+                                if result == "" and lmut_threads_position(table, direct_name, position):
+                                    result <- ident_name_of(argument)
+                                position <- position + 1
+                            return result
+                        if callee is Expr.Field(receiver, method_name, field_line):
+                            receiver_name: sview = ident_name_of(receiver)
+                            if receiver_name != "" and lmut_threads_position(table, method_name, 0):
+                                return receiver_name
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # Append the bare-Ident target names of an assignment target expression (a single
+        # `Ident` or a tuple `Array` of them) to OUT.
+        def lmut_collect_target_names(target: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Array(elements, array_line):
+                        for element in elements |out|:
+                            out.push(ident_name_of(element)) if ident_name_of(element) != ""
+                    _:
+                        pass
+
+        # Flag a threading call in VALUE whose threaded name is NOT among `targets`. Recurses
+        # through the shapes a rebind RHS can take (value-`if`, parens) so
+        # `lexer <- if c: lexer.advance() else: lexer` stays accepted.
+        def lmut_check_value(value: Ast::Expr, targets: darray[sview]&, line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                threaded: sview = lmut_threaded_arg_name(value, table)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LmutMutationNotReassignment, name: threaded, line: line, expected: "", actual: "", expected_count: 1}) if threaded != "" and not (any target in targets where target == threaded)
+                match value:
+                    Expr.If(condition, then_value, else_value, if_line):
+                        table <- lmut_check_value(then_value, targets, line, table)
+                        table <- lmut_check_value(else_value, targets, line, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- lmut_check_value(inner, targets, line, table)
+                    _:
+                        pass
+
+        def lmut_mutation_check_statements(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            no_targets: darray[sview] = []
+                            table <- lmut_check_value(expression, no_targets, line, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            no_targets: darray[sview] = []
+                            table <- lmut_check_value(value, no_targets, line, table)
+                        Stmt.Assign(target, operator, value, line):
+                            targets: mutable darray[sview] = []
+                            lmut_collect_target_names(target, targets)
+                            table <- lmut_check_value(value, targets, line, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- lmut_mutation_check_statements(then_body, table)
+                            table <- lmut_mutation_check_statements(else_body, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- lmut_mutation_check_statements(while_body, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- lmut_mutation_check_statements(for_body, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- lmut_mutation_check_statements(body, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- lmut_mutation_check_statements(arm.body, table)
+                        _:
+                            pass
+
+        def lmut_mutation_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- lmut_mutation_check_statements(body, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- lmut_mutation_walk(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- lmut_mutation_walk(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_lmut_mutation_reassignment(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- lmut_mutation_walk(file.top_decls, table)
