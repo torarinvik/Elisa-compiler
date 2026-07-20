@@ -945,6 +945,7 @@ run_case get_else_present 'def find(n: i64) -> i64?:\n    return n if n > 0 else
 run_case implicit_void_ref_assign 'def setto(a: mutable i64&, v: i64):\n    a <- v\n\ndef main() -> i64:\n    x: mutable i64 = 3\n    setto(&x, 9)\n    return x\n'   9
 run_case implicit_void_field_mut 'struct P:\n    x: mutable i64\n\ndef bump(p: mutable P&):\n    p.x <- p.x + 1\n\ndef main() -> i64:\n    p: mutable P = P{x: 5}\n    bump(&p)\n    return p.x\n'   6
 run_case pass_statement 'def note(x: i64):\n    if x < 0:\n        pass\n\ndef main() -> i64:\n    note(5)\n    return 7\n'   7
+run_case const_float 'const HALF: f64 = 0.5\n\ndef area(r: f64) -> f64:\n    return HALF * r * r\n\ndef main() -> i64:\n    return area(4.0).i64()\n'   8
 run_case const_bool 'const ON: bool = true\nconst OFF: bool = false\n\ndef main() -> i64:\n    return (5 if ON else 0) + (1 if OFF else 2)\n'   7
 run_case for_over_field_ref 'struct Bag:\n    items: darray[i64]\n\ndef total(b: Bag&) -> i64:\n    t: mutable i64 = 0\n    for x in b.items |t|:\n        t <- t + x\n    return t\n\ndef main() -> i64:\n    b: Bag = Bag{items: [1, 2, 3]}\n    return total(&b)\n'   6
 run_case for_over_borrowed_darray 'def sum(xs: darray[i64]&) -> i64:\n    t: mutable i64 = 0\n    for x in xs |t|:\n        t <- t + x\n    return t\n\ndef main() -> i64:\n    a: darray[i64] = [5, 10, 15]\n    return sum(&a)\n'   30
