@@ -1004,6 +1004,15 @@ decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a:
 # args are fixed; not modeled, so it declines rather than emitting a wrong signature.
 # An UNUSED variadic extern no longer poisons the module (per-fn tolerance): the
 # program runs. stage0 compiles this program too, so this is parity, not permissiveness.
+# `assert PATH != null` NARROWS the optional for what follows, so a plain-ref local may be
+# initialized from an optional-ref field. stage0 does this and REJECTS the same assignment
+# without the assert (verified both ways); the std dict's find/get/put all depend on it.
+run_case narrow_optional_ref_by_assert 'struct Node:\n    v: mutable i64\n\nstruct Holder:\n    p: mutable Node&?\n\ndef fetch(h: Holder&) -> i64:\n    assert h.p != null\n    q: Node& = h.p\n    return q.v\n\ndef main() -> i64:\n    n: mutable Node = Node{v: 42}\n    hold: mutable Holder = Holder{p: &n}\n    return fetch(&hold)\n' 42
+# An `if` GUARD narrows the same way inside its then-arm, and `and` chains are walked
+# (the dict rehash writes `if old_items != null and old_capacity > 0:`).
+run_case narrow_optional_ref_by_guard 'struct Node:\n    v: mutable i64\n\nstruct Holder:\n    p: mutable Node&?\n\ndef fetch(h: Holder&, n: i64) -> i64:\n    if h.p != null and n > 0:\n        q: Node& = h.p\n        return q.v\n    return 7\n\ndef main() -> i64:\n    n: mutable Node = Node{v: 42}\n    hold: mutable Holder = Holder{p: &n}\n    return fetch(&hold, 1)\n' 42
+# WITHOUT a proof the assignment must still DECLINE -- narrowing is a fact, not a coercion.
+stripped_case narrow_optional_ref_unproven 'struct Node:\n    v: mutable i64\n\nstruct Holder:\n    p: mutable Node&?\n\ndef fetch(h: Holder&) -> i64:\n    q: Node& = h.p\n    return q.v\n\ndef main() -> i64:\n    n: mutable Node = Node{v: 42}\n    hold: mutable Holder = Holder{p: &n}\n    return fetch(&hold)\n'
 # A const's type ANNOTATION is optional: `const A = 0x20` takes its type from the
 # initializer (stage0's default integer type is `int`). The arena writes every
 # ELISA_ARENA_PROT_* / MAP_* flag this way, so leaving these Unmodeled declined every

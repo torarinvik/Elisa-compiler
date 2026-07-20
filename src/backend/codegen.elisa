@@ -635,6 +635,17 @@ module Backend:
             # Runtime because Runtime is COPIED per function (copied_runtime) and this is a
             # container -- the side-table channel static_branch_lines already uses.
             pending_ensures: mutable darray[Expr]
+            # Paths proven non-null by an `assert PATH != null` in the function currently
+            # being emitted. stage0 NARROWS on that assert: `assert m.items != null` makes
+            # the following `items: DictBucket[K,T]& = m.items` legal (it rejects the same
+            # assignment WITHOUT the assert -- verified against stage0 both ways). The std
+            # dict's find/get/put all depend on it.
+            #
+            # A path is `owner.field` (field == "" for a bare local). Recorded per function
+            # and dropped as soon as anything ASSIGNS to the path, since the proof dies with
+            # the value it was about.
+            narrowed_owners: mutable darray[sview]
+            narrowed_fields: mutable darray[sview]
             # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
             # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
             #
@@ -4483,6 +4494,119 @@ module Backend:
             _ = LLVMBuildBr(builder, dest)
 
 
+        # The `owner` half of a narrowable path: `m.items` -> "m", `p` -> "p". "" = a shape
+        # too complex to track (a call result, an index, a nested path), which simply never
+        # narrows.
+        def narrow_owner_of(path: Expr) -> sview can[Abort.Panic]:
+            if path is Expr.Field(narrow_head, narrow_field_name, narrow_field_line):
+                if narrow_head is Expr.Ident(narrow_base_name, narrow_base_line):
+                    return narrow_base_name
+                return ""
+            if path is Expr.Ident(narrow_ident_name, narrow_ident_line):
+                return narrow_ident_name
+            return ""
+
+
+        # The `field` half: `m.items` -> "items", `p` -> "" (a bare local).
+        def narrow_field_of(path: Expr) -> sview can[Abort.Panic]:
+            if path is Expr.Field(narrow_f_head, narrow_f_name, narrow_f_line):
+                return narrow_f_name
+            return ""
+
+
+        # Whether `path` has been proven non-null by an earlier `assert PATH != null`.
+        def path_is_narrowed(path: Expr, structs: StructTable&) -> bool can[Abort.Panic]:
+            narrow_owner: sview = narrow_owner_of(path)
+            false return if narrow_owner == ""
+            narrow_field: sview = narrow_field_of(path)
+            narrow_index: mutable usize = 0
+            while narrow_index < structs.narrowed_owners.count |narrow_index, narrow_owner, narrow_field, structs|:
+                true return if structs.narrowed_owners[narrow_index] == narrow_owner and structs.narrowed_fields[narrow_index] == narrow_field
+                narrow_index <- narrow_index + 1
+            return false
+
+
+        # Record `assert PATH != null`. Only a `!=` against the null literal narrows; `==
+        # null` proves the opposite and must NOT record.
+        def record_null_assert(predicate: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if predicate is Expr.Binary(assert_left, assert_operator, assert_right, assert_line):
+                return if assert_operator != TokenKind.BangEq
+                left_null: bool = is_null_literal(assert_left)
+                right_null: bool = is_null_literal(assert_right)
+                return if not (left_null or right_null)
+                asserted_path: Expr = assert_right if left_null else assert_left
+                asserted_owner: sview = narrow_owner_of(asserted_path)
+                return if asserted_owner == ""
+                structs.narrowed_owners <- structs.narrowed_owners.push(asserted_owner)
+                structs.narrowed_fields <- structs.narrowed_fields.push(narrow_field_of(asserted_path))
+
+
+        # Drop any narrowing proof about `path` -- an assignment replaces the value the
+        # proof was about, so a stale proof would unwrap a fresh null.
+        def invalidate_narrowing(path: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            invalid_owner: sview = narrow_owner_of(path)
+            return if invalid_owner == ""
+            # Assigning to `m` invalidates every proof about `m.FIELD` too: the whole struct
+            # was replaced. So an owner match alone is enough to drop the row.
+            # Collected into LOCALS, then the table is emptied and refilled by PUSH. Binding
+            # `structs.narrowed_owners <- kept_owners` instead would hand the caller's field
+            # a darray backed by this function's auto region, freed on return -- the
+            # callee-rebind use-after-free the region checker rejects outright.
+            kept_owners: mutable darray[sview] = []
+            kept_fields: mutable darray[sview] = []
+            keep_index: mutable usize = 0
+            while keep_index < structs.narrowed_owners.count |keep_index, kept_owners, kept_fields, invalid_owner, structs|:
+                if structs.narrowed_owners[keep_index] != invalid_owner:
+                    kept_owners.push(structs.narrowed_owners[keep_index])
+                    kept_fields.push(structs.narrowed_fields[keep_index])
+                keep_index <- keep_index + 1
+            clear_narrowings(structs)
+            refill_index: mutable usize = 0
+            while refill_index < kept_owners.count |refill_index, kept_owners, kept_fields, structs|:
+                structs.narrowed_owners <- structs.narrowed_owners.push(kept_owners[refill_index])
+                structs.narrowed_fields <- structs.narrowed_fields.push(kept_fields[refill_index])
+                refill_index <- refill_index + 1
+
+
+        # Record every `PATH != null` a guard CONDITION proves, walking `and` chains (the std
+        # dict writes `if old_items_opt != null and old_capacity > 0:`). Only `and` is walked:
+        # under `or` neither side is guaranteed, so nothing is proven.
+        def record_null_guards(condition: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if condition is Expr.Binary(guard_left, guard_operator, guard_right, guard_line):
+                if guard_operator == TokenKind.And:
+                    record_null_guards(guard_left, structs)
+                    record_null_guards(guard_right, structs)
+                    return
+            record_null_assert(condition, structs)
+
+
+        # Save the proof set so a branch's narrowings can be rolled back at the join: a proof
+        # that only holds inside the `then` arm must not leak past it.
+        def snapshot_narrowings(structs: StructTable&, saved_owners: mutable darray[sview]&, saved_fields: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            snapshot_index: mutable usize = 0
+            while snapshot_index < structs.narrowed_owners.count |snapshot_index, saved_owners, saved_fields, structs|:
+                saved_owners.push(structs.narrowed_owners[snapshot_index])
+                saved_fields.push(structs.narrowed_fields[snapshot_index])
+                snapshot_index <- snapshot_index + 1
+
+
+        def restore_narrowings(structs: mutable StructTable&, saved_owners: darray[sview]&, saved_fields: darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            clear_narrowings(structs)
+            restore_index: mutable usize = 0
+            while restore_index < saved_owners.count |restore_index, saved_owners, saved_fields, structs|:
+                structs.narrowed_owners <- structs.narrowed_owners.push(saved_owners[restore_index])
+                structs.narrowed_fields <- structs.narrowed_fields.push(saved_fields[restore_index])
+                restore_index <- restore_index + 1
+
+
+        # Drop every narrowing proof (per-function reset, and the first half of a rebuild).
+        def clear_narrowings(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            while structs.narrowed_owners.count > 0 |structs|:
+                _ = structs.narrowed_owners.pop()
+            while structs.narrowed_fields.count > 0 |structs|:
+                _ = structs.narrowed_fields.pop()
+
+
         # Emit a runtime contract guard: branch on `condition`, abort on false, and leave
         # the builder positioned on the success path. Shared by `requires`/`assert` (checked
         # where they are written) and `ensure` (checked at every return).
@@ -4690,6 +4814,10 @@ module Backend:
                 bool_type_c: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
                 if emit_expression(contract_pred, bool_type_c, local_scope, fns, structs, generics, runtime, m, ctx, builder) is contract_value:
                     emit_contract_guard(contract_value, m, ctx, builder)
+                    # Past the guard the predicate HOLDS, so `assert p != null` narrows `p`
+                    # for the rest of the function -- stage0's rule, which the std dict
+                    # relies on to read `m.items` as a plain ref.
+                    record_null_assert(contract_pred, structs)
                     return EmitStatus.Open
                 return declined_contract
 
@@ -4834,7 +4962,21 @@ module Backend:
                 # Also stops a miscompile: stage1's parser erases the control-flow else of
                 # `x: i64 = get f() else return 7`, collapsing it to `x: i64 = f()` (f -> i64?).
                 var_value_type: ValueType = expression_type(var_value, local_scope, fns, structs, generics)
-                EmitStatus.Declined return if var_value_type.kind == TypeKind.Optional and declared_type.kind != TypeKind.Optional
+                if var_value_type.kind == TypeKind.Optional and declared_type.kind != TypeKind.Optional:
+                    # NARROWED by an earlier `assert PATH != null`: stage0 accepts the
+                    # assignment (and emits a plain pointer copy, its `T&?` being a bare
+                    # ptr). stage1's `{i1, ptr}` needs the payload extracted.
+                    EmitStatus.Declined return if not path_is_narrowed(var_value, structs)
+                    narrowed_payload: ValueType = optional_payload_of(var_value_type, structs)
+                    EmitStatus.Declined return if narrowed_payload.kind != declared_type.kind or narrowed_payload.bits != declared_type.bits
+                    if emit_expression(var_value, var_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is narrowed_optional:
+                        narrowed_value: LLVMValueRef = LLVMBuildExtractValue(builder, narrowed_optional, 1, "narrow.payload")
+                        narrow_storage: mutable darray[u8] = []
+                        narrow_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(declared_type, structs, ctx), sview_to_cstr(var_name, narrow_storage))
+                        _ = LLVMBuildStore(builder, narrowed_value, narrow_slot)
+                        declare_local(local_scope, var_name, narrow_slot, declared_type)
+                        return EmitStatus.Open
+                    return EmitStatus.Declined
                 if emit_expression(var_value, declared_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is initial:
                     name_storage: mutable darray[u8] = []
                     slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(declared_type, structs, ctx), sview_to_cstr(var_name, name_storage))
@@ -4852,6 +4994,10 @@ module Backend:
             # outer `i` never moves (an infinite loop, no diagnostic — observed).
             # Compound assignment (`+=`) and non-ident targets also decline.
             if statement is Stmt.Assign(assign_target, assign_operator, assign_value, assign_line):
+                # Any assignment kills a narrowing proof about the target: the value the
+                # `assert PATH != null` was about is gone, and a stale proof would unwrap a
+                # fresh null. Done BEFORE the store so no path below can miss it.
+                invalidate_narrowing(assign_target, structs)
                 # `PLACE as & <- value` — a REBORROW-ASSIGN to an optional-REFERENCE field
                 # (`arena: mutable Arena&?`): store `value` (a pointer) as the PRESENT payload.
                 # Parsed as an `as`-Binary target; the `&` leaf is the reinterpret marker. The
@@ -4998,7 +5144,16 @@ module Backend:
                     _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
 
                     LLVMPositionBuilderAtEnd(builder, then_block)
+                    # Inside the `then` arm the condition HOLDS, so `if p != null:` narrows
+                    # `p` there -- stage0's rule, and what the std dict's rehash loop needs.
+                    # Snapshotted and rolled back at the join: the proof does not survive
+                    # the arm, and must not reach the `else` arm, where it is FALSE.
+                    saved_owners: mutable darray[sview] = []
+                    saved_fields: mutable darray[sview] = []
+                    snapshot_narrowings(structs, saved_owners, saved_fields)
+                    record_null_guards(if_condition, structs)
                     then_status: EmitStatus = emit_statements(then_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                    restore_narrowings(structs, saved_owners, saved_fields)
                     EmitStatus.Declined return if then_status == EmitStatus.Declined
                     branch_if_open(then_status, builder, join_block)
 
@@ -6635,9 +6790,11 @@ module Backend:
                 if return_type_opt is declared_return:
                     return_value_type <- annotation_value_type(declared_return, structs)
                 false return if return_value_type.kind == TypeKind.Unmodeled
-                # `ensure` clauses are per-FUNCTION: drop the previous function's.
+                # `ensure` clauses and narrowing proofs are per-FUNCTION: drop the previous
+                # function's, or they would apply to a body that never asserted them.
                 while structs.pending_ensures.count > 0 |structs|:
                     _ = structs.pending_ensures.pop()
+                clear_narrowings(structs)
                 entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
                 LLVMPositionBuilderAtEnd(builder, entry)
 
@@ -6731,7 +6888,11 @@ module Backend:
             template_error_lines.push(function_line_of(generics.decls[slot])) if generics.is_error[slot]
             emitted: bool = emit_function_body(generics.decls[slot], handle, template_error_lines, fns, structs, generics, runtime, m, ctx, builder)
             pop_type_bindings(structs, bound)
-            record_declined_function(generics.pending_bases[index], m, ctx) if not emitted
+            # Report the MANGLED name: one template has many instantiations, and the base
+            # name alone does not say which type arguments failed.
+            record_declined_instantiation(handle, generics.pending_bases[index], m, ctx) if not emitted
+            # An instantiation is never `main`, so it always internalizes.
+            set_defined_function_linkage(generics.pending_bases[index], handle) if emitted
             return emitted
 
 
@@ -6908,6 +7069,45 @@ module Backend:
         # naming a mangled symbol with no indication of which function the backend gave up
         # on. (Chasing four such symbols by hand through the real-std dict is what motivated
         # this.) Recorded in the IR itself so `emit_native` output carries it.
+        # A function the C RUNTIME also provides. stage0 keeps these external only inside
+        # `native_runtime_support.elisa` (isDefaultNativeRuntimeSupportExport); an ORDINARY
+        # program that defines its own `arena_alloc` / `new_region` -- as the real std does --
+        # must not export them, or linking the program object together with the runtime
+        # object fails with "duplicate symbol _new_region".
+        #
+        # Internal linkage keeps the Elisa definition usable in-module while leaving the
+        # runtime's copy to satisfy everyone else. Every OTHER function keeps stage0's
+        # default external linkage: stage0 only internalizes wholesale at -O>0
+        # (preferPrivateLinkage), which is not this path.
+        def name_is_runtime_provided(name: sview) -> bool:
+            true return if name == "new_region" or name == "new_region_backend"
+            true return if name == "free_region" or name == "free_region_backend"
+            true return if name == "arena_alloc" or name == "arena_realloc"
+            true return if name == "arena_memcpy" or name == "arena_memeq"
+            true return if name == "arena_strdup" or name == "arena_memdup"
+            true return if name == "arena_snapshot" or name == "arena_reset"
+            true return if name == "arena_rewind" or name == "arena_free"
+            true return if name == "arena_adopt" or name == "arena_trim"
+            true return if name == "alloc_perm" or name == "alloc_scratch"
+            true return if name == "reset_scratch"
+            true return if name == "ctx_hash_cstr" or name == "ctx_hash_u64"
+            true return if name == "ctx_strlen" or name == "ctx_streq"
+            true return if name == "ctx_string_index" or name == "ctx_string_slice"
+            true return if name == "ctx_string_slice_eq" or name == "ctx_string_slices_eq"
+            true return if name == "ctx_string_view" or name == "ctx_string_view_len"
+            true return if name == "ctx_string_view_slice" or name == "ctx_string_view_index"
+            true return if name == "ctx_string_view_prefix" or name == "ctx_string_view_suffix"
+            true return if name == "ctx_string_view_eq" or name == "ctx_string_views_eq"
+            return false
+
+
+        # 8 = LLVMInternalLinkage. `main` is the entry point crt0 calls from outside the
+        # module and always stays external.
+        def set_defined_function_linkage(name: sview, handle: LLVMValueRef) -> void can[Abort.Panic]:
+            return if name == "main"
+            LLVMSetLinkage(handle, 8) if name_is_runtime_provided(name)
+
+
         def record_declined_function(name: sview, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate]:
             name_storage: mutable darray[u8] = []
             declined_cstr: cstr = sview_to_cstr(name, name_storage)
@@ -6915,8 +7115,21 @@ module Backend:
             LLVMAddNamedMetadataOperand(m, "elisa.declined", declined_string)
 
 
+        # Record a declined generic INSTANTIATION under the name LLVM knows it by (the
+        # mangled `base__K__T`), falling back to the template's base name if the handle has
+        # no name yet.
+        def record_declined_instantiation(handle: LLVMValueRef, base: sview, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            mangled_length: mutable usize = 0
+            mangled: cstr = LLVMGetValueName2(handle, &mangled_length)
+            if mangled_length == 0:
+                record_declined_function(base, m, ctx)
+                return
+            declined_instance: LLVMValueRef = LLVMMetadataAsValue(ctx, LLVMMDStringInContext2(ctx, mangled, mangled_length))
+            LLVMAddNamedMetadataOperand(m, "elisa.declined", declined_instance)
+
+
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: [], pending_ensures: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: [], pending_ensures: [], narrowed_owners: [], narrowed_fields: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -7039,6 +7252,7 @@ module Backend:
                         emitted_count <- emitted_count + 1 if nested_emitted else emitted_count
                         strip_function_body(fns.handles[nested_index.usize()]) if not nested_emitted
                         record_declined_function(nested_name, m, ctx) if not nested_emitted
+                        set_defined_function_linkage(nested_name, fns.handles[nested_index.usize()]) if nested_emitted
                     continue
                 declaration_name: sview = function_name_of(declaration)
                 continue if declaration_name == ""
@@ -7049,6 +7263,7 @@ module Backend:
                 emitted_count <- emitted_count + 1 if emitted else emitted_count
                 strip_function_body(fns.handles[handle_index.usize()]) if not emitted
                 record_declined_function(declaration_name, m, ctx) if not emitted
+                set_defined_function_linkage(declaration_name, fns.handles[handle_index.usize()]) if emitted
                 main_ok <- true if emitted and declaration_name == "main"
 
             # Drain the instantiation worklist. A LOOP, not a single pass: emitting one
