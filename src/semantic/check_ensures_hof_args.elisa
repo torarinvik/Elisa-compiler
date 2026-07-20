@@ -1,0 +1,345 @@
+# Higher-order `ensures(f, P)` contracts. A function may require a postcondition of an
+# fn-typed parameter:
+#
+#     def apply(f: fn(i64) -> i64, x: i64) -> i64:
+#         requires ensures(f, result >= 0)
+#         return f(x)
+#
+# Two obligations, both pinned against stage0 in both directions:
+#
+#   * DECLARATION: the `ensures` target must name an fn-typed parameter of the function
+#     (`ensures(x, ...)` over a scalar param is an error).
+#   * CALL SITE: the argument passed for that parameter must satisfy P —
+#       - a NAMED function satisfies it when its own declared `ensure` clauses ENTAIL P
+#         (`ensure result >= 5` entails `result >= 0`, not `result >= 10`);
+#       - a LAMBDA satisfies it when its result expression provably meets P, judged by
+#         the same linear machinery as the ensure tier (a ternary is judged per branch,
+#         with the branch condition's facts in scope).
+#
+# The callee's own `ensure` given `ensures(f, ...)` is NOT re-proven at `return f(x)` —
+# stage0 trusts the requires there (see check_ensure_strict's fn-param skip).
+extend Semantic:
+    private:
+        # Whether a type annotation is an fn type (`fn(...) -> T`).
+        def hof_type_is_fn(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Binary(signature, operator, result_type, line):
+                        false return if operator != TokenKind.Arrow
+                        return hof_type_is_fn(signature)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        return ident_name_of(callee) == "fn"
+                    Expr.Lambda(lambda_params, lambda_body, lambda_line):
+                        # `fn(i64) -> i64` in type position parses through the lambda
+                        # word; an annotation-shaped lambda IS the fn type.
+                        return true
+                    Expr.Paren(inner, paren_line):
+                        return hof_type_is_fn(inner)
+                    _:
+                        return false
+
+
+        # Negate a comparison operator (for the ELSE branch of a judged ternary).
+        def hof_negate_operator(operator: TokenKind) -> TokenKind:
+            can Abort.Panic:
+                TokenKind.LtEq return if operator == TokenKind.Gt
+                TokenKind.Lt return if operator == TokenKind.GtEq
+                TokenKind.GtEq return if operator == TokenKind.Lt
+                TokenKind.Gt return if operator == TokenKind.LtEq
+                TokenKind.BangEq return if operator == TokenKind.EqEq
+                TokenKind.EqEq return if operator == TokenKind.BangEq
+                return operator
+
+
+        # Collect the negation of FACT into the bounds (used for the else branch).
+        def hof_collect_negated_fact(fact: Ast::Expr, int_params: darray[sview]&, has_lo: mutable darray[bool]&, lo: mutable darray[i64]&, has_hi: mutable darray[bool]&, hi: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match fact:
+                    Expr.Paren(inner, line):
+                        hof_collect_negated_fact(inner, int_params, has_lo, lo, has_hi, hi)
+                    Expr.Binary(left, operator, right, line):
+                        # ¬(A and B) is a disjunction — nothing sound to collect. Only a
+                        # single comparison negates into a usable bound.
+                        return if not is_comparison_operator(operator)
+                        left_name: sview = ident_name_of(left)
+                        right_name: sview = ident_name_of(right)
+                        left_const: (found: bool, value: i64) = fold_const_int(left)
+                        right_const: (found: bool, value: i64) = fold_const_int(right)
+                        negated: TokenKind = hof_negate_operator(operator)
+                        lin_apply_bound(left_name, negated, right_const.value, false, int_params, has_lo, lo, has_hi, hi) if left_name != "" and right_const.found
+                        lin_apply_bound(right_name, negated, left_const.value, true, int_params, has_lo, lo, has_hi, hi) if right_name != "" and left_const.found
+                    _:
+                        pass
+
+
+        # Whether goal P (a comparison over `result`) holds for VALUE under the given
+        # parameter box. VALUE substitutes for `result` via the linear tier.
+        def hof_value_satisfies(predicate: Ast::Expr, value: Ast::Expr, int_params: darray[sview]&, has_lo: darray[bool]&, lo: darray[i64]&, has_hi: darray[bool]&, hi: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return hof_value_satisfies(inner, value, int_params, has_lo, lo, has_hi, hi)
+                    Expr.Binary(left, operator, right, line):
+                        false return if not is_comparison_operator(operator)
+                        return linear_goal_is_proven(left, operator, right, value, true, int_params, has_lo, lo, has_hi, hi)
+                    _:
+                        return false
+
+
+        # Whether a LAMBDA's result provably meets P. The lambda body is either the
+        # `=> EXPR` form (a single return) or a block ending in returns; only the single
+        # straight-line return is judged, a ternary per branch.
+        def hof_lambda_satisfies(lambda_params: darray[sview], lambda_body: darray[Ast::Stmt], predicate: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                returned: mutable Ast::Expr = Ast::Expr.Absent
+                return_count: mutable usize = 0
+                for statement in lambda_body |returned, return_count|:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is return_value:
+                                returned <- return_value
+                                return_count <- return_count + 1
+                        _:
+                            pass
+                false return if return_count != 1
+                # The lambda's own parameters form the box; unbounded unless a branch
+                # condition constrains them.
+                int_params: mutable darray[sview] = []
+                for lambda_param in lambda_params |int_params|:
+                    int_params.push(lambda_param)
+                base_has_lo: mutable darray[bool] = []
+                base_lo: mutable darray[i64] = []
+                base_has_hi: mutable darray[bool] = []
+                base_hi: mutable darray[i64] = []
+                for lambda_param in lambda_params |base_has_lo, base_lo, base_has_hi, base_hi|:
+                    base_has_lo.push(false)
+                    base_lo.push(0)
+                    base_has_hi.push(false)
+                    base_hi.push(0)
+                match returned:
+                    Expr.If(condition, then_value, else_value, if_line):
+                        # THEN branch under the condition's facts.
+                        then_has_lo: mutable darray[bool] = []
+                        then_lo: mutable darray[i64] = []
+                        then_has_hi: mutable darray[bool] = []
+                        then_hi: mutable darray[i64] = []
+                        for lambda_param in lambda_params |then_has_lo, then_lo, then_has_hi, then_hi|:
+                            then_has_lo.push(false)
+                            then_lo.push(0)
+                            then_has_hi.push(false)
+                            then_hi.push(0)
+                        lin_collect_fact(condition, int_params, then_has_lo, then_lo, then_has_hi, then_hi)
+                        false return if not hof_value_satisfies(predicate, then_value, int_params, then_has_lo, then_lo, then_has_hi, then_hi)
+                        # ELSE branch under the negated facts.
+                        else_has_lo: mutable darray[bool] = []
+                        else_lo: mutable darray[i64] = []
+                        else_has_hi: mutable darray[bool] = []
+                        else_hi: mutable darray[i64] = []
+                        for lambda_param in lambda_params |else_has_lo, else_lo, else_has_hi, else_hi|:
+                            else_has_lo.push(false)
+                            else_lo.push(0)
+                            else_has_hi.push(false)
+                            else_hi.push(0)
+                        hof_collect_negated_fact(condition, int_params, else_has_lo, else_lo, else_has_hi, else_hi)
+                        return hof_value_satisfies(predicate, else_value, int_params, else_has_lo, else_lo, else_has_hi, else_hi)
+                    _:
+                        return hof_value_satisfies(predicate, returned, int_params, base_has_lo, base_lo, base_has_hi, base_hi)
+
+
+        # Whether the declared `ensure` clauses of a named function ENTAIL P: derive the
+        # box they impose on `result`, then judge P over it.
+        def hof_ensures_entail(provided_ensures: darray[Ast::Expr]&, predicate: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if provided_ensures.count == 0
+                # A verbatim restatement always entails.
+                true return if any provided in provided_ensures where expressions_equal(predicate, provided)
+                result_var: mutable darray[sview] = []
+                result_var.push(sview("result", 0, 6))
+                has_lo: mutable darray[bool] = [false]
+                lo: mutable darray[i64] = [0]
+                has_hi: mutable darray[bool] = [false]
+                hi: mutable darray[i64] = [0]
+                for provided in provided_ensures |result_var, has_lo, lo, has_hi, hi|:
+                    lin_collect_fact(provided, result_var, has_lo, lo, has_hi, hi)
+                match predicate:
+                    Expr.Binary(left, operator, right, line):
+                        false return if not is_comparison_operator(operator)
+                        return linear_goal_is_proven(left, operator, right, Ast::Expr.Invalid, false, result_var, has_lo, lo, has_hi, hi)
+                    _:
+                        return false
+
+
+        # `ensures(F, P)` clauses of BODY: parallel target/predicate/line arrays.
+        def hof_collect_specs(body: darray[Ast::Stmt], out_targets: mutable darray[sview]&, out_predicates: mutable darray[Ast::Expr]&, out_lines: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |out_targets, out_predicates, out_lines|:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            continue if kind != "requires"
+                            match expression:
+                                Expr.Call(callee, arguments, argument_names, call_line):
+                                    if ident_name_of(callee) == "ensures" and arguments.count == 2:
+                                        out_targets.push(ident_name_of(arguments[0]))
+                                        out_predicates.push(arguments[1])
+                                        out_lines.push(line)
+                                _:
+                                    pass
+                        _:
+                            pass
+
+
+        # Judge one call argument against required predicate P.
+        def hof_check_argument(argument: Ast::Expr, parameter_name: sview, hof_name: sview, predicate: Ast::Expr, line: u32, fn_names: darray[sview]&, fn_ensure_starts: darray[usize]&, fn_ensure_counts: darray[usize]&, all_ensures: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Ident(argument_name, ident_line):
+                        # A named function: entailment against its declared ensures.
+                        slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < fn_names.count |slot, probe, argument_name, fn_names|:
+                            slot <- probe.i64() if fn_names[probe] == argument_name and slot < 0
+                            probe <- probe + 1
+                        return if slot < 0
+                        provided: mutable darray[Ast::Expr] = []
+                        start: usize = fn_ensure_starts[slot.usize()]
+                        count: usize = fn_ensure_counts[slot.usize()]
+                        offset: mutable usize = 0
+                        while offset < count |provided, offset, start, all_ensures|:
+                            provided.push(all_ensures[start + offset])
+                            offset <- offset + 1
+                        entailed: bool = hof_ensures_entail(provided, predicate)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsuresArgNotEntailed, name: argument_name, line: line, expected: parameter_name, actual: hof_name}) if not entailed
+                    Expr.Lambda(lambda_params, lambda_body, lambda_line):
+                        satisfied: bool = hof_lambda_satisfies(lambda_params, lambda_body, predicate)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsuresArgLambdaUnproven, name: "", line: line, expected: parameter_name, actual: hof_name}) if not satisfied
+                    _:
+                        pass
+
+
+        # Scan an expression for calls to `ensures`-carrying functions.
+        def hof_scan_expression(expression: Ast::Expr, line: u32, hof_names: darray[sview]&, hof_param_indexes: darray[usize]&, hof_param_names: darray[sview]&, hof_predicates: darray[Ast::Expr]&, fn_names: darray[sview]&, fn_ensure_starts: darray[usize]&, fn_ensure_counts: darray[usize]&, all_ensures: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        called: sview = ident_name_of(callee)
+                        spec: mutable usize = 0
+                        while spec < hof_names.count |spec, table| -> table:
+                            if hof_names[spec] == called and arguments.count > hof_param_indexes[spec]:
+                                table <- hof_check_argument(arguments[hof_param_indexes[spec]], hof_param_names[spec], called, hof_predicates[spec], line, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                            spec <- spec + 1
+                        for argument in arguments |table| -> table:
+                            table <- hof_scan_expression(argument, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- hof_scan_expression(left, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        table <- hof_scan_expression(right, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- hof_scan_expression(inner, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- hof_scan_expression(operand, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                    _:
+                        pass
+
+
+        def hof_scan_statements(statements: darray[Ast::Stmt], hof_names: darray[sview]&, hof_param_indexes: darray[usize]&, hof_param_names: darray[sview]&, hof_predicates: darray[Ast::Expr]&, fn_names: darray[sview]&, fn_ensure_starts: darray[usize]&, fn_ensure_counts: darray[usize]&, all_ensures: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- hof_scan_expression(expression, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- hof_scan_expression(returned, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- hof_scan_expression(value, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- hof_scan_expression(value, line, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- hof_scan_statements(then_body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                            table <- hof_scan_statements(else_body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- hof_scan_statements(while_body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- hof_scan_statements(block_body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        _:
+                            pass
+
+
+        # PASS 1: declaration-side validation + spec collection + per-function ensure index.
+        def hof_collect_declarations(declarations: darray[Ast::Decl], hof_names: mutable darray[sview]&, hof_param_indexes: mutable darray[usize]&, hof_param_names: mutable darray[sview]&, hof_predicates: mutable darray[Ast::Expr]&, fn_names: mutable darray[sview]&, fn_ensure_starts: mutable darray[usize]&, fn_ensure_counts: mutable darray[usize]&, all_ensures: mutable darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            # Index this function's own declared ensures for entailment.
+                            fn_names.push(name)
+                            fn_ensure_starts.push(all_ensures.count)
+                            ensure_count: mutable usize = 0
+                            for statement in body |all_ensures, ensure_count|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        if kind == "ensure":
+                                            all_ensures.push(expression)
+                                            ensure_count <- ensure_count + 1
+                                    _:
+                                        pass
+                            fn_ensure_counts.push(ensure_count)
+                            # `ensures(F, P)` specs, validating F names an fn-typed param.
+                            spec_targets: mutable darray[sview] = []
+                            spec_predicates: mutable darray[Ast::Expr] = []
+                            spec_lines: mutable darray[u32] = []
+                            hof_collect_specs(body, spec_targets, spec_predicates, spec_lines)
+                            spec: mutable usize = 0
+                            while spec < spec_targets.count |spec, hof_names, hof_param_indexes, hof_param_names, hof_predicates, table| -> table:
+                                target: sview = spec_targets[spec]
+                                slot: mutable i64 = -1
+                                is_fn_param: mutable bool = false
+                                probe: mutable usize = 0
+                                for parameter in parameters |slot, is_fn_param, probe, target|:
+                                    if parameter.name == target and slot < 0:
+                                        slot <- probe.i64()
+                                        is_fn_param <- hof_type_is_fn(parameter.type_expression)
+                                    probe <- probe + 1
+                                if slot >= 0 and is_fn_param:
+                                    hof_names.push(name)
+                                    hof_param_indexes.push(slot.usize())
+                                    hof_param_names.push(target)
+                                    hof_predicates.push(spec_predicates[spec])
+                                if slot >= 0 and not is_fn_param:
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsuresTargetNotFn, name: target, line: spec_lines[spec], expected: "", actual: name})
+                                spec <- spec + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- hof_collect_declarations(module_body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- hof_collect_declarations(scoped_body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        _:
+                            pass
+
+
+        # PASS 2: judge every call site.
+        def hof_check_calls(declarations: darray[Ast::Decl], hof_names: darray[sview]&, hof_param_indexes: darray[usize]&, hof_param_names: darray[sview]&, hof_predicates: darray[Ast::Expr]&, fn_names: darray[sview]&, fn_ensure_starts: darray[usize]&, fn_ensure_counts: darray[usize]&, all_ensures: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            table <- hof_scan_statements(body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- hof_check_calls(module_body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- hof_check_calls(scoped_body, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                        _:
+                            pass
+
+    public:
+        def check_ensures_hof_args(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                hof_names: mutable darray[sview] = []
+                hof_param_indexes: mutable darray[usize] = []
+                hof_param_names: mutable darray[sview] = []
+                hof_predicates: mutable darray[Ast::Expr] = []
+                fn_names: mutable darray[sview] = []
+                fn_ensure_starts: mutable darray[usize] = []
+                fn_ensure_counts: mutable darray[usize] = []
+                all_ensures: mutable darray[Ast::Expr] = []
+                table <- hof_collect_declarations(declarations, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
+                return if hof_names.count == 0
+                table <- hof_check_calls(declarations, hof_names, hof_param_indexes, hof_param_names, hof_predicates, fn_names, fn_ensure_starts, fn_ensure_counts, all_ensures, table)
