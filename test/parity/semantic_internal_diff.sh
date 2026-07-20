@@ -36,9 +36,20 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 ORACLE="$WORK/oracle.tsv"
 gunzip -c "$SNAPSHOT" > "$ORACLE"
 
-# Dedupe by (fingerprint, source); keep the max diagnostic count per key (a source
-# analyzed under several helpers keeps its most-diagnosing run).
-sort -t$'\t' -k4,4 -k5,5 -u "$ORACLE" > "$WORK/deduped.tsv"
+# Dedupe by (fingerprint, source); keep the MAX diagnostic count per key. stage0
+# analyzes some sources twice under one options struct (a speculative pre-pass
+# records an empty result before the real pass appends diagnostics), so a plain
+# `sort -u` keeps an arbitrary row and can crown the empty pre-pass — making a
+# correctly-diagnosing stage1 look like a false positive.
+sort -t$'\t' -k4,4 -k5,5 "$ORACLE" | awk -F'\t' '
+    function flush() { if (key != "") print best }
+    {
+        k = $4 "\t" $5
+        if (k != key) { flush(); key = k; best = $0; bestn = $2 + $3; next }
+        if ($2 + $3 > bestn) { best = $0; bestn = $2 + $3 }
+    }
+    END { flush() }
+' > "$WORK/deduped.tsv"
 
 total=0
 mismatches=0
