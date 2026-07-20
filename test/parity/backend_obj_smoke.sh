@@ -46,6 +46,15 @@ obj_case() {
 
 obj_case scalar   'def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n' 42
 
+# Aggregate cases at -O2: these exercise mixed-size struct/optional layout, which a MISSING
+# module datalayout silently corrupts (the optimizer falls back to a default where i64 is
+# 32-bit aligned, mislaying an {i1,i64} optional's payload). Each would pass at -O0; they earn
+# their keep only under the real -O2 pipeline. Regression guard for the datalayout fix.
+obj_case opt_return_through_call 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\n\ndef main() -> i64:\n    if find(5) is v:\n        return v\n    return 0\n' 5
+obj_case opt_absent_through_call 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\n\ndef main() -> i64:\n    if find(-3) is v:\n        return v\n    return 9\n' 9
+obj_case struct_return_fields 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n    e: i64\n\ndef mk() -> Big:\n    return Big{a: 1, b: 2, c: 3, d: 4, e: 5}\n\ndef main() -> i64:\n    g: Big = mk()\n    return g.a + g.e\n' 6
+obj_case enum_payload_through_call 'enum Shape:\n    Rect(i64, i64)\n    None\n\ndef mk() -> Shape:\n    return Shape.Rect(4, 5)\n\ndef main() -> i64:\n    return match mk():\n        Shape.Rect(w, h): w * h\n        _: 0\n' 20
+
 # The pipeline actually RUNS -- not a no-op. Every case above would pass identically at -O0
 # (an exit code cannot see optimization), so this asserts the one thing that distinguishes
 # them: at -O2 `add(40, 2)` is constant-folded into main, so main must NOT call _add.
