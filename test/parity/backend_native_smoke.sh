@@ -908,6 +908,7 @@ stripped_case() {
 run_case enum_multi_field_payload 'enum Pair:\n    Both(a: i64, b: i64)\n\ndef main() -> i64:\n    return match Pair.Both(1, 2):\n        Pair.Both(a, b): a + b\n'   3
 run_case enum_multi_field_mixed_width 'enum P:\n    Pt(i32, i64)\n    None\n\ndef f(p: P) -> i64:\n    return match p:\n        P.Pt(a, b): a.i64() + b\n        _: 0\n\ndef main() -> i64:\n    return f(P.Pt(7, 35))\n'   42
 run_case enum_multi_field_three 'enum V:\n    A(i64, i64, i64)\n\ndef s(v: V) -> i64:\n    return match v:\n        V.A(x, y, z): x + y + z\n        _: 0\n\ndef main() -> i64:\n    return s(V.A(10, 20, 30))\n'   60
+run_case enum_multi_field_stmt_match 'enum Shape:\n    Rect(i64, i64)\n    None\n\ndef f(s: Shape) -> i64:\n    match s:\n        Shape.Rect(w, h):\n            return w * h\n        _:\n            return 0\n\ndef main() -> i64:\n    return f(Shape.Rect(4, 5))\n'   20
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
