@@ -945,6 +945,7 @@ run_case get_else_present 'def find(n: i64) -> i64?:\n    return n if n > 0 else
 run_case implicit_void_ref_assign 'def setto(a: mutable i64&, v: i64):\n    a <- v\n\ndef main() -> i64:\n    x: mutable i64 = 3\n    setto(&x, 9)\n    return x\n'   9
 run_case implicit_void_field_mut 'struct P:\n    x: mutable i64\n\ndef bump(p: mutable P&):\n    p.x <- p.x + 1\n\ndef main() -> i64:\n    p: mutable P = P{x: 5}\n    bump(&p)\n    return p.x\n'   6
 run_case pass_statement 'def note(x: i64):\n    if x < 0:\n        pass\n\ndef main() -> i64:\n    note(5)\n    return 7\n'   7
+run_case darray_ref_write 'def fill(xs: mutable darray[i64]&, v: i64):\n    for i in 0..<3 |xs, v|:\n        xs[i] <- v\n\ndef main() -> i64:\n    a: mutable darray[i64] = [0, 0, 0]\n    fill(&a, 9)\n    return a[0] + a[1] + a[2]\n'   27
 run_case array_ref_write 'def zero(a: mutable i64[3]&):\n    a[0] <- 0\n    a[1] <- 0\n    a[2] <- 0\n\ndef main() -> i64:\n    arr: mutable i64[3] = [1, 2, 3]\n    zero(&arr)\n    return arr[0] + arr[1] + arr[2]\n'   0
 run_case array_ref_read 'def total(a: i64[4]&) -> i64:\n    return a[0] + a[1] + a[2] + a[3]\n\ndef main() -> i64:\n    arr: i64[4] = [1, 2, 3, 4]\n    return total(&arr)\n'   10
 run_case try_value_vardecl 'error Bad:\n    Boom\n\ndef inner(x: i64) -> i64 error[Bad]:\n    raise Bad.Boom if x < 0\n    return x\n\ndef outer(x: i64) -> i64 error[Bad]:\n    v: i64 = try inner(x)\n    return v + 1\n\ndef main() -> i64:\n    catch outer(7):\n        ok:\n            return ok\n        error e:\n            return 0\n'   8
