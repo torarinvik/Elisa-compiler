@@ -64,7 +64,8 @@ extend Parser:
 
             # Optional `decreases MEASURE` — consumed and evaluated (so its names resolve),
             # then discarded (the desugar loop doesn't need it; stage0 owns the check).
-            rebind has_decreases: bool, parser = parser.skip_machine_from_decreases()
+            decreases_names: mutable darray[sview] = []
+            rebind has_decreases: bool, parser = parser.skip_machine_from_decreases(decreases_names)
 
             parser, _ <- parser.expect(TokenKind.Colon)
             parser, _ <- parser.expect(TokenKind.Newline)
@@ -81,7 +82,7 @@ extend Parser:
             parser <- parser.check_machine_from_reachability(machine_arms, start_state, machine_token)
             parser <- parser.check_machine_from_decisions(machine_arms, machine_token)
             parser <- parser.check_machine_from_termination(machine_arms, has_decreases, machine_token)
-            return (build_machine_from_block(start_enum, start_state, start_args, machine_arms, machine_token.line))
+            return (build_machine_from_block(start_enum, start_state, start_args, machine_arms, decreases_names, machine_token.line))
 
         # A machine whose transition graph has a CYCLE must carry a `decreases` measure, or the
         # loop may never terminate (docs/125 §5: "transition cycle through state A has no
@@ -193,12 +194,38 @@ extend Parser:
 
         # Optional `decreases MEASURE` after the start state — consumed and evaluated (so
         # its names resolve), then discarded (stage0 owns the termination check).
-        def skip_machine_from_decreases(parser: lmut Parser) -> bool:
+        # `decreases MEASURE` names the machine's working variable(s): the desugared value
+        # block mutates them each step (`n <- n - 1`), so they must be captured — otherwise
+        # the E4 value-block-mutation check flags an outer-binding write stage0 permits.
+        # Records the measure's identifier names into `names` and reports presence.
+        def skip_machine_from_decreases(parser: lmut Parser, names: mutable darray[sview]&) -> bool:
             decreases_token: Token = parser.cursor()
             false return if parser.peek() != TokenKind.Ident or Lexer::text_or_empty(decreases_token, parser.source) != "decreases"
             parser, _ <- parser.advance()
-            parser, _ <- parser.expression()
+            rebind measure: Ast::Expr?, parser = parser.expression()
+            if measure is measure_expr:
+                gather_machine_measure_idents(measure_expr, names)
             return true
+
+        # Collect every identifier appearing in a decreases measure expression.
+        def gather_machine_measure_idents(expression: Ast::Expr, names: mutable darray[sview]&) -> void:
+            match expression:
+                Expr.Ident(name, line):
+                    names.push(name)
+                Expr.Binary(left, operator, right, line):
+                    gather_machine_measure_idents(left, names)
+                    gather_machine_measure_idents(right, names)
+                Expr.Unary(operator, operand, line):
+                    gather_machine_measure_idents(operand, names)
+                Expr.Paren(inner, line):
+                    gather_machine_measure_idents(inner, names)
+                Expr.Field(object, field, line):
+                    gather_machine_measure_idents(object, names)
+                Expr.Index(object, argument, line):
+                    gather_machine_measure_idents(object, names)
+                    gather_machine_measure_idents(argument, names)
+                _:
+                    pass
 
         # Optional R5 out-edge contract `-> {A, B}` after an arm header. Stage0 owns the R5
         # enforcement; stage1 only consumes the clause so the arm reaches its block colon.
@@ -341,7 +368,7 @@ extend Parser:
         # body reading a payload resolves. Payload-free states use a bare `mode is Enum.State`
         # test. Every arm is conditional (innermost else is empty) so each arm's `is` binds in
         # its own branch; stage0 owns exhaustiveness, the stage1 parse stays structural.
-        def build_machine_from_block(start_enum: sview, start_state: sview, start_args: darray[Ast::Expr], machine_arms: darray[MachineFromArmS], line: u32) -> Ast::Expr:
+        def build_machine_from_block(start_enum: sview, start_state: sview, start_args: darray[Ast::Expr], machine_arms: darray[MachineFromArmS], decreases_names: darray[sview], line: u32) -> Ast::Expr:
             result_var: sview = "__mf_result"
             done_var: sview = "__mf_done"
             mode_var: sview = "__mf_mode"
@@ -375,8 +402,39 @@ extend Parser:
             loop_condition: Ast::Expr = (Ast::Expr.Unary(TokenKind.Not, (Ast::Expr.Ident(done_var, line)), line))
             declarations.push((Ast::Stmt.While(loop_condition, dispatch, line)))
 
-            no_captures: darray[sview] = []
-            return (Ast::Expr.Block(declarations, (Ast::Expr.Ident(result_var, line)), no_captures, line))
+            # A decreases-measure variable is captured only when the machine actually
+            # MUTATES it (`n <- n - 1`): capturing an unmutated, immutable measure (e.g.
+            # `decreases flag` on a read-only bool) would wrongly trip the E10
+            # capture-must-be-mutable rule that stage0 does not raise.
+            assigned: mutable darray[sview] = []
+            for arm in machine_arms |assigned|:
+                gather_machine_assigned_idents(arm.body, assigned)
+            captured_measure: mutable darray[sview] = []
+            for measure_name in decreases_names |captured_measure, assigned|:
+                captured_measure.push(measure_name) if any assigned_name in assigned where assigned_name == measure_name
+            return (Ast::Expr.Block(declarations, (Ast::Expr.Ident(result_var, line)), captured_measure, line))
+
+        # Collect the root identifiers assigned (`x <- …` / `x = …`) anywhere in a body.
+        def gather_machine_assigned_idents(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            for statement in statements |out|:
+                match statement:
+                    Stmt.Assign(target, operator, value, line):
+                        if target is Expr.Ident(target_name, target_line):
+                            out.push(target_name)
+                    Stmt.If(condition, then_body, else_body, line):
+                        gather_machine_assigned_idents(then_body, out)
+                        gather_machine_assigned_idents(else_body, out)
+                    Stmt.While(condition, body, line):
+                        gather_machine_assigned_idents(body, out)
+                    Stmt.For(bind, variables, iterable, body, line):
+                        gather_machine_assigned_idents(body, out)
+                    Stmt.Block(kind, clause, binding, body, line):
+                        gather_machine_assigned_idents(body, out)
+                    Stmt.Match(scrutinee, arms, line):
+                        for arm in arms |out|:
+                            gather_machine_assigned_idents(arm.body, out)
+                    _:
+                        pass
 
         # A trailing run of terminators as a nested if/else: guarded terminators become the
         # conditions, the final unguarded one the else. A single unguarded terminator is its
