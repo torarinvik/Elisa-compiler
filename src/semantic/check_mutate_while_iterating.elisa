@@ -1,0 +1,91 @@
+# Iterator invalidation: a `for v in xs:` loop that grows `xs` inside the body (`xs.push(...)`,
+# `xs.extend(...)`, `xs.insert(...)`) can reallocate the darray's buffer out from under the live
+# iterator. stage0 rejects it. SOUND, structural: the iterable is a bare Ident and the body
+# calls a growing method on that same name (a reallocating mutation). Reads and mutations of a
+# DIFFERENT container are fine; `for v in move xs:` (a drain) is a separate consuming construct.
+extend Semantic:
+    private:
+        # The growing-mutation method name a statement expression calls on `container`
+        # (`container.push(..)` -> "push"), else "". Reallocating mutators only.
+        def iter_mutation_method(expression: Ast::Expr, container: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        if callee is Expr.Field(receiver, method_name, field_line):
+                            grows: bool = method_name == "push" or method_name == "extend" or method_name == "insert" or method_name == "append"
+                            if ident_name_of(receiver) == container and container != "" and grows:
+                                return method_name
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # Walk a loop body for a growing mutation of `container`; recurses control flow but NOT a
+        # nested `for ... in container` (that inner loop owns its own iterator check).
+        def iter_body_mutates(statements: darray[Ast::Stmt], container: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            method: sview = iter_mutation_method(expression, container)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutateWhileIterating, name: container, line: line, expected: "", actual: method}) if method != ""
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- iter_body_mutates(then_body, container, table)
+                            table <- iter_body_mutates(else_body, container, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- iter_body_mutates(while_body, container, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- iter_body_mutates(for_body, container, table) if ident_name_of(iterable) != container
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            table <- iter_body_mutates(block_body, container, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- iter_body_mutates(arm.body, container, table)
+                        _:
+                            pass
+
+        # Whether NAME is a region-backed local (`xs: darray[T] @buf`). A region-backed darray
+        # may be stable (`reserve_commit`/`fixed` — its buffer never moves), which stage0 allows
+        # to grow mid-iteration, so leave ALL region-backed containers to the region checker
+        # (conservative: never a false positive on a stable buffer).
+        def container_is_region_backed(region_annotations: darray[Ast::LocalRegionAnnotation]&, name: sview) -> bool:
+            can Abort.Panic:
+                return any annotation in region_annotations where annotation.name == name
+
+        def iter_check_statements(statements: darray[Ast::Stmt], region_annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.For(bind, variables, iterable, body, line):
+                            container: sview = ident_name_of(iterable)
+                            table <- iter_body_mutates(body, container, table) if container != "" and bind != "move" and not container_is_region_backed(region_annotations, container)
+                            table <- iter_check_statements(body, region_annotations, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- iter_check_statements(then_body, region_annotations, table)
+                            table <- iter_check_statements(else_body, region_annotations, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- iter_check_statements(while_body, region_annotations, table)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            table <- iter_check_statements(block_body, region_annotations, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- iter_check_statements(arm.body, region_annotations, table)
+                        _:
+                            pass
+
+        def iter_check_walk(declarations: darray[Ast::Decl], region_annotations: darray[Ast::LocalRegionAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- iter_check_statements(body, region_annotations, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- iter_check_walk(module_body, region_annotations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- iter_check_walk(scoped_body, region_annotations, table)
+                        _:
+                            pass
+
+    public:
+        def check_mutate_while_iterating(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- iter_check_walk(file.top_decls, file.local_region_annotations, table)
