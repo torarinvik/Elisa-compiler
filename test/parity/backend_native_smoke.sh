@@ -1004,6 +1004,11 @@ decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a:
 # args are fixed; not modeled, so it declines rather than emitting a wrong signature.
 # An UNUSED variadic extern no longer poisons the module (per-fn tolerance): the
 # program runs. stage0 compiles this program too, so this is parity, not permissiveness.
+# `x.cast[T]` from an INTEGER source is a real reinterpret (`inttoptr`), not a no-op --
+# `arena_region_from_uintptr(raw: uintptr)` in the std is exactly this shape.
+# Casting to an OPTIONAL pointer target wraps, and the tag comes from a NULL TEST on the
+# source: a null raw pointer must read as ABSENT, not as a present-but-null reference.
+run_case cast_int_to_pointer_optional '@internal\ndef as_ptr(raw: uintptr) -> mutable heap u8&:\n    trusted Unsafe.PointerCast:\n        return raw.cast[mutable heap u8&]\n\n@internal\ndef maybe(p: heap u8&) -> u8&?:\n    trusted Unsafe.PointerCast:\n        return p.cast[u8&?]\n\ndef main() -> i64:\n    p: mutable heap u8& = as_ptr(0.uintptr())\n    if maybe(p) is q:\n        return 7\n    return 42\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.

@@ -3156,7 +3156,12 @@ module Backend:
         # stores, and SROA collapses it at -O2 exactly the same. An Elisa expression of
         # payload type in an optional context is implicitly wrapped — the language has no
         # `some(x)`, so this is where that happens.
-        def wrap_optional(value: LLVMValueRef, optional_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # `force_null_test` — derive the tag from `value != null` even when the payload type
+        # says the reference cannot be null. A REINTERPRET (`heapptr.cast[u8&?]`) is exactly
+        # that case: the payload annotation is a plain `u8&`, but the value came from a raw
+        # pointer that may well be null, and a constant `true` tag would hand the program a
+        # null it believes is a real reference.
+        def wrap_optional_tagged(value: LLVMValueRef, optional_type: ValueType, force_null_test: bool, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             optional_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
             slot: LLVMValueRef = LLVMBuildAlloca(builder, optional_llvm, "opt")
             tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, slot, 0, "opt.tag.ptr")
@@ -3166,7 +3171,7 @@ module Backend:
             # present and hand the program a null it believes is real. An ordinary `T&` is
             # never null, so it keeps the constant tag.
             payload_type: ValueType = optional_payload_of(optional_type, structs)
-            if payload_type.kind == TypeKind.Ref and ref_is_heap_ref(payload_type, structs):
+            if force_null_test or (payload_type.kind == TypeKind.Ref and ref_is_heap_ref(payload_type, structs)):
                 null_pointer: LLVMValueRef = LLVMConstNull(LLVMPointerTypeInContext(ctx, 0))
                 _ = LLVMBuildStore(builder, LLVMBuildICmp(builder, 33, value, null_pointer, "opt.present"), tag_pointer)
             else:
@@ -3174,6 +3179,11 @@ module Backend:
             value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, slot, 1, "opt.value.ptr")
             _ = LLVMBuildStore(builder, value, value_pointer)
             return LLVMBuildLoad2(builder, optional_llvm, slot, "opt.wrapped")
+
+
+        # The ordinary wrap: the payload TYPE decides whether the tag is a null test.
+        def wrap_optional(value: LLVMValueRef, optional_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return wrap_optional_tagged(value, optional_type, false, structs, ctx, builder)
 
 
         # Emit a value expression, producing a value of `resolve_type(expression, expected)`.
@@ -4204,12 +4214,27 @@ module Backend:
                     if cast_method == "cast":
                         cast_target: ValueType = annotation_value_type(cast_index_type, structs)
                         null return if cast_target.kind == TypeKind.Unmodeled
-                        null return if not type_is_pointer(cast_target)
+                        # `ptr.cast[T&?]` — an OPTIONAL-of-pointer target. Produce the bare
+                        # pointer, then wrap: wrap_optional already derives a heap ref's tag
+                        # from a null test, so a null source stays ABSENT rather than being
+                        # handed back as a present-but-null reference.
+                        cast_wraps_optional: bool = cast_target.kind == TypeKind.Optional and type_is_pointer(optional_payload_of(cast_target, structs))
+                        null return if not type_is_pointer(cast_target) and not cast_wraps_optional
                         cast_source_type: ValueType = expression_type(cast_source, local_scope, fns, structs, generics)
-                        null return if not type_is_pointer(cast_source_type)
+                        # An INTEGER source (`raw: uintptr` -> `mutable heap Region&`) is a
+                        # real reinterpret and needs an `inttoptr`; pointer<->pointer is free
+                        # under opaque pointers. Anything else is not a reinterpret at all.
+                        cast_source_is_int: bool = is_integer_type(cast_source_type)
+                        null return if not type_is_pointer(cast_source_type) and not cast_source_is_int
                         if emit_expression(cast_source, cast_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cast_source_value:
-                            # Both sides are `ptr`; opaque pointers make the reinterpret free.
-                            return cast_source_value
+                            cast_pointer: mutable LLVMValueRef = cast_source_value
+                            if cast_source_is_int:
+                                cast_pointer <- LLVMBuildIntToPtr(builder, cast_source_value, LLVMPointerTypeInContext(ctx, 0), "inttoptr")
+                            # The SOURCE decides nullability, not the target annotation: an
+                            # integer or a raw heap pointer may be null, so the tag is a null
+                            # test. A safe `T&` source is never null and keeps the constant.
+                            cast_may_be_null: bool = cast_source_is_int or (cast_source_type.kind == TypeKind.Ref and ref_is_heap_ref(cast_source_type, structs))
+                            return wrap_optional_tagged(cast_pointer, cast_target, cast_may_be_null, structs, ctx, builder) if cast_wraps_optional else cast_pointer
                         return null
             # `xs[i]` — an index READ. Only a local array receiver is modeled: the address
             # comes from the local's slot, so no temporary spill is needed.
