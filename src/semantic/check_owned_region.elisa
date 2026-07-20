@@ -1,0 +1,158 @@
+# `owned T` ownership discipline. An owned region is a linear resource: it must be consumed
+# exactly once, by `destroy R` or by `move R` into a new owner.
+#
+#   def f() -> void:
+#       r: owned Arena = new_arena(64)      # never consumed -> must be consumed before exit
+#
+#   s: owned Arena = move r; destroy r      # r already moved   -> already destroyed
+#   s: owned Arena = r                      # copy, not a move  -> move-only
+#
+# All three are decidable from the statement order; no prover is involved. Verified against
+# stage0 for each shape.
+#
+# NOTE this check only became reachable once the parser learned the `owned` qualifier: while
+# `owned Arena` mis-parsed, stage1 emitted a bogus "unknown type 'owned'" that happened to
+# make the accept/reject class match. Fixing the parse removed that accidental cover, so the
+# rules below are what actually earns the agreement.
+extend Semantic:
+    private:
+        # Whether a type annotation carries the `owned` qualifier.
+        def annotation_is_owned(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        true return if operator == TokenKind.Owned
+                        return annotation_is_owned(operand)
+                    Expr.Paren(inner, paren_line):
+                        return annotation_is_owned(inner)
+                    _:
+                        return false
+
+
+        # The name a `move X` transfers, or "".
+        def owned_move_source(value: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Move(operand, line):
+                        return ident_name_of(operand)
+                    Expr.Paren(inner, paren_line):
+                        return owned_move_source(inner)
+                    _:
+                        return sview("", 0, 0)
+
+
+        # Every name a `move X` consumes anywhere in an expression -- notably a CALL ARGUMENT
+        # (`sink(move r)`), which transfers ownership just as an initializer does.
+        def owned_collect_moves(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Move(operand, line):
+                        moved: sview = ident_name_of(operand)
+                        out.push(moved) if moved != ""
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |out|:
+                            owned_collect_moves(argument, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        owned_collect_moves(left, out)
+                        owned_collect_moves(right, out)
+                    Expr.Paren(inner, paren_line):
+                        owned_collect_moves(inner, out)
+                    Expr.Unary(operator, operand, unary_line):
+                        owned_collect_moves(operand, out)
+                    _:
+                        pass
+
+
+        # Walk a body in order, tracking which owned names are still live. `live` carries the
+        # names; `consumed` the ones already destroyed or moved out.
+        def owned_walk(statements: darray[Ast::Stmt], live: mutable darray[sview]&, consumed: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |live, consumed, table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            moved_from: sview = owned_move_source(value)
+                            source_name: sview = ident_name_of(value)
+                            declares_owned: bool = annotation_is_owned(type_expression)
+                            # `s: owned T = r` — a bare owned source is a COPY of a move-only
+                            # value. stage0 names both sides in the message.
+                            copies_owned: bool = declares_owned and moved_from == "" and source_name != "" and (any l in live where l == source_name)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OwnedRegionMoveOnly, name: source_name, line: line, expected: name, actual: ""}) if copies_owned
+                            # A move CONSUMES its source.
+                            if moved_from != "":
+                                already: bool = any c in consumed where c == moved_from
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OwnedRegionAlreadyDestroyed, name: moved_from, line: line, expected: "", actual: ""}) if already
+                                consumed.push(moved_from)
+                            live.push(name) if declares_owned
+                        Stmt.Expr(expression, line):
+                            call_moves: mutable darray[sview] = []
+                            owned_collect_moves(expression, call_moves)
+                            for call_moved in call_moves |consumed, table| -> table:
+                                moved_twice: bool = any c in consumed where c == call_moved
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OwnedRegionAlreadyDestroyed, name: call_moved, line: line, expected: "", actual: ""}) if moved_twice
+                                consumed.push(call_moved)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            block_kind: sview = kind
+                            if block_kind == "destroy":
+                                for destroyed in clause |live, consumed, table| -> table:
+                                    already_destroyed: bool = any c in consumed where c == destroyed
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OwnedRegionAlreadyDestroyed, name: destroyed, line: line, expected: "", actual: ""}) if already_destroyed
+                                    consumed.push(destroyed)
+                            else:
+                                table <- owned_walk(block_body, live, consumed, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            # The arms are MUTUALLY EXCLUSIVE, so each starts from the
+                            # consumption state at the `if` -- `if c: release(move g) else:
+                            # release(move g)` consumes `g` once on either path, not twice.
+                            # Both arms' consumptions then merge into the parent, since after
+                            # the `if` the value is gone on every path that ran a branch.
+                            then_consumed: mutable darray[sview] = []
+                            else_consumed: mutable darray[sview] = []
+                            for carried in consumed |then_consumed, else_consumed|:
+                                then_consumed.push(carried)
+                                else_consumed.push(carried)
+                            table <- owned_walk(then_body, live, then_consumed, table)
+                            table <- owned_walk(else_body, live, else_consumed, table)
+                            for from_then in then_consumed |consumed|:
+                                consumed.push(from_then) if not (any c in consumed where c == from_then)
+                            for from_else in else_consumed |consumed|:
+                                consumed.push(from_else) if not (any c in consumed where c == from_else)
+                        Stmt.While(while_condition, while_body, while_line):
+                            table <- owned_walk(while_body, live, consumed, table)
+                        _:
+                            pass
+
+
+        def check_owned_region_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            live: mutable darray[sview] = []
+                            consumed: mutable darray[sview] = []
+                            # An `owned` PARAMETER is handed over to this function, so it
+                            # carries the same obligation as a local.
+                            for parameter in parameters |live|:
+                                live.push(parameter.name) if annotation_is_owned(parameter.type_expression)
+                            table <- owned_walk(body, live, consumed, table)
+                            # Anything declared owned and never consumed leaks. `live` is
+                            # append-only; subtracting `consumed` here avoids rebuilding it
+                            # per event (a fresh darray from a helper is region-polymorphic
+                            # and cannot be returned into this scope).
+                            leak_line: mutable u32 = line
+                            leak_index: mutable usize = 0
+                            while leak_index < live.count |leak_index, live, consumed, table, leak_line| -> table:
+                                leaked: sview = live[leak_index]
+                                still_owned: bool = not (any c in consumed where c == leaked)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OwnedRegionNotConsumed, name: leaked, line: leak_line, expected: "", actual: ""}) if still_owned
+                                leak_index <- leak_index + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_owned_region_walk(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_owned_region_walk(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_owned_region(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_owned_region_walk(declarations, table)
