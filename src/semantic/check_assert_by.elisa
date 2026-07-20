@@ -1,0 +1,411 @@
+# `assert C by:` scoped proof blocks (docs/90). The parser retains the proof body as a
+# Stmt.Block("assert_by", ...) whose first statement is the goal Contract. Two rules,
+# both pinned against stage0:
+#
+#   * PURITY: the block is erased from code, so it may contain only verification-only
+#     statements — lemma calls, nested `assert(...)` facts, contracts. An assignment
+#     (any statement with real effects) is an error.
+#   * DISCHARGE: the goal must follow from the block's facts plus the caller's facts.
+#     stage1's decidable core: a reflexive/identity goal, a goal linearly entailed by
+#     the block's `assert(...)` facts and the function's `requires`, or a lemma call in
+#     the block (trusted — its own ensure was checked at its declaration).
+extend Semantic:
+    private:
+        # Facts stated by the proof body: each `assert(P)` call's argument.
+        def assert_by_block_facts(proof_body: darray[Ast::Stmt], out: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in proof_body |out|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            match expression:
+                                Expr.Call(callee, arguments, argument_names, call_line):
+                                    out.push(arguments[0]) if ident_name_of(callee) == "assert" and arguments.count == 1
+                                _:
+                                    pass
+                        Stmt.Contract(kind, expression, contract_line):
+                            out.push(expression) if kind == "assert"
+                        _:
+                            pass
+
+
+        # Map a lemma-namespace variable to the caller namespace through the call's
+        # argument list (bare-ident arguments only), or "".
+        def lemma_map_name(name: sview, lemma_params: darray[sview]&, arg_names: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                probe: mutable usize = 0
+                found: mutable sview = sview("", 0, 0)
+                while probe < lemma_params.count |probe, found, name, lemma_params, arg_names|:
+                    found <- arg_names[probe] if lemma_params[probe] == name and found == ""
+                    probe <- probe + 1
+                return found
+
+
+        # Fold a lemma predicate, RENAMED into the caller namespace, into the box.
+        def lemma_collect_renamed_fact(fact: Ast::Expr, lemma_params: darray[sview]&, arg_names: darray[sview]&, int_params: darray[sview]&, has_lo: mutable darray[bool]&, lo: mutable darray[i64]&, has_hi: mutable darray[bool]&, hi: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match fact:
+                    Expr.Paren(inner, line):
+                        lemma_collect_renamed_fact(inner, lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi)
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.And:
+                            lemma_collect_renamed_fact(left, lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi)
+                            lemma_collect_renamed_fact(right, lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi)
+                            return
+                        return if not is_comparison_operator(operator)
+                        left_name: sview = lemma_map_name(ident_name_of(left), lemma_params, arg_names)
+                        right_name: sview = lemma_map_name(ident_name_of(right), lemma_params, arg_names)
+                        left_const: (found: bool, value: i64) = fold_const_int(left)
+                        right_const: (found: bool, value: i64) = fold_const_int(right)
+                        lin_apply_bound(left_name, operator, right_const.value, false, int_params, has_lo, lo, has_hi, hi) if left_name != "" and right_const.found
+                        lin_apply_bound(right_name, operator, left_const.value, true, int_params, has_lo, lo, has_hi, hi) if right_name != "" and left_const.found
+                    _:
+                        pass
+
+
+        # Whether a lemma `requires` clause, renamed into the caller namespace, already
+        # holds in the caller's box. Only simple `var op const` shapes (and conjunctions
+        # of them) decide; anything else is NOT established.
+        def lemma_requires_holds(fact: Ast::Expr, lemma_params: darray[sview]&, arg_names: darray[sview]&, int_params: darray[sview]&, has_lo: darray[bool]&, lo: darray[i64]&, has_hi: darray[bool]&, hi: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match fact:
+                    Expr.Paren(inner, line):
+                        return lemma_requires_holds(inner, lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi)
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.And:
+                            false return if not lemma_requires_holds(left, lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi)
+                            return lemma_requires_holds(right, lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi)
+                        false return if not is_comparison_operator(operator)
+                        left_name: sview = lemma_map_name(ident_name_of(left), lemma_params, arg_names)
+                        right_const: (found: bool, value: i64) = fold_const_int(right)
+                        false return if left_name == "" or not right_const.found
+                        slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < int_params.count |slot, probe, left_name, int_params|:
+                            slot <- probe.i64() if int_params[probe] == left_name and slot < 0
+                            probe <- probe + 1
+                        false return if slot < 0
+                        index: usize = slot.usize()
+                        bound: i64 = right_const.value
+                        (has_lo[index] and lo[index] >= bound) return if operator == TokenKind.GtEq
+                        (has_lo[index] and lo[index] >= bound + 1) return if operator == TokenKind.Gt
+                        (has_hi[index] and hi[index] <= bound) return if operator == TokenKind.LtEq
+                        (has_hi[index] and hi[index] <= bound - 1) return if operator == TokenKind.Lt
+                        (has_lo[index] and has_hi[index] and lo[index] == bound and hi[index] == bound) return if operator == TokenKind.EqEq
+                        return false
+                    _:
+                        return false
+
+
+        # Purity: a statement with real effects inside the proof body.
+        def assert_by_check_purity(proof_body: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in proof_body |table| -> table:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ProofBlockImpure, name: "", line: line, expected: "", actual: ""})
+                        Stmt.While(condition, while_body, while_line):
+                            table <- assert_by_check_purity(while_body, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- assert_by_check_purity(then_body, table)
+                            table <- assert_by_check_purity(else_body, table)
+                        _:
+                            pass
+
+
+        # Judge one assert_by block. PARAMETERS/REQUIRES are the enclosing function's.
+        def assert_by_judge(block_body: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl], requires_predicates: darray[Ast::Expr]&, lemma_names: darray[sview]&, lemma_param_starts: darray[usize]&, lemma_param_counts: darray[usize]&, all_lemma_params: darray[sview]&, lemma_requires_starts: darray[usize]&, lemma_requires_counts: darray[usize]&, all_lemma_requires: darray[Ast::Expr]&, lemma_ensure_starts: darray[usize]&, lemma_ensure_counts: darray[usize]&, all_lemma_ensures: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if block_body.count == 0
+                goal: mutable Ast::Expr = Ast::Expr.Absent
+                goal_line: mutable u32 = 0
+                match block_body[0]:
+                    Stmt.Contract(kind, expression, contract_line):
+                        goal <- expression
+                        goal_line <- contract_line
+                    _:
+                        pass
+                return if goal is Ast::Expr.Absent
+                proof_body: mutable darray[Ast::Stmt] = []
+                body_index: mutable usize = 1
+                while body_index < block_body.count |proof_body, body_index, block_body|:
+                    proof_body.push(block_body[body_index])
+                    body_index <- body_index + 1
+                table <- assert_by_check_purity(proof_body, table)
+                proven: mutable bool = false
+                match goal:
+                    Expr.Binary(left, operator, right, line):
+                        comparison: bool = is_comparison_operator(operator)
+                        reflexive: bool = comparison and equal_normalized(left, right, Ast::Expr.Invalid, false) and is_reflexively_true_operator(operator)
+                        int_params: mutable darray[sview] = []
+                        has_lo: mutable darray[bool] = []
+                        lo: mutable darray[i64] = []
+                        has_hi: mutable darray[bool] = []
+                        hi: mutable darray[i64] = []
+                        for parameter in parameters |int_params, has_lo, lo, has_hi, hi|:
+                            type_name: sview = bare_type_name(parameter.type_expression)
+                            continue if not ensure_int_type_name(type_name)
+                            int_params.push(parameter.name)
+                            has_lo.push(ensure_unsigned_type_name(type_name))
+                            lo.push(0)
+                            has_hi.push(false)
+                            hi.push(0)
+                        facts: mutable darray[Ast::Expr] = []
+                        assert_by_block_facts(proof_body, facts)
+                        for required in requires_predicates |facts|:
+                            facts.push(required)
+                        for fact in facts |int_params, has_lo, lo, has_hi, hi|:
+                            lin_collect_fact(fact, int_params, has_lo, lo, has_hi, hi)
+                        # LEMMA APPLICATIONS: for each call to a declared lemma whose
+                        # `requires` already hold (renamed through the arguments), fold
+                        # its renamed `ensure` facts into the box. A lemma whose requires
+                        # are NOT established contributes nothing (and the goal then
+                        # fails, which is stage0's outcome).
+                        for statement in proof_body |int_params, has_lo, lo, has_hi, hi|:
+                            match statement:
+                                Stmt.Expr(call_expression, call_stmt_line):
+                                    match call_expression:
+                                        Expr.Call(callee, arguments, argument_names, call_line):
+                                            called: sview = ident_name_of(callee)
+                                            continue if called == "assert" or called == ""
+                                            slot: mutable i64 = -1
+                                            probe: mutable usize = 0
+                                            while probe < lemma_names.count |slot, probe, called, lemma_names|:
+                                                slot <- probe.i64() if lemma_names[probe] == called and slot < 0
+                                                probe <- probe + 1
+                                            continue if slot < 0
+                                            arg_names: mutable darray[sview] = []
+                                            for argument in arguments |arg_names|:
+                                                arg_names.push(ident_name_of(argument))
+                                            lemma_params: mutable darray[sview] = []
+                                            start: usize = lemma_param_starts[slot.usize()]
+                                            count: usize = lemma_param_counts[slot.usize()]
+                                            offset: mutable usize = 0
+                                            while offset < count |lemma_params, offset, start, all_lemma_params|:
+                                                lemma_params.push(all_lemma_params[start + offset])
+                                                offset <- offset + 1
+                                            requires_ok: mutable bool = true
+                                            req_start: usize = lemma_requires_starts[slot.usize()]
+                                            req_count: usize = lemma_requires_counts[slot.usize()]
+                                            req_offset: mutable usize = 0
+                                            while req_offset < req_count |requires_ok, req_offset, req_start, lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi, all_lemma_requires|:
+                                                requires_ok <- false if not lemma_requires_holds(all_lemma_requires[req_start + req_offset], lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi)
+                                                req_offset <- req_offset + 1
+                                            continue if not requires_ok
+                                            ens_start: usize = lemma_ensure_starts[slot.usize()]
+                                            ens_count: usize = lemma_ensure_counts[slot.usize()]
+                                            ens_offset: mutable usize = 0
+                                            while ens_offset < ens_count |ens_offset, ens_start, lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi, all_lemma_ensures|:
+                                                lemma_collect_renamed_fact(all_lemma_ensures[ens_start + ens_offset], lemma_params, arg_names, int_params, has_lo, lo, has_hi, hi)
+                                                ens_offset <- ens_offset + 1
+                                        _:
+                                            pass
+                                _:
+                                    pass
+                        entailed: bool = comparison and linear_goal_is_proven(left, operator, right, Ast::Expr.Invalid, false, int_params, has_lo, lo, has_hi, hi)
+                        proven <- reflexive or entailed
+                    _:
+                        pass
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssertByUnproven, name: "", line: goal_line, expected: "", actual: ""}) if not proven
+
+
+        def assert_by_walk_statements(statements: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl], requires_predicates: darray[Ast::Expr]&, lemma_names: darray[sview]&, lemma_param_starts: darray[usize]&, lemma_param_counts: darray[usize]&, all_lemma_params: darray[sview]&, lemma_requires_starts: darray[usize]&, lemma_requires_counts: darray[usize]&, all_lemma_requires: darray[Ast::Expr]&, lemma_ensure_starts: darray[usize]&, lemma_ensure_counts: darray[usize]&, all_lemma_ensures: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            block_kind: sview = kind
+                            is_proof_block: bool = block_kind == "assert_by"
+                            table <- assert_by_judge(block_body, parameters, requires_predicates, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table) if is_proof_block
+                            table <- assert_by_walk_statements(block_body, parameters, requires_predicates, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table) if not is_proof_block
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- assert_by_walk_statements(then_body, parameters, requires_predicates, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table)
+                            table <- assert_by_walk_statements(else_body, parameters, requires_predicates, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- assert_by_walk_statements(while_body, parameters, requires_predicates, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- assert_by_walk_statements(arm.body, parameters, requires_predicates, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table)
+                        _:
+                            pass
+        # Bounded-PRODUCT goals (`x * x >= 0`, `a * b <= 100`): with every factor fully
+        # boxed, the product's extremes lie at the corners (same-variable squares dip to
+        # 0 when the box crosses it). Covers the nonlinear lemma goals stage0's SMT tier
+        # proves that the affine tier cannot.
+        def product_goal_is_proven(goal_left: Ast::Expr, operator: TokenKind, goal_right: Ast::Expr, int_params: darray[sview]&, has_lo: darray[bool]&, lo: darray[i64]&, has_hi: darray[bool]&, hi: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                bound_const: (found: bool, value: i64) = fold_const_int(goal_right)
+                false return if not bound_const.found
+                match goal_left:
+                    Expr.Binary(factor_a, star, factor_b, line):
+                        false return if star != TokenKind.Star
+                        a_name: sview = ident_name_of(factor_a)
+                        b_name: sview = ident_name_of(factor_b)
+                        false return if a_name == "" or b_name == ""
+                        a_slot: mutable i64 = -1
+                        b_slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < int_params.count |a_slot, b_slot, probe, a_name, b_name, int_params|:
+                            a_slot <- probe.i64() if int_params[probe] == a_name and a_slot < 0
+                            b_slot <- probe.i64() if int_params[probe] == b_name and b_slot < 0
+                            probe <- probe + 1
+                        false return if a_slot < 0 or b_slot < 0
+                        a_index: usize = a_slot.usize()
+                        b_index: usize = b_slot.usize()
+                        false return if not (has_lo[a_index] and has_hi[a_index] and has_lo[b_index] and has_hi[b_index])
+                        c1: i64 = lo[a_index] * lo[b_index]
+                        c2: i64 = lo[a_index] * hi[b_index]
+                        c3: i64 = hi[a_index] * lo[b_index]
+                        c4: i64 = hi[a_index] * hi[b_index]
+                        min_product: mutable i64 = c1
+                        max_product: mutable i64 = c1
+                        min_product <- c2 if c2 < min_product
+                        min_product <- c3 if c3 < min_product
+                        min_product <- c4 if c4 < min_product
+                        max_product <- c2 if c2 > max_product
+                        max_product <- c3 if c3 > max_product
+                        max_product <- c4 if c4 > max_product
+                        # A SQUARE's true minimum is 0 whenever the box crosses zero.
+                        same_var: bool = a_name == b_name
+                        min_product <- 0 if same_var and lo[a_index] <= 0 and hi[a_index] >= 0 and min_product > 0
+                        min_product <- 0 if same_var and min_product < 0
+                        bound: i64 = bound_const.value
+                        (min_product >= bound + 1) return if operator == TokenKind.Gt
+                        (min_product >= bound) return if operator == TokenKind.GtEq
+                        (max_product <= bound - 1) return if operator == TokenKind.Lt
+                        (max_product <= bound) return if operator == TokenKind.LtEq
+                        return false
+                    _:
+                        return false
+
+
+        # Collect every declared lemma's params/requires/ensures into flat indexed
+        # tables (fresh darrays from helpers are region-polymorphic, so the index/flat
+        # layout mirrors check_ensures_hof_args).
+        def lemma_collect_tables(declarations: darray[Ast::Decl], lemma_marker_names: darray[sview]&, lemma_names: mutable darray[sview]&, lemma_param_starts: mutable darray[usize]&, lemma_param_counts: mutable darray[usize]&, all_lemma_params: mutable darray[sview]&, lemma_requires_starts: mutable darray[usize]&, lemma_requires_counts: mutable darray[usize]&, all_lemma_requires: mutable darray[Ast::Expr]&, lemma_ensure_starts: mutable darray[usize]&, lemma_ensure_counts: mutable darray[usize]&, all_lemma_ensures: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            continue if not (any marker in lemma_marker_names where marker == name)
+                            lemma_names.push(name)
+                            lemma_param_starts.push(all_lemma_params.count)
+                            lemma_param_counts.push(parameters.count)
+                            for parameter in parameters |all_lemma_params|:
+                                all_lemma_params.push(parameter.name)
+                            lemma_requires_starts.push(all_lemma_requires.count)
+                            lemma_ensure_starts.push(all_lemma_ensures.count)
+                            requires_count: mutable usize = 0
+                            ensure_count: mutable usize = 0
+                            for statement in body |all_lemma_requires, all_lemma_ensures, requires_count, ensure_count|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        contract_kind: sview = kind
+                                        requires_count <- requires_count + 1 if contract_kind == "requires"
+                                        all_lemma_requires.push(expression) if contract_kind == "requires"
+                                        ensure_count <- ensure_count + 1 if contract_kind == "ensure"
+                                        all_lemma_ensures.push(expression) if contract_kind == "ensure"
+                                    _:
+                                        pass
+                            lemma_requires_counts.push(requires_count)
+                            lemma_ensure_counts.push(ensure_count)
+                        Decl.Module(module_name, module_body, module_line):
+                            lemma_collect_tables(module_body, lemma_marker_names, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            lemma_collect_tables(scoped_body, lemma_marker_names, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures)
+                        _:
+                            pass
+
+
+        # LEMMA OBLIGATION: a lemma is erased from code, so each of its `ensure` clauses
+        # must follow statically from its `requires` (plus body facts). Judged by the
+        # same decidable core: reflexivity/identity, or linear entailment over the box
+        # its requires impose. A self-call proves nothing (the circular-proof case).
+        def lemma_check_obligations(declarations: darray[Ast::Decl], lemma_marker_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            continue if not (any marker in lemma_marker_names where marker == name)
+                            int_params: mutable darray[sview] = []
+                            has_lo: mutable darray[bool] = []
+                            lo: mutable darray[i64] = []
+                            has_hi: mutable darray[bool] = []
+                            hi: mutable darray[i64] = []
+                            for parameter in parameters |int_params, has_lo, lo, has_hi, hi|:
+                                type_name: sview = bare_type_name(parameter.type_expression)
+                                continue if not ensure_int_type_name(type_name)
+                                int_params.push(parameter.name)
+                                has_lo.push(ensure_unsigned_type_name(type_name))
+                                lo.push(0)
+                                has_hi.push(false)
+                                hi.push(0)
+                            for statement in body |int_params, has_lo, lo, has_hi, hi|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        lin_collect_fact(expression, int_params, has_lo, lo, has_hi, hi) if kind == "requires"
+                                    _:
+                                        pass
+                            for statement in body |table| -> table:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        continue if kind != "ensure"
+                                        proven: mutable bool = false
+                                        match expression:
+                                            Expr.Binary(left, operator, right, goal_line):
+                                                comparison: bool = is_comparison_operator(operator)
+                                                reflexive: bool = comparison and equal_normalized(left, right, Ast::Expr.Invalid, false) and is_reflexively_true_operator(operator)
+                                                entailed: bool = comparison and linear_goal_is_proven(left, operator, right, Ast::Expr.Invalid, false, int_params, has_lo, lo, has_hi, hi)
+                                                product_entailed: bool = comparison and product_goal_is_proven(left, operator, right, int_params, has_lo, lo, has_hi, hi)
+                                                proven <- reflexive or entailed or product_entailed
+                                            _:
+                                                pass
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LemmaEnsureUnproven, name: name, line: contract_line, expected: "", actual: ""}) if not proven
+                                    _:
+                                        pass
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- lemma_check_obligations(module_body, lemma_marker_names, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- lemma_check_obligations(scoped_body, lemma_marker_names, table)
+                        _:
+                            pass
+
+
+        def check_assert_by_walk(declarations: darray[Ast::Decl], lemma_names: darray[sview]&, lemma_param_starts: darray[usize]&, lemma_param_counts: darray[usize]&, all_lemma_params: darray[sview]&, lemma_requires_starts: darray[usize]&, lemma_requires_counts: darray[usize]&, all_lemma_requires: darray[Ast::Expr]&, lemma_ensure_starts: darray[usize]&, lemma_ensure_counts: darray[usize]&, all_lemma_ensures: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            requires_predicates: mutable darray[Ast::Expr] = []
+                            for statement in body |requires_predicates|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        requires_predicates.push(expression) if kind == "requires"
+                                    _:
+                                        pass
+                            table <- assert_by_walk_statements(body, parameters, requires_predicates, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_assert_by_walk(module_body, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_assert_by_walk(scoped_body, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table)
+                        _:
+                            pass
+
+    public:
+        def check_assert_by(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                lemma_marker_names: mutable darray[sview] = []
+                for annotation in file.enum_annotations |lemma_marker_names|:
+                    lemma_marker_names.push(annotation.name) if annotation.owner == "__lemma"
+                lemma_names: mutable darray[sview] = []
+                lemma_param_starts: mutable darray[usize] = []
+                lemma_param_counts: mutable darray[usize] = []
+                all_lemma_params: mutable darray[sview] = []
+                lemma_requires_starts: mutable darray[usize] = []
+                lemma_requires_counts: mutable darray[usize] = []
+                all_lemma_requires: mutable darray[Ast::Expr] = []
+                lemma_ensure_starts: mutable darray[usize] = []
+                lemma_ensure_counts: mutable darray[usize] = []
+                all_lemma_ensures: mutable darray[Ast::Expr] = []
+                lemma_collect_tables(file.top_decls, lemma_marker_names, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures)
+                table <- lemma_check_obligations(file.top_decls, lemma_marker_names, table)
+                table <- check_assert_by_walk(file.top_decls, lemma_names, lemma_param_starts, lemma_param_counts, all_lemma_params, lemma_requires_starts, lemma_requires_counts, all_lemma_requires, lemma_ensure_starts, lemma_ensure_counts, all_lemma_ensures, table)
