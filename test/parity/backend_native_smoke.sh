@@ -937,6 +937,9 @@ run_case darray_nested_count 'def main() -> i64:\n    m: darray[darray[i64]] = [
 # Payload-enum value equality: compare the tag fields (a payloadless plain enum is this
 # {i32,...} representation, and == / != is the one op not already covered by match/ctor).
 run_case penum_equality 'enum C:\n    R\n    G\n\ndef same(x: C, y: C) -> i64:\n    return 1 if x == y else 0\n\ndef main() -> i64:\n    return same(C.G, C.G) * 10 + same(C.R, C.G)\n'   10
+# `get OPT else FALLBACK`: yield the optional's payload if present, else the fallback.
+run_case get_else_absent 'def main() -> i64:\n    x: i64? = null\n    return get x else 42\n'   42
+run_case get_else_present 'def find(n: i64) -> i64?:\n    return n if n > 0 else null\n\ndef main() -> i64:\n    return get find(8) else 99\n'   8
 # A packed constructor with NO active store declines: stage0 rejects the same program
 # ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
 # is no store to allocate the row from anyway.
