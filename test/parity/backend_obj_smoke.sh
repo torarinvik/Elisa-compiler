@@ -105,6 +105,11 @@ obj_case fstring_byte 'def main() -> i64 can[Abort.Panic, Memory.Allocate]:\n   
 # scalar/aggregate cases above don't. d(42) succeeds -> success arm returns 42.
 obj_case error_union_catch 'error Bad:\n    Boom\n\ndef d(x: i64) -> i64 error[Bad]:\n    raise Bad.Boom if x < 0\n    return x\n\ndef main() -> i64:\n    catch d(42):\n        v:\n            return v\n        error e:\n            return 0\n' 42
 
+# First-class functions (Stage A: named function as a `fn(...)` value + call through a
+# `fn`-typed param). `fn(A)->R` is a low-bit-tagged ptr; a named fn passes its raw pointer
+# (bit0=0), and calling the param emits the tag dispatch (raw path here). apply(dbl,21)=42.
+obj_case fn_value_named 'def dbl(x: i64) -> i64:\n    return x * 2\n\ndef apply(fn: fn(i64) -> i64, value: i64) -> i64:\n    return fn(value)\n\ndef main() -> i64:\n    return apply(dbl, 21)\n' 42
+
 # The comprehension actually VECTORIZES. This is the only check in the suite that asserts
 # Elisa's central performance claim rather than its behaviour: a comprehension exists to be
 # vectorized, and `-Wperf` exists to complain when one is not. No exit code can see this --

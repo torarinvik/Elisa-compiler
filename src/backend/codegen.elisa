@@ -145,6 +145,12 @@ module Backend:
             # from `view[T]` (DynArrayView). A literal `s: sview = "hi"` is the aggregate
             # `{ptr @str, i64 2}`; equality goes through `ctx_string_views_eq` BY VALUE.
             SView
+            # `fn(A, …) -> R` — a first-class function value. Represented as stage0 does: a
+            # low-bit-TAGGED `ptr`. Bit0 clear = a raw function pointer (`@f`), called directly;
+            # bit0 set = points (after `& ~1`) at an `%ElisaCoreLambdaClosure = {ptr code, ptr
+            # env}`, called `code(env, args…)`. The result type at a call site comes from the
+            # EXPECTED type (a `return f(x)` / `y: R = f(x)` supplies it), so `bits` is unused.
+            Fn
 
 
         struct ValueType:
@@ -415,6 +421,11 @@ module Backend:
                 # A user STRUCT name: `bits` carries its registry index.
                 struct_index: i64 = struct_index_of(structs, type_name)
                 ValueType{kind: TypeKind.Struct, bits: struct_index.u32()} return if struct_index >= 0
+            # A `fn(A, …) -> R` type annotation parses to the SAME node as a lambda VALUE:
+            # `Expr.Lambda(params, body, line)` (the annotation's body is empty). As a TYPE it
+            # denotes a first-class function value — a tagged `ptr` (TypeKind.Fn).
+            if type_expression is Expr.Lambda(fn_type_params, fn_type_body, fn_type_line):
+                return ValueType{kind: TypeKind.Fn, bits: 0}
             return unmodeled_type()
 
 
@@ -425,6 +436,8 @@ module Backend:
             # A cstr is an opaque `ptr`, exactly as stage0 passes it (`define i64
             # @take(ptr)`).
             LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.CStr
+            # A `fn(…)->R` value is a (possibly tagged) `ptr` — see the TypeKind.Fn note.
+            LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.Fn
             arena_llvm_type(ctx) return if value_type.kind == TypeKind.Arena
             # A packed handle is an **i32 INDEX** into the store, NOT the row. stage0:
             # `%n = alloca i32`, `store i32 %packed.alloc.index, ptr %n`, and the match
@@ -2321,6 +2334,86 @@ module Backend:
         # `get`/`put` function. The RECEIVER is threaded separately (a `darray[Expr]` of
         # receiver-then-args crashes stage0), and for a mutating helper the region leads the
         # argument list (stage0: `arena_dict_put_or_panic(ptr %region, ptr %d, …)`).
+        # Call THROUGH a `fn(…)` VALUE (a fn-typed local/param), e.g. `fn(value)` inside
+        # `apply(fn: fn(i64)->i64, …)`. The value is a low-bit-tagged ptr: bit0 clear → a raw
+        # function pointer (call directly); bit0 set → an `%ElisaCoreLambdaClosure = {ptr code,
+        # ptr env}` (unmask, load code+env, call `code(env, args…)`). The result type is the
+        # EXPECTED type (a `return f(x)` / `y: R = f(x)` supplies it). Branch results merge
+        # through an alloca (LLVMBuildPhi is not bound). Mirrors stage0's llvm call lowering.
+        def emit_fn_value_call(callee: Expr, arguments: darray[Expr]&, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            # The result type must be known — the subset uses the call site's expected type.
+            null return if expected.kind == TypeKind.Void or expected.kind == TypeKind.Unmodeled or expected.kind == TypeKind.Fn
+            return_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+            fn_pointer_opt: LLVMValueRef? = emit_expression(callee, ValueType{kind: TypeKind.Fn, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            fn_pointer: mutable LLVMValueRef = zeroed
+            got_fn_pointer: mutable bool = false
+            if fn_pointer_opt is fn_pointer_bound:
+                fn_pointer <- fn_pointer_bound
+                got_fn_pointer <- true
+            null return if not got_fn_pointer
+            argument_values: mutable darray[LLVMValueRef] = []
+            argument_llvm_types: mutable darray[LLVMTypeRef] = []
+            arg_declined: mutable bool = false
+            for call_argument in arguments |argument_values, argument_llvm_types, arg_declined, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                continue if arg_declined
+                call_argument_type: ValueType = expression_type(call_argument, local_scope, fns, structs, generics)
+                if call_argument_type.kind == TypeKind.Unmodeled:
+                    arg_declined <- true
+                elif emit_expression(call_argument, call_argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is call_argument_value:
+                    argument_values.push(call_argument_value)
+                    argument_llvm_types.push(llvm_type_of(call_argument_type, structs, ctx))
+                else:
+                    arg_declined <- true
+            null return if arg_declined
+            argument_count: usize = argument_values.count
+            # A zero-argument function value is an edge case the subset skips (keeps the
+            # argument-array base pointers below always in-bounds).
+            null return if argument_count == 0
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, return_llvm, "fnval.result")
+            fn_integer: LLVMValueRef = LLVMBuildPtrToInt(builder, fn_pointer, int64_type, "fnval.int")
+            fn_tag: LLVMValueRef = LLVMBuildAnd(builder, fn_integer, LLVMConstInt(int64_type, 1, 0), "fnval.tag")
+            is_closure: LLVMValueRef = LLVMBuildICmp(builder, 33, fn_tag, LLVMConstInt(int64_type, 0, 0), "fnval.is_closure")
+            enclosing: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            raw_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, enclosing, "fnval.raw")
+            closure_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, enclosing, "fnval.closure")
+            merge_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, enclosing, "fnval.merge")
+            _ = LLVMBuildCondBr(builder, is_closure, closure_block, raw_block)
+            # RAW: call the pointer as an ordinary `return_llvm (args…)` function.
+            LLVMPositionBuilderAtEnd(builder, raw_block)
+            raw_types_pointer: void& = (&argument_llvm_types[0]).cast[void&] can Unsafe.PointerCast
+            raw_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, raw_types_pointer, argument_count.u32(), 0)
+            raw_args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+            raw_result: LLVMValueRef = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, argument_count.u32(), "fnval.raw.call")
+            _ = LLVMBuildStore(builder, raw_result, result_slot)
+            _ = LLVMBuildBr(builder, merge_block)
+            # CLOSURE: unmask (bit0 is known set here, so `- 1` clears it), load {code, env},
+            # and call `code(env, args…)`.
+            LLVMPositionBuilderAtEnd(builder, closure_block)
+            closure_integer: LLVMValueRef = LLVMBuildSub(builder, fn_integer, LLVMConstInt(int64_type, 1, 0), "fnval.unmask")
+            closure_pointer: LLVMValueRef = LLVMBuildIntToPtr(builder, closure_integer, pointer_type, "fnval.cptr")
+            closure_fields: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type]
+            closure_fields_pointer: void& = (&closure_fields[0]).cast[void&] can Unsafe.PointerCast
+            closure_struct_type: LLVMTypeRef = LLVMStructTypeInContext(ctx, closure_fields_pointer, 2, 0)
+            code_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, closure_struct_type, closure_pointer, 0, "fnval.code.ptr")
+            env_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, closure_struct_type, closure_pointer, 1, "fnval.env.ptr")
+            code_pointer: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, code_field_pointer, "fnval.code")
+            env_pointer: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, env_field_pointer, "fnval.env")
+            closure_arg_types: mutable darray[LLVMTypeRef] = [pointer_type]
+            closure_arg_types.extend(argument_llvm_types)
+            closure_arg_values: mutable darray[LLVMValueRef] = [env_pointer]
+            closure_arg_values.extend(argument_values)
+            closure_types_pointer: void& = (&closure_arg_types[0]).cast[void&] can Unsafe.PointerCast
+            closure_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, closure_types_pointer, (argument_count + 1).u32(), 0)
+            closure_args_pointer: void& = (&closure_arg_values[0]).cast[void&] can Unsafe.PointerCast
+            closure_result: LLVMValueRef = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, (argument_count + 1).u32(), "fnval.closure.call")
+            _ = LLVMBuildStore(builder, closure_result, result_slot)
+            _ = LLVMBuildBr(builder, merge_block)
+            LLVMPositionBuilderAtEnd(builder, merge_block)
+            return LLVMBuildLoad2(builder, return_llvm, result_slot, "fnval.merged")
+
+
         def emit_dict_method_call(base: sview, type_args: darray[ValueType]&, receiver: Expr, arguments: darray[Expr]&, arena_leading: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if instantiate_generic(base, type_args, generics, structs, m, ctx) is target:
                 dict_arg_values: mutable darray[LLVMValueRef] = []
@@ -3585,6 +3678,13 @@ module Backend:
                     return LLVMConstNull(llvm_type_of(expected, structs, ctx))
             if expression is Expr.Ident(ident_name, ident_line):
                 ident_type: ValueType = lookup_type(local_scope, ident_name)
+                # A bare function NAME used where a `fn(…)` value is expected passes its RAW
+                # pointer `@name` (bit0 clear = not a closure) — how `apply(dbl, …)` hands over
+                # `dbl`. Checked before the local/const paths, but only for the Fn expectation,
+                # so an ordinary local of the same name still shadows.
+                if expected.kind == TypeKind.Fn and ident_type.kind == TypeKind.Unmodeled:
+                    fn_value_index: i64 = function_index_of(fns, "", ident_name)
+                    fns.handles[fn_value_index.usize()] return if fn_value_index >= 0
                 # A GLOBAL const is INLINED at its use site, exactly as stage0 does: no
                 # global, no load, just the folded value at the const's own type. Checked
                 # only when the name is not a local, so a local still shadows it.
@@ -4550,6 +4650,11 @@ module Backend:
                         if emit_expression(cast_object, source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is source_value:
                             return emit_conversion(source_value, source_type, target_type, structs, ctx, builder)
                         return null
+                # A call whose callee is a `fn(…)`-typed LOCAL/param (not a named function) is
+                # an indirect call through a function value — the tagged-pointer dispatch.
+                if call_callee is Expr.Ident(fn_local_name, fn_local_line):
+                    if lookup_type(local_scope, fn_local_name).kind == TypeKind.Fn:
+                        return emit_fn_value_call(call_callee, call_arguments, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 return emit_call(call_callee, call_arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             return null
 
