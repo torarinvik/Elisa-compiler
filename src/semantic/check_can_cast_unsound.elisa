@@ -1,0 +1,217 @@
+# Unsound effect-family cast `can SOURCE as TARGET:` (stage0 analyzer_permissions). Re-labeling a
+# held grant `SOURCE` (e.g. `Disk.Read`) as a family `TARGET` is only sound when TARGET SUBSUMES
+# SOURCE — TARGET is SOURCE's own family, a permission that (transitively) `includes` it, or an
+# `alias` whose set contains it. Otherwise the cast launders a permission the code does not hold.
+#
+# SOUND subset: fires only when SOURCE's family IS a declared permission (so we can judge subsumption)
+# AND TARGET is a KNOWN permission or alias that provably does not subsume it. An unknown/builtin
+# TARGET or SOURCE family is left un-judged (no false positive). Reuses permission_reaches /
+# permission_declared and the `__permission_decl` + include-edge (sentinel 3900000007) side-tables.
+extend Semantic:
+    private:
+        # Whether the dotted grant `dotted` (`Disk.Read`) has head family `family` (`Disk`) — a byte
+        # prefix match ending at a `.` boundary or end of string. Avoids substring construction.
+        def permcast_head_is(dotted: sview, family: sview) -> bool:
+            can Abort.Panic:
+                family_len: usize = sview_len(family)
+                dotted_len: usize = sview_len(dotted)
+                if family_len == 0 or dotted_len < family_len:
+                    return false
+                matches: mutable bool = true
+                index: mutable usize = 0
+                while index < family_len |matches, index|:
+                    matches <- false if sview_at(dotted, index) != sview_at(family, index)
+                    index <- index + 1
+                if not matches:
+                    return false
+                if dotted_len == family_len:
+                    return true
+                return sview_at(dotted, family_len) == 46
+
+        # The head family idents of an `alias NAME = A.B, C.D` body — the leftmost ident of each
+        # member (`A`, `C`). Handles a single dotted ref, a tuple/list of them, and parens.
+        def permcast_alias_families(target: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, ident_line):
+                        out.push(name)
+                    Expr.Field(receiver, field_name, field_line):
+                        permcast_alias_families(receiver, out)
+                    Expr.Scope(scope_owner, scope_name, scope_line):
+                        head: sview = ident_name_of(scope_owner)
+                        out.push(head) if head != ""
+                    Expr.Paren(inner, paren_line):
+                        permcast_alias_families(inner, out)
+                    Expr.Tuple(elements, tuple_line):
+                        for element in elements |out|:
+                            permcast_alias_families(element, out)
+                    Expr.SetLit(set_elements, set_line):
+                        for set_element in set_elements |out|:
+                            permcast_alias_families(set_element, out)
+                    _:
+                        pass
+
+        # Whether alias TARGET subsumes the declared family P — any member family that IS P, a
+        # permission that (transitively) `includes` P, or a NESTED alias that subsumes P. The visited
+        # list terminates alias cycles. This resolves `alias FileIO = IO, Cap.Seek` where
+        # `alias IO = Cap.Read, …` transitively covers `Cap`.
+        # Whether flat alias TARGET directly subsumes declared family P: a member family that IS P or
+        # is a permission (transitively) `includes`-ing P. Nested/empty aliases are handled by
+        # permcast_alias_unjudgeable (skipped), so no recursion is needed here.
+        def permcast_alias_direct(target: sview, family: sview, alias_owners: darray[sview]&, alias_families: darray[sview]&, edge_from: darray[sview]&, edge_to: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable bool = false
+                probe: mutable usize = 0
+                while probe < alias_owners.count |result, probe|:
+                    if alias_owners[probe] == target:
+                        member: sview = alias_families[probe]
+                        result <- true if member == family
+                        reach_visited: mutable darray[sview] = []
+                        result <- true if not result and permission_reaches(member, family, edge_from, edge_to, reach_visited)
+                    probe <- probe + 1
+                return result
+
+        # Whether TARGET subsumes SOURCE: SOURCE's family P must be a declared permission and TARGET
+        # must be P, a permission reaching P via `includes`, or an alias whose set contains P. When
+        # SOURCE's family is not a declared permission, returns true (un-judgeable → no diagnostic).
+        # Whether an alias TARGET cannot be fully resolved from the direct-member table, so its
+        # subsumption is left un-judged (no false positive): it is a declared alias whose captured
+        # member set is EMPTY (a comma/`|` body form not extracted structurally) or references
+        # ANOTHER alias (nested). Only a flat alias over declared permissions is judged.
+        def permcast_name_in(names: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                found: mutable bool = false
+                probe: mutable usize = 0
+                while probe < names.count |found, probe|:
+                    found <- true if names[probe] == name
+                    probe <- probe + 1
+                return found
+
+        def permcast_alias_unjudgeable(target: sview, declared: darray[sview]&, alias_names: darray[sview]&, alias_owners: darray[sview]&, alias_families: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                # Permissions ALSO collapse to Decl.Alias in the parser, so a declared permission is
+                # judged normally (via includes), never treated as an unresolvable alias.
+                if permcast_name_in(declared, target):
+                    return false
+                if not permcast_name_in(alias_names, target):
+                    return false
+                member_count: mutable usize = 0
+                has_nested: mutable bool = false
+                probe: mutable usize = 0
+                while probe < alias_owners.count |member_count, has_nested, probe|:
+                    if alias_owners[probe] == target:
+                        member_count <- member_count + 1
+                        has_nested <- true if permcast_name_in(alias_names, alias_families[probe]) and not permcast_name_in(declared, alias_families[probe])
+                    probe <- probe + 1
+                return member_count == 0 or has_nested
+
+        def permcast_target_subsumes(source: sview, target: sview, declared: darray[sview]&, edge_from: darray[sview]&, edge_to: darray[sview]&, alias_owners: darray[sview]&, alias_families: darray[sview]&, alias_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                judged: mutable bool = false
+                subsumed: mutable bool = false
+                family_index: mutable usize = 0
+                while family_index < declared.count |judged, subsumed, family_index|:
+                    family: sview = declared[family_index]
+                    if permcast_head_is(source, family):
+                        judged <- true
+                        if target == family:
+                            subsumed <- true
+                        reach_visited: mutable darray[sview] = []
+                        subsumed <- true if permission_reaches(target, family, edge_from, edge_to, reach_visited)
+                        subsumed <- true if permcast_alias_direct(target, family, alias_owners, alias_families, edge_from, edge_to)
+                        # Conservative: an alias target whose member set is unresolvable (empty
+                        # capture from a comma/`|` body, or a nested-alias member) is left un-judged
+                        # — only flat aliases over declared permissions are flagged.
+                        subsumed <- true if permcast_alias_unjudgeable(target, declared, alias_names, alias_owners, alias_families)
+                    family_index <- family_index + 1
+                if not judged:
+                    return true
+                return subsumed
+
+        def permcast_check_statements(statements: darray[Ast::Stmt], declared: darray[sview]&, edge_from: darray[sview]&, edge_to: darray[sview]&, alias_owners: darray[sview]&, alias_families: darray[sview]&, alias_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            if kind == "can" and binding != "" and clause.count > 0:
+                                source: sview = clause[0]
+                                target: sview = binding
+                                # Only a declared PERMISSION target is judged — its subsumption is
+                                # fully determined by the reliable `includes` graph. Alias targets need
+                                # member-set resolution that isn't reliably captured, so they are left
+                                # un-judged (no false positive), at the cost of missing alias-cast rows.
+                                target_is_permission: bool = permcast_name_in(declared, target)
+                                if target_is_permission and not permcast_target_subsumes(source, target, declared, edge_from, edge_to, alias_owners, alias_families, alias_names):
+                                    source_family: sview = permcast_source_family(source, declared)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.CanCastUnsound, name: target, line: line, expected: source, actual: source_family})
+                            table <- permcast_check_statements(body, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- permcast_check_statements(then_body, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+                            table <- permcast_check_statements(else_body, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+                        Stmt.While(condition, while_body, while_line) | Stmt.For(_, _, _, while_body, while_line):
+                            table <- permcast_check_statements(while_body, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- permcast_check_statements(arm.body, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+                        _:
+                            pass
+
+        # SOURCE's family: the declared permission that heads SOURCE, or "" (used only for the hint).
+        def permcast_source_family(source: sview, declared: darray[sview]&) -> sview:
+            can Abort.Panic:
+                found: mutable sview = sview("", 0, 0)
+                index: mutable usize = 0
+                while index < declared.count |found, index|:
+                    found <- declared[index] if found == "" and permcast_head_is(source, declared[index])
+                    index <- index + 1
+                return found
+
+        def permcast_walk(declarations: darray[Ast::Decl], declared: darray[sview]&, edge_from: darray[sview]&, edge_to: darray[sview]&, alias_owners: darray[sview]&, alias_families: darray[sview]&, alias_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            table <- permcast_check_statements(body, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- permcast_walk(module_body, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- permcast_walk(scoped_body, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+                        _:
+                            pass
+
+    public:
+        def check_can_cast_unsound(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                declared: mutable darray[sview] = []
+                edge_from: mutable darray[sview] = []
+                edge_to: mutable darray[sview] = []
+                for annotation in file.enum_annotations |declared, edge_from, edge_to|:
+                    declared.push(annotation.name) if annotation.owner == "__permission_decl"
+                    if annotation.line == 3900000007:
+                        edge_from.push(annotation.owner)
+                        edge_to.push(annotation.name)
+                alias_owners: mutable darray[sview] = []
+                alias_families: mutable darray[sview] = []
+                alias_names: mutable darray[sview] = []
+                permcast_collect_aliases(file.top_decls, alias_owners, alias_families, alias_names)
+                table <- permcast_walk(file.top_decls, declared, edge_from, edge_to, alias_owners, alias_families, alias_names, table)
+
+    private:
+        # Collect `alias NAME = …` bodies as (alias-name, head-family) rows plus the bare name list.
+        def permcast_collect_aliases(declarations: darray[Ast::Decl], alias_owners: mutable darray[sview]&, alias_families: mutable darray[sview]&, alias_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |alias_owners, alias_families, alias_names|:
+                    match declaration:
+                        Decl.Alias(alias_name, alias_target, alias_line):
+                            alias_names.push(alias_name)
+                            families: mutable darray[sview] = []
+                            permcast_alias_families(alias_target, families)
+                            for family in families |alias_owners, alias_families|:
+                                alias_owners.push(alias_name)
+                                alias_families.push(family)
+                        Decl.Module(module_name, module_body, module_line):
+                            permcast_collect_aliases(module_body, alias_owners, alias_families, alias_names)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            permcast_collect_aliases(scoped_body, alias_owners, alias_families, alias_names)
+                        _:
+                            pass
