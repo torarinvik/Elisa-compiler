@@ -463,6 +463,96 @@ extend Semantic:
         # Recurse through every function body (descending Module/Scoped). Signature effects
         # remain a conservative grant except for concrete effect-bearing callback wrappers,
         # whose callback invocation participates in local authority checking.
+        # Whether a granted clause ref transitively covers a required effect FAMILY, resolving
+        # BOTH permission `includes` (sentinel 3900000007: owner=permission, name=included) and
+        # multi-ref alias expansion (sentinel 3900000041: owner=alias, name=member-head). A grant
+        # of `App` where `permission App: includes IO` and `permission IO: includes Disk` covers
+        # the `Disk` family; a grant of `FileIO` where `alias FileIO = IO, Cap.Seek` and
+        # `alias IO = Cap.Read, Cap.Write` covers `Cap`. Depth-bounded against annotation cycles.
+        def cov_grant_covers_family(annotations: darray[Ast::EnumAnnotation]&, grant_ref: sview, target_family: sview, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 16
+                grant_family: sview = effect_ref_family(grant_ref)
+                true return if grant_family == target_family or grant_family == "any" or grant_ref == "any"
+                # Permission includes: recurse into each included permission of this family.
+                for annotation in annotations:
+                    if annotation.line == 3900000007 and annotation.owner == grant_family:
+                        true return if cov_grant_covers_family(annotations, annotation.name, target_family, depth + 1)
+                # Alias member-heads: recurse into each expanded member of this alias.
+                for annotation in annotations:
+                    if annotation.line == 3900000041 and annotation.owner == grant_family:
+                        true return if cov_grant_covers_family(annotations, annotation.name, target_family, depth + 1)
+                return false
+
+        # Whether the accumulated block grants cover a required effect FAMILY. `can[any]`
+        # requirements are covered by ANY non-empty grant; a normal family is covered when some
+        # granted ref transitively resolves to it. Empty family = covered (nothing required).
+        def cov_family_granted(annotations: darray[Ast::EnumAnnotation]&, granted: darray[sview]&, family: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if family == ""
+                if family == "any":
+                    return granted.count > 0
+                return any grant in granted where cov_grant_covers_family(annotations, grant, family, 0)
+
+        # The first declared required effect ref of `callee` whose family is NOT covered by the
+        # accumulated block grants, else "". Only callees WITH declared effects contribute.
+        def cov_call_uncovered_ref(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, callee: sview, granted: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                sview("", 0, 0) return if callee == ""
+                while declared_index < table.function_effect_owner.count |declared_index: usize = 0|:
+                    if table.function_effect_owner[declared_index] == callee:
+                        candidate: sview = table.function_effect_name[declared_index]
+                        candidate return if not cov_family_granted(annotations, granted, effect_ref_family(candidate))
+                    declared_index <- declared_index + 1
+                return ""
+
+        # Fire UngrantedEffectCall for a call INSIDE a can/trusted block whose required effect
+        # family is not covered by the enclosing block grants. Only fires when a grant is in scope
+        # (granted.count > 0); top-level calls are owned by check_ungranted_expression_deep.
+        def cov_check_call(expression: Ast::Expr, granted: darray[sview]&, line: u32, allocation_names: darray[sview]&, allocation_lines: darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, bound_names: darray[sview], strict_unsafe: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if granted.count == 0
+                return if line_has_inline_grant(allocation_names, allocation_lines, line)
+                callee: sview = called_function_name(expression)
+                return if callee == "" or names_contains(bound_names, callee)
+                uncovered: sview = cov_call_uncovered_ref(table, annotations, callee, granted)
+                family: sview = effect_ref_family(uncovered)
+                # The Unsafe family is owned by the dedicated strict-unsafe checks (which carry the
+                # runtime-std exemptions for internal `arena_*` helpers); this permission-coverage
+                # walk handles only ordinary permission/effect families (Disk, Cap, Net, Blocking, …).
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: callee, line: line, expected: uncovered, actual: family}) if uncovered != "" and family != "Unsafe"
+
+        # Walk block-grant scopes, accumulating each can/trusted clause's granted refs, firing for
+        # effect-calls whose required family the accumulated grants do not transitively cover.
+        def cov_walk(statements: darray[Ast::Stmt], granted: darray[sview], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, bound_names: darray[sview], strict_unsafe: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            if kind == "can" or kind == "trusted":
+                                new_granted: mutable darray[sview] = [grant for grant in granted]
+                                new_granted.extend(clause)
+                                table <- cov_walk(body, new_granted, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                            else:
+                                table <- cov_walk(body, granted, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                        Stmt.Expr(expression, line):
+                            table <- cov_check_call(expression, granted, line, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                        Stmt.Return(value, line):
+                            if value is return_expression:
+                                table <- cov_check_call(return_expression, granted, line, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- cov_walk(then_body, granted, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                            table <- cov_walk(else_body, granted, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- cov_walk(while_body, granted, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- cov_walk(for_body, granted, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- cov_walk(arm.body, granted, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
+                        _:
+                            pass
+
         def check_ungranted_panic(declarations: darray[Ast::Decl], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, strict_unsafe: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
@@ -474,6 +564,12 @@ extend Semantic:
                                 bound_names.push(parameter.name)
                             collect_bound_names(body, bound_names)
                             table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, line, signature_grant, strict_unsafe, bound_names, table)
+                            # Block-grant coverage: a `can NET:` / `trusted X:` block whose clause
+                            # does not TRANSITIVELY cover a call's declared required effect family
+                            # (resolving permission `includes` + multi-ref aliases) is ungranted for
+                            # that family. Additive to the walk above (which only fires OUTSIDE grants).
+                            no_grants: darray[sview] = []
+                            table <- cov_walk(body, no_grants, allocation_names, allocation_lines, annotations, bound_names, strict_unsafe, table)
                         Decl.Module(name, body, line):
                             table <- check_ungranted_panic(body, allocation_names, allocation_lines, annotations, strict_unsafe, table)
                         Decl.Scoped(body, line):
