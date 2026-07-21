@@ -93,6 +93,9 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
     case "$opts" in
         *EnforceProgressSafety:true*) hdr+=$'# progress\n' ;;
     esac
+    case "$opts" in
+        *RequireExternContracts:true*) hdr+=$'# strict-externs\n' ;;
+    esac
     fname="$(printf '%s' "$fname_b64" | openssl base64 -d -A 2>/dev/null)"
     is_runtime_std "$fname" && hdr+=$'# std\n'
     # Option-injected overlay layouts (7th column) are replayed as their IN-SOURCE
