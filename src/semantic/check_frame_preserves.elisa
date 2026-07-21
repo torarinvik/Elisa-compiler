@@ -1,0 +1,107 @@
+# Preserves-clause interprocedural violation. A function that declares `preserves ROOT.field`
+# must not let that field be written — including through a call:
+#
+#   def clobber(c: mutable Counter&) changes c.name: ...
+#   def outer(c: mutable Counter&) preserves c.name:
+#       clobber(c)                 # clobber changes c.name -> violates outer's preserves
+#
+#   def f(r: mutable Render&) preserves r.health:
+#       zero(&r.health)            # &r.health handed to a writer -> violates preserves
+#
+# Preserved (root, field) pairs are captured by the parser (3900000011 root + 3900000012
+# field, index-paired per function). A call whose argument is a preserved-root parameter
+# and whose callee `changes` that field, or an `&ROOT.field` address-of of a preserved
+# field passed anywhere, is flagged. Reuses frame_interproc_changes_fields for the callee.
+extend Semantic:
+    private:
+        def fp_collect_preserves(annotations: darray[Ast::EnumAnnotation]&, function_name: sview, roots: mutable darray[sview]&, fields: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for annotation in annotations |roots, fields|:
+                    roots.push(annotation.name) if annotation.owner == function_name and annotation.line == 3900000011
+                    fields.push(annotation.name) if annotation.owner == function_name and annotation.line == 3900000012
+
+        def fp_preserves_pair(roots: darray[sview]&, fields: darray[sview]&, root: sview, field: sview) -> bool:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < roots.count and index < fields.count |index|:
+                    true return if roots[index] == root and fields[index] == field
+                    index <- index + 1
+                return false
+
+        # The address-of-preserved-field an argument passes (`&r.health`), as (found, root,
+        # field); descends parens.
+        def fp_addr_of_field(argument: Ast::Expr) -> (found: bool, root: sview, field: sview):
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Unary(operator, operand, unary_line):
+                        if operator == TokenKind.Ampersand and operand is Expr.Field(Expr.Ident(root, ident_line), field, field_line):
+                            return (true, root, field)
+                        return fp_addr_of_field(operand)
+                    Expr.Paren(inner, paren_line):
+                        return fp_addr_of_field(inner)
+                    _:
+                        return (false, sview("", 0, 0), sview("", 0, 0))
+
+        def fp_check_call(expression: Ast::Expr, caller_name: sview, roots: darray[sview]&, fields: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                    callee_name: sview = ident_name_of(callee)
+                    callee_changes: mutable darray[sview] = []
+                    frame_interproc_changes_fields(annotations, callee_name, callee_changes)
+                    for argument in arguments |table| -> table:
+                        # &ROOT.field of a preserved field passed anywhere.
+                        addr: (found: bool, root: sview, field: sview) = fp_addr_of_field(argument)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreservesViolation, name: addr.root, line: call_line, expected: "", actual: caller_name, detail: addr.field}) if addr.found and fp_preserves_pair(roots, fields, addr.root, addr.field)
+                        # A whole-argument ROOT passed to a callee that `changes ROOT.field`
+                        # where that field is preserved by the caller.
+                        if argument is Expr.Ident(arg_root, arg_line):
+                            for changed_field in callee_changes |table| -> table:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreservesViolation, name: arg_root, line: call_line, expected: "", actual: caller_name, detail: changed_field}) if fp_preserves_pair(roots, fields, arg_root, changed_field)
+
+        def fp_walk(statements: darray[Ast::Stmt], caller_name: sview, roots: darray[sview]&, fields: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- fp_check_call(expression, caller_name, roots, fields, annotations, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- fp_check_call(value, caller_name, roots, fields, annotations, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- fp_check_call(value, caller_name, roots, fields, annotations, table)
+                        Stmt.Return(value, line):
+                            table <- fp_check_call(returned, caller_name, roots, fields, annotations, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- fp_walk(then_body, caller_name, roots, fields, annotations, table)
+                            table <- fp_walk(else_body, caller_name, roots, fields, annotations, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- fp_walk(while_body, caller_name, roots, fields, annotations, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- fp_walk(for_body, caller_name, roots, fields, annotations, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            table <- fp_walk(body, caller_name, roots, fields, annotations, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- fp_walk(arm.body, caller_name, roots, fields, annotations, table)
+                        _:
+                            pass
+
+        def fp_check_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            roots: mutable darray[sview] = []
+                            fields: mutable darray[sview] = []
+                            fp_collect_preserves(annotations, function_name, roots, fields)
+                            table <- fp_walk(body, function_name, roots, fields, annotations, table) if roots.count > 0
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- fp_check_declarations(module_body, annotations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- fp_check_declarations(scoped_body, annotations, table)
+                        _:
+                            pass
+
+    public:
+        def check_frame_preserves(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- fp_check_declarations(file.top_decls, file.enum_annotations, table)
