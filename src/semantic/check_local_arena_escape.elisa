@@ -1,0 +1,145 @@
+# Local-arena escape (stage0 checkLocalArenaEscape / localArenaEscapeLocals). A darray
+# records no home arena — each push/extend/reserve grows its backing from whatever
+# `in <arena>:` scope is active. Growing a function-local collection inside an
+# `in <local Arena value>:` block puts its backing in that local arena, which is freed
+# when the function returns. Returning that collection is therefore a use-after-free:
+#
+#   def collect(n: usize) -> darray[i64]:
+#       out: mutable darray[i64] = []
+#       arena: Arena = zeroed
+#       in arena:
+#           out.push(...)          # backing grown in local arena "arena"
+#       return out                 # cannot return "out": backing freed at return
+#
+# A local arena is a by-value `Arena` local (not an `Arena&` borrow, which the caller
+# owns). We collect the function's local names + local arenas, then walk the body: a
+# grow-call on a by-value local inside an `in <local arena>:` block marks that local as
+# escaping, and a later `return` of it is flagged.
+extend Semantic:
+    private:
+        def lae_is_grow_method(method: sview) -> bool:
+            return method == "push" or method == "extend" or method == "reserve" or method == "resize" or method == "add" or method == "insert"
+
+        # Root identifier of a value/receiver path (`values[0].field` -> "values"), or "".
+        def lae_root_ident(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match expression:
+                    Expr.Ident(name, line): name
+                    Expr.Field(object, field, field_line): lae_root_ident(object)
+                    Expr.Index(object, index, index_line): lae_root_ident(object)
+                    Expr.Paren(inner, paren_line): lae_root_ident(inner)
+                    _: ""
+
+        # The collection a returned value ALIASES, or "". Only a bare collection reference
+        # (through parens) carries the backing pointer; `xs.count` is a scalar copy and
+        # `xs[i]` an element copy, neither of which aliases the freed buffer — so a Field or
+        # Index step yields "" (stage0 gates the same cases on the value's type not being a
+        # collection/ref).
+        def lae_return_alias_root(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match expression:
+                    Expr.Ident(name, line): name
+                    Expr.Paren(inner, paren_line): lae_return_alias_root(inner)
+                    _: ""
+
+        def lae_name_in(names: darray[sview]&, candidate: sview) -> bool:
+            can Abort.Panic:
+                for name in names:
+                    true return if name == candidate
+                return false
+
+        def lae_type_is_ref(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        true return if operator == TokenKind.Ampersand
+                        return lae_type_is_ref(operand)
+                    Expr.Paren(inner, paren_line):
+                        return lae_type_is_ref(inner)
+                    _:
+                        return false
+
+        # Collect function-local VarDecl names, and (separately) the by-value `Arena`
+        # locals among them. Recurses into nested block/control bodies.
+        def lae_collect_locals(statements: darray[Ast::Stmt], locals: mutable darray[sview]&, arenas: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |locals, arenas|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            locals.push(name)
+                            arenas.push(name) if bare_type_name(type_expression) == "Arena" and not lae_type_is_ref(type_expression)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            lae_collect_locals(body, locals, arenas)
+                        Stmt.If(condition, then_body, else_body, line):
+                            lae_collect_locals(then_body, locals, arenas)
+                            lae_collect_locals(else_body, locals, arenas)
+                        Stmt.While(condition, while_body, line):
+                            lae_collect_locals(while_body, locals, arenas)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            lae_collect_locals(for_body, locals, arenas)
+                        _:
+                            pass
+
+        def lae_walk(statements: darray[Ast::Stmt], ambient_arena: sview, locals: darray[sview]&, arenas: darray[sview]&, escaping_names: mutable darray[sview]&, escaping_arenas: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |escaping_names, escaping_arenas, table| -> table:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            # `in <arena>:` sets the ambient allocation arena for its body when
+                            # the target names a by-value local arena.
+                            enters_local_arena: bool = kind == "in" and clause.count > 0 and lae_name_in(arenas, clause[0])
+                            body_arena: sview = clause[0] if enters_local_arena else ambient_arena
+                            table <- lae_walk(body, body_arena, locals, arenas, escaping_names, escaping_arenas, table)
+                        Stmt.Expr(expression, line):
+                            # A grow-call inside `in <local arena>:` on a by-value local
+                            # collection puts that collection's backing in the local arena.
+                            if ambient_arena != "" and expression is Expr.Call(callee, arguments, argument_names, call_line):
+                                if callee is Expr.Field(receiver, method, field_line):
+                                    receiver_root: sview = lae_root_ident(receiver)
+                                    grows_local: bool = lae_is_grow_method(method) and receiver_root != "" and lae_name_in(locals, receiver_root) and not lae_name_in(escaping_names, receiver_root)
+                                    if grows_local:
+                                        escaping_names.push(receiver_root)
+                                        escaping_arenas.push(ambient_arena)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                returned_root: sview = lae_return_alias_root(returned)
+                                escape_index: mutable usize = escaping_names.count
+                                probe: mutable usize = 0
+                                while probe < escaping_names.count |probe, escape_index|:
+                                    escape_index <- probe if escaping_names[probe] == returned_root
+                                    probe <- probe + 1
+                                if escape_index < escaping_names.count:
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalArenaEscape, name: returned_root, line: line, expected: "return", actual: escaping_arenas[escape_index]})
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- lae_walk(then_body, ambient_arena, locals, arenas, escaping_names, escaping_arenas, table)
+                            table <- lae_walk(else_body, ambient_arena, locals, arenas, escaping_names, escaping_arenas, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- lae_walk(while_body, ambient_arena, locals, arenas, escaping_names, escaping_arenas, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- lae_walk(for_body, ambient_arena, locals, arenas, escaping_names, escaping_arenas, table)
+                        _:
+                            pass
+
+        def check_local_arena_escape_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            locals: mutable darray[sview] = []
+                            arenas: mutable darray[sview] = []
+                            lae_collect_locals(body, locals, arenas)
+                            if arenas.count > 0:
+                                escaping_names: mutable darray[sview] = []
+                                escaping_arenas: mutable darray[sview] = []
+                                table <- lae_walk(body, "", locals, arenas, escaping_names, escaping_arenas, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_local_arena_escape_declarations(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_local_arena_escape_declarations(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_local_arena_escape(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_local_arena_escape_declarations(file.top_decls, table)
