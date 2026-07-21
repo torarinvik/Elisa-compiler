@@ -1,0 +1,429 @@
+# Inferred-region bump-stacks discipline (stage0 analyzeRegionLifetimes +
+# analyzeRegionGrowthDiscipline over assignRegionStacks). Region inference places a
+# function's fresh, non-escaping darray/dict locals into one synthesized region backed by
+# a bounded set of bump-stacks (budget `region_stack_cap` = 4). The first `cap`
+# unreserved growables each get their own stacks; the 5th and beyond share one "merge"
+# stacks; a reserved (pre-sized) container sits on the shared base stacks 0.
+#
+# Two objects that share a stacks cannot both grow/interleave freely:
+#  * GROWTH DISCIPLINE (warning): growing X after a same-stacks sibling Y was born on top
+#    of it forces a reallocation — X is no longer the arena tail.
+#  * INTERLEAVED LIFETIMES (error): X born while Y is still live, Y dies before X, and
+#    they share a stacks → their LIFO ranges cross and cannot share a bump-stacks.
+#
+# Objects on DIFFERENT stacks never conflict, so only same-stacks collisions (the over-
+# split merge stacks, or the shared reserved/base stacks) are flagged. This mirrors stage0
+# exactly; the stacks ASSIGNMENT (unlike the backing strategy) is target-independent.
+#
+# The synthesized region is modelled syntactically: the function body with `can`/`trusted`
+# blocks flattened to top level, restricted to fresh `= []` / `= {}` darray/dict locals
+# with no explicit `@region` annotation that do not ESCAPE (returned, passed by value,
+# address-taken, or bound elsewhere). Escaping containers are region-inferred into a
+# persistent/caller arena, so they are not members here.
+extend Semantic:
+    private:
+        def rsl_is_growth_method(method: sview) -> bool:
+            return method == "push" or method == "push_back" or method == "push_front" or method == "insert" or method == "append" or method == "extend" or method == "resize"
+
+        # A `name: mutable darray[T] = []` (or dict) with no explicit `@region`: a fresh
+        # inferred-region container. The value must be an allocating literal/comprehension
+        # and the declared head type darray or dict.
+        # Head name of a (possibly `mutable`-wrapped, generic) type annotation:
+        # `mutable darray[i64]` -> "darray", `dict[K,V]` -> "dict".
+        def rsl_type_head(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match type_expression:
+                    Expr.Unary(operator, operand, unary_line): rsl_type_head(operand) if operator == TokenKind.Mutable else bare_type_name(type_expression)
+                    Expr.Paren(inner, paren_line): rsl_type_head(inner)
+                    Expr.Index(head, argument, index_line): ident_name_of(head)
+                    Expr.IndexN(head, arguments, indexn_line): ident_name_of(head)
+                    _: bare_type_name(type_expression)
+
+        def rsl_is_fresh_region_local(type_expression: Ast::Expr, value: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                head: sview = rsl_type_head(type_expression)
+                if head != "darray" and head != "dict":
+                    return false
+                return match value:
+                    Expr.Array(elements, array_line): true
+                    Expr.Comprehension(loop_variable, iterable, condition, body, comp_line): true
+                    _: false
+
+        # Flatten `can`/`trusted` blocks (ambient grants, region-transparent) to top level;
+        # every other statement is opaque (its own scope).
+        def rsl_flatten(statements: darray[Ast::Stmt], out: mutable darray[Ast::Stmt]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    if statement is Stmt.Block(kind, clause, binding, body, line) and (kind == "can" or kind == "trusted"):
+                        rsl_flatten(body, out)
+                    else:
+                        out.push(statement)
+
+        def rsl_name_index(names: darray[sview]&, name: sview) -> usize:
+            can Abort.Panic:
+                probe: mutable usize = names.count
+                index: mutable usize = 0
+                while index < names.count |index, probe|:
+                    probe <- index if names[index] == name and probe == names.count
+                    index <- index + 1
+                return probe
+
+        # Escape scan: a member used anywhere OTHER than as the receiver-spine of a
+        # `.method()` / `[i]` / `.field` access is considered to escape (returned, passed by
+        # value, address-taken, or bound). `safe_receiver` marks positions where a bare
+        # member reference is a pure use, not an escape.
+        def rsl_escape_expr(expression: Ast::Expr, names: darray[sview]&, escaping: mutable darray[bool]&, safe_receiver: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        if not safe_receiver:
+                            index: usize = rsl_name_index(names, name)
+                            if index < names.count:
+                                escaping[index] <- true
+                    Expr.Field(object, field, field_line):
+                        rsl_escape_expr(object, names, escaping, true)
+                    Expr.Index(object, index_argument, index_line):
+                        rsl_escape_expr(object, names, escaping, true)
+                        rsl_escape_expr(index_argument, names, escaping, false)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if callee is Expr.Field(receiver, method, method_line):
+                            rsl_escape_expr(receiver, names, escaping, true)
+                        else:
+                            rsl_escape_expr(callee, names, escaping, false)
+                        for argument in arguments |names, escaping|:
+                            rsl_escape_expr(argument, names, escaping, false)
+                    Expr.Binary(left, operator, right, binary_line):
+                        rsl_escape_expr(left, names, escaping, false)
+                        rsl_escape_expr(right, names, escaping, false)
+                    Expr.Unary(operator, operand, unary_line):
+                        rsl_escape_expr(operand, names, escaping, false)
+                    Expr.Paren(inner, paren_line):
+                        rsl_escape_expr(inner, names, escaping, safe_receiver)
+                    Expr.Array(elements, array_line):
+                        for element in elements |names, escaping|:
+                            rsl_escape_expr(element, names, escaping, false)
+                    _:
+                        pass
+
+        def rsl_escape_stmts(statements: darray[Ast::Stmt], names: darray[sview]&, escaping: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, escaping|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            rsl_escape_expr(value, names, escaping, false)
+                        Stmt.Assign(target, operator, value, line):
+                            rsl_escape_expr(target, names, escaping, false)
+                            rsl_escape_expr(value, names, escaping, false)
+                        Stmt.Expr(expression, line):
+                            rsl_escape_expr(expression, names, escaping, false)
+                        Stmt.Return(value, line):
+                            rsl_escape_expr(returned, names, escaping, false) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            rsl_escape_expr(condition, names, escaping, false)
+                            rsl_escape_stmts(then_body, names, escaping)
+                            rsl_escape_stmts(else_body, names, escaping)
+                        Stmt.While(condition, while_body, line):
+                            rsl_escape_expr(condition, names, escaping, false)
+                            rsl_escape_stmts(while_body, names, escaping)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            rsl_escape_expr(iterable, names, escaping, false)
+                            rsl_escape_stmts(for_body, names, escaping)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            rsl_escape_stmts(body, names, escaping)
+                        Stmt.Match(scrutinee, arms, line):
+                            rsl_escape_expr(scrutinee, names, escaping, false)
+                            for arm in arms |names, escaping|:
+                                rsl_escape_stmts(arm.body, names, escaping)
+                        _:
+                            pass
+
+        # Collect every member ident referenced anywhere in an expression (receiver or not
+        # — all references count as uses for liveness).
+        def rsl_collect_refs(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Field(object, field, field_line):
+                        rsl_collect_refs(object, out)
+                    Expr.Index(object, index_argument, index_line):
+                        rsl_collect_refs(object, out)
+                        rsl_collect_refs(index_argument, out)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        rsl_collect_refs(callee, out)
+                        for argument in arguments |out|:
+                            rsl_collect_refs(argument, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        rsl_collect_refs(left, out)
+                        rsl_collect_refs(right, out)
+                    Expr.Unary(operator, operand, unary_line):
+                        rsl_collect_refs(operand, out)
+                    Expr.Paren(inner, paren_line):
+                        rsl_collect_refs(inner, out)
+                    Expr.Array(elements, array_line):
+                        for element in elements |out|:
+                            rsl_collect_refs(element, out)
+                    _:
+                        pass
+
+        # Growth/reserve calls in an expression on member receivers, appended as parallel
+        # (member-index, line) rows; `reserved[idx]` is set for a `.reserve()`.
+        def rsl_collect_calls(expression: Ast::Expr, fnames: darray[sview]&, line: u32, g_idx: mutable darray[usize]&, g_line: mutable darray[u32]&, reserved: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if callee is Expr.Field(receiver, method, method_line):
+                            if receiver is Expr.Ident(receiver_name, ident_line):
+                                index: usize = rsl_name_index(fnames, receiver_name)
+                                if index < fnames.count:
+                                    if method == "reserve":
+                                        reserved[index] <- true
+                                    elif rsl_is_growth_method(method):
+                                        g_idx.push(index)
+                                        g_line.push(line)
+                        for argument in arguments |fnames, g_idx, g_line, reserved|:
+                            rsl_collect_calls(argument, fnames, line, g_idx, g_line, reserved)
+                    Expr.Paren(inner, paren_line):
+                        rsl_collect_calls(inner, fnames, line, g_idx, g_line, reserved)
+                    Expr.Binary(left, operator, right, binary_line):
+                        rsl_collect_calls(left, fnames, line, g_idx, g_line, reserved)
+                        rsl_collect_calls(right, fnames, line, g_idx, g_line, reserved)
+                    _:
+                        pass
+
+        def rsl_stmt_line(statement: Ast::Stmt) -> u32:
+            return match statement:
+                Stmt.VarDecl(name, type_expression, value, line): line
+                Stmt.Assign(target, operator, value, line): line
+                Stmt.Expr(expression, line): line
+                Stmt.Return(value, line): line
+                Stmt.If(condition, then_body, else_body, line): line
+                Stmt.While(condition, while_body, line): line
+                Stmt.For(bind, variables, iterable, for_body, line): line
+                Stmt.Block(kind, clause, binding, body, line): line
+                Stmt.Match(scrutinee, arms, line): line
+                _: 0
+
+        def rsl_max_line(statements: darray[Ast::Stmt]) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                highest: mutable u32 = 0
+                for statement in statements |highest|:
+                    own: u32 = rsl_stmt_line(statement)
+                    if own > highest:
+                        highest <- own
+                    child: u32 = rsl_max_line_children(statement)
+                    if child > highest:
+                        highest <- child
+                return highest
+
+        def rsl_max_line_children(statement: Ast::Stmt) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.If(condition, then_body, else_body, line):
+                        then_max: u32 = rsl_max_line(then_body)
+                        else_max: u32 = rsl_max_line(else_body)
+                        return then_max if then_max > else_max else else_max
+                    Stmt.While(condition, while_body, line):
+                        return rsl_max_line(while_body)
+                    Stmt.For(bind, variables, iterable, for_body, line):
+                        return rsl_max_line(for_body)
+                    Stmt.Block(kind, clause, binding, body, line):
+                        return rsl_max_line(body)
+                    _:
+                        return 0
+
+        # Record member uses (updating death/first-use) and growth/reserve calls, walking
+        # the whole body with the enclosing loop's max line (0 outside any loop). A use
+        # inside a loop extends the object's death to the loop's lexical end.
+        def rsl_usage_stmts(statements: darray[Ast::Stmt], fnames: darray[sview]&, loop_max: u32, death: mutable darray[u32]&, firstuse: mutable darray[u32]&, firstuse_inloop: mutable darray[bool]&, reserved: mutable darray[bool]&, g_idx: mutable darray[usize]&, g_line: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |fnames, death, firstuse, firstuse_inloop, reserved, g_idx, g_line|:
+                    stmt_line: u32 = rsl_stmt_line(statement)
+                    refs: mutable darray[sview] = []
+                    rsl_usage_stmt_exprs(statement, refs, fnames, stmt_line, g_idx, g_line, reserved)
+                    in_loop: bool = loop_max > 0
+                    death_line: u32 = loop_max if in_loop and loop_max > stmt_line else stmt_line
+                    for ref_name in refs |fnames, death, firstuse, firstuse_inloop|:
+                        index: usize = rsl_name_index(fnames, ref_name)
+                        if index < fnames.count:
+                            if death_line > death[index]:
+                                death[index] <- death_line
+                            if stmt_line < firstuse[index]:
+                                firstuse[index] <- stmt_line
+                                firstuse_inloop[index] <- in_loop
+                    # Recurse into nested scopes; a loop sets the loop-max for its body.
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, line):
+                            rsl_usage_stmts(then_body, fnames, loop_max, death, firstuse, firstuse_inloop, reserved, g_idx, g_line)
+                            rsl_usage_stmts(else_body, fnames, loop_max, death, firstuse, firstuse_inloop, reserved, g_idx, g_line)
+                        Stmt.While(condition, while_body, line):
+                            body_max: u32 = rsl_max_line(while_body)
+                            rsl_usage_stmts(while_body, fnames, body_max, death, firstuse, firstuse_inloop, reserved, g_idx, g_line)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            body_max: u32 = rsl_max_line(for_body)
+                            rsl_usage_stmts(for_body, fnames, body_max, death, firstuse, firstuse_inloop, reserved, g_idx, g_line)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            rsl_usage_stmts(body, fnames, loop_max, death, firstuse, firstuse_inloop, reserved, g_idx, g_line)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |fnames, death, firstuse, firstuse_inloop, reserved, g_idx, g_line|:
+                                rsl_usage_stmts(arm.body, fnames, loop_max, death, firstuse, firstuse_inloop, reserved, g_idx, g_line)
+                        _:
+                            pass
+
+        # Collect this statement's member references (into `refs`) AND its growth/reserve
+        # calls. A VarDecl scans only its value (the name binding is the birth, not a use).
+        def rsl_usage_stmt_exprs(statement: Ast::Stmt, refs: mutable darray[sview]&, fnames: darray[sview]&, line: u32, g_idx: mutable darray[usize]&, g_line: mutable darray[u32]&, reserved: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.VarDecl(name, type_expression, value, line2):
+                        rsl_collect_refs(value, refs)
+                        rsl_collect_calls(value, fnames, line, g_idx, g_line, reserved)
+                    Stmt.Assign(target, operator, value, line2):
+                        rsl_collect_refs(target, refs)
+                        rsl_collect_refs(value, refs)
+                        rsl_collect_calls(value, fnames, line, g_idx, g_line, reserved)
+                    Stmt.Expr(expression, line2):
+                        rsl_collect_refs(expression, refs)
+                        rsl_collect_calls(expression, fnames, line, g_idx, g_line, reserved)
+                    Stmt.Return(value, line2):
+                        rsl_collect_refs(returned, refs) if value is returned
+                    _:
+                        pass
+
+        def rsl_collect_members(flat: darray[Ast::Stmt], names: mutable darray[sview]&, births: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in flat |names, births|:
+                    if statement is Stmt.VarDecl(name, type_expression, value, line):
+                        if rsl_is_fresh_region_local(type_expression, value) and rsl_name_index(names, name) == names.count:
+                            names.push(name)
+                            births.push(line)
+
+        # Stable selection sort of parallel (member-index, line) growth rows by line.
+        def rsl_sort_growths(g_idx: mutable darray[usize]&, g_line: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                outer: mutable usize = 0
+                while outer < g_line.count |outer, g_idx, g_line|:
+                    best: mutable usize = outer
+                    inner: mutable usize = outer + 1
+                    while inner < g_line.count |inner, best, g_line|:
+                        best <- inner if g_line[inner] < g_line[best]
+                        inner <- inner + 1
+                    if best != outer:
+                        tmp_line: u32 = g_line[outer]
+                        tmp_idx: usize = g_idx[outer]
+                        g_line[outer] <- g_line[best]
+                        g_idx[outer] <- g_idx[best]
+                        g_line[best] <- tmp_line
+                        g_idx[best] <- tmp_idx
+                    outer <- outer + 1
+
+        def rsl_analyze_function(body: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                flat: mutable darray[Ast::Stmt] = []
+                rsl_flatten(body, flat)
+                names: mutable darray[sview] = []
+                births: mutable darray[u32] = []
+                rsl_collect_members(flat, names, births)
+                if names.count < 2:
+                    return
+                escaping: mutable darray[bool] = [false for name in names]
+                rsl_escape_stmts(body, names, escaping)
+                # Filtered (non-escaping) members, kept in birth (source) order.
+                fnames: mutable darray[sview] = []
+                fbirth: mutable darray[u32] = []
+                filter_index: mutable usize = 0
+                while filter_index < names.count |filter_index, fnames, fbirth, names, births, escaping|:
+                    if not escaping[filter_index]:
+                        fnames.push(names[filter_index])
+                        fbirth.push(births[filter_index])
+                    filter_index <- filter_index + 1
+                if fnames.count < 2:
+                    return
+                # Per-member liveness + reservation state.
+                death: mutable darray[u32] = [birth for birth in fbirth]
+                firstuse: mutable darray[u32] = [4294967295 for member in fnames]
+                firstuse_inloop: mutable darray[bool] = [false for member in fnames]
+                reserved: mutable darray[bool] = [false for member in fnames]
+                g_idx: mutable darray[usize] = []
+                g_line: mutable darray[u32] = []
+                rsl_usage_stmts(body, fnames, 0, death, firstuse, firstuse_inloop, reserved, g_idx, g_line)
+                # Stack assignment: reserved -> shared base 0; first `cap` growables their
+                # own stacks 1..cap; the rest share one merge stacks (sentinel 1000000).
+                stacks: mutable darray[i64] = [0 for member in fnames]
+                assign_next: mutable i64 = 1
+                assign_index: mutable usize = 0
+                while assign_index < fnames.count |assign_index, assign_next, stacks, reserved|:
+                    if reserved[assign_index]:
+                        stacks[assign_index] <- 0
+                    elif assign_next > 4:
+                        stacks[assign_index] <- 1000000
+                    else:
+                        stacks[assign_index] <- assign_next
+                        assign_next <- assign_next + 1
+                    assign_index <- assign_index + 1
+                table <- rsl_emit_growth(fnames, fbirth, stacks, reserved, g_idx, g_line, table)
+                table <- rsl_emit_interleave(fnames, fbirth, stacks, death, firstuse, firstuse_inloop, table)
+
+        # Growth discipline: a growth on X sealed by a same-stacks sibling born on top of it
+        # (after X, before the growth) forces a reallocation. Warn once per container.
+        def rsl_emit_growth(fnames: darray[sview]&, fbirth: darray[u32]&, stacks: darray[i64]&, reserved: darray[bool]&, g_idx: mutable darray[usize]&, g_line: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                rsl_sort_growths(g_idx, g_line)
+                warned: mutable darray[bool] = [false for member in fnames]
+                growth_cursor: mutable usize = 0
+                while growth_cursor < g_idx.count |growth_cursor, warned, table| -> table:
+                    gi: usize = g_idx[growth_cursor]
+                    gl: u32 = g_line[growth_cursor]
+                    if not reserved[gi] and not warned[gi]:
+                        blocker: mutable usize = fnames.count
+                        blocker_birth: mutable u32 = 0
+                        sibling: mutable usize = 0
+                        while sibling < fnames.count |sibling, blocker, blocker_birth|:
+                            same_stack: bool = stacks[sibling] == stacks[gi]
+                            born_between: bool = fbirth[sibling] > fbirth[gi] and fbirth[sibling] < gl
+                            if same_stack and born_between:
+                                if blocker == fnames.count or fbirth[sibling] < blocker_birth:
+                                    blocker <- sibling
+                                    blocker_birth <- fbirth[sibling]
+                            sibling <- sibling + 1
+                        if blocker < fnames.count:
+                            warned[gi] <- true
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionGrowthRealloc, name: fnames[gi], line: gl, expected: "", actual: fnames[blocker]})
+                    growth_cursor <- growth_cursor + 1
+
+        # Interleaved lifetimes: for members in birth order, (i,j) crosses iff j is born
+        # while i is live and i dies before j; only a SAME-stacks crossing is a real conflict.
+        def rsl_emit_interleave(fnames: darray[sview]&, fbirth: darray[u32]&, stacks: darray[i64]&, death: darray[u32]&, firstuse: darray[u32]&, firstuse_inloop: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                flagged: mutable darray[bool] = [false for member in fnames]
+                outer: mutable usize = 0
+                while outer < fnames.count |outer, flagged, table| -> table:
+                    inner: mutable usize = outer + 1
+                    while inner < fnames.count |inner, flagged, table| -> table:
+                        crosses: bool = fbirth[inner] < death[outer] and death[outer] < death[inner]
+                        same_stack: bool = stacks[outer] == stacks[inner]
+                        if crosses and same_stack and not flagged[inner]:
+                            flagged[inner] <- true
+                            disjoint: bool = not firstuse_inloop[inner] and firstuse[inner] > death[outer]
+                            interleave_kind: DiagnosticKind = DiagnosticKind.RegionInterleaveDisjoint if disjoint else DiagnosticKind.RegionInterleaveOverlap
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: interleave_kind, name: fnames[inner], line: fbirth[inner], expected: "", actual: fnames[outer]})
+                        inner <- inner + 1
+                    outer <- outer + 1
+
+        def check_region_stack_lifetime_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- rsl_analyze_function(body, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_region_stack_lifetime_declarations(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_region_stack_lifetime_declarations(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_region_stack_lifetime(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_region_stack_lifetime_declarations(file.top_decls, table)
