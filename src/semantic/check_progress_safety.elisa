@@ -1,0 +1,150 @@
+# Progress-safety (stage0's EnforceProgressSafety): a `while` loop must carry EVIDENCE that it
+# makes progress toward termination, otherwise it may spin forever. Evidence stage0 accepts:
+#   - a `decreases <measure>` contract in the loop body,
+#   - a Progress budget (a `can Progress.Tick:`/`can Progress.Yield:` block, enclosing or nested),
+#   - the escape hatches `can/trusted Unsafe.AssumeProgress:` / `can/trusted Unsafe.NonProgress:`,
+#   - a loop-condition variable mutated toward its bound (the counting/direction proof).
+# This is the CONSERVATIVE port: it only FIRES when the body assigns to NO condition variable at
+# all (a provably-stuck loop like `while flag: pass`) AND none of the block-level hatches wrap or
+# nest inside it. That never over-fires on a loop carrying any of the evidence forms above; the
+# wrong-direction counting case (`while i<n: i<-i-1`) is left as a sound miss (direction analysis
+# is a later extension). Gated on `enforce_progress` (EnforceProgressSafety).
+extend Semantic:
+    private:
+        # The block grants that discharge a loop's progress obligation.
+        def progress_grant_is_evidence(grant: sview) -> bool:
+            can Abort.Panic:
+                return grant == "Unsafe.AssumeProgress" or grant == "Unsafe.NonProgress" or grant == "Progress.Tick" or grant == "Progress.Yield"
+
+        # Whether a statement list contains a progress-discharging `can/trusted …:` block
+        # anywhere (recursing through control flow), so a hatch NESTED in the loop body counts.
+        def progress_has_evidence_block(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            true return if (kind == "can" or kind == "trusted") and (any grant in clause where progress_grant_is_evidence(grant))
+                            true return if progress_has_evidence_block(body)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if progress_has_evidence_block(then_body)
+                            true return if progress_has_evidence_block(else_body)
+                        Stmt.While(condition, while_body, while_line):
+                            true return if progress_has_evidence_block(while_body)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            true return if progress_has_evidence_block(for_body)
+                        _:
+                            pass
+                return false
+
+        # Whether the loop body carries a `decreases` contract (its own progress measure).
+        def progress_body_has_decreases(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Contract(kind, expression, contract_line):
+                            true return if kind == "decreases" or kind == "decreases*"
+                        _:
+                            pass
+                return false
+
+        # The identifiers a (condition) expression mentions.
+        def progress_expr_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Binary(left, operator, right, line):
+                        progress_expr_idents(left, out)
+                        progress_expr_idents(right, out)
+                    Expr.Unary(operator, operand, line):
+                        progress_expr_idents(operand, out)
+                    Expr.Paren(inner, line):
+                        progress_expr_idents(inner, out)
+                    Expr.Field(object, field, line):
+                        progress_expr_idents(object, out)
+                    Expr.Index(object, index, line):
+                        progress_expr_idents(object, out)
+                        progress_expr_idents(index, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        progress_expr_idents(callee, out)
+                        for argument in arguments |out|:
+                            progress_expr_idents(argument, out)
+                    _:
+                        pass
+
+        # Whether any statement in the body ASSIGNS (any operator) to a name in `names`.
+        def progress_body_assigns_any(statements: darray[Ast::Stmt], names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, assign_line):
+                            assigned: sview = progress_assign_base(target)
+                            true return if assigned != "" and (any candidate in names where candidate == assigned)
+                        Stmt.VarDecl(name, type_expression, decl_value, decl_line):
+                            true return if any candidate in names where candidate == name
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if progress_body_assigns_any(then_body, names)
+                            true return if progress_body_assigns_any(else_body, names)
+                        Stmt.While(inner_condition, inner_body, inner_line):
+                            true return if progress_body_assigns_any(inner_body, names)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            true return if progress_body_assigns_any(for_body, names)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            true return if progress_body_assigns_any(block_body, names)
+                        _:
+                            pass
+                return false
+
+        # The base identifier an assignment target writes (`x` -> x, `x.f`/`x[i]` -> x).
+        def progress_assign_base(target: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, line):
+                        return name
+                    Expr.Index(object, index, line):
+                        return progress_assign_base(object)
+                    Expr.Field(object, field, line):
+                        return progress_assign_base(object)
+                    Expr.Paren(inner, line):
+                        return progress_assign_base(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        def progress_safety_statements(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.While(condition, while_body, line):
+                            has_decreases: bool = progress_body_has_decreases(while_body)
+                            has_hatch: bool = progress_has_evidence_block(while_body)
+                            condition_names: mutable darray[sview] = []
+                            progress_expr_idents(condition, condition_names)
+                            mutates_condition: bool = progress_body_assigns_any(while_body, condition_names)
+                            no_evidence: bool = not has_decreases and not has_hatch and not mutates_condition
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ProgressNoEvidence, name: "", line: line, expected: "", actual: ""}) if no_evidence
+                            table <- progress_safety_statements(while_body, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- progress_safety_statements(then_body, table)
+                            table <- progress_safety_statements(else_body, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- progress_safety_statements(for_body, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            # A `can/trusted …:` progress hatch wrapping the loop discharges every
+                            # loop nested inside it — skip the whole subtree.
+                            wraps_evidence: bool = (kind == "can" or kind == "trusted") and (any grant in clause where progress_grant_is_evidence(grant))
+                            table <- progress_safety_statements(body, table) if not wraps_evidence
+                        _:
+                            pass
+
+        def check_progress_safety(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- progress_safety_statements(body, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_progress_safety(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_progress_safety(scoped_body, table)
+                        _:
+                            pass
