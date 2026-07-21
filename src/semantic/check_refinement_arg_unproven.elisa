@@ -484,7 +484,125 @@ extend Semantic:
                         _:
                             pass
 
-        def guard_interval_walk(declarations: darray[Ast::Decl], signature_contract_exprs: darray[Ast::Expr], signature_contract_lines: darray[u32], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, gi_functions: darray[sview]&, gi_indices: darray[usize]&, gi_los: darray[i64]&, gi_his: darray[i64]&, table: lmut SymbolTable) -> void:
+        # Collect top-level integer `const NAME: T = <literal>` bindings into name/value arrays,
+        # so a refinement's dependent bound spelled as a const (`InRange[0, cap128]`) resolves.
+        def rau_collect_int_consts(declarations: darray[Ast::Decl], names: mutable darray[sview]&, values: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, values|:
+                    match declaration:
+                        Decl.Const(const_name, type_expression, value, is_mutable, const_line):
+                            literal: (found: bool, value: i64) = signed_int_literal(value)
+                            names.push(const_name) if literal.found and not is_mutable
+                            values.push(literal.value) if literal.found and not is_mutable
+                        Decl.Module(module_name, module_body, module_line):
+                            rau_collect_int_consts(module_body, names, values)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            rau_collect_int_consts(scoped_body, names, values)
+                        _:
+                            pass
+
+        # Collect `type AliasName[...] = TARGET` bindings as name -> target expr. Unlike
+        # collect_refine_aliases (which keeps only `where`-predicate Refinement targets), this
+        # keeps the raw target so an `is Law[...]` refinement (a Binary, not a Refinement) survives.
+        def rau_collect_alias_targets(declarations: darray[Ast::Decl], names: mutable darray[sview]&, targets: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, targets|:
+                    match declaration:
+                        Decl.Alias(alias_name, target, alias_line):
+                            names.push(alias_name)
+                            targets.push(target)
+                        Decl.Module(module_name, module_body, module_line):
+                            rau_collect_alias_targets(module_body, names, targets)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            rau_collect_alias_targets(scoped_body, names, targets)
+                        _:
+                            pass
+
+        # The `Law[...]` refinement application inside an alias TARGET, whether the target spells
+        # the refinement as `BASE is Law[...]` (a Binary) or as an Expr.Refinement.
+        def rau_target_law_app(target: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Binary(base, operator, right, line):
+                        return right if operator == TokenKind.Is else (Ast::Expr.Absent)
+                    Expr.Refinement(refine_base, predicate, refine_line):
+                        return predicate
+                    Expr.Paren(inner, paren_line):
+                        return rau_target_law_app(inner)
+                    _:
+                        return (Ast::Expr.Absent)
+
+        # Resolve an index-arg expression to an integer: a signed literal, or a bare ident that
+        # names a collected int const. (found, value).
+        def rau_resolve_int(expression: Ast::Expr, const_names: darray[sview]&, const_values: darray[i64]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                literal: (found: bool, value: i64) = signed_int_literal(expression)
+                literal return if literal.found
+                name: sview = ident_name_of(expression)
+                if name != "":
+                    probe: mutable usize = 0
+                    while probe < const_names.count |probe, name, const_names, const_values|:
+                        (true, const_values[probe]) return if const_names[probe] == name
+                        probe <- probe + 1
+                return (false, 0)
+
+        # Bounds of a PARAMETRIC-alias-typed value `AliasName[ARG]` where the alias is a range
+        # refinement `type AliasName[p] = BASE is Law[a, b]` and exactly ONE of a,b is the alias
+        # parameter (a bare ident), the other an int literal. ARG (a literal or a const) is
+        # substituted for the parameter, giving a concrete [lo, hi]. Ambiguous shapes (two idents,
+        # non-single application, unresolvable arg) return not-found — a sound miss.
+        def rau_aliased_bounds(type_expression: Ast::Expr, alias_names: darray[sview]&, alias_targets: darray[Ast::Expr]&, const_names: darray[sview]&, const_values: darray[i64]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&) -> (found: bool, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                alias_name: mutable sview = sview("", 0, 0)
+                arg_value: mutable (found: bool, value: i64) = (false, 0)
+                match type_expression:
+                    Expr.Index(object, index, index_line):
+                        alias_name <- ident_name_of(object)
+                        arg_value <- rau_resolve_int(index, const_names, const_values)
+                    Expr.IndexN(object_n, arguments_n, indexn_line):
+                        alias_name <- ident_name_of(object_n) if arguments_n.count == 1
+                        arg_value <- rau_resolve_int(arguments_n[0], const_names, const_values) if arguments_n.count == 1
+                    _:
+                        pass
+                (false, 0, 0) return if alias_name == "" or not arg_value.found
+                # Find the alias's target, then its `Law[...]` refinement application.
+                target: mutable Ast::Expr = (Ast::Expr.Absent)
+                found_alias: mutable bool = false
+                aidx: mutable usize = 0
+                while aidx < alias_names.count |target, found_alias, aidx, alias_name, alias_names, alias_targets|:
+                    if alias_names[aidx] == alias_name and not found_alias:
+                        target <- alias_targets[aidx]
+                        found_alias <- true
+                    aidx <- aidx + 1
+                (false, 0, 0) return if not found_alias
+                predicate: Ast::Expr = rau_target_law_app(target)
+                # The predicate is `Law[a, b]`; substitute the sole ident arg with arg_value.
+                return match predicate:
+                    Expr.IndexN(law_object, law_arguments, law_line):
+                        law_name: sview = ident_name_of(law_object)
+                        rau_substituted_range(law_name, law_arguments, arg_value.value, const_names, const_values, law_names, law_predicates) if law_arguments.count == 2 else (false, 0, 0)
+                    _:
+                        (false, 0, 0)
+
+        # Given a range law's [a, b] arg exprs, resolve each: an int literal/const stays itself, a
+        # bare ident (the alias parameter) becomes `param_value`. Fire only when the law is range-
+        # shaped and exactly one arg was the substituted ident (so the mapping is unambiguous).
+        def rau_substituted_range(law_name: sview, law_arguments: darray[Ast::Expr], param_value: i64, const_names: darray[sview]&, const_values: darray[i64]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&) -> (found: bool, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                (false, 0, 0) return if law_shape(law_name, law_names, law_predicates) != "range"
+                lo_lit: (found: bool, value: i64) = rau_resolve_int(law_arguments[0], const_names, const_values)
+                hi_lit: (found: bool, value: i64) = rau_resolve_int(law_arguments[1], const_names, const_values)
+                lo_ident: sview = ident_name_of(law_arguments[0])
+                hi_ident: sview = ident_name_of(law_arguments[1])
+                # Exactly one arg is the substituted parameter (a bare ident that is NOT a const).
+                lo_is_param: bool = not lo_lit.found and lo_ident != ""
+                hi_is_param: bool = not hi_lit.found and hi_ident != ""
+                (false, 0, 0) return if lo_is_param == hi_is_param
+                lo: i64 = param_value if lo_is_param else lo_lit.value
+                hi: i64 = param_value if hi_is_param else hi_lit.value
+                return (true, lo, hi)
+
+        def guard_interval_walk(declarations: darray[Ast::Decl], signature_contract_exprs: darray[Ast::Expr], signature_contract_lines: darray[u32], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, alias_names: darray[sview]&, alias_targets: darray[Ast::Expr]&, const_names: darray[sview]&, const_values: darray[i64]&, gi_functions: darray[sview]&, gi_indices: darray[usize]&, gi_los: darray[i64]&, gi_his: darray[i64]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -503,15 +621,21 @@ extend Semantic:
                             seed_hi: mutable darray[i64] = []
                             while pindex < parameters.count |seed_names, seed_lo, seed_hi, pindex: usize = 0|:
                                 pbounds: (found: bool, lo: i64, hi: i64) = refined_param_bounds(parameters[pindex].type_expression, law_names, law_predicates)
-                                seed_names.push(parameters[pindex].name) if pbounds.found
-                                seed_lo.push(pbounds.lo) if pbounds.found
-                                seed_hi.push(pbounds.hi) if pbounds.found
+                                # Fallback: a parametric-alias-over-const type (`SlotIndex[cap128]`)
+                                # that refined_param_bounds (literal-arg only) can't resolve.
+                                aliased: (found: bool, lo: i64, hi: i64) = rau_aliased_bounds(parameters[pindex].type_expression, alias_names, alias_targets, const_names, const_values, law_names, law_predicates) if not pbounds.found else (false, 0, 0)
+                                use_lo: i64 = pbounds.lo if pbounds.found else aliased.lo
+                                use_hi: i64 = pbounds.hi if pbounds.found else aliased.hi
+                                use_found: bool = pbounds.found or aliased.found
+                                seed_names.push(parameters[pindex].name) if use_found
+                                seed_lo.push(use_lo) if use_found
+                                seed_hi.push(use_hi) if use_found
                                 pindex <- pindex + 1
                             table <- guard_interval_check_statements(body, seed_names, seed_lo, seed_hi, excluded, law_names, law_predicates, gi_functions, gi_indices, gi_los, gi_his, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- guard_interval_walk(module_body, signature_contract_exprs, signature_contract_lines, law_names, law_predicates, gi_functions, gi_indices, gi_los, gi_his, table)
+                            table <- guard_interval_walk(module_body, signature_contract_exprs, signature_contract_lines, law_names, law_predicates, alias_names, alias_targets, const_names, const_values, gi_functions, gi_indices, gi_los, gi_his, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- guard_interval_walk(scoped_body, signature_contract_exprs, signature_contract_lines, law_names, law_predicates, gi_functions, gi_indices, gi_los, gi_his, table)
+                            table <- guard_interval_walk(scoped_body, signature_contract_exprs, signature_contract_lines, law_names, law_predicates, alias_names, alias_targets, const_names, const_values, gi_functions, gi_indices, gi_los, gi_his, table)
                         _:
                             pass
 
@@ -619,7 +743,13 @@ extend Semantic:
                 gi_los: mutable darray[i64] = []
                 gi_his: mutable darray[i64] = []
                 collect_refined_param_bounds(file.top_decls, law_names, law_predicates, gi_functions, gi_indices, gi_los, gi_his)
-                table <- guard_interval_walk(file.top_decls, file.signature_contract_exprs, file.signature_contract_lines, law_names, law_predicates, gi_functions, gi_indices, gi_los, gi_his, table)
+                const_names: mutable darray[sview] = []
+                const_values: mutable darray[i64] = []
+                rau_collect_int_consts(file.top_decls, const_names, const_values)
+                alias_target_names: mutable darray[sview] = []
+                alias_targets: mutable darray[Ast::Expr] = []
+                rau_collect_alias_targets(file.top_decls, alias_target_names, alias_targets)
+                table <- guard_interval_walk(file.top_decls, file.signature_contract_exprs, file.signature_contract_lines, law_names, law_predicates, alias_target_names, alias_targets, const_names, const_values, gi_functions, gi_indices, gi_los, gi_his, table)
                 sym_functions: mutable darray[sview] = []
                 sym_indices: mutable darray[usize] = []
                 collect_symbolic_range_positions(file.top_decls, law_names, law_predicates, sym_functions, sym_indices)
