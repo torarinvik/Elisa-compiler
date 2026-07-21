@@ -1,0 +1,145 @@
+# A function whose return type is a range refinement with a FINITE upper bound
+# (`-> i64 is Bounded[0, 4095]`) but whose body returns a product `param * const`
+# (|const| >= 2) of an UNBOUNDED-above parameter cannot be proven: the product grows
+# without bound, so no finite upper bound holds. Stage0's non-SMT prover warns
+# "refinement on the return of F could not be proven statically". This is the branchy /
+# multi-return companion of check_refinement_return's single-return interval check, which
+# already fires this shape but is gated to non-branchy single-return functions.
+#
+# SOUND subset (never over-fires): fire ONLY when the multiplied parameter is
+#   * unrefined (its type carries no `is Law` refinement — a refined param is bounded), AND
+#   * NOT upper-bounded by a `requires`/enclosing-guard comparison (`p <= K` / `p < K`), AND
+#   * the constant factor has |value| >= 2 (a genuine amplification).
+# A `return 0` (or any literal / bounded expression) has no such product and stays silent;
+# a two-sided-guarded param (`if p >= 0 and p <= 4095: return p`) is upper-bounded → silent.
+extend Semantic:
+    private:
+        # Upper-bounded subject names a condition establishes: `p <= K`, `p < K`, `K >= p`,
+        # `K > p` (K an int literal), descending `and`-conjunctions. Collected into `out`.
+        def brp_collect_upper_bounded(condition: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, paren_line):
+                        brp_collect_upper_bounded(inner, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            brp_collect_upper_bounded(left, out)
+                            brp_collect_upper_bounded(right, out)
+                        else:
+                            left_name: sview = ident_name_of(left)
+                            right_name: sview = ident_name_of(right)
+                            left_lit: (found: bool, value: i64) = signed_int_literal(left)
+                            right_lit: (found: bool, value: i64) = signed_int_literal(right)
+                            # `p <= K` / `p < K`: left is the subject, right a literal.
+                            if (operator == TokenKind.LtEq or operator == TokenKind.Lt) and left_name != "" and right_lit.found:
+                                out.push(left_name) if not (any o in out where o == left_name)
+                            # `K >= p` / `K > p`: right is the subject, left a literal.
+                            if (operator == TokenKind.GtEq or operator == TokenKind.Gt) and right_name != "" and left_lit.found:
+                                out.push(right_name) if not (any o in out where o == right_name)
+                    _:
+                        pass
+
+        # Whether `expr` contains a product `param * const` (|const| >= 2) whose parameter is in
+        # `unbounded` and NOT in `upper_bounded`.
+        def brp_has_unbounded_product(expression: Ast::Expr, unbounded: darray[sview]&, upper_bounded: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.Star:
+                            left_name: sview = ident_name_of(left)
+                            right_name: sview = ident_name_of(right)
+                            left_lit: (found: bool, value: i64) = signed_int_literal(left)
+                            right_lit: (found: bool, value: i64) = signed_int_literal(right)
+                            left_unbounded: bool = left_name != "" and (any u in unbounded where u == left_name) and not (any b in upper_bounded where b == left_name)
+                            right_unbounded: bool = right_name != "" and (any u in unbounded where u == right_name) and not (any b in upper_bounded where b == right_name)
+                            true return if left_unbounded and right_lit.found and (right_lit.value >= 2 or right_lit.value <= (0 - 2))
+                            true return if right_unbounded and left_lit.found and (left_lit.value >= 2 or left_lit.value <= (0 - 2))
+                        return brp_has_unbounded_product(left, unbounded, upper_bounded) or brp_has_unbounded_product(right, unbounded, upper_bounded)
+                    Expr.Unary(operator, operand, unary_line):
+                        return brp_has_unbounded_product(operand, unbounded, upper_bounded)
+                    Expr.Paren(inner, paren_line):
+                        return brp_has_unbounded_product(inner, unbounded, upper_bounded)
+                    _:
+                        return false
+
+        def brp_walk(statements: darray[Ast::Stmt], unbounded: darray[sview]&, upper_bounded: darray[sview], function_name: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementReturnNotProven, name: function_name, line: line, expected: "", actual: ""}) if brp_has_unbounded_product(returned, unbounded, upper_bounded)
+                        Stmt.If(condition, then_body, else_body, line):
+                            then_upper: mutable darray[sview] = [b for b in upper_bounded]
+                            brp_collect_upper_bounded(condition, then_upper)
+                            table <- brp_walk(then_body, unbounded, then_upper, function_name, table)
+                            table <- brp_walk(else_body, unbounded, upper_bounded, function_name, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- brp_walk(while_body, unbounded, upper_bounded, function_name, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- brp_walk(for_body, unbounded, upper_bounded, function_name, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- brp_walk(block_body, unbounded, upper_bounded, function_name, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- brp_walk(arm.body, unbounded, upper_bounded, function_name, table)
+                        _:
+                            pass
+
+        # Names of every declared type alias. A param typed as an alias (`tx: TileX` where
+        # `type TileX = i64 is Bounded[0,63]`) may be bounded through the alias, which
+        # local_refinement_law_name (a direct `is Law` probe) does not see — so conservatively
+        # treat any alias-typed param as NOT an unbounded candidate (fewer fires, never over-fires).
+        def brp_collect_alias_names(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Alias(alias_name, target, alias_line):
+                            out.push(alias_name)
+                        Decl.Module(module_name, module_body, module_line):
+                            brp_collect_alias_names(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            brp_collect_alias_names(scoped_body, out)
+                        _:
+                            pass
+
+        # `requires`-clause upper bounds active for the whole body.
+        def brp_collect_requires_upper(body: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |out|:
+                    if statement is Stmt.Contract(kind, expression, line) and (kind == "requires" or kind == "require"):
+                        brp_collect_upper_bounded(expression, out)
+
+        def brp_walk_decls(declarations: darray[Ast::Decl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, alias_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if return_type is present_return:
+                                bounds: (found: bool, lo: i64, hi: i64) = return_refinement_bounds(present_return, law_names, law_predicates)
+                                # Only a FINITE upper bound is violable by an unbounded product.
+                                if bounds.found and bounds.hi < 9223372036854775807:
+                                    unbounded: mutable darray[sview] = []
+                                    for parameter in parameters |unbounded, alias_names|:
+                                        param_head: sview = bare_type_name(parameter.type_expression)
+                                        is_alias_typed: bool = any a in alias_names where a == param_head
+                                        unbounded.push(parameter.name) if local_refinement_law_name(parameter.type_expression) == "" and not is_alias_typed
+                                    upper_bounded: mutable darray[sview] = []
+                                    brp_collect_requires_upper(body, upper_bounded)
+                                    table <- brp_walk(body, unbounded, upper_bounded, function_name, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- brp_walk_decls(module_body, law_names, law_predicates, alias_names, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- brp_walk_decls(scoped_body, law_names, law_predicates, alias_names, table)
+                        _:
+                            pass
+
+        def check_bounded_return_product(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(file.top_decls, law_names, law_predicates)
+                return if law_names.count == 0
+                alias_names: mutable darray[sview] = []
+                brp_collect_alias_names(file.top_decls, alias_names)
+                table <- brp_walk_decls(file.top_decls, law_names, law_predicates, alias_names, table)
