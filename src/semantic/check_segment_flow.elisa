@@ -1,0 +1,142 @@
+# Ambient-segment flow (stage0 validateSegmentFlow). A function body carries an ambient
+# segment owner, defaulting to Host. A call to a `@segment_transition`/mutation extern
+# SETS the ambient to its owner; a call to a function that REQUIRES a segment owner
+# (`extern host_only() -> void can[Segment.Host]`) errors when the ambient does not match.
+#
+#   extern host_only() -> void can[Segment.Host]
+#   def run() -> void:
+#       load_guest()        # ambient := Guest
+#       host_only()         # requires Host, ambient Guest -> "segment owner mismatch"
+#
+# Callee segment facts (transition owner / required owner) are captured on the side-table
+# by the parser (record_extern_segment_flow) as the "__seg_transition_*" / "__seg_required_*"
+# sentinels. Ambient is carried in a one-cell darray, mutated in place across sibling
+# statements exactly like the owned-region live/consumed sets.
+#
+# Owner encoding: 1 = Host, 2 = Guest, 0 = none/unknown. The default entry ambient is Host.
+extend Semantic:
+    private:
+        def seg_owner_name(owner: u8) -> sview:
+            return "Host" if owner == 1 else ("Guest" if owner == 2 else "Unknown")
+
+        # The ambient owner a call to `name` transitions to (0 when `name` is not a
+        # transition), read from the parser's side-table sentinels.
+        def seg_transition_owner(annotations: darray[Ast::EnumAnnotation]&, name: sview) -> u8:
+            can Abort.Panic:
+                for annotation in annotations:
+                    1 return if annotation.owner == name and annotation.name == "__seg_transition_host"
+                    2 return if annotation.owner == name and annotation.name == "__seg_transition_guest"
+                return 0
+
+        # The ambient owner a call to `name` requires (0 when it imposes none).
+        def seg_required_owner(annotations: darray[Ast::EnumAnnotation]&, name: sview) -> u8:
+            can Abort.Panic:
+                for annotation in annotations:
+                    1 return if annotation.owner == name and annotation.name == "__seg_required_host"
+                    2 return if annotation.owner == name and annotation.name == "__seg_required_guest"
+                return 0
+
+        # Apply one call's segment facts: flag a required-owner mismatch against the
+        # current ambient, then transition the ambient if the callee is a transition.
+        def seg_apply_call(callee_name: sview, line: u32, annotations: darray[Ast::EnumAnnotation]&, ambient: mutable darray[u8]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if callee_name != "":
+                    current: u8 = ambient[0]
+                    required: u8 = seg_required_owner(annotations, callee_name)
+                    mismatched: bool = required != 0 and current != 0 and current != required
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.SegmentOwnerMismatch, name: callee_name, line: line, expected: seg_owner_name(required), actual: seg_owner_name(current)}) if mismatched
+                    transition: u8 = seg_transition_owner(annotations, callee_name)
+                    ambient[0] <- transition if transition != 0 else current
+
+        # Walk an expression for calls (arguments first, then the call itself) so a
+        # transition inside an argument lands before the enclosing call is judged.
+        def seg_walk_expr(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, ambient: mutable darray[u8]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |ambient, table| -> table:
+                            table <- seg_walk_expr(argument, annotations, ambient, table)
+                        table <- seg_apply_call(ident_name_of(callee), call_line, annotations, ambient, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- seg_walk_expr(left, annotations, ambient, table)
+                        table <- seg_walk_expr(right, annotations, ambient, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- seg_walk_expr(operand, annotations, ambient, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- seg_walk_expr(inner, annotations, ambient, table)
+                    Expr.Field(object, field, field_line):
+                        table <- seg_walk_expr(object, annotations, ambient, table)
+                    Expr.Index(object, index_argument, index_line):
+                        table <- seg_walk_expr(object, annotations, ambient, table)
+                        table <- seg_walk_expr(index_argument, annotations, ambient, table)
+                    _:
+                        pass
+
+        def seg_walk_stmts(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, ambient: mutable darray[u8]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |ambient, table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- seg_walk_expr(expression, annotations, ambient, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- seg_walk_expr(value, annotations, ambient, table)
+                        Stmt.Return(value, line):
+                            table <- seg_walk_expr(returned, annotations, ambient, table) if value is returned
+                        Stmt.Assign(target, operator, value, line):
+                            table <- seg_walk_expr(value, annotations, ambient, table)
+                        Stmt.While(condition, body, line):
+                            table <- seg_walk_stmts(body, annotations, ambient, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- seg_walk_stmts(body, annotations, ambient, table)
+                        # `can`/`in`/`trusted`/… blocks are ambient-transparent: they grant
+                        # capabilities but do not by themselves establish a segment owner.
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- seg_walk_stmts(body, annotations, ambient, table)
+                        # Mutually exclusive arms each start from the ambient at the `if`;
+                        # they merge back to a shared owner only when they agree.
+                        Stmt.If(condition, then_body, else_body, line):
+                            base: mutable u8 = ambient[0]
+                            table <- seg_walk_stmts(then_body, annotations, ambient, table)
+                            then_owner: u8 = ambient[0]
+                            ambient[0] <- base
+                            table <- seg_walk_stmts(else_body, annotations, ambient, table)
+                            else_owner: u8 = ambient[0]
+                            merged: u8 = then_owner if then_owner == else_owner else base
+                            ambient[0] <- merged
+                        Stmt.Match(scrutinee, arms, line):
+                            base: mutable u8 = ambient[0]
+                            for arm in arms |ambient, table| -> table:
+                                ambient[0] <- base
+                                table <- seg_walk_stmts(arm.body, annotations, ambient, table)
+                            ambient[0] <- base
+                        _:
+                            pass
+
+        # A function whose ambient starts unknown (an @async_entry that does not itself
+        # establish a segment) or that is @segment_agnostic is out of scope for the plain
+        # Host-default ambient model; stage0 handles those through separate paths.
+        def seg_function_uses_host_default(decorators: darray[Ast::Annotation]&) -> bool:
+            can Abort.Panic:
+                for decorator in decorators:
+                    false return if decorator.name == "segment_agnostic" or decorator.name == "async_entry"
+                return true
+
+        def check_segment_flow_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            if seg_function_uses_host_default(decorators):
+                                ambient: mutable darray[u8] = [1]
+                                table <- seg_walk_stmts(body, annotations, ambient, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_segment_flow_declarations(module_body, annotations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_segment_flow_declarations(scoped_body, annotations, table)
+                        _:
+                            pass
+
+    public:
+        def check_segment_flow(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_segment_flow_declarations(file.top_decls, file.enum_annotations, table)
