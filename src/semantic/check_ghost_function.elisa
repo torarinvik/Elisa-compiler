@@ -1,0 +1,151 @@
+# Ghost-function discipline (stage0). A `ghost def` is verification-only: its defining
+# equation is used by the prover and it is erased from codegen. Two rules:
+#   * a ghost function's body must be pure — calling an impure function (an extern) is an
+#     error ("must be pure and total");
+#   * runtime (non-ghost) code may not CALL a ghost function ("verification-only").
+#
+# The parser marks each ghost function name on the __ghost_fn side-table. Extern names are
+# collected to detect impurity (an extern call has side effects).
+extend Semantic:
+    private:
+        def ghfn_name_in(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                for entry in names:
+                    true return if entry == wanted
+                return false
+
+        def ghfn_collect_names(annotations: darray[Ast::EnumAnnotation]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for annotation in annotations:
+                    out.push(annotation.name) if annotation.owner == "__ghost_fn" and not ghfn_name_in(out, annotation.name)
+
+        def ghfn_collect_externs(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Extern(name, param_start, arity, variadic, has_params, return_type, decorators, line):
+                            out.push(name)
+                        Decl.Module(module_name, module_body, module_line):
+                            ghfn_collect_externs(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            ghfn_collect_externs(scoped_body, out)
+                        _:
+                            pass
+
+        # The first call in `expression` whose callee is in `targets`, or "".
+        def ghfn_first_call_to(expression: Ast::Expr, targets: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        callee_name return if ghfn_name_in(targets, callee_name)
+                        for argument in arguments |targets|:
+                            hit: sview = ghfn_first_call_to(argument, targets)
+                            hit return if hit != ""
+                        return sview("", 0, 0)
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_hit: sview = ghfn_first_call_to(left, targets)
+                        return left_hit if left_hit != "" else ghfn_first_call_to(right, targets)
+                    Expr.Unary(operator, operand, unary_line):
+                        return ghfn_first_call_to(operand, targets)
+                    Expr.Paren(inner, paren_line):
+                        return ghfn_first_call_to(inner, targets)
+                    _:
+                        return sview("", 0, 0)
+
+        # Walk a body for a call to any target name; emit `kind` at each occurrence.
+        def ghfn_walk_calls(statements: darray[Ast::Stmt], targets: darray[sview]&, kind: DiagnosticKind, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- ghfn_emit(expression, targets, kind, line, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- ghfn_emit(value, targets, kind, line, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- ghfn_emit(value, targets, kind, line, table)
+                        Stmt.Return(value, line):
+                            table <- ghfn_emit(returned, targets, kind, line, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- ghfn_emit(condition, targets, kind, line, table)
+                            table <- ghfn_walk_calls(then_body, targets, kind, table)
+                            table <- ghfn_walk_calls(else_body, targets, kind, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- ghfn_walk_calls(while_body, targets, kind, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- ghfn_walk_calls(for_body, targets, kind, table)
+                        Stmt.Block(block_kind, clause, binding, body, block_line):
+                            table <- ghfn_walk_calls(body, targets, kind, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- ghfn_walk_calls(arm.body, targets, kind, table)
+                        _:
+                            pass
+
+        def ghfn_emit(expression: Ast::Expr, targets: darray[sview]&, kind: DiagnosticKind, line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                hit: sview = ghfn_first_call_to(expression, targets)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: kind, name: hit, line: line, expected: "", actual: ""}) if hit != ""
+
+        def ghfn_check_declarations(declarations: darray[Ast::Decl], ghost_fns: darray[sview]&, externs: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if ghfn_name_in(ghost_fns, function_name):
+                                # Ghost body may not call an impure (extern) function; the
+                                # GhostFnImpure message names the ghost function itself.
+                                table <- ghfn_walk_impure(body, externs, function_name, table)
+                            else:
+                                # Runtime code may not call a ghost function.
+                                table <- ghfn_walk_calls(body, ghost_fns, DiagnosticKind.GhostFnRuntimeCall, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- ghfn_check_declarations(module_body, ghost_fns, externs, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- ghfn_check_declarations(scoped_body, ghost_fns, externs, table)
+                        _:
+                            pass
+
+        # In a ghost body, an extern call is impurity; report it against the ghost function's
+        # own name (the message names the ghost function, not the callee).
+        def ghfn_walk_impure(statements: darray[Ast::Stmt], externs: darray[sview]&, ghost_name: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- ghfn_emit_impure(expression, externs, ghost_name, line, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- ghfn_emit_impure(value, externs, ghost_name, line, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- ghfn_emit_impure(value, externs, ghost_name, line, table)
+                        Stmt.Return(value, line):
+                            table <- ghfn_emit_impure(returned, externs, ghost_name, line, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- ghfn_walk_impure(then_body, externs, ghost_name, table)
+                            table <- ghfn_walk_impure(else_body, externs, ghost_name, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- ghfn_walk_impure(while_body, externs, ghost_name, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- ghfn_walk_impure(for_body, externs, ghost_name, table)
+                        Stmt.Block(block_kind, clause, binding, body, block_line):
+                            table <- ghfn_walk_impure(body, externs, ghost_name, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- ghfn_walk_impure(arm.body, externs, ghost_name, table)
+                        _:
+                            pass
+
+        def ghfn_emit_impure(expression: Ast::Expr, externs: darray[sview]&, ghost_name: sview, line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                hit: sview = ghfn_first_call_to(expression, externs)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.GhostFnImpure, name: ghost_name, line: line, expected: "", actual: ""}) if hit != ""
+
+    public:
+        def check_ghost_function(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                ghost_fns: mutable darray[sview] = []
+                ghfn_collect_names(file.enum_annotations, ghost_fns)
+                if ghost_fns.count > 0:
+                    externs: mutable darray[sview] = []
+                    ghfn_collect_externs(file.top_decls, externs)
+                    table <- ghfn_check_declarations(file.top_decls, ghost_fns, externs, table)
