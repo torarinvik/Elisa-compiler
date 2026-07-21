@@ -1,0 +1,119 @@
+# A flat `region NAME(...)` statement (no block colon) declares a region owner. Stage0
+# accepts it when the region is USED (an allocation target `new[NAME] …`, a `@NAME`
+# qualified ref, consumed by `destroy NAME` / `return move NAME`, or otherwise referenced),
+# and flags an owner that is TOUCHED NOWHERE as "region owner X must be consumed before
+# scope exit" (region_leak). This is the sound leaf of stage0's affine region tracker.
+#
+# SOUND SUBSET: fire only when NAME appears NOWHERE in the function body other than its own
+# declaration — no `new[NAME]` selector (recorded by the parser as a `__region_use`
+# annotation, since `new[...]` discards the token from the expr tree), no bare identifier
+# use, no destroy clause. Any single reference suppresses the fire, so this can never
+# over-fire vs stage0. A path-sensitive partial leak (`region r; if c: destroy r`) references
+# r via the destroy and is therefore a conservative MISS here, not a false negative risk.
+extend Semantic:
+    private:
+        # Collect every bare-identifier name occurring in an expression into `out`.
+        def rol_collect_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Move(operand, move_line):
+                        rol_collect_idents(operand, out)
+                    Expr.Field(object, field, field_line):
+                        rol_collect_idents(object, out)
+                    Expr.Index(object, index_argument, index_line):
+                        rol_collect_idents(object, out)
+                        rol_collect_idents(index_argument, out)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        rol_collect_idents(callee, out)
+                        for argument in arguments |out|:
+                            rol_collect_idents(argument, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        rol_collect_idents(left, out)
+                        rol_collect_idents(right, out)
+                    Expr.Unary(operator, operand, unary_line):
+                        rol_collect_idents(operand, out)
+                    Expr.Paren(inner, paren_line):
+                        rol_collect_idents(inner, out)
+                    Expr.Array(elements, array_line):
+                        for element in elements |out|:
+                            rol_collect_idents(element, out)
+                    _:
+                        pass
+
+        # Recurse the body collecting region-owner declarations (flat form: a "region"
+        # Block with an empty body) into owners/owner_lines, and every referenced name
+        # (idents + destroy clauses) into `refs`.
+        def rol_scan_stmts(statements: darray[Ast::Stmt], owners: mutable darray[sview]&, owner_lines: mutable darray[u32]&, refs: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |owners, owner_lines, refs|:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            if kind == "region" and body.count == 0 and binding != "":
+                                owners.push(binding)
+                                owner_lines.push(line)
+                            else:
+                                for clause_entry in clause |refs|:
+                                    refs.push(clause_entry)
+                            rol_scan_stmts(body, owners, owner_lines, refs)
+                        Stmt.If(condition, then_body, else_body, line):
+                            rol_collect_idents(condition, refs)
+                            rol_scan_stmts(then_body, owners, owner_lines, refs)
+                            rol_scan_stmts(else_body, owners, owner_lines, refs)
+                        Stmt.While(condition, body, line):
+                            rol_collect_idents(condition, refs)
+                            rol_scan_stmts(body, owners, owner_lines, refs)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            rol_collect_idents(iterable, refs)
+                            rol_scan_stmts(body, owners, owner_lines, refs)
+                        Stmt.Match(scrutinee, arms, line):
+                            rol_collect_idents(scrutinee, refs)
+                            for arm in arms |owners, owner_lines, refs|:
+                                rol_scan_stmts(arm.body, owners, owner_lines, refs)
+                        Stmt.Return(value, line):
+                            rol_collect_idents(returned, refs) if value is returned
+                        Stmt.Expr(expression, line):
+                            rol_collect_idents(expression, refs)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            rol_collect_idents(value, refs)
+                        Stmt.Assign(target, operator, value, line):
+                            rol_collect_idents(target, refs)
+                            rol_collect_idents(value, refs)
+                        _:
+                            pass
+
+        def rol_check_function(body: darray[Ast::Stmt], region_uses: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                owners: mutable darray[sview] = []
+                owner_lines: mutable darray[u32] = []
+                refs: mutable darray[sview] = []
+                rol_scan_stmts(body, owners, owner_lines, refs)
+                owner_index: mutable usize = 0
+                while owner_index < owners.count |owner_index, table| -> table:
+                    name: sview = owners[owner_index]
+                    referenced: bool = (any r in refs where r == name) or (any u in region_uses where u == name)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionOwnerLeak, name: name, line: owner_lines[owner_index], expected: "", actual: ""}) if not referenced
+                    owner_index <- owner_index + 1
+
+        def rol_walk_decls(declarations: darray[Ast::Decl], region_uses: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            table <- rol_check_function(body, region_uses, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- rol_walk_decls(module_body, region_uses, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- rol_walk_decls(scoped_body, region_uses, table)
+                        _:
+                            pass
+
+        def check_region_owner_leak(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Named `new[NAME]` allocation selectors recorded by the parser (the token
+                # is otherwise discarded from the expr tree); any region so used is not a leak.
+                region_uses: mutable darray[sview] = []
+                for annotation in file.enum_annotations |region_uses|:
+                    region_uses.push(annotation.owner) if annotation.name == "__region_use"
+                table <- rol_walk_decls(file.top_decls, region_uses, table)
