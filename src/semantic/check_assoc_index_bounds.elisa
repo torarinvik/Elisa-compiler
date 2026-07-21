@@ -1,0 +1,197 @@
+# Associated-type index bounds (stage0 refinement_assoc_type). A generic function
+# `dispatch[D: FieldDecoder](..., table: array[Handler, 128]&)` that indexes
+# `table[D.decode(d, w)]` is bounds-safe ONLY if the associated return type of the
+# protocol method is refined into the array's range for EVERY impl. The effective
+# refinement surfaces on each impl's method return type:
+#
+#   impl FieldDecoder for Sgpr:
+#       def decode(self: Sgpr, w: u32) -> u32 is InRange[0, 127]   # refined -> proven
+#       def decode(self: Sgpr, w: u32) -> u32                      # unrefined -> UNCHECKED
+#
+# When any impl's method return is unrefined the generic index cannot be proven in
+# bounds, so it is an unchecked index and requires can[Unsafe]. A refined return on
+# every impl (whether declared on the impl or inherited from a refined protocol default
+# that the impl re-states) proves it. Impl bodies are `Decl.Scoped` nodes carrying the
+# impl keyword's line; the parser records `__impl_scope` (line -> interface) so we can
+# read each impl method's return-type refinement straight from the AST.
+extend Semantic:
+    private:
+        # A return/type annotation is refined when it carries an `is Law[...]` predicate.
+        # A refined return type `u32 is InRange[0, 127]` parses as `Expr.Binary(base, Is,
+        # law)` (the structured `Expr.Refinement` node is only used for `type X = T where P`
+        # aliases). Peel paren/mutable/ref wrappers.
+        def aib_type_is_refined(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Refinement(refined_base, refined_predicate, refinement_line):
+                        return true
+                    Expr.Binary(left, operator, right, binary_line):
+                        return operator == TokenKind.Is
+                    Expr.Paren(inner, paren_line):
+                        return aib_type_is_refined(inner)
+                    Expr.Unary(operator, operand, unary_line):
+                        return aib_type_is_refined(operand)
+                    _:
+                        return false
+
+        # Head name of a (ref/mutable/generic) type: `array[Handler, 128]&` -> "array".
+        def aib_type_head(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match type_expression:
+                    Expr.Unary(operator, operand, unary_line): aib_type_head(operand)
+                    Expr.Paren(inner, paren_line): aib_type_head(inner)
+                    Expr.Index(head, argument, index_line): ident_name_of(head)
+                    Expr.IndexN(head, arguments, indexn_line): ident_name_of(head)
+                    _: bare_type_name(type_expression)
+
+        def aib_line_is_impl_scope(annotations: darray[Ast::EnumAnnotation]&, line: u32) -> bool:
+            can Abort.Panic:
+                for annotation in annotations:
+                    true return if annotation.owner == "__impl_scope" and annotation.line == line
+                return false
+
+        # Record every impl method's (name, refined?) by scanning impl-body Decl.Scoped
+        # nodes (those whose line is an `__impl_scope` line).
+        def aib_collect_impl_methods(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, method_names: mutable darray[sview]&, method_refined: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |annotations, method_names, method_refined|:
+                    match declaration:
+                        Decl.Scoped(body, scoped_line):
+                            if aib_line_is_impl_scope(annotations, scoped_line):
+                                for member in body |method_names, method_refined|:
+                                    if member is Decl.Func(name, params, return_type, func_body, effects, decorators, func_line):
+                                        refined: mutable bool = false
+                                        if return_type is return_expr:
+                                            refined <- aib_type_is_refined(return_expr)
+                                        method_names.push(name)
+                                        method_refined.push(refined)
+                            aib_collect_impl_methods(body, annotations, method_names, method_refined)
+                        Decl.Module(module_name, module_body, module_line):
+                            aib_collect_impl_methods(module_body, annotations, method_names, method_refined)
+                        _:
+                            pass
+
+        # A method is UNPROVEN if some impl declares it and at least one such declaration is
+        # unrefined (any impl dropping the refinement defeats the generic proof).
+        def aib_method_unproven(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview) -> bool:
+            can Abort.Panic:
+                seen: mutable bool = false
+                all_refined: mutable bool = true
+                index: mutable usize = 0
+                while index < method_names.count |index, seen, all_refined|:
+                    if method_names[index] == method:
+                        seen <- true
+                        all_refined <- false if not method_refined[index]
+                    index <- index + 1
+                return seen and not all_refined
+
+        # The generic type-parameter names declared by the function at `func_line` (the
+        # low side-table rows), and whether it has any protocol bound (a high-bit row).
+        def aib_function_generic_params(file: Ast::File&, func_line: u32, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                index: mutable usize = 0
+                while index < file.generic_param_names.count |index, out|:
+                    out.push(file.generic_param_names[index]) if file.generic_param_lines[index] == func_line
+                    index <- index + 1
+
+        def aib_function_has_bound(file: Ast::File&, func_line: u32) -> bool:
+            can Abort.Panic:
+                bound_line: u32 = func_line + 2147483648
+                for line in file.generic_param_lines:
+                    true return if line == bound_line
+                return false
+
+        def aib_name_in(names: darray[sview]&, candidate: sview) -> bool:
+            can Abort.Panic:
+                for name in names:
+                    true return if name == candidate
+                return false
+
+        # Walk a function body for `arr[G.method(...)]` where arr is a fixed-array param, G a
+        # bound generic type-parameter, and the method is unproven across impls. A `can` /
+        # `trusted` grant suppresses the requirement.
+        def aib_walk(statements: darray[Ast::Stmt], array_params: darray[sview]&, generic_params: darray[sview]&, method_names: darray[sview]&, method_refined: darray[bool]&, granted: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- aib_walk_expr(expression, line, array_params, generic_params, method_names, method_refined, granted, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- aib_walk_expr(value, line, array_params, generic_params, method_names, method_refined, granted, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- aib_walk_expr(value, line, array_params, generic_params, method_names, method_refined, granted, table)
+                        Stmt.Return(value, line):
+                            table <- aib_walk_expr(returned, line, array_params, generic_params, method_names, method_refined, granted, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- aib_walk(then_body, array_params, generic_params, method_names, method_refined, granted, table)
+                            table <- aib_walk(else_body, array_params, generic_params, method_names, method_refined, granted, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- aib_walk(while_body, array_params, generic_params, method_names, method_refined, granted, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- aib_walk(for_body, array_params, generic_params, method_names, method_refined, granted, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            body_granted: bool = granted or kind == "can" or kind == "trusted"
+                            table <- aib_walk(body, array_params, generic_params, method_names, method_refined, body_granted, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- aib_walk(arm.body, array_params, generic_params, method_names, method_refined, granted, table)
+                        _:
+                            pass
+
+        def aib_walk_expr(expression: Ast::Expr, line: u32, array_params: darray[sview]&, generic_params: darray[sview]&, method_names: darray[sview]&, method_refined: darray[bool]&, granted: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Index(object, index_argument, index_line):
+                        receiver: sview = ident_name_of(object)
+                        if not granted and aib_name_in(array_params, receiver) and aib_index_is_unproven_assoc(index_argument, generic_params, method_names, method_refined):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UncheckedIndexUngranted, name: receiver, line: line, expected: "", actual: ""})
+                        table <- aib_walk_expr(index_argument, line, array_params, generic_params, method_names, method_refined, granted, table)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        table <- aib_walk_expr(callee, line, array_params, generic_params, method_names, method_refined, granted, table)
+                        for argument in arguments |table| -> table:
+                            table <- aib_walk_expr(argument, line, array_params, generic_params, method_names, method_refined, granted, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- aib_walk_expr(left, line, array_params, generic_params, method_names, method_refined, granted, table)
+                        table <- aib_walk_expr(right, line, array_params, generic_params, method_names, method_refined, granted, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- aib_walk_expr(inner, line, array_params, generic_params, method_names, method_refined, granted, table)
+                    _:
+                        pass
+
+        # `G.method(...)` where G is a bound generic type-parameter and `method` is unproven.
+        def aib_index_is_unproven_assoc(index_argument: Ast::Expr, generic_params: darray[sview]&, method_names: darray[sview]&, method_refined: darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if index_argument is Expr.Call(callee, arguments, argument_names, call_line):
+                    if callee is Expr.Field(receiver, method, field_line):
+                        if receiver is Expr.Ident(receiver_name, ident_line):
+                            return aib_name_in(generic_params, receiver_name) and aib_method_unproven(method_names, method_refined, method)
+                return false
+
+        def aib_check_declarations(declarations: darray[Ast::Decl], file: Ast::File&, array_method_names: darray[sview]&, array_method_refined: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if aib_function_has_bound(file, line):
+                                array_params: mutable darray[sview] = []
+                                for parameter in parameters |array_params|:
+                                    array_params.push(parameter.name) if aib_type_head(parameter.type_expression) == "array"
+                                if array_params.count > 0:
+                                    generic_params: mutable darray[sview] = []
+                                    aib_function_generic_params(file, line, generic_params)
+                                    table <- aib_walk(body, array_params, generic_params, array_method_names, array_method_refined, false, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- aib_check_declarations(module_body, file, array_method_names, array_method_refined, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- aib_check_declarations(scoped_body, file, array_method_names, array_method_refined, table)
+                        _:
+                            pass
+
+    public:
+        def check_assoc_index_bounds(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                method_names: mutable darray[sview] = []
+                method_refined: mutable darray[bool] = []
+                aib_collect_impl_methods(file.top_decls, file.enum_annotations, method_names, method_refined)
+                if method_names.count > 0:
+                    table <- aib_check_declarations(file.top_decls, file, method_names, method_refined, table)
