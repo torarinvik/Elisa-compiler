@@ -1,0 +1,211 @@
+# Interprocedural refinement discharge for a local assigned from a range-bounding call.
+#
+#   def clamp(x: i64, lo: i64, hi: i64) -> i64:
+#       ensure result >= lo
+#       ensure result <= hi
+#       ...
+#   def use(x: i64) -> i64:
+#       c = clamp(x, 0, 100)              # c's known range = [0, 100] (ensures with args bound)
+#       y: i64 is Bounded[1, 100] = c     # requires [1, 100]; [0,100] NOT in [1,100] -> unproven
+#
+# Stage0 warns "refinement Bounded on y could not be proven statically". SOUND subset: fire only
+# when the callee's `ensure result >= P` / `ensure result <= Q` give BOTH bounds, the call's
+# matching args resolve to integer literals/consts, the assigned local is never reassigned, and
+# the required refinement range does NOT contain the derived range. A provable containment (the
+# derived range fits) stays silent; any unresolved piece is a conservative miss.
+extend Semantic:
+    private:
+        # From an `ensure result CMP X` contract: (found, is_ge, is_param, param_pos, literal).
+        # is_ge distinguishes the lower (>=) from the upper (<=) bound.
+        def era_bound_of_ensure(expression: Ast::Expr, parameters: darray[Ast::ParamDecl]) -> (found: bool, is_ge: bool, is_param: bool, param_pos: usize, literal: i64):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Binary(left, operator, right, line):
+                        is_result: bool = ident_name_of(left) == "result"
+                        is_ge: bool = operator == TokenKind.GtEq
+                        is_le: bool = operator == TokenKind.LtEq
+                        if is_result and (is_ge or is_le):
+                            lit: (found: bool, value: i64) = signed_int_literal(right)
+                            (true, is_ge, false, 0, lit.value) return if lit.found
+                            pname: sview = ident_name_of(right)
+                            if pname != "":
+                                pos: mutable i64 = -1
+                                idx: mutable usize = 0
+                                while idx < parameters.count |pos, idx, pname, parameters|:
+                                    pos <- idx.i64() if parameters[idx].name == pname and pos < 0
+                                    idx <- idx + 1
+                                (true, is_ge, true, pos.usize(), 0) return if pos >= 0
+                        return (false, false, false, 0, 0)
+                    _:
+                        return (false, false, false, 0, 0)
+
+        # Collect the ensures-range summary of every function that declares BOTH a `result >= …`
+        # and a `result <= …` bound. Parallel arrays keyed positionally. lo/hi sources: is_param +
+        # pos (an arg position) or a literal.
+        def era_collect_summaries(declarations: darray[Ast::Decl], fns: mutable darray[sview]&, lo_is_param: mutable darray[bool]&, lo_pos: mutable darray[usize]&, lo_lit: mutable darray[i64]&, hi_is_param: mutable darray[bool]&, hi_pos: mutable darray[usize]&, hi_lit: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            have_lo: mutable bool = false
+                            have_hi: mutable bool = false
+                            l_param: mutable bool = false
+                            l_pos: mutable usize = 0
+                            l_lit: mutable i64 = 0
+                            h_param: mutable bool = false
+                            h_pos: mutable usize = 0
+                            h_lit: mutable i64 = 0
+                            for statement in body |have_lo, have_hi, l_param, l_pos, l_lit, h_param, h_pos, h_lit|:
+                                if statement is Stmt.Contract(kind, expression, contract_line) and (kind == "ensure" or kind == "ensures"):
+                                    b: (found: bool, is_ge: bool, is_param: bool, param_pos: usize, literal: i64) = era_bound_of_ensure(expression, parameters)
+                                    if b.found and b.is_ge and not have_lo:
+                                        have_lo <- true
+                                        l_param <- b.is_param
+                                        l_pos <- b.param_pos
+                                        l_lit <- b.literal
+                                    if b.found and not b.is_ge and not have_hi:
+                                        have_hi <- true
+                                        h_param <- b.is_param
+                                        h_pos <- b.param_pos
+                                        h_lit <- b.literal
+                            if have_lo and have_hi:
+                                fns.push(function_name)
+                                lo_is_param.push(l_param)
+                                lo_pos.push(l_pos)
+                                lo_lit.push(l_lit)
+                                hi_is_param.push(h_param)
+                                hi_pos.push(h_pos)
+                                hi_lit.push(h_lit)
+                        Decl.Module(module_name, module_body, module_line):
+                            era_collect_summaries(module_body, fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            era_collect_summaries(scoped_body, fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit)
+                        _:
+                            pass
+
+        def era_const_int(name: sview, const_names: darray[sview]&, const_values: darray[i64]&) -> (found: bool, value: i64):
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < const_names.count |index, name, const_names, const_values|:
+                    (true, const_values[index]) return if const_names[index] == name
+                    index <- index + 1
+                return (false, 0)
+
+        def era_resolve_int(expression: Ast::Expr, const_names: darray[sview]&, const_values: darray[i64]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                lit: (found: bool, value: i64) = signed_int_literal(expression)
+                lit return if lit.found
+                return era_const_int(ident_name_of(expression), const_names, const_values)
+
+        def era_call_range(value: Ast::Expr, fns: darray[sview]&, lo_is_param: darray[bool]&, lo_pos: darray[usize]&, lo_lit: darray[i64]&, hi_is_param: darray[bool]&, hi_pos: darray[usize]&, hi_lit: darray[i64]&, const_names: darray[sview]&, const_values: darray[i64]&) -> (found: bool, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        fname: sview = ident_name_of(callee)
+                        slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < fns.count |slot, probe, fname, fns|:
+                            slot <- probe.i64() if fns[probe] == fname and slot < 0
+                            probe <- probe + 1
+                        (false, 0, 0) return if slot < 0
+                        s: usize = slot.usize()
+                        lo_ok: mutable bool = not lo_is_param[s]
+                        lo_val: mutable i64 = lo_lit[s]
+                        if lo_is_param[s] and lo_pos[s] < arguments.count:
+                            r: (found: bool, value: i64) = era_resolve_int(arguments[lo_pos[s]], const_names, const_values)
+                            lo_ok <- r.found
+                            lo_val <- r.value
+                        hi_ok: mutable bool = not hi_is_param[s]
+                        hi_val: mutable i64 = hi_lit[s]
+                        if hi_is_param[s] and hi_pos[s] < arguments.count:
+                            r2: (found: bool, value: i64) = era_resolve_int(arguments[hi_pos[s]], const_names, const_values)
+                            hi_ok <- r2.found
+                            hi_val <- r2.value
+                        return (lo_ok and hi_ok, lo_val, hi_val)
+                    _:
+                        return (false, 0, 0)
+
+        def era_check_function(body: darray[Ast::Stmt], fns: darray[sview]&, lo_is_param: darray[bool]&, lo_pos: darray[usize]&, lo_lit: darray[i64]&, hi_is_param: darray[bool]&, hi_pos: darray[usize]&, hi_lit: darray[i64]&, const_names: darray[sview]&, const_values: darray[i64]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Adjacency model (provably sound): carry the range of ONLY the immediately-preceding
+                # `c = call(...)` binding. A refined binding `y: Law[..] = c` on the very next
+                # statement is checked against it; ANY other intervening statement (a reassignment,
+                # another call, a branch) clears the carried range, so a value that could have
+                # changed is never used. Independent of how `c <- v` parses.
+                prev_name: mutable sview = sview("", 0, 0)
+                prev_lo: mutable i64 = 0
+                prev_hi: mutable i64 = 0
+                prev_valid: mutable bool = false
+                for statement in body |prev_name, prev_lo, prev_hi, prev_valid, table| -> table:
+                    # First, if this statement is `y: Law[reqLo,reqHi] = <prev binding>`, check it.
+                    if statement is Stmt.VarDecl(y_name, y_type, y_value, y_line):
+                        source_name: sview = ident_name_of(y_value)
+                        law_name: sview = local_refinement_law_name(y_type)
+                        required: (found: bool, lo: i64, hi: i64) = return_refinement_bounds(y_type, law_names, law_predicates) if law_name != "" else (false, 0, 0)
+                        if required.found and prev_valid and source_name == prev_name and source_name != "":
+                            not_contained: bool = prev_lo < required.lo or prev_hi > required.hi
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRefinementUnproven, name: law_name, line: y_line, expected: "", actual: y_name}) if not_contained
+                    # Then, recompute the carried binding from THIS statement (clearing it otherwise).
+                    next_name: mutable sview = sview("", 0, 0)
+                    next_value: mutable Ast::Expr = (Ast::Expr.Absent)
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, decl_line):
+                            next_name <- name
+                            next_value <- value
+                        Stmt.Assign(target, operator, value, assign_line):
+                            next_name <- ident_name_of(target) if operator == TokenKind.Assign
+                            next_value <- value if operator == TokenKind.Assign
+                        _:
+                            pass
+                    cr: (found: bool, lo: i64, hi: i64) = era_call_range(next_value, fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit, const_names, const_values) if next_name != "" else (false, 0, 0)
+                    prev_valid <- cr.found
+                    prev_name <- next_name if cr.found else sview("", 0, 0)
+                    prev_lo <- cr.lo
+                    prev_hi <- cr.hi
+
+        def era_walk_decls(declarations: darray[Ast::Decl], fns: darray[sview]&, lo_is_param: darray[bool]&, lo_pos: darray[usize]&, lo_lit: darray[i64]&, hi_is_param: darray[bool]&, hi_pos: darray[usize]&, hi_lit: darray[i64]&, const_names: darray[sview]&, const_values: darray[i64]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- era_check_function(body, fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit, const_names, const_values, law_names, law_predicates, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- era_walk_decls(module_body, fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit, const_names, const_values, law_names, law_predicates, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- era_walk_decls(scoped_body, fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit, const_names, const_values, law_names, law_predicates, table)
+                        _:
+                            pass
+
+        def era_collect_int_consts(declarations: darray[Ast::Decl], names: mutable darray[sview]&, values: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, values|:
+                    match declaration:
+                        Decl.Const(const_name, type_expression, value, is_mutable, const_line):
+                            literal: (found: bool, value: i64) = signed_int_literal(value)
+                            names.push(const_name) if literal.found and not is_mutable
+                            values.push(literal.value) if literal.found and not is_mutable
+                        Decl.Module(module_name, module_body, module_line):
+                            era_collect_int_consts(module_body, names, values)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            era_collect_int_consts(scoped_body, names, values)
+                        _:
+                            pass
+
+        def check_ensures_range_assign(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fns: mutable darray[sview] = []
+                lo_is_param: mutable darray[bool] = []
+                lo_pos: mutable darray[usize] = []
+                lo_lit: mutable darray[i64] = []
+                hi_is_param: mutable darray[bool] = []
+                hi_pos: mutable darray[usize] = []
+                hi_lit: mutable darray[i64] = []
+                era_collect_summaries(file.top_decls, fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit)
+                return if fns.count == 0
+                const_names: mutable darray[sview] = []
+                const_values: mutable darray[i64] = []
+                era_collect_int_consts(file.top_decls, const_names, const_values)
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(file.top_decls, law_names, law_predicates)
+                table <- era_walk_decls(file.top_decls, fns, lo_is_param, lo_pos, lo_lit, hi_is_param, hi_pos, hi_lit, const_names, const_values, law_names, law_predicates, table)
