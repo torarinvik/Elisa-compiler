@@ -1,0 +1,136 @@
+# Flow fact-invalidation (first increment of the establish->invalidate->use engine). A refinement
+# fact established by an `if SUBJ is Law:` guard is INVALIDATED when a shrinking container mutation
+# (`clear`/`truncate`/`pop`/`remove`/`resize`/`drain`) runs on SUBJ; a later call passing SUBJ to a
+# refinement-constrained parameter then "could not be proven" (stage0 emits RefinementArgNotProven).
+#
+# SOUND against the accept corpus: the diagnostic fires ONLY when a shrinking mutation sits between
+# the guard and the use. An accept-corpus file that guards then uses WITHOUT mutating (stage0 proves
+# it) has no mutation, so nothing fires. Growing ops (push/insert/extend) are deliberately excluded —
+# they cannot break `NonEmpty` or an upper `count` bound, so stage0 still proves those.
+extend Semantic:
+    private:
+        # Container ops that SHRINK (or arbitrarily resize) and so can break a `count > 0` /
+        # `i < count` refinement. Growing ops are excluded on purpose (they keep the fact live).
+        def rfi_is_shrink_method(name: sview) -> bool:
+            can Abort.Panic:
+                return name == "clear" or name == "truncate" or name == "pop" or name == "remove" or name == "resize" or name == "drain" or name == "pop_front" or name == "retain"
+
+        # The receiver subject of a shrinking method call `SUBJ.shrink(...)`, or "".
+        def rfi_shrink_subject(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        match callee:
+                            Expr.Field(receiver, method_name, field_line):
+                                if rfi_is_shrink_method(method_name):
+                                    return ident_name_of(receiver)
+                                return sview("", 0, 0)
+                            _:
+                                return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # The `if SUBJ is Law:` guard subject of a condition, or "" when the condition is not a
+        # single `IDENT is LAW` refinement test.
+        def rfi_guard_subject(condition: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, line):
+                        if operator != TokenKind.Is:
+                            return sview("", 0, 0)
+                        if right is Expr.Ident(law_name, ident_line):
+                            return ident_name_of(left)
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # Whether `name` is in `names`.
+        def rfi_contains(names: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                return any candidate in names where candidate == name and name != ""
+
+        # Emit for a call `f(..., SUBJ, ...)` where SUBJ (an Ident argument) is in both `guarded`
+        # and `mutated`, and f's parameter at that argument's position is refinement-constrained.
+        # Whether the call `f(..., SUBJ, ...)` passes a guarded-and-mutated subject at the
+        # refined parameter position recorded for (f, probe).
+        def rfi_call_fires_at(probe: usize, callee_name: sview, arguments: darray[Ast::Expr]&, guarded: darray[sview]&, mutated: darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if param_functions[probe] != callee_name
+                false return if param_indices[probe] >= arguments.count
+                argument_subject: sview = ident_name_of(arguments[param_indices[probe]])
+                return rfi_contains(guarded, argument_subject) and rfi_contains(mutated, argument_subject)
+
+        def rfi_check_call(expression: Ast::Expr, line: u32, guarded: darray[sview]&, mutated: darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        if callee_name != "":
+                            while probe < param_functions.count |probe: usize = 0, table| -> table:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementArgNotProven, name: callee_name, line: line, expected: "", actual: "", expected_count: (param_indices[probe] + 1).u32()}) if rfi_call_fires_at(probe, callee_name, arguments, guarded, mutated, param_functions, param_indices)
+                                probe <- probe + 1
+                        for argument in arguments |table| -> table:
+                            table <- rfi_check_call(argument, line, guarded, mutated, param_functions, param_indices, table)
+                    _:
+                        pass
+
+        # Walk a statement list in order, threading the live guard subjects (`guarded`) and the
+        # accumulated shrink-mutated subjects (`mutated`). A refined-param use is checked BEFORE the
+        # statement can itself mutate, so mutation must strictly precede use.
+        def rfi_check_statements(statements: darray[Ast::Stmt], guarded: darray[sview]&, mutated: mutable darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, mutated| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- rfi_check_call(expression, line, guarded, mutated, param_functions, param_indices, table)
+                            shrink_subject: sview = rfi_shrink_subject(expression)
+                            mutated.push(shrink_subject) if shrink_subject != "" and rfi_contains(guarded, shrink_subject)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- rfi_check_call(value, line, guarded, mutated, param_functions, param_indices, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- rfi_check_call(value, line, guarded, mutated, param_functions, param_indices, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- rfi_check_call(returned, line, guarded, mutated, param_functions, param_indices, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            subject: sview = rfi_guard_subject(condition)
+                            then_guarded: mutable darray[sview] = [entry for entry in guarded]
+                            then_guarded.push(subject) if subject != ""
+                            table <- rfi_check_statements(then_body, then_guarded, mutated, param_functions, param_indices, table)
+                            table <- rfi_check_statements(else_body, guarded, mutated, param_functions, param_indices, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- rfi_check_statements(block_body, guarded, mutated, param_functions, param_indices, table)
+                        Stmt.While(condition, while_body, while_line) | Stmt.For(_, _, _, while_body, while_line):
+                            table <- rfi_check_statements(while_body, guarded, mutated, param_functions, param_indices, table)
+                        _:
+                            pass
+
+        def rfi_walk(declarations: darray[Ast::Decl], param_functions: darray[sview]&, param_indices: darray[usize]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            guarded: darray[sview] = []
+                            mutated: mutable darray[sview] = []
+                            table <- rfi_check_statements(body, guarded, mutated, param_functions, param_indices, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- rfi_walk(module_body, param_functions, param_indices, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- rfi_walk(scoped_body, param_functions, param_indices, table)
+                        _:
+                            pass
+
+    public:
+        def check_refinement_fact_invalidated(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(declarations, law_names, law_predicates)
+                alias_names: mutable darray[sview] = []
+                alias_predicates: mutable darray[Ast::Expr] = []
+                collect_refine_aliases(declarations, alias_names, alias_predicates)
+                param_functions: mutable darray[sview] = []
+                param_indices: mutable darray[usize] = []
+                param_predicates: mutable darray[Ast::Expr] = []
+                collect_law_params(declarations, law_names, law_predicates, alias_names, alias_predicates, param_functions, param_indices, param_predicates)
+                table <- rfi_walk(declarations, param_functions, param_indices, table)
