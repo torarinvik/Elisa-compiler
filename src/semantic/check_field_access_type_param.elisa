@@ -1,0 +1,175 @@
+# Field/method access on a value whose type is an UNBOUNDED generic type parameter has no
+# struct to resolve against: stage0 errors "field access requires struct type, got T"
+# (`def f[T](a: T) -> T: return a.lt(a)` — `T` has no `lt`, and no free `lt` rescues it via
+# UFCS). Reuses DiagnosticKind.FieldAccessOnPrimitive, whose message is exactly that text.
+#
+# SOUND subset (never over-fires vs stage0):
+#  * the function has ≥1 generic param AND ZERO bound rows (every param is unbounded — a bound
+#    `[T: Ord]` could legitimately supply methods, so any bound at all disables the whole fn);
+#  * the receiver is a bare Ident naming a PARAMETER whose declared type is exactly one of those
+#    type-param names, and is NOT shadowed by a same-named local;
+#  * the accessed member is not `cast` (cast syntax, not a field) and is NOT the name of any
+#    top-level function (which would resolve the call via UFCS).
+# Any of these failing is a conservative MISS, never a false fire.
+extend Semantic:
+    private:
+        # Names of every top-level (module/scoped-nested) function — the UFCS candidate set.
+        def fatp_collect_function_names(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            out.push(name)
+                        Decl.Module(module_name, module_body, module_line):
+                            fatp_collect_function_names(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            fatp_collect_function_names(scoped_body, out)
+                        _:
+                            pass
+
+        # The unbounded type-param names of the function declared at `line`: names recorded at
+        # exactly `line`. Returns empty if the function has ANY bound row (line + 2^31), so a
+        # partially-bounded generic function is skipped wholesale (sound).
+        def fatp_unbounded_type_params(names: darray[sview]&, lines: darray[u32]&, line: u32, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                bound_marker: u32 = line + 2147483648
+                has_bound: bool = any bl in lines where bl == bound_marker
+                return if has_bound
+                index: mutable usize = 0
+                while index < lines.count |index, line, names, lines, out|:
+                    out.push(names[index]) if lines[index] == line
+                    index <- index + 1
+
+        # Whether `name` is one of `type_params`.
+        def fatp_is_type_param(type_params: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                return any tp in type_params where tp == name
+
+        def fatp_walk_expr(expression: Ast::Expr, tp_param_names: darray[sview]&, tp_param_types: darray[sview]&, shadowed: darray[sview]&, func_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if callee is Expr.Field(recv, method, field_line):
+                            table <- fatp_fire_if_type_param(recv, method, field_line, tp_param_names, tp_param_types, shadowed, func_names, table)
+                            table <- fatp_walk_expr(recv, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        else:
+                            table <- fatp_walk_expr(callee, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        for argument in arguments |table| -> table:
+                            table <- fatp_walk_expr(argument, tp_param_names, tp_param_types, shadowed, func_names, table)
+                    Expr.Field(object, field, field_line):
+                        table <- fatp_fire_if_type_param(object, field, field_line, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        table <- fatp_walk_expr(object, tp_param_names, tp_param_types, shadowed, func_names, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- fatp_walk_expr(left, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        table <- fatp_walk_expr(right, tp_param_names, tp_param_types, shadowed, func_names, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- fatp_walk_expr(operand, tp_param_names, tp_param_types, shadowed, func_names, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- fatp_walk_expr(inner, tp_param_names, tp_param_types, shadowed, func_names, table)
+                    _:
+                        pass
+
+        # Fire when `recv` is a bare Ident naming a type-param-typed, non-shadowed param and
+        # `member` is neither `cast` nor a top-level function name (UFCS).
+        def fatp_fire_if_type_param(recv: Ast::Expr, member: sview, line: u32, tp_param_names: darray[sview]&, tp_param_types: darray[sview]&, shadowed: darray[sview]&, func_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                recv_name: sview = ident_name_of(recv)
+                # `cast` is cast syntax; a primitive-type-name member (`value.u64()`, `.usize()`)
+                # is a builtin numeric/enum CONVERSION valid on a type param (resolved at
+                # monomorphization) — stage0 accepts both, so neither is a struct field access.
+                return if recv_name == "" or member == "cast" or is_primitive_type_name(member)
+                slot: mutable i64 = -1
+                probe: mutable usize = 0
+                while probe < tp_param_names.count |slot, probe, recv_name, tp_param_names|:
+                    slot <- probe.i64() if tp_param_names[probe] == recv_name and slot < 0
+                    probe <- probe + 1
+                return if slot < 0
+                return if any s in shadowed where s == recv_name
+                return if any fn in func_names where fn == member
+                type_param: sview = tp_param_types[slot.usize()]
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FieldAccessOnPrimitive, name: "", line: line, expected: "", actual: type_param})
+
+        def fatp_walk_stmts(statements: darray[Ast::Stmt], tp_param_names: darray[sview]&, tp_param_types: darray[sview]&, shadowed: darray[sview]&, func_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- fatp_walk_expr(expression, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- fatp_walk_expr(value, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- fatp_walk_expr(value, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        Stmt.Return(value, line):
+                            table <- fatp_walk_expr(returned, tp_param_names, tp_param_types, shadowed, func_names, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- fatp_walk_expr(condition, tp_param_names, tp_param_types, shadowed, func_names, table)
+                            table <- fatp_walk_stmts(then_body, tp_param_names, tp_param_types, shadowed, func_names, table)
+                            table <- fatp_walk_stmts(else_body, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- fatp_walk_stmts(while_body, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- fatp_walk_stmts(for_body, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- fatp_walk_stmts(block_body, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- fatp_walk_stmts(arm.body, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        _:
+                            pass
+
+        def fatp_walk_decls(declarations: darray[Ast::Decl], gp_names: darray[sview]&, gp_lines: darray[u32]&, func_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            type_params: mutable darray[sview] = []
+                            fatp_unbounded_type_params(gp_names, gp_lines, line, type_params)
+                            if type_params.count > 0:
+                                # Params whose declared type is exactly a type-param name.
+                                tp_param_names: mutable darray[sview] = []
+                                tp_param_types: mutable darray[sview] = []
+                                for parameter in parameters |tp_param_names, tp_param_types, type_params|:
+                                    param_type: sview = bare_type_name(parameter.type_expression)
+                                    if fatp_is_type_param(type_params, param_type):
+                                        tp_param_names.push(parameter.name)
+                                        tp_param_types.push(param_type)
+                                if tp_param_names.count > 0:
+                                    # Local var-decls that shadow a type-param-typed param suppress it.
+                                    shadowed: mutable darray[sview] = []
+                                    fatp_collect_local_names(body, shadowed)
+                                    table <- fatp_walk_stmts(body, tp_param_names, tp_param_types, shadowed, func_names, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- fatp_walk_decls(module_body, gp_names, gp_lines, func_names, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- fatp_walk_decls(scoped_body, gp_names, gp_lines, func_names, table)
+                        _:
+                            pass
+
+        # Every name bound by a local var-decl anywhere in the body (over-collection is sound —
+        # it only ever SUPPRESSES a fire).
+        def fatp_collect_local_names(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            out.push(name)
+                        Stmt.If(condition, then_body, else_body, line):
+                            fatp_collect_local_names(then_body, out)
+                            fatp_collect_local_names(else_body, out)
+                        Stmt.While(condition, while_body, line):
+                            fatp_collect_local_names(while_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            fatp_collect_local_names(for_body, out)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            fatp_collect_local_names(block_body, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out|:
+                                fatp_collect_local_names(arm.body, out)
+                        _:
+                            pass
+
+        def check_field_access_type_param(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                func_names: mutable darray[sview] = []
+                fatp_collect_function_names(file.top_decls, func_names)
+                table <- fatp_walk_decls(file.top_decls, file.generic_param_names, file.generic_param_lines, func_names, table)
