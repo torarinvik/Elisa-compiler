@@ -73,30 +73,43 @@ extend Semantic:
                     _:
                         pass
 
-        def frr_walk(statements: darray[Ast::Stmt], param_names: darray[sview]&, param_structs: darray[sview]&, guarded_fields: darray[sview], return_single_bound: bool, function_name: sview, s_names: darray[sview]&, f_names: darray[sview]&, refined: darray[bool]&, table: lmut SymbolTable) -> void:
+        # A RUNTIME-length receiver whose `.len`/`.count` is not a compile-time constant (unlike a
+        # fixed array `[T;N]`, whose `.len` IS constant and provable). Only these fire on a len-like
+        # field under a lower-bound-> 0 refinement.
+        def frr_is_runtime_len_type(type_head: sview) -> bool:
+            can Abort.Panic:
+                return type_head == "cstr" or type_head == "dstr" or type_head == "darray" or type_head == "view" or type_head == "sview" or type_head == "string"
+
+        def frr_walk(statements: darray[Ast::Stmt], param_names: darray[sview]&, param_structs: darray[sview]&, guarded_fields: darray[sview], return_single_bound: bool, required_lo: i64, function_name: sview, s_names: darray[sview]&, f_names: darray[sview]&, refined: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Return(value, line):
                             if return_single_bound and value is returned and returned is Expr.Field(field_object, field_name, field_line):
                                 recv: sview = ident_name_of(field_object)
-                                struct_name: sview = frr_param_struct(recv, param_names, param_structs)
-                                fire: bool = struct_name != "" and not frr_is_len_like(field_name) and not frr_field_refined_or_unknown(struct_name, field_name, s_names, f_names, refined) and not (any g in guarded_fields where g == field_name)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementReturnNotProven, name: function_name, line: line, expected: "", actual: ""}) if fire
+                                recv_type: sview = frr_param_struct(recv, param_names, param_structs)
+                                is_guarded: bool = any g in guarded_fields where g == field_name
+                                # A len/count accessor gives usize >= 0: proves a lower-bound-<= 0 law
+                                # (NonNeg), but NOT a lower-bound-> 0 law (AtLeast3) — and only on a
+                                # runtime-length receiver (a fixed array's .len is a const stage0 proves).
+                                len_fire: bool = frr_is_len_like(field_name) and required_lo > 0 and frr_is_runtime_len_type(recv_type) and not is_guarded
+                                # A non-len bare field is unprovable unless refined or guarded.
+                                field_fire: bool = recv_type != "" and not frr_is_len_like(field_name) and not frr_field_refined_or_unknown(recv_type, field_name, s_names, f_names, refined) and not is_guarded
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementReturnNotProven, name: function_name, line: line, expected: "", actual: ""}) if len_fire or field_fire
                         Stmt.If(condition, then_body, else_body, line):
                             then_guarded: mutable darray[sview] = [g for g in guarded_fields]
                             frr_collect_guarded_fields(condition, then_guarded)
-                            table <- frr_walk(then_body, param_names, param_structs, then_guarded, return_single_bound, function_name, s_names, f_names, refined, table)
-                            table <- frr_walk(else_body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                            table <- frr_walk(then_body, param_names, param_structs, then_guarded, return_single_bound, required_lo, function_name, s_names, f_names, refined, table)
+                            table <- frr_walk(else_body, param_names, param_structs, guarded_fields, return_single_bound, required_lo, function_name, s_names, f_names, refined, table)
                         Stmt.While(condition, while_body, line):
-                            table <- frr_walk(while_body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                            table <- frr_walk(while_body, param_names, param_structs, guarded_fields, return_single_bound, required_lo, function_name, s_names, f_names, refined, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- frr_walk(for_body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                            table <- frr_walk(for_body, param_names, param_structs, guarded_fields, return_single_bound, required_lo, function_name, s_names, f_names, refined, table)
                         Stmt.Block(kind, clause, binding, block_body, line):
-                            table <- frr_walk(block_body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                            table <- frr_walk(block_body, param_names, param_structs, guarded_fields, return_single_bound, required_lo, function_name, s_names, f_names, refined, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table| -> table:
-                                table <- frr_walk(arm.body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                                table <- frr_walk(arm.body, param_names, param_structs, guarded_fields, return_single_bound, required_lo, function_name, s_names, f_names, refined, table)
                         _:
                             pass
 
@@ -106,10 +119,13 @@ extend Semantic:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             return_single_bound: mutable bool = false
+                            required_lo: mutable i64 = 0
                             if return_type is present_return:
                                 return_law: sview = local_refinement_law_name(present_return)
                                 shape: sview = law_shape(return_law, law_names, law_predicates) if return_law != "" else sview("", 0, 0)
                                 return_single_bound <- shape == "lower" or shape == "upper"
+                                rlo: (found: bool, lo: i64, hi: i64) = refined_param_bounds(present_return, law_names, law_predicates) if return_single_bound else (false, 0, 0)
+                                required_lo <- rlo.lo if rlo.found
                             if return_single_bound:
                                 param_names: mutable darray[sview] = []
                                 param_structs: mutable darray[sview] = []
@@ -117,7 +133,7 @@ extend Semantic:
                                     param_names.push(parameter.name)
                                     param_structs.push(bare_type_name_through_ref(parameter.type_expression))
                                 no_guards: darray[sview] = []
-                                table <- frr_walk(body, param_names, param_structs, no_guards, return_single_bound, function_name, s_names, f_names, refined, table)
+                                table <- frr_walk(body, param_names, param_structs, no_guards, return_single_bound, required_lo, function_name, s_names, f_names, refined, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- frr_walk_decls(module_body, law_names, law_predicates, s_names, f_names, refined, table)
                         Decl.Scoped(scoped_body, scoped_line):
