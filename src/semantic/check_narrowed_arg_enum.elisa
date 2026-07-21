@@ -1,0 +1,154 @@
+# Enum-hierarchy narrowing at a call argument (docs/81 tree/enum unification). In a
+# `match e:` arm whose pattern is `Sub.Variant(...)`, the scrutinee `e` is narrowed to the
+# enum `Sub`. Passing that narrowed `e` to a function whose parameter expects a DIFFERENT
+# enum `T` — where `Sub` is neither `T` nor a subtype of `T` (its `is`-parent chain never
+# reaches `T`) — is a type error:
+#
+#     enum Literal is Expression: Int(..)
+#     enum BinaryExpression is Expression: Add(..)
+#     def fold_binop(b: BinaryExpression) -> i64: ...
+#     match e:                      # e: Expression
+#         Literal.Int(value: v):
+#             out <- fold_binop(e)  # e narrowed to Literal; not a BinaryExpression → error
+#
+# Fully syntactic: the narrowing is the arm's variant-path head, the hierarchy is declared
+# (`enum Sub is Base`, sentinel 3900000008), and the parameter type is a declared enum name.
+extend Semantic:
+    private:
+        # The enum a variant path narrows to — the head before the first `.` (`Literal.Int` -> "Literal").
+        def nae_path_head(path: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                while index < sview_len(path) |index: usize = 0|:
+                    path[0:index] return if path[index] == '.'
+                    index <- index + 1
+                return path
+
+        # The declared `is`-parent enum of `child` (sentinel 3900000008), or "".
+        def nae_enum_parent(annotations: darray[Ast::EnumAnnotation]&, child: sview) -> sview:
+            can Abort.Panic:
+                for annotation in annotations:
+                    annotation.name return if annotation.line == 3900000008 and annotation.owner == child
+                return sview("", 0, 0)
+
+        # Whether `sub` is assignable to `super_enum`: identical, or `super_enum` is reachable by
+        # walking `sub`'s `is`-parent chain. Depth-bounded against malformed cycles.
+        def nae_is_assignable(annotations: darray[Ast::EnumAnnotation]&, sub: sview, super_enum: sview, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 16 or sub == ""
+                true return if sub == super_enum
+                parent: sview = nae_enum_parent(annotations, sub)
+                false return if parent == ""
+                return nae_is_assignable(annotations, parent, super_enum, depth + 1)
+
+        # The declared bare type name of parameter `position` (0-based) of function `fn_name`,
+        # searching all top-level (and module/scoped) Decl.Func declarations, or "".
+        def nae_param_type(declarations: darray[Ast::Decl], fn_name: sview, position: usize) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if function_name == fn_name and position < parameters.count:
+                                return bare_type_name(parameters[position].type_expression)
+                        Decl.Module(module_name, module_body, module_line):
+                            nested: sview = nae_param_type(module_body, fn_name, position)
+                            nested return if nested != ""
+                        Decl.Scoped(scoped_body, scoped_line):
+                            nested_s: sview = nae_param_type(scoped_body, fn_name, position)
+                            nested_s return if nested_s != ""
+                        _:
+                            pass
+                return sview("", 0, 0)
+
+        # In an arm narrowed to `narrowed_enum`, flag a call `f(…, scrutinee, …)` whose parameter at
+        # the scrutinee's position expects an enum `T` that `narrowed_enum` is not assignable to.
+        def nae_check_expression(expression: Ast::Expr, scrutinee: sview, narrowed_enum: sview, declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if callee is Expr.Ident(fn_name, fn_line):
+                            for argument in arguments |table, position = 0| -> table:
+                                if argument is Expr.Ident(argument_name, argument_line):
+                                    if argument_name == scrutinee:
+                                        param_type: sview = nae_param_type(declarations, fn_name, position)
+                                        if param_type != "" and is_enum_name(table, param_type) and not nae_is_assignable(annotations, narrowed_enum, param_type, 0):
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NarrowedArgEnumMismatch, name: fn_name, line: call_line, expected: param_type, actual: narrowed_enum})
+                                position <- position + 1
+                        for argument in arguments |table| -> table:
+                            table <- nae_check_expression(argument, scrutinee, narrowed_enum, declarations, annotations, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- nae_check_expression(left, scrutinee, narrowed_enum, declarations, annotations, table)
+                        table <- nae_check_expression(right, scrutinee, narrowed_enum, declarations, annotations, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- nae_check_expression(inner, scrutinee, narrowed_enum, declarations, annotations, table)
+                    _:
+                        pass
+
+        def nae_check_statements(statements: darray[Ast::Stmt], scrutinee: sview, narrowed_enum: sview, declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- nae_check_expression(expression, scrutinee, narrowed_enum, declarations, annotations, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- nae_check_expression(value, scrutinee, narrowed_enum, declarations, annotations, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- nae_check_expression(value, scrutinee, narrowed_enum, declarations, annotations, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- nae_check_expression(returned, scrutinee, narrowed_enum, declarations, annotations, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- nae_check_statements(then_body, scrutinee, narrowed_enum, declarations, annotations, table)
+                            table <- nae_check_statements(else_body, scrutinee, narrowed_enum, declarations, annotations, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- nae_check_statements(while_body, scrutinee, narrowed_enum, declarations, annotations, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- nae_check_statements(for_body, scrutinee, narrowed_enum, declarations, annotations, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            table <- nae_check_statements(body, scrutinee, narrowed_enum, declarations, annotations, table)
+                        _:
+                            pass
+
+        def nae_walk_body(statements: darray[Ast::Stmt], declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Match(scrutinee_expr, arms, match_line):
+                            if scrutinee_expr is Expr.Ident(scrutinee_name, scrutinee_line):
+                                for arm in arms |table| -> table:
+                                    narrowed_enum: mutable sview = sview("", 0, 0)
+                                    if arm.pattern is Pattern.Variant(path, fields):
+                                        narrowed_enum <- nae_path_head(path)
+                                    table <- nae_check_statements(arm.body, scrutinee_name, narrowed_enum, declarations, annotations, table) if narrowed_enum != "" and is_enum_name(table, narrowed_enum)
+                                    table <- nae_walk_body(arm.body, declarations, annotations, table)
+                            else:
+                                for arm in arms |table| -> table:
+                                    table <- nae_walk_body(arm.body, declarations, annotations, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- nae_walk_body(then_body, declarations, annotations, table)
+                            table <- nae_walk_body(else_body, declarations, annotations, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- nae_walk_body(while_body, declarations, annotations, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- nae_walk_body(for_body, declarations, annotations, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            table <- nae_walk_body(body, declarations, annotations, table)
+                        _:
+                            pass
+
+        def nae_walk_declarations(declarations: darray[Ast::Decl], top_declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- nae_walk_body(body, top_declarations, annotations, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- nae_walk_declarations(module_body, top_declarations, annotations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- nae_walk_declarations(scoped_body, top_declarations, annotations, table)
+                        _:
+                            pass
+
+    public:
+        def check_narrowed_arg_enum(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- nae_walk_declarations(file.top_decls, file.top_decls, file.enum_annotations, table)
