@@ -1,0 +1,138 @@
+# A function returning a bare struct-field access under a SINGLE-BOUND refinement
+# (`def get_low(p: Packet&) -> u8 is NonNeg: return p.low`) cannot be proven by stage0's
+# non-SMT prover — an arbitrary field carries no static bound, so it warns "refinement on
+# the return of F could not be proven". (check_refinement_return deliberately SUPPRESSES the
+# kind-0 single-bound case, because SOME field-ish leaves — `.len`/`.count`, forall-guarded
+# indices — ARE provable there; this check fires only on the genuinely-unprovable remainder.)
+#
+# SOUND subset — fire on `return recv.field` under a single-bound refined return ONLY when:
+#   * field is not a len/count-style known-nonneg accessor, AND
+#   * the receiver is a parameter whose struct's declared `field` member is UNREFINED (a
+#     refined field `x: i64 is InRange[0,127]` is proven via its own refinement), AND
+#   * no enclosing guard mentions `field` (a guard `if s.n <= 103:` establishes the bound).
+# Any unknown receiver/struct, refined field, or guarded field is a conservative MISS.
+extend Semantic:
+    private:
+        def frr_is_len_like(field: sview) -> bool:
+            can Abort.Panic:
+                return field == "len" or field == "count" or field == "length" or field == "size" or field == "capacity"
+
+        # Struct-member refinement table: parallel (struct, field, refined) rows.
+        def frr_collect_fields(declarations: darray[Ast::Decl], s_names: mutable darray[sview]&, f_names: mutable darray[sview]&, refined: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |s_names, f_names, refined|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                            for member in members |s_names, f_names, refined, struct_name|:
+                                s_names.push(struct_name)
+                                f_names.push(member.name)
+                                refined.push(local_refinement_law_name(member.type_expression) != "")
+                        Decl.Module(module_name, module_body, module_line):
+                            frr_collect_fields(module_body, s_names, f_names, refined)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            frr_collect_fields(scoped_body, s_names, f_names, refined)
+                        _:
+                            pass
+
+        # Whether the (struct, field) member is refined OR unknown — either way NOT a fire
+        # candidate (unknown is conservative). Only a KNOWN-UNREFINED member returns false.
+        def frr_field_refined_or_unknown(struct_name: sview, field: sview, s_names: darray[sview]&, f_names: darray[sview]&, refined: darray[bool]&) -> bool:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < s_names.count |index, struct_name, field, s_names, f_names, refined|:
+                    refined[index] return if s_names[index] == struct_name and f_names[index] == field
+                    index <- index + 1
+                return true
+
+        # The bare struct type name of parameter `name`, or "".
+        def frr_param_struct(name: sview, param_names: darray[sview]&, param_structs: darray[sview]&) -> sview:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < param_names.count |index, name, param_names, param_structs|:
+                    param_structs[index] return if param_names[index] == name
+                    index <- index + 1
+                return sview("", 0, 0)
+
+        # Field names appearing in a guard condition (any `recv.field`), into `out`.
+        def frr_collect_guarded_fields(condition: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Field(object, field, field_line):
+                        out.push(field) if not (any o in out where o == field)
+                        frr_collect_guarded_fields(object, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        frr_collect_guarded_fields(left, out)
+                        frr_collect_guarded_fields(right, out)
+                    Expr.Unary(operator, operand, unary_line):
+                        frr_collect_guarded_fields(operand, out)
+                    Expr.Paren(inner, paren_line):
+                        frr_collect_guarded_fields(inner, out)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |out|:
+                            frr_collect_guarded_fields(argument, out)
+                    _:
+                        pass
+
+        def frr_walk(statements: darray[Ast::Stmt], param_names: darray[sview]&, param_structs: darray[sview]&, guarded_fields: darray[sview], return_single_bound: bool, function_name: sview, s_names: darray[sview]&, f_names: darray[sview]&, refined: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if return_single_bound and value is returned and returned is Expr.Field(field_object, field_name, field_line):
+                                recv: sview = ident_name_of(field_object)
+                                struct_name: sview = frr_param_struct(recv, param_names, param_structs)
+                                fire: bool = struct_name != "" and not frr_is_len_like(field_name) and not frr_field_refined_or_unknown(struct_name, field_name, s_names, f_names, refined) and not (any g in guarded_fields where g == field_name)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementReturnNotProven, name: function_name, line: line, expected: "", actual: ""}) if fire
+                        Stmt.If(condition, then_body, else_body, line):
+                            then_guarded: mutable darray[sview] = [g for g in guarded_fields]
+                            frr_collect_guarded_fields(condition, then_guarded)
+                            table <- frr_walk(then_body, param_names, param_structs, then_guarded, return_single_bound, function_name, s_names, f_names, refined, table)
+                            table <- frr_walk(else_body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- frr_walk(while_body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- frr_walk(for_body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- frr_walk(block_body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- frr_walk(arm.body, param_names, param_structs, guarded_fields, return_single_bound, function_name, s_names, f_names, refined, table)
+                        _:
+                            pass
+
+        def frr_walk_decls(declarations: darray[Ast::Decl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, s_names: darray[sview]&, f_names: darray[sview]&, refined: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            return_single_bound: mutable bool = false
+                            if return_type is present_return:
+                                return_law: sview = local_refinement_law_name(present_return)
+                                shape: sview = law_shape(return_law, law_names, law_predicates) if return_law != "" else sview("", 0, 0)
+                                return_single_bound <- shape == "lower" or shape == "upper"
+                            if return_single_bound:
+                                param_names: mutable darray[sview] = []
+                                param_structs: mutable darray[sview] = []
+                                for parameter in parameters |param_names, param_structs|:
+                                    param_names.push(parameter.name)
+                                    param_structs.push(bare_type_name_through_ref(parameter.type_expression))
+                                no_guards: darray[sview] = []
+                                table <- frr_walk(body, param_names, param_structs, no_guards, return_single_bound, function_name, s_names, f_names, refined, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- frr_walk_decls(module_body, law_names, law_predicates, s_names, f_names, refined, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- frr_walk_decls(scoped_body, law_names, law_predicates, s_names, f_names, refined, table)
+                        _:
+                            pass
+
+        def check_field_return_refinement(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(file.top_decls, law_names, law_predicates)
+                return if law_names.count == 0
+                s_names: mutable darray[sview] = []
+                f_names: mutable darray[sview] = []
+                refined: mutable darray[bool] = []
+                frr_collect_fields(file.top_decls, s_names, f_names, refined)
+                table <- frr_walk_decls(file.top_decls, law_names, law_predicates, s_names, f_names, refined, table)
