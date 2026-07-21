@@ -99,6 +99,12 @@ obj_case generic_two_params 'def snd[A, B](a: A, b: B) -> B:\n    return b\n\nde
 obj_case fstring_len 'def main() -> i64 can[Abort.Panic, Memory.Allocate]:\n    a: dstr = "xy"\n    b: dstr = "zzz"\n    s: dstr = f"{a}-{b}!"\n    return s.count.i64()\n' 7
 obj_case fstring_byte 'def main() -> i64 can[Abort.Panic, Memory.Allocate]:\n    a: dstr = "xy"\n    b: dstr = "zzz"\n    s: dstr = f"{a}-{b}!"\n    return (s[3] can Unsafe.UncheckedIndex).i64()\n' 122
 
+# Error unions end-to-end: an `error Bad:` set, a `-> i64 error[Bad]` function that `raise`s,
+# and a statement `catch` with a success arm + `error e:` arm. Exercises the i32-status +
+# leading-out-pointer ABI through the full emit_obj (-g + O2) path, which the narrow
+# scalar/aggregate cases above don't. d(42) succeeds -> success arm returns 42.
+obj_case error_union_catch 'error Bad:\n    Boom\n\ndef d(x: i64) -> i64 error[Bad]:\n    raise Bad.Boom if x < 0\n    return x\n\ndef main() -> i64:\n    catch d(42):\n        v:\n            return v\n        error e:\n            return 0\n' 42
+
 # The comprehension actually VECTORIZES. This is the only check in the suite that asserts
 # Elisa's central performance claim rather than its behaviour: a comprehension exists to be
 # vectorized, and `-Wperf` exists to complain when one is not. No exit code can see this --
