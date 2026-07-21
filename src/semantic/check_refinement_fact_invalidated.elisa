@@ -38,11 +38,54 @@ extend Semantic:
                     Expr.Binary(left, operator, right, line):
                         if operator != TokenKind.Is:
                             return sview("", 0, 0)
-                        if right is Expr.Ident(law_name, ident_line):
+                        # The refinement is a bare law (`is NonEmpty`) or an applied law with args
+                        # (`is Bounded[0, xs.count]`, spelled Index/IndexN/Call over the law ident).
+                        # Either way the guard subject is the left operand.
+                        if rfi_is_law_test(right):
                             return ident_name_of(left)
                         return sview("", 0, 0)
                     _:
                         return sview("", 0, 0)
+
+        # Whether the right side of an `is` test names a law: a bare ident, or a law application
+        # `Law[args]` / `Law(args)` whose head is an ident.
+        def rfi_is_law_test(right: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match right:
+                    Expr.Ident(law_name, ident_line): true
+                    Expr.Index(object, index, index_line): ident_name_of(object) != ""
+                    Expr.IndexN(object_n, arguments_n, index_n_line): ident_name_of(object_n) != ""
+                    Expr.Call(callee, call_arguments, call_argument_names, call_line): ident_name_of(callee) != ""
+                    _: false
+
+        # Collect the container idents a guard predicate DEPENDS on: the receiver of any
+        # `.count`/`.len`/`.length` field access inside the `is Law[..]` arguments. Shrinking such
+        # a container invalidates a dependent bound like `Bounded[0, xs.count]`.
+        def rfi_collect_dep_containers(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(receiver, field_name, field_line):
+                        if field_name == "count" or field_name == "len" or field_name == "length":
+                            container: sview = ident_name_of(receiver)
+                            out.push(container) if container != ""
+                        rfi_collect_dep_containers(receiver, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        rfi_collect_dep_containers(left, out)
+                        rfi_collect_dep_containers(right, out)
+                    Expr.Index(object, index, index_line):
+                        rfi_collect_dep_containers(object, out)
+                        rfi_collect_dep_containers(index, out)
+                    Expr.IndexN(object_n, arguments_n, index_n_line):
+                        rfi_collect_dep_containers(object_n, out)
+                        for argument_n in arguments_n |out|:
+                            rfi_collect_dep_containers(argument_n, out)
+                    Expr.Call(callee, call_arguments, call_argument_names, call_line):
+                        for call_argument in call_arguments |out|:
+                            rfi_collect_dep_containers(call_argument, out)
+                    Expr.Paren(inner, paren_line):
+                        rfi_collect_dep_containers(inner, out)
+                    _:
+                        pass
 
         # Whether `name` is in `names`.
         def rfi_contains(names: darray[sview]&, name: sview) -> bool:
@@ -77,14 +120,25 @@ extend Semantic:
         # Walk a statement list in order, threading the live guard subjects (`guarded`) and the
         # accumulated shrink-mutated subjects (`mutated`). A refined-param use is checked BEFORE the
         # statement can itself mutate, so mutation must strictly precede use.
-        def rfi_check_statements(statements: darray[Ast::Stmt], guarded: darray[sview]&, mutated: mutable darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&, table: lmut SymbolTable) -> void:
+        # Push every dependent subject whose bound depends on the shrunk container `M` into
+        # `mutated` (parallel dep_containers[k] -> dep_subjects[k] rows), invalidating dependent
+        # bounds like `i is Bounded[0, M.count]` when `M` is shrunk.
+        def rfi_invalidate_dependents(container: sview, dep_containers: darray[sview]&, dep_subjects: darray[sview]&, mutated: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while probe < dep_containers.count |probe: usize = 0, mutated|:
+                    mutated.push(dep_subjects[probe]) if dep_containers[probe] == container
+                    probe <- probe + 1
+
+        def rfi_check_statements(statements: darray[Ast::Stmt], guarded: darray[sview]&, mutated: mutable darray[sview]&, dep_containers: darray[sview]&, dep_subjects: darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table, mutated| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
                             table <- rfi_check_call(expression, line, guarded, mutated, param_functions, param_indices, table)
                             shrink_subject: sview = rfi_shrink_subject(expression)
-                            mutated.push(shrink_subject) if shrink_subject != "" and rfi_contains(guarded, shrink_subject)
+                            if shrink_subject != "":
+                                mutated.push(shrink_subject) if rfi_contains(guarded, shrink_subject)
+                                rfi_invalidate_dependents(shrink_subject, dep_containers, dep_subjects, mutated)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- rfi_check_call(value, line, guarded, mutated, param_functions, param_indices, table)
                         Stmt.Assign(target, operator, value, line):
@@ -95,13 +149,52 @@ extend Semantic:
                         Stmt.If(condition, then_body, else_body, line):
                             subject: sview = rfi_guard_subject(condition)
                             then_guarded: mutable darray[sview] = [entry for entry in guarded]
-                            then_guarded.push(subject) if subject != ""
-                            table <- rfi_check_statements(then_body, then_guarded, mutated, param_functions, param_indices, table)
-                            table <- rfi_check_statements(else_body, guarded, mutated, param_functions, param_indices, table)
+                            then_dep_containers: mutable darray[sview] = [entry for entry in dep_containers]
+                            then_dep_subjects: mutable darray[sview] = [entry for entry in dep_subjects]
+                            if subject != "":
+                                then_guarded.push(subject)
+                                guard_deps: mutable darray[sview] = []
+                                rfi_collect_dep_containers(condition, guard_deps)
+                                for guard_dep in guard_deps |then_dep_containers, then_dep_subjects|:
+                                    then_dep_containers.push(guard_dep)
+                                    then_dep_subjects.push(subject)
+                            table <- rfi_check_statements(then_body, then_guarded, mutated, then_dep_containers, then_dep_subjects, param_functions, param_indices, table)
+                            table <- rfi_check_statements(else_body, guarded, mutated, dep_containers, dep_subjects, param_functions, param_indices, table)
                         Stmt.Block(kind, clause, binding, block_body, line):
-                            table <- rfi_check_statements(block_body, guarded, mutated, param_functions, param_indices, table)
+                            table <- rfi_check_statements(block_body, guarded, mutated, dep_containers, dep_subjects, param_functions, param_indices, table)
                         Stmt.While(condition, while_body, while_line) | Stmt.For(_, _, _, while_body, while_line):
-                            table <- rfi_check_statements(while_body, guarded, mutated, param_functions, param_indices, table)
+                            table <- rfi_check_statements(while_body, guarded, mutated, dep_containers, dep_subjects, param_functions, param_indices, table)
+                        _:
+                            pass
+
+        # Whether a parameter TYPE is refinement-constrained: `T is <law>` (bare or applied) or a
+        # structural `where`-refinement. Broader than collect_law_params (which needs a usable
+        # no-arg predicate) — the invalidation check only needs to know the position is refined.
+        def rfi_param_is_refined(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Binary(base, operator, right, line):
+                        return operator == TokenKind.Is and rfi_is_law_test(right)
+                    Expr.Refinement(refined_base, refined_predicate, refinement_line):
+                        return true
+                    _:
+                        return false
+
+        # Collect (function, param-index) for every refinement-constrained parameter.
+        def rfi_collect_refined_params(declarations: darray[Ast::Decl], param_functions: mutable darray[sview]&, param_indices: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |param_functions, param_indices|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            while probe < parameters.count |probe: usize = 0, param_functions, param_indices|:
+                                if rfi_param_is_refined(parameters[probe].type_expression):
+                                    param_functions.push(function_name)
+                                    param_indices.push(probe)
+                                probe <- probe + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            rfi_collect_refined_params(module_body, param_functions, param_indices)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            rfi_collect_refined_params(scoped_body, param_functions, param_indices)
                         _:
                             pass
 
@@ -112,7 +205,9 @@ extend Semantic:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             guarded: darray[sview] = []
                             mutated: mutable darray[sview] = []
-                            table <- rfi_check_statements(body, guarded, mutated, param_functions, param_indices, table)
+                            dep_containers: darray[sview] = []
+                            dep_subjects: darray[sview] = []
+                            table <- rfi_check_statements(body, guarded, mutated, dep_containers, dep_subjects, param_functions, param_indices, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- rfi_walk(module_body, param_functions, param_indices, table)
                         Decl.Scoped(scoped_body, scoped_line):
@@ -123,14 +218,7 @@ extend Semantic:
     public:
         def check_refinement_fact_invalidated(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                law_names: mutable darray[sview] = []
-                law_predicates: mutable darray[Ast::Expr] = []
-                collect_laws(declarations, law_names, law_predicates)
-                alias_names: mutable darray[sview] = []
-                alias_predicates: mutable darray[Ast::Expr] = []
-                collect_refine_aliases(declarations, alias_names, alias_predicates)
                 param_functions: mutable darray[sview] = []
                 param_indices: mutable darray[usize] = []
-                param_predicates: mutable darray[Ast::Expr] = []
-                collect_law_params(declarations, law_names, law_predicates, alias_names, alias_predicates, param_functions, param_indices, param_predicates)
+                rfi_collect_refined_params(declarations, param_functions, param_indices)
                 table <- rfi_walk(declarations, param_functions, param_indices, table)
