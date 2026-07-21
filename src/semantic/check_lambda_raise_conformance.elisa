@@ -1,0 +1,142 @@
+# Inline-lambda raise conformance (stage0). A lambda passed as a call argument must not
+# raise an error family outside what the callee accepts:
+#
+#   def wantsIo(f: fn(i64) -> i64 error[IoErr], x: i64) -> i64 error[IoErr]: ...
+#   wantsIo(fn(n) => raise NetErr.Down, 3)   # NetErr not in IoErr -> error
+#
+# The lambda's expected error set is the callee parameter's; as a sound approximation we
+# use the callee's declared error families (captured by the parser as __error_set_family,
+# keyed by the callee's line). A raised family absent from that set cannot be in the
+# narrower per-parameter set either, so this only ever under-reports — never a false fire.
+extend Semantic:
+    private:
+        def lrc_collect_fn_families(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, out_fn: mutable darray[sview]&, out_family: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_fn, out_family|:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            for annotation in annotations |out_fn, out_family, name, line|:
+                                if annotation.owner == "__error_set_family" and annotation.line == line:
+                                    out_fn.push(name)
+                                    out_family.push(annotation.name)
+                        Decl.Module(module_name, module_body, module_line):
+                            lrc_collect_fn_families(module_body, annotations, out_fn, out_family)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            lrc_collect_fn_families(scoped_body, annotations, out_fn, out_family)
+                        _:
+                            pass
+
+        def lrc_fn_known(fn_names: darray[sview]&, callee: sview) -> bool:
+            can Abort.Panic:
+                for entry in fn_names:
+                    true return if entry == callee
+                return false
+
+        def lrc_fn_has_family(fn_names: darray[sview]&, fn_families: darray[sview]&, callee: sview, family: sview) -> bool:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < fn_names.count |index|:
+                    true return if fn_names[index] == callee and fn_families[index] == family
+                    index <- index + 1
+                return false
+
+        def lrc_first_family(fn_names: darray[sview]&, fn_families: darray[sview]&, callee: sview) -> sview:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < fn_names.count |index|:
+                    fn_families[index] return if fn_names[index] == callee
+                    index <- index + 1
+                return sview("", 0, 0)
+
+        # Walk a lambda body for statement-position raises whose family is outside `callee`'s
+        # accepted set, emitting for each.
+        def lrc_check_lambda_body(body: darray[Ast::Stmt], callee: sview, fn_names: darray[sview]&, fn_families: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- lrc_check_raise(expression, line, callee, fn_names, fn_families, table)
+                        Stmt.Return(value, line):
+                            table <- lrc_check_raise(returned, line, callee, fn_names, fn_families, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- lrc_check_lambda_body(then_body, callee, fn_names, fn_families, table)
+                            table <- lrc_check_lambda_body(else_body, callee, fn_names, fn_families, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- lrc_check_lambda_body(block_body, callee, fn_names, fn_families, table)
+                        _:
+                            pass
+
+        def lrc_check_raise(expression: Ast::Expr, line: u32, callee: sview, fn_names: darray[sview]&, fn_families: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                source_owner: sview = raised_error_owner(expression)
+                source_tag: sview = raised_error_tag(expression)
+                if source_owner != "" and source_tag != "" and not lrc_fn_has_family(fn_names, fn_families, callee, source_owner):
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LambdaRaiseMismatch, name: source_owner, line: line, expected: lrc_first_family(fn_names, fn_families, callee), actual: source_tag})
+
+        def lrc_walk_expr(expression: Ast::Expr, fn_names: darray[sview]&, fn_families: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        if callee_name != "" and lrc_fn_known(fn_names, callee_name):
+                            for argument in arguments |table| -> table:
+                                if argument is Expr.Lambda(lambda_params, lambda_body, lambda_line):
+                                    table <- lrc_check_lambda_body(lambda_body, callee_name, fn_names, fn_families, table)
+                        for argument in arguments |table| -> table:
+                            table <- lrc_walk_expr(argument, fn_names, fn_families, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- lrc_walk_expr(left, fn_names, fn_families, table)
+                        table <- lrc_walk_expr(right, fn_names, fn_families, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- lrc_walk_expr(inner, fn_names, fn_families, table)
+                    _:
+                        pass
+
+        def lrc_walk_stmts(statements: darray[Ast::Stmt], fn_names: darray[sview]&, fn_families: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- lrc_walk_expr(expression, fn_names, fn_families, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- lrc_walk_expr(value, fn_names, fn_families, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- lrc_walk_expr(value, fn_names, fn_families, table)
+                        Stmt.Return(value, line):
+                            table <- lrc_walk_expr(returned, fn_names, fn_families, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- lrc_walk_stmts(then_body, fn_names, fn_families, table)
+                            table <- lrc_walk_stmts(else_body, fn_names, fn_families, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- lrc_walk_stmts(while_body, fn_names, fn_families, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- lrc_walk_stmts(for_body, fn_names, fn_families, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- lrc_walk_stmts(block_body, fn_names, fn_families, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- lrc_walk_stmts(arm.body, fn_names, fn_families, table)
+                        _:
+                            pass
+
+        def lrc_walk_declarations(declarations: darray[Ast::Decl], fn_names: darray[sview]&, fn_families: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            table <- lrc_walk_stmts(body, fn_names, fn_families, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- lrc_walk_declarations(module_body, fn_names, fn_families, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- lrc_walk_declarations(scoped_body, fn_names, fn_families, table)
+                        _:
+                            pass
+
+    public:
+        def check_lambda_raise_conformance(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fn_names: mutable darray[sview] = []
+                fn_families: mutable darray[sview] = []
+                lrc_collect_fn_families(file.top_decls, file.enum_annotations, fn_names, fn_families)
+                if fn_names.count > 0:
+                    table <- lrc_walk_declarations(file.top_decls, fn_names, fn_families, table)
