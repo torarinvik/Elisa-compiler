@@ -109,6 +109,10 @@ obj_case error_union_catch 'error Bad:\n    Boom\n\ndef d(x: i64) -> i64 error[B
 # `fn`-typed param). `fn(A)->R` is a low-bit-tagged ptr; a named fn passes its raw pointer
 # (bit0=0), and calling the param emits the tag dispatch (raw path here). apply(dbl,21)=42.
 obj_case fn_value_named 'def dbl(x: i64) -> i64:\n    return x * 2\n\ndef apply(fn: fn(i64) -> i64, value: i64) -> i64:\n    return fn(value)\n\ndef main() -> i64:\n    return apply(dbl, 21)\n' 42
+# NESTED call through a fn value: fn(fn(v)). The inner call is in ARGUMENT position, so its
+# result type comes from the fn value's stored RETURN type (Fn signature side-pool), not the
+# expected type. twice(inc, 40) = inc(inc(40)) = 42.
+obj_case fn_value_nested 'def inc(x: i64) -> i64:\n    return x + 1\n\ndef twice(fn: fn(i64) -> i64, v: i64) -> i64:\n    return fn(fn(v))\n\ndef main() -> i64:\n    return twice(inc, 40)\n' 42
 
 # The comprehension actually VECTORIZES. This is the only check in the suite that asserts
 # Elisa's central performance claim rather than its behaviour: a comprehension exists to be

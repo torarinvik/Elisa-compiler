@@ -304,6 +304,43 @@ module Backend:
         # Unary node wrapping the type, so it is unwrapped here — mutability is the
         # frontend's business (it already rejects `x <- 1` on an immutable local), and the
         # backend only needs the underlying type.
+        # Record every `fn(…)->R` type's RETURN-type head (parser side-table __lambda_return,
+        # keyed by the fn-type's line) so a Fn ValueType can carry its result type.
+        def register_fn_signatures(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for annotation in file.enum_annotations |structs|:
+                if annotation.owner == "__lambda_return":
+                    structs.fn_return_lines.push(annotation.line)
+                    structs.fn_return_heads.push(annotation.name)
+
+        # The recorded return-type head for the fn-type declared at `line`, or "".
+        def fn_return_head_at(line: u32, structs: mutable StructTable&) -> sview can[Abort.Panic]:
+            probe: mutable usize = 0
+            while probe < structs.fn_return_lines.count |probe, line, structs|:
+                structs.fn_return_heads[probe] return if structs.fn_return_lines[probe] == line
+                probe <- probe + 1
+            return sview("", 0, 0)
+
+        # Resolve a bare type HEAD NAME (`i64`, `dstr`, a struct) to a ValueType. Only the
+        # forms a fn return head can name in the modeled subset; Unmodeled otherwise.
+        def resolve_type_head(head: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            scalar: ValueType = scalar_type_of_name(head)
+            scalar return if scalar.kind != TypeKind.Unmodeled
+            intern_darray_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs) return if head == "dstr"
+            head_struct: i64 = struct_index_of(structs, head)
+            ValueType{kind: TypeKind.Struct, bits: head_struct.u32()} return if head_struct >= 0
+            return unmodeled_type()
+
+        # A Fn ValueType carrying `return_type` in the side-pool at `bits`.
+        def intern_fn_type(return_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            structs.fn_pool_returns.push(return_type)
+            return ValueType{kind: TypeKind.Fn, bits: (structs.fn_pool_returns.count - 1).u32()}
+
+        # The RETURN type a Fn value produces when called, or Unmodeled if unknown.
+        def fn_return_type_of(fn_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if fn_type.kind != TypeKind.Fn
+            unmodeled_type() return if fn_type.bits.usize() >= structs.fn_pool_returns.count
+            return copied_type(structs.fn_pool_returns[fn_type.bits.usize()])
+
         def annotation_value_type(type_expression: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
             if type_expression is Expr.Unary(qualifier, qualified_type, qualifier_line):
                 # `mutable T` — a QUALIFIER, not part of the type: mutability is the
@@ -425,7 +462,9 @@ module Backend:
             # `Expr.Lambda(params, body, line)` (the annotation's body is empty). As a TYPE it
             # denotes a first-class function value — a tagged `ptr` (TypeKind.Fn).
             if type_expression is Expr.Lambda(fn_type_params, fn_type_body, fn_type_line):
-                return ValueType{kind: TypeKind.Fn, bits: 0}
+                fn_return_head: sview = fn_return_head_at(fn_type_line, structs)
+                fn_return_resolved: ValueType = resolve_type_head(fn_return_head, structs) if fn_return_head != "" else unmodeled_type()
+                return intern_fn_type(fn_return_resolved, structs)
             return unmodeled_type()
 
 
@@ -669,6 +708,15 @@ module Backend:
             # exit. `binding_names` are sviews into the source buffer, so nothing dangles.
             binding_names: mutable darray[sview]
             binding_types: mutable darray[ValueType]
+            # `fn(…)->R` signature reconstruction. The parser drops fn-type param/return types
+            # from the AST, recording only HEAD NAMES on the __lambda_return / __lambda_param
+            # annotations keyed by the fn-type's line. Populated ONCE (register_fn_signatures)
+            # from file.enum_annotations: `fn_return_lines[i]` -> `fn_return_heads[i]`. A resolved
+            # Fn ValueType carries its RETURN type in the `fn_pool_returns` side-pool at `bits`,
+            # so a call through a fn value knows its result type even in argument position.
+            fn_return_lines: mutable darray[u32]
+            fn_return_heads: mutable darray[sview]
+            fn_pool_returns: mutable darray[ValueType]
 
 
         # The LLVM type of ANY darray: `{ptr, i64, i64}` = {items, count, capacity}.
@@ -1721,6 +1769,11 @@ module Backend:
             if expression is Expr.Construct(construct_type, construct_fields, construct_line):
                 return annotation_value_type(construct_type, structs)
             if expression is Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
+                # A call through a `fn(…)`-typed local is an indirect call; its type is the
+                # fn value's declared RETURN type (so `f(f(x))` types its inner call).
+                if call_callee is Expr.Ident(fn_call_name, fn_call_name_line):
+                    fn_call_type: ValueType = lookup_type(local_scope, fn_call_name)
+                    fn_return_type_of(fn_call_type, structs) return if fn_call_type.kind == TypeKind.Fn
                 # `x.u8()` is a CAST (postfix call unifies cast and UFCS: `recv.Name()`
                 # where Name is a type name is a conversion).
                 if call_callee is Expr.Field(cast_object, cast_name, cast_line):
@@ -2343,9 +2396,15 @@ module Backend:
         def emit_fn_value_call(callee: Expr, arguments: darray[Expr]&, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
             pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
-            # The result type must be known — the subset uses the call site's expected type.
-            null return if expected.kind == TypeKind.Void or expected.kind == TypeKind.Unmodeled or expected.kind == TypeKind.Fn
-            return_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+            # The result type: the fn value's own DECLARED return type (from its Fn signature)
+            # is authoritative and works even in argument position (`f(f(x))`); fall back to the
+            # call site's EXPECTED type when the signature carries no return (older Fn{bits:0}).
+            declared_return: mutable ValueType = unmodeled_type()
+            if callee is Expr.Ident(callee_fn_name, callee_fn_name_line):
+                declared_return <- fn_return_type_of(lookup_type(local_scope, callee_fn_name), structs)
+            result_type: ValueType = declared_return if declared_return.kind != TypeKind.Unmodeled else expected
+            null return if result_type.kind == TypeKind.Void or result_type.kind == TypeKind.Unmodeled or result_type.kind == TypeKind.Fn
+            return_llvm: LLVMTypeRef = llvm_type_of(result_type, structs, ctx)
             fn_pointer_opt: LLVMValueRef? = emit_expression(callee, ValueType{kind: TypeKind.Fn, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             fn_pointer: mutable LLVMValueRef = zeroed
             got_fn_pointer: mutable bool = false
@@ -7417,7 +7476,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: [], pending_ensures: [], narrowed_owners: [], narrowed_fields: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: [], pending_ensures: [], narrowed_owners: [], narrowed_fields: [], fn_return_lines: [], fn_return_heads: [], fn_pool_returns: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -7429,6 +7488,9 @@ module Backend:
             # branches, flattened) rather than `file.top_decls`, so a branch is selected once
             # instead of nine times.
             register_target_consts(structs)
+            # fn(…)->R return-type heads, so annotation_value_type can carry a Fn's result
+            # type. Populated before any signature is resolved (declare pass reads fn params).
+            register_fn_signatures(file, structs)
             static_branch_lines: darray[u32] = file.static_if_lines
             top: mutable darray[Decl] = []
             # FIXPOINT, not one pass: a branch condition may name a const declared in an
