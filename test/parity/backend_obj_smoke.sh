@@ -84,6 +84,15 @@ obj_case darray   'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.
 obj_case comprehension 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[3] can Unsafe.UncheckedIndex) + 39\n' 42
 obj_case struct   'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 40, y: 2}\n    return p.x + p.y\n' 42
 
+# A user-defined GENERIC function. Its monomorphization (`id__i64`) is emitted lazily during
+# body emission -- AFTER emit_debug_info has run -- so the instantiation has no DISubprogram.
+# Attaching a DWARF parameter to a subprogram-less function built metadata with a null scope
+# that SEGFAULTED the -O2 pipeline (emit_module_with_debug only; the IR path was fine). Guard:
+# emit_instantiation_body now emits the monomorph body with debug OFF. Nested + multi-param
+# instantiations exercise the same path.
+obj_case generic_debug 'def id[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    return id(id(42))\n' 42
+obj_case generic_two_params 'def snd[A, B](a: A, b: B) -> B:\n    return b\n\ndef main() -> i64:\n    return snd(1, 42)\n' 42
+
 # The comprehension actually VECTORIZES. This is the only check in the suite that asserts
 # Elisa's central performance claim rather than its behaviour: a comprehension exists to be
 # vectorized, and `-Wperf` exists to complain when one is not. No exit code can see this --
