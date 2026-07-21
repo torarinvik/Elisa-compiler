@@ -93,6 +93,12 @@ obj_case struct   'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    
 obj_case generic_debug 'def id[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    return id(id(42))\n' 42
 obj_case generic_two_params 'def snd[A, B](a: A, b: B) -> B:\n    return b\n\ndef main() -> i64:\n    return snd(1, 42)\n' 42
 
+# f-strings: the parser desugars `f"…{x}…"` into `__fstr(chunk, value, …)`; the backend lowers
+# it to ctx_fstr_alloc(total) + ctx_fstr_append per string-like piece + load. "xy-zzz!" is 7
+# bytes; index 3 is 'z' (122), matching stage0 (verified). Guards the __fstr builtin.
+obj_case fstring_len 'def main() -> i64 can[Abort.Panic, Memory.Allocate]:\n    a: dstr = "xy"\n    b: dstr = "zzz"\n    s: dstr = f"{a}-{b}!"\n    return s.count.i64()\n' 7
+obj_case fstring_byte 'def main() -> i64 can[Abort.Panic, Memory.Allocate]:\n    a: dstr = "xy"\n    b: dstr = "zzz"\n    s: dstr = f"{a}-{b}!"\n    return (s[3] can Unsafe.UncheckedIndex).i64()\n' 122
+
 # The comprehension actually VECTORIZES. This is the only check in the suite that asserts
 # Elisa's central performance claim rather than its behaviour: a comprehension exists to be
 # vectorized, and `-Wperf` exists to complain when one is not. No exit code can see this --

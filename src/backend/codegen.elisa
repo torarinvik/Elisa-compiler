@@ -845,6 +845,64 @@ module Backend:
             return null
 
 
+        # `__fstr(chunk_or_value, …)` — the compiler-emitted f-string builder the parser
+        # desugars `f"…{x}…"` into. Each argument is a STRING-LIKE piece (a literal chunk or an
+        # interpolated dstr/sview — the checker rejects a non-string interpolant), so lowering
+        # is stage0's: sum the byte lengths, `ctx_fstr_alloc(total)` a `%DynArray__u8`, then
+        # `ctx_fstr_append(slot, data, len)` each piece in order and load the result dstr.
+        def emit_fstr_builtin(arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            dstr_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+            datas: mutable darray[LLVMValueRef] = []
+            lengths: mutable darray[LLVMValueRef] = []
+            declined: mutable bool = false
+            for argument in arguments |datas, lengths, declined, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                continue if declined
+                if argument is Expr.StringLit(chunk_text):
+                    chunk_storage: mutable darray[u8] = []
+                    chunk_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, sview_to_cstr(chunk_text, chunk_storage), "fstr.chunk")
+                    datas.push(chunk_global)
+                    lengths.push(LLVMConstInt(int64_type, sview_len(chunk_text).u64(), 0))
+                else:
+                    argument_type: ValueType = expression_type(argument, local_scope, fns, structs, generics)
+                    is_dstr: bool = argument_type.kind == TypeKind.DArray and darray_element_of(argument_type, structs).kind == TypeKind.Unsigned and darray_element_of(argument_type, structs).bits == 8
+                    is_sview: bool = argument_type.kind == TypeKind.SView
+                    if not is_dstr and not is_sview:
+                        declined <- true
+                    elif emit_expression(argument, argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is piece_value:
+                        # dstr `{ptr items, i64 count, i64 cap}` and sview `{ptr, i64 len}` both
+                        # carry the data pointer at field 0 and the byte length at field 1.
+                        datas.push(LLVMBuildExtractValue(builder, piece_value, 0, "fstr.data"))
+                        lengths.push(LLVMBuildExtractValue(builder, piece_value, 1, "fstr.len"))
+                    else:
+                        declined <- true
+            null return if declined
+            total: mutable LLVMValueRef = LLVMConstInt(int64_type, 0, 0)
+            for piece_length in lengths |total, builder|:
+                total <- LLVMBuildAdd(builder, total, piece_length, "fstr.total")
+            alloc_params: mutable darray[LLVMTypeRef] = [int64_type]
+            alloc_params_pointer: void& = (&alloc_params[0]).cast[void&] can Unsafe.PointerCast
+            alloc_type: LLVMTypeRef = LLVMFunctionType(dstr_header, alloc_params_pointer, 1, 0)
+            alloc_fn: LLVMValueRef = declare_or_get_named(m, "ctx_fstr_alloc", alloc_type)
+            alloc_args: mutable darray[LLVMValueRef] = [total]
+            alloc_args_pointer: void& = (&alloc_args[0]).cast[void&] can Unsafe.PointerCast
+            dstr_value: LLVMValueRef = LLVMBuildCall2(builder, alloc_type, alloc_fn, alloc_args_pointer, 1, "fstr.alloc")
+            fstr_slot: LLVMValueRef = LLVMBuildAlloca(builder, dstr_header, "fstr.slot")
+            _ = LLVMBuildStore(builder, dstr_value, fstr_slot)
+            append_params: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, int64_type]
+            append_params_pointer: void& = (&append_params[0]).cast[void&] can Unsafe.PointerCast
+            append_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), append_params_pointer, 3, 0)
+            append_fn: LLVMValueRef = declare_or_get_named(m, "ctx_fstr_append", append_type)
+            piece_index: mutable usize = 0
+            while piece_index < datas.count |piece_index, datas, lengths, fstr_slot, append_type, append_fn, builder|:
+                append_args: mutable darray[LLVMValueRef] = [fstr_slot, datas[piece_index], lengths[piece_index]]
+                append_args_pointer: void& = (&append_args[0]).cast[void&] can Unsafe.PointerCast
+                _ = LLVMBuildCall2(builder, append_type, append_fn, append_args_pointer, 3, "")
+                piece_index <- piece_index + 1
+            return LLVMBuildLoad2(builder, dstr_header, fstr_slot, "fstr.result")
+
+
         # Whether the function declared at `line` returns an error union. The frontend
         # records error-returning functions by LINE in File.error_set_func_lines (the
         # `error[E]` clause is consumed at parse time; only this side table survives).
@@ -1700,6 +1758,8 @@ module Backend:
                 if call_callee is Expr.Ident(callee_name, callee_line):
                     # The `ctx_hash_value` builtin returns u64.
                     ValueType{kind: TypeKind.Unsigned, bits: 64} return if callee_name == "ctx_hash_value"
+                    # `__fstr(…)` builds a dstr (`darray[u8]`).
+                    intern_darray_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs) return if callee_name == "__fstr"
                     ValueType{kind: TypeKind.Unsigned, bits: 64} return if callee_name == "size_of"
                     intern_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs) return if callee_name == "arena_alloc"
                     # A GENERIC template is NOT in `fns` — only its instantiations are —
@@ -2364,6 +2424,9 @@ module Backend:
                 # of that name exists), lowered per the key's concrete type.
                 if callee_name == "ctx_hash_value" and arguments.count == 1:
                     return emit_hash_builtin(arguments[0], local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # `__fstr(pieces…)` — the f-string builder desugared from `f"…"`.
+                if callee_name == "__fstr":
+                    return emit_fstr_builtin(arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 # `size_of(T)` — the type's byte size as a compile-time constant (its argument
                 # is a TYPE, so it resolves as an annotation). The dict grow path sizes its
                 # bucket array with `size_of(DictBucket[K, T])`.
