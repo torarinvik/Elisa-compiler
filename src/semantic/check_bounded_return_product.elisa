@@ -62,27 +62,70 @@ extend Semantic:
                     _:
                         return false
 
-        def brp_walk(statements: darray[Ast::Stmt], unbounded: darray[sview]&, upper_bounded: darray[sview], function_name: sview, table: lmut SymbolTable) -> void:
+        # The single index argument of a refinement application `Law[ARG]` (Index) or `Law[ARG]`
+        # (IndexN with one arg), else Absent.
+        def brp_single_index_arg(application: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match application:
+                    Expr.Index(object, index, index_line):
+                        return index
+                    Expr.IndexN(object_n, arguments_n, indexn_line):
+                        return arguments_n[0] if arguments_n.count == 1 else (Ast::Expr.Absent)
+                    _:
+                        return (Ast::Expr.Absent)
+
+        # Bounds of a range refinement, handling BOTH the two-arg form `Law[lo, hi]` (via
+        # return_refinement_bounds) AND the single range-argument form `Law[lo..=hi]` /
+        # `Law[lo..<hi]` that stage0 accepts for a two-bound law.
+        def brp_refinement_bounds(type_expression: Ast::Expr, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&) -> (found: bool, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                direct: (found: bool, lo: i64, hi: i64) = return_refinement_bounds(type_expression, law_names, law_predicates)
+                direct return if direct.found
+                match type_expression:
+                    Expr.Binary(base, operator, application, binary_line):
+                        (false, 0, 0) return if operator != TokenKind.Is
+                        range_arg: Ast::Expr = brp_single_index_arg(application)
+                        return match range_arg:
+                            Expr.Binary(range_lo, range_op, range_hi, range_line):
+                                lo_lit: (found: bool, value: i64) = signed_int_literal(range_lo)
+                                hi_lit: (found: bool, value: i64) = signed_int_literal(range_hi)
+                                # `..=` inclusive keeps hi; `..`/`..<` exclusive is hi-1.
+                                inclusive: bool = range_op == TokenKind.RangeLe
+                                (lo_lit.found and hi_lit.found and is_range_operator(range_op), lo_lit.value, hi_lit.value if inclusive else hi_lit.value - 1)
+                            _:
+                                (false, 0, 0)
+                    _:
+                        return (false, 0, 0)
+
+        def brp_walk(statements: darray[Ast::Stmt], unbounded: darray[sview]&, upper_bounded: darray[sview], function_name: sview, return_finite: bool, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Return(value, line):
                             if value is returned:
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementReturnNotProven, name: function_name, line: line, expected: "", actual: ""}) if brp_has_unbounded_product(returned, unbounded, upper_bounded)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementReturnNotProven, name: function_name, line: line, expected: "", actual: ""}) if return_finite and brp_has_unbounded_product(returned, unbounded, upper_bounded)
+                        Stmt.VarDecl(name, type_expression, value, decl_line):
+                            # A refined-range local bound directly from an UNBOUNDED-above param
+                            # (`x: Bounded[0,500] = a`, a only lower-guarded) cannot be proven ≤ hi.
+                            law_name: sview = local_refinement_law_name(type_expression)
+                            bounds: (found: bool, lo: i64, hi: i64) = brp_refinement_bounds(type_expression, law_names, law_predicates) if law_name != "" else (false, 0, 0)
+                            value_name: sview = ident_name_of(value)
+                            value_unbounded: bool = value_name != "" and (any u in unbounded where u == value_name) and not (any b in upper_bounded where b == value_name)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRefinementUnproven, name: law_name, line: decl_line, expected: "", actual: name}) if bounds.found and bounds.hi < 9223372036854775807 and value_unbounded
                         Stmt.If(condition, then_body, else_body, line):
                             then_upper: mutable darray[sview] = [b for b in upper_bounded]
                             brp_collect_upper_bounded(condition, then_upper)
-                            table <- brp_walk(then_body, unbounded, then_upper, function_name, table)
-                            table <- brp_walk(else_body, unbounded, upper_bounded, function_name, table)
+                            table <- brp_walk(then_body, unbounded, then_upper, function_name, return_finite, law_names, law_predicates, table)
+                            table <- brp_walk(else_body, unbounded, upper_bounded, function_name, return_finite, law_names, law_predicates, table)
                         Stmt.While(condition, while_body, line):
-                            table <- brp_walk(while_body, unbounded, upper_bounded, function_name, table)
+                            table <- brp_walk(while_body, unbounded, upper_bounded, function_name, return_finite, law_names, law_predicates, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- brp_walk(for_body, unbounded, upper_bounded, function_name, table)
+                            table <- brp_walk(for_body, unbounded, upper_bounded, function_name, return_finite, law_names, law_predicates, table)
                         Stmt.Block(kind, clause, binding, block_body, line):
-                            table <- brp_walk(block_body, unbounded, upper_bounded, function_name, table)
+                            table <- brp_walk(block_body, unbounded, upper_bounded, function_name, return_finite, law_names, law_predicates, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table| -> table:
-                                table <- brp_walk(arm.body, unbounded, upper_bounded, function_name, table)
+                                table <- brp_walk(arm.body, unbounded, upper_bounded, function_name, return_finite, law_names, law_predicates, table)
                         _:
                             pass
 
@@ -115,18 +158,20 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            # return_finite gates the RETURN-product check (a violable finite upper
+                            # bound); the LOCAL refined-binding check runs regardless of the return.
+                            return_finite: mutable bool = false
                             if return_type is present_return:
-                                bounds: (found: bool, lo: i64, hi: i64) = return_refinement_bounds(present_return, law_names, law_predicates)
-                                # Only a FINITE upper bound is violable by an unbounded product.
-                                if bounds.found and bounds.hi < 9223372036854775807:
-                                    unbounded: mutable darray[sview] = []
-                                    for parameter in parameters |unbounded, alias_names|:
-                                        param_head: sview = bare_type_name(parameter.type_expression)
-                                        is_alias_typed: bool = any a in alias_names where a == param_head
-                                        unbounded.push(parameter.name) if local_refinement_law_name(parameter.type_expression) == "" and not is_alias_typed
-                                    upper_bounded: mutable darray[sview] = []
-                                    brp_collect_requires_upper(body, upper_bounded)
-                                    table <- brp_walk(body, unbounded, upper_bounded, function_name, table)
+                                rbounds: (found: bool, lo: i64, hi: i64) = brp_refinement_bounds(present_return, law_names, law_predicates)
+                                return_finite <- rbounds.found and rbounds.hi < 9223372036854775807
+                            unbounded: mutable darray[sview] = []
+                            for parameter in parameters |unbounded, alias_names|:
+                                param_head: sview = bare_type_name(parameter.type_expression)
+                                is_alias_typed: bool = any a in alias_names where a == param_head
+                                unbounded.push(parameter.name) if local_refinement_law_name(parameter.type_expression) == "" and not is_alias_typed
+                            upper_bounded: mutable darray[sview] = []
+                            brp_collect_requires_upper(body, upper_bounded)
+                            table <- brp_walk(body, unbounded, upper_bounded, function_name, return_finite, law_names, law_predicates, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- brp_walk_decls(module_body, law_names, law_predicates, alias_names, table)
                         Decl.Scoped(scoped_body, scoped_line):
