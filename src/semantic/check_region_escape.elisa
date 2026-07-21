@@ -231,7 +231,38 @@ extend Semantic:
                     Expr.Paren(inner, paren_line): region_escape_assign_target_root(inner)
                     _: sview("", 0, 0)
 
-        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        # The root ident of a stored VALUE expression, through field/index/paren/move selectors
+        # (`inner.xs` / `mid` -> "inner" / "mid"). A `copy(x)`/other-call value has no ident root,
+        # so a deep copy correctly launders the region (returns "").
+        def region_value_root_ident(value: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match value:
+                    Expr.Ident(name, ident_line): name
+                    Expr.Field(object, field_name, field_line): region_value_root_ident(object)
+                    Expr.Index(object, index, index_line): region_value_root_ident(object)
+                    Expr.Paren(inner, paren_line): region_value_root_ident(inner)
+                    Expr.Move(inner, move_line): region_value_root_ident(inner)
+                    _: sview("", 0, 0)
+
+        # The region a name has been TAINTED with (a value from that region flowed into it, directly
+        # or via a struct field/copy), or "".
+        def region_taint_lookup(taint_names: darray[sview]&, taint_regions: darray[sview]&, name: sview) -> sview:
+            can Abort.Panic:
+                found: mutable sview = sview("", 0, 0)
+                while probe < taint_names.count |found, probe: usize = 0|:
+                    found <- taint_regions[probe] if taint_names[probe] == name and found == "" and name != ""
+                    probe <- probe + 1
+                return found
+
+        # The region a stored value lives in: its own `@region` provenance, or — when it has none —
+        # the region tainting its root ident (a struct copied/field-assigned from a region value).
+        def effective_value_region(value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, taint_names: darray[sview]&, taint_regions: darray[sview]&, line: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                direct: sview = stored_value_region(value, annotations, view_fns, line)
+                direct return if direct != ""
+                return region_taint_lookup(taint_names, taint_regions, region_value_root_ident(value))
+
+        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, taint_names: darray[sview]&, taint_regions: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 target_name: sview = region_escape_assign_target_root(target)
                 return if target_name == ""
@@ -242,7 +273,7 @@ extend Semantic:
                 if target_is_global_mutable and value_is_ref_param:
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: "", actual: ""})
                     return
-                value_region: sview = stored_value_region(value, annotations, view_fns, line)
+                value_region: sview = effective_value_region(value, annotations, view_fns, taint_names, taint_regions, line)
                 return if value_region == ""
                 value_position: (found: bool, position: usize) = region_stack_position(nesting, value_region)
                 # Store of a function-local region value into a GLOBAL is an unconditional escape:
@@ -261,7 +292,12 @@ extend Semantic:
                 # locals participate — a region-annotated target goes through the nesting comparison
                 # below; an inner local (declared inside the region body) is not in outer_locals.
                 target_is_outer_local: bool = any outer_name in outer_locals where outer_name == target_name
-                if value_position.found and target_region == "" and target_is_outer_local:
+                # `outer_locals` is relative to the CURRENT (innermost) block, so it only proves the
+                # target outlives the value's region when the value lives in that innermost region.
+                # A value from an ENCLOSING region stored into a same-level local does not dangle (the
+                # local does not outlive that enclosing region), so require value_region == innermost.
+                value_is_innermost: bool = nesting.count > 0 and nesting[nesting.count - 1] == value_region
+                if value_position.found and target_region == "" and target_is_outer_local and value_is_innermost:
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: value_region, actual: value_region})
                     return
                 return if target_region == "" or target_region == value_region
@@ -304,7 +340,13 @@ extend Semantic:
                 # local (escape) from one stored into a region-body local (fine).
                 child_outer_locals: mutable darray[sview] = [name for name in outer_locals]
                 collect_level_local_names(statements, child_outer_locals)
-                for statement in statements |table| -> table:
+                # Value-taint accumulated within THIS statement list: a name maps to the region a
+                # value from that region flowed into it (a struct field-assigned or copied from a
+                # region-local). Local to this scope — the copy-launder escape occurs within one
+                # region block's body, so no cross-block threading is needed.
+                taint_names: mutable darray[sview] = []
+                taint_regions: mutable darray[sview] = []
+                for statement in statements |table, taint_names, taint_regions| -> table:
                     match statement:
                         Stmt.Block(kind, clause, binding, body, line):
                             is_region_block: bool = kind == "region" and clause.count > 0
@@ -320,9 +362,21 @@ extend Semantic:
                             table <- region_escape_check_store(expression, line, nesting, annotations, view_fns, table)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- region_escape_check_store(value, line, nesting, annotations, view_fns, table)
+                            # A local copied/derived from a region value carries that region's taint.
+                            var_region: sview = effective_value_region(value, annotations, view_fns, taint_names, taint_regions, line)
+                            if var_region != "":
+                                taint_names.push(name)
+                                taint_regions.push(var_region)
                         Stmt.Assign(target, operator, value, line):
                             table <- region_escape_check_store(value, line, nesting, annotations, view_fns, table)
-                            table <- region_escape_check_assign(target, value, line, nesting, annotations, mutable_globals, ref_params, outer_locals, view_fns, table)
+                            table <- region_escape_check_assign(target, value, line, nesting, annotations, mutable_globals, ref_params, outer_locals, view_fns, taint_names, taint_regions, table)
+                            # Storing a region value into a field of an aggregate taints the aggregate
+                            # (`inner.xs <- v` taints `inner`); a whole-value store taints the target.
+                            assign_region: sview = effective_value_region(value, annotations, view_fns, taint_names, taint_regions, line)
+                            assign_root: sview = region_escape_assign_target_root(target)
+                            if assign_region != "" and assign_root != "":
+                                taint_names.push(assign_root)
+                                taint_regions.push(assign_region)
                         Stmt.Return(value, line):
                             if value is returned:
                                 returned_region: sview = stored_value_region(returned, annotations, view_fns, line)
