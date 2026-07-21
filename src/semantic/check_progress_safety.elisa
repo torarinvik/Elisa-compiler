@@ -14,7 +14,7 @@ extend Semantic:
         # The block grants that discharge a loop's progress obligation.
         def progress_grant_is_evidence(grant: sview) -> bool:
             can Abort.Panic:
-                return grant == "Unsafe.AssumeProgress" or grant == "Unsafe.NonProgress" or grant == "Progress.Tick" or grant == "Progress.Yield"
+                return grant == "Unsafe.AssumeProgress" or grant == "Unsafe.NonProgress" or grant == "Progress.Tick" or grant == "Progress.Yield" or grant == "Progress.EnterRecursion"
 
         # Whether a statement list contains a progress-discharging `can/trusted …:` block
         # anywhere (recursing through control flow), so a hatch NESTED in the loop body counts.
@@ -206,8 +206,127 @@ extend Semantic:
                         _:
                             pass
 
+        # Zero-argument direct callee names in an expression (`f()`). A zero-arg call can
+        # carry no decreasing argument, so a CYCLE of such calls can never be structural
+        # recursion — it is provably non-progressing unless a member discharges it.
+        def progress_zero_arg_calls_expr(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        if arguments.count == 0:
+                            match callee:
+                                Expr.Ident(name, ident_line):
+                                    out.push(name)
+                                _:
+                                    pass
+                        progress_zero_arg_calls_expr(callee, out)
+                        for argument in arguments |out|:
+                            progress_zero_arg_calls_expr(argument, out)
+                    Expr.Binary(left, operator, right, line):
+                        progress_zero_arg_calls_expr(left, out)
+                        progress_zero_arg_calls_expr(right, out)
+                    Expr.Unary(operator, operand, line):
+                        progress_zero_arg_calls_expr(operand, out)
+                    Expr.Paren(inner, line):
+                        progress_zero_arg_calls_expr(inner, out)
+                    Expr.Field(object, field, line):
+                        progress_zero_arg_calls_expr(object, out)
+                    Expr.Index(object, index, line):
+                        progress_zero_arg_calls_expr(object, out)
+                        progress_zero_arg_calls_expr(index, out)
+                    _:
+                        pass
+
+        # Zero-arg direct callee names across a statement body (recursing control flow).
+        def progress_zero_arg_calls_body(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Expr(expression, expr_line):
+                            progress_zero_arg_calls_expr(expression, out)
+                        Stmt.Return(value, return_line):
+                            if value is present_value:
+                                progress_zero_arg_calls_expr(present_value, out)
+                        Stmt.VarDecl(name, type_expression, value, decl_line):
+                            progress_zero_arg_calls_expr(value, out)
+                        Stmt.Assign(target, operator, value, assign_line):
+                            progress_zero_arg_calls_expr(value, out)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            progress_zero_arg_calls_body(then_body, out)
+                            progress_zero_arg_calls_body(else_body, out)
+                        Stmt.While(condition, while_body, while_line):
+                            progress_zero_arg_calls_body(while_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            progress_zero_arg_calls_body(for_body, out)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            progress_zero_arg_calls_body(block_body, out)
+                        _:
+                            pass
+
+        # Whether a function body carries its own progress evidence: a `decreases` contract
+        # or a Progress/Unsafe budget block anywhere in the body.
+        def progress_func_has_evidence(body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if progress_body_has_decreases(body)
+                return progress_has_evidence_block(body)
+
+        # Whether zero-arg-call node `origin` can reach itself following zero-arg-call edges
+        # (a non-progressing recursive cycle). `visited` tracks nodes already expanded.
+        def progress_reaches_self(origin: usize, current: usize, names: darray[sview]&, has_evidence: darray[bool]&, callee_start: darray[usize]&, callee_count: darray[usize]&, all_callees: darray[sview]&, visited: mutable darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                edge: mutable usize = 0
+                while edge < callee_count[current] |edge, origin, current, names, has_evidence, callee_start, callee_count, all_callees, visited|:
+                    callee_name: sview = all_callees[callee_start[current] + edge]
+                    target: mutable i64 = -1
+                    probe: mutable usize = 0
+                    while probe < names.count |target, probe, callee_name, names|:
+                        target <- probe.i64() if names[probe] == callee_name and target < 0
+                        probe <- probe + 1
+                    if target >= 0:
+                        # A closed cycle back to the origin: non-progressing (origin has no
+                        # evidence, checked by the caller).
+                        true return if target.usize() == origin
+                        # Do NOT traverse through a node that carries its own progress
+                        # evidence — its `decreases`/budget discharges any cycle through it.
+                        if not visited[target.usize()] and not has_evidence[target.usize()]:
+                            visited[target.usize()] <- true
+                            true return if progress_reaches_self(origin, target.usize(), names, has_evidence, callee_start, callee_count, all_callees, visited)
+                    edge <- edge + 1
+                return false
+
+        # File-level pass: functions in a zero-arg recursive cycle with no progress evidence.
+        def progress_recursive_cycles(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                lines: mutable darray[u32] = []
+                has_evidence: mutable darray[bool] = []
+                callee_start: mutable darray[usize] = []
+                callee_count: mutable darray[usize] = []
+                all_callees: mutable darray[sview] = []
+                for declaration in declarations |names, lines, has_evidence, callee_start, callee_count, all_callees|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            names.push(function_name)
+                            lines.push(line)
+                            has_evidence.push(progress_func_has_evidence(body))
+                            callee_start.push(all_callees.count)
+                            local_callees: mutable darray[sview] = []
+                            progress_zero_arg_calls_body(body, local_callees)
+                            callee_count.push(local_callees.count)
+                            all_callees.extend(local_callees)
+                        _:
+                            pass
+                index: mutable usize = 0
+                while index < names.count |index, names, lines, has_evidence, callee_start, callee_count, all_callees, table|:
+                    if not has_evidence[index]:
+                        visited: mutable darray[bool] = [false for _ in names]
+                        if progress_reaches_self(index, index, names, has_evidence, callee_start, callee_count, all_callees, visited):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ProgressRecursiveCycle, name: names[index], line: lines[index], expected: "", actual: ""})
+                    index <- index + 1
+
         def check_progress_safety(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
+                table <- progress_recursive_cycles(declarations, table)
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
