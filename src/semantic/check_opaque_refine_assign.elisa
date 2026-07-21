@@ -1,0 +1,101 @@
+# A refined local bound from an OPAQUE call result cannot be proven: `x = make()` where
+# `make() -> i64` has a plain (unrefined) return and no `ensure` gives x no static bound, so
+# `y: i64 is Nat = x` (Nat = self >= 0) is unprovable — stage0 warns "refinement Nat on y
+# could not be proven statically". Companion of check_ensures_range_assign (which handles a
+# callee WITH an ensures range summary); this handles the no-summary / plain-return callee.
+#
+# SOUND (adjacency model, like check_ensures_range_assign): carry ONLY the immediately-
+# preceding `x = <opaque call>` binding; any intervening statement (a guard `if x >= 0:`, a
+# reassignment) clears it, so a value that could have been constrained is never used. Fire
+# only when the callee is a known plain-return function with NO ensures and the refined law is
+# range/lower/upper shaped (a genuine numeric bound). Unknown callees / refined-return callees
+# are a conservative miss.
+extend Semantic:
+    private:
+        # Whether a body has any `ensure`/`ensures` contract statement.
+        def ora_body_has_ensure(body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    if statement is Stmt.Contract(kind, expression, contract_line):
+                        true return if kind == "ensure" or kind == "ensures"
+                return false
+
+        # Names of functions with an OPAQUE result: an unrefined return type AND no `ensure`
+        # contract (either would give the result a static bound).
+        def ora_collect_opaque_fns(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            return_refined: mutable bool = false
+                            if return_type is present_return:
+                                return_refined <- local_refinement_law_name(present_return) != ""
+                            out.push(function_name) if not return_refined and not ora_body_has_ensure(body)
+                        Decl.Module(module_name, module_body, module_line):
+                            ora_collect_opaque_fns(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            ora_collect_opaque_fns(scoped_body, out)
+                        _:
+                            pass
+
+        # The bare callee name of a direct `f(...)` call value, or "".
+        def ora_opaque_call_name(value: Ast::Expr, opaque_fns: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        name: sview = ident_name_of(callee)
+                        return name if name != "" and (any f in opaque_fns where f == name) else sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        def ora_check_function(body: darray[Ast::Stmt], opaque_fns: darray[sview]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                prev_name: mutable sview = sview("", 0, 0)
+                prev_opaque: mutable bool = false
+                for statement in body |prev_name, prev_opaque, table| -> table:
+                    # First: a refined binding `y: Law[..] = <prev opaque binding>` is unproven.
+                    if statement is Stmt.VarDecl(y_name, y_type, y_value, y_line):
+                        law_name: sview = local_refinement_law_name(y_type)
+                        shape: sview = law_shape(law_name, law_names, law_predicates) if law_name != "" else sview("", 0, 0)
+                        source_name: sview = ident_name_of(y_value)
+                        numeric_law: bool = shape == "lower" or shape == "upper" or shape == "range"
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRefinementUnproven, name: law_name, line: y_line, expected: "", actual: y_name}) if numeric_law and prev_opaque and source_name != "" and source_name == prev_name
+                    # Then: recompute the carried binding from THIS statement (else clear it).
+                    next_name: mutable sview = sview("", 0, 0)
+                    next_value: mutable Ast::Expr = (Ast::Expr.Absent)
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, decl_line):
+                            next_name <- name
+                            next_value <- value
+                        Stmt.Assign(target, operator, value, assign_line):
+                            next_name <- ident_name_of(target) if operator == TokenKind.Assign
+                            next_value <- value if operator == TokenKind.Assign
+                        _:
+                            pass
+                    opaque_call: sview = ora_opaque_call_name(next_value, opaque_fns) if next_name != "" else sview("", 0, 0)
+                    prev_opaque <- opaque_call != ""
+                    prev_name <- next_name if opaque_call != "" else sview("", 0, 0)
+
+        def ora_walk_decls(declarations: darray[Ast::Decl], opaque_fns: darray[sview]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- ora_check_function(body, opaque_fns, law_names, law_predicates, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- ora_walk_decls(module_body, opaque_fns, law_names, law_predicates, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- ora_walk_decls(scoped_body, opaque_fns, law_names, law_predicates, table)
+                        _:
+                            pass
+
+        def check_opaque_refine_assign(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(file.top_decls, law_names, law_predicates)
+                return if law_names.count == 0
+                opaque_fns: mutable darray[sview] = []
+                ora_collect_opaque_fns(file.top_decls, opaque_fns)
+                return if opaque_fns.count == 0
+                table <- ora_walk_decls(file.top_decls, opaque_fns, law_names, law_predicates, table)
