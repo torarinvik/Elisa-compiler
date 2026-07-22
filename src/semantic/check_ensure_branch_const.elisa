@@ -95,6 +95,103 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
+        # A condition of the shape `NAME <op> LITERAL` (op/lit extracted), else not-found.
+        def ebc_ident_lit_cond(condition: Ast::Expr, name: sview) -> (found: bool, op: TokenKind, lit: i64):
+            can Memory.Allocate, Abort.Panic:
+                if condition is Expr.Binary(left, operator, right, binary_line):
+                    if ident_name_of(left) == name:
+                        bound: (found: bool, value: i64) = where_signed_literal(right)
+                        if bound.found:
+                            return (true, operator, bound.value)
+                return (false, TokenKind.Eof, 0)
+
+        # The last statement of a block is an early-exit `return`.
+        def ebc_ends_in_return(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if statements.count == 0
+                match statements[statements.count - 1]:
+                    Stmt.Return(value, line):
+                        return true
+                    _:
+                        return false
+
+        # A sound integer interval [lo, hi] (each bound optional) for the bare parameter `name` at the
+        # function's trailing `return name`, derived from its type, `requires` facts, and the NEGATION
+        # of every guarding `if COND: return ...` early-exit that precedes the tail (fallthrough facts).
+        def ebc_param_interval(body: darray[Ast::Stmt], name: sview, unsigned: bool) -> (lop: bool, lo: i64, hip: bool, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                lop: mutable bool = unsigned
+                lo: mutable i64 = 0
+                hip: mutable bool = false
+                hi: mutable i64 = 0
+                for statement in body |lop, lo, hip, hi|:
+                    match statement:
+                        Stmt.Contract(contract_kind, contract_expr, contract_line):
+                            if contract_kind == "requires":
+                                fact: (found: bool, op: TokenKind, lit: i64) = ebc_ident_lit_cond(contract_expr, name)
+                                if fact.found:
+                                    # requires x >= K / x > K tighten the lower bound; <= / < the upper.
+                                    if fact.op == TokenKind.GtEq and (not lop or fact.lit > lo):
+                                        lop <- true
+                                        lo <- fact.lit
+                                    if fact.op == TokenKind.Gt and (not lop or fact.lit + 1 > lo):
+                                        lop <- true
+                                        lo <- fact.lit + 1
+                                    if fact.op == TokenKind.LtEq and (not hip or fact.lit < hi):
+                                        hip <- true
+                                        hi <- fact.lit
+                                    if fact.op == TokenKind.Lt and (not hip or fact.lit - 1 < hi):
+                                        hip <- true
+                                        hi <- fact.lit - 1
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            # Only an early-exit guard constrains the fallthrough; add NOT(condition).
+                            if ebc_ends_in_return(then_body):
+                                guard: (found: bool, op: TokenKind, lit: i64) = ebc_ident_lit_cond(condition, name)
+                                if guard.found:
+                                    # not(x < K)  => x >= K ;  not(x <= K) => x > K (>= K+1)
+                                    if guard.op == TokenKind.Lt and (not lop or guard.lit > lo):
+                                        lop <- true
+                                        lo <- guard.lit
+                                    if guard.op == TokenKind.LtEq and (not lop or guard.lit + 1 > lo):
+                                        lop <- true
+                                        lo <- guard.lit + 1
+                                    # not(x > K)  => x <= K ;  not(x >= K) => x < K (<= K-1)
+                                    if guard.op == TokenKind.Gt and (not hip or guard.lit < hi):
+                                        hip <- true
+                                        hi <- guard.lit
+                                    if guard.op == TokenKind.GtEq and (not hip or guard.lit - 1 < hi):
+                                        hip <- true
+                                        hi <- guard.lit - 1
+                        _:
+                            pass
+                return (lop, lo, hip, hi)
+
+        # Does the parameter's known interval FAIL to entail `ensure result <op> LITERAL`?
+        # (Only a definite non-entailment fires; an interval that entails the predicate is silent.)
+        def ebc_param_return_unproven(predicate: Ast::Expr, body: darray[Ast::Stmt], name: sview, unsigned: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Binary(left, operator, right, binary_line):
+                        false return if ident_name_of(left) != "result"
+                        bound: (found: bool, value: i64) = where_signed_literal(right)
+                        false return if not bound.found
+                        iv: (lop: bool, lo: i64, hip: bool, hi: i64) = ebc_param_interval(body, name, unsigned)
+                        # entailed by the interval? then NOT unproven.
+                        false return if operator == TokenKind.Gt and iv.lop and iv.lo > bound.value
+                        false return if operator == TokenKind.GtEq and iv.lop and iv.lo >= bound.value
+                        false return if operator == TokenKind.Lt and iv.hip and iv.hi < bound.value
+                        false return if operator == TokenKind.LtEq and iv.hip and iv.hi <= bound.value
+                        false return if operator == TokenKind.EqEq and iv.lop and iv.hip and iv.lo == bound.value and iv.hi == bound.value
+                        # a comparison against a literal we understand, not entailed → unproven.
+                        return operator == TokenKind.Lt or operator == TokenKind.LtEq or operator == TokenKind.Gt or operator == TokenKind.GtEq or operator == TokenKind.EqEq
+                    _:
+                        return false
+
+        def ebc_is_unsigned_bare(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                bare: sview = bare_type_name(type_expression)
+                return bare == "u8" or bare == "u16" or bare == "u32" or bare == "u64" or bare == "usize" or bare == "uintptr" or bare == "uint"
+
         def ebc_check_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
@@ -105,6 +202,15 @@ extend Semantic:
                                 consts: mutable darray[i64] = []
                                 unknown: mutable bool = false
                                 ebc_interp(body, return_var, consts, unknown)
+                                # Case A: the returned variable was pinned to constants on some path.
+                                # Case B: the returned variable is a bare parameter never reassigned
+                                # (consts empty, not unknown) whose type/`requires` do not entail the ensure.
+                                param_unsigned: mutable bool = false
+                                param_is_return: mutable bool = false
+                                for parameter in parameters |param_unsigned, param_is_return|:
+                                    if parameter.name == return_var:
+                                        param_is_return <- true
+                                        param_unsigned <- ebc_is_unsigned_bare(parameter.type_expression)
                                 for statement in body |table| -> table:
                                     match statement:
                                         Stmt.Contract(contract_kind, contract_expr, contract_line):
@@ -112,6 +218,8 @@ extend Semantic:
                                                 violated: mutable bool = false
                                                 for c in consts |violated|:
                                                     violated <- true if predicate_violated_by(contract_expr, "result", c)
+                                                if consts.count == 0 and not unknown and param_is_return:
+                                                    violated <- true if ebc_param_return_unproven(contract_expr, body, return_var, param_unsigned)
                                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsureNotProven, name: function_name, line: contract_line, expected: "", actual: ""}) if violated
                                         _:
                                             pass
