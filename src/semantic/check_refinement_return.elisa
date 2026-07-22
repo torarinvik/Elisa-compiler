@@ -211,25 +211,72 @@ extend Semantic:
                     _:
                         return false
 
+        # A range-shaped law `self >= lo and self <op hi` — like law_predicate_is_range_shape
+        # but ALSO accepts an EXCLUSIVE upper (`self < hi`), reporting whether it is strict.
+        def dependent_law_shape(predicate: Ast::Expr) -> (is_range: bool, strict_upper: bool):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Binary(left, operator, right, line):
+                        (false, false) return if operator != TokenKind.And
+                        lower_ok: bool = comparison_on_self(left, TokenKind.GtEq)
+                        upper_le: bool = comparison_on_self(right, TokenKind.LtEq)
+                        upper_lt: bool = comparison_on_self(right, TokenKind.Lt)
+                        return (lower_ok and (upper_le or upper_lt), upper_lt)
+                    _:
+                        return (false, false)
+
         # A DEPENDENT range window `Bounded[CONST, VAR]` (`-> i64 is Bounded[0, limit]`):
-        # the lower bound is a constant, the upper a parameter. found=false otherwise.
-        def dependent_return_window(return_type: Ast::Expr, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&) -> (found: bool, lo: i64, hi_var: sview):
+        # the lower bound is a constant, the upper a parameter. `strict_upper` = the law uses
+        # `self < hi` (exclusive) rather than `self <= hi`. found=false otherwise.
+        def dependent_return_window(return_type: Ast::Expr, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&) -> (found: bool, lo: i64, hi_var: sview, strict_upper: bool):
             can Memory.Allocate, Abort.Panic:
                 match return_type:
                     Expr.Binary(base, operator, application, line):
-                        (false, 0, sview("", 0, 0)) return if operator != TokenKind.Is
+                        (false, 0, sview("", 0, 0), false) return if operator != TokenKind.Is
                         match application:
                             Expr.IndexN(law_object, law_arguments, law_line):
                                 law_name: sview = ident_name_of(law_object)
-                                (false, 0, sview("", 0, 0)) return if law_arguments.count != 2 or law_shape(law_name, law_names, law_predicates) != "range"
+                                shape: (is_range: bool, strict_upper: bool) = dependent_law_shape(law_predicate_by_name(law_name, law_names, law_predicates))
+                                (false, 0, sview("", 0, 0), false) return if law_arguments.count != 2 or not shape.is_range
                                 lo_literal: (found: bool, value: i64) = signed_int_literal(law_arguments[0])
                                 hi_name: sview = ident_name_of(law_arguments[1])
-                                (true, lo_literal.value, hi_name) return if lo_literal.found and hi_name != ""
-                                return (false, 0, sview("", 0, 0))
+                                (true, lo_literal.value, hi_name, shape.strict_upper) return if lo_literal.found and hi_name != ""
+                                return (false, 0, sview("", 0, 0), false)
                             _:
-                                return (false, 0, sview("", 0, 0))
+                                return (false, 0, sview("", 0, 0), false)
                     _:
-                        return (false, 0, sview("", 0, 0))
+                        return (false, 0, sview("", 0, 0), false)
+
+        # Whether the `requires` list entails `sub <op> upper` (both variables) at the strictness
+        # the caller needs. strict_needed => only `<`/`>` counts; else `<=`/`<`/`>=`/`>` all do.
+        def requires_proves_relation(requires_predicates: darray[Ast::Expr]&, sub: sview, upper: sview, strict_needed: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for required in requires_predicates |sub, upper, strict_needed|:
+                    true return if relation_pred_proves(required, sub, upper, strict_needed)
+                return false
+
+        def relation_pred_proves(predicate: Ast::Expr, sub: sview, upper: sview, strict_needed: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return relation_pred_proves(inner, sub, upper, strict_needed)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            true return if relation_pred_proves(left, sub, upper, strict_needed)
+                            return relation_pred_proves(right, sub, upper, strict_needed)
+                        left_name: sview = ident_name_of(left)
+                        right_name: sview = ident_name_of(right)
+                        # sub < upper  /  sub <= upper
+                        if left_name == sub and right_name == upper:
+                            true return if operator == TokenKind.Lt
+                            return operator == TokenKind.LtEq and not strict_needed
+                        # upper > sub  /  upper >= sub
+                        if left_name == upper and right_name == sub:
+                            true return if operator == TokenKind.Gt
+                            return operator == TokenKind.GtEq and not strict_needed
+                        return false
+                    _:
+                        return false
 
 
         # The refinement window of a PARAM annotation, resolving named aliases
@@ -488,8 +535,17 @@ extend Semantic:
                 alias_bounds: (found: bool, lo: i64, hi: i64) = param_refinement_window(return_type, law_names, law_predicates, ret_alias_names, ret_alias_bases)
                 bounds: (found: bool, lo: i64, hi: i64) = alias_bounds if alias_bounds.found else refined_param_bounds(return_type, law_names, law_predicates)
                 single_bound_window: bool = not alias_bounds.found and bounds.found
-                dependent: (found: bool, lo: i64, hi_var: sview) = dependent_return_window(return_type, law_names, law_predicates) if not bounds.found else (false, 0, sview("", 0, 0))
+                dependent: (found: bool, lo: i64, hi_var: sview, strict_upper: bool) = dependent_return_window(return_type, law_names, law_predicates) if not bounds.found else (false, 0, sview("", 0, 0), false)
                 return if not bounds.found and not dependent.found
+                # Raw `requires` predicates (for the dependent RELATIONAL tier: a variable return
+                # `raw` into `[0, cap]` needs `requires raw < cap` / `raw <= cap` per strictness).
+                dep_requires: mutable darray[Ast::Expr] = []
+                for dep_statement in body |dep_requires|:
+                    match dep_statement:
+                        Stmt.Contract(dep_kind, dep_expression, dep_line):
+                            dep_requires.push(dep_expression) if dep_kind == "requires"
+                        _:
+                            pass
                 # A SINGLE straight-line return is additionally judged by RANGE over the
                 # parameter windows: an out-of-window or unboundable (division, cast,
                 # windowless leaf) result is unproven. Branchy bodies may prove the
@@ -574,8 +630,14 @@ extend Semantic:
                                         dep_floor_slot <- dep_probe.i64() if floor_names[dep_probe] == dependent.hi_var and dep_floor_slot < 0
                                         dep_probe <- dep_probe + 1
                                     dep_floor_known: bool = dep_floor_slot >= 0
-                                    dep_ok: bool = dep_literal.found and dep_literal.value >= dependent.lo and dep_floor_known and dep_literal.value <= floor_values[dep_floor_slot.usize()]
-                                    range_unproven <- not dep_ok
+                                    dep_const_ok: bool = dep_literal.found and dep_literal.value >= dependent.lo and dep_floor_known and dep_literal.value <= floor_values[dep_floor_slot.usize()]
+                                    # RELATIONAL tier: a plain-variable return `raw` into `[0, cap]`
+                                    # is proven iff a `requires` entails `raw < cap` (strict law) or
+                                    # `raw <= cap` (inclusive). lo<=0 keeps the free unsigned lower
+                                    # bound sound; other lows are left unproven (a sound miss).
+                                    dep_var: sview = ident_name_of(returned)
+                                    dep_relational_ok: bool = dep_var != "" and dependent.lo <= 0 and requires_proves_relation(dep_requires, dep_var, dependent.hi_var, dependent.strict_upper)
+                                    range_unproven <- not (dep_const_ok or dep_relational_ok)
                                 if bounds.found and return_count == 1 and not branchy:
                                     # Requires-derived windows are an SMT-tier fact:
                                     # stage0's basic prover does not consume `requires`
