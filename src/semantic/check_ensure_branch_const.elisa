@@ -1,0 +1,128 @@
+# Branchy ensure postcondition, constant-return slice. check_ensure_strict handles only single-return,
+# non-branchy bodies; a body that assigns the returned variable a CONSTANT on one branch (and a
+# different constant / nothing on another) is left unproven. This pass abstract-interprets the
+# returned variable over a tiny constant domain (known-consts + unknown), joining `if` branches and
+# giving up (→ unknown) on loops, then flags a reachable constant value that VIOLATES an `ensure`
+# predicate — stage0 reports "ensure postcondition ... could not be proven".
+#
+# SOUND: only a definitely-reachable constant that provably breaks the predicate fires (a strict
+# subset of "not provable"); a value the analysis cannot pin to a constant is unknown → never flags.
+extend Semantic:
+    private:
+        # The constant integer value of an expression, or not-found.
+        def ebc_const_value(value: Ast::Expr) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                return where_signed_literal(value)
+
+        # Merge value `v` into a constant set (dedup).
+        def ebc_add_const(consts: mutable darray[i64]&, v: i64) -> void:
+            can Memory.Allocate, Abort.Panic:
+                consts.push(v) if not (any c in consts where c == v)
+
+        # Does any statement in `body` assign `var` (so a loop makes it unknown)?
+        def ebc_assigns_var(statements: darray[Ast::Stmt], var: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            true return if ident_name_of(target) == var
+                        Stmt.VarDecl(name, type_expression, decl_value, line):
+                            true return if name == var
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if ebc_assigns_var(then_body, var)
+                            true return if ebc_assigns_var(else_body, var)
+                        Stmt.While(while_condition, while_body, while_line):
+                            true return if ebc_assigns_var(while_body, var)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            true return if ebc_assigns_var(for_body, var)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if ebc_assigns_var(block_body, var)
+                        _:
+                            pass
+                return false
+
+        # Abstract-interpret `var`'s value over the statements, updating (consts, unknown).
+        def ebc_interp(statements: darray[Ast::Stmt], var: sview, consts: mutable darray[i64]&, unknown: mutable bool&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |consts, unknown|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            if name == var:
+                                cv: (found: bool, value: i64) = ebc_const_value(value)
+                                consts <- consts.truncate(0)
+                                unknown <- not cv.found
+                                ebc_add_const(consts, cv.value) if cv.found
+                        Stmt.Assign(target, operator, value, line):
+                            if ident_name_of(target) == var and operator == TokenKind.LArrow:
+                                cv: (found: bool, value: i64) = ebc_const_value(value)
+                                consts <- consts.truncate(0)
+                                unknown <- not cv.found
+                                ebc_add_const(consts, cv.value) if cv.found
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            then_consts: mutable darray[i64] = [c for c in consts]
+                            then_unknown: mutable bool = unknown
+                            ebc_interp(then_body, var, then_consts, then_unknown)
+                            else_consts: mutable darray[i64] = [c for c in consts]
+                            else_unknown: mutable bool = unknown
+                            ebc_interp(else_body, var, else_consts, else_unknown)
+                            consts <- consts.truncate(0)
+                            for c in then_consts |consts|:
+                                ebc_add_const(consts, c)
+                            for c in else_consts |consts|:
+                                ebc_add_const(consts, c)
+                            unknown <- then_unknown or else_unknown
+                        Stmt.While(while_condition, while_body, while_line):
+                            if ebc_assigns_var(while_body, var):
+                                consts <- consts.truncate(0)
+                                unknown <- true
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            if ebc_assigns_var(for_body, var):
+                                consts <- consts.truncate(0)
+                                unknown <- true
+                        _:
+                            pass
+
+        # The bare returned variable name of a body whose LAST statement is `return VAR`, else "".
+        def ebc_return_var(statements: darray[Ast::Stmt]) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                if statements.count == 0:
+                    return sview("", 0, 0)
+                match statements[statements.count - 1]:
+                    Stmt.Return(value, line):
+                        if value is returned:
+                            return ident_name_of(returned)
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        def ebc_check_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            return_var: sview = ebc_return_var(body)
+                            if return_var != "":
+                                consts: mutable darray[i64] = []
+                                unknown: mutable bool = false
+                                ebc_interp(body, return_var, consts, unknown)
+                                for statement in body |table| -> table:
+                                    match statement:
+                                        Stmt.Contract(contract_kind, contract_expr, contract_line):
+                                            if contract_kind == "ensure":
+                                                violated: mutable bool = false
+                                                for c in consts |violated|:
+                                                    violated <- true if predicate_violated_by(contract_expr, "result", c)
+                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsureNotProven, name: function_name, line: contract_line, expected: "", actual: ""}) if violated
+                                        _:
+                                            pass
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- ebc_check_declarations(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- ebc_check_declarations(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_ensure_branch_const(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- ebc_check_declarations(declarations, table)
