@@ -1,0 +1,159 @@
+# Function-body `invariant EXPR` proof (stage0's design-by-contract invariant gate). stage0's
+# invariant prover is WEAK: it accepts an invariant that RESTATES a `requires`, restates a
+# `self`-parameter's struct invariant, or reduces to a reflexive comparison after resolving
+# straight-line (incl. `ghost`) locals to their definitions — `ghost shadow = n; invariant
+# shadow == n` proves (shadow == n reflexively). It does NOT do arithmetic/interval reasoning,
+# so `ghost g = x + 1; invariant g > x` WARNS "invariant could not be proven statically…"
+# even though it is logically true. This pass mirrors that exactly and warns otherwise.
+#
+# SOUND toward stage0: we prove ONLY the restatement/reflexive cases stage0 proves and warn on
+# everything else — the same envelope stage0 uses (no linear tier). Loop `invariant`s are handled
+# by the loop-invariant checks; only a function-body top-level invariant is judged here.
+extend Semantic:
+    private:
+        # Resolve an expression's HEAD to an existing node: while it is an identifier bound to a
+        # straight-line local, replace it with that local's (recursively resolved) defining value.
+        # Returns an EXISTING node (no allocation), unwrapping parens.
+        def fi_resolve_head(expression: Ast::Expr, local_names: darray[sview]&, local_values: darray[Ast::Expr]&, depth: u32) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                (expression) return if depth > 24
+                match expression:
+                    Expr.Ident(name, line):
+                        probe: mutable usize = 0
+                        while probe < local_names.count |probe, name, local_names, local_values, depth|:
+                            (fi_resolve_head(local_values[probe], local_names, local_values, depth + 1)) return if local_names[probe] == name
+                            probe <- probe + 1
+                        return expression
+                    Expr.Paren(inner, line):
+                        return fi_resolve_head(inner, local_names, local_values, depth + 1)
+                    _:
+                        return expression
+
+        # Structural equality of two expressions with straight-line locals resolved at every
+        # level (no allocation). `shadow == n` reduces both sides to `n`; `g` (= x + 1) vs `x`
+        # differ (Binary vs Ident).
+        def fi_equal_resolved(a: Ast::Expr, b: Ast::Expr, local_names: darray[sview]&, local_values: darray[Ast::Expr]&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 24
+                resolved_a: Ast::Expr = fi_resolve_head(a, local_names, local_values, 0)
+                resolved_b: Ast::Expr = fi_resolve_head(b, local_names, local_values, 0)
+                match resolved_a:
+                    Expr.Ident(a_name, a_line):
+                        return match resolved_b:
+                            Expr.Ident(b_name, b_line): a_name == b_name
+                            _: false
+                    Expr.IntLit(a_value):
+                        return match resolved_b:
+                            Expr.IntLit(b_value): a_value == b_value
+                            _: false
+                    Expr.Binary(a_left, a_operator, a_right, a_line):
+                        return match resolved_b:
+                            Expr.Binary(b_left, b_operator, b_right, b_line): a_operator == b_operator and fi_equal_resolved(a_left, b_left, local_names, local_values, depth + 1) and fi_equal_resolved(a_right, b_right, local_names, local_values, depth + 1)
+                            _: false
+                    Expr.Unary(a_operator, a_operand, a_line):
+                        return match resolved_b:
+                            Expr.Unary(b_operator, b_operand, b_line): a_operator == b_operator and fi_equal_resolved(a_operand, b_operand, local_names, local_values, depth + 1)
+                            _: false
+                    Expr.Field(a_object, a_field, a_line):
+                        return match resolved_b:
+                            Expr.Field(b_object, b_field, b_line): a_field == b_field and fi_equal_resolved(a_object, b_object, local_names, local_values, depth + 1)
+                            _: false
+                    _:
+                        return false
+
+        # Collect the (name, value) of every straight-line `NAME = V` / `ghost NAME = V` local,
+        # in declaration order — an unconditional VarDecl at the function body top level.
+        def fi_collect_locals(body: darray[Ast::Stmt], names: mutable darray[sview]&, values: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |names, values|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            names.push(name)
+                            values.push(value)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            # A `ghost:` block's bindings are straight-line locals too.
+                            fi_collect_locals(block_body, names, values) if kind == "ghost"
+                        _:
+                            pass
+
+        # The struct invariants of any `self`-typed parameter, flattened.
+        def fi_collect_self_invariants(parameters: darray[Ast::ParamDecl], struct_names: darray[sview]&, inv_starts: darray[usize]&, inv_counts: darray[usize]&, all_invariants: darray[Ast::Expr]&, out: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for parameter in parameters |out, struct_names, inv_starts, inv_counts, all_invariants|:
+                    if parameter.name == "self":
+                        self_struct: sview = es_unwrap_type_name(parameter.type_expression)
+                        struct_probe: mutable usize = 0
+                        while struct_probe < struct_names.count |struct_probe, self_struct, struct_names, inv_starts, inv_counts, all_invariants, out|:
+                            if struct_names[struct_probe] == self_struct:
+                                inv_index: mutable usize = inv_starts[struct_probe]
+                                inv_end: usize = inv_index + inv_counts[struct_probe]
+                                while inv_index < inv_end |inv_index, inv_end, all_invariants, out|:
+                                    out.push(all_invariants[inv_index])
+                                    inv_index <- inv_index + 1
+                            struct_probe <- struct_probe + 1
+
+        # Whether INVARIANT is provable by stage0's weak tier.
+        def fi_invariant_proven(invariant_expression: Ast::Expr, requires_predicates: darray[Ast::Expr]&, self_invariants: darray[Ast::Expr]&, local_names: darray[sview]&, local_values: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if ese_is_tautology(invariant_expression)
+                # Verbatim restatement of a `requires` or a self struct invariant.
+                true return if any required in requires_predicates where expressions_equal(invariant_expression, required)
+                true return if any self_invariant in self_invariants where expressions_equal(invariant_expression, self_invariant)
+                # Reflexive comparison after resolving straight-line locals to their definitions.
+                match invariant_expression:
+                    Expr.Binary(left, operator, right, binary_line):
+                        false return if not is_reflexively_true_operator(operator)
+                        return fi_equal_resolved(left, right, local_names, local_values, 0)
+                    _:
+                        return false
+
+        def fi_check_function(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], ghost_lines: darray[u32]&, struct_names: darray[sview]&, inv_starts: darray[usize]&, inv_counts: darray[usize]&, all_invariants: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                requires_predicates: mutable darray[Ast::Expr] = []
+                for statement in body |requires_predicates|:
+                    match statement:
+                        Stmt.Contract(kind, expression, contract_line):
+                            requires_predicates.push(expression) if kind == "requires"
+                        _:
+                            pass
+                self_invariants: mutable darray[Ast::Expr] = []
+                fi_collect_self_invariants(parameters, struct_names, inv_starts, inv_counts, all_invariants, self_invariants)
+                local_names: mutable darray[sview] = []
+                local_values: mutable darray[Ast::Expr] = []
+                fi_collect_locals(body, local_names, local_values)
+                # A function-level invariant is judged ONLY when it reads a GHOST local: stage0
+                # can't track a ghost's arithmetic (so it warns), but PROVES real-local invariants
+                # via flow reasoning this weak tier doesn't model — restricting to ghost reads keeps
+                # us a strict subset of stage0's warnings (no false positive on flow-proven ones).
+                ghost_names: mutable darray[sview] = []
+                collect_ghost_local_names(body, ghost_lines, ghost_names)
+                for statement in body |table, requires_predicates, self_invariants, local_names, local_values, ghost_names| -> table:
+                    match statement:
+                        Stmt.Contract(kind, expression, contract_line):
+                            if kind == "invariant" and expression_reads_ghost(expression, ghost_names) != "":
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FunctionInvariantUnproven, name: "", line: contract_line, expected: "", actual: ""}) if not fi_invariant_proven(expression, requires_predicates, self_invariants, local_names, local_values)
+                        _:
+                            pass
+
+        def fi_check_declarations(declarations: darray[Ast::Decl], ghost_lines: darray[u32]&, struct_names: darray[sview]&, inv_starts: darray[usize]&, inv_counts: darray[usize]&, all_invariants: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- fi_check_function(parameters, body, ghost_lines, struct_names, inv_starts, inv_counts, all_invariants, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- fi_check_declarations(module_body, ghost_lines, struct_names, inv_starts, inv_counts, all_invariants, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- fi_check_declarations(scoped_body, ghost_lines, struct_names, inv_starts, inv_counts, all_invariants, table)
+                        _:
+                            pass
+
+    public:
+        def check_function_invariant(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                struct_names: mutable darray[sview] = []
+                inv_starts: mutable darray[usize] = []
+                inv_counts: mutable darray[usize] = []
+                all_invariants: mutable darray[Ast::Expr] = []
+                es_collect_struct_invariants(file.top_decls, struct_names, inv_starts, inv_counts, all_invariants)
+                table <- fi_check_declarations(file.top_decls, file.ghost_local_lines, struct_names, inv_starts, inv_counts, all_invariants, table)
