@@ -59,21 +59,52 @@ extend Semantic:
                     _:
                         return false
 
+        # An owned-container member type through a `mutable`/paren wrapper (`mutable darray[i64]`
+        # -> darray). Such a member holds inferred-region heap storage.
+        def member_type_is_owned_container(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        member_type_is_owned_container(operand) return if operator == TokenKind.Mutable
+                        return return_type_is_owned_container(type_expression)
+                    Expr.Paren(inner, paren_line):
+                        return member_type_is_owned_container(inner)
+                    _:
+                        return return_type_is_owned_container(type_expression)
+
+        # Struct names that OWN inferred-region heap storage — a member is an owned container.
+        # A function returning such a struct (built from container literals, no region param)
+        # yields an inferred-region value, exactly like a bare-container return.
+        def collect_container_structs(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                            has_container: bool = any member in members where member_type_is_owned_container(member.type_expression)
+                            out.push(struct_name) if has_container
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_container_structs(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_container_structs(scoped_body, out)
+                        _:
+                            pass
+
         # Free functions that allocate an owned container in the AMBIENT region and return it — a
-        # bare-owned-container return type AND no region parameters (a region-poly function allocates
-        # in its region param, not the caller's block). A call to one inside a region block yields a
-        # value living in that block's region.
-        def region_escape_collect_container_fns(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+        # bare-owned-container return type OR a container-owning struct, AND no region parameters (a
+        # region-poly function allocates in its region param, not the caller's block). A call to one
+        # inside a region block yields a value living in that block's region.
+        def region_escape_collect_container_fns(declarations: darray[Ast::Decl], container_structs: darray[sview]&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |out|:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, effects, decorators, line):
                             if return_type is declared_return:
-                                out.push(name) if return_type_is_owned_container(declared_return) and not func_has_region_param(parameters)
+                                returns_container_struct: bool = any container_struct in container_structs where container_struct == ident_name_of(declared_return)
+                                out.push(name) if (return_type_is_owned_container(declared_return) or returns_container_struct) and not func_has_region_param(parameters)
                         Decl.Module(module_name, module_body, module_line):
-                            region_escape_collect_container_fns(module_body, out)
+                            region_escape_collect_container_fns(module_body, container_structs, out)
                         Decl.Scoped(scoped_body, scoped_line):
-                            region_escape_collect_container_fns(scoped_body, out)
+                            region_escape_collect_container_fns(scoped_body, container_structs, out)
                         _:
                             pass
 
@@ -286,6 +317,17 @@ extend Semantic:
                     Expr.Paren(inner, paren_line): region_escape_assign_target_root(inner)
                     _: sview("", 0, 0)
 
+        # The callee name of a direct call VALUE (`make_users()` -> "make_users"), else "".
+        def region_escape_call_callee_name(value: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        return ident_name_of(callee)
+                    Expr.Paren(inner, paren_line):
+                        return region_escape_call_callee_name(inner)
+                    _:
+                        return sview("", 0, 0)
+
         # Whether an assignment target selects a FIELD (`out.p`, `a.b.c`) rather than being a
         # whole binding (`out`) — a forwarded-ref store escapes only through a field of a
         # longer-lived ref target, never a whole-binding assign (which is a type error).
@@ -351,7 +393,7 @@ extend Semantic:
                     _:
                         return sview("", 0, 0)
 
-        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, taint_names: darray[sview]&, taint_regions: darray[sview]&, table: lmut SymbolTable) -> void:
+        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, container_fns: darray[sview]&, taint_names: darray[sview]&, taint_regions: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 target_name: sview = region_escape_assign_target_root(target)
                 return if target_name == ""
@@ -369,6 +411,15 @@ extend Semantic:
                 target_is_field: bool = region_escape_is_field_target(target)
                 target_root_is_ref_param: bool = any ref_name in ref_params where ref_name == target_name
                 if target_is_field and target_root_is_ref_param and value_is_ref_param:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: "", actual: ""})
+                    return
+                # `dst.users <- make_users()` — an inferred-region container value (a call to an
+                # owned-container / container-struct-returning free function) stored into a ref
+                # parameter's field escapes: the inferred region is freed at scope exit while the
+                # caller-owned target outlives it. stage0: "escapes its `in auto:` scope".
+                value_callee_name: sview = region_escape_call_callee_name(value)
+                value_is_container_call: bool = value_callee_name != "" and (any container_fn in container_fns where container_fn == value_callee_name)
+                if target_is_field and target_root_is_ref_param and value_is_container_call:
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: "", actual: ""})
                     return
                 value_region: sview = effective_value_region(value, annotations, view_fns, taint_names, taint_regions, line)
@@ -467,7 +518,7 @@ extend Semantic:
                                 taint_regions.push(var_region)
                         Stmt.Assign(target, operator, value, line):
                             table <- region_escape_check_store(value, line, nesting, annotations, view_fns, table)
-                            table <- region_escape_check_assign(target, value, line, nesting, annotations, mutable_globals, ref_params, outer_locals, view_fns, taint_names, taint_regions, table)
+                            table <- region_escape_check_assign(target, value, line, nesting, annotations, mutable_globals, ref_params, outer_locals, view_fns, container_fns, taint_names, taint_regions, table)
                             # Storing a region value into a field of an aggregate taints the aggregate
                             # (`inner.xs <- v` taints `inner`); a whole-value store taints the target.
                             assign_region: sview = region_escape_stored_or_call_region(value, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line)
@@ -513,6 +564,8 @@ extend Semantic:
                 collect_mutable_globals(file.top_decls, mutable_globals)
                 view_fns: mutable darray[sview] = []
                 collect_view_returning_fns(file.top_decls, view_fns)
+                container_structs: mutable darray[sview] = []
+                collect_container_structs(file.top_decls, container_structs)
                 container_fns: mutable darray[sview] = []
-                region_escape_collect_container_fns(file.top_decls, container_fns)
+                region_escape_collect_container_fns(file.top_decls, container_structs, container_fns)
                 table <- check_region_escape_walk(file.top_decls, file.local_region_annotations, mutable_globals, view_fns, container_fns, table)
