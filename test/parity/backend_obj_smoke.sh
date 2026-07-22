@@ -124,6 +124,10 @@ obj_case lambda_capture 'def apply(fn: fn(i64) -> i64, value: i64) -> i64:\n    
 # arg like f(21) adopts the param type). adder(2) captures n=2; f(40) = 42.
 obj_case higher_order_named 'def dbl(x: i64) -> i64:\n    return x * 2\n\ndef getfn() -> fn(i64) -> i64:\n    return dbl\n\ndef main() -> i64:\n    f: fn(i64) -> i64 = getfn()\n    return f(21)\n' 42
 obj_case higher_order_closure 'def adder(n: i64) -> fn(i64) -> i64:\n    return fn(x) => x + n\n\ndef main() -> i64:\n    f: fn(i64) -> i64 = adder(2)\n    return f(40)\n' 42
+# STRING ITERATION `for c in s`: sview iterates bytes by index<len; cstr until a 0 byte; the
+# loop var is a u8. "AB" byte-sum 65+66=131; -89 = 42 (verified byte-identical to stage0).
+obj_case sview_iter 'def main() -> i64:\n    s: sview = "AB"\n    total: mutable i64 = 0\n    for c in s |total|:\n        total <- total + c.i64()\n    return total - 89\n' 42
+obj_case cstr_iter 'def main() -> i64:\n    s: cstr = "AB"\n    total: mutable i64 = 0\n    for c in s |total|:\n        total <- total + c.i64()\n    return total - 89\n' 42
 
 # The comprehension actually VECTORIZES. This is the only check in the suite that asserts
 # Elisa's central performance claim rather than its behaviour: a comprehension exists to be
