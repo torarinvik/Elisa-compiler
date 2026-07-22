@@ -1,0 +1,144 @@
+# Mutually-recursive `decreases` cycle. A function that declares a `decreases` measure and sits in a
+# call cycle passing through at least one OTHER function (a -> b -> ... -> a) cannot have its measure
+# proven to strictly decrease across the cycle by the non-SMT prover — stage0 always errors ("cannot
+# prove the `decreases` measure strictly decreases across the mutually-recursive cycle containing X").
+# (Even measures on every cycle member do not help without the solver, so the structural presence of
+# a length>=2 cycle through a decreases-carrying function is exactly the trigger — a sound match.)
+extend Semantic:
+    private:
+        # Record every function's name + whether it carries a `decreases` clause + that clause's line.
+        def mdc_collect_functions(declarations: darray[Ast::Decl], names: mutable darray[sview]&, has_decreases: mutable darray[bool]&, decreases_line: mutable darray[u32]&, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, has_decreases, decreases_line, edge_from, edge_to|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            found_line: mutable u32 = 0
+                            for statement in body |found_line|:
+                                match statement:
+                                    Stmt.Contract(contract_kind, contract_expr, contract_line):
+                                        found_line <- contract_line if contract_kind == "decreases" and found_line == 0
+                                    _:
+                                        pass
+                            names.push(function_name)
+                            has_decreases.push(found_line != 0)
+                            decreases_line.push(found_line)
+                            mdc_collect_calls(body, function_name, edge_from, edge_to)
+                        Decl.Module(module_name, module_body, module_line):
+                            mdc_collect_functions(module_body, names, has_decreases, decreases_line, edge_from, edge_to)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            mdc_collect_functions(scoped_body, names, has_decreases, decreases_line, edge_from, edge_to)
+                        _:
+                            pass
+
+        # The callee name of a call expression: `f(..)` -> "f", UFCS `x.m(..)` -> "m".
+        def mdc_callee_name(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                    match callee:
+                        Expr.Ident(name, ident_line):
+                            return name
+                        Expr.Field(receiver, method_name, field_line):
+                            return method_name
+                        _:
+                            return sview("", 0, 0)
+                return sview("", 0, 0)
+
+        def mdc_scan_expr(expression: Ast::Expr, caller: sview, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                callee: sview = mdc_callee_name(expression)
+                if callee != "":
+                    edge_from.push(caller)
+                    edge_to.push(callee)
+                match expression:
+                    Expr.Call(call_callee, arguments, argument_names, call_line):
+                        mdc_scan_expr(call_callee, caller, edge_from, edge_to)
+                        for argument in arguments |edge_from, edge_to|:
+                            mdc_scan_expr(argument, caller, edge_from, edge_to)
+                    Expr.Binary(left, operator, right, binary_line):
+                        mdc_scan_expr(left, caller, edge_from, edge_to)
+                        mdc_scan_expr(right, caller, edge_from, edge_to)
+                    Expr.Unary(operator, operand, unary_line):
+                        mdc_scan_expr(operand, caller, edge_from, edge_to)
+                    Expr.Paren(inner, paren_line):
+                        mdc_scan_expr(inner, caller, edge_from, edge_to)
+                    Expr.Field(object, field_name, field_line):
+                        mdc_scan_expr(object, caller, edge_from, edge_to)
+                    _:
+                        pass
+
+        def mdc_collect_calls(statements: darray[Ast::Stmt], caller: sview, edge_from: mutable darray[sview]&, edge_to: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |edge_from, edge_to|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            mdc_scan_expr(expression, caller, edge_from, edge_to)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            mdc_scan_expr(value, caller, edge_from, edge_to)
+                        Stmt.Assign(target, operator, value, line):
+                            mdc_scan_expr(value, caller, edge_from, edge_to)
+                        Stmt.Return(value, line):
+                            mdc_scan_expr(returned, caller, edge_from, edge_to) if value is returned
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            mdc_scan_expr(condition, caller, edge_from, edge_to)
+                            mdc_collect_calls(then_body, caller, edge_from, edge_to)
+                            mdc_collect_calls(else_body, caller, edge_from, edge_to)
+                        Stmt.While(while_condition, while_body, while_line):
+                            mdc_scan_expr(while_condition, caller, edge_from, edge_to)
+                            mdc_collect_calls(while_body, caller, edge_from, edge_to)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            mdc_collect_calls(for_body, caller, edge_from, edge_to)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            mdc_collect_calls(block_body, caller, edge_from, edge_to)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |edge_from, edge_to|:
+                                mdc_collect_calls(arm.body, caller, edge_from, edge_to)
+                        _:
+                            pass
+
+        # Does `origin` reach `target` following call edges (any path length >= 1)?
+        def mdc_reaches(origin: sview, target: sview, edge_from: darray[sview]&, edge_to: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                frontier: mutable darray[sview] = [origin]
+                seen: mutable darray[sview] = []
+                found: mutable bool = false
+                while frontier.count > 0 and not found |frontier, seen, found, target, edge_from, edge_to|:
+                    current: sview = frontier[frontier.count - 1]
+                    frontier <- frontier.truncate(frontier.count - 1)
+                    if not (any s in seen where s == current):
+                        seen.push(current)
+                        edge_probe: mutable usize = 0
+                        while edge_probe < edge_from.count |edge_probe, frontier, found, current, target, edge_from, edge_to|:
+                            if edge_from[edge_probe] == current:
+                                found <- true if edge_to[edge_probe] == target
+                                frontier.push(edge_to[edge_probe])
+                            edge_probe <- edge_probe + 1
+                return found
+
+        # `fn` sits in a mutual cycle: a direct callee OTHER than fn reaches fn back.
+        def mdc_in_mutual_cycle(fn: sview, edge_from: darray[sview]&, edge_to: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                probe: mutable usize = 0
+                result: mutable bool = false
+                while probe < edge_from.count and not result |probe, result, fn, edge_from, edge_to|:
+                    if edge_from[probe] == fn and edge_to[probe] != fn:
+                        result <- true if mdc_reaches(edge_to[probe], fn, edge_from, edge_to)
+                    probe <- probe + 1
+                return result
+
+    public:
+        def check_mutual_decreases_cycle(file: Ast::File&, enable_smt: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # With SMT on, stage0 proves mutual-recursion measures (e.g. is_even/is_odd on n),
+                # so the structural cycle is not an error there — this is a non-SMT-only diagnostic.
+                return if enable_smt
+                names: mutable darray[sview] = []
+                has_decreases: mutable darray[bool] = []
+                decreases_line: mutable darray[u32] = []
+                edge_from: mutable darray[sview] = []
+                edge_to: mutable darray[sview] = []
+                mdc_collect_functions(file.top_decls, names, has_decreases, decreases_line, edge_from, edge_to)
+                index: mutable usize = 0
+                while index < names.count |index, table| -> table:
+                    if has_decreases[index] and mdc_in_mutual_cycle(names[index], edge_from, edge_to):
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutualDecreasesCycle, name: names[index], line: decreases_line[index], expected: "", actual: ""})
+                    index <- index + 1
