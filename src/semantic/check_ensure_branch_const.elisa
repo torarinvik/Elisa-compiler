@@ -233,11 +233,82 @@ extend Semantic:
                             pass
                 return false
 
+        # Does any statement write `X.field` for ANY base (used to poison a callee summary)?
+        def ebc_field_written_anybase(statements: darray[Ast::Stmt], field: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            tf: (ok: bool, base: sview, field: sview) = ebc_field_of(target)
+                            true return if tf.ok and tf.field == field
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if ebc_field_written_anybase(then_body, field)
+                            true return if ebc_field_written_anybase(else_body, field)
+                        Stmt.While(while_condition, while_body, while_line):
+                            true return if ebc_field_written_anybase(while_body, field)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            true return if ebc_field_written_anybase(for_body, field)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if ebc_field_written_anybase(block_body, field)
+                        _:
+                            pass
+                return false
+
+        # Summarize a callee's NET effect on `field`: does it write it, is the effect unknown
+        # (conditional / non-constant write => poisoned), and the last unconditional constant value.
+        def ebc_summarize_field(statements: darray[Ast::Stmt], field: sview) -> (writes: bool, poisoned: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                writes: mutable bool = false
+                poisoned: mutable bool = false
+                value: mutable i64 = 0
+                for statement in statements |writes, poisoned, value|:
+                    match statement:
+                        Stmt.Assign(target, operator, assign_value, line):
+                            tf: (ok: bool, base: sview, field: sview) = ebc_field_of(target)
+                            if tf.ok and tf.field == field and operator == TokenKind.LArrow:
+                                writes <- true
+                                cv: (found: bool, value: i64) = ebc_const_value(assign_value)
+                                poisoned <- true if not cv.found
+                                value <- cv.value if cv.found
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            if ebc_field_written_anybase(then_body, field) or ebc_field_written_anybase(else_body, field):
+                                writes <- true
+                                poisoned <- true
+                        Stmt.While(while_condition, while_body, while_line):
+                            if ebc_field_written_anybase(while_body, field):
+                                writes <- true
+                                poisoned <- true
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            if ebc_field_written_anybase(for_body, field):
+                                writes <- true
+                                poisoned <- true
+                        _:
+                            pass
+                return (writes, poisoned, value)
+
+        # The top-level body of a function named `name` in `declarations`, else not-found.
+        def ebc_find_func_body(declarations: darray[Ast::Decl], name: sview) -> (found: bool, body: darray[Ast::Stmt]):
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if function_name == name:
+                                return (true, body)
+                        Decl.Module(module_name, module_body, module_line):
+                            nested: (found: bool, body: darray[Ast::Stmt]) = ebc_find_func_body(module_body, name)
+                            nested return if nested.found
+                        Decl.Scoped(scoped_body, scoped_line):
+                            nested: (found: bool, body: darray[Ast::Stmt]) = ebc_find_func_body(scoped_body, name)
+                            nested return if nested.found
+                        _:
+                            pass
+                return (false, [])
+
         # Abstract-interpret `base.field`'s exit value over the constant domain (consts, unknown).
         # Seeded unknown=true by the caller since the incoming field value is not known.
-        def ebc_interp_field(statements: darray[Ast::Stmt], base: sview, field: sview, consts: mutable darray[i64]&, unknown: mutable bool&) -> void:
+        def ebc_interp_field(statements: darray[Ast::Stmt], base: sview, field: sview, declarations: darray[Ast::Decl], consts: mutable darray[i64]&, unknown: mutable bool&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |consts, unknown|:
+                for statement in statements |consts, unknown, declarations|:
                     match statement:
                         Stmt.Assign(target, operator, value, line):
                             tf: (ok: bool, base: sview, field: sview) = ebc_field_of(target)
@@ -246,13 +317,28 @@ extend Semantic:
                                 consts <- consts.truncate(0)
                                 unknown <- not cv.found
                                 ebc_add_const(consts, cv.value) if cv.found
+                        Stmt.Expr(expression, line):
+                            # A call passing `base` as its first (self) argument may mutate base.field.
+                            if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                                callee_name: sview = ident_name_of(callee)
+                                if callee_name != "" and arguments.count >= 1 and ident_name_of(arguments[0]) == base:
+                                    target_body: (found: bool, body: darray[Ast::Stmt]) = ebc_find_func_body(declarations, callee_name)
+                                    if target_body.found:
+                                        effect: (writes: bool, poisoned: bool, value: i64) = ebc_summarize_field(target_body.body, field)
+                                        if effect.writes and effect.poisoned:
+                                            consts <- consts.truncate(0)
+                                            unknown <- true
+                                        if effect.writes and not effect.poisoned:
+                                            consts <- consts.truncate(0)
+                                            unknown <- false
+                                            ebc_add_const(consts, effect.value)
                         Stmt.If(condition, then_body, else_body, if_line):
                             then_consts: mutable darray[i64] = [c for c in consts]
                             then_unknown: mutable bool = unknown
-                            ebc_interp_field(then_body, base, field, then_consts, then_unknown)
+                            ebc_interp_field(then_body, base, field, declarations, then_consts, then_unknown)
                             else_consts: mutable darray[i64] = [c for c in consts]
                             else_unknown: mutable bool = unknown
-                            ebc_interp_field(else_body, base, field, else_consts, else_unknown)
+                            ebc_interp_field(else_body, base, field, declarations, else_consts, else_unknown)
                             consts <- consts.truncate(0)
                             for c in then_consts |consts|:
                                 ebc_add_const(consts, c)
@@ -285,7 +371,7 @@ extend Semantic:
                                             if fe.ok:
                                                 fconsts: mutable darray[i64] = []
                                                 funknown: mutable bool = true
-                                                ebc_interp_field(body, fe.base, fe.field, fconsts, funknown)
+                                                ebc_interp_field(body, fe.base, fe.field, declarations, fconsts, funknown)
                                                 fviolated: mutable bool = fconsts.count > 0 and not funknown
                                                 for c in fconsts |fviolated|:
                                                     fviolated <- false if evaluate_comparison(c, fe.op, fe.lit)
