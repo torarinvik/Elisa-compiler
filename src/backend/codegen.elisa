@@ -2409,6 +2409,135 @@ module Backend:
         # `get`/`put` function. The RECEIVER is threaded separately (a `darray[Expr]` of
         # receiver-then-args crashes stage0), and for a mutating helper the region leads the
         # argument list (stage0: `arena_dict_put_or_panic(ptr %region, ptr %d, …)`).
+        # Emit a lambda VALUE `fn(params) => body` as a tagged closure, per stage0's ABI:
+        # malloc an env of the captured enclosing scalars, emit a LIFTED `@lambda(ptr env,
+        # params…)` whose body loads its captures from env, then malloc a `{code, env}` closure
+        # and `ptrtoint | 1`-tag it. `expected` (a Fn) supplies the param + return types. Sound
+        # subset: only SCALAR captures (int/bool/float) and a modeled return; anything else
+        # declines. Non-capturing lambdas pass a null env.
+        def emit_lambda_value(lambda_params: darray[sview], lambda_body: darray[Stmt], expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            null return if expected.kind != TypeKind.Fn
+            return_type: ValueType = fn_return_type_of(expected, structs)
+            null return if return_type.kind == TypeKind.Unmodeled
+            null return if expected.bits.usize() >= structs.fn_pool_param_start.count
+            param_span_start: usize = structs.fn_pool_param_start[expected.bits.usize()]
+            param_span_count: usize = structs.fn_pool_param_count[expected.bits.usize()]
+            null return if param_span_count != lambda_params.count or param_span_count == 0
+            return_llvm: LLVMTypeRef = llvm_type_of(return_type, structs, ctx)
+            param_types: mutable darray[ValueType] = []
+            param_llvms: mutable darray[LLVMTypeRef] = []
+            param_declined: mutable bool = false
+            param_probe: mutable usize = 0
+            while param_probe < param_span_count |param_types, param_llvms, param_declined, param_probe, param_span_start, structs, ctx|:
+                one_param: ValueType = copied_type(structs.fn_pool_params[param_span_start + param_probe])
+                param_declined <- true if one_param.kind == TypeKind.Unmodeled
+                param_types.push(one_param)
+                param_llvms.push(llvm_type_of(one_param, structs, ctx))
+                param_probe <- param_probe + 1
+            null return if param_declined
+            # Capture every SCALAR local in scope, BY VALUE (load it now, in the caller block).
+            capture_names: mutable darray[sview] = []
+            capture_types: mutable darray[ValueType] = []
+            capture_llvms: mutable darray[LLVMTypeRef] = []
+            capture_values: mutable darray[LLVMValueRef] = []
+            capture_probe: mutable usize = 0
+            while capture_probe < local_scope.names.count |capture_names, capture_types, capture_llvms, capture_values, capture_probe, local_scope, structs, ctx, builder|:
+                capture_type: ValueType = copied_type(local_scope.types[capture_probe])
+                if is_integer_type(capture_type) or capture_type.kind == TypeKind.Bool or capture_type.kind == TypeKind.Float:
+                    capture_llvm: LLVMTypeRef = llvm_type_of(capture_type, structs, ctx)
+                    capture_names.push(local_scope.names[capture_probe])
+                    capture_types.push(capture_type)
+                    capture_llvms.push(capture_llvm)
+                    capture_values.push(LLVMBuildLoad2(builder, capture_llvm, local_scope.slots[capture_probe], "lambda.capture"))
+                capture_probe <- capture_probe + 1
+            # Build + fill the env (null when nothing is captured).
+            has_env: bool = capture_names.count > 0
+            env_struct_type: mutable LLVMTypeRef = zeroed
+            env_pointer: mutable LLVMValueRef = LLVMConstNull(pointer_type)
+            malloc_param_types: mutable darray[LLVMTypeRef] = [int64_type]
+            malloc_types_pointer: void& = (&malloc_param_types[0]).cast[void&] can Unsafe.PointerCast
+            malloc_type: LLVMTypeRef = LLVMFunctionType(pointer_type, malloc_types_pointer, 1, 0)
+            malloc_fn: LLVMValueRef = declare_or_get_named(m, "malloc", malloc_type)
+            if has_env:
+                env_fields_pointer: void& = (&capture_llvms[0]).cast[void&] can Unsafe.PointerCast
+                env_struct_type <- LLVMStructTypeInContext(ctx, env_fields_pointer, capture_names.count.u32(), 0)
+                env_malloc_args: mutable darray[LLVMValueRef] = [LLVMSizeOf(env_struct_type)]
+                env_malloc_pointer: void& = (&env_malloc_args[0]).cast[void&] can Unsafe.PointerCast
+                env_pointer <- LLVMBuildCall2(builder, malloc_type, malloc_fn, env_malloc_pointer, 1, "lambda.env")
+                store_probe: mutable usize = 0
+                while store_probe < capture_names.count |store_probe, env_struct_type, env_pointer, capture_values, builder|:
+                    store_field: LLVMValueRef = LLVMBuildStructGEP2(builder, env_struct_type, env_pointer, store_probe.u32(), "lambda.env.field")
+                    _ = LLVMBuildStore(builder, capture_values[store_probe], store_field)
+                    store_probe <- store_probe + 1
+            # The LIFTED function `@lambda(ptr env, params…)`. LLVM uniquifies the name.
+            lifted_llvm_types: mutable darray[LLVMTypeRef] = [pointer_type]
+            lifted_llvm_types.extend(param_llvms)
+            lifted_types_pointer: void& = (&lifted_llvm_types[0]).cast[void&] can Unsafe.PointerCast
+            lifted_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, lifted_types_pointer, (param_span_count + 1).u32(), 0)
+            lifted_fn: LLVMValueRef = LLVMAddFunction(m, "lambda", lifted_fn_type)
+            saved_block: LLVMBasicBlockRef = LLVMGetInsertBlock(builder)
+            lifted_entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lifted_fn, "entry")
+            LLVMPositionBuilderAtEnd(builder, lifted_entry)
+            lifted_scope: mutable Scope = Scope{names: [], slots: [], types: []}
+            lifted_loops: mutable LoopStack = LoopStack{exits: [], continues: []}
+            lifted_regions: mutable RegionStack = RegionStack{arenas: []}
+            lifted_runtime: mutable Runtime = copied_runtime(runtime)
+            lifted_arena_type: LLVMTypeRef = arena_llvm_type(ctx)
+            lifted_arena_slot: LLVMValueRef = LLVMBuildAlloca(builder, lifted_arena_type, "auto.region")
+            _ = LLVMBuildStore(builder, LLVMConstNull(lifted_arena_type), lifted_arena_slot)
+            lifted_strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, lifted_arena_type, lifted_arena_slot, 3, "region.strategy")
+            _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 2, 0), lifted_strategy_pointer)
+            lifted_runtime.arena <- lifted_arena_slot
+            lifted_runtime.owns_arena <- true
+            lifted_runtime.debug_active <- false
+            lifted_regions.arenas.push(lifted_arena_slot)
+            # Load each capture from the env param (param 0) into a fresh local.
+            env_param: LLVMValueRef = LLVMGetParam(lifted_fn, 0)
+            load_probe: mutable usize = 0
+            while load_probe < capture_names.count |load_probe, env_struct_type, env_param, capture_llvms, capture_names, capture_types, lifted_scope, builder|:
+                load_field: LLVMValueRef = LLVMBuildStructGEP2(builder, env_struct_type, env_param, load_probe.u32(), "lambda.cap.ptr")
+                loaded_capture: LLVMValueRef = LLVMBuildLoad2(builder, capture_llvms[load_probe], load_field, "lambda.cap")
+                capture_slot: LLVMValueRef = LLVMBuildAlloca(builder, capture_llvms[load_probe], "lambda.cap.slot")
+                _ = LLVMBuildStore(builder, loaded_capture, capture_slot)
+                declare_local(lifted_scope, capture_names[load_probe], capture_slot, capture_types[load_probe])
+                load_probe <- load_probe + 1
+            # Declare the lambda's own params (LLVM params 1..).
+            lifted_param_probe: mutable usize = 0
+            while lifted_param_probe < lambda_params.count |lifted_param_probe, lifted_fn, param_llvms, param_types, lambda_params, lifted_scope, builder|:
+                lifted_param_slot: LLVMValueRef = LLVMBuildAlloca(builder, param_llvms[lifted_param_probe], "lambda.param")
+                _ = LLVMBuildStore(builder, LLVMGetParam(lifted_fn, (lifted_param_probe + 1).u32()), lifted_param_slot)
+                declare_local(lifted_scope, lambda_params[lifted_param_probe], lifted_param_slot, param_types[lifted_param_probe])
+                lifted_param_probe <- lifted_param_probe + 1
+            lifted_status: EmitStatus = emit_statements(lambda_body, return_type, lifted_scope, lifted_loops, lifted_regions, fns, structs, generics, lifted_runtime, m, ctx, builder)
+            lifted_ok: mutable bool = lifted_status != EmitStatus.Declined
+            if lifted_status == EmitStatus.Open:
+                if return_type.kind == TypeKind.Void:
+                    emit_region_free(lifted_runtime, builder)
+                    _ = LLVMBuildRetVoid(builder)
+                else:
+                    lifted_ok <- false
+            LLVMPositionBuilderAtEnd(builder, saved_block)
+            if not lifted_ok:
+                strip_function_body(lifted_fn)
+                return null
+            # Build the `{code, env}` closure and tag it.
+            closure_fields: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type]
+            closure_fields_pointer: void& = (&closure_fields[0]).cast[void&] can Unsafe.PointerCast
+            closure_struct_type: LLVMTypeRef = LLVMStructTypeInContext(ctx, closure_fields_pointer, 2, 0)
+            closure_malloc_args: mutable darray[LLVMValueRef] = [LLVMSizeOf(closure_struct_type)]
+            closure_malloc_pointer: void& = (&closure_malloc_args[0]).cast[void&] can Unsafe.PointerCast
+            closure_pointer: LLVMValueRef = LLVMBuildCall2(builder, malloc_type, malloc_fn, closure_malloc_pointer, 1, "lambda.closure")
+            closure_code_field: LLVMValueRef = LLVMBuildStructGEP2(builder, closure_struct_type, closure_pointer, 0, "lambda.closure.code")
+            _ = LLVMBuildStore(builder, lifted_fn, closure_code_field)
+            closure_env_field: LLVMValueRef = LLVMBuildStructGEP2(builder, closure_struct_type, closure_pointer, 1, "lambda.closure.env")
+            _ = LLVMBuildStore(builder, env_pointer, closure_env_field)
+            closure_integer: LLVMValueRef = LLVMBuildPtrToInt(builder, closure_pointer, int64_type, "lambda.closure.int")
+            closure_tagged: LLVMValueRef = LLVMBuildOr(builder, closure_integer, LLVMConstInt(int64_type, 1, 0), "lambda.closure.tagged")
+            return LLVMBuildIntToPtr(builder, closure_tagged, pointer_type, "lambda.closure.value")
+
+
         # Call THROUGH a `fn(…)` VALUE (a fn-typed local/param), e.g. `fn(value)` inside
         # `apply(fn: fn(i64)->i64, …)`. The value is a low-bit-tagged ptr: bit0 clear → a raw
         # function pointer (call directly); bit0 set → an `%ElisaCoreLambdaClosure = {ptr code,
@@ -3452,6 +3581,11 @@ module Backend:
         # Emit a value expression, producing a value of `resolve_type(expression, expected)`.
         # `null` = unmodeled; the caller must decline.
         def emit_expression(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A lambda VALUE `fn(params) => body` in a `fn(…)` context — lift it to a closure.
+            # (An empty-body Expr.Lambda is a fn-TYPE annotation, never emitted as a value.)
+            if expected.kind == TypeKind.Fn and expression is Expr.Lambda(lambda_value_params, lambda_value_body, lambda_value_line):
+                lambda_value_ok: bool = lambda_value_body.count > 0
+                emit_lambda_value(lambda_value_params, lambda_value_body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) return if lambda_value_ok
             # IMPLICIT WRAP: Elisa has no `some(x)` — an expression of payload type in an
             # optional context IS the optional. Handled before everything else so each
             # value form stays unaware of optionals: re-emit at the PAYLOAD type, then wrap.

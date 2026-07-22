@@ -113,6 +113,11 @@ obj_case fn_value_named 'def dbl(x: i64) -> i64:\n    return x * 2\n\ndef apply(
 # result type comes from the fn value's stored RETURN type (Fn signature side-pool), not the
 # expected type. twice(inc, 40) = inc(inc(40)) = 42.
 obj_case fn_value_nested 'def inc(x: i64) -> i64:\n    return x + 1\n\ndef twice(fn: fn(i64) -> i64, v: i64) -> i64:\n    return fn(fn(v))\n\ndef main() -> i64:\n    return twice(inc, 40)\n' 42
+# LAMBDA VALUES (closures). fn(v) => body lifts to @lambda(ptr env, v): a no-capture lambda
+# passes a null env; a capturing one mallocs an env of the captured scalars, and the tagged
+# {code,env} closure flows through emit_fn_value_call's closure branch. Both = 42.
+obj_case lambda_nocapture 'def apply(fn: fn(i64) -> i64, value: i64) -> i64:\n    return fn(value)\n\ndef main() -> i64:\n    return apply(fn(v) => v * 2, 21)\n' 42
+obj_case lambda_capture 'def apply(fn: fn(i64) -> i64, value: i64) -> i64:\n    return fn(value)\n\ndef run() -> i64:\n    offset: i64 = 1\n    return apply(fn(v) => v + offset, 41)\n\ndef main() -> i64:\n    return run()\n' 42
 
 # The comprehension actually VECTORIZES. This is the only check in the suite that asserts
 # Elisa's central performance claim rather than its behaviour: a comprehension exists to be
