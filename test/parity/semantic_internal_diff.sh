@@ -84,6 +84,12 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
     case "$opts" in
         *EnforceUnsafePermissions:true*|*EnforceStrictProofs:true*) hdr+=$'# strict\n' ;;
     esac
+    # Pure EnforceUnsafePermissions is a NARROWER axis than the `# strict` union above:
+    # stage0 gates the raw-extern-call obligation on it ALONE, so a proof-only case must
+    # not inherit that obligation. Emitted as an extra header.
+    case "$opts" in
+        *EnforceUnsafePermissions:true*) hdr+=$'# unsafe\n' ;;
+    esac
     case "$opts" in
         *EnableSMT:true*) hdr+=$'# smt\n' ;;
     esac

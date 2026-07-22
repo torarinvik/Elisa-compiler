@@ -771,10 +771,100 @@ extend Semantic:
                         _:
                             pass
 
-        def check_strict_unsafe_ops(file: Ast::File&, table: lmut SymbolTable) -> void:
+        # Names of every `extern` function anywhere in the tree. stage0 marks each extern
+        # fnType with an unconditional `Unsafe.RawExtern` permission ref (markRawExternFuncType,
+        # gated only on enforceUnsafePermissions), so EVERY call to one requires the grant.
+        def collect_extern_names(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Extern(name, param_start, arity, variadic, callable, return_type_name, decorators, line):
+                            out.push(name)
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_extern_names(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_extern_names(scoped_body, out)
+                        _:
+                            pass
+
+        # Flag a direct call to a raw extern (`c_puts(text)`) outside any effect grant. A
+        # METHOD/UFCS callee (`x.f()`) is not a bare extern name; only Ident callees match.
+        def strict_extern_call_expression(expression: Ast::Expr, line: u32, extern_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        called: sview = ident_name_of(callee)
+                        is_extern: bool = called != "" and (any e in extern_names where e == called)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: called, line: line, expected: "Unsafe.RawExtern", actual: "Unsafe"}) if is_extern and not in_grant
+                        for argument in arguments |table| -> table:
+                            table <- strict_extern_call_expression(argument, line, extern_names, in_grant, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- strict_extern_call_expression(left, line, extern_names, in_grant, table)
+                        table <- strict_extern_call_expression(right, line, extern_names, in_grant, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- strict_extern_call_expression(operand, line, extern_names, in_grant, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- strict_extern_call_expression(inner, line, extern_names, in_grant, table)
+                    Expr.Index(object, index, index_line):
+                        table <- strict_extern_call_expression(object, line, extern_names, in_grant, table)
+                        table <- strict_extern_call_expression(index, line, extern_names, in_grant, table)
+                    _:
+                        pass
+
+        def strict_extern_call_walk(statements: darray[Ast::Stmt], extern_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- strict_extern_call_expression(expression, line, extern_names, in_grant, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- strict_extern_call_expression(value, line, extern_names, in_grant, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- strict_extern_call_expression(target, line, extern_names, in_grant, table)
+                            table <- strict_extern_call_expression(value, line, extern_names, in_grant, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- strict_extern_call_expression(returned, line, extern_names, in_grant, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- strict_extern_call_expression(condition, line, extern_names, in_grant, table)
+                            table <- strict_extern_call_walk(then_body, extern_names, in_grant, table)
+                            table <- strict_extern_call_walk(else_body, extern_names, in_grant, table)
+                        Stmt.While(condition, body, line):
+                            table <- strict_extern_call_expression(condition, line, extern_names, in_grant, table)
+                            table <- strict_extern_call_walk(body, extern_names, in_grant, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- strict_extern_call_walk(body, extern_names, in_grant, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            grant_here: bool = in_grant or kind == "can" or kind == "trusted"
+                            table <- strict_extern_call_walk(body, extern_names, grant_here, table)
+                        _:
+                            pass
+
+        # Every raw-extern call obligation: skip functions with signature effects (a
+        # conservative over-grant, mirroring the bounds/alias pass) and grant blocks.
+        def strict_extern_call_decls(declarations: darray[Ast::Decl], extern_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            continue if effects.count > 0
+                            table <- strict_extern_call_walk(body, extern_names, false, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- strict_extern_call_decls(module_body, extern_names, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- strict_extern_call_decls(scoped_body, extern_names, table)
+                        _:
+                            pass
+
+        # `enforce_raw_unsafe` is stage0's pure EnforceUnsafePermissions (NOT the strict-proofs
+        # union): the raw-extern obligation fires only under it.
+        def check_strict_unsafe_ops(file: Ast::File&, enforce_raw_unsafe: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 mutable_globals: mutable darray[sview] = []
                 collect_mutable_globals(file.top_decls, mutable_globals)
+                extern_names: mutable darray[sview] = []
+                collect_extern_names(file.top_decls, extern_names)
+                table <- strict_extern_call_decls(file.top_decls, extern_names, table) if enforce_raw_unsafe and extern_names.count > 0
                 checked_get_lines: mutable darray[u32] = []
                 for annotation in file.enum_annotations |checked_get_lines|:
                     checked_get_lines.push(annotation.line) if annotation.owner == "__checked_get"
