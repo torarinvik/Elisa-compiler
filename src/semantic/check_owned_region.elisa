@@ -71,9 +71,49 @@ extend Semantic:
                         pass
 
 
+        # Collect every region/owner name that is EXPLICITLY consumed anywhere in a body --
+        # by `destroy NAME` or by `move NAME` (in an initializer, call argument, or return).
+        # A bare `region NAME(size)` is only a linear obligation once it is manually consumed
+        # on SOME path: a region used purely as allocation backing (`new[NAME] ...`) auto-frees
+        # at scope exit and needs no explicit teardown -- so it must NOT be tracked as a leak.
+        # Tracking only names that appear in a consume yields exactly stage0's PARTIAL-
+        # consumption diagnostic (consumed on one branch, live on another) without flagging
+        # the fully-automatic allocation regions that stage0 accepts.
+        def collect_region_consumes(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            owned_collect_moves(value, out)
+                        Stmt.Expr(expression, line):
+                            owned_collect_moves(expression, out)
+                        Stmt.Return(value, line):
+                            if value is returned_value:
+                                owned_collect_moves(returned_value, out)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            if kind == "destroy":
+                                for destroyed in clause |out|:
+                                    out.push(destroyed)
+                            else:
+                                collect_region_consumes(block_body, out)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            collect_region_consumes(then_body, out)
+                            collect_region_consumes(else_body, out)
+                        Stmt.While(while_condition, while_body, while_line):
+                            collect_region_consumes(while_body, out)
+                        Stmt.For(bind, variables, iterable, body, for_line):
+                            collect_region_consumes(body, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |out|:
+                                collect_region_consumes(arm.body, out)
+                        _:
+                            pass
+
+
         # Walk a body in order, tracking which owned names are still live. `live` carries the
-        # names; `consumed` the ones already destroyed or moved out.
-        def owned_walk(statements: darray[Ast::Stmt], live: mutable darray[sview]&, consumed: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        # names; `consumed` the ones already destroyed or moved out. `tracked_regions` names the
+        # bare regions that are manually consumed somewhere and so bear a linear obligation.
+        def owned_walk(statements: darray[Ast::Stmt], live: mutable darray[sview]&, consumed: mutable darray[sview]&, tracked_regions: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |live, consumed, table| -> table:
                     match statement:
@@ -115,8 +155,17 @@ extend Semantic:
                                     already_destroyed: bool = any c in consumed where c == destroyed
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OwnedRegionAlreadyDestroyed, name: destroyed, line: line, expected: "", actual: ""}) if already_destroyed
                                     consumed.push(destroyed)
+                            elif block_kind == "region" and block_body.count == 0 and binding != "" and (any r in tracked_regions where r == binding):
+                                # A BARE `region NAME(size)` (no `:`-block) that is MANUALLY
+                                # consumed somewhere (`tracked_regions`) is a linear owner: it
+                                # must be consumed on EVERY path, else it leaks (consumed on one
+                                # branch, live on another). A region consumed on no path is pure
+                                # allocation backing -- auto-freed at scope exit -- and is never
+                                # tracked here, so the fresh-allocation regions stage0 accepts
+                                # stay clean. Parity: stage0's PARTIAL-consumption leak.
+                                live.push(binding)
                             else:
-                                table <- owned_walk(block_body, live, consumed, table)
+                                table <- owned_walk(block_body, live, consumed, tracked_regions, table)
                         Stmt.If(condition, then_body, else_body, if_line):
                             # The arms are MUTUALLY EXCLUSIVE, so each starts from the
                             # consumption state at the `if` -- `if c: release(move g) else:
@@ -128,8 +177,8 @@ extend Semantic:
                             for carried in consumed |then_consumed, else_consumed|:
                                 then_consumed.push(carried)
                                 else_consumed.push(carried)
-                            table <- owned_walk(then_body, live, then_consumed, table)
-                            table <- owned_walk(else_body, live, else_consumed, table)
+                            table <- owned_walk(then_body, live, then_consumed, tracked_regions, table)
+                            table <- owned_walk(else_body, live, else_consumed, tracked_regions, table)
                             # A value is gone after the `if` only if EVERY path consumed it:
                             # merge the INTERSECTION of the two arms. A consume on just one
                             # branch (`if c: destroy g`) leaves `g` live -> leaks at exit,
@@ -139,7 +188,7 @@ extend Semantic:
                                 in_else: bool = any e in else_consumed where e == from_then
                                 consumed.push(from_then) if in_else and not (any c in consumed where c == from_then)
                         Stmt.While(while_condition, while_body, while_line):
-                            table <- owned_walk(while_body, live, consumed, table)
+                            table <- owned_walk(while_body, live, consumed, tracked_regions, table)
                         _:
                             pass
 
@@ -155,7 +204,12 @@ extend Semantic:
                             # carries the same obligation as a local.
                             for parameter in parameters |live|:
                                 live.push(parameter.name) if annotation_is_owned(parameter.type_expression)
-                            table <- owned_walk(body, live, consumed, table)
+                            # Pre-scan: which bare regions are manually consumed anywhere in the
+                            # body. Only those bear a linear obligation (partial-consumption leak);
+                            # pure allocation-backing regions auto-free and stay untracked.
+                            tracked_regions: mutable darray[sview] = []
+                            collect_region_consumes(body, tracked_regions)
+                            table <- owned_walk(body, live, consumed, tracked_regions, table)
                             # Anything declared owned and never consumed leaks. `live` is
                             # append-only; subtracting `consumed` here avoids rebuilding it
                             # per event (a fresh darray from a helper is region-polymorphic
