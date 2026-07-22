@@ -1,0 +1,123 @@
+# The @hot disjoint-kernel perf lint (stage0 analyzer_disjoint_param_perf_lint.go). A `@hot`
+# function with two or more numeric-`darray[T]&` parameters vectorizes into a tight element loop
+# ONLY when the backend can prove those buffers disjoint. When no call site proves distinctness,
+# stage0 warns (a plain warning even without -Wperf). The analyzer proves disjointness for a call
+# passing distinct fresh addresses (`f(&a, &b)`); a kernel with no such call keeps the alias-guard.
+#
+# Sound structural subset: warn on a @hot kernel with >= 2 numeric-darray-ref params UNLESS some
+# call in the file passes >= 2 DISTINCT address-of-ident arguments (`&a, &b`) — that is exactly the
+# shape stage0's whole-program disjointness fact proves. Skipping on any such call can only MISS a
+# warning (never a false positive), keeping stage1 a subset.
+extend Semantic:
+    private:
+        def hdk_is_hot(decorators: darray[Ast::Annotation]&) -> bool:
+            can Abort.Panic:
+                return any decorator in decorators where decorator.name == "hot"
+
+        def hdk_is_numeric_name(name: sview) -> bool:
+            can Abort.Panic:
+                return name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "f32" or name == "f64" or name == "usize" or name == "isize" or name == "int" or name == "uint" or name == "byte"
+
+        def hdk_scan_ref_darray_numeric(type_expression: Ast::Expr, saw_amp: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        return hdk_scan_ref_darray_numeric(operand, saw_amp or operator == TokenKind.Ampersand)
+                    Expr.Paren(inner, paren_line):
+                        return hdk_scan_ref_darray_numeric(inner, saw_amp)
+                    Expr.Index(object, index, index_line):
+                        return saw_amp and ident_name_of(object) == "darray" and hdk_is_numeric_name(ident_name_of(index))
+                    Expr.IndexN(object, arguments, index_n_line):
+                        return saw_amp and ident_name_of(object) == "darray" and arguments.count >= 1 and hdk_is_numeric_name(ident_name_of(arguments[0]))
+                    _:
+                        return false
+
+        def hdk_ref_darray_numeric(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return hdk_scan_ref_darray_numeric(type_expression, false)
+
+        # A `&IDENT` argument's root name, or "" when the argument is not an address-of-ident.
+        def hdk_addr_ident(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Unary(operator, operand, unary_line):
+                    if operator == TokenKind.Ampersand:
+                        return ident_name_of(operand)
+                return sview("", 0, 0)
+
+        # A call `fn_name(...)` with >= 2 DISTINCT `&ident` arguments — stage0 proves disjointness.
+        def hdk_expr_proves(expression: Ast::Expr, fn_name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                    if ident_name_of(callee) == fn_name:
+                        addrs: mutable darray[sview] = []
+                        for argument in arguments |addrs|:
+                            root: sview = hdk_addr_ident(argument)
+                            addrs.push(root) if root != "" and not (any a in addrs where a == root)
+                        true return if addrs.count >= 2
+                return false
+
+        def hdk_stmts_prove(statements: darray[Ast::Stmt], fn_name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            true return if hdk_expr_proves(expression, fn_name)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            true return if hdk_expr_proves(value, fn_name)
+                        Stmt.Assign(target, operator, value, line):
+                            true return if hdk_expr_proves(value, fn_name)
+                        Stmt.Return(value, line):
+                            true return if value is returned and hdk_expr_proves(returned, fn_name)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if hdk_stmts_prove(then_body, fn_name)
+                            true return if hdk_stmts_prove(else_body, fn_name)
+                        Stmt.While(while_condition, while_body, while_line):
+                            true return if hdk_stmts_prove(while_body, fn_name)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            true return if hdk_stmts_prove(for_body, fn_name)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if hdk_stmts_prove(block_body, fn_name)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms:
+                                true return if hdk_stmts_prove(arm.body, fn_name)
+                        _:
+                            pass
+                return false
+
+        def hdk_decls_prove(declarations: darray[Ast::Decl], fn_name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            true return if hdk_stmts_prove(body, fn_name)
+                        Decl.Module(module_name, module_body, module_line):
+                            true return if hdk_decls_prove(module_body, fn_name)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            true return if hdk_decls_prove(scoped_body, fn_name)
+                        _:
+                            pass
+                return false
+
+        def hdk_check_declarations(declarations: darray[Ast::Decl], all_declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if hdk_is_hot(decorators):
+                                container_params: mutable darray[sview] = []
+                                for parameter in parameters |container_params|:
+                                    container_params.push(parameter.name) if hdk_ref_darray_numeric(parameter.type_expression)
+                                if container_params.count >= 2 and not hdk_decls_prove(all_declarations, function_name):
+                                    pair: sview = container_params[0]
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.HotKernelNotDisjoint, name: function_name, line: line, expected: pair, actual: container_params[1]})
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- hdk_check_declarations(module_body, all_declarations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- hdk_check_declarations(scoped_body, all_declarations, table)
+                        _:
+                            pass
+
+    public:
+        def check_hot_disjoint_kernel(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- hdk_check_declarations(file.top_decls, file.top_decls, table)
