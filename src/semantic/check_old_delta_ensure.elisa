@@ -8,13 +8,57 @@
 # positive). Any non-additive write, call, or control flow touching `p` leaves the delta unknown (skip).
 extend Semantic:
     private:
-        # `old(NAME)` -> NAME, else "".
-        def ode_old_arg(expression: Ast::Expr) -> sview:
+        # A mutable "place": a bare ident (kind 1, base=name) or `base.field` (kind 2), else kind 0.
+        def ode_place_of(expression: Ast::Expr) -> (kind: i64, base: sview, field: sview):
+            can Memory.Allocate, Abort.Panic:
+                name: sview = ident_name_of(expression)
+                if name != "":
+                    return (1, name, sview("", 0, 0))
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        return ode_place_of(inner)
+                    Expr.Field(object, field, field_line):
+                        base: sview = ident_name_of(object)
+                        if base != "":
+                            return (2, base, field)
+                        return (0, sview("", 0, 0), sview("", 0, 0))
+                    _:
+                        return (0, sview("", 0, 0), sview("", 0, 0))
+
+        def ode_places_match(a: (kind: i64, base: sview, field: sview), b: (kind: i64, base: sview, field: sview)) -> bool:
+            can Abort.Panic:
+                false return if a.kind == 0 or a.kind != b.kind or a.base != b.base
+                return a.kind == 1 or a.field == b.field
+
+        # The place inside `old(PLACE)`, else kind 0.
+        def ode_old_place(expression: Ast::Expr) -> (kind: i64, base: sview, field: sview):
             can Memory.Allocate, Abort.Panic:
                 if expression is Expr.Call(callee, arguments, argument_names, call_line):
                     if ident_name_of(callee) == "old" and arguments.count == 1:
-                        return ident_name_of(arguments[0])
-                return sview("", 0, 0)
+                        return ode_place_of(arguments[0])
+                return (0, sview("", 0, 0), sview("", 0, 0))
+
+        # The delta of a plain-rebind RHS relative to `place`: `place` (unchanged) -> 0,
+        # `place + lit` -> +lit, `place - lit` -> -lit, else not-ok.
+        def ode_assign_delta(value: Ast::Expr, place: (kind: i64, base: sview, field: sview)) -> (ok: bool, delta: i64):
+            can Memory.Allocate, Abort.Panic:
+                true_place: (kind: i64, base: sview, field: sview) = ode_place_of(value)
+                if ode_places_match(true_place, place):
+                    return (true, 0)
+                match value:
+                    Expr.Paren(inner, paren_line):
+                        return ode_assign_delta(inner, place)
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_place: (kind: i64, base: sview, field: sview) = ode_place_of(left)
+                        if ode_places_match(left_place, place):
+                            literal: (found: bool, value: i64) = where_signed_literal(right)
+                            if literal.found and operator == TokenKind.Plus:
+                                return (true, literal.value)
+                            if literal.found and operator == TokenKind.Minus:
+                                return (true, 0 - literal.value)
+                        return (false, 0)
+                    _:
+                        return (false, 0)
 
         # Flip a comparison operator for the mirrored form (`old(p) <op> p` == `p <flip> old(p)`).
         def ode_flip(operator: TokenKind) -> TokenKind:
@@ -26,51 +70,60 @@ extend Semantic:
                     TokenKind.LtEq -> TokenKind.GtEq
                     _ -> operator
 
-        # (param, comparison) of an `ensure p <cmp> old(p)` (either operand order), else ("", Eof).
-        def ode_match_goal(predicate: Ast::Expr) -> (ok: bool, param: sview, op: TokenKind):
+        # (place, comparison) of an `ensure PLACE <cmp> old(PLACE)` (either operand order), else kind 0.
+        def ode_match_goal(predicate: Ast::Expr) -> (ok: bool, place: (kind: i64, base: sview, field: sview), op: TokenKind):
             can Memory.Allocate, Abort.Panic:
+                empty: (kind: i64, base: sview, field: sview) = (0, sview("", 0, 0), sview("", 0, 0))
                 match predicate:
                     Expr.Paren(inner, paren_line):
                         return ode_match_goal(inner)
                     Expr.Binary(left, operator, right, binary_line):
-                        left_name: sview = ident_name_of(left)
-                        right_old: sview = ode_old_arg(right)
-                        if left_name != "" and right_old == left_name:
-                            return (true, left_name, operator)
-                        left_old: sview = ode_old_arg(left)
-                        right_name: sview = ident_name_of(right)
-                        if right_name != "" and left_old == right_name:
-                            return (true, right_name, ode_flip(operator))
-                        return (false, sview("", 0, 0), TokenKind.Eof)
+                        left_place: (kind: i64, base: sview, field: sview) = ode_place_of(left)
+                        right_old: (kind: i64, base: sview, field: sview) = ode_old_place(right)
+                        if ode_places_match(left_place, right_old):
+                            return (true, left_place, operator)
+                        left_old: (kind: i64, base: sview, field: sview) = ode_old_place(left)
+                        right_place: (kind: i64, base: sview, field: sview) = ode_place_of(right)
+                        if ode_places_match(right_place, left_old):
+                            return (true, right_place, ode_flip(operator))
+                        return (false, empty, TokenKind.Eof)
                     _:
-                        return (false, sview("", 0, 0), TokenKind.Eof)
+                        return (false, empty, TokenKind.Eof)
 
-        # The net integer delta applied to `param` across the body (via additive compound assigns of
-        # literals). `known` is false if any other write, call, or control flow could change `param`.
-        def ode_net_delta(body: darray[Ast::Stmt], param: sview) -> (known: bool, delta: i64):
+        # The net integer delta applied to `place` across the body (additive compound assigns and
+        # `place <- place ± lit` rebinds). `known` is false if any other write, call, or control flow
+        # could change the place (or its base struct).
+        def ode_net_delta(body: darray[Ast::Stmt], place: (kind: i64, base: sview, field: sview)) -> (known: bool, delta: i64):
             can Memory.Allocate, Abort.Panic:
                 known: mutable bool = true
                 delta: mutable i64 = 0
-                for statement in body |known, delta, param|:
+                for statement in body |known, delta, place|:
                     match statement:
                         Stmt.Contract(kind, expression, contract_line):
                             pass
                         Stmt.VarDecl(name, type_expression, value, decl_line):
-                            # A local initializer that references `param` (e.g. borrows it) is opaque.
-                            known <- false if ode_expr_mentions(value, param)
+                            known <- false if ode_expr_mentions(value, place.base)
                         Stmt.Assign(target, operator, value, assign_line):
-                            if ident_name_of(target) == param:
+                            target_place: (kind: i64, base: sview, field: sview) = ode_place_of(target)
+                            if ode_places_match(target_place, place):
                                 literal: (found: bool, value: i64) = where_signed_literal(value)
                                 if operator == TokenKind.PlusEq and literal.found:
                                     delta <- delta + literal.value
                                 elif operator == TokenKind.MinusEq and literal.found:
                                     delta <- delta - literal.value
+                                elif operator == TokenKind.LArrow:
+                                    rebind: (ok: bool, delta: i64) = ode_assign_delta(value, place)
+                                    delta <- delta + rebind.delta if rebind.ok
+                                    known <- false if not rebind.ok
                                 else:
                                     known <- false
-                            elif ode_expr_mentions(value, param):
+                            elif target_place.kind == 1 and target_place.base == place.base:
+                                # A whole-base reassignment invalidates the tracked field.
+                                known <- false
+                            elif ode_expr_mentions(value, place.base):
                                 known <- false
                         _:
-                            # Any control flow / call statement that could touch `param` is opaque.
+                            # Any control flow / call statement that could touch the place is opaque.
                             known <- false
                 return (known, delta)
 
@@ -119,9 +172,9 @@ extend Semantic:
                                 match statement:
                                     Stmt.Contract(kind, expression, contract_line):
                                         if kind == "ensure":
-                                            goal: (ok: bool, param: sview, op: TokenKind) = ode_match_goal(expression)
+                                            goal: (ok: bool, place: (kind: i64, base: sview, field: sview), op: TokenKind) = ode_match_goal(expression)
                                             if goal.ok:
-                                                net: (known: bool, delta: i64) = ode_net_delta(body, goal.param)
+                                                net: (known: bool, delta: i64) = ode_net_delta(body, goal.place)
                                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsureNotProven, name: function_name, line: contract_line, expected: "", actual: ""}) if net.known and ode_misaligned(goal.op, net.delta)
                                     _:
                                         pass
