@@ -110,10 +110,92 @@ extend Semantic:
                             pass
 
 
+        # Collect the names of bare `region NAME(size)` declarations (empty-body region blocks)
+        # anywhere in a body — the LOCAL regions a function owns.
+        def collect_region_decl_names(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            out.push(binding) if kind == "region" and block_body.count == 0 and binding != ""
+                            collect_region_decl_names(block_body, out) if kind != "region"
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            collect_region_decl_names(then_body, out)
+                            collect_region_decl_names(else_body, out)
+                        Stmt.While(while_condition, while_body, while_line):
+                            collect_region_decl_names(while_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            collect_region_decl_names(for_body, out)
+                        _:
+                            pass
+
+        # Every name a `return move X` transfers out of a body.
+        def collect_return_moves(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Return(value, line):
+                            owned_collect_moves(returned, out) if value is returned
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            collect_return_moves(then_body, out)
+                            collect_return_moves(else_body, out)
+                        Stmt.While(while_condition, while_body, while_line):
+                            collect_return_moves(while_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            collect_return_moves(for_body, out)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            collect_return_moves(block_body, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |out|:
+                                collect_return_moves(arm.body, out)
+                        _:
+                            pass
+
+        # Whether a function `return move X`s a LOCAL region it declared — such a function
+        # hands an OWNED region to its caller, so the caller's binding must be consumed. A
+        # function that returns a borrowed param (`return owner`, no move of a local region)
+        # is NOT owned-returning, so callers of it stay unflagged.
+        def fn_returns_owned_region(body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                region_names: mutable darray[sview] = []
+                collect_region_decl_names(body, region_names)
+                false return if region_names.count == 0
+                return_moves: mutable darray[sview] = []
+                collect_return_moves(body, return_moves)
+                return any region_name in region_names where (any moved in return_moves where moved == region_name)
+
+        # The set of functions that return an owned local region (by name).
+        def collect_owned_region_returning_fns(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            out.push(function_name) if function_name != "" and fn_returns_owned_region(body)
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_owned_region_returning_fns(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_owned_region_returning_fns(scoped_body, out)
+                        _:
+                            pass
+
+        # Whether a VarDecl initializer is a direct call to an owned-region-returning function,
+        # so the bound local inherits the consumption obligation.
+        def value_calls_owned_returning_fn(value: Ast::Expr, owned_returning_fns: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        return callee_name != "" and (any fn_name in owned_returning_fns where fn_name == callee_name)
+                    Expr.Paren(inner, paren_line):
+                        return value_calls_owned_returning_fn(inner, owned_returning_fns)
+                    _:
+                        return false
+
         # Walk a body in order, tracking which owned names are still live. `live` carries the
         # names; `consumed` the ones already destroyed or moved out. `tracked_regions` names the
         # bare regions that are manually consumed somewhere and so bear a linear obligation.
-        def owned_walk(statements: darray[Ast::Stmt], live: mutable darray[sview]&, consumed: mutable darray[sview]&, tracked_regions: darray[sview]&, table: lmut SymbolTable) -> void:
+        # `owned_returning_fns` names functions whose result is an owned region.
+        def owned_walk(statements: darray[Ast::Stmt], live: mutable darray[sview]&, consumed: mutable darray[sview]&, tracked_regions: darray[sview]&, owned_returning_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |live, consumed, table| -> table:
                     match statement:
@@ -130,7 +212,10 @@ extend Semantic:
                                 already: bool = any c in consumed where c == moved_from
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OwnedRegionAlreadyDestroyed, name: moved_from, line: line, expected: "", actual: ""}) if already
                                 consumed.push(moved_from)
-                            live.push(name) if declares_owned
+                            # A local bound to a call returning an owned region inherits the
+                            # linear obligation, even when its annotation is a bare `Arena`.
+                            returns_owned_region: bool = moved_from == "" and value_calls_owned_returning_fn(value, owned_returning_fns)
+                            live.push(name) if declares_owned or returns_owned_region
                         Stmt.Expr(expression, line):
                             call_moves: mutable darray[sview] = []
                             owned_collect_moves(expression, call_moves)
@@ -165,7 +250,7 @@ extend Semantic:
                                 # stay clean. Parity: stage0's PARTIAL-consumption leak.
                                 live.push(binding)
                             else:
-                                table <- owned_walk(block_body, live, consumed, tracked_regions, table)
+                                table <- owned_walk(block_body, live, consumed, tracked_regions, owned_returning_fns, table)
                         Stmt.If(condition, then_body, else_body, if_line):
                             # The arms are MUTUALLY EXCLUSIVE, so each starts from the
                             # consumption state at the `if` -- `if c: release(move g) else:
@@ -177,8 +262,8 @@ extend Semantic:
                             for carried in consumed |then_consumed, else_consumed|:
                                 then_consumed.push(carried)
                                 else_consumed.push(carried)
-                            table <- owned_walk(then_body, live, then_consumed, tracked_regions, table)
-                            table <- owned_walk(else_body, live, else_consumed, tracked_regions, table)
+                            table <- owned_walk(then_body, live, then_consumed, tracked_regions, owned_returning_fns, table)
+                            table <- owned_walk(else_body, live, else_consumed, tracked_regions, owned_returning_fns, table)
                             # A value is gone after the `if` only if EVERY path consumed it:
                             # merge the INTERSECTION of the two arms. A consume on just one
                             # branch (`if c: destroy g`) leaves `g` live -> leaks at exit,
@@ -188,12 +273,12 @@ extend Semantic:
                                 in_else: bool = any e in else_consumed where e == from_then
                                 consumed.push(from_then) if in_else and not (any c in consumed where c == from_then)
                         Stmt.While(while_condition, while_body, while_line):
-                            table <- owned_walk(while_body, live, consumed, tracked_regions, table)
+                            table <- owned_walk(while_body, live, consumed, tracked_regions, owned_returning_fns, table)
                         _:
                             pass
 
 
-        def check_owned_region_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def check_owned_region_walk(declarations: darray[Ast::Decl], owned_returning_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -209,7 +294,7 @@ extend Semantic:
                             # pure allocation-backing regions auto-free and stay untracked.
                             tracked_regions: mutable darray[sview] = []
                             collect_region_consumes(body, tracked_regions)
-                            table <- owned_walk(body, live, consumed, tracked_regions, table)
+                            table <- owned_walk(body, live, consumed, tracked_regions, owned_returning_fns, table)
                             # Anything declared owned and never consumed leaks. `live` is
                             # append-only; subtracting `consumed` here avoids rebuilding it
                             # per event (a fresh darray from a helper is region-polymorphic
@@ -222,13 +307,15 @@ extend Semantic:
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.OwnedRegionNotConsumed, name: leaked, line: leak_line, expected: "", actual: ""}) if still_owned
                                 leak_index <- leak_index + 1
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_owned_region_walk(module_body, table)
+                            table <- check_owned_region_walk(module_body, owned_returning_fns, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_owned_region_walk(scoped_body, table)
+                            table <- check_owned_region_walk(scoped_body, owned_returning_fns, table)
                         _:
                             pass
 
     public:
         def check_owned_region(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                table <- check_owned_region_walk(declarations, table)
+                owned_returning_fns: mutable darray[sview] = []
+                collect_owned_region_returning_fns(declarations, owned_returning_fns)
+                table <- check_owned_region_walk(declarations, owned_returning_fns, table)
