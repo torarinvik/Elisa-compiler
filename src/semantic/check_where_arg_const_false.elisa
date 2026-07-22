@@ -1,0 +1,181 @@
+# Where-parameter precondition, provably-false slice. A parameter typed `T where PRED` (PRED a
+# comparison over the callee's parameters, e.g. `y: i64 where x < y`) imposes PRED on the call's
+# arguments. When the caller's straight-line constant values make PRED evaluate to FALSE, stage0
+# reports "precondition of ... where refinement could not be proven statically". Sound subset: fires
+# only when every referenced argument is a tracked integer constant and PRED is definitely false —
+# a strict subset of "not provable", so never a false positive. Non-constant args are a miss.
+extend Semantic:
+    private:
+        # The `where PRED` of a parameter type, or Absent.
+        def wacf_param_where(type_expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Refinement(base, predicate, refine_line):
+                        return predicate
+                    Expr.Unary(operator, operand, unary_line):
+                        return wacf_param_where(operand)
+                    _:
+                        return (Ast::Expr.Absent)
+
+        def wacf_index_of(names: darray[sview]&, name: sview) -> i64:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                slot: mutable i64 = -1
+                while probe < names.count |probe, slot, name, names|:
+                    slot <- probe.i64() if name != "" and names[probe] == name and slot < 0
+                    probe <- probe + 1
+                return slot
+
+        # Evaluate a param-name term to a constant using the (param name -> arg constant) mapping.
+        def wacf_term_value(term: Ast::Expr, param_names: darray[sview]&, arg_consts: darray[i64]&, arg_known: darray[bool]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                literal: (found: bool, value: i64) = where_signed_literal(term)
+                literal return if literal.found
+                name: sview = ident_name_of(term)
+                slot: i64 = wacf_index_of(param_names, name) if name != "" else -1
+                if slot >= 0 and arg_known[slot.usize()]:
+                    return (true, arg_consts[slot.usize()])
+                return (false, 0)
+
+        # Is the comparison predicate `A <op> B` DEFINITELY false under the constant argument mapping?
+        def wacf_predicate_false(predicate: Ast::Expr, param_names: darray[sview]&, arg_consts: darray[i64]&, arg_known: darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return wacf_predicate_false(inner, param_names, arg_consts, arg_known)
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_value: (found: bool, value: i64) = wacf_term_value(left, param_names, arg_consts, arg_known)
+                        right_value: (found: bool, value: i64) = wacf_term_value(right, param_names, arg_consts, arg_known)
+                        if left_value.found and right_value.found and is_where_comparison(operator):
+                            return not evaluate_comparison(left_value.value, operator, right_value.value)
+                        return false
+                    _:
+                        return false
+
+        # A callee's where-parameter: (name, its full param names, refined param index, predicate).
+        def wacf_collect(declarations: darray[Ast::Decl], out_fns: mutable darray[sview]&, out_predicates: mutable darray[Ast::Expr]&, out_param_starts: mutable darray[usize]&, out_param_counts: mutable darray[usize]&, out_params: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_fns, out_predicates, out_param_starts, out_param_counts, out_params|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            for parameter in parameters |out_fns, out_predicates, out_param_starts, out_param_counts, out_params, function_name, parameters|:
+                                predicate: Ast::Expr = wacf_param_where(parameter.type_expression)
+                                has_where: bool = match predicate:
+                                    Expr.Absent: false
+                                    _: true
+                                if has_where:
+                                    out_fns.push(function_name)
+                                    out_predicates.push(predicate)
+                                    out_param_starts.push(out_params.count)
+                                    out_param_counts.push(parameters.count)
+                                    for inner_param in parameters |out_params|:
+                                        out_params.push(inner_param.name)
+                        Decl.Module(module_name, module_body, module_line):
+                            wacf_collect(module_body, out_fns, out_predicates, out_param_starts, out_param_counts, out_params)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            wacf_collect(scoped_body, out_fns, out_predicates, out_param_starts, out_param_counts, out_params)
+                        _:
+                            pass
+
+        # For a call to a where-param callee, build (param name -> arg const) and flag a false PRED.
+        def wacf_check_call(expression: Ast::Expr, local_names: darray[sview]&, local_values: darray[i64]&, out_fns: darray[sview]&, out_predicates: darray[Ast::Expr]&, out_param_starts: darray[usize]&, out_param_counts: darray[usize]&, out_params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                    callee_name: sview = ident_name_of(callee)
+                    if callee_name != "":
+                        probe: mutable usize = 0
+                        while probe < out_fns.count |probe, table| -> table:
+                            if out_fns[probe] == callee_name and out_param_counts[probe] == arguments.count:
+                                param_names: mutable darray[sview] = []
+                                arg_consts: mutable darray[i64] = []
+                                arg_known: mutable darray[bool] = []
+                                slot: mutable usize = 0
+                                while slot < out_param_counts[probe] |slot, param_names, arg_consts, arg_known, probe, arguments, out_param_starts, out_params, local_names, local_values|:
+                                    param_names.push(out_params[out_param_starts[probe] + slot])
+                                    arg_value: (found: bool, value: i64) = wacf_arg_const(arguments[slot], local_names, local_values)
+                                    arg_consts.push(arg_value.value)
+                                    arg_known.push(arg_value.found)
+                                    slot <- slot + 1
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: "return where refinement", line: call_line, expected: "", actual: ""}) if wacf_predicate_false(out_predicates[probe], param_names, arg_consts, arg_known)
+                            probe <- probe + 1
+
+        # The tracked straight-line constant value of an argument (a literal, or a const-tracked local).
+        def wacf_arg_const(argument: Ast::Expr, local_names: darray[sview]&, local_values: darray[i64]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                literal: (found: bool, value: i64) = where_signed_literal(argument)
+                literal return if literal.found
+                name: sview = ident_name_of(argument)
+                if name != "":
+                    probe: mutable usize = 0
+                    found: mutable bool = false
+                    value: mutable i64 = 0
+                    while probe < local_names.count |probe, found, value, name, local_names, local_values|:
+                        found <- true if local_names[probe] == name
+                        value <- local_values[probe] if local_names[probe] == name
+                        probe <- probe + 1
+                    return (found, value)
+                return (false, 0)
+
+        # Walk a function's TOP-LEVEL statements, tracking straight-line integer-constant locals and
+        # checking where-param calls against them. (Branch bodies are skipped — a sound miss.)
+        def wacf_walk_top(statements: darray[Ast::Stmt], out_fns: darray[sview]&, out_predicates: darray[Ast::Expr]&, out_param_starts: darray[usize]&, out_param_counts: darray[usize]&, out_params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                local_names: mutable darray[sview] = []
+                local_values: mutable darray[i64] = []
+                for statement in statements |local_names, local_values, table| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- wacf_check_call(value, local_names, local_values, out_fns, out_predicates, out_param_starts, out_param_counts, out_params, table)
+                            constant: (found: bool, value: i64) = where_signed_literal(value)
+                            wacf_set_local(local_names, local_values, name, constant)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- wacf_check_call(value, local_names, local_values, out_fns, out_predicates, out_param_starts, out_param_counts, out_params, table)
+                            assign_name: sview = ident_name_of(target)
+                            constant: (found: bool, value: i64) = where_signed_literal(value) if operator == TokenKind.LArrow or operator == TokenKind.Assign else (false, 0)
+                            wacf_set_local(local_names, local_values, assign_name, constant) if assign_name != ""
+                        Stmt.Return(value, line):
+                            table <- wacf_check_call(returned, local_names, local_values, out_fns, out_predicates, out_param_starts, out_param_counts, out_params, table) if value is returned
+                        Stmt.Expr(expression, line):
+                            table <- wacf_check_call(expression, local_names, local_values, out_fns, out_predicates, out_param_starts, out_param_counts, out_params, table)
+                        _:
+                            pass
+
+        # Set or invalidate a local's tracked constant. When `constant.found` is false the name is
+        # marked unknown (a sentinel entry the arg lookup treats as "not a constant").
+        def wacf_set_local(local_names: mutable darray[sview]&, local_values: mutable darray[i64]&, name: sview, constant: (found: bool, value: i64)) -> void:
+            can Memory.Allocate, Abort.Panic:
+                slot: i64 = wacf_index_of(local_names, name)
+                if constant.found:
+                    if slot >= 0:
+                        local_values[slot.usize()] <- constant.value
+                    else:
+                        local_names.push(name)
+                        local_values.push(constant.value)
+                elif slot >= 0:
+                    # Reassigned to a non-constant: drop the tracked value by shadowing with itself
+                    # removed — mark unknown by setting the name to "" so lookups miss it.
+                    local_names[slot.usize()] <- sview("", 0, 0)
+
+        def wacf_check_declarations(declarations: darray[Ast::Decl], out_fns: darray[sview]&, out_predicates: darray[Ast::Expr]&, out_param_starts: darray[usize]&, out_param_counts: darray[usize]&, out_params: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- wacf_walk_top(body, out_fns, out_predicates, out_param_starts, out_param_counts, out_params, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- wacf_check_declarations(module_body, out_fns, out_predicates, out_param_starts, out_param_counts, out_params, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- wacf_check_declarations(scoped_body, out_fns, out_predicates, out_param_starts, out_param_counts, out_params, table)
+                        _:
+                            pass
+
+    public:
+        def check_where_arg_const_false(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out_fns: mutable darray[sview] = []
+                out_predicates: mutable darray[Ast::Expr] = []
+                out_param_starts: mutable darray[usize] = []
+                out_param_counts: mutable darray[usize] = []
+                out_params: mutable darray[sview] = []
+                wacf_collect(file.top_decls, out_fns, out_predicates, out_param_starts, out_param_counts, out_params)
+                table <- wacf_check_declarations(file.top_decls, out_fns, out_predicates, out_param_starts, out_param_counts, out_params, table)
