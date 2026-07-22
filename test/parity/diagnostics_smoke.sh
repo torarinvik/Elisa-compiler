@@ -176,6 +176,7 @@ NAMES=(
     optional_var_scalar_mismatch
     container_count_scalar_mismatch
     logical_structural_operand
+    nominal_arg_scalar_mismatch
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -318,6 +319,7 @@ EXPECTS=(
     "variable 'y' expects i64, got i64"
     "variable 'n' expects bool, got usize"
     "logical operator requires bool operands"
+    "argument 1 to 'g' expects i64, got Box"
 )
 
 total=0
