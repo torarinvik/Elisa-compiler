@@ -1,0 +1,117 @@
+# A function returning `error[E]` whose body directly `return WRAP(g, ...)`s a POLYMORPHIC errorset
+# wrapper — `def WRAP[errorset R](f: fn() -> T error[R]) -> T error[R]` — propagates the wrapper's
+# instantiated error set out of the caller. When the concrete family bound to R (the error family of
+# a function-reference argument `g`) is not covered by the caller's declared set E, the return type
+# cannot hold: stage0 rejects it ("return type expects i64 | E, got i64 | error[...]").
+#
+# SOUND cut: fire only on a DIRECT `return CALL(...)` whose callee is a poly wrapper (its return
+# family == its own `[errorset R]` parameter) and which carries EXACTLY ONE function-ref argument
+# with a concrete (non-parametric) error family. Ambiguous/absent bindings decline (no false
+# positive); a caller whose declared set covers the family is left clean.
+extend Semantic:
+    private:
+        def ewr_function_line(table: SymbolTable&, name: sview) -> u32:
+            found: mutable u32 = 0
+            for symbol in table.symbols |found|:
+                found <- symbol.line if symbol.kind == SymbolKind.Func and symbol.name == name and found == 0
+            return found
+
+        # G returns `error[R]` where R is G's OWN errorset parameter — i.e. a polymorphic wrapper.
+        def ewr_is_poly_wrapper(annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                family: sview = callable_error_family(annotations, name)
+                false return if family == ""
+                gline: u32 = ewr_function_line(table, name)
+                false return if gline == 0
+                return family == errorset_param_at(annotations, gline)
+
+        # The CONCRETE error family of a function reference (a real enum, not an errorset parameter).
+        def ewr_concrete_family(annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, name: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                family: sview = callable_error_family(annotations, name)
+                "" return if family == ""
+                gline: u32 = ewr_function_line(table, name)
+                "" return if gline != 0 and family == errorset_param_at(annotations, gline)
+                return family
+
+        # The single concrete arg-family among a call's ident arguments, or "" if none / ambiguous.
+        def ewr_arg_family(arguments: darray[Ast::Expr], annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable sview = ""
+                ambiguous: mutable bool = false
+                for argument in arguments |found, ambiguous|:
+                    if argument is Expr.Ident(arg_name, arg_line):
+                        fam: sview = ewr_concrete_family(annotations, table, arg_name)
+                        if fam != "":
+                            ambiguous <- true if found != "" and found != fam
+                            found <- fam if found == ""
+                "" return if ambiguous
+                return found
+
+        # The caller's first declared error family (for the diagnostic), or "".
+        def ewr_declared_first(annotations: darray[Ast::EnumAnnotation]&, function_line: u32) -> sview:
+            first: mutable sview = ""
+            for row in annotations |first|:
+                first <- row.name if first == "" and row.owner == "__error_set_family" and row.line == function_line
+            return first
+
+        # Does the caller (function_line) declare an error set that covers `actual`? A caller with NO
+        # declared set is treated as covering (a distinct diagnostic handles that shape; avoid FP).
+        def ewr_declared_covers(annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, function_line: u32, actual: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                covered: mutable bool = false
+                has_family: mutable bool = false
+                for row in annotations |covered, has_family|:
+                    if row.owner == "__error_set_family" and row.line == function_line:
+                        has_family <- true
+                        covered <- true if row.name == actual or error_family_covers(actual, row.name, table)
+                return covered or not has_family
+
+        def ewr_check_returned_call(value: Ast::Expr, function_line: u32, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if value is Expr.Call(callee, arguments, argument_names, call_line):
+                    if callee is Expr.Ident(callee_name, callee_line):
+                        if ewr_is_poly_wrapper(annotations, table, callee_name):
+                            actual: sview = ewr_arg_family(arguments, annotations, table)
+                            if actual != "" and not ewr_declared_covers(annotations, table, function_line, actual):
+                                expected: sview = ewr_declared_first(annotations, function_line)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryPropagationMismatch, name: actual, line: call_line, expected: expected, actual: ""})
+
+        def ewr_walk(statements: darray[Ast::Stmt], function_line: u32, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            table <- ewr_check_returned_call(returned, function_line, annotations, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- ewr_walk(then_body, function_line, annotations, table)
+                            table <- ewr_walk(else_body, function_line, annotations, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- ewr_walk(body, function_line, annotations, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- ewr_walk(while_body, function_line, annotations, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- ewr_walk(for_body, function_line, annotations, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- ewr_walk(arm.body, function_line, annotations, table)
+                        _:
+                            pass
+
+        def ewr_check_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- ewr_walk(body, line, annotations, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- ewr_check_declarations(module_body, annotations, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- ewr_check_declarations(scoped_body, annotations, table)
+                        _:
+                            pass
+
+    public:
+        def check_errorset_wrapper_return(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- ewr_check_declarations(file.top_decls, file.enum_annotations, table)
