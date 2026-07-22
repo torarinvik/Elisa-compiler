@@ -1,0 +1,178 @@
+# A closure submitted to a task pool (`submit[...] (lambda)(...)`) must not CAPTURE a
+# binding that owns heap state — a container (darray/dstr/dict/set), a container-owning
+# struct, or a reference to either — because the captured state lives on the submitting
+# frame and cannot outlive the asynchronous task. stage0 rejects "the closure passed to X
+# captures state that cannot outlive the task".
+#
+# `submit[...] (lambda)(arg)` parses to a value `Expr.Block([], Call(Lambda, [arg]), [])`.
+# A NON-submit lambda that captures the same state is accepted (verified on stage0), so the
+# check fires ONLY for the submit-block shape. A captured SCALAR (or scalar-only struct) is
+# copied and outlives the task, so only container-owning captures are flagged.
+extend Semantic:
+    private:
+        # A parameter/local type that OWNS heap state — a container head (through mutable/&/
+        # paren), OR a container-owning struct name. Reuses check_region_escape's classifiers
+        # (member_type_is_owned_container, container_structs).
+        def cc_type_is_container_owning(type_expression: Ast::Expr, container_structs: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        cc_type_is_container_owning(operand, container_structs) return if operator == TokenKind.Mutable or operator == TokenKind.Ampersand or operator == TokenKind.Lmut or operator == TokenKind.Owned
+                        return false
+                    Expr.Paren(inner, paren_line):
+                        return cc_type_is_container_owning(inner, container_structs)
+                    Expr.Ident(name, ident_line):
+                        return name == "dstr" or (any container_struct in container_structs where container_struct == name)
+                    Expr.Index(object, index_argument, index_line):
+                        head: sview = ident_name_of(object)
+                        return head == "darray" or head == "set" or head == "dict" or head == "array" or (any container_struct in container_structs where container_struct == head)
+                    Expr.IndexN(object_n, arguments_n, index_n_line):
+                        head_n: sview = ident_name_of(object_n)
+                        return head_n == "darray" or head_n == "set" or head_n == "dict" or head_n == "array" or (any container_struct in container_structs where container_struct == head_n)
+                    _:
+                        return false
+
+        # Every ROOT ident referenced in an expression (`h.items[0]` -> "h").
+        def cc_collect_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        out.push(name) if name != ""
+                    Expr.Field(object, field, field_line):
+                        cc_collect_idents(object, out)
+                    Expr.Index(object, index_argument, index_line):
+                        cc_collect_idents(object, out)
+                        cc_collect_idents(index_argument, out)
+                    Expr.IndexN(object_n, arguments_n, index_n_line):
+                        cc_collect_idents(object_n, out)
+                        for argument in arguments_n |out|:
+                            cc_collect_idents(argument, out)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        cc_collect_idents(callee, out)
+                        for argument in arguments |out|:
+                            cc_collect_idents(argument, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        cc_collect_idents(left, out)
+                        cc_collect_idents(right, out)
+                    Expr.Unary(operator, operand, unary_line):
+                        cc_collect_idents(operand, out)
+                    Expr.Paren(inner, paren_line):
+                        cc_collect_idents(inner, out)
+                    Expr.Move(operand, move_line):
+                        cc_collect_idents(operand, out)
+                    _:
+                        pass
+
+        # The Lambda a submit-block wraps, or Absent: a `Block([], Call(Lambda, args), [])`.
+        def cc_submit_lambda(expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Block(block_statements, block_value, block_captures, block_line):
+                    if block_value is Expr.Call(callee, arguments, argument_names, call_line):
+                        if callee is Expr.Lambda(lambda_parameters, lambda_body, lambda_line):
+                            return callee
+                return (Ast::Expr.Absent)
+
+        # Flag a submitted lambda that captures a container-owning enclosing binding.
+        def cc_check_submit(expression: Ast::Expr, line: u32, param_names: darray[sview]&, param_container: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                lambda_expression: Ast::Expr = cc_submit_lambda(expression)
+                if lambda_expression is Expr.Lambda(lambda_parameters, lambda_body, lambda_line):
+                    captured: mutable darray[sview] = []
+                    for lambda_statement in lambda_body |captured|:
+                        cc_collect_stmt_idents(lambda_statement, captured)
+                    escapes: mutable bool = false
+                    for captured_name in captured |escapes, param_names, param_container|:
+                        is_lambda_param: bool = any lambda_parameter in lambda_parameters where lambda_parameter == captured_name
+                        index: usize = cc_param_index(param_names, captured_name)
+                        escapes <- true if not is_lambda_param and index < param_names.count and param_container[index]
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ClosureCaptureEscape, name: "", line: line, expected: "", actual: ""}) if escapes
+
+        def cc_param_index(param_names: darray[sview]&, name: sview) -> usize:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                found: mutable usize = param_names.count
+                while probe < param_names.count |probe, found|:
+                    found <- probe if found == param_names.count and param_names[probe] == name
+                    probe <- probe + 1
+                return found
+
+        # Collect root idents from a lambda body statement (its expressions).
+        def cc_collect_stmt_idents(statement: Ast::Stmt, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Expr(expression, line):
+                        cc_collect_idents(expression, out)
+                    Stmt.Return(value, line):
+                        cc_collect_idents(returned, out) if value is returned
+                    Stmt.VarDecl(name, type_expression, value, line):
+                        cc_collect_idents(value, out)
+                    Stmt.Assign(target, operator, value, line):
+                        cc_collect_idents(value, out)
+                    _:
+                        pass
+
+        # Walk an expression for submit-blocks (they appear as return/assign/expr values).
+        def cc_walk_expr(expression: Ast::Expr, line: u32, param_names: darray[sview]&, param_container: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- cc_check_submit(expression, line, param_names, param_container, table)
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |table| -> table:
+                            table <- cc_walk_expr(argument, line, param_names, param_container, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- cc_walk_expr(inner, line, param_names, param_container, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- cc_walk_expr(left, line, param_names, param_container, table)
+                        table <- cc_walk_expr(right, line, param_names, param_container, table)
+                    _:
+                        pass
+
+        def cc_walk_stmts(statements: darray[Ast::Stmt], param_names: darray[sview]&, param_container: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- cc_walk_expr(expression, line, param_names, param_container, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- cc_walk_expr(value, line, param_names, param_container, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- cc_walk_expr(value, line, param_names, param_container, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- cc_walk_expr(returned, line, param_names, param_container, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- cc_walk_stmts(then_body, param_names, param_container, table)
+                            table <- cc_walk_stmts(else_body, param_names, param_container, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- cc_walk_stmts(while_body, param_names, param_container, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- cc_walk_stmts(for_body, param_names, param_container, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            table <- cc_walk_stmts(body, param_names, param_container, table)
+                        _:
+                            pass
+
+        def cc_check_declarations(declarations: darray[Ast::Decl], container_structs: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            param_names: mutable darray[sview] = []
+                            param_container: mutable darray[bool] = []
+                            for parameter in parameters |param_names, param_container|:
+                                param_names.push(parameter.name)
+                                param_container.push(cc_type_is_container_owning(parameter.type_expression, container_structs))
+                            table <- cc_walk_stmts(body, param_names, param_container, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- cc_check_declarations(module_body, container_structs, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- cc_check_declarations(scoped_body, container_structs, table)
+                        _:
+                            pass
+
+    public:
+        def check_closure_capture(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                container_structs: mutable darray[sview] = []
+                collect_container_structs(file.top_decls, container_structs)
+                table <- cc_check_declarations(file.top_decls, container_structs, table)
