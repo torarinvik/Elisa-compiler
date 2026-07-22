@@ -178,6 +178,7 @@ NAMES=(
     logical_structural_operand
     nominal_arg_scalar_mismatch
     field_arg_to_mutable_ref
+    ref_arg_value_param
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -322,6 +323,7 @@ EXPECTS=(
     "logical operator requires bool operands"
     "argument 1 to 'g' expects i64, got Box"
     "argument 1 to \"bump\" expects mutable S&, got S"
+    "argument 1 to 'sink' expects C, got mutable C&"
 )
 
 total=0
