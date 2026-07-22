@@ -128,6 +128,9 @@ obj_case higher_order_closure 'def adder(n: i64) -> fn(i64) -> i64:\n    return 
 # loop var is a u8. "AB" byte-sum 65+66=131; -89 = 42 (verified byte-identical to stage0).
 obj_case sview_iter 'def main() -> i64:\n    s: sview = "AB"\n    total: mutable i64 = 0\n    for c in s |total|:\n        total <- total + c.i64()\n    return total - 89\n' 42
 obj_case cstr_iter 'def main() -> i64:\n    s: cstr = "AB"\n    total: mutable i64 = 0\n    for c in s |total|:\n        total <- total + c.i64()\n    return total - 89\n' 42
+# `x is Enum.PayloadlessVariant` as a bare bool (tag == ordinal) — the RHS is a bare
+# Enum.Variant Field (no binders), distinct from the payload-narrowing `is Variant(a, b)`.
+obj_case is_payloadless_variant 'enum Dir:\n    N\n    S\ndef opp(d: Dir) -> Dir:\n    return match d:\n        Dir.N: Dir.S\n        Dir.S: Dir.N\ndef main() -> i64:\n    return 42 if opp(Dir.N) is Dir.S else 0\n' 42
 
 # The comprehension actually VECTORIZES. This is the only check in the suite that asserts
 # Elisa's central performance claim rather than its behaviour: a comprehension exists to be
