@@ -1,0 +1,191 @@
+# Transitive precondition violation. A callee `requires P <cmp> Q` (P, Q parameters) is provably
+# violated at a call when the caller's own `requires` facts transitively imply the NEGATION of the
+# substituted comparison — e.g. `sink_geq(lo, hi) requires lo >= hi` called `sink_geq(a, c)` under
+# `requires a <= b` + `requires b < c` (⟹ a < c ⟹ ¬(a >= c)). stage0 errors "precondition of F is
+# violated". Sound: only fires when the closure PROVES the negation; unprovable calls are a miss.
+#
+# Facts are normalized to "less-than" edges u→v (u <= v, strict when u < v); the caller's requires
+# clauses seed them, and a transitive closure derives the rest. A precondition is violated when the
+# closure contains an edge proving its negation.
+extend Semantic:
+    private:
+        # Normalize a comparison `L <op> R` (idents) into a less-than edge (from, to, strict): the
+        # smaller endpoint points to the larger. Returns found=false for non-ident / non-order ops.
+        def tpv_edge_of(comparison: Ast::Expr) -> (found: bool, origin: sview, dst: sview, strict: bool):
+            can Memory.Allocate, Abort.Panic:
+                match comparison:
+                    Expr.Binary(left, operator, right, line):
+                        left_name: sview = ident_name_of(left)
+                        right_name: sview = ident_name_of(right)
+                        if left_name != "" and right_name != "":
+                            (true, left_name, right_name, false) return if operator == TokenKind.LtEq
+                            (true, left_name, right_name, true) return if operator == TokenKind.Lt
+                            (true, right_name, left_name, false) return if operator == TokenKind.GtEq
+                            (true, right_name, left_name, true) return if operator == TokenKind.Gt
+                    _:
+                        pass
+                return (false, sview("", 0, 0), sview("", 0, 0), false)
+
+        # Collect the caller's `requires` comparison facts as less-than edges.
+        def tpv_collect_facts(body: darray[Ast::Stmt], e_from: mutable darray[sview]&, e_to: mutable darray[sview]&, e_strict: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |e_from, e_to, e_strict|:
+                    match statement:
+                        Stmt.Contract(contract_kind, contract_expr, contract_line):
+                            if contract_kind == "requires":
+                                edge: (found: bool, origin: sview, dst: sview, strict: bool) = tpv_edge_of(contract_expr)
+                                if edge.found:
+                                    e_from.push(edge.origin)
+                                    e_to.push(edge.dst)
+                                    e_strict.push(edge.strict)
+                        _:
+                            pass
+
+        # Does an edge from->to exist (need_strict requires a strict one) in the closed relation?
+        def tpv_has_edge(origin: sview, dst: sview, need_strict: bool, e_from: darray[sview]&, e_to: darray[sview]&, e_strict: darray[bool]&) -> bool:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                found: mutable bool = false
+                while probe < e_from.count |probe, found, origin, dst, need_strict, e_from, e_to, e_strict|:
+                    found <- true if e_from[probe] == origin and e_to[probe] == dst and (e_strict[probe] or not need_strict)
+                    probe <- probe + 1
+                return found
+
+        # Transitively close the edge set: (u->v) + (v->w) => (u->w, strict if either is). Iterates
+        # to a fixpoint (edge counts are tiny — a handful of requires facts per function).
+        def tpv_close(e_from: mutable darray[sview]&, e_to: mutable darray[sview]&, e_strict: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                changed: mutable bool = true
+                while changed |changed, e_from, e_to, e_strict|:
+                    changed <- false
+                    i: mutable usize = 0
+                    while i < e_from.count |i, changed, e_from, e_to, e_strict|:
+                        j: mutable usize = 0
+                        while j < e_from.count |j, i, changed, e_from, e_to, e_strict|:
+                            if e_to[i] == e_from[j]:
+                                derived_strict: bool = e_strict[i] or e_strict[j]
+                                if not tpv_has_edge(e_from[i], e_to[j], derived_strict, e_from, e_to, e_strict):
+                                    e_from.push(e_from[i])
+                                    e_to.push(e_to[j])
+                                    e_strict.push(derived_strict)
+                                    changed <- true
+                            j <- j + 1
+                        i <- i + 1
+
+        # The precondition `A <op> B` (substituted with the call args) is provably violated when the
+        # closed fact relation proves its negation.
+        def tpv_violated(op: TokenKind, arg_a: sview, arg_b: sview, e_from: darray[sview]&, e_to: darray[sview]&, e_strict: darray[bool]&) -> bool:
+            can Abort.Panic:
+                # A >= B  violated by  A < B          (strict A->B)
+                tpv_has_edge(arg_a, arg_b, true, e_from, e_to, e_strict) return if op == TokenKind.GtEq
+                # A > B   violated by  A <= B         (A->B any)
+                tpv_has_edge(arg_a, arg_b, false, e_from, e_to, e_strict) return if op == TokenKind.Gt
+                # A <= B  violated by  A > B          (strict B->A)
+                tpv_has_edge(arg_b, arg_a, true, e_from, e_to, e_strict) return if op == TokenKind.LtEq
+                # A < B   violated by  A >= B         (B->A any)
+                tpv_has_edge(arg_b, arg_a, false, e_from, e_to, e_strict) return if op == TokenKind.Lt
+                return false
+
+        # A callee's `requires PARAM <op> PARAM` recorded as (name, param index i, param index j, op).
+        def tpv_collect_preconditions(declarations: darray[Ast::Decl], out_fns: mutable darray[sview]&, out_i: mutable darray[usize]&, out_j: mutable darray[usize]&, out_op: mutable darray[TokenKind]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_fns, out_i, out_j, out_op|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            param_names: mutable darray[sview] = []
+                            for parameter in parameters |param_names|:
+                                param_names.push(parameter.name)
+                            for statement in body |out_fns, out_i, out_j, out_op, function_name, param_names|:
+                                match statement:
+                                    Stmt.Contract(contract_kind, contract_expr, contract_line):
+                                        if contract_kind == "requires" and contract_expr is Expr.Binary(pl, pop, pr, pline):
+                                            li: i64 = tpv_index_of(param_names, ident_name_of(pl))
+                                            ri: i64 = tpv_index_of(param_names, ident_name_of(pr))
+                                            if li >= 0 and ri >= 0 and tpv_is_order_op(pop):
+                                                out_fns.push(function_name)
+                                                out_i.push(li.usize())
+                                                out_j.push(ri.usize())
+                                                out_op.push(pop)
+                                    _:
+                                        pass
+                        Decl.Module(module_name, module_body, module_line):
+                            tpv_collect_preconditions(module_body, out_fns, out_i, out_j, out_op)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            tpv_collect_preconditions(scoped_body, out_fns, out_i, out_j, out_op)
+                        _:
+                            pass
+
+        def tpv_is_order_op(op: TokenKind) -> bool:
+            can Abort.Panic:
+                return op == TokenKind.Lt or op == TokenKind.LtEq or op == TokenKind.Gt or op == TokenKind.GtEq
+
+        def tpv_index_of(names: darray[sview]&, name: sview) -> i64:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                slot: mutable i64 = -1
+                while probe < names.count |probe, slot, name, names|:
+                    slot <- probe.i64() if name != "" and names[probe] == name and slot < 0
+                    probe <- probe + 1
+                return slot
+
+        def tpv_check_call(expression: Ast::Expr, e_from: darray[sview]&, e_to: darray[sview]&, e_strict: darray[bool]&, pc_fns: darray[sview]&, pc_i: darray[usize]&, pc_j: darray[usize]&, pc_op: darray[TokenKind]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                    callee_name: sview = ident_name_of(callee)
+                    if callee_name != "":
+                        probe: mutable usize = 0
+                        while probe < pc_fns.count |probe, table| -> table:
+                            if pc_fns[probe] == callee_name and pc_i[probe] < arguments.count and pc_j[probe] < arguments.count:
+                                arg_a: sview = ident_name_of(arguments[pc_i[probe]])
+                                arg_b: sview = ident_name_of(arguments[pc_j[probe]])
+                                if arg_a != "" and arg_b != "" and tpv_violated(pc_op[probe], arg_a, arg_b, e_from, e_to, e_strict):
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionProvablyViolated, name: callee_name, line: call_line, expected: "", actual: ""})
+                            probe <- probe + 1
+
+        def tpv_walk(statements: darray[Ast::Stmt], e_from: darray[sview]&, e_to: darray[sview]&, e_strict: darray[bool]&, pc_fns: darray[sview]&, pc_i: darray[usize]&, pc_j: darray[usize]&, pc_op: darray[TokenKind]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- tpv_check_call(expression, e_from, e_to, e_strict, pc_fns, pc_i, pc_j, pc_op, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- tpv_check_call(value, e_from, e_to, e_strict, pc_fns, pc_i, pc_j, pc_op, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- tpv_check_call(value, e_from, e_to, e_strict, pc_fns, pc_i, pc_j, pc_op, table)
+                        Stmt.Return(value, line):
+                            table <- tpv_check_call(returned, e_from, e_to, e_strict, pc_fns, pc_i, pc_j, pc_op, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- tpv_walk(then_body, e_from, e_to, e_strict, pc_fns, pc_i, pc_j, pc_op, table)
+                            table <- tpv_walk(else_body, e_from, e_to, e_strict, pc_fns, pc_i, pc_j, pc_op, table)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            table <- tpv_walk(block_body, e_from, e_to, e_strict, pc_fns, pc_i, pc_j, pc_op, table)
+                        _:
+                            pass
+
+        def tpv_check_callers(declarations: darray[Ast::Decl], pc_fns: darray[sview]&, pc_i: darray[usize]&, pc_j: darray[usize]&, pc_op: darray[TokenKind]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            e_from: mutable darray[sview] = []
+                            e_to: mutable darray[sview] = []
+                            e_strict: mutable darray[bool] = []
+                            tpv_collect_facts(body, e_from, e_to, e_strict)
+                            tpv_close(e_from, e_to, e_strict)
+                            table <- tpv_walk(body, e_from, e_to, e_strict, pc_fns, pc_i, pc_j, pc_op, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- tpv_check_callers(module_body, pc_fns, pc_i, pc_j, pc_op, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- tpv_check_callers(scoped_body, pc_fns, pc_i, pc_j, pc_op, table)
+                        _:
+                            pass
+
+    public:
+        def check_transitive_precondition_violated(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                pc_fns: mutable darray[sview] = []
+                pc_i: mutable darray[usize] = []
+                pc_j: mutable darray[usize] = []
+                pc_op: mutable darray[TokenKind] = []
+                tpv_collect_preconditions(file.top_decls, pc_fns, pc_i, pc_j, pc_op)
+                table <- tpv_check_callers(file.top_decls, pc_fns, pc_i, pc_j, pc_op, table)
