@@ -1,0 +1,333 @@
+# Call-site precondition COULD-NOT-PROVE (a WARNING). At a call `f(args)` to a function with a
+# `requires GOAL`, if the caller's facts do not ENTAIL the goal (with params substituted by args),
+# stage0 warns "precondition of f could not be proven statically". This refines the coarse
+# no-fact-at-all trigger in check_precondition_violated to an INTERVAL-ENTAILMENT test.
+#
+# SOUNDNESS (never a false positive): OVER-gathering facts is safe (more facts => tighter box =>
+# fewer warnings => under-fire), so we gather generously — caller `requires`/`assert`s, enclosing
+# THEN-guards, local `NAME = CONST` decls, and IMMUTABLE global consts. The only UNDER-gather risks
+# are (a) else-branch negated guards and (b) a param reassigned to a constant stage0 tracks; both are
+# avoided by NEVER descending into else/loop/match bodies and firing ONLY when every goal variable is
+# a never-reassigned caller param, a local const, or an immutable global. A mutable global stays
+# UNFOLDED (matching stage0), so `requires lo <= hi; clamp(x, 8, CAP)` with `global mutable CAP` warns.
+extend Semantic:
+    private:
+        # fn -> (param names, requires-goal predicates). Requires are read from BODY Stmt.Contract
+        # ("requires") and the signature side-channel at the function's line.
+        def cpu_collect(declarations: darray[Ast::Decl], sig_lines: darray[u32]&, sig_kinds: darray[sview]&, sig_exprs: darray[Ast::Expr]&, fn_names: mutable darray[sview]&, fn_param_starts: mutable darray[usize]&, fn_param_counts: mutable darray[usize]&, all_params: mutable darray[sview]&, fn_goal_starts: mutable darray[usize]&, fn_goal_counts: mutable darray[usize]&, all_goals: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, func_line):
+                            fn_names.push(function_name)
+                            fn_param_starts.push(all_params.count)
+                            for parameter in parameters |all_params|:
+                                all_params.push(parameter.name)
+                            fn_param_counts.push(parameters.count)
+                            fn_goal_starts.push(all_goals.count)
+                            goal_count: mutable usize = 0
+                            for statement in body |all_goals, goal_count|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        if kind == "requires":
+                                            all_goals.push(expression)
+                                            goal_count <- goal_count + 1
+                                    _:
+                                        pass
+                            sig_probe: mutable usize = 0
+                            while sig_probe < sig_lines.count |sig_probe, all_goals, goal_count, sig_lines, sig_kinds, sig_exprs, func_line|:
+                                if sig_lines[sig_probe] == func_line and sig_kinds[sig_probe] == "requires":
+                                    all_goals.push(sig_exprs[sig_probe])
+                                    goal_count <- goal_count + 1
+                                sig_probe <- sig_probe + 1
+                            fn_goal_counts.push(goal_count)
+                        Decl.Module(module_name, module_body, module_line):
+                            cpu_collect(module_body, sig_lines, sig_kinds, sig_exprs, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            cpu_collect(scoped_body, sig_lines, sig_kinds, sig_exprs, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals)
+                        _:
+                            pass
+
+        # Whether NAME is reassigned (`<-`) anywhere in a statement list (recursing).
+        def cpu_reassigned(statements: darray[Ast::Stmt]&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            true return if operator == TokenKind.LArrow and ident_name_of(target) == name
+                        Stmt.If(condition, then_body, else_body, line):
+                            true return if cpu_reassigned(then_body, name) or cpu_reassigned(else_body, name)
+                        Stmt.While(while_condition, while_body, while_line):
+                            true return if cpu_reassigned(while_body, name)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            true return if cpu_reassigned(for_body, name)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if cpu_reassigned(block_body, name)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms:
+                                true return if cpu_reassigned(arm.body, name)
+                        _:
+                            pass
+                return false
+
+        # Globals split by mutability: IMMUTABLE consts fold to a bound (stage0 folds them too),
+        # MUTABLE globals are unfoldable (stage0 does NOT fold) — collected as "safe but unbounded".
+        def cpu_collect_globals(declarations: darray[Ast::Decl], imm_names: mutable darray[sview]&, imm_values: mutable darray[i64]&, mut_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |imm_names, imm_values, mut_names|:
+                    match declaration:
+                        Decl.Const(const_name, type_expression, value, is_global, const_line):
+                            # NOTE: stage1's parser discards the `mutable` keyword on globals
+                            # (parser_types_signature.elisa ~513), so `global CAP` and `global
+                            # mutable CAP` are indistinguishable here. Sound choice: FOLD every
+                            # global with a constant initializer (matches stage0 for the common
+                            # immutable case; a `global mutable` that stage0 leaves unfolded is a
+                            # SOUND MISS, never a false positive). mut_names stays empty.
+                            const_value: (found: bool, value: i64) = fold_const_int(value)
+                            imm_names.push(const_name) if const_value.found
+                            imm_values.push(const_value.value) if const_value.found
+                        Decl.Module(module_name, module_body, module_line):
+                            cpu_collect_globals(module_body, imm_names, imm_values, mut_names)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            cpu_collect_globals(scoped_body, imm_names, imm_values, mut_names)
+                        _:
+                            pass
+
+        # Local `NAME = CONST` decls anywhere in the caller body (recursing into nested blocks), that
+        # are never reassigned — a constant regardless of nesting depth.
+        def cpu_collect_local_consts(statements: darray[Ast::Stmt], full_body: darray[Ast::Stmt]&, names: mutable darray[sview]&, values: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, values, full_body|:
+                    match statement:
+                        Stmt.VarDecl(local_name, local_type, local_value, local_line):
+                            local_const: (found: bool, value: i64) = where_signed_literal(local_value)
+                            if local_const.found and not cpu_reassigned(full_body, local_name):
+                                names.push(local_name)
+                                values.push(local_const.value)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            cpu_collect_local_consts(then_body, full_body, names, values)
+                            cpu_collect_local_consts(else_body, full_body, names, values)
+                        Stmt.While(while_condition, while_body, while_line):
+                            cpu_collect_local_consts(while_body, full_body, names, values)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            cpu_collect_local_consts(for_body, full_body, names, values)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            cpu_collect_local_consts(block_body, full_body, names, values)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |names, values, full_body|:
+                                cpu_collect_local_consts(arm.body, full_body, names, values)
+                        _:
+                            pass
+
+        # A fact comparison is "clean" (fully modeled by the interval tier) iff at least one side is
+        # an INTEGER LITERAL. A relational `a <= b` (both vars) or a const-ident guard `a < LIMIT`
+        # (LIMIT folds only in stage0's richer engine) has NO literal side — stage0 may prove the goal
+        # through it, so a function carrying ANY such fact is skipped (else false positive).
+        def cpu_pred_clean(predicate: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return cpu_pred_clean(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And or operator == TokenKind.Or:
+                            return cpu_pred_clean(left) and cpu_pred_clean(right)
+                        false return if not is_comparison_operator(operator)
+                        left_literal: (found: bool, value: i64) = where_signed_literal(left)
+                        right_literal: (found: bool, value: i64) = where_signed_literal(right)
+                        return left_literal.found or right_literal.found
+                    _:
+                        return true
+
+        # Whether the caller body carries any UNCLEAN fact — a requires/assert or an `if` condition
+        # comparison with no integer-literal operand. Recurses into nested bodies.
+        def cpu_facts_unclean(statements: darray[Ast::Stmt]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Contract(kind, expression, contract_line):
+                            true return if (kind == "requires" or kind == "assert") and not cpu_pred_clean(expression)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if not cpu_pred_clean(condition)
+                            true return if cpu_facts_unclean(then_body) or cpu_facts_unclean(else_body)
+                        Stmt.While(while_condition, while_body, while_line):
+                            true return if cpu_facts_unclean(while_body)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            true return if cpu_facts_unclean(for_body)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if cpu_facts_unclean(block_body)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms:
+                                true return if cpu_facts_unclean(arm.body)
+                        _:
+                            pass
+                return false
+
+        # Substitute (top level only) a goal side that is a callee param ident with the matching arg.
+        def cpu_subst_side(side: Ast::Expr, params: darray[sview]&, arguments: darray[Ast::Expr]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                side_name: sview = ident_name_of(side)
+                (side) return if side_name == ""
+                probe: mutable usize = 0
+                while probe < params.count |probe, side_name, params|:
+                    arguments[probe] return if params[probe] == side_name and probe < arguments.count
+                    probe <- probe + 1
+                return side
+
+        # Whether an expression is a safe goal leaf: a literal, or a name that is a non-reassigned
+        # caller param / local const / immutable global (so its facts are completely gathered).
+        def cpu_leaf_safe(expression: Ast::Expr, safe_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.IntLit(value):
+                        return true
+                    Expr.Paren(inner, paren_line):
+                        return cpu_leaf_safe(inner, safe_names)
+                    Expr.Ident(name, ident_line):
+                        return any safe in safe_names where safe == name
+                    _:
+                        return false
+
+        # Evaluate a substituted single-comparison goal against the fact box; warn when not proven.
+        def cpu_eval_call(callee_name: sview, arguments: darray[Ast::Expr]&, call_line: u32, fn_names: darray[sview]&, fn_param_starts: darray[usize]&, fn_param_counts: darray[usize]&, all_params: darray[sview]&, fn_goal_starts: darray[usize]&, fn_goal_counts: darray[usize]&, all_goals: darray[Ast::Expr]&, int_params: darray[sview]&, has_lo: darray[bool]&, lo: darray[i64]&, has_hi: darray[bool]&, hi: darray[i64]&, safe_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                slot: mutable i64 = -1
+                fn_probe: mutable usize = 0
+                while fn_probe < fn_names.count |fn_probe, slot, callee_name, fn_names|:
+                    slot <- fn_probe.i64() if fn_names[fn_probe] == callee_name and slot < 0
+                    fn_probe <- fn_probe + 1
+                return if slot < 0
+                index: usize = slot.usize()
+                params: mutable darray[sview] = []
+                param_copy: mutable usize = 0
+                while param_copy < fn_param_counts[index] |param_copy, params, all_params, fn_param_starts, index|:
+                    params.push(all_params[fn_param_starts[index] + param_copy])
+                    param_copy <- param_copy + 1
+                goal_index: mutable usize = 0
+                while goal_index < fn_goal_counts[index] |goal_index, table| -> table:
+                    goal: Ast::Expr = all_goals[fn_goal_starts[index] + goal_index]
+                    match goal:
+                        Expr.Binary(goal_left, goal_operator, goal_right, goal_line):
+                            if is_comparison_operator(goal_operator):
+                                sub_left: Ast::Expr = cpu_subst_side(goal_left, params, arguments)
+                                sub_right: Ast::Expr = cpu_subst_side(goal_right, params, arguments)
+                                both_safe: bool = cpu_leaf_safe(sub_left, safe_names) and cpu_leaf_safe(sub_right, safe_names)
+                                proven: bool = linear_goal_is_proven(sub_left, goal_operator, sub_right, (Ast::Expr.Invalid), false, int_params, has_lo, lo, has_hi, hi)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: callee_name, line: call_line, expected: "", actual: ""}) if both_safe and not proven
+                        _:
+                            pass
+                    goal_index <- goal_index + 1
+
+        # Walk a caller's statements, threading the accumulated guard facts. `int_params`/bounds and
+        # `safe_names` are prebuilt per-caller; guards extend the bounds inside then-branches.
+        def cpu_walk(statements: darray[Ast::Stmt], fn_names: darray[sview]&, fn_param_starts: darray[usize]&, fn_param_counts: darray[usize]&, all_params: darray[sview]&, fn_goal_starts: darray[usize]&, fn_goal_counts: darray[usize]&, all_goals: darray[Ast::Expr]&, int_params: darray[sview]&, has_lo: darray[bool]&, lo: darray[i64]&, has_hi: darray[bool]&, hi: darray[i64]&, safe_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                                table <- cpu_eval_call(ident_name_of(callee), arguments, line, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals, int_params, has_lo, lo, has_hi, hi, safe_names, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                if returned is Expr.Call(callee, arguments, argument_names, call_line):
+                                    table <- cpu_eval_call(ident_name_of(callee), arguments, line, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals, int_params, has_lo, lo, has_hi, hi, safe_names, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            # Descend into THEN with the guard added to the bounds; SKIP else (its
+                            # negated guard is an ungatherable fact => would risk a false positive).
+                            guard_lo: mutable darray[bool] = [flag for flag in has_lo]
+                            guard_lo_v: mutable darray[i64] = [value for value in lo]
+                            guard_hi: mutable darray[bool] = [flag2 for flag2 in has_hi]
+                            guard_hi_v: mutable darray[i64] = [value2 for value2 in hi]
+                            lin_collect_fact(condition, int_params, guard_lo, guard_lo_v, guard_hi, guard_hi_v)
+                            table <- cpu_walk(then_body, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals, int_params, guard_lo, guard_lo_v, guard_hi, guard_hi_v, safe_names, table)
+                        _:
+                            pass
+
+        def cpu_check_declarations(declarations: darray[Ast::Decl], global_names: darray[sview]&, global_values: darray[i64]&, mut_global_names: darray[sview]&, fn_names: darray[sview]&, fn_param_starts: darray[usize]&, fn_param_counts: darray[usize]&, all_params: darray[sview]&, fn_goal_starts: darray[usize]&, fn_goal_counts: darray[usize]&, all_goals: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            # Skip the whole function when it carries an UNCLEAN fact (relational or
+                            # const-ident comparison) stage0 may prove through — else a false positive.
+                            skip_func: bool = cpu_facts_unclean(body)
+                            # int_params = caller params + local consts + immutable globals; seed
+                            # const equalities; then apply caller requires + asserts as fact bounds.
+                            int_params: mutable darray[sview] = []
+                            has_lo: mutable darray[bool] = []
+                            lo: mutable darray[i64] = []
+                            has_hi: mutable darray[bool] = []
+                            hi: mutable darray[i64] = []
+                            safe_names: mutable darray[sview] = []
+                            for parameter in parameters |int_params, has_lo, lo, has_hi, hi, safe_names, body|:
+                                int_params.push(parameter.name)
+                                has_lo.push(false)
+                                lo.push(0)
+                                has_hi.push(false)
+                                hi.push(0)
+                                # SAFE only if the param's type is a bare primitive integer with NO
+                                # refinement: a named refine-alias (`x: Positive`) or inline `where`
+                                # carries a type fact this check does not gather, so stage0 may prove a
+                                # goal on it (exclude => a goal referencing it is never flagged).
+                                param_bare: sview = bare_type_name(parameter.type_expression)
+                                param_inline_refined: bool = match where_predicate_of_type(parameter.type_expression):
+                                    Expr.Absent: false
+                                    _: true
+                                param_safe: bool = is_primitive_type(param_bare) and not param_inline_refined
+                                safe_names.push(parameter.name) if not cpu_reassigned(body, parameter.name) and param_safe
+                            local_const_names: mutable darray[sview] = []
+                            local_const_values: mutable darray[i64] = []
+                            cpu_collect_local_consts(body, body, local_const_names, local_const_values)
+                            local_probe: mutable usize = 0
+                            while local_probe < local_const_names.count |local_probe, int_params, has_lo, lo, has_hi, hi, safe_names, local_const_names, local_const_values|:
+                                int_params.push(local_const_names[local_probe])
+                                has_lo.push(true)
+                                lo.push(local_const_values[local_probe])
+                                has_hi.push(true)
+                                hi.push(local_const_values[local_probe])
+                                safe_names.push(local_const_names[local_probe])
+                                local_probe <- local_probe + 1
+                            # IMMUTABLE globals: bounded (folded). MUTABLE globals: safe but unbounded
+                            # (so `8 <= CAP` with `global mutable CAP` is unproven -> warns).
+                            global_probe: mutable usize = 0
+                            while global_probe < global_names.count |global_probe, int_params, has_lo, lo, has_hi, hi, safe_names, global_names, global_values|:
+                                int_params.push(global_names[global_probe])
+                                has_lo.push(true)
+                                lo.push(global_values[global_probe])
+                                has_hi.push(true)
+                                hi.push(global_values[global_probe])
+                                safe_names.push(global_names[global_probe])
+                                global_probe <- global_probe + 1
+                            mut_global_probe: mutable usize = 0
+                            while mut_global_probe < mut_global_names.count |mut_global_probe, safe_names, mut_global_names|:
+                                safe_names.push(mut_global_names[mut_global_probe])
+                                mut_global_probe <- mut_global_probe + 1
+                            for statement in body |int_params, has_lo, lo, has_hi, hi|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        lin_collect_fact(expression, int_params, has_lo, lo, has_hi, hi) if kind == "requires" or kind == "assert"
+                                    _:
+                                        pass
+                            table <- cpu_walk(body, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals, int_params, has_lo, lo, has_hi, hi, safe_names, table) if not skip_func
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- cpu_check_declarations(module_body, global_names, global_values, mut_global_names, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- cpu_check_declarations(scoped_body, global_names, global_values, mut_global_names, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals, table)
+                        _:
+                            pass
+
+    public:
+        def check_call_precondition_unproven(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fn_names: mutable darray[sview] = []
+                fn_param_starts: mutable darray[usize] = []
+                fn_param_counts: mutable darray[usize] = []
+                all_params: mutable darray[sview] = []
+                fn_goal_starts: mutable darray[usize] = []
+                fn_goal_counts: mutable darray[usize] = []
+                all_goals: mutable darray[Ast::Expr] = []
+                cpu_collect(file.top_decls, file.signature_contract_lines, file.signature_contract_kinds, file.signature_contract_exprs, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals)
+                global_names: mutable darray[sview] = []
+                global_values: mutable darray[i64] = []
+                mut_global_names: mutable darray[sview] = []
+                cpu_collect_globals(file.top_decls, global_names, global_values, mut_global_names)
+                table <- cpu_check_declarations(file.top_decls, global_names, global_values, mut_global_names, fn_names, fn_param_starts, fn_param_counts, all_params, fn_goal_starts, fn_goal_counts, all_goals, table)
