@@ -1,0 +1,196 @@
+# Parametric index-refinement argument violation (stage0's where-precondition check for a bound like
+# `refine IndexOf[T](xs: darray[T]) = i64 where self >= 0 and self < xs.count`). A call passing a
+# constant index that provably falls outside [0, N) — where N is the compile-time count of the
+# array argument the bound is taken over — is rejected ("where precondition of F is violated").
+#
+# Decidable subset: the alias predicate is `self >= LO and self < SRC.count` with SRC a callee
+# PARAMETER name, the index argument is an integer literal, and the SRC argument is a literal array
+# (or a local bound to one) of known count. Anything else is a sound miss.
+extend Semantic:
+    private:
+        # `self >= LO` -> LO (found), for the lower-bound conjunct.
+        def pixv_lower_bound(conjunct: Ast::Expr) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match conjunct:
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.GtEq and ident_name_of(left) == "self":
+                            return where_signed_literal(right)
+                    _:
+                        pass
+                return (false, 0)
+
+        # `self < SRC.count` -> "SRC", for the parametric upper-bound conjunct.
+        def pixv_count_source(conjunct: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match conjunct:
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.Lt and ident_name_of(left) == "self":
+                            if right is Expr.Field(object, field_name, field_line):
+                                return ident_name_of(object) if field_name == "count" else sview("", 0, 0)
+                    _:
+                        pass
+                return sview("", 0, 0)
+
+        # A `self >= LO and self < SRC.count` predicate -> (found, LO, SRC).
+        def pixv_index_alias_info(predicate: Ast::Expr) -> (found: bool, lo: i64, source: sview):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return pixv_index_alias_info(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            lower: (found: bool, value: i64) = pixv_lower_bound(left)
+                            source: sview = pixv_count_source(right)
+                            (true, lower.value, source) return if lower.found and source != ""
+                    _:
+                        pass
+                return (false, 0, sview("", 0, 0))
+
+        def pixv_alias_index_info(type_expression: Ast::Expr, alias_names: darray[sview]&, alias_predicates: darray[Ast::Expr]&) -> (found: bool, lo: i64, source: sview):
+            can Memory.Allocate, Abort.Panic:
+                alias: sview = match type_expression:
+                    Expr.Index(object, index, index_line): ident_name_of(object)
+                    Expr.IndexN(object, arguments, index_n_line): ident_name_of(object)
+                    Expr.Ident(name, ident_line): name
+                    _: sview("", 0, 0)
+                if alias == "":
+                    return (false, 0, sview("", 0, 0))
+                probe: mutable usize = 0
+                result: mutable (found: bool, lo: i64, source: sview) = (false, 0, sview("", 0, 0))
+                while probe < alias_names.count |probe, result, alias, alias_names, alias_predicates|:
+                    result <- pixv_index_alias_info(alias_predicates[probe]) if alias_names[probe] == alias
+                    probe <- probe + 1
+                return result
+
+        # The compile-time count of an array argument: a literal `[..]`, or a local bound to one.
+        def pixv_array_count(argument: Ast::Expr, local_names: darray[sview]&, local_counts: darray[i64]&) -> (found: bool, count: i64):
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Array(elements, array_line):
+                        return (true, elements.count.i64())
+                    Expr.Ident(name, ident_line):
+                        probe: mutable usize = 0
+                        found: mutable bool = false
+                        value: mutable i64 = 0
+                        while probe < local_names.count |probe, found, value, name, local_names, local_counts|:
+                            found <- true if local_names[probe] == name
+                            value <- local_counts[probe] if local_names[probe] == name
+                            probe <- probe + 1
+                        return (found, value)
+                    _:
+                        return (false, 0)
+
+        # Param index of `name` in `param_names`, or -1.
+        def pixv_param_index(param_names: darray[sview]&, name: sview) -> i64:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                slot: mutable i64 = -1
+                while probe < param_names.count |probe, slot, name, param_names|:
+                    slot <- probe.i64() if param_names[probe] == name and slot < 0
+                    probe <- probe + 1
+                return slot
+
+        # Collect local `x: darray[..] = [literal array]` counts in a body.
+        def pixv_collect_local_counts(statements: darray[Ast::Stmt], out_names: mutable darray[sview]&, out_counts: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_names, out_counts|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            match value:
+                                Expr.Array(elements, array_line):
+                                    out_names.push(name)
+                                    out_counts.push(elements.count.i64())
+                                _:
+                                    pass
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            pixv_collect_local_counts(then_body, out_names, out_counts)
+                            pixv_collect_local_counts(else_body, out_names, out_counts)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            pixv_collect_local_counts(block_body, out_names, out_counts)
+                        _:
+                            pass
+
+        # For a callee named F with an index-refined param at `refined_index` bounded by
+        # [lo, <src param>.count), flag a call `F(...)` whose index arg is a constant outside the range.
+        def pixv_check_call(expression: Ast::Expr, callee_name: sview, refined_index: usize, lo: i64, source_index: usize, local_names: darray[sview]&, local_counts: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                    if ident_name_of(callee) == callee_name and refined_index < arguments.count and source_index < arguments.count:
+                        index_literal: (found: bool, value: i64) = where_signed_literal(arguments[refined_index])
+                        source_count: (found: bool, count: i64) = pixv_array_count(arguments[source_index], local_names, local_counts)
+                        if index_literal.found and source_count.found:
+                            violated: bool = index_literal.value < lo or index_literal.value >= source_count.count
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ParametricIndexViolated, name: callee_name, line: call_line, expected: "", actual: ""}) if violated
+
+        def pixv_walk_statements(statements: darray[Ast::Stmt], callee_name: sview, refined_index: usize, lo: i64, source_index: usize, local_names: darray[sview]&, local_counts: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- pixv_check_call(expression, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- pixv_check_call(value, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- pixv_check_call(value, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        Stmt.Return(value, line):
+                            table <- pixv_check_call(returned, callee_name, refined_index, lo, source_index, local_names, local_counts, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- pixv_walk_statements(then_body, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                            table <- pixv_walk_statements(else_body, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        Stmt.While(while_condition, while_body, while_line):
+                            table <- pixv_walk_statements(while_body, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- pixv_walk_statements(for_body, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            table <- pixv_walk_statements(block_body, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- pixv_walk_statements(arm.body, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        _:
+                            pass
+
+        def pixv_check_callers(declarations: darray[Ast::Decl], callee_name: sview, refined_index: usize, lo: i64, source_index: usize, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            local_names: mutable darray[sview] = []
+                            local_counts: mutable darray[i64] = []
+                            pixv_collect_local_counts(body, local_names, local_counts)
+                            table <- pixv_walk_statements(body, callee_name, refined_index, lo, source_index, local_names, local_counts, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- pixv_check_callers(module_body, callee_name, refined_index, lo, source_index, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- pixv_check_callers(scoped_body, callee_name, refined_index, lo, source_index, table)
+                        _:
+                            pass
+
+        def pixv_scan_index_functions(declarations: darray[Ast::Decl], all_declarations: darray[Ast::Decl], alias_names: darray[sview]&, alias_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            param_names: mutable darray[sview] = []
+                            for parameter in parameters |param_names|:
+                                param_names.push(parameter.name)
+                            refined_probe: mutable usize = 0
+                            while refined_probe < parameters.count |refined_probe, table| -> table:
+                                info: (found: bool, lo: i64, source: sview) = pixv_alias_index_info(parameters[refined_probe].type_expression, alias_names, alias_predicates)
+                                if info.found:
+                                    source_index: i64 = pixv_param_index(param_names, info.source)
+                                    table <- pixv_check_callers(all_declarations, function_name, refined_probe, info.lo, source_index.usize(), table) if source_index >= 0
+                                refined_probe <- refined_probe + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- pixv_scan_index_functions(module_body, all_declarations, alias_names, alias_predicates, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- pixv_scan_index_functions(scoped_body, all_declarations, alias_names, alias_predicates, table)
+                        _:
+                            pass
+
+    public:
+        def check_parametric_index_violated(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                alias_names: mutable darray[sview] = []
+                alias_predicates: mutable darray[Ast::Expr] = []
+                collect_refine_aliases(file.top_decls, alias_names, alias_predicates)
+                table <- pixv_scan_index_functions(file.top_decls, file.top_decls, alias_names, alias_predicates, table)
