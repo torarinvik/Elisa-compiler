@@ -1,0 +1,244 @@
+# A signed-integer function whose body can `return <negative literal>` is a "not-found
+# sentinel" function (the negative marks "absent", e.g. `find` returning -1). A local bound
+# to a call of such a function, then used as a sequence index WITHOUT first being bounds-
+# checked, silently casts the negative sentinel to a huge unsigned index -> far out-of-bounds
+# read. stage0 emits a warning here. We over-approximate "bounds-checked" as: the local ever
+# appears in ANY comparison in the function (sound against false positives — if it is compared
+# anywhere we assume the programmer guards it, so we stay silent).
+extend Semantic:
+    private:
+        def si_is_signed_int_name(name: sview) -> bool:
+            can Abort.Panic:
+                return name == "int" or name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "isize"
+
+        # Does this expression return-value denote a negative integer literal?
+        def si_is_negative_literal(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(value):
+                        return value < 0
+                    Expr.Unary(operator, operand, unary_line):
+                        if operator == TokenKind.Minus and operand is Expr.IntLit(literal_value):
+                            return true
+                        return false
+                    Expr.Paren(inner, paren_line):
+                        return si_is_negative_literal(inner)
+                    _:
+                        return false
+
+        # Does any `return` in this statement list yield a negative literal?
+        def si_body_returns_negative(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Return(value, line):
+                            true return if value is returned and si_is_negative_literal(returned)
+                        Stmt.If(condition, then_body, else_body, line):
+                            true return if si_body_returns_negative(then_body) or si_body_returns_negative(else_body)
+                        Stmt.While(condition, body, line):
+                            true return if si_body_returns_negative(body)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            true return if si_body_returns_negative(body)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            true return if si_body_returns_negative(body)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                true return if si_body_returns_negative(arm.body)
+                        _:
+                            pass
+                return false
+
+        # Names of functions that return a signed int and can return a negative sentinel.
+        def si_collect_sentinel_fns(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            if return_type is return_expression:
+                                signed: bool = si_is_signed_int_name(bare_type_name(return_expression))
+                                out.push(name) if signed and si_body_returns_negative(body)
+                        Decl.Module(module_name, module_body, module_line):
+                            si_collect_sentinel_fns(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            si_collect_sentinel_fns(scoped_body, out)
+                        _:
+                            pass
+
+        # The callee's function name if `value` is a direct call `f(...)`, else "".
+        def si_call_target(value: Ast::Expr) -> sview:
+            can Abort.Panic:
+                if value is Expr.Call(callee, arguments, argument_names, call_line):
+                    return ident_name_of(callee)
+                return ""
+
+        # Locals bound to a call of a sentinel function.
+        def si_collect_sentinel_locals(statements: darray[Ast::Stmt], sentinel_fns: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            target: sview = si_call_target(value)
+                            out.push(name) if target != "" and (any sentinel_fn in sentinel_fns where sentinel_fn == target)
+                        Stmt.If(condition, then_body, else_body, line):
+                            si_collect_sentinel_locals(then_body, sentinel_fns, out)
+                            si_collect_sentinel_locals(else_body, sentinel_fns, out)
+                        Stmt.While(condition, body, line):
+                            si_collect_sentinel_locals(body, sentinel_fns, out)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            si_collect_sentinel_locals(body, sentinel_fns, out)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            si_collect_sentinel_locals(body, sentinel_fns, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out|:
+                                si_collect_sentinel_locals(arm.body, sentinel_fns, out)
+                        _:
+                            pass
+
+        # Collect every ident appearing inside a comparison (our "bounds-checked" proxy).
+        def si_collect_compared_expr(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.Lt or operator == TokenKind.LtEq or operator == TokenKind.Gt or operator == TokenKind.GtEq or operator == TokenKind.EqEq or operator == TokenKind.BangEq:
+                            cc_collect_idents(left, out)
+                            cc_collect_idents(right, out)
+                        si_collect_compared_expr(left, out)
+                        si_collect_compared_expr(right, out)
+                    Expr.Unary(operator, operand, unary_line) | Expr.Paren(operand, unary_line) | Expr.Move(operand, unary_line):
+                        si_collect_compared_expr(operand, out)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |out|:
+                            si_collect_compared_expr(argument, out)
+                    _:
+                        pass
+
+        def si_collect_compared(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            si_collect_compared_expr(value, out)
+                        Stmt.Assign(target, operator, value, line):
+                            si_collect_compared_expr(value, out)
+                        Stmt.Expr(expression, line):
+                            si_collect_compared_expr(expression, out)
+                        Stmt.Return(value, line):
+                            si_collect_compared_expr(returned, out) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            si_collect_compared_expr(condition, out)
+                            si_collect_compared(then_body, out)
+                            si_collect_compared(else_body, out)
+                        Stmt.While(condition, body, line):
+                            si_collect_compared_expr(condition, out)
+                            si_collect_compared(body, out)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            si_collect_compared(body, out)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            si_collect_compared(body, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out|:
+                                si_collect_compared(arm.body, out)
+                        _:
+                            pass
+
+        # The base ident an index expression derives from, peeling `.usize()`/casts/parens.
+        # `idx` -> "idx"; `idx.usize()` -> "idx"; `(idx)` -> "idx".
+        def si_index_root(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        return name
+                    Expr.Paren(inner, paren_line):
+                        return si_index_root(inner)
+                    Expr.Field(object, field, field_line):
+                        return si_index_root(object)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        return si_index_root(callee)
+                    _:
+                        return ""
+
+        def si_report_index(index_expression: Ast::Expr, line: u32, sentinel_locals: darray[sview]&, compared: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                root: sview = si_index_root(index_expression)
+                return if root == ""
+                is_sentinel: bool = any sentinel_local in sentinel_locals where sentinel_local == root
+                is_guarded: bool = any compared_name in compared where compared_name == root
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.SentinelIndex, name: root, line: line, expected: "", actual: ""}) if is_sentinel and not is_guarded
+
+        def si_walk_expr(expression: Ast::Expr, sentinel_locals: darray[sview]&, compared: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Index(object, index_argument, index_line):
+                        table <- si_report_index(index_argument, index_line, sentinel_locals, compared, table)
+                        table <- si_walk_expr(object, sentinel_locals, compared, table)
+                        table <- si_walk_expr(index_argument, sentinel_locals, compared, table)
+                    Expr.IndexN(object, arguments, index_line):
+                        for argument in arguments |table|:
+                            table <- si_report_index(argument, index_line, sentinel_locals, compared, table)
+                        table <- si_walk_expr(object, sentinel_locals, compared, table)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        table <- si_walk_expr(callee, sentinel_locals, compared, table)
+                        for argument in arguments |table|:
+                            table <- si_walk_expr(argument, sentinel_locals, compared, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- si_walk_expr(left, sentinel_locals, compared, table)
+                        table <- si_walk_expr(right, sentinel_locals, compared, table)
+                    Expr.Unary(operator, operand, unary_line) | Expr.Paren(operand, unary_line) | Expr.Move(operand, unary_line):
+                        table <- si_walk_expr(operand, sentinel_locals, compared, table)
+                    Expr.Field(object, field, field_line):
+                        table <- si_walk_expr(object, sentinel_locals, compared, table)
+                    _:
+                        pass
+
+        def si_walk_stmts(statements: darray[Ast::Stmt], sentinel_locals: darray[sview]&, compared: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- si_walk_expr(value, sentinel_locals, compared, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- si_walk_expr(value, sentinel_locals, compared, table)
+                        Stmt.Expr(expression, line):
+                            table <- si_walk_expr(expression, sentinel_locals, compared, table)
+                        Stmt.Return(value, line):
+                            table <- si_walk_expr(returned, sentinel_locals, compared, table) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- si_walk_stmts(then_body, sentinel_locals, compared, table)
+                            table <- si_walk_stmts(else_body, sentinel_locals, compared, table)
+                        Stmt.While(condition, body, line):
+                            table <- si_walk_stmts(body, sentinel_locals, compared, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- si_walk_stmts(body, sentinel_locals, compared, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- si_walk_stmts(body, sentinel_locals, compared, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table|:
+                                table <- si_walk_stmts(arm.body, sentinel_locals, compared, table)
+                        _:
+                            pass
+
+        def si_check_declarations(declarations: darray[Ast::Decl], sentinel_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            sentinel_locals: mutable darray[sview] = []
+                            si_collect_sentinel_locals(body, sentinel_fns, sentinel_locals)
+                            if sentinel_locals.count > 0:
+                                compared: mutable darray[sview] = []
+                                si_collect_compared(body, compared)
+                                table <- si_walk_stmts(body, sentinel_locals, compared, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- si_check_declarations(module_body, sentinel_fns, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- si_check_declarations(scoped_body, sentinel_fns, table)
+                        _:
+                            pass
+
+    public:
+        def check_sentinel_index(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                sentinel_fns: mutable darray[sview] = []
+                si_collect_sentinel_fns(declarations, sentinel_fns)
+                return if sentinel_fns.count == 0
+                table <- si_check_declarations(declarations, sentinel_fns, table)
