@@ -90,15 +90,141 @@ extend Semantic:
                             pass
                 return (assign_count, violating_count)
 
+        # The single top-level `p <- V` write's value when there is EXACTLY one and the body
+        # is straight-line (no If/While/Match/Block). branchy=true disables the unproven check
+        # (flow may establish the fact). found=false when the write count is not 1.
+        def ensures_single_write(body: darray[Ast::Stmt], param_name: sview) -> (found: bool, value: Ast::Expr, branchy: bool):
+            can Memory.Allocate, Abort.Panic:
+                write_count: mutable usize = 0
+                write_value: mutable Ast::Expr = Ast::Expr.Absent
+                is_branchy: mutable bool = false
+                for statement in body |write_count, write_value, is_branchy, param_name|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            if operator == TokenKind.LArrow and ident_name_of(target) == param_name:
+                                write_count <- write_count + 1
+                                write_value <- value
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            is_branchy <- true
+                        Stmt.While(condition, while_body, while_line):
+                            is_branchy <- true
+                        Stmt.Match(scrutinee, arms, match_line):
+                            is_branchy <- true
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            is_branchy <- true
+                        _:
+                            pass
+                return (write_count == 1, write_value, is_branchy)
+
+        # The tightest lower bound `subject op K` (>=/>) from a list of fact predicates
+        # (`requires`/`assert`), splitting `and`. found=false when none constrains subject.
+        def ensures_fact_lower(facts: darray[Ast::Expr]&, subject: sview) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                best_found: mutable bool = false
+                best_value: mutable i64 = 0
+                for fact in facts |best_found, best_value, subject|:
+                    candidate: (found: bool, value: i64) = ensures_fact_lower_pred(fact, subject)
+                    if candidate.found and (not best_found or candidate.value > best_value):
+                        best_found <- true
+                        best_value <- candidate.value
+                return (best_found, best_value)
+
+        def ensures_fact_lower_pred(predicate: Ast::Expr, subject: sview) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return ensures_fact_lower_pred(inner, subject)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            left_fact: (found: bool, value: i64) = ensures_fact_lower_pred(left, subject)
+                            left_fact return if left_fact.found
+                            return ensures_fact_lower_pred(right, subject)
+                        (false, 0) return if ident_name_of(left) != subject
+                        bound: (found: bool, value: i64) = fold_const_int(right)
+                        (false, 0) return if not bound.found
+                        (true, bound.value) return if operator == TokenKind.GtEq
+                        (true, bound.value + 1) return if operator == TokenKind.Gt
+                        return (false, 0)
+                    _:
+                        return (false, 0)
+
+        # The lower bound a BARE no-arg law imposes on its subject: `self > K` -> K+1;
+        # `self >= K` -> K (descending the left conjunct of an `and`). found=false for laws
+        # with no lower bound (`self < K`, bool `self`, ...). Complements refinement_bound_spec
+        # (which only reads PARAMETRIC laws `Law[lo,hi]`), so `Positive`/`NonNeg` are handled.
+        def ensures_law_lower_bound(predicate: Ast::Expr) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return ensures_law_lower_bound(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            left_bound: (found: bool, value: i64) = ensures_law_lower_bound(left)
+                            left_bound return if left_bound.found
+                            return ensures_law_lower_bound(right)
+                        (false, 0) return if ident_name_of(left) != "self"
+                        bound: (found: bool, value: i64) = signed_int_literal(right)
+                        (false, 0) return if not bound.found
+                        (true, bound.value + 1) return if operator == TokenKind.Gt
+                        (true, bound.value) return if operator == TokenKind.GtEq
+                        return (false, 0)
+                    _:
+                        return (false, 0)
+
+        # Whether writing VALUE into the ensures-constrained param provably SATISFIES the law's
+        # [lo, hi] window. A const is decided directly; a non-const single variable is proven
+        # only when a requires/assert fact bounds it below by >= lo (upper side is left to the
+        # existing violation refuter — a value above hi is a definite violation, not "unproven").
+        # Anything else (arithmetic, calls, no fact) is NOT proven → the postcondition is unproven.
+        def ensures_write_satisfies(value: Ast::Expr, lo: i64, hi: i64, facts: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                const_value: (found: bool, value: i64) = fold_const_int(value)
+                (const_value.value >= lo and const_value.value <= hi) return if const_value.found
+                var_name: sview = ident_name_of(value)
+                (false) return if var_name == ""
+                fact_lower: (found: bool, value: i64) = ensures_fact_lower(facts, var_name)
+                return fact_lower.found and fact_lower.value >= lo
+
         def ensures_assign_check_function(function_line: u32, body: darray[Ast::Stmt], contract_lines: darray[u32]&, contract_kinds: darray[sview]&, contract_exprs: darray[Ast::Expr]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                while contract_index < contract_lines.count |contract_index: usize = 0, table| -> table:
+                # Fact set: this function's `requires` clauses (signature side-channel) plus
+                # body `assert`s — used to decide whether a non-const write is provably bounded.
+                facts: mutable darray[Ast::Expr] = []
+                fact_index: mutable usize = 0
+                while fact_index < contract_lines.count |facts, fact_index, contract_lines, contract_kinds, contract_exprs|:
+                    facts.push(contract_exprs[fact_index]) if contract_lines[fact_index] == function_line and contract_kinds[fact_index] == "requires"
+                    fact_index <- fact_index + 1
+                for statement in body |facts|:
+                    match statement:
+                        Stmt.Contract(assert_kind, assert_expr, assert_line):
+                            facts.push(assert_expr) if assert_kind == "assert" or assert_kind == "requires"
+                        _:
+                            pass
+                while contract_index < contract_lines.count |contract_index: usize = 0, table, facts| -> table:
                     is_ensures_here: bool = contract_lines[contract_index] == function_line and contract_kinds[contract_index] == "ensure"
                     ensures_predicate: Ast::Expr = contract_exprs[contract_index]
                     param_name: sview = ensures_subject_param(ensures_predicate) if is_ensures_here else sview("", 0, 0)
                     law_name: sview = ensures_law_of_predicate(ensures_predicate)
                     counts: (assigns: usize, violations: usize) = ensures_assign_scan(body, param_name, ensures_predicate, law_name, law_names, law_predicates) if is_ensures_here and param_name != "" else (0, 0)
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementBoundViolated, name: law_name, line: contract_lines[contract_index], expected: "param", actual: param_name}) if counts.assigns > 0 and counts.assigns == counts.violations
+                    # UNPROVEN (not violated): a bounded-law postcondition on a mutable-ref param
+                    # whose single straight-line write is a NON-CONST value not provably bounded by
+                    # a requires/assert fact cannot be discharged (stage0 warns; -strict errors).
+                    # Const writes are left to the violation refuter above (avoids double-firing).
+                    spec: (found: bool, law_name: sview, lo: i64, hi: i64) = refinement_bound_spec(ensures_predicate, law_names, law_predicates) if is_ensures_here and param_name != "" else (false, sview("", 0, 0), 0, 0)
+                    # Effective [lo, hi]: a parametric `Law[lo,hi]`, else a bare no-arg law's own
+                    # lower bound (`Positive` -> [1, max]) derived from its predicate.
+                    bare_predicate: Ast::Expr = law_predicate_by_name(law_name, law_names, law_predicates) if is_ensures_here and param_name != "" and not spec.found else (Ast::Expr.Absent)
+                    bare_lower: (found: bool, value: i64) = ensures_law_lower_bound(bare_predicate)
+                    bound_found: bool = spec.found or bare_lower.found
+                    bound_lo: i64 = spec.lo if spec.found else bare_lower.value
+                    bound_hi: i64 = spec.hi if spec.found else 9223372036854775807
+                    write: (found: bool, value: Ast::Expr, branchy: bool) = ensures_single_write(body, param_name) if bound_found else (false, Ast::Expr.Absent, false)
+                    write_is_const: bool = match write.value:
+                        Ast::Expr.Absent: true
+                        _: fold_const_int(write.value).found
+                    unproven: bool = bound_found and write.found and not write.branchy and not write_is_const and not ensures_write_satisfies(write.value, bound_lo, bound_hi, facts)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.EnsureNotProven, name: law_name, line: contract_lines[contract_index], expected: "", actual: param_name}) if unproven
                     contract_index <- contract_index + 1
 
         def ensures_assign_violated_walk(declarations: darray[Ast::Decl], contract_lines: darray[u32]&, contract_kinds: darray[sview]&, contract_exprs: darray[Ast::Expr]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
