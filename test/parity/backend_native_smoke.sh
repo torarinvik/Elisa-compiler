@@ -121,6 +121,10 @@ run_case call_forward     'def main() -> i64:\n    return helper(42)\n\ndef help
 run_case recursion        'def fact(n: i64) -> i64:\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\n\ndef main() -> i64:\n    return fact(5)\n'  120
 # `_ = EXPR` — explicit discard of a call result (emit for side effects, drop the value).
 run_case discard_call     'def helper(x: i64) -> i64:\n    return x + 1\n\ndef main() -> i64:\n    _ = helper(5)\n    return 42\n'  42
+# No-argument lambda `fn() => …` as a first-class value, and CALLING a no-arg fn value
+# `f()` — both were declined edge cases (empty arg array). Plain and capturing.
+run_case lambda_noarg     'def call(f: fn() -> i64) -> i64:\n    return f()\n\ndef main() -> i64:\n    return call(fn() => 42)\n'  42
+run_case lambda_noarg_cap 'def call(f: fn() -> i64) -> i64:\n    return f()\n\ndef main() -> i64:\n    n: i64 = 42\n    return call(fn() => n)\n'  42
 
 # Membership `x in [literal array]` over a numeric element type: an OR-chain of equality
 # compares. Asserted by VALUE (hit vs miss), in both a ternary condition and an if-condition,
