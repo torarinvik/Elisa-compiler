@@ -129,6 +129,12 @@ run_case in_empty         'def main() -> i64:\n    x: i64 = 9\n    return 42 if 
 run_case in_if_stmt       'def main() -> i64:\n    x: i64 = 2\n    if x in [1, 2, 3]:\n        return 42\n    return 7\n'  42
 run_case in_expr_elems    'def main() -> i64:\n    x: i64 = 4\n    a: i64 = 2\n    return 1 if x in [a, a + 2, 7] else 0\n'  1
 
+# Fixed-array LOCAL, both spellings stage0 accepts: canonical `T[N]` and explicit
+# `array[T, N]`. Declared from a literal, indexed by literal and by variable.
+run_case array_tn_local   'def main() -> i64:\n    xs: array[i64, 3] = [10, 42, 30]\n    return xs[1]\n'  42
+run_case array_canon_local 'def main() -> i64:\n    xs: i64[3] = [7, 8, 9]\n    return xs[2]\n'  9
+run_case array_var_index   'def main() -> i64:\n    xs: array[i64, 4] = [1, 2, 3, 36]\n    i: mutable i64 = 0\n    s: mutable i64 = 0\n    while i < 4:\n        s <- s + xs[i.usize()]\n        i <- i + 1\n    return s\n'  42
+
 # for-range loops, break/continue, bitwise, bool.
 run_case for_range        'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 0..<10:\n        total <- total + i\n    return total\n'   45
 run_case for_inclusive    'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 1..=5:\n        total <- total + i\n    return total\n'     15
