@@ -125,6 +125,32 @@ dict_case missing 'def main() -> i64:
     d.put(1, 7)
     return 42 if d.get(99) == null else 0' 42
 
+# `for k, v in d` iteration: a raw bucket-array walk over occupied slots (state==1),
+# binding key + value. Sum of values, and entry count, asserted by exit code.
+dict_case iter_sum_values 'def main() -> i64:
+    d: mutable dict[i64, i64] = {}
+    d.put(1, 40)
+    d.put(2, 2)
+    s: mutable i64 = 0
+    for k, v in d:
+        s <- s + v
+    return s' 42
+dict_case iter_count 'def main() -> i64:
+    d: mutable dict[i64, i64] = {}
+    d.put(10, 5)
+    d.put(20, 5)
+    d.put(30, 5)
+    n: mutable i64 = 0
+    for k, v in d:
+        n <- n + 1
+    return n' 3
+dict_case iter_empty 'def main() -> i64:
+    d: mutable dict[i64, i64] = {}
+    n: mutable i64 = 0
+    for k, v in d:
+        n <- n + 1
+    return n' 0
+
 if [ "$pass" -eq "$total" ]; then
     echo "dict_real_smoke OK: $pass/$total real-std collections.elisa dict programs compile+run correctly"
 else

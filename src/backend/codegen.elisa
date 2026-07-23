@@ -6096,8 +6096,96 @@ module Backend:
             if statement is Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
                 # `bind` is a MODIFIER ("parallel" / "mutable" / ""), NOT the loop
                 # variable — the names live in `variables`. Only the plain single-variable
-                # form is modeled; `for parallel …` and `for k, v in …` decline.
+                # form and the two-binder dict form are modeled; `for parallel …` declines.
                 EmitStatus.Declined return if for_bind != ""
+                # `for k, v in d` — DICT ITERATION over the std DynDict (a LIBRARY type; its
+                # layout is `items: DictBucket&? , count, used, capacity, arena`, with
+                # DictBucket = `key, value, state:u8` (state 1 == occupied)). Walk the raw
+                # bucket array 0..<capacity, bind k/v only for occupied slots. Mirrors stage0's
+                # two-binder iter loop over dict entries.
+                if for_variables.count == 2:
+                    dict_iter_type: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
+                    EmitStatus.Declined return if dict_iter_type.kind != TypeKind.Struct
+                    dict_slot: usize = dict_iter_type.bits.usize()
+                    EmitStatus.Declined return if structs.names[dict_slot] != "DynDict"
+                    dict_items_index: i64 = field_index_of(structs, dict_slot, "items")
+                    dict_capacity_index: i64 = field_index_of(structs, dict_slot, "capacity")
+                    EmitStatus.Declined return if dict_items_index < 0 or dict_capacity_index < 0
+                    dict_items_field_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_slot] + dict_items_index.usize()])
+                    EmitStatus.Declined return if dict_items_field_type.kind != TypeKind.Optional
+                    dict_items_ref_type: ValueType = optional_payload_of(dict_items_field_type, structs)
+                    EmitStatus.Declined return if dict_items_ref_type.kind != TypeKind.Ref
+                    dict_bucket_type: ValueType = ref_target_of(dict_items_ref_type, structs)
+                    EmitStatus.Declined return if dict_bucket_type.kind != TypeKind.Struct
+                    dict_bucket_slot: usize = dict_bucket_type.bits.usize()
+                    dict_key_index: i64 = field_index_of(structs, dict_bucket_slot, "key")
+                    dict_value_index: i64 = field_index_of(structs, dict_bucket_slot, "value")
+                    dict_state_index: i64 = field_index_of(structs, dict_bucket_slot, "state")
+                    EmitStatus.Declined return if dict_key_index < 0 or dict_value_index < 0 or dict_state_index < 0
+                    dict_key_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_bucket_slot] + dict_key_index.usize()])
+                    dict_value_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_bucket_slot] + dict_value_index.usize()])
+                    if struct_chain_address(for_iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dict_address:
+                        dict_llvm: LLVMTypeRef = llvm_type_of(dict_iter_type, structs, ctx)
+                        dict_optional_llvm: LLVMTypeRef = llvm_type_of(dict_items_field_type, structs, ctx)
+                        dict_bucket_llvm: LLVMTypeRef = llvm_type_of(dict_bucket_type, structs, ctx)
+                        dict_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                        dict_i8: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+                        # items is `DictBucket&?` — a TAGGED optional {i1, ptr}; the raw array
+                        # pointer is field 1. Empty dict → null items, but capacity is then 0 so
+                        # the loop body never runs.
+                        dict_items_opt_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_llvm, dict_address, dict_items_index.u32(), "dict.items.opt.ptr")
+                        dict_items_opt: LLVMValueRef = LLVMBuildLoad2(builder, dict_optional_llvm, dict_items_opt_ptr, "dict.items.opt")
+                        dict_items_raw: LLVMValueRef = LLVMBuildExtractValue(builder, dict_items_opt, 1, "dict.items.raw")
+                        dict_capacity_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_llvm, dict_address, dict_capacity_index.u32(), "dict.cap.ptr")
+                        dict_capacity: LLVMValueRef = LLVMBuildLoad2(builder, dict_i64, dict_capacity_ptr, "dict.cap")
+                        dict_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, dict_i64, "dict.i")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(dict_i64, 0, 0), dict_index_slot)
+                        dict_key_storage: mutable darray[u8] = []
+                        dict_key_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(dict_key_type, structs, ctx), sview_to_cstr(for_variables[0], dict_key_storage))
+                        declare_local(local_scope, for_variables[0], dict_key_slot, dict_key_type)
+                        dict_value_storage: mutable darray[u8] = []
+                        dict_value_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(dict_value_type, structs, ctx), sview_to_cstr(for_variables[1], dict_value_storage))
+                        declare_local(local_scope, for_variables[1], dict_value_slot, dict_value_type)
+                        dict_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        dict_head: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.head")
+                        dict_check: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.check")
+                        dict_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.body")
+                        dict_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.step")
+                        dict_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.exit")
+                        _ = LLVMBuildBr(builder, dict_head)
+                        LLVMPositionBuilderAtEnd(builder, dict_head)
+                        dict_current: LLVMValueRef = LLVMBuildLoad2(builder, dict_i64, dict_index_slot, "dict.cur")
+                        dict_keep: LLVMValueRef = LLVMBuildICmp(builder, 36, dict_current, dict_capacity, "dict.cmp")
+                        _ = LLVMBuildCondBr(builder, dict_keep, dict_check, dict_exit)
+                        # CHECK: load this slot's state; occupied (1) → body, else → step.
+                        LLVMPositionBuilderAtEnd(builder, dict_check)
+                        dict_slot_indices: mutable darray[LLVMValueRef] = [dict_current]
+                        dict_slot_indices_pointer: void& = (&dict_slot_indices[0]).cast[void&] can Unsafe.PointerCast
+                        dict_bucket_ptr: LLVMValueRef = LLVMBuildGEP2(builder, dict_bucket_llvm, dict_items_raw, dict_slot_indices_pointer, 1, "dict.bucket.ptr")
+                        dict_state_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_state_index.u32(), "dict.state.ptr")
+                        dict_state: LLVMValueRef = LLVMBuildLoad2(builder, dict_i8, dict_state_ptr, "dict.state")
+                        dict_occupied: LLVMValueRef = LLVMBuildICmp(builder, 32, dict_state, LLVMConstInt(dict_i8, 1, 0), "dict.occ")
+                        _ = LLVMBuildCondBr(builder, dict_occupied, dict_body, dict_step)
+                        # BODY: bind k = bucket.key, v = bucket.value, then run the loop body.
+                        LLVMPositionBuilderAtEnd(builder, dict_body)
+                        dict_key_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_key_index.u32(), "dict.key.ptr")
+                        _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(dict_key_type, structs, ctx), dict_key_ptr, "dict.key"), dict_key_slot)
+                        dict_value_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_value_index.u32(), "dict.value.ptr")
+                        _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(dict_value_type, structs, ctx), dict_value_ptr, "dict.value"), dict_value_slot)
+                        loops.exits <- loops.exits.push(dict_exit)
+                        loops.continues <- loops.continues.push(dict_step)
+                        dict_body_status: EmitStatus = emit_statements(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                        _ = loops.exits.pop()
+                        _ = loops.continues.pop()
+                        EmitStatus.Declined return if dict_body_status == EmitStatus.Declined
+                        branch_if_open(dict_body_status, builder, dict_step)
+                        LLVMPositionBuilderAtEnd(builder, dict_step)
+                        dict_next: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, dict_i64, dict_index_slot, "dict.next.cur"), LLVMConstInt(dict_i64, 1, 0), "dict.next")
+                        _ = LLVMBuildStore(builder, dict_next, dict_index_slot)
+                        _ = LLVMBuildBr(builder, dict_head)
+                        LLVMPositionBuilderAtEnd(builder, dict_exit)
+                        return EmitStatus.Open
+                    return EmitStatus.Declined
                 EmitStatus.Declined return if for_variables.count != 1
                 for_variable: sview = for_variables[0]
                 # A single-variable darray iteration uses the header's count/items fields
