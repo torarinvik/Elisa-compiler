@@ -1078,6 +1078,10 @@ run_case cast_pointer_to_uintptr_roundtrip 'def main() -> i64:\n    x: mutable i
 run_case convert_prefix_widen  'def main() -> i64:\n    x: u8 = 200\n    return i64(x) - 158\n' 42
 run_case convert_prefix_narrow 'def main() -> i64:\n    x: i64 = 300\n    return u8(x).i64() - 2\n' 42
 run_case convert_prefix_ftrunc 'def main() -> i64:\n    x: f64 = 42.9\n    return i64(x)\n' 42
+# List comprehension over an existing DARRAY source (not a range): built by push, one
+# element per source item that passes the optional `if` filter.
+run_case list_comp_over_darray 'def main() -> i64:\n    xs: darray[i64] = [10, 20, 12]\n    ys: darray[i64] = [x + 1 for x in xs]\n    return ys[0] + ys[1] + ys[2] - 3\n' 42
+run_case list_comp_darray_filter 'def main() -> i64:\n    xs: darray[i64] = [1, 2, 3, 4, 5, 6]\n    ys: darray[i64] = [x for x in xs if x > 3]\n    return ys[0] + ys[1] + ys[2] + 27\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
