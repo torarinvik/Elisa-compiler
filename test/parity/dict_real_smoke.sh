@@ -151,6 +151,24 @@ dict_case iter_empty 'def main() -> i64:
         n <- n + 1
     return n' 0
 
+# Non-empty dict LITERAL `{k: v, …}`: a zeroed DynDict + one arena_dict_put_or_panic per
+# entry (the frictionless insert), then read back. The analogue of the set literal.
+dict_case literal_entries 'def main() -> i64:
+    d: mutable dict[i64, i64] = {1: 40, 2: 2}
+    total: mutable i64 = 0
+    if d.get(1) is a:
+        total <- total + a
+    if d.get(2) is b:
+        total <- total + b
+    return total' 42
+# A literal entry then an explicit put overwrites (count stays 1, value replaced).
+dict_case literal_then_put 'def main() -> i64:
+    d: mutable dict[i64, i64] = {5: 100}
+    d.put(5, 42)
+    if d.get(5) is v:
+        return v
+    return 0' 42
+
 if [ "$pass" -eq "$total" ]; then
     echo "dict_real_smoke OK: $pass/$total real-std collections.elisa dict programs compile+run correctly"
 else
