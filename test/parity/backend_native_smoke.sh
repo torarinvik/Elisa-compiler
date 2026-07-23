@@ -143,6 +143,15 @@ run_case tuple_field_x     'def main() -> i64:\n    r: (x: i64, y: i64) = (40, 2
 run_case tuple_from_return 'def swap(a: i64, b: i64) -> (x: i64, y: i64):\n    return (b, a)\n\ndef main() -> i64:\n    r: (x: i64, y: i64) = swap(42, 7)\n    return r.y\n'  42
 run_case tuple_expr_fields 'def main() -> i64:\n    a: i64 = 20\n    r: (x: i64, y: i64) = (a, a + 2)\n    return r.x + r.y\n'  42
 
+# Atomics: `atomic[T]` is a std struct `{value:T}`; a call to a std atomic op on an
+# `atomic[int]&` (store/load/fetch_add/...) lowers to a REAL LLVM atomic instruction
+# (SeqCst), not the plain-field-access function body. Verified by VALUE (single-threaded,
+# the atomic instruction still returns the right result). The `struct atomic` + op defs
+# stand in for the std here (backend_native_smoke has no std concatenation).
+run_case atomic_store_load 'struct atomic[T]:\n    value: mutable T\n\ndef store(s: mutable atomic[i64]&, v: i64) -> void:\n    s.value <- v\n\ndef load(s: atomic[i64]&) -> i64:\n    return s.value\n\ndef main() -> i64:\n    a: mutable atomic[i64] = atomic[i64]{value: 0}\n    store(&a, 42)\n    return load(&a)\n'  42
+run_case atomic_fetch_add 'struct atomic[T]:\n    value: mutable T\n\ndef store(s: mutable atomic[i64]&, v: i64) -> void:\n    s.value <- v\n\ndef load(s: atomic[i64]&) -> i64:\n    return s.value\n\ndef fetch_add(s: mutable atomic[i64]&, v: i64) -> i64:\n    return s.value\n\ndef main() -> i64:\n    a: mutable atomic[i64] = atomic[i64]{value: 0}\n    store(&a, 40)\n    fetch_add(&a, 2)\n    return load(&a)\n'  42
+run_case atomic_exchange 'struct atomic[T]:\n    value: mutable T\n\ndef exchange(s: mutable atomic[i64]&, v: i64) -> i64:\n    return s.value\n\ndef main() -> i64:\n    a: mutable atomic[i64] = atomic[i64]{value: 42}\n    return exchange(&a, 7)\n'  42
+
 # for-range loops, break/continue, bitwise, bool.
 run_case for_range        'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 0..<10:\n        total <- total + i\n    return total\n'   45
 run_case for_inclusive    'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 1..=5:\n        total <- total + i\n    return total\n'     15
