@@ -1112,6 +1112,9 @@ run_case generic_darray_param 'def cnt[T](da: mutable darray[T]&) -> i64:\n    r
 # Indexing a ref-to-NUMERIC-scalar as a C-style pointer base (`p: T& = base.cast[T&]; p[i]`),
 # how Slice[T] reads its backing. Round-trips a value through a uintptr and reads it back by index.
 run_case scalar_ref_index_read 'def main() -> i64:\n    x: mutable i64 = 42\n    u: uintptr = (&x).cast[uintptr] can Unsafe.PointerCast\n    p: mutable i64& = u.cast[mutable i64&] can Unsafe.PointerCast\n    return p[0.usize()]\n' 42
+# Address of a BORROWED darray-ref param's element (`&da[i]`), as in Slice's
+# `slice(&da)` -> `(&da[0]).cast[uintptr]`. Round-trips the address back to a ref and reads it.
+run_case addr_of_darray_ref_elem 'def head_addr(da: mutable darray[i64]&) -> uintptr:\n    return (&da[0.usize()]).cast[uintptr] can Unsafe.PointerCast\ndef main() -> i64:\n    xs: mutable darray[i64] = [42, 8, 9]\n    u: uintptr = head_addr(&xs)\n    p: i64& = u.cast[i64&] can Unsafe.PointerCast\n    return p\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
