@@ -1,0 +1,156 @@
+# Call-site precondition on a STRUCT-FIELD, unprovable when the field was built from an
+# unconstrained value. A callee `f(v: S, ...)` with `requires <expr> <cmp> v.FIELD` imposes a bound
+# on that field; when the caller passes a freshly-constructed `S{FIELD: n, ...}` whose FIELD value is
+# a bare caller PARAMETER with no `requires` of its own, the bound cannot be discharged — stage0 warns
+# "precondition of f could not be proven". Sound: fires only for a bare-parameter field initializer
+# the caller never constrains; a literal, an expression, or a `requires`-bounded param all decline.
+extend Semantic:
+    private:
+        # The first field of `param0` a predicate references (`v.size` -> "size"), else "".
+        def csfp_field_of_param(expression: Ast::Expr, param0_name: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, field_line):
+                        field return if ident_name_of(object) == param0_name
+                        return csfp_field_of_param(object, param0_name)
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_field: sview = csfp_field_of_param(left, param0_name)
+                        left_field return if left_field != ""
+                        return csfp_field_of_param(right, param0_name)
+                    Expr.Paren(inner, paren_line):
+                        return csfp_field_of_param(inner, param0_name)
+                    Expr.Unary(operator, operand, unary_line):
+                        return csfp_field_of_param(operand, param0_name)
+                    _:
+                        return sview("", 0, 0)
+
+        # Collect (fn, referenced-field) for functions whose `requires` bounds a field of their FIRST
+        # parameter. Parallel arrays; a function referencing several fields yields several entries.
+        def csfp_collect(declarations: darray[Ast::Decl], out_fns: mutable darray[sview]&, out_fields: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_fns, out_fields|:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            if params.count > 0:
+                                param0: sview = params[0].name
+                                for statement in body |out_fns, out_fields, name, param0|:
+                                    match statement:
+                                        Stmt.Contract(kind, expression, contract_line):
+                                            if kind == "requires":
+                                                field: sview = csfp_field_of_param(expression, param0)
+                                                if field != "":
+                                                    out_fns.push(name)
+                                                    out_fields.push(field)
+                                        _:
+                                            pass
+                        Decl.Module(module_name, module_body, module_line):
+                            csfp_collect(module_body, out_fns, out_fields)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            csfp_collect(scoped_body, out_fns, out_fields)
+                        _:
+                            pass
+
+        # The value a Construct expression assigns to FIELD, else Absent.
+        def csfp_construct_field_value(construct: Ast::Expr, field: sview) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                if construct is Expr.Construct(construct_type, construct_fields, construct_line):
+                    for field_init in construct_fields:
+                        field_init.value return if field_init.name == field
+                return (Ast::Expr.Absent)
+
+        # The referenced field name of a called function (matching fns/fields), else "".
+        def csfp_lookup_field(callee_name: sview, fns: darray[sview]&, fields: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                probe: mutable usize = 0
+                while probe < fns.count |probe, callee_name, fns, fields|:
+                    fields[probe] return if fns[probe] == callee_name
+                    probe <- probe + 1
+                return sview("", 0, 0)
+
+        def csfp_check_expr(expression: Ast::Expr, fns: darray[sview]&, fields: darray[sview]&, caller_params: darray[sview]&, requires_names: darray[sview]&, local_names: darray[sview]&, local_constructs: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        if callee_name != "" and arguments.count > 0:
+                            field: sview = csfp_lookup_field(callee_name, fns, fields)
+                            if field != "":
+                                arg0_name: sview = ident_name_of(arguments[0])
+                                local_slot: mutable i64 = -1
+                                local_probe: mutable usize = 0
+                                while local_probe < local_names.count |local_slot, local_probe, arg0_name, local_names|:
+                                    local_slot <- local_probe.i64() if local_names[local_probe] == arg0_name and local_slot < 0
+                                    local_probe <- local_probe + 1
+                                if local_slot >= 0:
+                                    field_value: Ast::Expr = csfp_construct_field_value(local_constructs[local_slot.usize()], field)
+                                    value_name: sview = ident_name_of(field_value)
+                                    unconstrained: bool = value_name != "" and name_in(caller_params, value_name) and not name_in(requires_names, value_name)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: callee_name, line: call_line, expected: "", actual: ""}) if unconstrained
+                        for argument in arguments |table| -> table:
+                            table <- csfp_check_expr(argument, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- csfp_check_expr(left, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                        table <- csfp_check_expr(right, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- csfp_check_expr(inner, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                    _:
+                        pass
+
+        def csfp_check_stmts(statements: darray[Ast::Stmt], fns: darray[sview]&, fields: darray[sview]&, caller_params: darray[sview]&, requires_names: darray[sview]&, local_names: darray[sview]&, local_constructs: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- csfp_check_expr(expression, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                        Stmt.Return(value, line):
+                            table <- csfp_check_expr(returned, fns, fields, caller_params, requires_names, local_names, local_constructs, table) if value is returned
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- csfp_check_expr(value, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- csfp_check_expr(value, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- csfp_check_stmts(then_body, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                            table <- csfp_check_stmts(else_body, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- csfp_check_stmts(while_body, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- csfp_check_stmts(block_body, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                        _:
+                            pass
+
+        def csfp_check_decls(declarations: darray[Ast::Decl], fns: darray[sview]&, fields: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            caller_params: mutable darray[sview] = []
+                            for parameter in params |caller_params|:
+                                caller_params.push(parameter.name)
+                            requires_names: mutable darray[sview] = []
+                            local_names: mutable darray[sview] = []
+                            local_constructs: mutable darray[Ast::Expr] = []
+                            for statement in body |requires_names, local_names, local_constructs|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        collect_expression_idents(expression, requires_names) if kind == "requires"
+                                    Stmt.VarDecl(local_name, local_type, local_value, local_line):
+                                        if local_value is Expr.Construct(construct_type, construct_fields, construct_line):
+                                            local_names.push(local_name)
+                                            local_constructs.push(local_value)
+                                    _:
+                                        pass
+                            table <- csfp_check_stmts(body, fns, fields, caller_params, requires_names, local_names, local_constructs, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- csfp_check_decls(module_body, fns, fields, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- csfp_check_decls(scoped_body, fns, fields, table)
+                        _:
+                            pass
+
+    public:
+        def check_call_struct_field_precondition(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fns: mutable darray[sview] = []
+                fields: mutable darray[sview] = []
+                csfp_collect(file.top_decls, fns, fields)
+                table <- csfp_check_decls(file.top_decls, fns, fields, table)
