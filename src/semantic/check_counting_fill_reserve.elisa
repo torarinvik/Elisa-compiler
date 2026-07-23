@@ -1,0 +1,199 @@
+# Nested counting-fill without a synthesizable reserve (stage0 auto-reserve lint, docs/70).
+# A fresh darray grown inside a pair of nested counting loops `for i in 0..<A: ... for j in
+# 0..<B: out.push(...)` presizes to `A*B` ONLY when both bounds are loop-invariant, so the
+# product is a stable expression auto-reserve can synthesize. When the INNER bound `B` depends
+# on a name introduced by the OUTER loop (its induction variable, or a local declared in the
+# outer body — e.g. `n = i + 1`, or `found.parts.count` where `found` is bound per-iteration),
+# the per-iteration total varies and stage0 cannot synthesize the reserve; it emits a warning
+# asking for an explicit one.
+#
+# SOUND, NARROW subset: fire only when an inner counting loop whose bound mentions an outer-loop
+# name grows a darray local that is NEVER `reserve`/`resize`-d in the function, and the push is
+# not inside an `in`/`region` owner scope. `rs_rc_nested_product` (`for i in 0..<n: for j in
+# 0..<m: xs.push`) has an outer-INVARIANT inner bound `m`, so it is auto-reservable and stays
+# silent — correctly excluded. Reuses is_darray_type / expr_mentions_name / collect_darray_names
+# / push_call_shape from check_push_loop_lint.elisa.
+extend Semantic:
+    private:
+        # The HI operand of a counting range `LO..<HI` / `LO..HI` / `LO..=HI`, else (false, Absent).
+        def cfr_range_hi(iterable: Ast::Expr) -> (found: bool, hi: Ast::Expr):
+            can Memory.Allocate, Abort.Panic:
+                match iterable:
+                    Expr.Binary(left, operator, right, line):
+                        counting: bool = operator == TokenKind.Range or operator == TokenKind.RangeLt or operator == TokenKind.RangeLe
+                        return (true, right) if counting else (false, (Ast::Expr.Absent))
+                    Expr.Paren(inner, paren_line):
+                        return cfr_range_hi(inner)
+                    _:
+                        return (false, (Ast::Expr.Absent))
+
+        # Every VarDecl name declared anywhere in a statement list (recursively).
+        def cfr_collect_local_decls(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            out.push(name)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            cfr_collect_local_decls(then_body, out)
+                            cfr_collect_local_decls(else_body, out)
+                        Stmt.While(condition, while_body, while_line):
+                            cfr_collect_local_decls(while_body, out)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            cfr_collect_local_decls(for_body, out)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            cfr_collect_local_decls(block_body, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |out|:
+                                cfr_collect_local_decls(arm.body, out)
+                        _:
+                            pass
+
+        # Whether EXPR mentions any name in NAMES.
+        def cfr_mentions_any(expression: Ast::Expr, names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return any candidate in names where candidate != "" and expr_mentions_name(expression, candidate)
+
+        # Whether `name.reserve(...)` or `name.resize(...)` occurs anywhere — either disqualifies
+        # the fresh darray from the lint (an explicit or resizing capacity is already present).
+        def cfr_has_reserve(statements: darray[Ast::Stmt]&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            true return if cfr_expr_is_reserve(expression, name)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if cfr_has_reserve(then_body, name)
+                            true return if cfr_has_reserve(else_body, name)
+                        Stmt.While(condition, while_body, while_line):
+                            true return if cfr_has_reserve(while_body, name)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            true return if cfr_has_reserve(for_body, name)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            true return if cfr_has_reserve(block_body, name)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |name|:
+                                true return if cfr_has_reserve(arm.body, name)
+                        _:
+                            pass
+                return false
+
+        def cfr_expr_is_reserve(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if callee is Expr.Field(object, field, field_line):
+                            grows: bool = field == "reserve" or field == "resize"
+                            return grows and ident_name_of(object) == name
+                        return false
+                    _:
+                        return false
+
+        # Collect darray destinations pushed-to anywhere in a statement list (recursively).
+        def cfr_collect_pushes(statements: darray[Ast::Stmt], darray_names: darray[sview]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |darray_names, out|:
+                    shape: (dst: sview, value: Ast::Expr) = push_call_shape(statement)
+                    out.push(shape.dst) if shape.dst != "" and (any d in darray_names where d == shape.dst)
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            cfr_collect_pushes(then_body, darray_names, out)
+                            cfr_collect_pushes(else_body, darray_names, out)
+                        Stmt.While(condition, while_body, while_line):
+                            cfr_collect_pushes(while_body, darray_names, out)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            cfr_collect_pushes(for_body, darray_names, out)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            cfr_collect_pushes(block_body, darray_names, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |darray_names, out|:
+                                cfr_collect_pushes(arm.body, darray_names, out)
+                        _:
+                            pass
+
+        # Within an outer counting loop, find an inner counting loop whose bound depends on an
+        # outer-loop name and grows an unreserved darray; fire once per such darray.
+        def cfr_scan_inner(statements: darray[Ast::Stmt], outer_names: darray[sview]&, darray_names: darray[sview]&, full_body: darray[Ast::Stmt]&, in_owner: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            hi: (found: bool, hi: Ast::Expr) = cfr_range_hi(iterable)
+                            dependent: bool = hi.found and cfr_mentions_any(hi.hi, outer_names)
+                            if dependent and not in_owner:
+                                pushed: mutable darray[sview] = []
+                                cfr_collect_pushes(for_body, darray_names, pushed)
+                                fired: mutable darray[sview] = []
+                                for target in pushed |fired, table| -> table:
+                                    already: bool = any f in fired where f == target
+                                    should_fire: bool = not already and not cfr_has_reserve(full_body, target)
+                                    fired.push(target) if not already
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.CountingFillUnreserved, name: target, line: for_line, expected: "", actual: ""}) if should_fire
+                            table <- cfr_scan_inner(for_body, outer_names, darray_names, full_body, in_owner, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- cfr_scan_inner(then_body, outer_names, darray_names, full_body, in_owner, table)
+                            table <- cfr_scan_inner(else_body, outer_names, darray_names, full_body, in_owner, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- cfr_scan_inner(while_body, outer_names, darray_names, full_body, in_owner, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            nested_owner: bool = in_owner or kind == "in" or kind == "region"
+                            table <- cfr_scan_inner(block_body, outer_names, darray_names, full_body, nested_owner, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- cfr_scan_inner(arm.body, outer_names, darray_names, full_body, in_owner, table)
+                        _:
+                            pass
+
+        def cfr_walk(statements: darray[Ast::Stmt], darray_names: darray[sview]&, full_body: darray[Ast::Stmt]&, in_owner: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            outer_hi: (found: bool, hi: Ast::Expr) = cfr_range_hi(iterable)
+                            if outer_hi.found:
+                                outer_names: mutable darray[sview] = []
+                                for loop_var in variables |outer_names|:
+                                    outer_names.push(loop_var) if loop_var != "" and loop_var != "_"
+                                cfr_collect_local_decls(for_body, outer_names)
+                                table <- cfr_scan_inner(for_body, outer_names, darray_names, full_body, in_owner, table)
+                            table <- cfr_walk(for_body, darray_names, full_body, in_owner, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- cfr_walk(then_body, darray_names, full_body, in_owner, table)
+                            table <- cfr_walk(else_body, darray_names, full_body, in_owner, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- cfr_walk(while_body, darray_names, full_body, in_owner, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            nested_owner: bool = in_owner or kind == "in" or kind == "region"
+                            table <- cfr_walk(block_body, darray_names, full_body, nested_owner, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- cfr_walk(arm.body, darray_names, full_body, in_owner, table)
+                        _:
+                            pass
+
+        def cfr_check_declarations(declarations: darray[Ast::Decl], region_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            has_region: bool = any region_line in region_lines where region_line == line
+                            if not has_region:
+                                darray_names: mutable darray[sview] = []
+                                for parameter in parameters |darray_names|:
+                                    darray_names.push(parameter.name) if is_darray_type(parameter.type_expression)
+                                collect_darray_names(body, darray_names)
+                                table <- cfr_walk(body, darray_names, body, false, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- cfr_check_declarations(module_body, region_lines, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- cfr_check_declarations(scoped_body, region_lines, table)
+                        _:
+                            pass
+
+    public:
+        def check_counting_fill_reserve(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                region_lines: mutable darray[u32] = []
+                for annotation in file.local_region_annotations |region_lines|:
+                    region_lines.push(annotation.line)
+                table <- cfr_check_declarations(file.top_decls, region_lines, table)
