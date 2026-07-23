@@ -140,6 +140,11 @@ set_case comprehension 'def main() -> i64:
 set_case comprehension_filter 'def main() -> i64:
     s: mutable set[i64] = {x for x in 0..<10 if x > 6}
     return 42 if (7 in s) and not (3 in s) else 7' 42
+# Comprehension over an existing DARRAY source (not a range).
+set_case comprehension_over_darray 'def main() -> i64:
+    xs: darray[i64] = [3, 5, 7]
+    s: mutable set[i64] = {x * 2 for x in xs}
+    return 42 if (10 in s) and not (3 in s) else 7' 42
 
 if [ "$pass" -eq "$total" ]; then
     echo "set_real_smoke OK: $pass/$total real-std collections.elisa set programs compile+run correctly"

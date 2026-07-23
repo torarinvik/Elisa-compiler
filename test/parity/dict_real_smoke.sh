@@ -187,6 +187,13 @@ dict_case comprehension_filter 'def main() -> i64:
     for k, v in d:
         n <- n + 1
     return n + 39' 42
+# Comprehension over an existing DARRAY source (not a range).
+dict_case comprehension_over_darray 'def main() -> i64:
+    xs: darray[i64] = [1, 2, 3]
+    d: mutable dict[i64, i64] = {k: k * 10 for k in xs}
+    if d.get(2) is v:
+        return v + 22
+    return 0' 42
 
 if [ "$pass" -eq "$total" ]; then
     echo "dict_real_smoke OK: $pass/$total real-std collections.elisa dict programs compile+run correctly"
