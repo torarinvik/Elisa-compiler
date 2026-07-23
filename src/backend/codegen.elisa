@@ -314,6 +314,9 @@ module Backend:
                 if annotation.owner == "__lambda_param":
                     structs.fn_param_lines.push(annotation.line)
                     structs.fn_param_heads.push(annotation.name)
+                if annotation.owner == "__tuple_label":
+                    structs.tuple_label_lines.push(annotation.line)
+                    structs.tuple_label_names.push(annotation.name)
 
         # The recorded return-type head for the fn-type declared at `line`, or "".
         def fn_return_head_at(line: u32, structs: mutable StructTable&) -> sview can[Abort.Panic]:
@@ -426,6 +429,21 @@ module Backend:
                 return unmodeled_type()
             # `dict[K, V]` / `Pair[K, V]` — a multi-argument generic type application. The
             # `dict` spelling denotes the runtime's `DynDict[K, V]` struct.
+            # A named-tuple TYPE `(x: T, y: U)` — resolve to its pre-registered anonymous struct
+            # (register_tuple_types ran with ctx before any body). Lookup is by structure.
+            if type_expression is Expr.Tuple(tuple_type_elements, tuple_type_line):
+                tuple_labels: darray[sview] = tuple_labels_at(tuple_type_line, structs)
+                unmodeled_type() return if tuple_type_elements.count == 0 or tuple_labels.count != tuple_type_elements.count
+                tuple_element_types: mutable darray[ValueType] = []
+                tuple_declined: mutable bool = false
+                for tuple_element in tuple_type_elements |tuple_element_types, tuple_declined, structs|:
+                    tuple_element_type: ValueType = annotation_value_type(tuple_element, structs)
+                    tuple_declined <- true if tuple_element_type.kind == TypeKind.Unmodeled
+                    tuple_element_types.push(tuple_element_type)
+                unmodeled_type() return if tuple_declined
+                tuple_slot: i64 = tuple_struct_lookup(tuple_labels, tuple_element_types, structs)
+                ValueType{kind: TypeKind.Struct, bits: tuple_slot.u32()} return if tuple_slot >= 0
+                return unmodeled_type()
             if type_expression is Expr.IndexN(application_head, application_args, application_line):
                 if application_head is Expr.Ident(application_name, application_name_line):
                     # `array[T, N]` — the explicit fixed-array spelling (stage0 accepts it
@@ -566,6 +584,12 @@ module Backend:
             field_types: mutable darray[ValueType]
             field_start: mutable darray[usize]
             field_count: mutable darray[usize]
+            # Named-tuple field LABELS recovered from the parser's `__tuple_label` side-table
+            # (labels are stripped from the Expr.Tuple node, recorded by line). A named tuple
+            # type `(x: i64, y: i64)` is modeled as a synthesized anonymous (empty-named)
+            # struct pre-registered by register_tuple_types; these give the `.field` names.
+            tuple_label_lines: mutable darray[u32]
+            tuple_label_names: mutable darray[sview]
             # GENERIC struct templates. A `struct Box[T]:` is NOT a concrete type — it is
             # a template materialized per type-argument tuple into an ordinary registered
             # struct named `Box__i64` (the concrete name doubles as the instantiation memo:
@@ -4676,6 +4700,28 @@ module Backend:
                 null return if declined
                 return LLVMBuildLoad2(builder, array_llvm, temporary, "arrayval")
 
+            # Named-tuple VALUE `(a, b, …)` — construct positionally into the EXPECTED tuple
+            # struct (a synthesized anonymous struct; register_tuple_types resolved its type).
+            if expression is Expr.Tuple(tuple_value_elements, tuple_value_line):
+                null return if expected.kind != TypeKind.Struct
+                tuple_value_slot: usize = expected.bits.usize()
+                null return if structs.field_count[tuple_value_slot] != tuple_value_elements.count
+                tuple_value_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                tuple_value_temporary: LLVMValueRef = LLVMBuildAlloca(builder, tuple_value_llvm, "tuple")
+                tuple_value_field_start: usize = structs.field_start[tuple_value_slot]
+                tuple_value_declined: mutable bool = false
+                tuple_value_position: mutable u32 = 0
+                for tuple_value_element in tuple_value_elements |tuple_value_declined, tuple_value_position, tuple_value_field_start, tuple_value_llvm, tuple_value_temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    tuple_value_field_type: ValueType = copied_type(structs.field_types[tuple_value_field_start + tuple_value_position.usize()])
+                    tuple_value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, tuple_value_llvm, tuple_value_temporary, tuple_value_position, "tuple.field.ptr")
+                    if emit_expression(tuple_value_element, tuple_value_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is tuple_value_field:
+                        _ = LLVMBuildStore(builder, tuple_value_field, tuple_value_pointer)
+                    else:
+                        tuple_value_declined <- true
+                    tuple_value_position <- tuple_value_position + 1
+                null return if tuple_value_declined
+                return LLVMBuildLoad2(builder, tuple_value_llvm, tuple_value_temporary, "tupleval")
+
             # `x.cast[T]` — a REINTERPRET cast (parsed as Index(Field(x,"cast"), T), no call).
             # Only pointer<->pointer is modeled (a ref/cstr/void& is a `ptr`, and opaque
             # pointers make it a no-op) — that is all the std alloc helpers need
@@ -6584,6 +6630,115 @@ module Backend:
                 structs.field_count <- structs.field_count.push(0)
 
 
+        # The `__tuple_label` field names recorded (in source order) for the tuple at `line`.
+        def tuple_labels_at(line: u32, structs: mutable StructTable&) -> darray[sview] can[Abort.Panic, Memory.Allocate]:
+            result: mutable darray[sview] = []
+            probe: mutable usize = 0
+            while probe < structs.tuple_label_lines.count |probe, line, result, structs|:
+                result.push(structs.tuple_label_names[probe]) if structs.tuple_label_lines[probe] == line
+                probe <- probe + 1
+            return result
+
+
+        # The index of an already-registered anonymous tuple struct whose field NAMES and field
+        # TYPES match (structural memo — an empty struct name marks a synthesized tuple), or -1.
+        def tuple_struct_lookup(labels: darray[sview]&, element_types: darray[ValueType]&, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            si: mutable usize = 0
+            while si < structs.names.count |si, labels, element_types, structs|:
+                if structs.names[si] == "" and structs.field_count[si] == labels.count and labels.count > 0:
+                    start: usize = structs.field_start[si]
+                    matched: mutable bool = true
+                    k: mutable usize = 0
+                    while k < labels.count |k, matched, start, si, labels, element_types, structs|:
+                        if structs.field_names[start + k] != labels[k] or structs.field_types[start + k].kind != element_types[k].kind or structs.field_types[start + k].bits != element_types[k].bits:
+                            matched <- false
+                        k <- k + 1
+                    si.i64() return if matched
+                si <- si + 1
+            return -1
+
+
+        # Register ONE named-tuple type `(x: T, y: U)` as an anonymous (empty-named) struct, if
+        # not already registered. Its field labels come from the __tuple_label side-table; its
+        # element types resolve like any annotation. Structurally memoized so a tuple return
+        # type and a same-shape local resolve to the SAME struct.
+        def register_one_tuple_type(elements: darray[Ast::Expr], line: u32, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            labels: darray[sview] = tuple_labels_at(line, structs)
+            return if elements.count == 0 or labels.count != elements.count
+            element_types: mutable darray[ValueType] = []
+            declined: mutable bool = false
+            for element in elements |element_types, declined, structs|:
+                element_type: ValueType = annotation_value_type(element, structs)
+                declined <- true if element_type.kind == TypeKind.Unmodeled
+                element_types.push(element_type)
+            return if declined
+            return if tuple_struct_lookup(labels, element_types, structs) >= 0
+            name_storage: mutable darray[u8] = []
+            handle: LLVMTypeRef = LLVMStructCreateNamed(ctx, sview_to_cstr("tuple", name_storage))
+            llvm_fields: mutable darray[LLVMTypeRef] = []
+            for element_type_slot in element_types |llvm_fields, structs, ctx|:
+                llvm_fields.push(llvm_type_of(element_type_slot, structs, ctx))
+            llvm_fields_pointer: void& = (&llvm_fields[0]).cast[void&] can Unsafe.PointerCast
+            LLVMStructSetBody(handle, llvm_fields_pointer, element_types.count.u32(), 0)
+            field_start: usize = structs.field_names.count
+            fi: mutable usize = 0
+            while fi < labels.count |fi, labels, element_types, structs|:
+                structs.field_names <- structs.field_names.push(labels[fi])
+                structs.field_types <- structs.field_types.push(element_types[fi])
+                fi <- fi + 1
+            structs.names <- structs.names.push(sview("", 0, 0))
+            structs.handles <- structs.handles.push(handle)
+            structs.field_start <- structs.field_start.push(field_start)
+            structs.field_count <- structs.field_count.push(labels.count)
+
+
+        # If `type_expression` is a named-tuple TYPE, pre-register its anonymous struct.
+        def register_tuple_types_in_type(type_expression: Ast::Expr, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if type_expression is Expr.Tuple(tuple_elements, tuple_line):
+                register_one_tuple_type(tuple_elements, tuple_line, structs, ctx)
+
+
+        # Walk statements for tuple-typed local declarations, recursing into nested blocks.
+        def register_tuple_types_stmts(statements: darray[Ast::Stmt], structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for statement in statements |structs, ctx|:
+                match statement:
+                    Stmt.VarDecl(var_name, var_type, var_value, var_line):
+                        register_tuple_types_in_type(var_type, structs, ctx)
+                    Stmt.If(if_condition, then_body, else_body, if_line):
+                        register_tuple_types_stmts(then_body, structs, ctx)
+                        register_tuple_types_stmts(else_body, structs, ctx)
+                    Stmt.While(while_condition, while_body, while_line):
+                        register_tuple_types_stmts(while_body, structs, ctx)
+                    Stmt.Block(block_kind, block_clause, block_binding, block_body, block_line):
+                        register_tuple_types_stmts(block_body, structs, ctx)
+                    Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
+                        register_tuple_types_stmts(for_body, structs, ctx)
+                    Stmt.Match(match_scrutinee, match_arms, match_line):
+                        for match_arm in match_arms |structs, ctx|:
+                            register_tuple_types_stmts(match_arm.body, structs, ctx)
+                    _:
+                        pass
+
+
+        # Pre-pass: register every named-tuple TYPE that appears in a function signature
+        # (params, return) or a local declaration, BEFORE any body is emitted — annotation_value_type
+        # then resolves a tuple annotation by structural lookup (it has no ctx to build a handle).
+        def register_tuple_types(declarations: darray[Ast::Decl], structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration in declarations |structs, ctx|:
+                match declaration:
+                    Decl.Func(function_name, parameters, return_type, body, effects, decorators, function_line):
+                        register_tuple_types_in_type(present_return, structs, ctx) if return_type is present_return
+                        for parameter in parameters |structs, ctx|:
+                            register_tuple_types_in_type(parameter.type_expression, structs, ctx)
+                        register_tuple_types_stmts(body, structs, ctx)
+                    Decl.Module(module_name, module_body, module_line):
+                        register_tuple_types(module_body, structs, ctx)
+                    Decl.Scoped(scoped_body, scoped_line):
+                        register_tuple_types(scoped_body, structs, ctx)
+                    _:
+                        pass
+
+
         def const_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
             index: mutable usize = 0
             while index < structs.const_names.count |index, structs, name|:
@@ -7749,7 +7904,7 @@ module Backend:
 
 
         def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: [], pending_ensures: [], narrowed_owners: [], narrowed_fields: [], fn_return_lines: [], fn_return_heads: [], fn_pool_returns: [], fn_param_lines: [], fn_param_heads: [], fn_pool_param_start: [], fn_pool_param_count: [], fn_pool_params: []}
+            structs: mutable StructTable = StructTable{names: [], handles: [], field_names: [], field_types: [], field_start: [], field_count: [], tuple_label_lines: [], tuple_label_names: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_common_counts: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], static_branch_lines: [], static_taken_lines: [], pending_ensures: [], narrowed_owners: [], narrowed_fields: [], fn_return_lines: [], fn_return_heads: [], fn_pool_returns: [], fn_param_lines: [], fn_param_heads: [], fn_pool_param_start: [], fn_pool_param_count: [], fn_pool_params: []}
             # The runtime is declared once per module; each function gets its own arena
             # value below (the `arena` field here is a placeholder until then).
             runtime: mutable Runtime = declare_runtime(m, ctx)
@@ -7824,6 +7979,10 @@ module Backend:
             # unreachable use never runs; a reachable one fails llc/link LOUDLY.
             for declaration in top |structs, ctx|:
                 _ = set_struct_body(declaration, structs, ctx)
+            # Named-tuple types are synthesized anonymous structs; pre-register them now (all
+            # named structs their elements may reference already have bodies) so that
+            # annotation_value_type — which has no ctx — can resolve a tuple annotation by lookup.
+            register_tuple_types(top, structs, ctx)
 
             # Passes 3 and 4 cover FUNCTIONS only: a struct declaration emits no code of
             # its own (its type was built above), so it is skipped rather than declined.
