@@ -1125,6 +1125,10 @@ run_case in_borrowed_arena 'def build(a: mutable Arena&) -> i64 can[Memory.Alloc
 # binds the payload on present, the null arm runs on absent (like `if OPT is v:` as a match).
 run_case match_optional_present 'def f(x: i64) -> i64?:\n    return x if x > 0 else null\ndef main() -> i64:\n    match f(42):\n        null:\n            return 7\n        v:\n            return v\n    return 0\n' 42
 run_case match_optional_absent 'def f(x: i64) -> i64?:\n    return x if x > 0 else null\ndef main() -> i64:\n    match f(-1):\n        null:\n            return 42\n        v:\n            return v\n    return 0\n' 42
+# `x: T = get OPT else BODY` — monadic unwrap with an explicit recovery: present binds the
+# payload, absent runs BODY (which exits). Present path and absent path both exercised.
+run_case get_else_present 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\ndef main() -> i64:\n    v: i64 = get find(40) else return 7\n    return v + 2\n' 42
+run_case get_else_absent 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\ndef main() -> i64:\n    v: i64 = get find(-1) else return 42\n    return v + 100\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
