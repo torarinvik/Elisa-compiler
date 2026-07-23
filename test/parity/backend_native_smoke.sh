@@ -1067,6 +1067,10 @@ run_case const_untyped_bool 'const DEBUG = false\n\ndef main() -> i64:\n    retu
 # Casting to an OPTIONAL pointer target wraps, and the tag comes from a NULL TEST on the
 # source: a null raw pointer must read as ABSENT, not as a present-but-null reference.
 run_case cast_int_to_pointer_optional '@internal\ndef as_ptr(raw: uintptr) -> mutable heap u8&:\n    trusted Unsafe.PointerCast:\n        return raw.cast[mutable heap u8&]\n\n@internal\ndef maybe(p: heap u8&) -> u8&?:\n    trusted Unsafe.PointerCast:\n        return p.cast[u8&?]\n\ndef main() -> i64:\n    p: mutable heap u8& = as_ptr(0.uintptr())\n    if maybe(p) is q:\n        return 7\n    return 42\n' 42
+# `ptr.cast[uintptr]` — the INVERSE reinterpret: a pointer to an INTEGER (`ptrtoint`). Stashing
+# a raw address as a scalar `uintptr` (Slice[T]'s `base` field does exactly this). Round-tripped
+# ptr -> uintptr -> ptr -> deref recovers the original value, so the exit code is deterministic.
+run_case cast_pointer_to_uintptr_roundtrip 'def main() -> i64:\n    x: mutable i64 = 42\n    u: uintptr = (&x).cast[uintptr] can Unsafe.PointerCast\n    p: i64& = u.cast[i64&] can Unsafe.PointerCast\n    return p\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
