@@ -105,6 +105,16 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
     case "$opts" in
         *RequireExternContracts:true*) hdr+=$'# strict-externs\n' ;;
     esac
+    # regionStackCap is recorded in the fingerprint (an analyzer global some region-lifetime
+    # tests override from the production default 64). Replay a NON-DEFAULT cap as a
+    # `# regioncap N` header so stage1's region checker uses the same budget; the default 64
+    # is stage1's own default and needs no header.
+    case "$opts" in
+        *regionStackCap=64*) : ;;
+        *regionStackCap=*)
+            rc="${opts##*regionStackCap=}"; rc="${rc%%[!0-9]*}"
+            [ -n "$rc" ] && hdr+="# regioncap ${rc}"$'\n' ;;
+    esac
     fname="$(printf '%s' "$fname_b64" | openssl base64 -d -A 2>/dev/null)"
     is_runtime_std "$fname" && hdr+=$'# std\n'
     # Option-injected overlay layouts (7th column) are replayed as their IN-SOURCE
