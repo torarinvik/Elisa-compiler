@@ -1,0 +1,162 @@
+# Region-parameter inference failure at a call site (stage0 analyzeRegionParamInference). A
+# callee that grows a darray field of a `mutable Struct&` param needs `@__rg_<param>`; when the
+# argument is a plain call-initialised local (no region scope) whose grown field ESCAPES (is
+# returned), stage0 cannot synthesise a region and reports it. Non-escaping grows are auto-
+# regioned locally and stay silent, so the escape gate keeps this decidable subset sound.
+#
+# Return-value recursion only (no `mutable&` out-params) and a small function count — the full
+# out-param version tripped a stage0 codegen scale threshold.
+extend Semantic:
+    private:
+        # Grown field name of a `param.FIELD.push(...)` inside an expression, else "".
+        def rpu_growth_field(expression: Ast::Expr, param: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        return rpu_growth_field(inner, param)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        match callee:
+                            Expr.Field(receiver, method, field_line):
+                                grow: bool = method == "push" or method == "push_back" or method == "insert" or method == "append" or method == "extend" or method == "resize"
+                                if grow:
+                                    match receiver:
+                                        Expr.Field(object, base_field, base_line):
+                                            base_field return if ident_name_of(object) == param
+                                        _:
+                                            pass
+                            _:
+                                pass
+                        found: mutable sview = sview("", 0, 0)
+                        for argument in arguments |found, param|:
+                            found <- rpu_growth_field(argument, param) if found == ""
+                        return found
+                    _:
+                        return sview("", 0, 0)
+
+        # Grown field of PARAM anywhere in a statement list, else "".
+        def rpu_growth_field_stmts(statements: darray[Ast::Stmt], param: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable sview = sview("", 0, 0)
+                for statement in statements |found, param|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            found <- rpu_growth_field(expression, param) if found == ""
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            found <- rpu_growth_field_stmts(block_body, param) if found == ""
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            found <- rpu_growth_field_stmts(then_body, param) if found == ""
+                            found <- rpu_growth_field_stmts(else_body, param) if found == ""
+                        _:
+                            pass
+                return found
+
+        # Whether the body returns `local.field`; whether it opens a region scope; whether
+        # `local` is a plain call-initialised struct local. Combined struct-name membership check.
+        def rpu_name_in(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                return any candidate in names where candidate == wanted
+
+        # Struct-name head of a (possibly `mutable`/`&`/paren-wrapped) type — `mutable Bag&` -> "Bag".
+        def rpu_struct_head(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, ident_line):
+                        return name
+                    Expr.Unary(operator, operand, unary_line):
+                        return rpu_struct_head(operand)
+                    Expr.Paren(inner, paren_line):
+                        return rpu_struct_head(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        def rpu_returns_field(statements: darray[Ast::Stmt], local: sview, field: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                match returned:
+                                    Expr.Field(object, return_field, field_line):
+                                        true return if ident_name_of(object) == local and return_field == field
+                                    _:
+                                        pass
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if rpu_returns_field(then_body, local, field)
+                            true return if rpu_returns_field(else_body, local, field)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if rpu_returns_field(block_body, local, field)
+                        _:
+                            pass
+                return false
+
+        def rpu_has_region_scope(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if block_kind == "region" or block_kind == "in"
+                            true return if rpu_has_region_scope(block_body)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if rpu_has_region_scope(then_body)
+                            true return if rpu_has_region_scope(else_body)
+                        _:
+                            pass
+                return false
+
+        def rpu_local_is_plain(statements: darray[Ast::Stmt], local: sview, structs: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            if name == local:
+                                is_struct: bool = rpu_name_in(structs, rpu_struct_head(type_expression))
+                                match value:
+                                    Expr.Call(callee, arguments, argument_names, call_line):
+                                        return is_struct
+                                    _:
+                                        return false
+                        _:
+                            pass
+                return false
+
+    public:
+        def check_region_param_uninferable(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Struct names + field-grower (name, grown field) tables.
+                structs: mutable darray[sview] = []
+                for declaration in file.top_decls |structs|:
+                    if declaration is Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_line):
+                        structs.push(struct_name)
+                return if structs.count == 0
+                grower_name: mutable darray[sview] = []
+                grower_field: mutable darray[sview] = []
+                for declaration in file.top_decls |structs, grower_name, grower_field|:
+                    if declaration is Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                        if parameters.count >= 1:
+                            first_type: Ast::Expr = parameters[0].type_expression
+                            ref_struct: bool = rpu_name_in(structs, rpu_struct_head(first_type)) and type_marker_present(first_type, TokenKind.Ampersand)
+                            if ref_struct:
+                                grown: sview = rpu_growth_field_stmts(body, parameters[0].name)
+                                if grown != "":
+                                    grower_name.push(function_name)
+                                    grower_field.push(grown)
+                return if grower_name.count == 0
+                # Check each function's top-level grower calls.
+                for declaration in file.top_decls |structs, grower_name, grower_field, table| -> table:
+                    if declaration is Decl.Func(check_name, check_params, check_return, check_body, check_effects, check_decorators, check_line):
+                        if not rpu_has_region_scope(check_body):
+                            for statement in check_body |structs, grower_name, grower_field, table| -> table:
+                                if statement is Stmt.Expr(call_expression, stmt_line):
+                                    if call_expression is Expr.Call(callee, arguments, argument_names, call_line):
+                                        callee_name: sview = ident_name_of(callee)
+                                        gi: mutable i64 = -1
+                                        gp: mutable usize = 0
+                                        while gp < grower_name.count |gi, gp, callee_name, grower_name|:
+                                            gi <- gp.i64() if grower_name[gp] == callee_name and gi < 0
+                                            gp <- gp + 1
+                                        if gi >= 0 and arguments.count >= 1:
+                                            field: sview = grower_field[gi.usize()]
+                                            local: sview = ident_name_of(arguments[0])
+                                            plain: bool = local != "" and rpu_local_is_plain(check_body, local, structs)
+                                            fires: bool = plain and rpu_returns_field(check_body, local, field)
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionParamUninferable, name: callee_name, line: call_line, expected: "", actual: local}) if fires
