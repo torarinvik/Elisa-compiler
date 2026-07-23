@@ -1109,6 +1109,9 @@ run_case overload_ufcs_both 'struct Holder[T]:\n    v: T\nstruct Keeper[T]:\n   
 # A generic function over a DARRAY PARAMETER: `cnt[T](da: darray[T]&)`. T must be inferred
 # from the darray argument's element (unify_annotation recurses into darray[T] like view[T]).
 run_case generic_darray_param 'def cnt[T](da: mutable darray[T]&) -> i64:\n    return da.count.i64()\ndef main() -> i64:\n    xs: mutable darray[i64] = [1, 2, 3]\n    return cnt(&xs) + 39\n' 42
+# Indexing a ref-to-NUMERIC-scalar as a C-style pointer base (`p: T& = base.cast[T&]; p[i]`),
+# how Slice[T] reads its backing. Round-trips a value through a uintptr and reads it back by index.
+run_case scalar_ref_index_read 'def main() -> i64:\n    x: mutable i64 = 42\n    u: uintptr = (&x).cast[uintptr] can Unsafe.PointerCast\n    p: mutable i64& = u.cast[mutable i64&] can Unsafe.PointerCast\n    return p[0.usize()]\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
