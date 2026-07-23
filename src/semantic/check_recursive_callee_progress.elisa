@@ -1,0 +1,214 @@
+# Interprocedural termination for a self-recursive function whose `decreases` measure is a
+# FIELD DIFFERENCE over a by-reference parameter, mutated only through contracted callees:
+#
+#     def advance(p: mutable Parser&) changes p.pos:
+#         ensure p.pos > old(p.pos)          # STRICT progress
+#     def walk(p: mutable Parser&):
+#         decreases p.stop - p.pos
+#         if p.pos >= p.stop: return
+#         advance(p)                          # strictly shrinks the measure
+#         walk(p)                             # ... so the recursion terminates — PROVEN
+#
+# The measure `p.stop - p.pos` strictly decreases across the recursive `walk(p)` (which passes
+# `p` unchanged) IFF some intervening effect strictly moves it down: the subtrahend field
+# (`pos`) strictly UP, or the minuend field (`stop`) strictly DOWN. A callee whose ensure is
+# only NON-strict (`p.pos >= old(p.pos)`, touch) or moves the wrong way (`p.pos < old(p.pos)`,
+# back) supplies no such guarantee — stage0 reports the measure non-decreasing.
+#
+# SOUND, NARROW: emit ONLY when the measure is a field difference over the recursive-call's
+# unchanged reference argument and NO effect (a strict-progress callee ensure, or a direct
+# `p.pos <- p.pos + c` increment) strictly shrinks it. A single strict-progress effect anywhere
+# suppresses the diagnostic (matching `advance`). Strict-proofs-gated.
+extend Semantic:
+    private:
+        def rcp_field_name(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, field_line):
+                        return field
+                    Expr.Paren(inner, paren_line):
+                        return rcp_field_name(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        def rcp_field_base(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, field_line):
+                        return ident_name_of(object)
+                    Expr.Paren(inner, paren_line):
+                        return rcp_field_base(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        def rcp_present(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match expression:
+                    Expr.Absent: false
+                    _: true
+
+        def rcp_same_field(a: Ast::Expr, b: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                fa: sview = rcp_field_name(a)
+                return fa != "" and fa == rcp_field_name(b) and rcp_field_base(a) == rcp_field_base(b)
+
+        # From an ensure `F op old(F)` (or the mirror), the (field, increase?, strict?) it asserts.
+        def rcp_progress(predicate: Ast::Expr) -> (found: bool, field: sview, increase: bool, strict: bool):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return rcp_progress(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        right_old: Ast::Expr = es_old_arg(right)
+                        if rcp_present(right_old) and rcp_same_field(left, right_old):
+                            increase: bool = operator == TokenKind.Gt or operator == TokenKind.GtEq
+                            strict: bool = operator == TokenKind.Gt or operator == TokenKind.Lt
+                            return (rcp_field_name(left) != "", rcp_field_name(left), increase, strict)
+                        left_old: Ast::Expr = es_old_arg(left)
+                        if rcp_present(left_old) and rcp_same_field(right, left_old):
+                            # old(F) op F: `old(F) < F` means F increased.
+                            increase2: bool = operator == TokenKind.Lt or operator == TokenKind.LtEq
+                            strict2: bool = operator == TokenKind.Lt or operator == TokenKind.Gt
+                            return (rcp_field_name(right) != "", rcp_field_name(right), increase2, strict2)
+                        return (false, sview("", 0, 0), false, false)
+                    _:
+                        return (false, sview("", 0, 0), false, false)
+
+        # Collect every function's progress ensures onto parallel side arrays keyed by name.
+        def rcp_collect_summaries(declarations: darray[Ast::Decl], owner: mutable darray[sview]&, field: mutable darray[sview]&, increase: mutable darray[bool]&, strict: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |owner, field, increase, strict|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            for statement in body |function_name, owner, field, increase, strict|:
+                                if statement is Stmt.Contract(kind, expression, contract_line) and (kind == "ensure" or kind == "ensures"):
+                                    progress: (found: bool, field: sview, increase: bool, strict: bool) = rcp_progress(expression)
+                                    if progress.found:
+                                        owner.push(function_name)
+                                        field.push(progress.field)
+                                        increase.push(progress.increase)
+                                        strict.push(progress.strict)
+                        Decl.Module(module_name, module_body, module_line):
+                            rcp_collect_summaries(module_body, owner, field, increase, strict)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            rcp_collect_summaries(scoped_body, owner, field, increase, strict)
+                        _:
+                            pass
+
+        # Whether callee CALLEE guarantees a strict move of FIELD in the wanted direction.
+        def rcp_callee_strictly(callee: sview, want_field: sview, want_increase: bool, owner: darray[sview]&, field: darray[sview]&, increase: darray[bool]&, strict: darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                probe: mutable usize = 0
+                while probe < owner.count |probe, callee, want_field, want_increase, owner, field, increase, strict|:
+                    hit: bool = owner[probe] == callee and field[probe] == want_field and increase[probe] == want_increase and strict[probe]
+                    true return if hit
+                    probe <- probe + 1
+                return false
+
+        # The decreases measure of a body, as (found, minuend_field, subtrahend_field, base).
+        def rcp_measure(body: darray[Ast::Stmt]) -> (found: bool, minuend: sview, subtrahend: sview, base: sview):
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    if statement is Stmt.Contract(kind, expression, contract_line) and kind == "decreases":
+                        match expression:
+                            Expr.Binary(left, operator, right, binary_line):
+                                if operator == TokenKind.Minus:
+                                    minuend_field: sview = rcp_field_name(left)
+                                    subtrahend_field: sview = rcp_field_name(right)
+                                    base: sview = rcp_field_base(left)
+                                    (true, minuend_field, subtrahend_field, base) return if minuend_field != "" and subtrahend_field != "" and base != "" and base == rcp_field_base(right)
+                            _:
+                                pass
+                return (false, sview("", 0, 0), sview("", 0, 0), sview("", 0, 0))
+
+        # Whether the body makes a recursive call to SELF passing BASE unchanged as an argument.
+        def rcp_recurses_with_base(body: darray[Ast::Stmt], self_name: sview, base: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            true return if rcp_call_recurses(expression, self_name, base)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if rcp_recurses_with_base(then_body, self_name, base) or rcp_recurses_with_base(else_body, self_name, base)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if rcp_recurses_with_base(block_body, self_name, base)
+                        _:
+                            pass
+                return false
+
+        def rcp_call_recurses(expression: Ast::Expr, self_name: sview, base: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if ident_name_of(callee) == self_name:
+                            true return if any argument in arguments where ident_name_of(argument) == base
+                        return false
+                    _:
+                        return false
+
+        # Whether any intervening effect strictly shrinks the measure: a callee that strictly
+        # moves the subtrahend up or the minuend down, or a direct increment of the subtrahend.
+        def rcp_has_strict_progress(body: darray[Ast::Stmt], base: sview, minuend: sview, subtrahend: sview, owner: darray[sview]&, field: darray[sview]&, increase: darray[bool]&, strict: darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                direct_up: i64 = es_field_increment_max(body, base, subtrahend)
+                true return if direct_up > 0
+                for statement in body:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            true return if rcp_call_progresses(expression, base, minuend, subtrahend, owner, field, increase, strict)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if rcp_has_strict_progress(then_body, base, minuend, subtrahend, owner, field, increase, strict)
+                            true return if rcp_has_strict_progress(else_body, base, minuend, subtrahend, owner, field, increase, strict)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if rcp_has_strict_progress(block_body, base, minuend, subtrahend, owner, field, increase, strict)
+                        _:
+                            pass
+                return false
+
+        def rcp_call_progresses(expression: Ast::Expr, base: sview, minuend: sview, subtrahend: sview, owner: darray[sview]&, field: darray[sview]&, increase: darray[bool]&, strict: darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        passes_base: bool = any argument in arguments where ident_name_of(argument) == base
+                        if callee_name != "" and passes_base:
+                            true return if rcp_callee_strictly(callee_name, subtrahend, true, owner, field, increase, strict)
+                            true return if rcp_callee_strictly(callee_name, minuend, false, owner, field, increase, strict)
+                        return false
+                    _:
+                        return false
+
+        def rcp_check_declarations(declarations: darray[Ast::Decl], owner: darray[sview]&, field: darray[sview]&, increase: darray[bool]&, strict: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            measure: (found: bool, minuend: sview, subtrahend: sview, base: sview) = rcp_measure(body)
+                            if measure.found and rcp_recurses_with_base(body, function_name, measure.base):
+                                progresses: bool = rcp_has_strict_progress(body, measure.base, measure.minuend, measure.subtrahend, owner, field, increase, strict)
+                                measure_line: u32 = rcp_decreases_line(body)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonDecreasingMeasure, name: function_name, line: measure_line, expected: "", actual: ""}) if not progresses
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- rcp_check_declarations(module_body, owner, field, increase, strict, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- rcp_check_declarations(scoped_body, owner, field, increase, strict, table)
+                        _:
+                            pass
+
+        def rcp_decreases_line(body: darray[Ast::Stmt]) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable u32 = 0
+                for statement in body |found|:
+                    if statement is Stmt.Contract(kind, expression, contract_line) and kind == "decreases" and found == 0:
+                        found <- contract_line
+                return found
+
+    public:
+        def check_recursive_callee_progress(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                owner: mutable darray[sview] = []
+                field: mutable darray[sview] = []
+                increase: mutable darray[bool] = []
+                strict: mutable darray[bool] = []
+                rcp_collect_summaries(file.top_decls, owner, field, increase, strict)
+                table <- rcp_check_declarations(file.top_decls, owner, field, increase, strict, table)
