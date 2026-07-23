@@ -120,6 +120,15 @@ run_case call             'def double(n: i64) -> i64:\n    return n * 2\n\ndef m
 run_case call_forward     'def main() -> i64:\n    return helper(42)\n\ndef helper(n: i64) -> i64:\n    return n\n'      42
 run_case recursion        'def fact(n: i64) -> i64:\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\n\ndef main() -> i64:\n    return fact(5)\n'  120
 
+# Membership `x in [literal array]` over a numeric element type: an OR-chain of equality
+# compares. Asserted by VALUE (hit vs miss), in both a ternary condition and an if-condition,
+# and the empty list is constant-false.
+run_case in_hit           'def main() -> i64:\n    x: i64 = 3\n    return 42 if x in [1, 2, 3] else 7\n'  42
+run_case in_miss          'def main() -> i64:\n    x: i64 = 9\n    return 42 if x in [1, 2, 3] else 7\n'  7
+run_case in_empty         'def main() -> i64:\n    x: i64 = 9\n    return 42 if x in [] else 7\n'  7
+run_case in_if_stmt       'def main() -> i64:\n    x: i64 = 2\n    if x in [1, 2, 3]:\n        return 42\n    return 7\n'  42
+run_case in_expr_elems    'def main() -> i64:\n    x: i64 = 4\n    a: i64 = 2\n    return 1 if x in [a, a + 2, 7] else 0\n'  1
+
 # for-range loops, break/continue, bitwise, bool.
 run_case for_range        'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 0..<10:\n        total <- total + i\n    return total\n'   45
 run_case for_inclusive    'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 1..=5:\n        total <- total + i\n    return total\n'     15
