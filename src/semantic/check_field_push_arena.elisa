@@ -1,0 +1,130 @@
+# A `base.field.push(...)` whose grown darray ESCAPES by being stored into a RETURNED struct
+# construct (`return Out{a: b.xs}`) needs an active `in <arena>:` scope — the field's heap
+# storage must outlive the call, and (unlike a directly-returned local darray, which is
+# auto-region-inferred) a field moved into another struct is not. stage0 requires the arena.
+#
+# SOUND, NARROW subset: fire only when the exact `base.field` that is grown appears as a field
+# value inside a Construct that is a `return` value, the push is NOT inside an `in`/`region`
+# owner scope, and the function carries no `@r` region annotation (which would supply the
+# owner). Anything else — a non-escaping push, a directly-returned local darray, an arena
+# scope, a region-annotated function — stays silent.
+extend Semantic:
+    private:
+        def fpa_is_grow_method(name: sview) -> bool:
+            can Abort.Panic:
+                return name == "push" or name == "push_back" or name == "extend" or name == "append" or name == "insert"
+
+        # The (base, field) of a `base.field` field access on a bare ident, else ("","").
+        def fpa_field_base(expression: Ast::Expr) -> (base: sview, field: sview):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(object, field, field_line):
+                        return (ident_name_of(object), field)
+                    Expr.Paren(inner, paren_line):
+                        return fpa_field_base(inner)
+                    _:
+                        return (sview("", 0, 0), sview("", 0, 0))
+
+        # Collect every `base.field` pair used as a field VALUE inside a Construct expression
+        # (recursively) — the shapes that carry a field's storage out of the function.
+        def fpa_collect_construct_fields(expression: Ast::Expr, out_bases: mutable darray[sview]&, out_fields: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Construct(type_expression, fields, construct_line):
+                        for field in fields |out_bases, out_fields|:
+                            bf: (base: sview, field: sview) = fpa_field_base(field.value)
+                            if bf.base != "" and bf.field != "":
+                                out_bases.push(bf.base)
+                                out_fields.push(bf.field)
+                            fpa_collect_construct_fields(field.value, out_bases, out_fields)
+                    Expr.Paren(inner, paren_line):
+                        fpa_collect_construct_fields(inner, out_bases, out_fields)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |out_bases, out_fields|:
+                            fpa_collect_construct_fields(argument, out_bases, out_fields)
+                    _:
+                        pass
+
+        # The escape set (base.field pairs carried out via a returned Construct) of a body.
+        def fpa_escape_set(statements: darray[Ast::Stmt], out_bases: mutable darray[sview]&, out_fields: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out_bases, out_fields|:
+                    match statement:
+                        Stmt.Return(value, line):
+                            fpa_collect_construct_fields(returned, out_bases, out_fields) if value is returned
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            fpa_escape_set(then_body, out_bases, out_fields)
+                            fpa_escape_set(else_body, out_bases, out_fields)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            fpa_escape_set(block_body, out_bases, out_fields)
+                        Stmt.While(condition, while_body, while_line):
+                            fpa_escape_set(while_body, out_bases, out_fields)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            fpa_escape_set(for_body, out_bases, out_fields)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |out_bases, out_fields|:
+                                fpa_escape_set(arm.body, out_bases, out_fields)
+                        _:
+                            pass
+
+        # Whether (base, field) is in the parallel escape arrays.
+        def fpa_escapes(base: sview, field: sview, esc_bases: darray[sview]&, esc_fields: darray[sview]&) -> bool:
+            can Abort.Panic:
+                probe: mutable usize = 0
+                while probe < esc_bases.count |probe, base, field, esc_bases, esc_fields|:
+                    if esc_bases[probe] == base and esc_fields[probe] == field and base != "" and field != "":
+                        return true
+                    probe <- probe + 1
+                return false
+
+        def fpa_walk(statements: darray[Ast::Stmt], in_owner_scope: bool, has_region: bool, esc_bases: darray[sview]&, esc_fields: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                                if callee is Expr.Field(receiver, method, field_line):
+                                    if fpa_is_grow_method(method):
+                                        bf: (base: sview, field: sview) = fpa_field_base(receiver)
+                                        fires: bool = bf.base != "" and bf.field != "" and fpa_escapes(bf.base, bf.field, esc_bases, esc_fields) and not in_owner_scope and not has_region
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DarrayPushArenaRequired, name: "", line: line, expected: "", actual: ""}) if fires
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- fpa_walk(then_body, in_owner_scope, has_region, esc_bases, esc_fields, table)
+                            table <- fpa_walk(else_body, in_owner_scope, has_region, esc_bases, esc_fields, table)
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            nested_owner: bool = in_owner_scope or kind == "in" or kind == "region"
+                            table <- fpa_walk(block_body, nested_owner, has_region, esc_bases, esc_fields, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- fpa_walk(while_body, in_owner_scope, has_region, esc_bases, esc_fields, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- fpa_walk(for_body, in_owner_scope, has_region, esc_bases, esc_fields, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- fpa_walk(arm.body, in_owner_scope, has_region, esc_bases, esc_fields, table)
+                        _:
+                            pass
+
+        def fpa_check_declarations(declarations: darray[Ast::Decl], region_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            esc_bases: mutable darray[sview] = []
+                            esc_fields: mutable darray[sview] = []
+                            fpa_escape_set(body, esc_bases, esc_fields)
+                            has_region: bool = any region_line in region_lines where region_line == line
+                            table <- fpa_walk(body, false, has_region, esc_bases, esc_fields, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- fpa_check_declarations(module_body, region_lines, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- fpa_check_declarations(scoped_body, region_lines, table)
+                        _:
+                            pass
+
+    public:
+        def check_field_push_arena(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                region_lines: mutable darray[u32] = []
+                for annotation in file.local_region_annotations |region_lines|:
+                    region_lines.push(annotation.line)
+                table <- fpa_check_declarations(file.top_decls, region_lines, table)
