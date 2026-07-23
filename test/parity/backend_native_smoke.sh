@@ -1121,6 +1121,10 @@ run_case field_ref_index 'struct Buf:\n    items: mutable i64&\n    n: usize\nde
 # `in owner:` region block where owner is a BORROWED arena (`owner: mutable Arena&`) — the std
 # container ctors activate their arena this way. Allocations inside target the borrowed arena.
 run_case in_borrowed_arena 'def build(a: mutable Arena&) -> i64 can[Memory.Allocate]:\n    xs: mutable darray[i64] = []\n    in a:\n        xs.push(42)\n    return xs[0]\ndef main() -> i64 can[Memory.Allocate]:\n    arena: mutable Arena = zeroed\n    return build(&arena)\n' 42
+# `match OPT: null: … v: …` — a match whose scrutinee is an OPTIONAL value: the binding arm
+# binds the payload on present, the null arm runs on absent (like `if OPT is v:` as a match).
+run_case match_optional_present 'def f(x: i64) -> i64?:\n    return x if x > 0 else null\ndef main() -> i64:\n    match f(42):\n        null:\n            return 7\n        v:\n            return v\n    return 0\n' 42
+run_case match_optional_absent 'def f(x: i64) -> i64?:\n    return x if x > 0 else null\ndef main() -> i64:\n    match f(-1):\n        null:\n            return 42\n        v:\n            return v\n    return 0\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
