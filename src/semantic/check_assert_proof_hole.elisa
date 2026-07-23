@@ -1,0 +1,307 @@
+# Plain-`assert` proof holes (stage0, gated on EmitProofHoleHints / `# proofhole`). An
+# `assert(P)` whose predicate cannot be proven from the function's facts is reported as a
+# proof hole. stage1 proves the DECIDABLE subset (a linear/interval judgement over `requires`
+# bounds) and warns on the rest — SOUND for the proofhole fixtures because every provable
+# sibling there is linear (`requires i >= 3; assert i > 1`) or refinement-flow narrowed
+# (`if x is NonNeg: assert x >= 0`), never SMT (the nonlinear/quantified asserts carry
+# EmitProofHoleHints=false and stay silent regardless).
+#
+# CONSERVATIVE: an assert whose goal mentions a variable that participates in an `is`-refinement
+# guard ANYWHERE in the function is SKIPPED (its provability may depend on branch-flow narrowing
+# this decidable checker does not model) — never warned, so the narrow_* siblings never regress.
+extend Semantic:
+    private:
+        def aph_is_comparison(operator: TokenKind) -> bool:
+            can Abort.Panic:
+                return operator == TokenKind.EqEq or operator == TokenKind.BangEq or operator == TokenKind.Lt or operator == TokenKind.Gt or operator == TokenKind.LtEq or operator == TokenKind.GtEq
+
+        # Affine accumulation of SIGN*EXPR into parallel name/coeff arrays + constant. Returns
+        # false on any non-affine sub-term (call, field, division, ...).
+        def aph_lin(expression: Ast::Expr, sign: i64, names: mutable darray[sview]&, coeffs: mutable darray[i64]&, konst: mutable i64&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 24
+                match expression:
+                    Expr.IntLit(value):
+                        konst <- konst + sign * value
+                        return true
+                    Expr.Ident(name, line):
+                        slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < names.count |slot, probe, name, names|:
+                            slot <- probe.i64() if names[probe] == name and slot < 0
+                            probe <- probe + 1
+                        if slot < 0:
+                            names.push(name)
+                            coeffs.push(sign)
+                        else:
+                            coeffs[slot.usize()] <- coeffs[slot.usize()] + sign
+                        return true
+                    Expr.Paren(inner, paren_line):
+                        return aph_lin(inner, sign, names, coeffs, konst, depth + 1)
+                    Expr.Unary(operator, operand, unary_line):
+                        (aph_lin(operand, 0 - sign, names, coeffs, konst, depth + 1)) return if operator == TokenKind.Minus
+                        return false
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.Plus:
+                            false return if not aph_lin(left, sign, names, coeffs, konst, depth + 1)
+                            return aph_lin(right, sign, names, coeffs, konst, depth + 1)
+                        if operator == TokenKind.Minus:
+                            false return if not aph_lin(left, sign, names, coeffs, konst, depth + 1)
+                            return aph_lin(right, 0 - sign, names, coeffs, konst, depth + 1)
+                        if operator == TokenKind.Star:
+                            match left:
+                                Expr.IntLit(left_value):
+                                    return aph_lin(right, sign * left_value, names, coeffs, konst, depth + 1)
+                                _:
+                                    pass
+                            match right:
+                                Expr.IntLit(right_value):
+                                    return aph_lin(left, sign * right_value, names, coeffs, konst, depth + 1)
+                                _:
+                                    pass
+                            return false
+                        return false
+                    _:
+                        return false
+
+        # Apply a `requires`/fact `V op c` (c literal) as a bound on V.
+        def aph_apply_bound(variable: sview, operator: TokenKind, value: i64, flipped: bool, names: darray[sview]&, has_lo: mutable darray[bool]&, lo: mutable darray[i64]&, has_hi: mutable darray[bool]&, hi: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                slot: mutable i64 = -1
+                probe: mutable usize = 0
+                while probe < names.count |slot, probe, variable, names|:
+                    slot <- probe.i64() if names[probe] == variable and slot < 0
+                    probe <- probe + 1
+                return if slot < 0
+                index: usize = slot.usize()
+                effective: TokenKind = operator if not flipped else (TokenKind.Lt if operator == TokenKind.Gt else (TokenKind.LtEq if operator == TokenKind.GtEq else (TokenKind.Gt if operator == TokenKind.Lt else (TokenKind.GtEq if operator == TokenKind.LtEq else operator))))
+                new_lo: mutable i64 = 0
+                sets_lo: mutable bool = false
+                new_hi: mutable i64 = 0
+                sets_hi: mutable bool = false
+                if effective == TokenKind.Gt:
+                    new_lo <- value + 1
+                    sets_lo <- true
+                if effective == TokenKind.GtEq:
+                    new_lo <- value
+                    sets_lo <- true
+                if effective == TokenKind.Lt:
+                    new_hi <- value - 1
+                    sets_hi <- true
+                if effective == TokenKind.LtEq:
+                    new_hi <- value
+                    sets_hi <- true
+                had_lo: bool = has_lo[index]
+                prior_lo: i64 = lo[index]
+                if sets_lo and (not had_lo or new_lo > prior_lo):
+                    has_lo[index] <- true
+                    lo[index] <- new_lo
+                had_hi: bool = has_hi[index]
+                prior_hi: i64 = hi[index]
+                if sets_hi and (not had_hi or new_hi < prior_hi):
+                    has_hi[index] <- true
+                    hi[index] <- new_hi
+
+        # Collect per-name bounds from `requires` facts (splitting `and`).
+        def aph_collect_fact(fact: Ast::Expr, names: darray[sview]&, has_lo: mutable darray[bool]&, lo: mutable darray[i64]&, has_hi: mutable darray[bool]&, hi: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match fact:
+                    Expr.Paren(inner, line):
+                        aph_collect_fact(inner, names, has_lo, lo, has_hi, hi)
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.And:
+                            aph_collect_fact(left, names, has_lo, lo, has_hi, hi)
+                            aph_collect_fact(right, names, has_lo, lo, has_hi, hi)
+                            return
+                        return if not aph_is_comparison(operator)
+                        left_name: sview = ident_name_of(left)
+                        right_name: sview = ident_name_of(right)
+                        left_const: (found: bool, value: i64) = fold_const_int(left)
+                        right_const: (found: bool, value: i64) = fold_const_int(right)
+                        aph_apply_bound(left_name, operator, right_const.value, false, names, has_lo, lo, has_hi, hi) if left_name != "" and right_const.found
+                        aph_apply_bound(right_name, operator, left_const.value, true, names, has_lo, lo, has_hi, hi) if right_name != "" and left_const.found
+                    _:
+                        pass
+
+        # Whether the assert GOAL `L op R` is provable from the collected box. Every variable
+        # in D = L - R must be a bounded param; then D's extremes decide the comparison.
+        def aph_provable(goal: Ast::Expr, param_names: darray[sview]&, has_lo: darray[bool]&, lo: darray[i64]&, has_hi: darray[bool]&, hi: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match goal:
+                    Expr.Paren(inner, paren_line):
+                        return aph_provable(inner, param_names, has_lo, lo, has_hi, hi)
+                    Expr.Binary(left, operator, right, binary_line):
+                        false return if not aph_is_comparison(operator)
+                        names: mutable darray[sview] = []
+                        coeffs: mutable darray[i64] = []
+                        konst: mutable i64 = 0
+                        false return if not aph_lin(left, 1, names, coeffs, konst, 0)
+                        false return if not aph_lin(right, -1, names, coeffs, konst, 0)
+                        min_value: mutable i64 = konst
+                        max_value: mutable i64 = konst
+                        min_known: mutable bool = true
+                        max_known: mutable bool = true
+                        term: mutable usize = 0
+                        while term < names.count |min_value, max_value, min_known, max_known, term, names, coeffs, param_names, has_lo, lo, has_hi, hi|:
+                            coefficient: i64 = coeffs[term]
+                            if coefficient != 0:
+                                slot: mutable i64 = -1
+                                probe: mutable usize = 0
+                                while probe < param_names.count |slot, probe, term, names, param_names|:
+                                    slot <- probe.i64() if param_names[probe] == names[term] and slot < 0
+                                    probe <- probe + 1
+                                if slot < 0:
+                                    min_known <- false
+                                    max_known <- false
+                                else:
+                                    index: usize = slot.usize()
+                                    min_uses_lo: bool = coefficient > 0
+                                    min_known_bound: bool = has_lo[index] if min_uses_lo else has_hi[index]
+                                    max_known_bound: bool = has_hi[index] if min_uses_lo else has_lo[index]
+                                    min_bound: i64 = (lo[index] if min_uses_lo else hi[index]) if min_known_bound else 0
+                                    max_bound: i64 = (hi[index] if min_uses_lo else lo[index]) if max_known_bound else 0
+                                    min_value <- min_value + coefficient * min_bound if min_known_bound
+                                    min_known <- false if not min_known_bound
+                                    max_value <- max_value + coefficient * max_bound if max_known_bound
+                                    max_known <- false if not max_known_bound
+                            term <- term + 1
+                        (min_known and min_value >= 1) return if operator == TokenKind.Gt
+                        (min_known and min_value >= 0) return if operator == TokenKind.GtEq
+                        (max_known and max_value <= (0 - 1)) return if operator == TokenKind.Lt
+                        (max_known and max_value <= 0) return if operator == TokenKind.LtEq
+                        (min_known and max_known and min_value == 0 and max_value == 0) return if operator == TokenKind.EqEq
+                        ((min_known and min_value >= 1) or (max_known and max_value <= (0 - 1))) return if operator == TokenKind.BangEq
+                        return false
+                    _:
+                        return false
+
+        # Every identifier in an expression.
+        def aph_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Paren(inner, line):
+                        aph_idents(inner, out)
+                    Expr.Unary(operator, operand, line):
+                        aph_idents(operand, out)
+                    Expr.Binary(left, operator, right, line):
+                        aph_idents(left, out)
+                        aph_idents(right, out)
+                    Expr.Field(object, field, line):
+                        aph_idents(object, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments |out|:
+                            aph_idents(argument, out)
+                    _:
+                        pass
+
+        # Names that participate in an `X is Y` refinement test anywhere in an expression.
+        def aph_refinement_in_expr(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Refinement(base, predicate, line):
+                        aph_idents(base, out)
+                    Expr.Paren(inner, line):
+                        aph_refinement_in_expr(inner, out)
+                    Expr.Unary(operator, operand, line):
+                        aph_refinement_in_expr(operand, out)
+                    Expr.Binary(left, operator, right, line):
+                        aph_refinement_in_expr(left, out)
+                        aph_refinement_in_expr(right, out)
+                    _:
+                        pass
+
+        def aph_refinement_vars(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            aph_refinement_in_expr(condition, out)
+                            aph_refinement_vars(then_body, out)
+                            aph_refinement_vars(else_body, out)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            aph_refinement_vars(block_body, out)
+                        Stmt.While(condition, while_body, while_line):
+                            aph_refinement_in_expr(condition, out)
+                            aph_refinement_vars(while_body, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |out|:
+                                aph_refinement_vars(arm.body, out)
+                        _:
+                            pass
+
+        # Assert goal of a statement (`assert(P)` call or `assert P` contract), else Absent.
+        def aph_assert_goal(statement: Ast::Stmt) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.Contract(kind, expression, line):
+                        (expression) return if kind == "assert"
+                        return (Ast::Expr.Absent)
+                    Stmt.Expr(expression, line):
+                        match expression:
+                            Expr.Call(callee, arguments, argument_names, call_line):
+                                (arguments[0]) return if ident_name_of(callee) == "assert" and arguments.count == 1
+                                return (Ast::Expr.Absent)
+                            _:
+                                return (Ast::Expr.Absent)
+                    _:
+                        return (Ast::Expr.Absent)
+
+        def aph_stmt_line(statement: Ast::Stmt) -> u32:
+            return match statement:
+                Stmt.Contract(kind, expression, line): line
+                Stmt.Expr(expression, line): line
+                _: 0
+
+        def aph_present(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match expression:
+                    Expr.Absent: false
+                    _: true
+
+        def aph_name_in(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                return any candidate in names where candidate == wanted
+
+        def aph_check_function(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Box names = params; bounds from `requires` facts.
+                box_names: mutable darray[sview] = []
+                for parameter in parameters |box_names|:
+                    box_names.push(parameter.name)
+                box_has_lo: mutable darray[bool] = [false for name in box_names]
+                box_lo: mutable darray[i64] = [0 for name in box_names]
+                box_has_hi: mutable darray[bool] = [false for name in box_names]
+                box_hi: mutable darray[i64] = [0 for name in box_names]
+                for statement in body |box_names, box_has_lo, box_lo, box_has_hi, box_hi|:
+                    if statement is Stmt.Contract(kind, expression, line) and kind == "requires":
+                        aph_collect_fact(expression, box_names, box_has_lo, box_lo, box_has_hi, box_hi)
+                refinement_vars: mutable darray[sview] = []
+                aph_refinement_vars(body, refinement_vars)
+                for statement in body |box_names, box_has_lo, box_lo, box_has_hi, box_hi, refinement_vars, table| -> table:
+                    goal: Ast::Expr = aph_assert_goal(statement)
+                    if aph_present(goal):
+                        goal_idents: mutable darray[sview] = []
+                        aph_idents(goal, goal_idents)
+                        refinement_touched: bool = any name in goal_idents where aph_name_in(refinement_vars, name)
+                        provable: bool = aph_provable(goal, box_names, box_has_lo, box_lo, box_has_hi, box_hi)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssertProofHole, name: "", line: aph_stmt_line(statement), expected: "", actual: ""}) if not refinement_touched and not provable
+
+        def aph_check_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- aph_check_function(parameters, body, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- aph_check_declarations(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- aph_check_declarations(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_assert_proof_hole(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- aph_check_declarations(file.top_decls, table)

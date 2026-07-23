@@ -94,6 +94,9 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
         *EnableSMT:true*) hdr+=$'# smt\n' ;;
     esac
     case "$opts" in
+        *EmitProofHoleHints:true*) hdr+=$'# proofhole\n' ;;
+    esac
+    case "$opts" in
         *WarnDiscardedValues:true*) hdr+=$'# warn-discard\n' ;;
     esac
     case "$opts" in
