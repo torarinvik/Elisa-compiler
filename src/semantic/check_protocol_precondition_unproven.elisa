@@ -1,0 +1,173 @@
+# Precondition-at-call for protocol methods, decidable UNPROVABLE subset. A protocol method
+# may declare a `requires` over the receiver's opaque state:
+#
+#     protocol Indexable:
+#         def get(self: Self, i: usize) -> Elem
+#             requires i < self.count()
+#     def reckless[C: Indexable](c: C) -> C.Elem:
+#         return c.get(1)                         # goal 1 < c.count() — unprovable
+#
+# When the enclosing generic function carries NO `requires`/`assert` facts at all, a
+# precondition that depends on the receiver's state (`self.`) over a GENERIC-type-param
+# receiver is provably undischargeable — there is nothing to bound the opaque `c.count()`.
+# stage0 emits `precondition of "P.m" could not be proven at this call`; stage1 mirrors it.
+#
+# SOUND, NARROW: fires ONLY on (zero requires + zero asserts + self-dependent protocol
+# `requires` + generic-param receiver). `second[C: Indexable](c) requires c.count() >= 2:
+# return c.get(1)` HAS a requires, so it is excluded (stage0 discharges it) — the check
+# never fires when any fact is in scope, so it can only agree with stage0's "unprovable".
+# The parser captured each protocol method's requires span at 3900000072 (owner = method),
+# its declaring protocol's members at 3900000060 (owner = protocol, name = method), and the
+# function/struct generic type-param names at file.generic_param_names/lines.
+extend Semantic:
+    private:
+        # Whether span text contains the substring "self" (a receiver-state dependence).
+        def ppu_span_mentions_self(span: sview) -> bool:
+            can Abort.Panic:
+                length: usize = sview_len(span)
+                (false) return if length < 4
+                start: mutable usize = 0
+                limit: usize = length - 4
+                while start <= limit |start, span, limit|:
+                    hit: bool = sview_at(span, start) == 115 and sview_at(span, start + 1) == 101 and sview_at(span, start + 2) == 108 and sview_at(span, start + 3) == 102
+                    true return if hit
+                    start <- start + 1
+                return false
+
+        # Method names whose protocol `requires` depends on receiver state (`self`).
+        def ppu_collect_self_requires_methods(annotations: darray[Ast::EnumAnnotation]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for annotation in annotations |out|:
+                    out.push(annotation.owner) if annotation.line == 3900000072 and ppu_span_mentions_self(annotation.name)
+
+        # Whether STATEMENTS contain any `requires` contract (recursively).
+        def ppu_body_has_requires(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            true return if kind == "requires"
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if ppu_body_has_requires(then_body) or ppu_body_has_requires(else_body)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if ppu_body_has_requires(block_body)
+                        _:
+                            pass
+                return false
+
+        # Whether STATEMENTS contain any `assert` — a fact-establishing contract or call.
+        def ppu_body_has_assert(statements: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            true return if kind == "assert"
+                        Stmt.Expr(expression, line):
+                            true return if ident_name_of(ppu_call_head(expression)) == "assert"
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if ppu_body_has_assert(then_body) or ppu_body_has_assert(else_body)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if ppu_body_has_assert(block_body)
+                        _:
+                            pass
+                return false
+
+        def ppu_call_head(expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        return callee
+                    _:
+                        return (Ast::Expr.Absent)
+
+        # Whether NAME is one of the function's generic type parameters (keyed by decl line).
+        def ppu_is_generic_param(name: sview, decl_line: u32, generic_names: darray[sview]&, generic_lines: darray[u32]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                (false) return if name == ""
+                probe: mutable usize = 0
+                while probe < generic_names.count |probe, name, decl_line, generic_names, generic_lines|:
+                    true return if generic_lines[probe] == decl_line and generic_names[probe] == name
+                    probe <- probe + 1
+                return false
+
+        # Names of params whose declared type is one of the function's generic type params.
+        def ppu_collect_generic_receivers(parameters: darray[Ast::ParamDecl], decl_line: u32, generic_names: darray[sview]&, generic_lines: darray[u32]&, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for parameter in parameters |out, decl_line, generic_names, generic_lines|:
+                    type_name: sview = bare_type_name(parameter.type_expression)
+                    out.push(parameter.name) if ppu_is_generic_param(type_name, decl_line, generic_names, generic_lines)
+
+        def ppu_name_in(name: sview, names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                return any candidate in names where candidate == name
+
+        # Walk for calls `recv.m(args)` with m a self-requires protocol method and recv a
+        # generic-param receiver; emit once per such call.
+        def ppu_walk(statements: darray[Ast::Stmt], receivers: darray[sview]&, methods: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            table <- ppu_check_expr(returned, line, receivers, methods, annotations, table) if value is returned
+                        Stmt.Expr(expression, line):
+                            table <- ppu_check_expr(expression, line, receivers, methods, annotations, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- ppu_check_expr(value, line, receivers, methods, annotations, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- ppu_check_expr(value, line, receivers, methods, annotations, table)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- ppu_walk(then_body, receivers, methods, annotations, table)
+                            table <- ppu_walk(else_body, receivers, methods, annotations, table)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            table <- ppu_walk(block_body, receivers, methods, annotations, table)
+                        _:
+                            pass
+
+        def ppu_check_expr(expression: Ast::Expr, line: u32, receivers: darray[sview]&, methods: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if callee is Expr.Field(object, field, field_line):
+                            receiver: sview = ident_name_of(object)
+                            fires: bool = receiver != "" and ppu_name_in(receiver, receivers) and ppu_name_in(field, methods)
+                            if fires:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: field, line: call_line, expected: "", actual: ""})
+                        for argument in arguments |table| -> table:
+                            table <- ppu_check_expr(argument, line, receivers, methods, annotations, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- ppu_check_expr(inner, line, receivers, methods, annotations, table)
+                    Expr.Binary(binary_left, operator, binary_right, binary_line):
+                        table <- ppu_check_expr(binary_left, line, receivers, methods, annotations, table)
+                        table <- ppu_check_expr(binary_right, line, receivers, methods, annotations, table)
+                    _:
+                        pass
+
+        def ppu_check_declarations(declarations: darray[Ast::Decl], methods: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, generic_names: darray[sview]&, generic_lines: darray[u32]&, sig_kinds: darray[sview]&, sig_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            sig_requires: mutable bool = false
+                            sig_index: mutable usize = 0
+                            while sig_index < sig_lines.count |sig_requires, sig_index, line, sig_lines, sig_kinds|:
+                                sig_requires <- true if sig_lines[sig_index] == line and sig_kinds[sig_index] == "requires"
+                                sig_index <- sig_index + 1
+                            has_facts: bool = sig_requires or ppu_body_has_requires(body) or ppu_body_has_assert(body)
+                            if not has_facts:
+                                receivers: mutable darray[sview] = []
+                                ppu_collect_generic_receivers(parameters, line, generic_names, generic_lines, receivers)
+                                table <- ppu_walk(body, receivers, methods, annotations, table) if receivers.count > 0
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- ppu_check_declarations(module_body, methods, annotations, generic_names, generic_lines, sig_kinds, sig_lines, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- ppu_check_declarations(scoped_body, methods, annotations, generic_names, generic_lines, sig_kinds, sig_lines, table)
+                        _:
+                            pass
+
+    public:
+        def check_protocol_precondition_unproven(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                methods: mutable darray[sview] = []
+                ppu_collect_self_requires_methods(file.enum_annotations, methods)
+                return if methods.count == 0
+                table <- ppu_check_declarations(file.top_decls, methods, file.enum_annotations, file.generic_param_names, file.generic_param_lines, file.signature_contract_kinds, file.signature_contract_lines, table)
