@@ -1,0 +1,178 @@
+# Source-level expansion of `static generate` blocks (docs/... static generate; task #35).
+#
+# stage0 expands `static generate` at the AST level (analyzer_decl_analysis.go →
+# expandActiveAndGeneratedDecls). stage1 does it as a SOURCE→SOURCE preprocessing pass BEFORE
+# the real parse: it recognizes the decidable shape
+#
+#     static generate:
+#         for VAR in variants(ENUM):
+#             emit def PREFIX${VAR.name}...(...):
+#                 BODY (may contain ${VAR.name})
+#
+# and, for each variant of ENUM, splices a concrete declaration (the emit template with
+# `${VAR.name}` replaced by the variant name) into the output source, dropping the original
+# block. The expanded source is then lexed+parsed ONCE, so all generated declarations live in
+# a single coherent node store and flow through symbol collection, resolution, type-checking,
+# and duplicate detection exactly like hand-written ones. This makes generated names resolve
+# (a caller of `is_Int` type-checks), generated bodies type-check (`bad: bool = 7` errors), and
+# a generated name colliding with an existing declaration reports a duplicate — matching stage0.
+#
+# The pass is DELIBERATELY NARROW: only the single-`for`-over-`variants(ENUM)`, single-`emit def`
+# shape whose interpolations are all `${VAR.name}` is expanded. Any other block (a runtime-call
+# interpolation, a filter, a nested form, an unknown enum) is copied through verbatim, so the
+# existing parser + `check_static_generate_interp` handle it unchanged (e.g. the compile-time
+# interpolation error). The output buffer is caller-owned, so the generated declarations' source
+# spans stay alive for the whole analysis, just like the original source.
+using Lexer
+
+# The variant names of ENUM among a parsed file's top-level enum declarations, or empty.
+def sg_enum_variant_names(file: Ast::File&, enum_name: sview) -> darray[sview]:
+    can Memory.Allocate, Abort.Panic:
+        result: mutable darray[sview] = []
+        for decl in file.top_decls |result|:
+            match decl:
+                Ast::Decl.Enum(name, variants, is_const, storage_type, line):
+                    if name == enum_name:
+                        for variant in variants |result|:
+                            result.push(variant.name)
+                _:
+                    pass
+        return result
+
+
+# Append source[from ..< to) to out.
+def sg_append_range(out: mutable darray[u8]&, source: u8&, from_at: usize, end_at: usize) -> void:
+    can Memory.Allocate, Abort.Panic:
+        cursor: mutable usize = from_at
+        while cursor < end_at |cursor, out|:
+            out.push(source[cursor])
+            cursor <- cursor + 1
+
+
+# Append the bytes of an sview to out.
+def sg_append_sview(out: mutable darray[u8]&, value: sview) -> void:
+    can Memory.Allocate, Abort.Panic:
+        length: usize = sview_len(value)
+        index: mutable usize = 0
+        while index < length |index, out|:
+            out.push(sview_at(value, index))
+            index <- index + 1
+
+
+# Whether source bytes at position `at` spell `${VAR.name}` for the given VAR name.
+def sg_interp_is_var_name(source: u8&, slen: usize, at: usize, var_name: sview) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        var_length: usize = sview_len(var_name)
+        # Need: `$` `{` VAR `.` `n` `a` `m` `e` `}`  = 2 + var_length + 6 bytes.
+        needed: usize = at + var_length + 8
+        false return if needed > slen
+        false return if source[at] != 36 or source[at + 1] != 123
+        probe: mutable usize = 0
+        while probe < var_length |probe|:
+            false return if source[at + 2 + probe] != sview_at(var_name, probe)
+            probe <- probe + 1
+        suffix_at: usize = at + 2 + var_length
+        # `.name}`
+        return source[suffix_at] == 46 and source[suffix_at + 1] == 110 and source[suffix_at + 2] == 97 and source[suffix_at + 3] == 109 and source[suffix_at + 4] == 101 and source[suffix_at + 5] == 125
+
+
+# Whether EVERY `${...}` interpolation in source[tstart ..< tend) is exactly `${VAR.name}`.
+# A block with any other interpolation shape is left unexpanded (copied verbatim).
+def sg_template_interps_ok(source: u8&, slen: usize, tstart: usize, tend: usize, var_name: sview) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        cursor: mutable usize = tstart
+        while cursor + 1 < tend |cursor|:
+            if source[cursor] == 36 and source[cursor + 1] == 123:
+                false return if not sg_interp_is_var_name(source, slen, cursor, var_name)
+                cursor <- cursor + 1
+            cursor <- cursor + 1
+        return true
+
+
+# Append the emit template source[tstart ..< tend) to out, substituting every `${VAR.name}`
+# with the variant name. Assumes sg_template_interps_ok already validated the interpolations.
+def sg_append_template(out: mutable darray[u8]&, source: u8&, slen: usize, tstart: usize, tend: usize, var_name: sview, variant_name: sview) -> void:
+    can Memory.Allocate, Abort.Panic:
+        var_length: usize = sview_len(var_name)
+        cursor: mutable usize = tstart
+        while cursor < tend |cursor, out|:
+            if cursor + 1 < tend and source[cursor] == 36 and source[cursor + 1] == 123 and sg_interp_is_var_name(source, slen, cursor, var_name):
+                sg_append_sview(out, variant_name)
+                cursor <- cursor + 2 + var_length + 6
+            else:
+                out.push(source[cursor])
+                cursor <- cursor + 1
+
+
+# Expand recognized `static generate` blocks in `source` into `out`. Returns true iff at least
+# one block was expanded (callers can then re-lex+parse `out` instead of the original source).
+def frontend_preprocess_static_generate(source: u8&, slen: usize, tokens: darray[Lexer::Token]&, file: Ast::File&, out: mutable darray[u8]&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        copied: mutable usize = 0
+        changed: mutable bool = false
+        count: usize = tokens.count
+        i: mutable usize = 0
+        while i < count |i, copied, changed, out|:
+            recognized: mutable bool = false
+            # `static generate :`
+            if tokens[i].kind == Lexer::TokenKind.Static and i + 3 < count and Lexer::text_or_empty(tokens[i + 1], source) == "generate" and tokens[i + 2].kind == Lexer::TokenKind.Colon:
+                # After the colon: Newline, Indent open the block body (depth 1).
+                if tokens[i + 3].kind == Lexer::TokenKind.Newline and i + 4 < count and tokens[i + 4].kind == Lexer::TokenKind.Indent:
+                    body: usize = i + 5
+                    # `for VAR in variants ( ENUM ) :`
+                    if body + 7 < count and Lexer::text_or_empty(tokens[body], source) == "for" and tokens[body + 1].kind == Lexer::TokenKind.Ident and tokens[body + 2].kind == Lexer::TokenKind.In and Lexer::text_or_empty(tokens[body + 3], source) == "variants" and tokens[body + 4].kind == Lexer::TokenKind.LParen and tokens[body + 5].kind == Lexer::TokenKind.Ident and tokens[body + 6].kind == Lexer::TokenKind.RParen and tokens[body + 7].kind == Lexer::TokenKind.Colon:
+                        var_name: sview = Lexer::text_or_empty(tokens[body + 1], source)
+                        enum_name: sview = Lexer::text_or_empty(tokens[body + 5], source)
+                        # After the for-colon: Newline, Indent open the for body (depth 2),
+                        # then `emit def ...`.
+                        loop_body: usize = body + 8
+                        if loop_body + 2 < count and tokens[loop_body].kind == Lexer::TokenKind.Newline and tokens[loop_body + 1].kind == Lexer::TokenKind.Indent and Lexer::text_or_empty(tokens[loop_body + 2], source) == "emit" and loop_body + 3 < count and tokens[loop_body + 3].kind == Lexer::TokenKind.Def:
+                            def_index: usize = loop_body + 3
+                            template_start: usize = tokens[def_index].start.usize()
+                            # Walk the emit declaration: its signature line, then its INDENT-opened
+                            # body, until the matching DEDENT closes it. The last token before that
+                            # DEDENT ends the template. depth counts INDENT/DEDENT from the def line.
+                            scan: mutable usize = def_index
+                            depth: mutable i64 = 0
+                            template_end: mutable usize = tokens[def_index].start.usize() + tokens[def_index].length.usize()
+                            opened: mutable bool = false
+                            done: mutable bool = false
+                            while scan < count and not done |scan, depth, template_end, opened, done|:
+                                kind: Lexer::TokenKind = tokens[scan].kind
+                                if kind == Lexer::TokenKind.Indent:
+                                    depth <- depth + 1
+                                    opened <- true
+                                elif kind == Lexer::TokenKind.Dedent:
+                                    depth <- depth - 1
+                                    done <- true if opened and depth <= 0
+                                elif kind != Lexer::TokenKind.Newline:
+                                    template_end <- tokens[scan].start.usize() + tokens[scan].length.usize()
+                                scan <- scan + 1
+                            # scan now sits just past the DEDENT that closed the emit body (depth 2
+                            # → 1). The whole `static generate` block closes when two more DEDENTs
+                            # bring depth to 0; skip forward to the first token past the block.
+                            block_depth: mutable i64 = 1
+                            resume: mutable usize = scan
+                            while resume < count and block_depth > 0 |resume, block_depth|:
+                                rkind: Lexer::TokenKind = tokens[resume].kind
+                                block_depth <- block_depth + 1 if rkind == Lexer::TokenKind.Indent
+                                block_depth <- block_depth - 1 if rkind == Lexer::TokenKind.Dedent
+                                resume <- resume + 1
+                            variant_names: darray[sview] = sg_enum_variant_names(file, enum_name)
+                            interps_ok: bool = sg_template_interps_ok(source, slen, template_start, template_end, var_name)
+                            if variant_names.count > 0 and interps_ok:
+                                # Copy everything up to the `static` keyword, then splice one concrete
+                                # declaration per variant, then resume after the block.
+                                sg_append_range(out, source, copied, tokens[i].start.usize())
+                                for variant_name in variant_names |out|:
+                                    sg_append_template(out, source, slen, template_start, template_end, var_name, variant_name)
+                                    out.push(10)
+                                    out.push(10)
+                                resume_byte: usize = tokens[resume].start.usize() if resume < count else slen
+                                copied <- resume_byte
+                                changed <- true
+                                recognized <- true
+                                i <- resume
+            i <- i + 1 if not recognized
+        sg_append_range(out, source, copied, slen)
+        return changed
