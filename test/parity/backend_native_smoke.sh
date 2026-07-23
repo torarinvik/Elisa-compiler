@@ -1115,6 +1115,9 @@ run_case scalar_ref_index_read 'def main() -> i64:\n    x: mutable i64 = 42\n   
 # Address of a BORROWED darray-ref param's element (`&da[i]`), as in Slice's
 # `slice(&da)` -> `(&da[0]).cast[uintptr]`. Round-trips the address back to a ref and reads it.
 run_case addr_of_darray_ref_elem 'def head_addr(da: mutable darray[i64]&) -> uintptr:\n    return (&da[0.usize()]).cast[uintptr] can Unsafe.PointerCast\ndef main() -> i64:\n    xs: mutable darray[i64] = [42, 8, 9]\n    u: uintptr = head_addr(&xs)\n    p: i64& = u.cast[i64&] can Unsafe.PointerCast\n    return p\n' 42
+# Indexing a ref-typed FIELD as a buffer pointer: `&b.items[i]` / `b.items[i] <- v` where
+# `items` is a ref field (Deque's `items: T&?` is this, optional-wrapped). Write then read back.
+run_case field_ref_index 'struct Buf:\n    items: mutable i64&\n    n: usize\ndef wr(b: Buf&, i: usize, v: i64) -> void:\n    b.items[i] <- v\ndef main() -> i64:\n    x: mutable i64 = 0\n    b: Buf = Buf { items: &x, n: 1.usize() }\n    wr(&b, 0.usize(), 42)\n    return x\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
