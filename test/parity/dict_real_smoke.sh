@@ -168,6 +168,25 @@ dict_case literal_then_put 'def main() -> i64:
     if d.get(5) is v:
         return v
     return 0' 42
+# Dict COMPREHENSION `{k: v for k in LOW..<HIGH}`: a zeroed DynDict + one
+# arena_dict_put_or_panic per iteration. Values 2+4+6 = 12 (+30 = 42).
+dict_case comprehension 'def main() -> i64:
+    d: mutable dict[i64, i64] = {k: k * 2 for k in 1..<4}
+    t: mutable i64 = 0
+    if d.get(1) is a:
+        t <- t + a
+    if d.get(2) is b:
+        t <- t + b
+    if d.get(3) is c:
+        t <- t + c
+    return t + 30' 42
+# Filtered comprehension `{… for … if COND}`: only k in {7,8,9} pass, 3 entries.
+dict_case comprehension_filter 'def main() -> i64:
+    d: mutable dict[i64, i64] = {k: k for k in 0..<10 if k > 6}
+    n: mutable i64 = 0
+    for k, v in d:
+        n <- n + 1
+    return n + 39' 42
 
 if [ "$pass" -eq "$total" ]; then
     echo "dict_real_smoke OK: $pass/$total real-std collections.elisa dict programs compile+run correctly"
