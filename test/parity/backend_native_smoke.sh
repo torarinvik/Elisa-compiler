@@ -119,6 +119,8 @@ run_case call             'def double(n: i64) -> i64:\n    return n * 2\n\ndef m
 # emit_module declares every function before emitting any body.
 run_case call_forward     'def main() -> i64:\n    return helper(42)\n\ndef helper(n: i64) -> i64:\n    return n\n'      42
 run_case recursion        'def fact(n: i64) -> i64:\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\n\ndef main() -> i64:\n    return fact(5)\n'  120
+# `_ = EXPR` — explicit discard of a call result (emit for side effects, drop the value).
+run_case discard_call     'def helper(x: i64) -> i64:\n    return x + 1\n\ndef main() -> i64:\n    _ = helper(5)\n    return 42\n'  42
 
 # Membership `x in [literal array]` over a numeric element type: an OR-chain of equality
 # compares. Asserted by VALUE (hit vs miss), in both a ternary condition and an if-condition,
