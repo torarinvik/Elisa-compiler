@@ -194,6 +194,24 @@ dict_case comprehension_over_darray 'def main() -> i64:
     if d.get(2) is v:
         return v + 22
     return 0' 42
+# `d.clear()` empties the dict (a subsequent get misses; a subsequent put still works).
+dict_case clear 'def main() -> i64:
+    d: mutable dict[i64, i64] = {}
+    d.put(1, 5)
+    d.clear()
+    return 42 if d.get(1) == null else 7' 42
+# `d.contains(k)` / `d.remove(k)` round-trip.
+dict_case contains_remove 'def main() -> i64:
+    d: mutable dict[i64, i64] = {}
+    d.put(1, 5)
+    d.put(2, 9)
+    hit: mutable i64 = 0
+    if d.contains(1):
+        hit <- hit + 40
+    _ = d.remove(1)
+    if not d.contains(1):
+        hit <- hit + 2
+    return hit' 42
 
 if [ "$pass" -eq "$total" ]; then
     echo "dict_real_smoke OK: $pass/$total real-std collections.elisa dict programs compile+run correctly"
