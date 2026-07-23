@@ -202,6 +202,27 @@ extend Semantic:
                     mutated.push(dep_subjects[probe]) if dep_containers[probe] == container
                     probe <- probe + 1
 
+        # Resolve a local through the alias map (`ys = &xs` records ys -> xs): returns the
+        # aliased TARGET when `name` is a known `&`-alias, else "". An alias of an alias is
+        # resolved transitively (bounded by the map size).
+        def rfi_resolve_alias(name: sview, alias_names: darray[sview]&, alias_targets: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                current: mutable sview = name
+                steps: mutable usize = 0
+                found_any: mutable bool = false
+                while steps < alias_names.count |current, steps, found_any, name, alias_names, alias_targets|:
+                    hit: mutable bool = false
+                    probe: mutable usize = 0
+                    while probe < alias_names.count |hit, current, found_any, probe, alias_names, alias_targets|:
+                        if alias_names[probe] == current:
+                            current <- alias_targets[probe]
+                            hit <- true
+                            found_any <- true
+                        probe <- probe + 1
+                    break if not hit
+                    steps <- steps + 1
+                return current if found_any else sview("", 0, 0)
+
         # The base ident of an address-of expression `&SUBJ` (through parens/nested unaries), or "".
         def rfi_ref_pass_base(expression: Ast::Expr) -> sview:
             can Memory.Allocate, Abort.Panic:
@@ -244,7 +265,7 @@ extend Semantic:
 
         # Collect the base idents of every `&SUBJ` passed to a plain-mutating callee parameter — a
         # mutable borrow that may mutate SUBJ, invalidating a refinement fact.
-        def rfi_collect_ref_pass_subjects(expression: Ast::Expr, mutating_functions: darray[sview]&, mutating_positions: darray[usize]&, out: mutable darray[sview]&) -> void:
+        def rfi_collect_ref_pass_subjects(expression: Ast::Expr, mutating_functions: darray[sview]&, mutating_positions: darray[usize]&, alias_names: darray[sview]&, alias_targets: darray[sview]&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
@@ -254,28 +275,38 @@ extend Semantic:
                         callee_name: sview = rfi_call_target_name(callee)
                         parameter_offset: usize = rfi_call_self_offset(callee)
                         while argument_position < arguments.count |argument_position: usize = 0, out|:
+                            mutates_here: bool = rfi_callee_mutates_at(callee_name, argument_position + parameter_offset, mutating_functions, mutating_positions)
                             ref_base: sview = rfi_ref_pass_base(arguments[argument_position])
-                            out.push(ref_base) if ref_base != "" and rfi_callee_mutates_at(callee_name, argument_position + parameter_offset, mutating_functions, mutating_positions)
-                            rfi_collect_ref_pass_subjects(arguments[argument_position], mutating_functions, mutating_positions, out)
+                            out.push(ref_base) if ref_base != "" and mutates_here
+                            # A bare alias local (`r`, where `r = &y`) passed to a mutating ref
+                            # parameter mutates its TARGET `y` — the borrow was taken at the alias
+                            # binding, so the call reaches `y` through it.
+                            arg_ident: sview = ident_name_of(arguments[argument_position])
+                            alias_target: sview = rfi_resolve_alias(arg_ident, alias_names, alias_targets) if arg_ident != "" else sview("", 0, 0)
+                            out.push(alias_target) if alias_target != "" and mutates_here
+                            rfi_collect_ref_pass_subjects(arguments[argument_position], mutating_functions, mutating_positions, alias_names, alias_targets, out)
                             argument_position <- argument_position + 1
                     Expr.Binary(left, operator, right, binary_line):
-                        rfi_collect_ref_pass_subjects(left, mutating_functions, mutating_positions, out)
-                        rfi_collect_ref_pass_subjects(right, mutating_functions, mutating_positions, out)
+                        rfi_collect_ref_pass_subjects(left, mutating_functions, mutating_positions, alias_names, alias_targets, out)
+                        rfi_collect_ref_pass_subjects(right, mutating_functions, mutating_positions, alias_names, alias_targets, out)
                     Expr.Paren(inner, paren_line):
-                        rfi_collect_ref_pass_subjects(inner, mutating_functions, mutating_positions, out)
+                        rfi_collect_ref_pass_subjects(inner, mutating_functions, mutating_positions, alias_names, alias_targets, out)
                     _:
                         pass
 
         # Invalidate every guarded subject that this expression mutates: a shrinking method call
         # on it, or a mutable borrow (`&SUBJ`) passed to any call. Dependents are invalidated too.
-        def rfi_apply_invalidations(expression: Ast::Expr, guarded: darray[sview]&, established: darray[sview]&, mutated: mutable darray[sview]&, dep_containers: darray[sview]&, dep_subjects: darray[sview]&, mutating_functions: darray[sview]&, mutating_positions: darray[usize]&) -> void:
+        def rfi_apply_invalidations(expression: Ast::Expr, guarded: darray[sview]&, established: darray[sview]&, mutated: mutable darray[sview]&, dep_containers: darray[sview]&, dep_subjects: darray[sview]&, mutating_functions: darray[sview]&, mutating_positions: darray[usize]&, alias_names: darray[sview]&, alias_targets: darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                shrink_subject: sview = rfi_shrink_subject(expression)
+                shrink_receiver: sview = rfi_shrink_subject(expression)
+                # A shrink method on an alias (`ys.clear()`, `ys = &xs`) mutates its TARGET `xs`.
+                shrink_target: sview = rfi_resolve_alias(shrink_receiver, alias_names, alias_targets) if shrink_receiver != "" else sview("", 0, 0)
+                shrink_subject: sview = shrink_target if shrink_target != "" else shrink_receiver
                 if shrink_subject != "":
                     mutated.push(shrink_subject) if rfi_contains(guarded, shrink_subject) or rfi_contains(established, shrink_subject)
                     rfi_invalidate_dependents(shrink_subject, dep_containers, dep_subjects, mutated)
                 ref_subjects: mutable darray[sview] = []
-                rfi_collect_ref_pass_subjects(expression, mutating_functions, mutating_positions, ref_subjects)
+                rfi_collect_ref_pass_subjects(expression, mutating_functions, mutating_positions, alias_names, alias_targets, ref_subjects)
                 for ref_subject in ref_subjects |mutated|:
                     mutated.push(ref_subject) if rfi_contains(guarded, ref_subject) or rfi_contains(established, ref_subject)
                     rfi_invalidate_dependents(ref_subject, dep_containers, dep_subjects, mutated)
@@ -288,21 +319,27 @@ extend Semantic:
                     Expr.Paren(inner, paren_line): rfi_assign_target_name(inner)
                     _: sview("", 0, 0)
 
-        def rfi_check_statements(statements: darray[Ast::Stmt], guarded: darray[sview]&, established: mutable darray[sview]&, mutated: mutable darray[sview]&, dep_containers: darray[sview]&, dep_subjects: darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&, mutating_functions: darray[sview]&, mutating_positions: darray[usize]&, ensures_functions: darray[sview]&, ensures_positions: darray[usize]&, table: lmut SymbolTable) -> void:
+        def rfi_check_statements(statements: darray[Ast::Stmt], guarded: darray[sview]&, established: mutable darray[sview]&, mutated: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_targets: mutable darray[sview]&, dep_containers: darray[sview]&, dep_subjects: darray[sview]&, param_functions: darray[sview]&, param_indices: darray[usize]&, mutating_functions: darray[sview]&, mutating_positions: darray[usize]&, ensures_functions: darray[sview]&, ensures_positions: darray[usize]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table, mutated, established| -> table:
+                for statement in statements |table, mutated, established, alias_names, alias_targets| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
                             table <- rfi_check_call(expression, line, guarded, established, mutated, param_functions, param_indices, table)
                             rfi_apply_establishments(expression, ensures_functions, ensures_positions, established)
-                            rfi_apply_invalidations(expression, guarded, established, mutated, dep_containers, dep_subjects, mutating_functions, mutating_positions)
+                            rfi_apply_invalidations(expression, guarded, established, mutated, dep_containers, dep_subjects, mutating_functions, mutating_positions, alias_names, alias_targets)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- rfi_check_call(value, line, guarded, established, mutated, param_functions, param_indices, table)
                             rfi_apply_establishments(value, ensures_functions, ensures_positions, established)
-                            rfi_apply_invalidations(value, guarded, established, mutated, dep_containers, dep_subjects, mutating_functions, mutating_positions)
+                            rfi_apply_invalidations(value, guarded, established, mutated, dep_containers, dep_subjects, mutating_functions, mutating_positions, alias_names, alias_targets)
+                            # Record an alias binding `name = &SUBJ` so a later mutation through
+                            # `name` invalidates SUBJ's refinement fact.
+                            alias_base: sview = rfi_ref_pass_base(value)
+                            if alias_base != "" and name != "":
+                                alias_names.push(name)
+                                alias_targets.push(alias_base)
                         Stmt.Assign(target, operator, value, line):
                             table <- rfi_check_call(value, line, guarded, established, mutated, param_functions, param_indices, table)
-                            rfi_apply_invalidations(value, guarded, established, mutated, dep_containers, dep_subjects, mutating_functions, mutating_positions)
+                            rfi_apply_invalidations(value, guarded, established, mutated, dep_containers, dep_subjects, mutating_functions, mutating_positions, alias_names, alias_targets)
                             # A direct reassignment `SUBJ <- e` drops any refinement fact on SUBJ.
                             assign_target: sview = rfi_assign_target_name(target)
                             if assign_target != "":
@@ -323,12 +360,12 @@ extend Semantic:
                                 for guard_dep in guard_deps |then_dep_containers, then_dep_subjects|:
                                     then_dep_containers.push(guard_dep)
                                     then_dep_subjects.push(subject)
-                            table <- rfi_check_statements(then_body, then_guarded, established, mutated, then_dep_containers, then_dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
-                            table <- rfi_check_statements(else_body, guarded, established, mutated, dep_containers, dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
+                            table <- rfi_check_statements(then_body, then_guarded, established, mutated, alias_names, alias_targets, then_dep_containers, then_dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
+                            table <- rfi_check_statements(else_body, guarded, established, mutated, alias_names, alias_targets, dep_containers, dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
                         Stmt.Block(kind, clause, binding, block_body, line):
-                            table <- rfi_check_statements(block_body, guarded, established, mutated, dep_containers, dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
+                            table <- rfi_check_statements(block_body, guarded, established, mutated, alias_names, alias_targets, dep_containers, dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
                         Stmt.While(condition, while_body, while_line) | Stmt.For(_, _, _, while_body, while_line):
-                            table <- rfi_check_statements(while_body, guarded, established, mutated, dep_containers, dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
+                            table <- rfi_check_statements(while_body, guarded, established, mutated, alias_names, alias_targets, dep_containers, dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
                         _:
                             pass
 
@@ -401,9 +438,11 @@ extend Semantic:
                             guarded: darray[sview] = []
                             established: mutable darray[sview] = []
                             mutated: mutable darray[sview] = []
+                            alias_names: mutable darray[sview] = []
+                            alias_targets: mutable darray[sview] = []
                             dep_containers: darray[sview] = []
                             dep_subjects: darray[sview] = []
-                            table <- rfi_check_statements(body, guarded, established, mutated, dep_containers, dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
+                            table <- rfi_check_statements(body, guarded, established, mutated, alias_names, alias_targets, dep_containers, dep_subjects, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- rfi_walk(module_body, param_functions, param_indices, mutating_functions, mutating_positions, ensures_functions, ensures_positions, table)
                         Decl.Scoped(scoped_body, scoped_line):
