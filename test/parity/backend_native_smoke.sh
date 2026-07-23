@@ -1082,6 +1082,10 @@ run_case convert_prefix_ftrunc 'def main() -> i64:\n    x: f64 = 42.9\n    retur
 # element per source item that passes the optional `if` filter.
 run_case list_comp_over_darray 'def main() -> i64:\n    xs: darray[i64] = [10, 20, 12]\n    ys: darray[i64] = [x + 1 for x in xs]\n    return ys[0] + ys[1] + ys[2] - 3\n' 42
 run_case list_comp_darray_filter 'def main() -> i64:\n    xs: darray[i64] = [1, 2, 3, 4, 5, 6]\n    ys: darray[i64] = [x for x in xs if x > 3]\n    return ys[0] + ys[1] + ys[2] + 27\n' 42
+# `xs.extend(ys)` — append every element of the source darray, lowered as a push loop.
+run_case darray_extend_count 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2, 3]\n    ys: darray[i64] = [10, 20]\n    xs.extend(ys)\n    return xs.count.i64() * 8 + 2\n' 42
+run_case darray_extend_values 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    ys: darray[i64] = [40, 8]\n    xs.extend(ys)\n    return xs[2] + xs[3] - 6\n' 42
+run_case darray_extend_empty 'def main() -> i64:\n    xs: mutable darray[i64] = [42]\n    ys: darray[i64] = []\n    xs.extend(ys)\n    return xs[0]\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
