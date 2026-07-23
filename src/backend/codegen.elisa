@@ -3313,10 +3313,18 @@ module Backend:
         # Constant filters preserve the presized lowering: `if true` is ordinary and
         # `if false` produces an empty darray.
         def emit_comprehension(comprehension_var: sview, iterable: Expr, condition: Expr, body: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            # `{k: v for VAR in LOW..<HIGH}` — a DICT comprehension: `expected` is a DynDict and
-            # the key/value pair rides in `body` as a two-element Tuple (the parser has no
-            # dedicated dict-comp node). Dispatched here before the darray path.
+            # A container comprehension whose `expected` is a struct is either a DICT
+            # comprehension (`{k: v for …}`, a DynDict — the pair rides in `body` as a Tuple) or a
+            # SET comprehension (`{x for …}`, a DynSet — `body` is the element). Route by base;
+            # both are dispatched before the darray path.
             if expected.kind == TypeKind.Struct:
+                comp_struct_base: mutable sview = ""
+                comp_struct_arg_start: mutable usize = 0
+                comp_struct_arg_count: mutable usize = 0
+                comp_struct_has: bool = generic_struct_instantiation_of(structs, expected, comp_struct_base, comp_struct_arg_start, comp_struct_arg_count)
+                null return if not comp_struct_has
+                if comp_struct_base == "DynSet":
+                    return emit_set_comprehension(comprehension_var, iterable, condition, body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 return emit_dict_comprehension(comprehension_var, iterable, condition, body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             null return if expected.kind != TypeKind.DArray
             # A quantifier (`any`/`all`) has no body; only the collection form is modeled.
@@ -3528,6 +3536,94 @@ module Backend:
                                 LLVMPositionBuilderAtEnd(builder, dc_done)
                                 return LLVMBuildLoad2(builder, dc_llvm, dc_slot, "dict.comp.value")
                             return null
+                        return null
+                    return null
+                return null
+            return null
+
+
+        # `{x for VAR in LOW..<HIGH (if COND)?}` — a SET comprehension. The single-column analogue
+        # of the dict comprehension: a zeroed DynSet plus one `arena_set_add_or_panic(arena, &s,
+        # elem)` per iteration that passes the optional filter. `expected` is the DynSet[T] struct;
+        # `body` is the element expression. Only an integer-range iterable is modeled.
+        def emit_set_comprehension(comprehension_var: sview, iterable: Expr, condition: Expr, body: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            sc_base: mutable sview = ""
+            sc_arg_start: mutable usize = 0
+            sc_arg_count: mutable usize = 0
+            sc_has: bool = generic_struct_instantiation_of(structs, expected, sc_base, sc_arg_start, sc_arg_count)
+            null return if not sc_has or sc_base != "DynSet" or sc_arg_count != 1
+            null return if body is Expr.Absent
+            # A constant-false filter yields the empty set; other filters loop.
+            if condition is Expr.BoolLit(sc_filter_value):
+                if not sc_filter_value:
+                    return LLVMConstNull(llvm_type_of(expected, structs, ctx))
+            # Only an integer-range iterable is modeled.
+            sc_low_expr: mutable Expr = Expr.Absent
+            sc_high_expr: mutable Expr = Expr.Absent
+            sc_inclusive: mutable bool = false
+            sc_range_ok: mutable bool = false
+            if iterable is Expr.Binary(sc_low_read, sc_op_read, sc_high_read, sc_range_read_line):
+                if sc_op_read == TokenKind.RangeLt or sc_op_read == TokenKind.RangeLe:
+                    sc_low_expr <- sc_low_read
+                    sc_high_expr <- sc_high_read
+                    sc_inclusive <- sc_op_read == TokenKind.RangeLe
+                    sc_range_ok <- true
+            null return if not sc_range_ok
+            sc_elem_type: ValueType = copied_type(structs.generic_struct_inst_args[sc_arg_start])
+            sc_type_args: mutable darray[ValueType] = [sc_elem_type]
+            if instantiate_generic("arena_set_add_or_panic", sc_type_args, generics, structs, m, ctx) is sc_add:
+                sc_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                sc_index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                if emit_expression(sc_low_expr, sc_index_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sc_low_value:
+                    if emit_expression(sc_high_expr, sc_index_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sc_high_value:
+                        sc_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                        sc_add_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(sc_add)
+                        sc_slot: LLVMValueRef = LLVMBuildAlloca(builder, sc_llvm, "set.comp")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(sc_llvm), sc_slot)
+                        sc_limit: mutable LLVMValueRef = sc_high_value
+                        sc_limit <- LLVMBuildAdd(builder, sc_high_value, LLVMConstInt(sc_i64, 1, 0), "set.comp.limit") if sc_inclusive
+                        sc_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, sc_i64, "set.comp.i")
+                        _ = LLVMBuildStore(builder, sc_low_value, sc_index_slot)
+                        sc_var_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(sc_index_type, structs, ctx), "set.comp.var")
+                        declare_local(local_scope, comprehension_var, sc_var_slot, sc_index_type)
+                        sc_filtered: mutable bool = true
+                        if condition is Expr.Absent:
+                            sc_filtered <- false
+                        elif condition is Expr.BoolLit:
+                            sc_filtered <- false
+                        sc_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        sc_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sc_function, "set.comp.cond")
+                        sc_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sc_function, "set.comp.body")
+                        sc_add_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sc_function, "set.comp.add")
+                        sc_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sc_function, "set.comp.step")
+                        sc_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sc_function, "set.comp.done")
+                        _ = LLVMBuildBr(builder, sc_cond)
+                        LLVMPositionBuilderAtEnd(builder, sc_cond)
+                        sc_cur: LLVMValueRef = LLVMBuildLoad2(builder, sc_i64, sc_index_slot, "set.comp.cur")
+                        sc_more: LLVMValueRef = LLVMBuildICmp(builder, 40, sc_cur, sc_limit, "set.comp.more")
+                        _ = LLVMBuildCondBr(builder, sc_more, sc_bodyb, sc_done)
+                        LLVMPositionBuilderAtEnd(builder, sc_bodyb)
+                        _ = LLVMBuildStore(builder, sc_cur, sc_var_slot)
+                        sc_body_ok: mutable bool = true
+                        if sc_filtered:
+                            if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sc_pred:
+                                _ = LLVMBuildCondBr(builder, sc_pred, sc_add_block, sc_step)
+                            else:
+                                sc_body_ok <- false
+                        else:
+                            _ = LLVMBuildBr(builder, sc_add_block)
+                        null return if not sc_body_ok
+                        LLVMPositionBuilderAtEnd(builder, sc_add_block)
+                        if emit_expression(body, sc_elem_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sc_elem_value:
+                            sc_add_args: mutable darray[LLVMValueRef] = [runtime.arena, sc_slot, sc_elem_value]
+                            sc_add_args_pointer: void& = (&sc_add_args[0]).cast[void&] can Unsafe.PointerCast
+                            _ = LLVMBuildCall2(builder, sc_add_fn_type, sc_add, sc_add_args_pointer, 3, "set.comp.add.call")
+                            _ = LLVMBuildBr(builder, sc_step)
+                            LLVMPositionBuilderAtEnd(builder, sc_step)
+                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, sc_cur, LLVMConstInt(sc_i64, 1, 0), "set.comp.next"), sc_index_slot)
+                            _ = LLVMBuildBr(builder, sc_cond)
+                            LLVMPositionBuilderAtEnd(builder, sc_done)
+                            return LLVMBuildLoad2(builder, sc_llvm, sc_slot, "set.comp.value")
                         return null
                     return null
                 return null

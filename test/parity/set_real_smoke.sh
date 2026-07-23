@@ -124,6 +124,22 @@ set_case all_present 'def main() -> i64:
     if 30 in s:
         hit <- hit + 1
     return hit' 3
+# Set COMPREHENSION `{x for x in LOW..<HIGH}`: a zeroed DynSet + one
+# arena_set_add_or_panic per iteration. Members {1,2,3,4}: 2 and 4 present, 9 absent.
+set_case comprehension 'def main() -> i64:
+    s: mutable set[i64] = {x for x in 1..<5}
+    hit: mutable i64 = 0
+    if 2 in s:
+        hit <- hit + 1
+    if 4 in s:
+        hit <- hit + 1
+    if 9 in s:
+        hit <- hit + 1
+    return 42 if hit == 2 else 7' 42
+# Filtered comprehension `{x for x in … if COND}`: only x in {7,8,9} added.
+set_case comprehension_filter 'def main() -> i64:
+    s: mutable set[i64] = {x for x in 0..<10 if x > 6}
+    return 42 if (7 in s) and not (3 in s) else 7' 42
 
 if [ "$pass" -eq "$total" ]; then
     echo "set_real_smoke OK: $pass/$total real-std collections.elisa set programs compile+run correctly"
