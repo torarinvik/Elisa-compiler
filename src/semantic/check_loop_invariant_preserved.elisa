@@ -13,15 +13,45 @@
 extend Semantic:
     private:
         # The invariant's (variable, operator, bound) when it has the judged shape.
-        def invariant_shape(predicate: Ast::Expr) -> (found: bool, name: sview, operator: TokenKind, bound: i64):
+        # Collect top-level `const NAME: T = <int>` declarations (NAME -> value).
+        def lip_collect_consts(declarations: darray[Ast::Decl], out_names: mutable darray[sview]&, out_values: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_names, out_values|:
+                    match declaration:
+                        Decl.Const(const_name, const_type, const_value, const_is_global, const_line):
+                            literal: (found: bool, value: i64) = fold_const_int(const_value)
+                            if literal.found:
+                                out_names.push(const_name)
+                                out_values.push(literal.value)
+                        Decl.Module(module_name, module_body, module_line):
+                            lip_collect_consts(module_body, out_names, out_values)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            lip_collect_consts(scoped_body, out_names, out_values)
+                        _:
+                            pass
+
+        # The constant value of a bound expression: a folded literal, or a named `const`.
+        def lip_bound_value(expression: Ast::Expr, const_names: darray[sview]&, const_values: darray[i64]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                literal: (found: bool, value: i64) = fold_const_int(expression)
+                literal return if literal.found
+                name: sview = ident_name_of(expression)
+                if name != "":
+                    probe: mutable usize = 0
+                    while probe < const_names.count |probe, name, const_names, const_values|:
+                        (true, const_values[probe]) return if const_names[probe] == name
+                        probe <- probe + 1
+                return (false, 0)
+
+        def invariant_shape(predicate: Ast::Expr, const_names: darray[sview]&, const_values: darray[i64]&) -> (found: bool, name: sview, operator: TokenKind, bound: i64):
             can Memory.Allocate, Abort.Panic:
                 match predicate:
                     Expr.Paren(inner, line):
-                        return invariant_shape(inner)
+                        return invariant_shape(inner, const_names, const_values)
                     Expr.Binary(left, operator, right, line):
                         (false, sview("", 0, 0), operator, 0) return if not is_comparison_operator(operator)
                         left_name: sview = ident_name_of(left)
-                        bound: (found: bool, value: i64) = fold_const_int(right)
+                        bound: (found: bool, value: i64) = lip_bound_value(right, const_names, const_values)
                         (true, left_name, operator, bound.value) return if left_name != "" and bound.found
                         return (false, sview("", 0, 0), operator, 0)
                     _:
@@ -32,7 +62,41 @@ extend Semantic:
         # the invariant: a constant store failing the bound, or a step in the bound's
         # losing direction (strictly positive against an upper bound; strictly negative
         # against a lower bound — the invariant alone cannot absorb it).
-        def invariant_body_breaks(statements: darray[Ast::Stmt], name: sview, operator: TokenKind, bound: i64) -> bool:
+        # The upper bound the loop GUARD imposes on `name` (`name < V` -> V-1, `name <= V` -> V),
+        # searching through `and` conjunctions. (found, value) where value is the MAX name can take.
+        def lip_guard_upper_bound(condition: Ast::Expr, name: sview, const_names: darray[sview]&, const_values: darray[i64]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, paren_line):
+                        return lip_guard_upper_bound(inner, name, const_names, const_values)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            left_bound: (found: bool, value: i64) = lip_guard_upper_bound(left, name, const_names, const_values)
+                            left_bound return if left_bound.found
+                            return lip_guard_upper_bound(right, name, const_names, const_values)
+                        if ident_name_of(left) == name:
+                            limit: (found: bool, value: i64) = lip_bound_value(right, const_names, const_values)
+                            if limit.found and operator == TokenKind.Lt:
+                                return (true, limit.value - 1)
+                            if limit.found and operator == TokenKind.LtEq:
+                                return (true, limit.value)
+                        return (false, 0)
+                    _:
+                        return (false, 0)
+
+        # Whether the loop GUARD already keeps a `< / <=` invariant true across a `+step` body: the
+        # next-iteration maximum (guard-max + step) still satisfies the bound (so stage0's SMT proves
+        # it — do NOT report). Only meaningful for upper-bound invariants with a positive step.
+        def lip_guard_preserves(operator: TokenKind, bound: i64, step: i64, guard_condition: Ast::Expr, name: sview, const_names: darray[sview]&, const_values: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                gub: (found: bool, value: i64) = lip_guard_upper_bound(guard_condition, name, const_names, const_values)
+                false return if not gub.found
+                next_max: i64 = gub.value + step
+                true return if operator == TokenKind.Lt and next_max < bound
+                true return if operator == TokenKind.LtEq and next_max <= bound
+                return false
+
+        def invariant_body_breaks(statements: darray[Ast::Stmt], name: sview, operator: TokenKind, bound: i64, guard_condition: Ast::Expr, const_names: darray[sview]&, const_values: darray[i64]&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |name, operator, bound|:
                     match statement:
@@ -60,23 +124,26 @@ extend Semantic:
                                 true return if operator == TokenKind.GtEq and not (value_konst >= bound)
                                 continue
                             continue if self_coeff != 1
-                            # `v <- v + d`: the losing direction cannot be re-proven from
-                            # the invariant alone.
-                            true return if value_konst > 0 and (operator == TokenKind.Lt or operator == TokenKind.LtEq)
+                            # `v <- v + d`: the losing direction cannot be re-proven from the invariant
+                            # ALONE — but the loop GUARD may already bound v tightly enough to preserve
+                            # it (`n <= C` under guard `n < C`), which stage0's SMT discharges. Suppress
+                            # the report in that case; a strict `<` bound is never saved this way.
+                            if value_konst > 0 and (operator == TokenKind.Lt or operator == TokenKind.LtEq):
+                                true return if not lip_guard_preserves(operator, bound, value_konst, guard_condition, name, const_names, const_values)
                             true return if value_konst < 0 and (operator == TokenKind.Gt or operator == TokenKind.GtEq)
                         Stmt.If(condition, then_body, else_body, if_line):
-                            true return if invariant_body_breaks(then_body, name, operator, bound)
-                            true return if invariant_body_breaks(else_body, name, operator, bound)
+                            true return if invariant_body_breaks(then_body, name, operator, bound, guard_condition, const_names, const_values)
+                            true return if invariant_body_breaks(else_body, name, operator, bound, guard_condition, const_names, const_values)
                         Stmt.While(condition, while_body, while_line):
-                            true return if invariant_body_breaks(while_body, name, operator, bound)
+                            true return if invariant_body_breaks(while_body, name, operator, bound, guard_condition, const_names, const_values)
                         Stmt.Block(kind, clause, binding, block_body, block_line):
-                            true return if invariant_body_breaks(block_body, name, operator, bound)
+                            true return if invariant_body_breaks(block_body, name, operator, bound, guard_condition, const_names, const_values)
                         _:
                             pass
                 return false
 
 
-        def loop_invariant_walk(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+        def loop_invariant_walk(statements: darray[Ast::Stmt], const_names: darray[sview]&, const_values: darray[i64]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
@@ -85,33 +152,40 @@ extend Semantic:
                                 match body_statement:
                                     Stmt.Contract(kind, expression, contract_line):
                                         continue if kind != "invariant"
-                                        shape: (found: bool, name: sview, operator: TokenKind, bound: i64) = invariant_shape(expression)
+                                        shape: (found: bool, name: sview, operator: TokenKind, bound: i64) = invariant_shape(expression, const_names, const_values)
                                         continue if not shape.found
-                                        breaks: bool = invariant_body_breaks(while_body, shape.name, shape.operator, shape.bound)
+                                        breaks: bool = invariant_body_breaks(while_body, shape.name, shape.operator, shape.bound, condition, const_names, const_values)
                                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LoopInvariantNotPreserved, name: shape.name, line: contract_line, expected: "", actual: ""}) if breaks
                                     _:
                                         pass
-                            table <- loop_invariant_walk(while_body, table)
+                            table <- loop_invariant_walk(while_body, const_names, const_values, table)
                         Stmt.If(condition, then_body, else_body, if_line):
-                            table <- loop_invariant_walk(then_body, table)
-                            table <- loop_invariant_walk(else_body, table)
+                            table <- loop_invariant_walk(then_body, const_names, const_values, table)
+                            table <- loop_invariant_walk(else_body, const_names, const_values, table)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
-                            table <- loop_invariant_walk(for_body, table)
+                            table <- loop_invariant_walk(for_body, const_names, const_values, table)
                         Stmt.Block(kind, clause, binding, block_body, block_line):
-                            table <- loop_invariant_walk(block_body, table)
+                            table <- loop_invariant_walk(block_body, const_names, const_values, table)
+                        _:
+                            pass
+
+        def lip_walk_declarations(declarations: darray[Ast::Decl], const_names: darray[sview]&, const_values: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            table <- loop_invariant_walk(body, const_names, const_values, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- lip_walk_declarations(module_body, const_names, const_values, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- lip_walk_declarations(scoped_body, const_names, const_values, table)
                         _:
                             pass
 
     public:
         def check_loop_invariant_preserved(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |table| -> table:
-                    match declaration:
-                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
-                            table <- loop_invariant_walk(body, table)
-                        Decl.Module(module_name, module_body, module_line):
-                            table <- check_loop_invariant_preserved(module_body, table)
-                        Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_loop_invariant_preserved(scoped_body, table)
-                        _:
-                            pass
+                const_names: mutable darray[sview] = []
+                const_values: mutable darray[i64] = []
+                lip_collect_consts(declarations, const_names, const_values)
+                table <- lip_walk_declarations(declarations, const_names, const_values, table)
