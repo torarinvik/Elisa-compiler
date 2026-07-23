@@ -4062,6 +4062,78 @@ module Backend:
             return false
 
 
+        # `xs.reserve(n)` — ensure capacity >= n WITHOUT changing count or storing any
+        # element. The grow half of push (alloc-or-realloc to n*stride, then seal the new
+        # capacity), guarded by the same `capacity UGE needed` skip. Unlike resize (which
+        # push-fills zeros and so is scalar-only), reserve never materializes an element, so
+        # it works for ANY element type — including a darray of structs (IndexMap.entries).
+        def emit_darray_reserve(array_slot: LLVMValueRef, array_type: ValueType, needed: LLVMValueRef, structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            element_type: ValueType = darray_element_of(array_type, structs)
+            false return if element_type.kind == TypeKind.Unmodeled
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+            stride: LLVMValueRef = element_stride(element_type, structs, ctx)
+
+            items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, array_slot, 0, "reserve.items.ptr")
+            capacity_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, array_slot, 2, "reserve.cap.ptr")
+            capacity: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, capacity_pointer, "reserve.cap")
+
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            grow_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "reserve.grow")
+            done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "reserve.done")
+            # 35 = UGE: already big enough → nothing to do.
+            enough: LLVMValueRef = LLVMBuildICmp(builder, 35, capacity, needed, "reserve.cap.ok")
+            _ = LLVMBuildCondBr(builder, enough, done_block, grow_block)
+
+            LLVMPositionBuilderAtEnd(builder, grow_block)
+            # Grow to exactly `needed` (>= old capacity here, so never shrinks the backing).
+            old_bytes: LLVMValueRef = LLVMBuildMul(builder, capacity, stride, "reserve.old.bytes")
+            new_bytes: LLVMValueRef = LLVMBuildMul(builder, needed, stride, "reserve.new.bytes")
+            old_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "reserve.items")
+            is_null: LLVMValueRef = LLVMBuildICmp(builder, 32, old_items, LLVMConstNull(LLVMPointerTypeInContext(ctx, 0)), "reserve.items.null")
+            alloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "reserve.alloc")
+            realloc_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "reserve.realloc")
+            _ = LLVMBuildCondBr(builder, is_null, alloc_block, realloc_block)
+
+            LLVMPositionBuilderAtEnd(builder, alloc_block)
+            alloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, new_bytes]
+            alloc_pointer: void& = (&alloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+            allocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "reserve.alloc")
+            _ = LLVMBuildStore(builder, allocated, items_pointer)
+            _ = LLVMBuildStore(builder, needed, capacity_pointer)
+            _ = LLVMBuildBr(builder, done_block)
+
+            LLVMPositionBuilderAtEnd(builder, realloc_block)
+            realloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, old_items, old_bytes, new_bytes]
+            realloc_pointer: void& = (&realloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+            reallocated: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_realloc_type, runtime.arena_realloc, realloc_pointer, 4, "reserve.realloc")
+            _ = LLVMBuildStore(builder, reallocated, items_pointer)
+            _ = LLVMBuildStore(builder, needed, capacity_pointer)
+            _ = LLVMBuildBr(builder, done_block)
+
+            LLVMPositionBuilderAtEnd(builder, done_block)
+            return true
+
+
+        # `_ = xs.reserve(n)` — reserve returns `mutable darray&` (for chaining), so it is
+        # DISCARDED via `_ =` rather than appearing as a bare statement (unlike void `push`).
+        # Both discard sites (`_` VarDecl and `_` Assign) route through emit_expression, which
+        # does not model the darray growth method — intercept it here first. Returns 1 = handled
+        # (Open), -1 = recognized-but-declined, 0 = not a darray reserve (fall through).
+        def try_discarded_darray_reserve(value_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if value_expression is Expr.Call(dr_callee, dr_arguments, dr_argument_names, dr_call_line):
+                if dr_callee is Expr.Field(dr_object, dr_method, dr_method_line):
+                    if dr_method == "reserve" and dr_arguments.count == 1:
+                        dr_type: ValueType = darray_type_behind_expr(dr_object, local_scope, structs)
+                        if dr_type.kind == TypeKind.DArray:
+                            if darray_address_of_expr(dr_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dr_slot:
+                                if emit_expression(dr_arguments[0], ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dr_n:
+                                    if emit_darray_reserve(dr_slot, dr_type, dr_n, structs, runtime, ctx, builder):
+                                        return 1
+                            return -1
+            return 0
+
+
         # The user-defined `struct Arena`, when the program declares one. The NAME `Arena`
         # always annotates as TypeKind.Arena (the runtime carrier -- `in` blocks and arena
         # threading key on it), but the std DEFINES the struct itself, with fields the
@@ -6204,6 +6276,15 @@ module Backend:
                                 _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), clear_count_ptr)
                                 return EmitStatus.Open
                             return EmitStatus.Declined
+                        # `xs.reserve(n)` — ensure capacity >= n without changing count or
+                        # storing an element (see emit_darray_reserve). Works for any element
+                        # type, so the IndexMap ctor's `map.entries.reserve(cap)` lowers here.
+                        if push_type.kind == TypeKind.DArray and push_method == "reserve" and push_arguments.count == 1:
+                            if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is reserve_slot:
+                                if emit_expression(push_arguments[0], ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is reserve_n:
+                                    if emit_darray_reserve(reserve_slot, push_type, reserve_n, structs, runtime, ctx, builder):
+                                        return EmitStatus.Open
+                            return EmitStatus.Declined
                         # `xs.truncate(n)` — SHRINK to at most n elements: count becomes min(count,
                         # n). A no-op when n >= count. Pure count clamp, like clear; the backing is
                         # retained and growth is never triggered (truncate only shrinks).
@@ -6367,6 +6448,9 @@ module Backend:
                 # discarded call (`_ = fetch_add(&a, 2)`, `_ = helper(5)`) declined at the
                 # Unmodeled-annotation gate below.
                 if var_name == "_":
+                    dr_var_status: i64 = try_discarded_darray_reserve(var_value, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    EmitStatus.Open return if dr_var_status == 1
+                    EmitStatus.Declined return if dr_var_status < 0
                     discard_type: ValueType = expression_type(var_value, local_scope, fns, structs, generics)
                     discard_expected: ValueType = discard_type if discard_type.kind != TypeKind.Unmodeled else ValueType{kind: TypeKind.Signed, bits: 64}
                     if emit_expression(var_value, discard_expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is discarded_var_value:
@@ -6532,6 +6616,9 @@ module Backend:
                 # non-ident/`=`-target declines below.
                 if assign_target is Expr.Ident(assign_discard_name, assign_discard_line):
                     if assign_discard_name == "_":
+                        dr_assign_status: i64 = try_discarded_darray_reserve(assign_value, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        EmitStatus.Open return if dr_assign_status == 1
+                        EmitStatus.Declined return if dr_assign_status < 0
                         discard_assign_type: ValueType = expression_type(assign_value, local_scope, fns, structs, generics)
                         discard_assign_expected: ValueType = discard_assign_type if discard_assign_type.kind != TypeKind.Unmodeled else ValueType{kind: TypeKind.Signed, bits: 64}
                         if emit_expression(assign_value, discard_assign_expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is discarded_assign_value:
