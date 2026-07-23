@@ -58,6 +58,23 @@ extend Semantic:
                     Expr.Ident(name, line): false
                     _: true
 
+        # An indexed element store whose index is a BARE identifier (`c[j] <- …`). Element assignment
+        # is length-preserving, so it cannot affect a `.count`/`.len` measure over the container; and a
+        # bare-ident index is the modeled loop position, so stage0's focused capture routes it to the
+        # real interval prover instead of the structural bail. A COMPOUND index (`c[j+1] <- …`) stays
+        # opaque (the analyzer does not track that position), matching stage0.
+        def decreases_element_store_bare_index(target: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Paren(inner, paren_line):
+                        return decreases_element_store_bare_index(inner)
+                    Expr.Index(object, index, index_line):
+                        return match index:
+                            Expr.Ident(index_name, ident_line): true
+                            _: false
+                    _:
+                        return false
+
         # Identifiers a measure expression mentions — the FOCUS set. stage0's capture is
         # focused: only effects touching a measure variable can make the body unmodelable
         # (`captureLoopBodyEffectForTerminationFocused`), and guard-`if` bodies go through
@@ -112,7 +129,7 @@ extend Semantic:
                     # A non-arithmetic write is opaque ONLY when its base is a MEASURE variable —
                     # `arr[j] <- …` cannot affect a measure `n - j` (arr not in the focus set), so
                     # stage0 (focused capture) tolerates it and still proves the decrease.
-                    Stmt.Assign(target, operator, value, assign_line): (decreases_target_is_nonlocal(target) and (any focus_name in measure_focus where focus_name == decreases_target_base(target))) or decreases_expr_has_call(value)
+                    Stmt.Assign(target, operator, value, assign_line): (decreases_target_is_nonlocal(target) and not decreases_element_store_bare_index(target) and (any focus_name in measure_focus where focus_name == decreases_target_base(target))) or decreases_expr_has_call(value)
                     Stmt.Expr(expression, expr_line): decreases_expr_has_call(expression)
                     Stmt.VarDecl(name, type_expression, value, decl_line): decreases_expr_has_call(value)
                     _: false
@@ -174,6 +191,72 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 return decreases_branch_unmodelable(statements, false, measure_focus)
 
+
+        # Build the measure as a linear form over its VARYING (bare-ident) terms, treating any
+        # non-linear sub-term (`self.xs.count`, `n.usize()`, an index read) as loop-INVARIANT and
+        # dropping it — sound here because a body that reaches the decrease judge has no length-changing
+        # or opaque write to those terms (element stores preserve `.count`; other writes bail earlier).
+        # Only the per-iteration DELTA matters, so an invariant term contributes nothing.
+        def decreases_int_literal(expression: Ast::Expr) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                return match expression:
+                    Expr.IntLit(literal_value): (true, literal_value)
+                    Expr.Paren(inner, paren_line): decreases_int_literal(inner)
+                    _: (false, 0)
+
+        def decreases_measure_form(expression: Ast::Expr, sign: i64, names: mutable darray[sview]&, coeffs: mutable darray[i64]&, konst: mutable i64&, modeled: mutable bool&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        decreases_measure_form(inner, sign, names, coeffs, konst, modeled)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.Plus:
+                            decreases_measure_form(left, sign, names, coeffs, konst, modeled)
+                            decreases_measure_form(right, sign, names, coeffs, konst, modeled)
+                        else:
+                            if operator == TokenKind.Minus:
+                                decreases_measure_form(left, sign, names, coeffs, konst, modeled)
+                                decreases_measure_form(right, 0 - sign, names, coeffs, konst, modeled)
+                            else:
+                                if operator == TokenKind.Star:
+                                    left_const: (found: bool, value: i64) = decreases_int_literal(left)
+                                    right_const: (found: bool, value: i64) = decreases_int_literal(right)
+                                    if left_const.found:
+                                        decreases_measure_form(right, sign * left_const.value, names, coeffs, konst, modeled)
+                                    else:
+                                        if right_const.found:
+                                            decreases_measure_form(left, sign * right_const.value, names, coeffs, konst, modeled)
+                                        else:
+                                            modeled <- false
+                                else:
+                                    modeled <- false
+                    Expr.Ident(name, ident_line):
+                        slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < names.count |slot, probe, name, names|:
+                            slot <- probe.i64() if names[probe] == name and slot < 0
+                            probe <- probe + 1
+                        if slot < 0:
+                            names.push(name)
+                            coeffs.push(sign)
+                        else:
+                            coeffs[slot.usize()] <- coeffs[slot.usize()] + sign
+                    Expr.IntLit(literal_value):
+                        konst <- konst + sign * literal_value
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        # A numeric cast is a representation change on its receiver — recurse through it.
+                        if call_is_numeric_cast(callee, arguments):
+                            decreases_measure_form(cast_receiver_of(callee), sign, names, coeffs, konst, modeled)
+                        else:
+                            modeled <- false
+                    Expr.Field(object, field, field_line):
+                        # A field term (`self.xs.count`) is loop-invariant here (no length-changing write
+                        # reaches the judge) — it contributes nothing to the per-iteration delta.
+                        pass
+                    Expr.Index(object, index_expression, index_line):
+                        pass
+                    _:
+                        modeled <- false
 
         # PER-PATH decrease proof (the port of stage0's straight-line capture + guard-`if`
         # path enumeration): every NON-EXITING path through the body must move the
@@ -263,7 +346,9 @@ extend Semantic:
                             measure_names: mutable darray[sview] = []
                             measure_coeffs: mutable darray[i64] = []
                             measure_konst: mutable i64 = 0
-                            measure_linear: bool = judge and lin_add(measure_expression, 1, measure_names, measure_coeffs, measure_konst, Ast::Expr.Invalid, false, 0)
+                            measure_form_modeled: mutable bool = true
+                            decreases_measure_form(measure_expression, 1, measure_names, measure_coeffs, measure_konst, measure_form_modeled) if judge
+                            measure_linear: bool = judge and measure_form_modeled and measure_names.count > 0
                             modeled: mutable bool = true
                             all_paths_decrease: bool = measure_linear and decreases_paths_decrease(while_body, 0, 0, measure_names, measure_coeffs, modeled)
                             non_decreasing: bool = judge and measure_linear and modeled and not all_paths_decrease
