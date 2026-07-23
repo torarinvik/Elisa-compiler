@@ -200,6 +200,17 @@ dict_case clear 'def main() -> i64:
     d.put(1, 5)
     d.clear()
     return 42 if d.get(1) == null else 7' 42
+# `arena_dict_get` returns `usize&?` (an optional REF); deref it via `found[0]` after a
+# `found == null` narrowing — the index_map_find_index shape. Exercises optional-ref indexing.
+dict_case optional_ref_deref 'def find_idx(d: dict[i64, usize]&, key: i64) -> usize:
+    found: usize&? = arena_dict_get[i64, usize](d, key)
+    return 999.usize() if found == null else found[0]
+def main() -> i64 can[Memory.Allocate, Abort.Panic]:
+    arena: mutable Arena = zeroed
+    d: mutable dict[i64, usize] = zeroed
+    d <- arena_dict_new[i64, usize](&arena, 8.usize())
+    arena_dict_put_or_panic[i64, usize](&arena, &d, 7, 40.usize())
+    return find_idx(&d, 7).i64() + 2' 42
 # `d.contains(k)` / `d.remove(k)` round-trip.
 dict_case contains_remove 'def main() -> i64:
     d: mutable dict[i64, i64] = {}
