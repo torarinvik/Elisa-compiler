@@ -1071,6 +1071,13 @@ run_case cast_int_to_pointer_optional '@internal\ndef as_ptr(raw: uintptr) -> mu
 # a raw address as a scalar `uintptr` (Slice[T]'s `base` field does exactly this). Round-tripped
 # ptr -> uintptr -> ptr -> deref recovers the original value, so the exit code is deterministic.
 run_case cast_pointer_to_uintptr_roundtrip 'def main() -> i64:\n    x: mutable i64 = 42\n    u: uintptr = (&x).cast[uintptr] can Unsafe.PointerCast\n    p: i64& = u.cast[i64&] can Unsafe.PointerCast\n    return p\n' 42
+# `T(x)` — a value CONVERSION in PREFIX form (the canonical spelling alongside postfix
+# `x.T()`). A scalar type name applied to one argument converts it: widen (u8->i64), narrow
+# (i64->u8, wraps mod 256), and float truncation (f64->i64) all resolve to the same
+# emit_conversion the postfix form uses.
+run_case convert_prefix_widen  'def main() -> i64:\n    x: u8 = 200\n    return i64(x) - 158\n' 42
+run_case convert_prefix_narrow 'def main() -> i64:\n    x: i64 = 300\n    return u8(x).i64() - 2\n' 42
+run_case convert_prefix_ftrunc 'def main() -> i64:\n    x: f64 = 42.9\n    return i64(x)\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
