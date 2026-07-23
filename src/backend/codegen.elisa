@@ -283,7 +283,11 @@ module Backend:
         def generic_return_type(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
             index: i64 = generic_index_of(generics, base)
             unmodeled_type() return if index < 0
-            slot: usize = index.usize()
+            return generic_return_type_at(index.usize(), type_args, generics, structs)
+
+
+        def generic_return_type_at(slot: usize, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if slot >= generics.names.count
             unmodeled_type() return if generics.param_count[slot] != type_args.count
             if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 # A missing return annotation is `void` — so a call to it names its result ""
@@ -1412,6 +1416,11 @@ module Backend:
             inst_arg_start: mutable darray[usize]
             inst_arg_count: mutable darray[usize]
             inst_handles: mutable darray[LLVMValueRef]
+            # The template SLOT each instantiation came from. Redundant with the base name UNLESS
+            # the name is overloaded (`len[T](Slice)` vs `len[T](ReadView)`): then base+args are not
+            # unique, so the slot is what distinguishes the two — used to key the cache and to emit
+            # the correct BODY (emit_instantiation_body must not re-derive the slot by first-name).
+            inst_slots: mutable darray[usize]
             # The WORKLIST: instantiations declared but whose BODY still needs emitting. A
             # body cannot be emitted at the call site (the builder sits inside the caller),
             # so emit_module drains this afterwards — and keeps draining, because a generic
@@ -1421,10 +1430,14 @@ module Backend:
             pending_arg_start: mutable darray[usize]
             pending_arg_count: mutable darray[usize]
             pending_handles: mutable darray[LLVMValueRef]
+            # The template slot for each queued body (parallel to pending_bases). emit_instantiation_body
+            # emits generics.decls[this slot] — NOT decls[generic_index_of(base)], which would pick the
+            # first overload's body for an overloaded name.
+            pending_slots: mutable darray[usize]
 
 
         def new_generic_table() -> GenericTable can[Abort.Panic, Memory.Allocate]:
-            return GenericTable{names: [], decls: [], params: [], param_start: [], param_count: [], is_error: [], inst_bases: [], inst_args: [], inst_arg_start: [], inst_arg_count: [], inst_handles: [], pending_bases: [], pending_args: [], pending_arg_start: [], pending_arg_count: [], pending_handles: []}
+            return GenericTable{names: [], decls: [], params: [], param_start: [], param_count: [], is_error: [], inst_bases: [], inst_args: [], inst_arg_start: [], inst_arg_count: [], inst_handles: [], inst_slots: [], pending_bases: [], pending_args: [], pending_arg_start: [], pending_arg_count: [], pending_handles: [], pending_slots: []}
 
 
         # Push one type-parameter binding per (param name, type arg) for template `slot`, so
@@ -2313,12 +2326,46 @@ module Backend:
         # call site needs immediately. The BODY is queued because emitting it needs the
         # builder, which is currently positioned inside the caller.
         def instantiate_generic(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            if instantiation_of(generics, base, type_args) is already_declared:
-                return already_declared
-
+            # Direct-name entry (the common case): resolve the FIRST template with this name. For a
+            # unique name that is the only template; an overloaded name is disambiguated only via
+            # instantiate_generic_at (the UFCS path), which selects the slot by receiver type.
             index: i64 = generic_index_of(generics, base)
             null return if index < 0
-            slot: usize = index.usize()
+            return instantiate_generic_at(index.usize(), type_args, generics, structs, m, ctx)
+
+
+        # Number of generic templates sharing `name` (1 for a unique name, >1 for an overload set).
+        def generic_slot_count(generics: GenericTable&, name: sview) -> usize can[Abort.Panic]:
+            count: mutable usize = 0.usize()
+            for index in 0..<generics.names.count |count, generics, name|:
+                count <- count + 1.usize() if generics.names[index] == name
+            return count
+
+
+        # The instantiation cached for (SLOT, args), or null. Keyed on slot rather than base name so
+        # two overloads of the same name with the same type args do not alias to one handle.
+        def instantiation_of_slot(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<generics.inst_slots.count |generics, slot, type_args|:
+                continue if generics.inst_slots[index] != slot
+                continue if generics.inst_arg_count[index] != type_args.count
+                astart: usize = generics.inst_arg_start[index]
+                matched: mutable bool = true
+                for k in 0..<type_args.count |generics, matched, astart, type_args|:
+                    stored: ValueType = generics.inst_args[astart + k]
+                    matched <- false if stored.kind != type_args[k].kind or stored.bits != type_args[k].bits
+                generics.inst_handles[index] return if matched
+            return null
+
+
+        # Instantiate template SLOT for `type_args` (declaring the signature + queuing the body).
+        # instantiate_generic delegates here after resolving the slot; the UFCS path calls it with an
+        # overload-selected slot. The mangled name gets a slot suffix ONLY for overloaded names, so a
+        # unique name's instantiation keeps its exact current symbol.
+        def instantiate_generic_at(slot: usize, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if slot >= generics.names.count
+            base: sview = generics.names[slot]
+            if instantiation_of_slot(generics, slot, type_args) is already_declared:
+                return already_declared
             # The call must supply exactly one argument per type parameter.
             null return if generics.param_count[slot] != type_args.count
 
@@ -2347,7 +2394,8 @@ module Backend:
                 null return if declined or return_value_type.kind == TypeKind.Unmodeled
 
                 name_storage: mutable darray[u8] = []
-                mangled: cstr = mangled_name_multi_into(base, type_args, structs, name_storage)
+                mangled_slot_suffix: i64 = slot.i64() if generic_slot_count(generics, base) > 1.usize() else -1
+                mangled: cstr = mangled_name_multi_into(base, type_args, mangled_slot_suffix, structs, name_storage)
                 llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
                 llvm_return <- LLVMInt32TypeInContext(ctx) if instantiation_is_error
                 full_params: mutable darray[LLVMTypeRef] = []
@@ -2368,6 +2416,7 @@ module Backend:
                 generics.inst_arg_start <- generics.inst_arg_start.push(inst_arg_start)
                 generics.inst_arg_count <- generics.inst_arg_count.push(type_args.count)
                 generics.inst_handles <- generics.inst_handles.push(handle)
+                generics.inst_slots <- generics.inst_slots.push(slot)
                 pending_arg_start: usize = generics.pending_args.count
                 for argument in type_args |generics|:
                     generics.pending_args <- generics.pending_args.push(copied_type(argument))
@@ -2375,6 +2424,7 @@ module Backend:
                 generics.pending_arg_start <- generics.pending_arg_start.push(pending_arg_start)
                 generics.pending_arg_count <- generics.pending_arg_count.push(type_args.count)
                 generics.pending_handles <- generics.pending_handles.push(handle)
+                generics.pending_slots <- generics.pending_slots.push(slot)
                 return handle
             return null
 
@@ -2384,7 +2434,11 @@ module Backend:
         def instantiation_param_type(base: sview, type_args: darray[ValueType]&, position: usize, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
             index: i64 = generic_index_of(generics, base)
             unmodeled_type() return if index < 0
-            slot: usize = index.usize()
+            return instantiation_param_type_at(index.usize(), type_args, position, generics, structs)
+
+
+        def instantiation_param_type_at(slot: usize, type_args: darray[ValueType]&, position: usize, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if slot >= generics.names.count
             if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                 unmodeled_type() return if position >= params.count
                 # POP is symmetric via pop_type_bindings — never `<- []`, which would rebind
@@ -2408,10 +2462,15 @@ module Backend:
         # instantiate_generic uses to build the signature (so the call site matches). Computed
         # under the type-arg bindings so `wrap[i64] -> darray[i64]` (grows a darray) is detected.
         def instantiation_wants_arena(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
-            arena_slot: i64 = generic_index_of(generics, base)
-            false return if arena_slot < 0
-            if generics.decls[arena_slot.usize()] is Decl.Func(arena_fn_name, arena_params, arena_ret_opt, arena_body, arena_effects, arena_decs, arena_line):
-                arena_bound: usize = push_type_bindings(generics, structs, arena_slot.usize(), type_args)
+            arena_index: i64 = generic_index_of(generics, base)
+            false return if arena_index < 0
+            return instantiation_wants_arena_at(arena_index.usize(), type_args, generics, structs)
+
+
+        def instantiation_wants_arena_at(arena_slot: usize, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            false return if arena_slot >= generics.names.count
+            if generics.decls[arena_slot] is Decl.Func(arena_fn_name, arena_params, arena_ret_opt, arena_body, arena_effects, arena_decs, arena_line):
+                arena_bound: usize = push_type_bindings(generics, structs, arena_slot, type_args)
                 arena_ret_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
                 if arena_ret_opt is arena_ret:
                     arena_ret_type <- annotation_value_type(arena_ret, structs)
@@ -2446,6 +2505,61 @@ module Backend:
                 LLVMBuildCall2(builder, fn_type, target, null, 0, gresult_name) return if argument_values.count == 0
                 args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
                 return LLVMBuildCall2(builder, fn_type, target, args_pointer, argument_values.count.u32(), gresult_name)
+            return null
+
+
+        # Infer template SLOT's type arguments for a UFCS call `recv.f(a, b)` == `f(recv, a, b)`:
+        # parameter 0 unifies with the receiver, parameters 1+ with the explicit arguments. The
+        # receiver is threaded separately (a receiver-then-args darray[Expr] crashes stage0).
+        # Returns empty when any parameter stays unbound — which is how the WRONG overload for this
+        # receiver is rejected (its parameter-0 base will not match, leaving a type param free).
+        def infer_generic_args_ufcs(slot: usize, receiver: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            count: usize = generics.param_count[slot]
+            bindings: mutable darray[ValueType] = [unmodeled_type() for _slot_index in 0..<count]
+            bound_flags: mutable darray[bool] = [false for _flag_index in 0..<count]
+            no_args: darray[ValueType] = []
+            if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                no_args return if params.count == 0
+                receiver_actual: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+                unify_annotation(params[0].type_expression, receiver_actual, generics, slot, structs, bindings, bound_flags) if receiver_actual.kind != TypeKind.Unmodeled
+                arg_limit: usize = (params.count - 1.usize()) if (params.count - 1.usize()) < arguments.count else arguments.count
+                for position in 0..<arg_limit |bindings, bound_flags, params, arguments, local_scope, fns, structs, generics, slot|:
+                    actual: mutable ValueType = expression_type(arguments[position], local_scope, fns, structs, generics)
+                    actual <- ValueType{kind: TypeKind.Signed, bits: 64} if actual.kind == TypeKind.Unmodeled and is_int_literal_expr(arguments[position])
+                    continue if actual.kind == TypeKind.Unmodeled
+                    unify_annotation(params[position + 1.usize()].type_expression, actual, generics, slot, structs, bindings, bound_flags)
+            for flag_index in 0..<count |bound_flags, no_args, count|:
+                no_args return if not bound_flags[flag_index]
+            return bindings
+
+
+        # Emit a UFCS call to a GENERIC user function at a specific template SLOT: `recv.f(a)` as
+        # `f(recv, a)`, receiver as parameter 0. The slot-keyed analogue of emit_generic_call, used
+        # for overloaded std generics (Slice/Deque/…) that direct-name resolution cannot distinguish.
+        def emit_generic_ufcs_call(slot: usize, type_args: darray[ValueType]&, receiver: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instantiate_generic_at(slot, type_args, generics, structs, m, ctx) is target:
+                argument_values: mutable darray[LLVMValueRef] = []
+                declined: mutable bool = false
+                receiver_wanted: ValueType = instantiation_param_type_at(slot, type_args, 0.usize(), generics, structs)
+                if emit_expression(receiver, receiver_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is emitted_receiver:
+                    argument_values.push(emitted_receiver)
+                else:
+                    declined <- true
+                argument_index: mutable usize = 1.usize()
+                for argument in arguments |argument_values, declined, argument_index, slot, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    wanted: ValueType = instantiation_param_type_at(slot, type_args, argument_index, generics, structs)
+                    if emit_expression(argument, wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is emitted_argument:
+                        argument_values.push(emitted_argument)
+                    else:
+                        declined <- true
+                    argument_index <- argument_index + 1.usize()
+                null return if declined
+                argument_values.push(runtime.arena) if instantiation_wants_arena_at(slot, type_args, generics, structs)
+                ufcs_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                ufcs_result_name: cstr = call_result_name(generic_return_type_at(slot, type_args, generics, structs))
+                LLVMBuildCall2(builder, ufcs_fn_type, target, null, 0, ufcs_result_name) return if argument_values.count == 0
+                ufcs_args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildCall2(builder, ufcs_fn_type, target, ufcs_args_pointer, argument_values.count.u32(), ufcs_result_name)
             return null
 
 
@@ -3044,6 +3158,25 @@ module Backend:
                     if dict_helper != "":
                         dict_arena_leading: bool = dict_method_is_mutating(method_name)
                         return emit_dict_method_call(dict_helper, dict_args, receiver, arguments, dict_arena_leading, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # `recv.f(a)` where `f` is a GENERIC user function (`f[T](self: Slice[T], …)`) —
+                # the receiver is parameter 0. Try EVERY template slot named `f` and pick the one
+                # whose parameter 0 unifies with THIS receiver (the wrong overload leaves a type
+                # param unbound → infer returns empty). The selected slot is threaded through
+                # instantiation so an overloaded name emits the correct body. This is what the whole
+                # UFCS surface of Slice/Deque/IndexMap/InlineVec needs. Checked before the
+                # non-generic lookup, which only finds monomorphic functions.
+                if generic_index_of(generics, method_name) >= 0:
+                    ufcs_chosen_slot: mutable i64 = -1
+                    ufcs_chosen_args: mutable darray[ValueType] = []
+                    for ufcs_cand_slot in 0..<generics.names.count |ufcs_chosen_slot, ufcs_chosen_args, method_name, receiver, arguments, local_scope, fns, structs, generics|:
+                        continue if ufcs_chosen_slot >= 0 or generics.names[ufcs_cand_slot] != method_name
+                        ufcs_cand_args: darray[ValueType] = infer_generic_args_ufcs(ufcs_cand_slot, receiver, arguments, local_scope, fns, structs, generics)
+                        if ufcs_cand_args.count != 0:
+                            ufcs_chosen_slot <- ufcs_cand_slot.i64()
+                            ufcs_chosen_args <- ufcs_cand_args
+                    if ufcs_chosen_slot >= 0:
+                        return emit_generic_ufcs_call(ufcs_chosen_slot.usize(), ufcs_chosen_args, receiver, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    return null
                 ufcs_target_opt: LLVMValueRef? = lookup_function(fns, "", method_name)
                 if ufcs_target_opt is ufcs_target:
                     return emit_direct_call("", method_name, receiver, true, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
@@ -7338,7 +7471,26 @@ module Backend:
         # `arena_dict_put` + [i64, i64] -> "arena_dict_put__i64__i64". One `__ARG` per type
         # argument, so a two-parameter generic gets a distinct name per (K, T) tuple. Struct
         # arguments contribute their registered name (push_generic_arg_name).
-        def mangled_name_multi_into(base: sview, type_args: darray[ValueType]&, structs: StructTable&, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # Append `value` as ASCII decimal digits to `storage` (used to make an overloaded
+        # instantiation's symbol name unique by its template slot).
+        def append_usize_decimal(value: usize, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if value == 0.usize():
+                storage.push(48)
+                return
+            digits: mutable darray[u8] = []
+            remaining: mutable usize = value
+            for _step in 0..<24 |digits, remaining|:
+                break if remaining == 0.usize()
+                digits.push((48.usize() + (remaining % 10.usize())).u8())
+                remaining <- remaining / 10.usize()
+            # digits are least-significant-first; append reversed.
+            for reverse_index in 0..<digits.count |storage, digits|:
+                storage.push(digits[digits.count - 1.usize() - reverse_index])
+
+
+        # `slot_suffix >= 0` appends `__ov<slot>` before the terminator, disambiguating the LLVM
+        # symbol for an OVERLOADED template (unique names pass -1 and keep their exact symbol).
+        def mangled_name_multi_into(base: sview, type_args: darray[ValueType]&, slot_suffix: i64, structs: StructTable&, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             for index in 0..<sview_len(base) |storage, base|:
                 storage.push(sview_at(base, index))
             # UNROLLED rather than a loop: growing `storage` through a nested call INSIDE a
@@ -7350,6 +7502,12 @@ module Backend:
             append_mangled_arg(type_args, 1, structs, storage)
             append_mangled_arg(type_args, 2, structs, storage)
             append_mangled_arg(type_args, 3, structs, storage)
+            if slot_suffix >= 0:
+                storage.push(95)
+                storage.push(95)
+                storage.push(111)
+                storage.push(118)
+                append_usize_decimal(slot_suffix.usize(), storage)
             storage.push(0)
             return (&storage[0]).cast[cstr] can Unsafe.PointerCast
 
@@ -8435,9 +8593,9 @@ module Backend:
         def emit_instantiation_body(index: usize, generics: mutable GenericTable&, fns: FnTable&, structs: mutable StructTable&, runtime: mutable Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             base: sview = generics.pending_bases[index]
             handle: LLVMValueRef = generics.pending_handles[index]
-            template_index: i64 = generic_index_of(generics, base)
-            false return if template_index < 0
-            slot: usize = template_index.usize()
+            # Use the RECORDED slot, not generic_index_of(base): for an overloaded name the latter
+            # returns the first overload, whose body would be wrong for this instantiation.
+            slot: usize = generics.pending_slots[index]
 
             # Rebuild this instantiation's type-argument tuple from the pending pool and bind
             # every K/T for the body emission.

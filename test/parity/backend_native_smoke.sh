@@ -1101,6 +1101,11 @@ run_case darray_truncate_noop 'def main() -> i64:\n    xs: mutable darray[i64] =
 # shrinking. Grow (count 3->5, new elements read as 0) and shrink (5->2, prefix kept).
 run_case darray_resize_grow 'def main() -> i64:\n    xs: mutable darray[i64] = [7, 8, 9]\n    xs.resize(5.usize())\n    return xs.count.i64() + xs[3] + xs[4] + 37\n' 42
 run_case darray_resize_shrink 'def main() -> i64:\n    xs: mutable darray[i64] = [40, 8, 9, 10, 11]\n    xs.resize(2.usize())\n    return xs[0] + xs[1] + xs.count.i64() - 8\n' 42
+# OVERLOADED generic UFCS: two `pick[T]` templates distinguished by receiver type. The right
+# BODY must be selected by the receiver (not by declaration order), and two instantiations of
+# the same name+args must not alias in the cache. Slot-aware generic overload resolution.
+run_case overload_ufcs_by_receiver 'struct Holder[T]:\n    v: T\nstruct Keeper[T]:\n    v: T\ndef pick[T](x: Holder[T]) -> i64:\n    return 7\ndef pick[T](x: Keeper[T]) -> i64:\n    return 42\ndef main() -> i64:\n    b: Keeper[i64] = Keeper[i64] { v: 1 }\n    return b.pick()\n' 42
+run_case overload_ufcs_both 'struct Holder[T]:\n    v: T\nstruct Keeper[T]:\n    v: T\ndef pick[T](x: Holder[T]) -> i64:\n    return 40\ndef pick[T](x: Keeper[T]) -> i64:\n    return 2\ndef main() -> i64:\n    a: Holder[i64] = Holder[i64] { v: 1 }\n    b: Keeper[i64] = Keeper[i64] { v: 1 }\n    return a.pick() + b.pick()\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
