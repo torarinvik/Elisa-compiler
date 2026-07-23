@@ -94,6 +94,20 @@ slice_case get_unchecked 'def main() -> i64:
     s: Slice[i64] = slice(&xs)
     return s.get_unchecked(0.usize()) + s.get_unchecked(1.usize())' 42
 
+# split(n, k) returns the k-th of n disjoint bands; its len is the band size.
+slice_case split 'def main() -> i64:
+    xs: mutable darray[i64] = [1, 2, 3, 4, 5, 6]
+    s: Slice[i64] = slice(&xs)
+    b: Slice[i64] = s.split(2.usize(), 1.usize())
+    return b.len().i64() + 39' 42
+# set_unchecked(i, v) WRITES element i through the borrowed backing (ref-to-scalar store);
+# the write is observed by a subsequent get and through the source darray.
+slice_case set_unchecked 'def main() -> i64:
+    xs: mutable darray[i64] = [1, 2, 3, 4]
+    s: Slice[i64] = slice(&xs)
+    s.set_unchecked(2.usize(), 42)
+    return s.get(2.usize())' 42
+
 if [ "$pass" -eq "$total" ]; then
     echo "slice_real_smoke OK: $pass/$total real-std Slice[T] programs compile+run correctly"
 else
