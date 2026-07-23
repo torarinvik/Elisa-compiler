@@ -1128,7 +1128,12 @@ run_case match_optional_absent 'def f(x: i64) -> i64?:\n    return x if x > 0 el
 # `x: T = get OPT else BODY` — monadic unwrap with an explicit recovery: present binds the
 # payload, absent runs BODY (which exits). Present path and absent path both exercised.
 run_case get_else_present 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\ndef main() -> i64:\n    v: i64 = get find(40) else return 7\n    return v + 2\n' 42
-run_case get_else_absent 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\ndef main() -> i64:\n    v: i64 = get find(-1) else return 42\n    return v + 100\n' 42
+# BARE `get OPT` (no `else`): the parser erases it to `v: T = OPT` (OPT: T?) plus a
+# `__checked_get` annotation; the backend recognizes the unnarrowed Optional->non-optional
+# VarDecl (which stage0 accepts ONLY for a get-unwrap) and lowers it to bind-payload on
+# PRESENT / propagate-None on ABSENT out of THIS optional-returning fn. index_map_get uses it.
+run_case get_bare_present 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\ndef pick(x: i64) -> i64?:\n    v: i64 = get find(x)\n    return v + 2\ndef main() -> i64:\n    return get pick(40) else 7\n' 42
+run_case get_bare_absent 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\ndef pick(x: i64) -> i64?:\n    v: i64 = get find(x)\n    return v + 2\ndef main() -> i64:\n    return get pick(-1) else 42\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
