@@ -1,0 +1,131 @@
+# A UFCS method call `recv.m()` is ambiguous when two or more free functions named `m` accept the
+# receiver's type as an IDENTICAL by-value first parameter (`def m(x: T)` in two modules, both
+# `using`-imported). stage0 reports "UFCS call m on T is ambiguous". SOUND subset: only by-value
+# candidates are counted (a by-ref/mutable candidate has a distinct overload rank stage0 disambiguates
+# by), the receiver must be a by-value parameter of the enclosing function, and at least two
+# candidates must share the receiver's bare type — so it fires only on a genuine same-rank tie.
+extend Semantic:
+    private:
+        # The last identifier component of a (possibly qualified) type name, stripping `mutable`.
+        def ufa_qualified_bare(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        return name
+                    Expr.Scope(base, name, scope_line):
+                        return name
+                    Expr.Field(object, field, field_line):
+                        return field
+                    Expr.Paren(inner, paren_line):
+                        return ufa_qualified_bare(inner)
+                    Expr.Unary(operator, operand, unary_line):
+                        return ufa_qualified_bare(operand)
+                    _:
+                        return sview("", 0, 0)
+
+        # A by-value parameter type: no `mutable` and no `&` reference marker.
+        def ufa_is_by_value(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return not type_marker_present(type_expression, TokenKind.Mutable) and not type_marker_present(type_expression, TokenKind.Ampersand)
+
+        # Collect every free function's (name, by-value first-param bare type). A non-by-value first
+        # param yields "" so it never matches a by-value receiver.
+        def ufa_collect(declarations: darray[Ast::Decl], out_names: mutable darray[sview]&, out_recv: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_names, out_recv|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if parameters.count >= 1 and ufa_is_by_value(parameters[0].type_expression):
+                                out_names.push(function_name)
+                                out_recv.push(ufa_qualified_bare(parameters[0].type_expression))
+                        Decl.Module(module_name, module_body, module_line):
+                            ufa_collect(module_body, out_names, out_recv)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            ufa_collect(scoped_body, out_names, out_recv)
+                        _:
+                            pass
+
+        # The by-value bare type of parameter `name` in `parameters`, or "".
+        def ufa_recv_type(parameters: darray[Ast::ParamDecl], name: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                for parameter in parameters:
+                    if parameter.name == name and ufa_is_by_value(parameter.type_expression):
+                        return ufa_qualified_bare(parameter.type_expression)
+                return sview("", 0, 0)
+
+        # The count of by-value free functions named `method` whose receiver bare type is `recv_type`.
+        def ufa_candidate_count(method: sview, recv_type: sview, names: darray[sview]&, recv_types: darray[sview]&) -> usize:
+            can Abort.Panic:
+                count: mutable usize = 0
+                probe: mutable usize = 0
+                while probe < names.count |count, probe, method, recv_type, names, recv_types|:
+                    count <- count + 1 if names[probe] == method and recv_types[probe] == recv_type
+                    probe <- probe + 1
+                return count
+
+        def ufa_walk_expr(expression: Ast::Expr, parameters: darray[Ast::ParamDecl], names: darray[sview]&, recv_types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if callee is Expr.Field(object, method, field_line):
+                            receiver: sview = ident_name_of(object)
+                            if receiver != "" and method != "":
+                                recv_type: sview = ufa_recv_type(parameters, receiver)
+                                if recv_type != "" and ufa_candidate_count(method, recv_type, names, recv_types) >= 2:
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UfcsAmbiguousCall, name: method, line: call_line, expected: recv_type, actual: ""})
+                        for argument in arguments |table| -> table:
+                            table <- ufa_walk_expr(argument, parameters, names, recv_types, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- ufa_walk_expr(left, parameters, names, recv_types, table)
+                        table <- ufa_walk_expr(right, parameters, names, recv_types, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- ufa_walk_expr(inner, parameters, names, recv_types, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- ufa_walk_expr(operand, parameters, names, recv_types, table)
+                    _:
+                        pass
+
+        def ufa_walk_statements(statements: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl], names: darray[sview]&, recv_types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            table <- ufa_walk_expr(returned, parameters, names, recv_types, table) if value is returned
+                        Stmt.Expr(expression, line):
+                            table <- ufa_walk_expr(expression, parameters, names, recv_types, table)
+                        Stmt.VarDecl(var_name, type_expression, value, line):
+                            table <- ufa_walk_expr(value, parameters, names, recv_types, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- ufa_walk_expr(value, parameters, names, recv_types, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- ufa_walk_statements(then_body, parameters, names, recv_types, table)
+                            table <- ufa_walk_statements(else_body, parameters, names, recv_types, table)
+                        Stmt.While(condition, body, line):
+                            table <- ufa_walk_statements(body, parameters, names, recv_types, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- ufa_walk_statements(body, parameters, names, recv_types, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- ufa_walk_statements(body, parameters, names, recv_types, table)
+                        _:
+                            pass
+
+        def ufa_walk_declarations(declarations: darray[Ast::Decl], names: darray[sview]&, recv_types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- ufa_walk_statements(body, parameters, names, recv_types, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- ufa_walk_declarations(module_body, names, recv_types, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- ufa_walk_declarations(scoped_body, names, recv_types, table)
+                        _:
+                            pass
+
+    public:
+        def check_ufcs_ambiguous(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                recv_types: mutable darray[sview] = []
+                ufa_collect(file.top_decls, names, recv_types)
+                table <- ufa_walk_declarations(file.top_decls, names, recv_types, table)
