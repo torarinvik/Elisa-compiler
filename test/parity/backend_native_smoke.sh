@@ -1090,6 +1090,9 @@ run_case darray_extend_empty 'def main() -> i64:\n    xs: mutable darray[i64] = 
 # running index i64 and the element).
 run_case darray_enumerate_value 'def main() -> i64:\n    xs: darray[i64] = [10, 20, 30]\n    s: mutable i64 = 0\n    for i, x in xs.enumerate():\n        s <- s + x\n    return s - 18\n' 42
 run_case darray_enumerate_index 'def main() -> i64:\n    xs: darray[i64] = [5, 5, 5, 5]\n    s: mutable i64 = 0\n    for i, x in xs.enumerate():\n        s <- s + i\n    return s + 36\n' 42
+# `xs.clear()` — logically empty the darray (count -> 0, backing retained).
+run_case darray_clear_count 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2, 3]\n    xs.clear()\n    return xs.count.i64() + 42\n' 42
+run_case darray_clear_then_push 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2, 3]\n    xs.clear()\n    xs.push(42)\n    return xs[0]\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
