@@ -1106,6 +1106,9 @@ run_case darray_resize_shrink 'def main() -> i64:\n    xs: mutable darray[i64] =
 # the same name+args must not alias in the cache. Slot-aware generic overload resolution.
 run_case overload_ufcs_by_receiver 'struct Holder[T]:\n    v: T\nstruct Keeper[T]:\n    v: T\ndef pick[T](x: Holder[T]) -> i64:\n    return 7\ndef pick[T](x: Keeper[T]) -> i64:\n    return 42\ndef main() -> i64:\n    b: Keeper[i64] = Keeper[i64] { v: 1 }\n    return b.pick()\n' 42
 run_case overload_ufcs_both 'struct Holder[T]:\n    v: T\nstruct Keeper[T]:\n    v: T\ndef pick[T](x: Holder[T]) -> i64:\n    return 40\ndef pick[T](x: Keeper[T]) -> i64:\n    return 2\ndef main() -> i64:\n    a: Holder[i64] = Holder[i64] { v: 1 }\n    b: Keeper[i64] = Keeper[i64] { v: 1 }\n    return a.pick() + b.pick()\n' 42
+# A generic function over a DARRAY PARAMETER: `cnt[T](da: darray[T]&)`. T must be inferred
+# from the darray argument's element (unify_annotation recurses into darray[T] like view[T]).
+run_case generic_darray_param 'def cnt[T](da: mutable darray[T]&) -> i64:\n    return da.count.i64()\ndef main() -> i64:\n    xs: mutable darray[i64] = [1, 2, 3]\n    return cnt(&xs) + 39\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
