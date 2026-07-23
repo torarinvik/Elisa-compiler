@@ -1134,6 +1134,11 @@ run_case get_else_present 'def find(x: i64) -> i64?:\n    return x if x > 0 else
 # PRESENT / propagate-None on ABSENT out of THIS optional-returning fn. index_map_get uses it.
 run_case get_bare_present 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\ndef pick(x: i64) -> i64?:\n    v: i64 = get find(x)\n    return v + 2\ndef main() -> i64:\n    return get pick(40) else 7\n' 42
 run_case get_bare_absent 'def find(x: i64) -> i64?:\n    return x if x > 0 else null\ndef pick(x: i64) -> i64?:\n    v: i64 = get find(x)\n    return v + 2\ndef main() -> i64:\n    return get pick(-1) else 42\n' 42
+# A struct FIELD passed to a `mutable T&` param WITHOUT an explicit `&` must be auto-
+# addressed (stage0 does): the callee mutates the ORIGINAL field, not a by-value copy. Without
+# it the struct is passed by value and the mutation is lost (or its bytes read as a pointer →
+# crash). This is what the real-std IndexMap's `arena_dict_put(a, map.by_key, …)` relies on.
+run_case field_arg_autoref 'struct Inner:\n    v: mutable i64\nstruct Outer:\n    inner: mutable Inner\ndef bump(p: mutable Inner&) -> void:\n    p.v <- p.v + 42\ndef main() -> i64:\n    o: mutable Outer = zeroed\n    bump(o.inner)\n    return o.inner.v\n' 42
 run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
