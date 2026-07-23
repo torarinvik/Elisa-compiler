@@ -317,7 +317,121 @@ extend Semantic:
                     _:
                         return decreases_paths_decrease(statements, index + 1, delta, measure_names, measure_coeffs, modeled)
 
-        def decreases_unmodelable_statements(statements: darray[Ast::Stmt], enable_smt: bool, table: lmut SymbolTable) -> void:
+        # Whether a bare type name is a SIGNED integer (can hold a very negative value, so a
+        # subtraction against it may overflow the bitvector — stage0's SMT tier rejects it).
+        def du_is_signed_int_type(type_name: sview) -> bool:
+            can Abort.Panic:
+                return type_name == "i8" or type_name == "i16" or type_name == "i32" or type_name == "i64" or type_name == "i128" or type_name == "int" or type_name == "isize"
+
+        # Names of params + locals whose declared type is a signed integer.
+        def du_collect_signed_names(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for parameter in parameters |out|:
+                    out.push(parameter.name) if du_is_signed_int_type(bare_type_name(parameter.type_expression))
+                du_collect_signed_locals(body, out)
+
+        def du_collect_signed_locals(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            out.push(name) if du_is_signed_int_type(bare_type_name(type_expression))
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            du_collect_signed_locals(then_body, out)
+                            du_collect_signed_locals(else_body, out)
+                        Stmt.While(while_condition, while_body, while_line):
+                            du_collect_signed_locals(while_body, out)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
+                            du_collect_signed_locals(for_body, out)
+                        Stmt.Block(block_kind, block_clause, block_binding, block_body, block_line):
+                            du_collect_signed_locals(block_body, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |out|:
+                                du_collect_signed_locals(arm.body, out)
+                        _:
+                            pass
+
+        # Every identifier appearing anywhere in an expression.
+        def du_all_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Paren(inner, paren_line):
+                        du_all_idents(inner, out)
+                    Expr.Unary(operator, operand, unary_line):
+                        du_all_idents(operand, out)
+                    Expr.Binary(binary_left, operator, binary_right, binary_line):
+                        du_all_idents(binary_left, out)
+                        du_all_idents(binary_right, out)
+                    Expr.Field(object, field, field_line):
+                        du_all_idents(object, out)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |out|:
+                            du_all_idents(argument, out)
+                    _:
+                        pass
+
+        # Identifiers that appear in a SUBTRAHEND position (right of a `-`, or under a unary
+        # minus) — the operands whose large-magnitude negativity can overflow the measure.
+        def du_subtrahend_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Binary(binary_left, operator, binary_right, binary_line):
+                        du_subtrahend_idents(binary_left, out)
+                        du_all_idents(binary_right, out) if operator == TokenKind.Minus
+                        du_subtrahend_idents(binary_right, out) if operator != TokenKind.Minus
+                    Expr.Unary(operator, operand, unary_line):
+                        du_all_idents(operand, out) if operator == TokenKind.Minus
+                        du_subtrahend_idents(operand, out) if operator != TokenKind.Minus
+                    Expr.Paren(inner, paren_line):
+                        du_subtrahend_idents(inner, out)
+                    _:
+                        pass
+
+        # Whether an invariant/requires-style predicate lower-bounds NAME (`name >= c`, `name > c`,
+        # or the mirrored `c <= name` / `c < name`), splitting `and` conjunctions.
+        def du_predicate_lower_bounds(predicate: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return du_predicate_lower_bounds(inner, name)
+                    Expr.Binary(binary_left, operator, binary_right, binary_line):
+                        if operator == TokenKind.And:
+                            return du_predicate_lower_bounds(binary_left, name) or du_predicate_lower_bounds(binary_right, name)
+                        forward: bool = ident_name_of(binary_left) == name and (operator == TokenKind.GtEq or operator == TokenKind.Gt)
+                        mirrored: bool = ident_name_of(binary_right) == name and (operator == TokenKind.LtEq or operator == TokenKind.Lt)
+                        return forward or mirrored
+                    _:
+                        return false
+
+        # Whether some loop `invariant` lower-bounds NAME — the fact that rules out the
+        # subtracted variable's negative-overflow case (stage0 accepts `invariant i >= 0`).
+        def du_invariant_lower_bounds(while_body: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in while_body:
+                    match statement:
+                        Stmt.Contract(kind, expression, contract_line):
+                            true return if kind == "invariant" and du_predicate_lower_bounds(expression, name)
+                        _:
+                            pass
+                return false
+
+        def du_name_present(names: darray[sview]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                return any candidate in names where candidate == wanted
+
+        # Whether the measure subtracts a SIGNED variable whose negativity is not ruled out by
+        # a lower-bounding invariant — a bitvector-overflow the SMT tier rejects (stage0 warns).
+        def du_measure_overflow_risk(measure_expression: Ast::Expr, while_body: darray[Ast::Stmt], signed_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                subtrahends: mutable darray[sview] = []
+                du_subtrahend_idents(measure_expression, subtrahends)
+                for candidate in subtrahends |while_body, signed_names|:
+                    true return if candidate != "" and du_name_present(signed_names, candidate) and not du_invariant_lower_bounds(while_body, candidate)
+                return false
+
+        def decreases_unmodelable_statements(statements: darray[Ast::Stmt], enable_smt: bool, signed_names: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
@@ -357,7 +471,13 @@ extend Semantic:
                             # stand-in, so it may only DISCHARGE the measure when SMT is enabled —
                             # otherwise the loop reports the same "could not be proven" fallback.
                             non_decreasing: bool = judge and measure_linear and modeled and (not all_paths_decrease or not enable_smt)
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DecreasesLoopNotDecreasing, name: "", line: decreases_line, expected: "", actual: ""}) if non_decreasing
+                            # OVERFLOW tier (pinned against stage0's bitvector SMT): even a
+                            # strictly-decreasing measure is REJECTED when it subtracts a signed
+                            # variable whose negativity is not ruled out by a lower-bounding
+                            # invariant — `decreases n - i` (i: i64) may overflow at i=INT_MIN, so
+                            # `invariant i >= 0` is required (usize measures carry it inherently).
+                            overflow_risk: bool = judge and has_measure and du_measure_overflow_risk(measure_expression, while_body, signed_names)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DecreasesLoopNotDecreasing, name: "", line: decreases_line, expected: "", actual: ""}) if non_decreasing or overflow_risk
                             # A LEXICOGRAPHIC measure `(c0, c1, ...)` whose LEADING component provably
                             # strictly INCREASES on every path can never decrease (the first component
                             # dominates the order), so stage0 always reports it — never proves it,
@@ -372,18 +492,18 @@ extend Semantic:
                                         lead_modeled: mutable bool = true
                                         lead_increases: bool = decreases_paths_decrease(while_body, 0, 0, lead_names, lead_coeffs, lead_modeled)
                                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.DecreasesLoopNotDecreasing, name: "", line: decreases_line, expected: "", actual: ""}) if lead_modeled and lead_increases
-                            table <- decreases_unmodelable_statements(while_body, enable_smt, table)
+                            table <- decreases_unmodelable_statements(while_body, enable_smt, signed_names, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- decreases_unmodelable_statements(then_body, enable_smt, table)
-                            table <- decreases_unmodelable_statements(else_body, enable_smt, table)
+                            table <- decreases_unmodelable_statements(then_body, enable_smt, signed_names, table)
+                            table <- decreases_unmodelable_statements(else_body, enable_smt, signed_names, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- decreases_unmodelable_statements(for_body, enable_smt, table)
+                            table <- decreases_unmodelable_statements(for_body, enable_smt, signed_names, table)
                         Stmt.Block(kind, clause, binding, body, block_line):
                             # `can Unsafe.AssumeProgress:` (or `trusted …`) is the explicit
                             # termination escape hatch: the programmer asserts progress, so
                             # stage0 suppresses ALL `decreases` diagnostics in its body.
                             assume_progress: bool = (kind == "can" or kind == "trusted") and (any grant in clause where grant == "Unsafe.AssumeProgress")
-                            table <- decreases_unmodelable_statements(body, enable_smt, table) if not assume_progress
+                            table <- decreases_unmodelable_statements(body, enable_smt, signed_names, table) if not assume_progress
                         _:
                             pass
 
@@ -392,7 +512,9 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            table <- decreases_unmodelable_statements(body, enable_smt, table)
+                            signed_names: mutable darray[sview] = []
+                            du_collect_signed_names(parameters, body, signed_names)
+                            table <- decreases_unmodelable_statements(body, enable_smt, signed_names, table)
                         Decl.Module(module_name, module_body, module_line):
                             table <- check_decreases_unmodelable(module_body, enable_smt, table)
                         Decl.Scoped(scoped_body, scoped_line):
