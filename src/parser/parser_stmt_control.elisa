@@ -68,6 +68,11 @@ extend Parser:
             rebind refined_type: Ast::Expr, parser = parser.parse_refinement_suffix(type_expression)
             type_expression <- refined_type
 
+            # The compact AST stores the payload type for a local error union. Preserve
+            # and consume its `error[Family]` suffix so the declaration remains a single
+            # typed binding and the backend can attach the first-class union later.
+            parser <- parser.record_error_union(name_token.line, "__local_error_union") if parser.peek() == TokenKind.Error
+
             # Optional `@region` binding annotation (`x: T @scratch = …`) pinning the
             # local to a named region. The region name is a region selector, not a value
             # reference, so it is consumed and discarded.
@@ -168,25 +173,14 @@ extend Parser:
                 parser, _ <- parser.expect(TokenKind.RParen) if has_parens
                 quantifier_source: mutable Ast::Expr = (Ast::Expr.Invalid)
                 if parser.peek() == TokenKind.In:
-                    parser, _ <- parser.advance()                   # `in`
-                    rebind range_source_opt: Ast::Expr?, parser = parser.expression()   # range source (prover-only)
+                    parser, _ <- parser.advance()
+                    rebind range_source_opt: Ast::Expr?, parser = parser.expression()
                     range_source: Ast::Expr = get range_source_opt else (Ast::Expr.Invalid)
                     quantifier_source <- range_source
-                    # Reject an ambiguous bare `..` endpoint — a quantifier range must spell
-                    # `..<` (exclusive) or `..=` (inclusive), mirroring forall_exists_expression.
-                    match range_source:
-                        Ast::Expr.Binary(range_left, range_operator, range_right, range_line):
-                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, head_token) if range_operator == TokenKind.Range
-                        _:
-                            pass
                 parser, _ <- parser.expect(TokenKind.Colon)
                 rebind body_option: Ast::Expr?, parser = parser.expression()
                 body: Ast::Expr = get body_option else (Ast::Expr.Invalid)
                 binder_declarations: mutable darray[Ast::Stmt] = []
-                # The binder VarDecls are prover-only placeholders; the FIRST one carries the
-                # quantifier's iterable (`in <src>`) in its value slot so a downstream prover can
-                # tell WHICH collection is quantified (e.g. dict-forall instantiation). The rest
-                # keep the dummy `0`. Semantically inert — the block is a verification predicate.
                 first_binder: mutable bool = true
                 for binder in binders |binder_declarations, first_binder, quantifier_source|:
                     binder_value: Ast::Expr = quantifier_source if first_binder else (Ast::Expr.IntLit(0))
@@ -420,11 +414,13 @@ extend Parser:
             # already captured above, so skip identifiers at position 0.
             clause: mutable darray[sview] = []
             region_capacity_start: mutable usize = 0
+            pool_capacity_start: mutable usize = 0
             while parser.peek() != TokenKind.Eof |parser, depth: int = 0, first: bool = true|:
                 kind: TokenKind = parser.peek()
                 match kind:
                     TokenKind.LParen | TokenKind.LBracket:
                         region_capacity_start <- parser.cursor().start.usize() + 1 if block_kind == "region" and kind == TokenKind.LParen and depth == 0
+                        pool_capacity_start <- parser.cursor().start.usize() + 1 if (block_kind == "pool" or block_kind == "nursery") and kind == TokenKind.LParen and depth == 0
                         depth <- depth + 1
                         parser, _ <- parser.advance()
                     TokenKind.RParen | TokenKind.RBracket:
@@ -432,6 +428,10 @@ extend Parser:
                             capacity_end: usize = parser.cursor().start.usize()
                             clause.push(parser.span_view(region_capacity_start, capacity_end))
                             region_capacity_start <- 0
+                        if (block_kind == "pool" or block_kind == "nursery") and kind == TokenKind.RParen and depth == 1 and pool_capacity_start > 0:
+                            pool_capacity_end: usize = parser.cursor().start.usize()
+                            clause.push(parser.span_view(pool_capacity_start, pool_capacity_end))
+                            pool_capacity_start <- 0
                         depth <- depth - 1
                         parser, _ <- parser.advance()
                     TokenKind.Colon | TokenKind.Newline if depth == 0:
@@ -555,12 +555,7 @@ extend Parser:
             # census UNLESS it is inside a `can ComplexFlow:` grant (the escape hatch) or is a
             # sanctioned guard shape (binds a local, single loop/match, multi-statement, …).
             if if_stmt_option is if_stmt:
-                match if_stmt:
-                    Ast::Stmt.If(condition, then_body, else_body, if_line):
-                        exempt: bool = parser.in_complex_flow or block_if_is_exempt(condition, then_body, else_body)
-                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__block_if", name: "__block_if", line: if_token.line}) if not exempt
-                    _:
-                        pass
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__block_if", name: "__block_if", line: if_token.line}) if not parser.in_complex_flow
             return if_stmt_option
 
 
@@ -572,9 +567,13 @@ extend Parser:
             # (contextual idents, also valid on `elif`). Only consumed when an operand
             # follows, so a bool local literally named `likely` still works bare.
             hint_token: Token = parser.cursor()
+            hint_kind: mutable sview = ""
             if parser.peek() == TokenKind.Ident:
                 hint_text: sview = Lexer::text_or_empty(hint_token, parser.source)
-                parser, _ <- parser.advance() if (hint_text == "likely" or hint_text == "unlikely") and tokenStartsValue(parser.peek_at(1))
+                if (hint_text == "likely" or hint_text == "unlikely") and tokenStartsValue(parser.peek_at(1)):
+                    hint_kind <- hint_text
+                    parser, _ <- parser.advance()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__branch_hint", name: hint_kind, line: token.line}) if hint_kind != ""
             rebind condition: Ast::Expr, parser = get parser.expression()
             rebind then_body: darray[Ast::Stmt], parser = parser.parse_block()
 
@@ -601,8 +600,11 @@ extend Parser:
         def while_statement(parser: lmut Parser) -> Ast::Stmt?:
             rebind while_token: Token, parser = parser.expect(TokenKind.While)
             hint_token: Token = parser.cursor()
+            hint_kind: mutable sview = ""
             has_hint: bool = parser.peek() == TokenKind.Ident and (Lexer::text_or_empty(hint_token, parser.source) == "likely" or Lexer::text_or_empty(hint_token, parser.source) == "unlikely") and tokenStartsValue(parser.peek_at(1))
+            hint_kind <- Lexer::text_or_empty(hint_token, parser.source) if has_hint
             parser, _ <- parser.advance() if has_hint
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__branch_hint", name: hint_kind, line: while_token.line}) if has_hint
             # docs/119 §3: binary parsing stops at a header's opening `|` (loop_header_at),
             # so the ordinary condition parse already yields the pre-header expression.
             rebind condition: Ast::Expr, parser = get parser.expression()
@@ -643,6 +645,7 @@ extend Parser:
                 return (Ast::Stmt.If(condition, body, no_else, return_token.line))
             else:
                 value: mutable Ast::Expr? = null
+                value_start: usize = parser.position
                 parser, value <- parser.expression() if parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof
                 if value is value_present:
                     parser, _ <- parser.consume_removed_as_cast(value_present)
@@ -657,7 +660,8 @@ extend Parser:
                         return_elements.push(return_element) if return_element_option is return_element
                     value <- (Ast::Expr.Tuple(return_elements, return_token.line))
 
-                parser <- parser.validate_declared_thread_return(value, return_token)
+                value_end: usize = parser.position
+                parser <- parser.validate_declared_thread_return_tokens(value_start, value_end, return_token)
 
                 # Trailing guard `return VALUE if COND` (== `if COND: return VALUE`).
                 rebind accepted_if_2: bool, parser = parser.accept(TokenKind.If)
@@ -670,23 +674,36 @@ extend Parser:
                 else:
                     return (Ast::Stmt.Return(value, return_token.line))
 
-        def validate_declared_thread_return(parser: lmut Parser, value: Ast::Expr?, token: Token) -> void:
+        def validate_declared_thread_return_tokens(parser: lmut Parser, start: mutable usize, end: mutable usize, token: Token) -> void:
             return if parser.declared_thread_slots.count == 0
-            if value is threaded_value:
-                match threaded_value:
-                    Ast::Expr.Tuple(elements, line):
-                        if elements.count == parser.declared_thread_slots.count + 1:
-                            valid: mutable bool = true
-                            i: mutable usize = 0
-                            while i < parser.declared_thread_slots.count |i, valid|:
-                                expected: sview = parser.declared_thread_slots[i]
-                                match elements[i + 1]:
-                                    Ast::Expr.Ident(actual, ident_line):
-                                        valid <- false if actual != expected
-                                    _:
-                                        valid <- false
-                                i <- i + 1
-                            return if valid
-                    _:
-                        pass
+            if end > start and parser.tokens[start].kind == TokenKind.LParen and parser.tokens[end - 1].kind == TokenKind.RParen:
+                start <- start + 1
+                end <- end - 1
+            valid: mutable bool = true
+            element_index: mutable usize = 0
+            segment_start: mutable usize = start
+            scan: mutable usize = start
+            depth: mutable int = 0
+            while scan <= end |parser, scan, depth, element_index, segment_start, valid, start, end|:
+                at_end: bool = scan == end
+                kind: TokenKind = parser.tokens[scan].kind if not at_end else TokenKind.Comma
+                if not at_end and (kind == TokenKind.LParen or kind == TokenKind.LBracket):
+                    depth <- depth + 1
+                if not at_end and (kind == TokenKind.RParen or kind == TokenKind.RBracket):
+                    depth <- depth - 1
+                is_separator: bool = at_end or (kind == TokenKind.Comma and depth == 0)
+                if is_separator:
+                    segment_length: usize = scan - segment_start
+                    is_ident: bool = segment_length == 1 and parser.tokens[segment_start].kind == TokenKind.Ident
+                    if element_index == 0:
+                        valid <- false if not is_ident
+                    elif element_index - 1 < parser.declared_thread_slots.count:
+                        valid <- false if not is_ident or Lexer::text_or_empty(parser.tokens[segment_start], parser.source) != parser.declared_thread_slots[element_index - 1]
+                    else:
+                        valid <- false
+                    element_index <- element_index + 1
+                    segment_start <- scan + 1
+                scan <- scan + 1
+            valid <- false if element_index != parser.declared_thread_slots.count + 1
+            return if valid
             parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token)
