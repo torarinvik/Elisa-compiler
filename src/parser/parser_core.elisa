@@ -74,6 +74,11 @@ module Parser:
             allocation_region_names: mutable darray[sview]
             allocation_region_lines: mutable darray[u32]
             enum_annotations: mutable darray[Ast::EnumAnnotation]
+            # Full type expressions for typed function-value parameters. The legacy annotation
+            # rows retain only a head token; these rows preserve generic applications such as
+            # `fn(Slice[T]) -> i64` for backend ABI resolution.
+            fn_type_param_lines: mutable darray[u32]
+            fn_type_param_exprs: mutable darray[Ast::Expr]
             # Expression-recursion depth, bounded by EXPR_DEPTH_LIMIT so a pathological
             # deeply-nested expression (`((((…))))`) emits a diagnostic instead of
             # overflowing the stack. Incremented on entry to `expression`, decremented on exit.
@@ -201,6 +206,8 @@ module Parser:
                 allocation_region_names: [],
                 allocation_region_lines: [],
                 enum_annotations: [],
+                fn_type_param_lines: [],
+                fn_type_param_exprs: [],
                 depth: 0,
                 suppress_pipe: false,
                 suppress_arrow: false,
@@ -302,7 +309,8 @@ module Parser:
 
         def expect(parser: lmut Parser, kind: TokenKind) -> Token:
             current_token: Token = parser.cursor()
-            parser <- parser.error_at(Ast::ParseErrorKind.ExpectedToken, current_token) if current_token.kind != kind
+            if current_token.kind != kind:
+                parser <- parser.error_at(Ast::ParseErrorKind.ExpectedToken, current_token)
             rebind advanced_token: Token, parser = parser.advance()
             return advanced_token
 
@@ -367,7 +375,7 @@ module Parser:
 
             while true |parser|:
                 parser <- parser.skip_newlines()
-                break if parser.peek() in {TokenKind.Dedent, TokenKind.Eof}
+                break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
                 rebind __m_192: Ast::Stmt?, parser = parser.statement()
                 if __m_192 is body_statement:
                     items.push(body_statement)
@@ -395,13 +403,13 @@ module Parser:
         def value_capture_header_ahead(parser: Parser&) -> bool:
             false return if parser.peek() != TokenKind.Pipe or parser.peek_at(1) != TokenKind.Ident
             # Scan `IDENT (, IDENT)*`; the yielded cursor lands on the closing pipe.
-            closing_pipe_index: usize =
-                while parser.peek_at(lookahead_index) == TokenKind.Ident |lookahead_index: usize = 1| -> lookahead_index:
-                    lookahead_index <- lookahead_index + 1
-                    if parser.peek_at(lookahead_index) == TokenKind.Comma:
-                        lookahead_index <- lookahead_index + 1
-                    else:
-                        break
+            closing_pipe_index: mutable usize = 1
+            while parser.peek_at(closing_pipe_index) == TokenKind.Ident |parser, closing_pipe_index|:
+                closing_pipe_index <- closing_pipe_index + 1
+                if parser.peek_at(closing_pipe_index) == TokenKind.Comma:
+                    closing_pipe_index <- closing_pipe_index + 1
+                else:
+                    break
             return parser.peek_at(closing_pipe_index) == TokenKind.Pipe and parser.peek_at(closing_pipe_index + 1) == TokenKind.Newline and parser.peek_at(closing_pipe_index + 2) == TokenKind.Indent
 
         # The two block-expression RHS forms every `=`/`<-` site shares: bare block
@@ -457,14 +465,14 @@ module Parser:
         # `Expr.Match` (same arm shape); a bare expression statement is the value itself.
         def tail_statement_to_value(parser: lmut Parser, statement: Ast::Stmt) -> Ast::Expr:
             match statement:
-                Stmt.Expr(expression, line):
+                Ast::Stmt.Expr(expression, line):
                     return expression
-                Stmt.If(condition, then_body, else_body, line):
+                Ast::Stmt.If(condition, then_body, else_body, line):
                     parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor()) if else_body.count == 0
                     rebind then_value: Ast::Expr, parser = parser.branch_to_value(then_body)
                     rebind else_value: Ast::Expr, parser = parser.branch_to_value(else_body)
                     return (Ast::Expr.If(condition, then_value, else_value, line))
-                Stmt.Match(scrutinee, arms, line):
+                Ast::Stmt.Match(scrutinee, arms, line):
                     return (Ast::Expr.Match(scrutinee, arms, line))
                 _:
                     return (Ast::Expr.Invalid)
@@ -501,11 +509,14 @@ module Parser:
             # Scan forward for the closing depth-0 pipe; the token after it decides. Only a
             # top-level pipe or newline (or EOF) ends the scan — a depth-0 `:` does NOT, so
             # a typed accumulator `|n: T = 0|` keeps scanning to its closing pipe.
-            while true |depth=0,lookahead_index=1|:
+            depth: mutable int = 0
+            lookahead_index: mutable usize = 1
+            while true |parser, depth, lookahead_index|:
                 kind: TokenKind = parser.peek_at(lookahead_index)
                 false return if kind == TokenKind.Eof
-                depth <- depth + 1 if kind in {TokenKind.LParen, TokenKind.LBracket, TokenKind.LBrace}
-                is_closer: bool = kind in {TokenKind.RParen, TokenKind.RBracket, TokenKind.RBrace}
+                is_opener: bool = kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace
+                is_closer: bool = kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace
+                depth <- depth + 1 if is_opener
                 false return if is_closer and depth == 0   # left the enclosing expression: not a header
                 depth <- depth - 1 if is_closer
                 at_closing_pipe: bool = depth == 0 and kind == TokenKind.Pipe
@@ -639,26 +650,26 @@ module Parser:
         # clause terminates at a depth-0 block colon before any line break, i.e. it opens
         # a `can …:` statement block rather than a trailing inline grant.
         def block_opener_ahead(parser: Parser&) -> bool:
-            is_block_opener: bool =
-                while scan < parser.tokens.count |scan = parser.position + 1.usize(), depth = 0, opener = false| -> opener:
-                    kind: TokenKind = parser.tokens[scan].kind
-                    # docs/125 declared exception: a hot per-token bracket-depth scan with a
-                    # `break` on the terminating colon/newline — every value-form rewrite
-                    # attempted (when/match folding the break into arms) was materially
-                    # harder to follow for no behavior change, so the block-if flow is kept
-                    # (mirrors the identical exception in parser_stmt_control.elisa).
-                    can ComplexFlow:
-                        if kind in {TokenKind.LParen, TokenKind.LBracket, TokenKind.LBrace}:
-                            depth <- depth + 1
-                        elif kind in {TokenKind.RParen, TokenKind.RBracket, TokenKind.RBrace}:
-                            break if depth == 0
-                            depth <- depth - 1
-                        elif depth == 0 and kind == TokenKind.Colon:
-                            opener <- true
-                            break
-                        elif depth == 0 and kind in {TokenKind.Newline, TokenKind.Dedent, TokenKind.Eof}:
-                            break
-                    scan <- scan + 1.usize()
+            scan: mutable usize = parser.position + 1.usize()
+            depth: mutable int = 0
+            is_block_opener: mutable bool = false
+            done: mutable bool = false
+            while scan < parser.tokens.count |parser, scan, depth, is_block_opener, done|:
+                break if done
+                kind: TokenKind = parser.tokens[scan].kind
+                is_opener: bool = kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace
+                is_closer: bool = kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace
+                if is_opener:
+                    depth <- depth + 1
+                elif is_closer:
+                    done <- true if depth == 0
+                    depth <- depth - 1 if depth > 0
+                elif depth == 0 and kind == TokenKind.Colon:
+                    is_block_opener <- true
+                    done <- true
+                elif depth == 0 and (kind == TokenKind.Newline or kind == TokenKind.Dedent or kind == TokenKind.Eof):
+                    done <- true
+                scan <- scan + 1.usize()
             return is_block_opener
 
         # Bracketed form `can[E1, E2]`: the effect set is delimited by `[...]`, so consume
@@ -694,8 +705,15 @@ module Parser:
         # Select bracket-vs-bare effect-list scanning without a ternary over two
         # lmut-Parser-threading calls (that form mis-lowers — docs/125 migration note).
         def consume_effect_list(parser: lmut Parser, is_bracket_form: bool) -> void:
-            parser <- parser.consume_bracket_effect_list() if is_bracket_form
-            parser <- parser.consume_bare_effect_list() if not is_bracket_form
+            if is_bracket_form:
+                parser <- parser.consume_bracket_effect_list()
+            else:
+                while parser.peek() != TokenKind.Eof |parser|:
+                    kind: TokenKind = parser.peek()
+                    break if kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace or kind == TokenKind.Newline or kind == TokenKind.Dedent or kind == TokenKind.Colon
+                    parser <- parser.push_dotted_effect_if_ident()
+                    rebind accepted_comma: bool, parser = parser.accept(TokenKind.Comma)
+                    break if not accepted_comma
 
         def skip_trailing_can(parser: lmut Parser, guard_block_opener: bool) -> void:
             # Clear in place (no fresh alloc — that would escape the parser's region).
