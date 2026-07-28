@@ -234,7 +234,10 @@ dwarf_case compile_unit 'DW_TAG_compile_unit'
 dwarf_case producer 'DW_AT_producer.*elisacore'
 dwarf_case language_is_c99 'DW_AT_language.*DW_LANG_C99'
 dwarf_case subprogram 'DW_TAG_subprogram'
-dwarf_case names_the_function 'DW_AT_name.*"add"'
+# `add` is internal (ce054cd) and tiny, so the optimizer inlines it away and its DIE goes
+# with it — stage0's own -O2 object for this program likewise keeps only `_main`. Assert on
+# the function that survives; the point of the case is that a subprogram DIE carries a name.
+dwarf_case names_the_function 'DW_AT_name.*"main"'
 # The subprogram's TYPE. Without a subroutine type carrying real parameter/return types a
 # debugger shows a signature-less symbol, and the object contains no DW_TAG_base_type at
 # all -- which is exactly what stage1 emitted before (stage0's object has them).
