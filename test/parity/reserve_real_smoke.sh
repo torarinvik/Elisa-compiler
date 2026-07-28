@@ -67,7 +67,7 @@ PY
         echo "  FAIL $name: stage1 declined the reserve program"; return; fi
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
         echo "  FAIL $name: llc rejected the emitted IR"; return; fi
-    if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
+    if ! clang -Wl,-dead_strip -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
         echo "  FAIL $name: link failed (an instantiation body declined?)"; return; fi
     RUN "$exe"; local got=$?
     if [ "$got" -eq 124 ]; then echo "  FAIL $name: TIMED OUT"; return; fi
