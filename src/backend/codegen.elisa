@@ -1499,6 +1499,16 @@ module Backend:
                 return true
             return false
 
+        # Hidden arena ABI count. Parser AST routines are compiled by stage0 with two
+        # independently threaded arena positions around the packed store (`arena, store,
+        # arena`). The stage1 backend keeps both positions even though the runtime currently
+        # uses the same caller arena for each. Backend routines carry store context only;
+        # their AST handles are store-backed and do not imply a region parameter.
+        def frontend_arena_count(owner: sview, name: sview, signature_wants_arena: bool, wants_store: bool) -> usize can[Abort.Panic]:
+            if owner == "Parser" or (sview_len(name) > 7 and sview_matches_prefix(name, "Parser.", 0, 7)):
+                return 2 if wants_store else 1
+            return 1 if signature_wants_arena else 0
+
 
         # The darray ValueType behind `name`, whether it is a local darray or a
         # `darray[T]&` parameter — Unmodeled when it is neither.
@@ -2263,6 +2273,10 @@ module Backend:
             # True when the function has an implicit trailing arena parameter (it takes a
             # growable container by reference). The CALL SITE must then pass its own arena.
             needs_arena: mutable darray[bool]
+            # Number of hidden arena parameters. Parser functions carrying AST store context
+            # use the stage0 ABI `arena, store, arena`; ordinary arena-threaded functions use
+            # one trailing arena. Keeping the count avoids collapsing two distinct lifetimes.
+            arena_counts: mutable darray[usize]
             # True when the function carries the compiler's implicit AST packed-store
             # context. Stage0 injects this trailing ABI parameter for Parser/Backend
             # functions that expose the recursive AST hierarchy; it is distinct from the
@@ -4553,12 +4567,13 @@ module Backend:
             # LLVMCountParams counts the implicit trailing ARENA too, so the arity check
             # must expect it — otherwise every call to an arena-threading function
             # declines on a spurious mismatch.
-            wants_arena: bool = fns.needs_arena[fn_index.usize()]
+            arena_count: usize = fns.arena_counts[fn_index.usize()]
+            wants_arena: bool = arena_count > 0
             wants_store: bool = fns.needs_store[fn_index.usize()]
             variadic_call: bool = fns.is_variadic[fn_index.usize()]
             fixed_arguments: usize = fns.param_count[fn_index.usize()]
             null return if variadic_call and total_arguments < fixed_arguments
-            expected_params: usize = fixed_arguments + (1 if wants_arena else 0) + (1 if wants_store else 0) if variadic_call else total_arguments + (1 if wants_arena else 0) + (1 if wants_store else 0)
+            expected_params: usize = fixed_arguments + arena_count + (1 if wants_store else 0) if variadic_call else total_arguments + arena_count + (1 if wants_store else 0)
             null return if LLVMCountParams(target).i64() != expected_params.i64()
 
             argument_values: mutable darray[LLVMValueRef] = []
@@ -4623,6 +4638,7 @@ module Backend:
             # the call.
             argument_values.push(runtime.arena) if wants_arena
             argument_values.push(runtime.active_store) if wants_store
+            argument_values.push(runtime.arena) if arena_count > 1
             LLVMBuildCall2(builder, fn_type, target, null, 0, result_name) return if argument_values.count == 0
             args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
             return LLVMBuildCall2(builder, fn_type, target, args_pointer, argument_values.count.u32(), result_name)
@@ -12806,14 +12822,15 @@ module Backend:
             return qualified_name_cstr(owner, function_name, name_storage)
 
 
-        def declared_parameter_llvm_types(declared_param_types: darray[ValueType], wants_arena: bool, wants_store: bool, structs: mutable StructTable&, ctx: LLVMContextRef) -> darray[LLVMTypeRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declared_parameter_llvm_types(declared_param_types: darray[ValueType], arena_count: usize, wants_store: bool, structs: mutable StructTable&, ctx: LLVMContextRef) -> darray[LLVMTypeRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             llvm_param_types: mutable darray[LLVMTypeRef] = []
             for declared_param_type in declared_param_types |llvm_param_types, structs, ctx|:
                 llvm_param_types.push(llvm_type_of(declared_param_type, structs, ctx))
-            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if wants_arena
+            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if arena_count > 0
             if wants_store:
                 ast_store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: 0}
                 llvm_param_types.push(llvm_type_of(ast_store_type, structs, ctx))
+            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if arena_count > 1
             return llvm_param_types
 
 
@@ -12829,8 +12846,9 @@ module Backend:
             # Parser/Lexer functions construct opaque AST handles whose nested side
             # tables are not visible in the source signature. Keep their allocations
             # in the caller's region just like an explicit darray return.
-            wants_arena: bool = signature_needs_arena(params, return_value_type, structs) or wants_store or frontend_function_threads_arena(owner, function_name)
-            llvm_param_types: mutable darray[LLVMTypeRef] = declared_parameter_llvm_types(declared_param_types, wants_arena, wants_store, structs, ctx)
+            signature_wants_arena: bool = signature_needs_arena(params, return_value_type, structs)
+            arena_count: usize = frontend_arena_count(owner, function_name, signature_wants_arena, wants_store)
+            llvm_param_types: mutable darray[LLVMTypeRef] = declared_parameter_llvm_types(declared_param_types, arena_count, wants_store, structs, ctx)
             is_error_fn: bool = line_is_error_returning(error_lines, line)
             if is_error_fn:
                 error_out_param: mutable darray[LLVMTypeRef] = []
@@ -12852,13 +12870,15 @@ module Backend:
             for oi in 0..<fns.names.count |oi, fns, owner, function_name, overload_count|:
                 overload_count <- overload_count + 1 if fns.names[oi] == function_name and fns.owners[oi] == owner
             wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store
-            wants_arena: bool = signature_needs_arena(params, return_value_type, structs) or wants_store or frontend_function_threads_arena(owner, function_name)
+            signature_wants_arena: bool = signature_needs_arena(params, return_value_type, structs)
+            arena_count: usize = frontend_arena_count(owner, function_name, signature_wants_arena, wants_store)
             is_error_fn: bool = line_is_error_returning(error_lines, line)
             handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, declared_param_types, decorators, line, owner, overload_count, force_ast_store, error_lines, annotation_args, structs, m, ctx)
             fns.names <- fns.names.push(function_name)
             fns.lines <- fns.lines.push(line)
             fns.owners <- fns.owners.push(owner)
-            fns.needs_arena <- fns.needs_arena.push(wants_arena)
+            fns.needs_arena <- fns.needs_arena.push(arena_count > 0)
+            fns.arena_counts <- fns.arena_counts.push(arena_count)
             fns.needs_store <- fns.needs_store.push(wants_store)
             fns.is_error <- fns.is_error.push(is_error_fn)
             fns.is_variadic <- fns.is_variadic.push(false)
@@ -13089,6 +13109,7 @@ module Backend:
                 fns.lines <- fns.lines.push(extern_line)
                 fns.owners <- fns.owners.push("")
                 fns.needs_arena <- fns.needs_arena.push(false)
+                fns.arena_counts <- fns.arena_counts.push(0)
                 fns.needs_store <- fns.needs_store.push(false)
                 fns.is_error <- fns.is_error.push(false)
                 fns.is_variadic <- fns.is_variadic.push(variadic)
@@ -13151,7 +13172,9 @@ module Backend:
                     local_runtime.error_out <- LLVMGetParam(fn, 0)
                     local_runtime.in_error_fn <- true
                 ast_store_needed: bool = function_needs_store_for_declaration(declaration, fns)
-                threads_arena: bool = signature_needs_arena(params, return_value_type, structs) or ast_store_needed or frontend_function_threads_arena(owner, function_name)
+                signature_wants_arena: bool = signature_needs_arena(params, return_value_type, structs)
+                arena_count: usize = frontend_arena_count(owner, function_name, signature_wants_arena, ast_store_needed)
+                threads_arena: bool = arena_count > 0
                 if threads_arena:
                     local_runtime.arena <- LLVMGetParam(fn, params.count.u32() + error_param_offset)
                     local_runtime.owns_arena <- false
@@ -13896,7 +13919,7 @@ module Backend:
             # Templates must be known before any body is emitted: a call decides between
             # "ordinary function" and "instantiate a generic" by looking here.
             register_generics(file, top, generics)
-            fns: mutable FnTable = FnTable{names: [], lines: [], owners: [], needs_arena: [], needs_store: [], is_error: [], is_variadic: [], handles: [], returns: [], param_types: [], param_names: [], param_start: [], param_count: []}
+            fns: mutable FnTable = FnTable{names: [], lines: [], owners: [], needs_arena: [], arena_counts: [], needs_store: [], is_error: [], is_variadic: [], handles: [], returns: [], param_types: [], param_names: [], param_start: [], param_count: []}
             declined: mutable bool = false
 
             # THREE passes. Structs first: a function signature can name a struct, and a
