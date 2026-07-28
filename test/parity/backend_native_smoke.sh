@@ -451,7 +451,7 @@ ir_case() {
 # The literal's storage must be a private unnamed_addr [N x i8] with a NUL terminator, and
 # it must reach a cstr parameter as a bare `ptr` -- exactly stage0's shape.
 ir_case cstr_global_shape 'def main() -> i64:\n    s: cstr = "hi"\n    return 42\n' '^@str = private unnamed_addr constant \[3 x i8\] c"hi\\00"'
-ir_case cstr_param_is_ptr 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n' 'define i64 @take\(ptr'
+ir_case cstr_param_is_ptr 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n' 'define (internal )?i64 @take\(ptr'
 ir_case export_scalar_wrapper 'def internal(x: i64) -> i64:\n    return x + 1\n\nexport fn add(x: i64) -> i64 = internal\n\ndef main() -> i64:\n    return 42\n' 'define i64 @add\(i64'
 ir_case export_global_alias 'global seed: i64 = 7\n\nexport global seed as ctx_seed\n\ndef main() -> i64:\n    return seed\n' '^@ctx_seed = alias i64, ptr @seed'
 ir_case aggregate_global_refs 'struct Pair:\n    left: i32\n    right: i32\n\nstruct Holder:\n    pair: Pair\n\nglobal base: Pair = Pair{left: 1, right: 2}\nglobal table: Pair[2] = [base, Pair{left: 3, right: 4}]\nglobal picked: Pair = table[1]\nglobal wrapped: Holder = Holder{pair: table[0]}\nglobal first_left: i32 = table[0].left\n\ndef main() -> i64:\n    return picked.left.i64() + wrapped.pair.right.i64() + first_left.i64()\n' '^@picked = global %Pair { i32 3, i32 4 }'
@@ -560,7 +560,7 @@ stage1_ir_case function_attr_hot '@hot\ndef helper(value: i64) -> i64:\n    retu
 stage1_ir_case function_attr_cold '@cold\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'cold'
 stage1_ir_case function_attr_norecurse '@norecurse\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'norecurse'
 stage1_ir_case function_fast_math '@fast_math\ndef helper(value: f64) -> f64:\n    return value * value + value\n\ndef main() -> i64:\n    return 42\n' 'fmul fast'
-stage1_ir_case function_callconv_winapi '@callconv(winapi)\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return 42\n' 'define x86_stdcallcc i64 @helper'
+stage1_ir_case function_callconv_winapi '@callconv(winapi)\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return 42\n' 'define (internal )?x86_stdcallcc i64 @helper'
 stage1_ir_case function_segment_marker '@segment_agnostic\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return 42\n' 'elisacore.segment_agnostic'
 stage1_ir_case function_nounwind 'def helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'attributes #[0-9]+ = \{ nounwind'
 stage1_ir_case branch_weights_likely 'def helper(value: bool) -> i64:\n    if likely value:\n        return 1\n    return 0\n\ndef main() -> i64:\n    return helper(true)\n' 'branch_weights.*2000.*1'
@@ -571,7 +571,7 @@ stage1_ir_case darray_checked_reserve_bound 'def main() -> i64:\n    xs: mutable
 stage1_ir_case defer_function '@link_name(sink)\nextern sink(value: i64) -> void\n\ndef keep() -> i64:\n    value: i64 = 10\n    defer function:\n        sink(value)\n    return value\n\ndef main() -> i64:\n    return keep()\n' 'call void @sink\(i64.*\)'
 stage1_ir_case defer_block_pool 'struct ThreadPool:\n    handle: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef observe(pool: ThreadPool&) -> void:\n    return\n\ndef keep() -> void:\n    pool workers(1):\n        defer block:\n            observe(&workers)\n\ndef main() -> i64:\n    keep()\n    return 42\n' 'call void @observe'
 stage1_ir_case struct_align '@align(64)\nstruct Counter:\n    value: i64\n\nglobal counter: Counter = zeroed\n\ndef fold() -> i64:\n    local: Counter = zeroed\n    return local.value\n\ndef main() -> i64:\n    return fold()\n' '@counter = global %Counter zeroinitializer, align 64'
-stage1_ir_env_case noalias_mutable_scalar ELISACORE_NOALIAS_MUTABLE_REFS 1 'def bump(x: mutable i32&) -> void:\n    x <- x + 1\n\ndef main() -> i64:\n    return 0\n' 'define void @bump\(ptr noalias'
+stage1_ir_env_case noalias_mutable_scalar ELISACORE_NOALIAS_MUTABLE_REFS 1 'def bump(x: mutable i32&) -> void:\n    x <- x + 1\n\ndef main() -> i64:\n    return 0\n' 'define (internal )?void @bump\(ptr noalias'
 stage1_ir_absent_case noalias_default_off 'def bump(x: mutable i32&) -> void:\n    x <- x + 1\n\ndef main() -> i64:\n    return 0\n' 'define void @bump\(ptr noalias'
 stage1_ir_env_case deref_guard_forced ELISACORE_FORCE_BOUNDS_CHECK 1 'struct P:\n    x: mutable i32\n\ndef read(p: P&) -> i32:\n    return p.x\n\ndef main() -> i64:\n    return 0\n' 'pg\.valid'
 stage1_ir_absent_case deref_guard_default_off 'struct P:\n    x: mutable i32\n\ndef read(p: P&) -> i32:\n    return p.x\n\ndef main() -> i64:\n    return 0\n' 'pg\.valid'

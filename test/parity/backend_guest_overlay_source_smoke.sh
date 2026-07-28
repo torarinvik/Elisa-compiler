@@ -34,7 +34,9 @@ if ! rg -q ", 40" "$IR"; then
     echo "backend_guest_overlay_source_smoke FAILED: missing +40 field offset"
     exit 1
 fi
-if ! rg -q "define i64 @read_ext2\\(i64" "$IR"; then
+# Module functions carry `internal` linkage since ce054cd (it is what stops the
+# duplicate-symbol collisions against the runtime object), so allow it here.
+if ! rg -q "define (internal )?i64 @read_ext2\\(i64" "$IR"; then
     echo "backend_guest_overlay_source_smoke FAILED: carrier params not i64"
     exit 1
 fi
