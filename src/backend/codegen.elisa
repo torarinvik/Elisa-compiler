@@ -8655,6 +8655,165 @@ module Backend:
 
 
         # Emit a statement list. Declined if ANY statement declined; Terminated if the
+        # Emit one arm's body of a `x = match …` and STORE its yielded value into `result_slot`,
+        # then branch to `done_block`. Unlike a match-EXPRESSION arm (a single expression), a
+        # statement-position arm may be a BLOCK: leading statements (a `rebind`, a call) followed
+        # by a final yield expression. The leading statements are emitted in full statement
+        # context; the final `Stmt.Expr` becomes the stored value. A prefix that itself terminates
+        # (a `return` in the arm) yields no value and just closes the arm. Returns false to DECLINE.
+        def emit_arm_body_into_slot(body: darray[Stmt]&, result_type: ValueType, result_slot: LLVMValueRef, done_block: LLVMBasicBlockRef, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if body.count == 0
+            prefix_open: mutable bool = true
+            for prefix_index in 0..<body.count - 1 |prefix_open, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                continue if not prefix_open
+                pre_status: EmitStatus = emit_statement(body[prefix_index], return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                false return if pre_status == EmitStatus.Declined
+                prefix_open <- false if pre_status != EmitStatus.Open
+            # A prefix that already returned/broke leaves no open block to yield into.
+            true return if not prefix_open
+            final_stmt: Stmt = body[body.count - 1]
+            if final_stmt is Stmt.Expr(final_expr, final_line):
+                if emit_expression(final_expr, result_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is final_value:
+                    _ = LLVMBuildStore(builder, final_value, result_slot)
+                    _ = LLVMBuildBr(builder, done_block)
+                    return true
+                return false
+            # A non-expression final statement (`return X`, `raise`) must itself terminate.
+            fin_status: EmitStatus = emit_statement(final_stmt, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+            false return if fin_status == EmitStatus.Declined
+            return true
+
+        # `x: T = match SCRUT:` — a match in VALUE position whose arms may be BLOCKS (statements
+        # then a yield). emit_expression's Expr.Match handles only single-expression arms and
+        # lacks the statement context (loops/regions/return_type) a block arm needs; this runs
+        # at statement level and routes each arm through emit_arm_body_into_slot. Allocates and
+        # declares `var_name`. Mirrors the match-expr's scrutinee dispatch (int/cstr/sview/packed/
+        # penum) and its variant-payload binding. Returns Declined for unmodeled shapes.
+        def emit_match_into_slot(match_scrutinee: Expr, match_arms: darray[MatchArm]&, result_type: ValueType, var_name: sview, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            scrutinee_type: ValueType = resolve_type(match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
+            penum_scrutinee: bool = scrutinee_type.kind == TypeKind.PayloadEnum
+            packed_scrutinee: bool = scrutinee_type.kind == TypeKind.PackedEnum
+            cstr_scrutinee: bool = scrutinee_type.kind == TypeKind.CStr
+            sview_scrutinee: bool = scrutinee_type.kind == TypeKind.SView
+            EmitStatus.Declined return if result_type.kind == TypeKind.Unmodeled
+            EmitStatus.Declined return if packed_scrutinee and runtime.active_store_enum != packed_root_index_of(structs, scrutinee_type.bits.i64())
+            EmitStatus.Declined return if not is_integer_type(scrutinee_type) and not penum_scrutinee and not packed_scrutinee and not cstr_scrutinee and not sview_scrutinee
+            if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scrutinee_raw:
+                mis_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                mis_scrutinee: mutable LLVMValueRef = scrutinee_raw
+                mis_compare_type: mutable LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
+                if packed_scrutinee:
+                    mis_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "mis.state")
+                    mis_index: LLVMValueRef = LLVMBuildZExt(builder, scrutinee_raw, LLVMInt64TypeInContext(ctx), "mis.index")
+                    mis_tag_args: mutable darray[LLVMValueRef] = [mis_state, mis_index]
+                    mis_tag_pointer: void& = (&mis_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                    mis_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, mis_tag_pointer, 2, "mis.record")
+                    mis_row_type: LLVMTypeRef = packed_row_llvm_type(structs, scrutinee_type.bits.i64(), ctx)
+                    mis_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, 0, "mis.tag.ptr")
+                    mis_scrutinee <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), mis_tag_ptr, "mis.tag")
+                    mis_compare_type <- LLVMInt32TypeInContext(ctx)
+                if penum_scrutinee:
+                    mis_scrutinee <- LLVMBuildExtractValue(builder, scrutinee_raw, 0, "mis.penum.tag")
+                    mis_compare_type <- LLVMInt32TypeInContext(ctx)
+                mis_slot_storage: mutable darray[u8] = []
+                mis_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(result_type, structs, ctx), sview_to_cstr(var_name, mis_slot_storage))
+                mis_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.done")
+                mis_declined: mutable bool = false
+                mis_saw_default: mutable bool = false
+                for arm in match_arms |mis_declined, mis_saw_default, cstr_scrutinee, sview_scrutinee, packed_scrutinee, penum_scrutinee, mis_scrutinee, scrutinee_raw, scrutinee_type, mis_compare_type, result_type, mis_result_slot, mis_done, mis_function, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                    continue if mis_declined or mis_saw_default
+                    mis_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.arm")
+                    # Catch-all (`_` / binder): unconditional, closes the chain.
+                    if is_catch_all_pattern(arm.pattern):
+                        _ = LLVMBuildBr(builder, mis_arm_block)
+                        LLVMPositionBuilderAtEnd(builder, mis_arm_block)
+                        if arm.pattern is Pattern.Binding(mis_bind_name):
+                            mis_bind_storage: mutable darray[u8] = []
+                            mis_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(scrutinee_type, structs, ctx), sview_to_cstr(mis_bind_name, mis_bind_storage))
+                            _ = LLVMBuildStore(builder, scrutinee_raw, mis_bind_slot)
+                            declare_local(local_scope, mis_bind_name, mis_bind_slot, scrutinee_type)
+                        if emit_arm_body_into_slot(arm.body, result_type, mis_result_slot, mis_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder):
+                            mis_saw_default <- true
+                        else:
+                            mis_declined <- true
+                        continue
+                    # Compute the arm's hit test into `mis_hit` and (for variants) bind payload.
+                    mis_next: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.next")
+                    mis_hit: mutable LLVMValueRef = zeroed
+                    mis_have_hit: mutable bool = false
+                    if arm.pattern is Pattern.Literal(mis_lit_text):
+                        if cstr_scrutinee:
+                            mis_cstr_storage: mutable darray[u8] = []
+                            if string_pattern_content_cstr(mis_lit_text, mis_cstr_storage) is mis_cstr:
+                                mis_cstr_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, mis_cstr, "mis.strpat")
+                                mis_streq_args: mutable darray[LLVMValueRef] = [mis_scrutinee, mis_cstr_global]
+                                mis_streq_pointer: void& = (&mis_streq_args[0]).cast[void&] can Unsafe.PointerCast
+                                mis_streq_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.streq_type, runtime.streq, mis_streq_pointer, 2, "mis.streq")
+                                mis_hit <- LLVMBuildICmp(builder, 33, mis_streq_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "mis.streq.hit")
+                                mis_have_hit <- true
+                            else:
+                                mis_declined <- true
+                        elif sview_scrutinee:
+                            mis_sv_storage: mutable darray[u8] = []
+                            if string_pattern_content_cstr(mis_lit_text, mis_sv_storage) is mis_sv_cstr:
+                                mis_sv_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, mis_sv_cstr, "mis.svpat")
+                                mis_sv_lit_type: LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
+                                mis_sv_undef: LLVMValueRef = LLVMGetUndef(mis_sv_lit_type)
+                                mis_sv_with_ptr: LLVMValueRef = LLVMBuildInsertValue(builder, mis_sv_undef, mis_sv_global, 0, "mis.svpat.ptr")
+                                mis_sv_len: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), (mis_sv_storage.count - 1).u64(), 0)
+                                mis_sv_lit: LLVMValueRef = LLVMBuildInsertValue(builder, mis_sv_with_ptr, mis_sv_len, 1, "mis.svpat.len")
+                                mis_sv_args: mutable darray[LLVMValueRef] = [scrutinee_raw, mis_sv_lit]
+                                mis_sv_pointer: void& = (&mis_sv_args[0]).cast[void&] can Unsafe.PointerCast
+                                mis_sv_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, mis_sv_pointer, 2, "mis.sview.eq")
+                                mis_hit <- LLVMBuildICmp(builder, 33, mis_sv_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "mis.sview.hit")
+                                mis_have_hit <- true
+                            else:
+                                mis_declined <- true
+                        else:
+                            mis_lit_value: mutable i64 = 0
+                            if parse_pattern_scalar(mis_lit_text, mis_lit_value):
+                                mis_hit <- LLVMBuildICmp(builder, 32, mis_scrutinee, LLVMConstInt(llvm_type_of(scrutinee_type, structs, ctx), mis_lit_value.u64(), 1), "mis.int.hit")
+                                mis_have_hit <- true
+                            else:
+                                mis_declined <- true
+                    elif arm.pattern is Pattern.Variant(mis_variant_path, mis_variant_fields):
+                        mis_ordinal: mutable i64 = -1
+                        if packed_scrutinee:
+                            mis_ordinal <- packed_variant_index_of_path(mis_variant_path, structs)
+                        if penum_scrutinee:
+                            mis_ordinal <- penum_variant_index_of_path(mis_variant_path, structs)
+                        if mis_ordinal >= 0:
+                            mis_hit <- LLVMBuildICmp(builder, 32, mis_scrutinee, LLVMConstInt(mis_compare_type, mis_ordinal.u64(), 0), "mis.variant.hit")
+                            mis_have_hit <- true
+                        else:
+                            mis_declined <- true
+                    else:
+                        mis_declined <- true
+                    if mis_declined:
+                        LLVMPositionBuilderAtEnd(builder, mis_next)
+                        continue
+                    if mis_have_hit:
+                        _ = LLVMBuildCondBr(builder, mis_hit, mis_arm_block, mis_next)
+                        LLVMPositionBuilderAtEnd(builder, mis_arm_block)
+                        if arm_has_guard(arm.guard):
+                            if emit_condition(arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is mis_guard_bit:
+                                mis_guard_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.guard")
+                                _ = LLVMBuildCondBr(builder, mis_guard_bit, mis_guard_body, mis_next)
+                                LLVMPositionBuilderAtEnd(builder, mis_guard_body)
+                            else:
+                                mis_declined <- true
+                        if not mis_declined:
+                            if not emit_arm_body_into_slot(arm.body, result_type, mis_result_slot, mis_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder):
+                                mis_declined <- true
+                        LLVMPositionBuilderAtEnd(builder, mis_next)
+                EmitStatus.Declined return if mis_declined
+                if not mis_saw_default:
+                    _ = LLVMBuildUnreachable(builder)
+                LLVMPositionBuilderAtEnd(builder, mis_done)
+                declare_local(local_scope, var_name, mis_result_slot, result_type)
+                return EmitStatus.Open
+            return EmitStatus.Declined
+
         # list ended the block.
         #
         # A statement AFTER a terminator is unreachable; the subset does not model dead
@@ -9274,6 +9433,11 @@ module Backend:
                 if declared_type.kind == TypeKind.Unmodeled:
                     declared_type <- expression_type(var_value, local_scope, fns, structs, generics)
                 EmitStatus.Declined return if declared_type.kind == TypeKind.Unmodeled
+                # `x: T = match SCRUT:` whose arms are BLOCKS (statements then a yield) — the
+                # match-EXPRESSION emitter handles only single-expression arms and has no statement
+                # context, so route it through the statement-level match-into-slot emitter.
+                if var_value is Expr.Match(vm_scrutinee, vm_arms, vm_match_line):
+                    return emit_match_into_slot(vm_scrutinee, vm_arms, declared_type, var_name, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                 # A declaration without an initializer still needs a real storage
                 # object.  In particular, fixed-size stack arrays are used as
                 # scratch buffers by the runtime string helpers.  Expr.Invalid is
