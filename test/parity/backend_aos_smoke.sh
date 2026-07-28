@@ -16,10 +16,12 @@ clang -o "$BUILD/driver" "$BUILD/driver.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDI
 "$BUILD/driver" < "$ROOT/test/breadth/packed_aos_fixture.elisa" > "$BUILD/aos.ll"
 grep -q 'declare ptr @ctx_aos_store_new(ptr, i64)' "$BUILD/aos.ll"
 grep -q 'declare.*@ctx_aos_store_alloc(ptr, ptr)' "$BUILD/aos.ll"
-grep -q 'declare ptr @ctx_aos_store_record(ptr, i32)' "$BUILD/aos.ll"
+# The runtime declares `ctx_aos_store_record(state, index: usize)`, so the index is
+# i64 (commit 33320f9 moved AoS record indices to 64-bit); this assertion said i32.
+grep -q 'declare ptr @ctx_aos_store_record(ptr, i64)' "$BUILD/aos.ll"
 
 /opt/homebrew/opt/llvm/bin/llc -filetype=obj -o "$BUILD/aos.o" "$BUILD/aos.ll"
-clang -o "$BUILD/aos" "$BUILD/aos.o" "$ROOT/build/runtime/elisacore_runtime.o"
+clang -Wl,-dead_strip -o "$BUILD/aos" "$BUILD/aos.o" "$ROOT/build/runtime/elisacore_runtime.o"
 set +e
 "$BUILD/aos"
 rc=$?
