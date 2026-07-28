@@ -731,59 +731,135 @@ extend Semantic:
                             pass
 
 
-        # The lines of statement-position block `if`s that sit INSIDE A LOOP BODY. stage0's
-        # -Wflow-strict block-`if` rule fires only there (a decision in a loop is a state
-        # machine in disguise); a top-level `if` in a function body is accepted. stage1 was
-        # flagging every tagged block `if`, which disagreed with stage0 on ordinary code.
-        def collect_loop_inner_if_lines(statements: darray[Ast::Stmt], in_loop: bool, out: mutable darray[u32]&) -> void:
+        # docs/125 §6b, ported from stage0's isLegitimateGuardBlock: a written block `if`
+        # is EXEMPT when it is a conditional COMPUTATION rather than a hidden decision
+        # tree. stage1 previously flagged every tagged block `if`, which disagreed with
+        # stage0 on ordinary code.
+        def flow_cond_contains_is_test(condition: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match condition:
+                    Expr.Binary(is_left, is_operator, is_right, is_line):
+                        true return if is_operator == TokenKind.Is
+                        if is_operator == TokenKind.And or is_operator == TokenKind.Or:
+                            return flow_cond_contains_is_test(is_left) or flow_cond_contains_is_test(is_right)
+                        return false
+                    Expr.Unary(unary_operator, unary_operand, unary_line):
+                        if unary_operator == TokenKind.Not:
+                            return flow_cond_contains_is_test(unary_operand)
+                        return false
+                    Expr.Paren(paren_inner, paren_line):
+                        return flow_cond_contains_is_test(paren_inner)
+                    _:
+                        return false
+
+        # A body binds a NEW local (`x = <compute>`) — the one shape no guard or value
+        # form can express, so such a block is a legitimate guard.
+        def flow_body_binds_local(statements: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic:
+                binds: mutable bool = false
+                for statement in statements |binds|:
+                    binds <- true if statement is Stmt.VarDecl(_, _, _, _)
+                return binds
+
+        def flow_stmt_is_loop_or_match(statement: Ast::Stmt) -> bool:
+            can Abort.Panic:
+                true return if statement is Stmt.While(_, _, _)
+                true return if statement is Stmt.For(_, _, _, _, _)
+                true return if statement is Stmt.Match(_, _, _)
+                # A capture-listed loop parses as Stmt.Expr(Expr.Block([decls…, loop], …)).
+                if statement is Stmt.Expr(wrapped_expression, wrapped_line):
+                    if wrapped_expression is Expr.Block(wrapped_statements, wrapped_value, wrapped_captures, wrapped_block_line):
+                        wrapped_has_loop: mutable bool = false
+                        for wrapped_statement in wrapped_statements |wrapped_has_loop|:
+                            wrapped_has_loop <- true if wrapped_statement is Stmt.While(_, _, _)
+                            wrapped_has_loop <- true if wrapped_statement is Stmt.For(_, _, _, _, _)
+                        return wrapped_has_loop
+                return false
+
+        def flow_body_has_nested_decision(statements: darray[Ast::Stmt], block_if_lines: darray[u32]&) -> bool:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |in_loop, out|:
+                nested: mutable bool = false
+                for statement in statements |nested, block_if_lines|:
+                    if statement is Stmt.If(nested_condition, nested_then, nested_else, nested_line):
+                        # Only a SOURCE block `if` can make the parent a tree; a desugared
+                        # postfix guard is a sanctioned form.
+                        continue if not (any tagged in block_if_lines where tagged == nested_line)
+                        continue if flow_cond_contains_is_test(nested_condition)
+                        continue if flow_if_is_legitimate_guard(nested_condition, nested_then, nested_else, block_if_lines)
+                        nested <- true
+                return nested
+
+        def flow_if_is_legitimate_guard(condition: Ast::Expr, then_body: darray[Ast::Stmt], else_body: darray[Ast::Stmt], block_if_lines: darray[u32]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                # An if/elif chain is a decision TABLE (stage1 desugars `elif` into a lone
+                # nested `if` in the else branch), never exempt.
+                chained: mutable bool = false
+                for only in else_body |chained|:
+                    chained <- true if only is Stmt.If(_, _, _, _)
+                chained <- false if else_body.count != 1
+                false return if chained
+                false return if flow_body_has_nested_decision(then_body, block_if_lines)
+                false return if flow_body_has_nested_decision(else_body, block_if_lines)
+                true return if flow_body_binds_local(then_body) or flow_body_binds_local(else_body)
+                # Guarded loop or guarded match: `if COND:` whose body is exactly one of them.
+                true return if else_body.count == 0 and then_body.count == 1 and flow_stmt_is_loop_or_match(then_body[0])
+                # Straight-line multi-effect guard: splitting it to postfix guards would
+                # re-evaluate the condition once per statement.
+                true return if else_body.count == 0 and then_body.count >= 2
+                # Two-way alternation where at least one side carries 2+ statements: no
+                # ternary can carry statements. Both-sides-single stays flagged.
+                true return if else_body.count > 0 and (then_body.count >= 2 or else_body.count >= 2)
+                return false
+
+        def flow_strict_walk_statements(statements: darray[Ast::Stmt], block_if_lines: darray[u32]&, out: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |block_if_lines, out|:
                     match statement:
                         Stmt.If(if_condition, then_body, else_body, if_line):
-                            out.push(if_line) if in_loop
-                            collect_loop_inner_if_lines(then_body, in_loop, out)
-                            collect_loop_inner_if_lines(else_body, in_loop, out)
+                            tagged: bool = any tagged_line in block_if_lines where tagged_line == if_line
+                            exempt: bool = flow_cond_contains_is_test(if_condition) or flow_if_is_legitimate_guard(if_condition, then_body, else_body, block_if_lines)
+                            out.push(if_line) if tagged and not exempt
+                            flow_strict_walk_statements(then_body, block_if_lines, out)
+                            flow_strict_walk_statements(else_body, block_if_lines, out)
                         Stmt.While(while_condition, while_body, while_line):
-                            collect_loop_inner_if_lines(while_body, true, out)
+                            flow_strict_walk_statements(while_body, block_if_lines, out)
                         Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
-                            collect_loop_inner_if_lines(for_body, true, out)
+                            flow_strict_walk_statements(for_body, block_if_lines, out)
                         Stmt.Block(block_kind, block_clause, block_binding, block_body, block_line):
-                            collect_loop_inner_if_lines(block_body, in_loop, out)
+                            flow_strict_walk_statements(block_body, block_if_lines, out)
                         Stmt.Match(match_scrutinee, match_arms, match_line):
-                            for match_arm in match_arms |in_loop, out|:
-                                collect_loop_inner_if_lines(match_arm.body, in_loop, out)
-                        # A capture-listed loop (`for x in xs |total|:`) parses as
-                        # Stmt.Expr(Expr.Block([accumulator decls…, the loop], …)), so the
-                        # loop is only reachable through the block expression.
+                            for match_arm in match_arms |block_if_lines, out|:
+                                flow_strict_walk_statements(match_arm.body, block_if_lines, out)
                         Stmt.Expr(statement_expression, statement_expression_line):
-                            collect_loop_inner_if_lines_expr(statement_expression, in_loop, out)
+                            flow_strict_walk_expression(statement_expression, block_if_lines, out)
                         Stmt.VarDecl(var_name, var_type, var_value, var_line):
-                            collect_loop_inner_if_lines_expr(var_value, in_loop, out)
+                            flow_strict_walk_expression(var_value, block_if_lines, out)
                         Stmt.Assign(assign_target, assign_operator, assign_value, assign_line):
-                            collect_loop_inner_if_lines_expr(assign_value, in_loop, out)
+                            flow_strict_walk_expression(assign_value, block_if_lines, out)
                         _:
                             pass
 
-        def collect_loop_inner_if_lines_expr(expression: Ast::Expr, in_loop: bool, out: mutable darray[u32]&) -> void:
+        def flow_strict_walk_expression(expression: Ast::Expr, block_if_lines: darray[u32]&, out: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Block(block_statements, block_value, block_captures, block_expr_line):
-                        collect_loop_inner_if_lines(block_statements, in_loop, out)
-                        collect_loop_inner_if_lines_expr(block_value, in_loop, out)
+                        flow_strict_walk_statements(block_statements, block_if_lines, out)
+                        flow_strict_walk_expression(block_value, block_if_lines, out)
                     _:
                         pass
 
     public:
-        def loop_inner_if_lines(declarations: darray[Ast::Decl], out: mutable darray[u32]&) -> void:
+        # The block-`if` sites that stage0 would actually flag under -Wflow-strict.
+        def flow_strict_flagged_if_lines(declarations: darray[Ast::Decl], block_if_lines: darray[u32]&, out: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |out|:
+                for declaration in declarations |block_if_lines, out|:
                     match declaration:
-                        Decl.Func(loop_if_name, loop_if_params, loop_if_return, loop_if_body, loop_if_effects, loop_if_decorators, loop_if_line):
-                            collect_loop_inner_if_lines(loop_if_body, false, out)
-                        Decl.Module(loop_if_module, loop_if_module_body, loop_if_module_line):
-                            loop_inner_if_lines(loop_if_module_body, out)
-                        Decl.Scoped(loop_if_scoped_body, loop_if_scoped_line):
-                            loop_inner_if_lines(loop_if_scoped_body, out)
+                        Decl.Func(flow_fn_name, flow_fn_params, flow_fn_return, flow_fn_body, flow_fn_effects, flow_fn_decorators, flow_fn_line):
+                            flow_strict_walk_statements(flow_fn_body, block_if_lines, out)
+                        Decl.Module(flow_module_name, flow_module_body, flow_module_line):
+                            flow_strict_flagged_if_lines(flow_module_body, block_if_lines, out)
+                        Decl.Scoped(flow_scoped_body, flow_scoped_line):
+                            flow_strict_flagged_if_lines(flow_scoped_body, block_if_lines, out)
                         _:
                             pass
 
