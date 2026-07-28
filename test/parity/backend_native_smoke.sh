@@ -96,6 +96,7 @@ run_case return_0         'def main() -> i64:\n    return 0\n'     0
 run_case return_7         'def main() -> i64:\n    return 7\n'     7
 # Exit codes are taken mod 256 by the shell; 200 stays in range and is not a boundary.
 run_case return_200       'def main() -> i64:\n    return 200\n'  200
+run_case intrinsic_ctpop  '@intrinsic(llvm.ctpop.i64)\nextern popcount(value: u64) -> u64\n\ndef main() -> i64:\n    return popcount(15).i64()\n' 4
 
 # Arithmetic. Precedence/grouping are asserted by VALUE (2+3*4 == 14, not 20), so a
 # backend that ignored precedence could not pass.
@@ -115,9 +116,13 @@ run_case if_else_both_ret 'def main() -> i64:\n    x: i64 = 1\n    if x > 3:\n  
 # A real loop: sums 1..9 == 45, so an off-by-one or a mis-wired backedge shows up.
 run_case while_sum        'def main() -> i64:\n    i: mutable i64 = 0\n    total: mutable i64 = 0\n    while i < 9:\n        i <- i + 1\n        total <- total + i\n    return total\n'  45
 run_case call             'def double(n: i64) -> i64:\n    return n * 2\n\ndef main() -> i64:\n    return double(21)\n'  42
+run_case named_call       'def subtract(left: i64, right: i64) -> i64:\n    return left - right\n\ndef main() -> i64:\n    return subtract(right: 2, left: 40)\n'  38
+run_case named_generic    'def first[A, B](left: A, right: B) -> A:\n    return left\n\ndef main() -> i64:\n    return first(right: 2, left: 40)\n'  40
 # Forward reference: `main` calls a function declared LATER. Passes only because
 # emit_module declares every function before emitting any body.
 run_case call_forward     'def main() -> i64:\n    return helper(42)\n\ndef helper(n: i64) -> i64:\n    return n\n'      42
+run_case export_scalar    'def internal(x: i64) -> i64:\n    return x + 1\n\nexport fn add(x: i64) -> i64 = internal\n\ndef main() -> i64:\n    return 42\n' 42
+run_case export_global    'global seed: i64 = 7\n\nexport global seed as ctx_seed\n\ndef main() -> i64:\n    return seed\n' 7
 run_case recursion        'def fact(n: i64) -> i64:\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\n\ndef main() -> i64:\n    return fact(5)\n'  120
 # `_ = EXPR` — explicit discard of a call result (emit for side effects, drop the value).
 run_case discard_call     'def helper(x: i64) -> i64:\n    return x + 1\n\ndef main() -> i64:\n    _ = helper(5)\n    return 42\n'  42
@@ -300,6 +305,16 @@ run_case darray_count     'def main() -> i64:\n    xs: mutable darray[i64] = []\
 run_case darray_loop      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<10:\n        xs.push(i)\n    total: mutable i64 = 0\n    for j in 0..<10:\n        total <- total + xs[j]\n    return total - 3\n'  42
 run_case darray_u8        'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'  42
 run_case darray_write     'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(1)\n    xs.push(1)\n    xs[0] <- 40\n    xs[1] <- 2\n    return xs[0] + xs[1]\n'  42
+run_case clone_optional_value 'def main() -> i64:\n    source: i64? = 7\n    copy: i64? = clone[i64?](source)\n    if copy is found:\n        return found + 35\n    return 0\n' 42
+run_case clone_nested_darray 'def main() -> i64:\n    inner: mutable darray[i64] = []\n    inner.push(42)\n    source: mutable darray[darray[i64]] = []\n    source.push(inner)\n    copy: mutable darray[darray[i64]] = clone[darray[darray[i64]]](source)\n    return copy[0][0]\n' 42
+run_case clone_struct_darray 'struct Box:\n    items: darray[i64]\n\ndef main() -> i64:\n    items: mutable darray[i64] = []\n    items.push(42)\n    source: Box = Box{items: items}\n    copy: Box = clone[Box](source)\n    return copy.items[0]\n' 42
+run_case clone_sview_bytes 'def main() -> i64:\n    text: sview = "AB"\n    bytes: darray[u8] = clone[darray[u8]](text)\n    return bytes[0].i64() + bytes[1].i64() - 65 - 66 + 42\n' 42
+run_case clone_view_darray 'def main() -> i64:\n    source: mutable darray[i64] = []\n    source.push(42)\n    window: view[i64] = source[0:1]\n    copy: darray[i64] = clone[darray[i64]](window)\n    return copy[0]\n' 42
+run_case clone_array_darray 'def main() -> i64:\n    source: i64[2] = [7, 35]\n    copy: darray[i64] = clone[darray[i64]](source)\n    return copy[0] + copy[1]\n' 42
+run_case clone_error_union_success 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef main() -> i64:\n    source: i64 error[E] = make()\n    copy: i64 error[E] = clone[i64 error[E]](source)\n    return 42\n' 42
+run_case clone_error_union_failure 'error E:\n    X\n\ndef fail() -> i64 error[E]:\n    raise E.X\n\ndef main() -> i64:\n    source: i64 error[E] = fail()\n    copy: i64 error[E] = clone[i64 error[E]](source)\n    return 42\n' 42
+run_case clone_error_union_struct_field 'error E:\n    X\n\nstruct Box:\n    value: i64 error[E]\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef main() -> i64:\n    source: Box = Box{value: make()}\n    copy: Box = clone[Box](source)\n    return 42\n' 42
+run_case error_union_parameter 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef take(value: i64 error[E]) -> i64:\n    return 42\n\ndef main() -> i64:\n    source: i64 error[E] = make()\n    return take(source)\n' 42
 # 500 pushes past the 256 initial capacity: this is the arena_realloc GROW path. A push
 # that never grew would pass the smaller cases and fail only here.
 run_case darray_grow      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'  42
@@ -437,6 +452,17 @@ ir_case() {
 # it must reach a cstr parameter as a bare `ptr` -- exactly stage0's shape.
 ir_case cstr_global_shape 'def main() -> i64:\n    s: cstr = "hi"\n    return 42\n' '^@str = private unnamed_addr constant \[3 x i8\] c"hi\\00"'
 ir_case cstr_param_is_ptr 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n' 'define i64 @take\(ptr'
+ir_case export_scalar_wrapper 'def internal(x: i64) -> i64:\n    return x + 1\n\nexport fn add(x: i64) -> i64 = internal\n\ndef main() -> i64:\n    return 42\n' 'define i64 @add\(i64'
+ir_case export_global_alias 'global seed: i64 = 7\n\nexport global seed as ctx_seed\n\ndef main() -> i64:\n    return seed\n' '^@ctx_seed = alias i64, ptr @seed'
+ir_case aggregate_global_refs 'struct Pair:\n    left: i32\n    right: i32\n\nstruct Holder:\n    pair: Pair\n\nglobal base: Pair = Pair{left: 1, right: 2}\nglobal table: Pair[2] = [base, Pair{left: 3, right: 4}]\nglobal picked: Pair = table[1]\nglobal wrapped: Holder = Holder{pair: table[0]}\nglobal first_left: i32 = table[0].left\n\ndef main() -> i64:\n    return picked.left.i64() + wrapped.pair.right.i64() + first_left.i64()\n' '^@picked = global %Pair { i32 3, i32 4 }'
+
+# Typed non-call externs are C globals. Stage0 lowers the declaration to an external
+# LLVM global and accesses it through ordinary loads/stores; keep all three shapes in
+# the differential IR suite because these paths are not safely runnable without a C
+# definition for the symbol.
+ir_case extern_global_decl 'extern errno_value: i32\n\ndef main() -> i64:\n    return 42\n' '^@errno_value = external global i32'
+ir_case extern_global_read 'extern errno_value: i32\n\ndef main() -> i64:\n    return errno_value + 42\n' 'load i32, ptr @errno_value'
+ir_case extern_global_write 'extern errno_value: i32\n\ndef main() -> i64:\n    errno_value <- 7\n    return 42\n' 'store i32 7, ptr @errno_value'
 
 # An extern returning a POINTER must declare as `ptr`. The `return_type_name` side table
 # keeps only the bare head name (`void`), so before the `__extern_return_ptr` annotation
@@ -459,6 +485,20 @@ stage1_ir_case() {
     total=$((total + 1))
     local ll="$BUILD/s1ir_$name.ll"
     if ! printf '%b' "$src" | "$BUILD/emit_native" > "$ll" 2>/dev/null; then
+        echo "  FAIL s1ir_$name: stage1 declined"; return
+    fi
+    if grep -qE "$pattern" "$ll"; then
+        pass=$((pass + 1))
+    else
+        echo "  FAIL s1ir_$name: stage1 IR lacks /$pattern/"
+    fi
+}
+
+stage1_ir_env_case() {
+    local name="$1" env_name="$2" env_value="$3" src="$4" pattern="$5"
+    total=$((total + 1))
+    local ll="$BUILD/s1ir_${name}.ll"
+    if ! env "$env_name=$env_value" printf '%b' "$src" | env "$env_name=$env_value" "$BUILD/emit_native" > "$ll" 2>/dev/null; then
         echo "  FAIL s1ir_$name: stage1 declined"; return
     fi
     if grep -qE "$pattern" "$ll"; then
@@ -509,6 +549,37 @@ stage1_ir_case autovec_marker 'def main() -> i64:\n    xs: darray[i64] = [i for 
 # to be the node itself, and silently IGNORES a node that is not -- the marker would be
 # "present" and useless.
 stage1_ir_case autovec_loop_selfref 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' '^!0 = distinct .\{!0, !1\}'
+
+# Function decorators are semantic declarations that stage0 lowers into LLVM function
+# attributes. Keep these checks on stage1's IR because LLVM may renumber attribute groups
+# between the two backend implementations; the source spellings and LLVM names are taken
+# from stage0's llvm_inline_test.go.
+stage1_ir_case function_attr_alwaysinline '@inline(always)\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'alwaysinline'
+stage1_ir_case function_attr_noinline '@inline(never)\ndef helper() -> i64:\n    return 1\n\ndef main() -> i64:\n    return helper()\n' 'noinline'
+stage1_ir_case function_attr_hot '@hot\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'hot'
+stage1_ir_case function_attr_cold '@cold\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'cold'
+stage1_ir_case function_attr_norecurse '@norecurse\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'norecurse'
+stage1_ir_case function_fast_math '@fast_math\ndef helper(value: f64) -> f64:\n    return value * value + value\n\ndef main() -> i64:\n    return 42\n' 'fmul fast'
+stage1_ir_case function_callconv_winapi '@callconv(winapi)\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return 42\n' 'define x86_stdcallcc i64 @helper'
+stage1_ir_case function_segment_marker '@segment_agnostic\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return 42\n' 'elisacore.segment_agnostic'
+stage1_ir_case function_nounwind 'def helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'attributes #[0-9]+ = \{ nounwind'
+stage1_ir_case branch_weights_likely 'def helper(value: bool) -> i64:\n    if likely value:\n        return 1\n    return 0\n\ndef main() -> i64:\n    return helper(true)\n' 'branch_weights.*2000.*1'
+stage1_ir_case branch_weights_unlikely 'def helper(value: bool) -> i64:\n    while unlikely value:\n        return 1\n    return 0\n\ndef main() -> i64:\n    return helper(true)\n' 'branch_weights.*1.*2000'
+stage1_ir_case intrinsic_ctpop '@intrinsic(llvm.ctpop.i64)\nextern popcount(value: u64) -> u64\n\ndef main() -> i64:\n    return popcount(15).i64()\n' 'declare i64 @llvm.ctpop.i64\(i64\)'
+stage1_ir_case darray_checked_growth 'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(7)\n    return xs[0] can Unsafe.UncheckedIndex\n' 'umul.with.overflow.i64'
+stage1_ir_case darray_checked_reserve_bound 'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.reserve(2 * 3)\n    return xs.count.i64() + 42\n' 'umul.with.overflow.i64'
+stage1_ir_case defer_function '@link_name(sink)\nextern sink(value: i64) -> void\n\ndef keep() -> i64:\n    value: i64 = 10\n    defer function:\n        sink(value)\n    return value\n\ndef main() -> i64:\n    return keep()\n' 'call void @sink\(i64.*\)'
+stage1_ir_case defer_block_pool 'struct ThreadPool:\n    handle: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef observe(pool: ThreadPool&) -> void:\n    return\n\ndef keep() -> void:\n    pool workers(1):\n        defer block:\n            observe(&workers)\n\ndef main() -> i64:\n    keep()\n    return 42\n' 'call void @observe'
+stage1_ir_case struct_align '@align(64)\nstruct Counter:\n    value: i64\n\nglobal counter: Counter = zeroed\n\ndef fold() -> i64:\n    local: Counter = zeroed\n    return local.value\n\ndef main() -> i64:\n    return fold()\n' '@counter = global %Counter zeroinitializer, align 64'
+stage1_ir_env_case noalias_mutable_scalar ELISACORE_NOALIAS_MUTABLE_REFS 1 'def bump(x: mutable i32&) -> void:\n    x <- x + 1\n\ndef main() -> i64:\n    return 0\n' 'define void @bump\(ptr noalias'
+stage1_ir_absent_case noalias_default_off 'def bump(x: mutable i32&) -> void:\n    x <- x + 1\n\ndef main() -> i64:\n    return 0\n' 'define void @bump\(ptr noalias'
+stage1_ir_env_case deref_guard_forced ELISACORE_FORCE_BOUNDS_CHECK 1 'struct P:\n    x: mutable i32\n\ndef read(p: P&) -> i32:\n    return p.x\n\ndef main() -> i64:\n    return 0\n' 'pg\.valid'
+stage1_ir_absent_case deref_guard_default_off 'struct P:\n    x: mutable i32\n\ndef read(p: P&) -> i32:\n    return p.x\n\ndef main() -> i64:\n    return 0\n' 'pg\.valid'
+stage1_ir_env_case index_guard_forced ELISACORE_FORCE_BOUNDS_CHECK 1 'def at(xs: mutable darray[i32]&, i: usize) -> i32:\n    return xs[i]\n\ndef main() -> i64:\n    return 0\n' 'wd\.in_bounds'
+stage1_ir_env_case disjoint_darray_scopes ELISACORE_NOALIAS_MUTABLE_REFS 1 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    b: mutable darray[f64] = []\n    axpy(&a, &b)\n    return 0\n' 'elisa\.disjoint\.axpy\.aa'
+stage1_ir_absent_case disjoint_alias_call 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    axpy(&a, &a)\n    return 0\n' 'elisa\.disjoint\.'
+stage1_ir_env_case disjoint_clone_call ELISACORE_NOALIAS_MUTABLE_REFS 1 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    b: mutable darray[f64] = clone[darray[f64]](a)\n    axpy(&a, &b)\n    return 0\n' 'elisa\.disjoint\.axpy\.aa'
+stage1_ir_env_case disjoint_forwarded_call ELISACORE_NOALIAS_MUTABLE_REFS 1 'def axpy(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    y[0] <- x[0]\n\ndef driver(y: mutable darray[f64]&, x: mutable darray[f64]&) -> void:\n    axpy(&y, &x)\n    y[0] <- x[0]\n\ndef main() -> i64:\n    a: mutable darray[f64] = []\n    b: mutable darray[f64] = []\n    driver(&a, &b)\n    return 0\n' 'elisa\.disjoint\.driver\.aa'
 # A plain for-loop is NOT a comprehension build loop and must NOT be tagged: a marker there
 # would make -Wperf demand vectorization of a loop the language never promised to vectorize.
 stage1_ir_absent_case autovec_not_plain_loop 'def main() -> i64:\n    total: mutable i64 = 0\n    for i in 0..<10:\n        total <- total + i\n    return total - 3\n' 'elisa.autovec.expected'
@@ -581,6 +652,7 @@ diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n   
 diff_case array_literal 'def main() -> i64:\n    xs: i64[3] = [10, 30, 2]\n    return xs[0] + xs[1] + xs[2]\n'
 diff_case array_u8      'def main() -> i64:\n    xs: u8[3] = [200, 100, 50]\n    return xs[0].i64() - xs[1].i64() - xs[2].i64() - 8\n'
 diff_case array_rw      'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0, 0, 0]\n    for i in 0..<5:\n        xs[i] <- i * 2\n    total: mutable i64 = 0\n    for j in 0..<5:\n        total <- total + xs[j]\n    return total + 22\n'
+diff_case nested_array  'def main() -> i64:\n    m: i64[2][2] = [[10, 20], [3, 9]]\n    return m[0][1] + m[1][0] + 12\n'
 diff_case optional_return 'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(true)\n    if v is found:\n        return found\n    return 0\n'
 diff_case optional_absent 'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(false)\n    if v is found:\n        return found\n    return 42\n'
 diff_case optional_u8     'def main() -> i64:\n    v: u8? = 200\n    if v is found:\n        return found.i64() - 158\n    return 0\n'
@@ -626,6 +698,7 @@ diff_case const_u8 'const B: u8 = 200\n\ndef main() -> i64:\n    return B.i64() 
 # A LOCAL shadows a global const of the same name.
 diff_case const_shadowed_by_local 'const V: i64 = 1\n\ndef main() -> i64:\n    V: i64 = 42\n    return V\n'
 diff_case const_in_arithmetic 'const A: i64 = 40\nconst B: i64 = 2\n\ndef main() -> i64:\n    return A + B\n'
+diff_case aggregate_global_refs 'struct Pair:\n    left: i32\n    right: i32\n\nstruct Holder:\n    pair: Pair\n\nglobal base: Pair = Pair{left: 1, right: 2}\nglobal table: Pair[2] = [base, Pair{left: 3, right: 4}]\nglobal picked: Pair = table[1]\nglobal wrapped: Holder = Holder{pair: table[0]}\nglobal first_left: i32 = table[0].left\n\ndef main() -> i64:\n    return picked.left.i64() + wrapped.pair.right.i64() + first_left.i64()\n'
 # `const A: mutable i64 = 42` is accepted by stage0, so `is_mutable` must not decline.
 diff_case const_mutable_global 'const A: mutable i64 = 42\n\ndef main() -> i64:\n    return A\n'
 # MODULES. stage0 emits `module M: def fetch()` as `define i64 @M.fetch` — DOT-mangled,
@@ -650,6 +723,8 @@ diff_case cstr_local 'def main() -> i64:\n    s: cstr = "hi"\n    return 42\n'
 diff_case cstr_param 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n'
 diff_case cstr_two_literals 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    a: cstr = "one"\n    b: cstr = "two"\n    return take(a) - take(b) + 42\n'
 diff_case cstr_empty 'def main() -> i64:\n    s: cstr = ""\n    return 42\n'
+# `@link_name` changes only the emitted symbol spelling; source calls still use `c_strlen`.
+diff_case extern_link_name '@link_name(strlen)\nextern c_strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return c_strlen("hello").i64()\n'
 diff_case cstr_reassign 'def main() -> i64:\n    s: mutable cstr = "a"\n    s <- "b"\n    return 42\n'
 # CROSS-FN REGION THREADING — the first real piece of region polymorphism. A function
 # taking a GROWABLE container by reference gets an implicit trailing `ptr` arena parameter
@@ -765,6 +840,10 @@ diff_case extern_strlen_literal 'extern strlen(s: cstr) -> usize\n\ndef main() -
 diff_case extern_strlen_empty 'extern strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return strlen("").i64() + 42\n'
 # Two args, and a return type that is not the i64 default.
 diff_case extern_two_args 'extern strncmp(a: cstr, b: cstr, n: usize) -> i32\n\ndef main() -> i64:\n    return strncmp("abc", "abc", 3).i64() + 42\n'
+# Mutable globals must be real writable storage in both backends, while plain `global`
+# declarations used by the runtime remain folded/linked according to stage0's existing ABI.
+diff_case global_mutable_scalar 'global mutable seed: i64 = 0\n\ndef main() -> i64:\n    seed <- 42\n    return seed\n'
+diff_case global_mutable_array 'global mutable xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    xs[1] <- 42\n    return xs[1]\n'
 # NAMED-FIELD construction: `Shape.Circle(r: 42)`, which stage0 accepts alongside the
 # positional form. The label is checked against the payload field's DECLARED name -- a label
 # naming something else is a different program. This is the last of the four prerequisites
@@ -854,6 +933,10 @@ diff_case error_union_success 'error E:\n    X\n\ndef doubler(n: i64) -> i64 err
 diff_case error_union_raise 'error E:\n    X\n    Y\n\ndef fails(n: i64) -> i64 error[E]:\n    raise E.Y\n\ndef main() -> i64:\n    return try fails(5) else 42\n'
 # A u8 success value round-trips through the out-param at its own width.
 diff_case error_union_u8 'error E:\n    X\n\ndef mk(n: u8) -> u8 error[E]:\n    return n\n\ndef main() -> i64:\n    v: u8 = try mk(200) else 0\n    return v.i64() - 158\n'
+# First-class error-union operands, not just direct calls. Stage0 permits `try` and
+# expression `catch` over locals/parameters carrying the descriptor representation.
+run_case error_union_try_local 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef use(value: i64 error[E]) -> i64:\n    return try value else 42\n\ndef main() -> i64:\n    return use(make())\n' 7
+run_case error_union_catch_local 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    raise E.X\n\ndef use(value: i64 error[E]) -> i64:\n    return catch value:\n        ok:\n            ok\n        E.X:\n            42\n\ndef main() -> i64:\n    return use(make())\n' 42
 # CONTRACTS: `requires PRED` is a precondition, lowered to `if not PRED: abort`. stage0
 # emits a predicate check + panic; a provably-true predicate is optimized away. The SUCCESS
 # path (predicate holds) is bit-identical to stage0 -- these fixtures exercise that. (A
@@ -979,6 +1062,9 @@ run_case penum_is_narrow_multi 'enum Shape:\n    Rect(i64, i64)\n    None\n\ndef
 run_case const_array_literal_index 'const xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    return xs[0] + xs[2]\n'   40
 run_case const_array_dynamic_index 'const xs: i64[3] = [10, 20, 30]\n\ndef get(i: i64) -> i64:\n    return xs[i]\n\ndef main() -> i64:\n    return get(1)\n'   20
 run_case const_array_u8_elem 'const bs: u8[4] = [1, 2, 3, 4]\n\ndef main() -> i64:\n    return bs[3].i64()\n'   4
+# Mutable Elisa globals are addressable module storage, not folded constants.
+run_case global_mutable_scalar 'global mutable seed: i64 = 0\n\ndef main() -> i64:\n    seed <- 42\n    return seed\n' 42
+run_case global_mutable_array 'global mutable xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    xs[1] <- 42\n    return xs[1]\n' 42
 # Nested const arrays: `i64[2][3]` -> `[3 x [2 x i64]]` (extents inside-out), a recursively
 # built constant global, indexed level by level.
 run_case const_array_2d_square 'const g: i64[2][2] = [[1, 2], [3, 4]]\n\ndef main() -> i64:\n    return g[0][1] + g[1][1]\n'   6
@@ -1001,6 +1087,11 @@ run_case static_if_untaken_fn_dropped 'static if ELISA_TARGET_OS_WINDOWS:\n    d
 # cstr byte indexing lowers to ctx_string_index(s, i) -> i64 (stage0's shape).
 run_case cstr_index_const 'def main() -> i64:\n    s: cstr = "ABC"\n    return s[0].i64() + s[2].i64()\n'   132
 run_case cstr_index_dynamic 'def at(s: cstr, i: i64) -> i64:\n    return s[i]\n\ndef main() -> i64:\n    return at("XYZ", 1)\n'   89
+# Low-level runtime string helpers return borrowed byte pointers (`u8&`), not only cstr.
+# A literal in that context must still lower to the same LLVM global pointer.
+run_case byte_ref_literal 'def choose(flag: bool) -> u8&:\n    return "True" if flag else "False"\n\ndef main() -> i64:\n    _ = choose(true)\n    return 42\n' 42
+# `isize` is the signed pointer-width scalar used by portable runtime callbacks.
+run_case isize_scalar 'def main() -> i64:\n    value: isize = 40\n    return value.i64() + 2\n' 42
 # Nested darray[darray[i64]]: elements are 24-byte inner headers; the container's element
 # stride must be sizeof(header), not the scalar-fallback 0 that corrupted every push.
 run_case darray_nested_index 'def main() -> i64:\n    m: darray[darray[i64]] = [[1, 2], [3, 4]]\n    return m[0][0] + m[0][1] + m[1][0] + m[1][1]\n'   10
@@ -1038,10 +1129,8 @@ decline_case packed_enum_needs_store 'packed enum Node:\n    Leaf(v: i64)\n    T
 # so ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and it
 # declines here too -- for the independent reason that its payload is not a scalar.
 decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a: Node, b: Node)\n\ndef main() -> i64:\n    n: Node = Node.Leaf(42)\n    return match n:\n        Node.Leaf(v): v\n        Node.Pair(a, b): 0\n'
-# A VARIADIC extern needs a different LLVMFunctionType flag and a call site that knows which
-# args are fixed; not modeled, so it declines rather than emitting a wrong signature.
-# An UNUSED variadic extern no longer poisons the module (per-fn tolerance): the
-# program runs. stage0 compiles this program too, so this is parity, not permissiveness.
+# C variadic externs use the fixed parameter ABI plus C default argument promotions for the
+# unnamed tail. The call is observable through printf and stage0 accepts the same program.
 # `get OPT else return X` — the CONTROL-FLOW recovery form. The parser used to consume the
 # else-clause and THROW IT AWAY, which turned this into `v: i64 = find(n)` (a `T?` bound to
 # a `T`, early return gone). The recovery is now retained on the node and lowered: present
@@ -1139,7 +1228,7 @@ run_case get_bare_absent 'def find(x: i64) -> i64?:\n    return x if x > 0 else 
 # it the struct is passed by value and the mutation is lost (or its bytes read as a pointer →
 # crash). This is what the real-std IndexMap's `arena_dict_put(a, map.by_key, …)` relies on.
 run_case field_arg_autoref 'struct Inner:\n    v: mutable i64\nstruct Outer:\n    inner: mutable Inner\ndef bump(p: mutable Inner&) -> void:\n    p.v <- p.v + 42\ndef main() -> i64:\n    o: mutable Outer = zeroed\n    bump(o.inner)\n    return o.inner.v\n' 42
-run_case unused_variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    return 42\n' 42
+diff_case variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() -> i64:\n    _ = printf("%d %f\\n", 7, 1.5)\n    return 42\n' 42
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
 decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(bogus: 42)\n    return match s:\n        Shape.Circle(r): r\n'

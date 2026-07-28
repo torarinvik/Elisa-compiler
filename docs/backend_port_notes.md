@@ -902,3 +902,23 @@ straightforward.
 
 Everything else probed (struct==, global struct const, `flags`) is a stage0 REJECT, i.e.
 stage1 correctly declines it too.
+
+## MILESTONE (2026-07-28) — self-host CRASH FIXED (Elisa-core fd5cffee)
+
+gen1 segfaulted compiling the driver because emitPackedEnumPayloadDArrayAdopt did a SHALLOW
+copy of packed-ctor darray payloads: `Stmt.Match(arms: darray[MatchArm])` copied the arms
+backing into the store arena but left each `MatchArm.body: darray[Stmt]` pointing at the
+builder's freed region — a UAF. Fix = emitDeepAdoptElementContainers (recursive deep adoption
+of owned-container fields; sview/view/handle fields skipped). Reliable 1454-line lexer
+reproducer (scratchpad/RELIABLE_lexonly_repro.elisa) now compiles 0/3 (was 3/3 crash);
+self_host_gen2.sh now COMPILES the driver end-to-end and reaches LINK with 55 undefined symbols
+= declined function bodies (sound-subset coverage gaps).
+
+Dominant decline class root-caused: functions that `match` a packed AST-root variant with a
+COMPLEX mixed payload (e.g. Decl.Func with sview + darray-of-struct + optional + darrays) are
+declined — reproduced standalone in scratchpad/declfunc.elisa (name_of emitted=0). The decline
+is a `null return` in the match-EXPRESSION setup (codegen.elisa 6968-7013), NOT any
+`declined <- true` in the arm region (all instrumented, none fire). Likely 6980 (expected type
+Unmodeled) via a payload-type-resolution that yields Unmodeled for the complex aggregate. This
+class likely unblocks a large fraction of the 55 (every Decl/Expr/Stmt matcher). Fix requires
+modeling the AST-root complex-payload aggregate in the match read path.

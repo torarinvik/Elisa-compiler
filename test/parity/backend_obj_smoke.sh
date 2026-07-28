@@ -18,6 +18,7 @@ LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 [ "$(uname -m)" = "arm64" ] || { echo "backend_obj_smoke SKIP: driver is arm64-only"; exit 0; }
 
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
+LLVM_DIS="$(dirname "$LLVM_CONFIG")/llvm-dis"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
 [ -f "$RUNTIME_OBJ" ] || { echo "backend_obj_smoke SKIP: no runtime object"; exit 0; }
@@ -37,6 +38,8 @@ obj_case() {
         echo "  FAIL obj_$name: emit_obj declined or errored"; return
     fi
     [ -f "$dir/stage1_out.o" ] || { echo "  FAIL obj_$name: no object emitted"; return; }
+    [ -s "$dir/stage1_out.bc" ] || { echo "  FAIL obj_$name: no bitcode emitted"; return; }
+    "$LLVM_DIS" "$dir/stage1_out.bc" -o /dev/null 2>/dev/null || { echo "  FAIL obj_$name: invalid bitcode emitted"; return; }
     clang -o "$dir/prog" "$dir/stage1_out.o" "$RUNTIME_OBJ" 2>/dev/null \
       || { echo "  FAIL obj_$name: link"; return; }
     RUN "$dir/prog"; local got=$?
@@ -45,6 +48,10 @@ obj_case() {
 }
 
 obj_case scalar   'def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n' 42
+
+# Value blocks lower their leading declarations in the current scope and evaluate the
+# trailing expression as the block result.
+obj_case value_block 'def main() -> i64:\n    value: i64 =\n        x: i64 = 40\n        x + 2\n    return value\n' 42
 
 # Aggregate cases at -O2: these exercise mixed-size struct/optional layout, which a MISSING
 # module datalayout silently corrupts (the optimizer falls back to a default where i64 is
@@ -81,6 +88,13 @@ optimizer_case() {
 optimizer_case
 obj_case recursion 'def fact(n: i64) -> i64:\n    return 1 if n <= 1 else n * fact(n - 1)\n\ndef main() -> i64:\n    return fact(5) - 78\n' 42
 obj_case darray   'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(42)\n    return xs[0] can Unsafe.UncheckedIndex\n' 42
+obj_case nested_darray 'def main() -> i64:\n    xs: mutable darray[darray[i64]] = []\n    inner: mutable darray[i64] = []\n    inner.push(42)\n    xs.push(inner)\n    return xs[0][0] can Unsafe.UncheckedIndex\n' 42
+obj_case recursive_generic 'struct Node[T]:\n    value: T\n    next: Node[T]&?\n\ndef main() -> i64:\n    node: Node[i64] = Node[i64]{value: 42, next: null}\n    return node.value\n' 42
+obj_case parallel_range 'def for_indices_par(n: usize, body: fn(usize) -> i64, w: usize = 0.usize()) -> void:\n    return\n\ndef main() -> i64:\n    total: usize = 4.usize()\n    for i in 0.usize() ..< total by par:\n        _ = i.i64()\n    return 42\n' 42
+obj_case parallel_band_generic 'struct Slice[T]:\n    base: usize\n    count: usize\n\ndef each[T](s: Slice[T], body: fn(Slice[T]) -> i64, w: usize) -> void:\n    return\n\ndef main() -> i64:\n    whole: Slice[i64] = Slice[i64]{base: 0.usize(), count: 1.usize()}\n    parallel for band in whole:\n        _ = band.count.i64()\n    return 42\n' 42
+obj_case pool_scope 'struct ThreadPool:\n    handle: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef main() -> i64:\n    pool workers(2):\n        pass\n    return 42\n' 42
+obj_case nursery_submit 'struct ThreadPool:\n    handle: void&?\n\nstruct TaskGroup:\n    handle: void&?\n    cleanup: void&?\n\nstruct Task[T, S]:\n    handle: usize\n    state: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef task_group_new() -> TaskGroup:\n    return TaskGroup{handle: null, cleanup: null}\n\ndef task_group_wait_all(group: TaskGroup&) -> void:\n    return\n\ndef pool_submit1[A, R](pool: ThreadPool&, fn: fn(A) -> R, arg: A) -> Task[R, i64]:\n    return zeroed\n\ndef task_group_add[R](group: TaskGroup&, task: Task[R, i64]) -> void:\n    _ = move task\n    return\n\ndef bump(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    nursery workers(2):\n        submit bump(41)\n    return 42\n' 42
+obj_case await_task 'struct Task[T, S]:\n    handle: usize\n    state: void&?\n\ndef pool_await[R](task: Task[R, i64]) -> R:\n    return 42\n\ndef main() -> i64:\n    t: Task[i64, i64] = zeroed\n    return await t\n' 42
 obj_case comprehension 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[3] can Unsafe.UncheckedIndex) + 39\n' 42
 obj_case struct   'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 40, y: 2}\n    return p.x + p.y\n' 42
 
