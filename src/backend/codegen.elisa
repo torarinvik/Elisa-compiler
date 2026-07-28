@@ -7282,8 +7282,10 @@ module Backend:
                 packed_scrutinee: bool = scrutinee_type.kind == TypeKind.PackedEnum
                 # A CSTR scrutinee's arms are string-literal patterns compared with ctx_streq.
                 cstr_scrutinee: bool = scrutinee_type.kind == TypeKind.CStr
+                # An SVIEW scrutinee's arms compare each literal via ctx_string_views_eq.
+                sview_scrutinee: bool = scrutinee_type.kind == TypeKind.SView
                 null return if packed_scrutinee and runtime.active_store_enum != packed_root_index_of(structs, scrutinee_type.bits.i64())
-                null return if not is_integer_type(scrutinee_type) and not penum_scrutinee and not packed_scrutinee and not cstr_scrutinee
+                null return if not is_integer_type(scrutinee_type) and not penum_scrutinee and not packed_scrutinee and not cstr_scrutinee and not sview_scrutinee
                 match_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
                 null return if expected.kind == TypeKind.Unmodeled
                 if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scrutinee_raw:
@@ -7318,11 +7320,56 @@ module Backend:
                     declined: mutable bool = false
                     saw_default: mutable bool = false
 
-                    for arm in match_arms |declined, saw_default, cstr_scrutinee, scrutinee, scrutinee_type, penum_scrutinee, packed_scrutinee, scrutinee_raw, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    for arm in match_arms |declined, saw_default, cstr_scrutinee, sview_scrutinee, scrutinee, scrutinee_type, penum_scrutinee, packed_scrutinee, scrutinee_raw, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
                         # Once a catch-all is emitted the chain is closed.
                         continue if declined or saw_default
                         if arm_value_expression(arm.body) is arm_expression:
                             arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.arm")
+                            # `match s: "done":` — an SVIEW scrutinee compares each literal via
+                            # ctx_string_views_eq (nonzero = equal); `_`/binder is the catch-all.
+                            if sview_scrutinee:
+                                if arm.pattern is Pattern.Literal(sview_pat_text):
+                                    sview_pat_storage: mutable darray[u8] = []
+                                    if string_pattern_content_cstr(sview_pat_text, sview_pat_storage) is sview_pat_cstr:
+                                        sview_pat_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, sview_pat_cstr, "svpat")
+                                        sview_lit_type: LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
+                                        sview_lit_undef: LLVMValueRef = LLVMGetUndef(sview_lit_type)
+                                        sview_lit_with_ptr: LLVMValueRef = LLVMBuildInsertValue(builder, sview_lit_undef, sview_pat_global, 0, "svpat.ptr")
+                                        sview_lit_len: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), (sview_pat_storage.count - 1).u64(), 0)
+                                        sview_lit: LLVMValueRef = LLVMBuildInsertValue(builder, sview_lit_with_ptr, sview_lit_len, 1, "svpat.len")
+                                        sview_next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "match.next")
+                                        sview_eq_args: mutable darray[LLVMValueRef] = [scrutinee_raw, sview_lit]
+                                        sview_eq_pointer: void& = (&sview_eq_args[0]).cast[void&] can Unsafe.PointerCast
+                                        sview_eq_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, sview_eq_pointer, 2, "match.sview.eq")
+                                        sview_hit: LLVMValueRef = LLVMBuildICmp(builder, 33, sview_eq_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "match.sview.hit")
+                                        _ = LLVMBuildCondBr(builder, sview_hit, arm_block, sview_next_block)
+                                        LLVMPositionBuilderAtEnd(builder, arm_block)
+                                        if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_arm_value:
+                                            _ = LLVMBuildStore(builder, sview_arm_value, result_slot)
+                                            _ = LLVMBuildBr(builder, done_block)
+                                        else:
+                                            declined <- true
+                                        LLVMPositionBuilderAtEnd(builder, sview_next_block)
+                                    else:
+                                        declined <- true
+                                    continue
+                                if is_catch_all_pattern(arm.pattern):
+                                    _ = LLVMBuildBr(builder, arm_block)
+                                    LLVMPositionBuilderAtEnd(builder, arm_block)
+                                    if arm.pattern is Pattern.Binding(sview_bind_name):
+                                        sview_bind_storage: mutable darray[u8] = []
+                                        sview_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(scrutinee_type, structs, ctx), sview_to_cstr(sview_bind_name, sview_bind_storage))
+                                        _ = LLVMBuildStore(builder, scrutinee_raw, sview_bind_slot)
+                                        declare_local(local_scope, sview_bind_name, sview_bind_slot, scrutinee_type)
+                                    if emit_expression(arm_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_default_value:
+                                        _ = LLVMBuildStore(builder, sview_default_value, result_slot)
+                                        _ = LLVMBuildBr(builder, done_block)
+                                        saw_default <- true
+                                    else:
+                                        declined <- true
+                                    continue
+                                declined <- true
+                                continue
                             # `match s: "yes":` — a CSTR scrutinee compares each string-literal
                             # arm with `ctx_streq(s, "lit") != 0`; `_`/binder is the catch-all.
                             if cstr_scrutinee:
