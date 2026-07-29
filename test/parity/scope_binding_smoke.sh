@@ -426,6 +426,24 @@ def main() -> i64:
 EOF
 )" 7
 
+# 16. `.count` on a CALL RESULT. Same shape as case 15 — a darray read through a value
+#     with no header address, needing a spill. It dropped `Easm.parse_layout_module`, the
+#     last shared easm symbol, worth 10 more corpus programs.
+differential darray_count_on_call_result "$(cat <<'EOF'
+def make() -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = []
+        out.push(1)
+        out.push(2)
+        return out
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        return make().count.i64()
+EOF
+)" 2
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
