@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Stage1 backend smoke: local SCOPE and `is`-binding SLOTS, asserted by exit code.
+# Stage1 backend smoke: local SCOPE, `is`-binding SLOTS, and match ALTERNATION arms,
+# asserted by exit code.
 #
-# Both cases here are miscompiles that a fixture gate cannot see by inspection — the
+# These are backend gaps the gen3 bootstrap exposed — cases a fixture gate cannot see by
+# inspection, because the
 # programs compile clean and then return the wrong answer (or segfault), because a load
 # reads an alloca that the taken path never stored. Both were found only when gen2 tried
 # to compile the compiler, and both are checked DIFFERENTIALLY: stage0 is the oracle, so
@@ -18,6 +20,10 @@
 #      the later path never stored. This is what killed gen2 on the compiler itself:
 #      `emit_statement_loops` declares `int64_type` in the darray-`for` branch and the
 #      range-`for` branch below it then allocated with that undominated slot.
+#
+#   3. MATCH ALTERNATION. `"u8" | "i8" | "bool": 1` — an arm with several literal options.
+#      stage1 declined the whole function (which DROPS it, so the link fails), rather than
+#      miscompiling it. Every option is compared and the results OR'd.
 #
 # Every compiled binary runs under a timeout: a scope bug can produce a spinning loop
 # rather than a wrong answer, and an untimed gate hangs with it.
@@ -189,6 +195,37 @@ def main() -> i64:
     return compute(20)
 EOF
 )" 41
+
+# 6. An alternation arm over an sview scrutinee. `width("i16")` takes the second arm's
+#    SECOND option and `width("u8")` the first arm's first, so an implementation that only
+#    ever compares one option per arm fails.
+differential match_alternation_arms "$(cat <<'EOF'
+def width(type_name: sview) -> i64:
+    return match type_name:
+        "u8" | "i8" | "bool": 1
+        "u16" | "i16": 2
+        "u32" | "i32": 4
+        _: 8
+
+
+def main() -> i64:
+    return width("i16") * 10 + width("u8")
+EOF
+)" 21
+
+# 7. The alternation fall-through: nothing matches, so the catch-all arm has to win.
+differential match_alternation_default "$(cat <<'EOF'
+def width(type_name: sview) -> i64:
+    return match type_name:
+        "u8" | "i8" | "bool": 1
+        "u16" | "i16": 2
+        _: 8
+
+
+def main() -> i64:
+    return width("f64")
+EOF
+)" 8
 
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
