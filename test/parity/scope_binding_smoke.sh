@@ -227,6 +227,31 @@ def main() -> i64:
 EOF
 )" 8
 
+# 8. `ptr != null` / `ptr == null` on a BARE pointer. A `void&` has no {i1,T} optional
+#    tag — null IS the absent value — so the test is a plain pointer compare. stage1 only
+#    accepted Optional operands here and declined (and therefore DROPPED) every std
+#    function guarding a raw pointer, e.g. `if state_bits != null:`.
+differential null_compare_bare_pointer "$(cat <<'EOF'
+def probe(state_bits: mutable void&) -> i64:
+    if state_bits != null:
+        return 7
+    return 3
+
+
+def probe_eq(state_bits: mutable void&) -> i64:
+    if state_bits == null:
+        return 1
+    return 9
+
+
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        x: mutable i64 = 5
+        bits: mutable void& = (&x).cast[mutable void&]
+        return probe(bits) * 10 + probe_eq(bits)
+EOF
+)" 79
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
