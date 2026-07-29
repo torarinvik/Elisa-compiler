@@ -649,6 +649,41 @@ def main() -> i64:
 EOF
 )" 42
 
+# 26. `==`/`!=` between an OPTIONAL ref and a plain ref — the arena walks its region list
+#     with `while current != null and current != region`. stage0 niche-optimizes an
+#     optional pointer to a bare pointer and compares directly; stage1 compares the
+#     payload pointer out of its {i1, ptr}. Walks to a target that IS in the list (must
+#     stop at index 2, not run off the end at 3) and one that is NOT (must reach the end),
+#     so a compare stuck at either always-true or always-false is caught.
+differential optional_ref_vs_ref_equality "$(cat <<'EOF'
+struct Chunk:
+    count: mutable i64
+    next: mutable heap Chunk&?
+
+
+def walk(head: mutable heap Chunk&?, target: heap Chunk&) -> i64 can[Abort.Panic]:
+    index: mutable i64 = 0
+    current: mutable heap Chunk&? = head
+    trusted Unsafe.AssumeProgress:
+        while current != null and current != target:
+            current <- current.next
+            index <- index + 1
+    return index
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        c: mutable Chunk = Chunk{count: 3, next: null}
+        b: mutable Chunk = Chunk{count: 2, next: (&c).cast[heap Chunk&]}
+        a: mutable Chunk = Chunk{count: 1, next: (&b).cast[heap Chunk&]}
+        head: mutable heap Chunk&? = (&a).cast[heap Chunk&]
+        found: i64 = walk(head, (&c).cast[heap Chunk&])
+        outside: mutable Chunk = Chunk{count: 9, next: null}
+        missing: i64 = walk(head, (&outside).cast[heap Chunk&])
+        return found * 20 + missing - 1
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
