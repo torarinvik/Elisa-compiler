@@ -529,6 +529,26 @@ def main() -> i64:
 EOF
 )" 42
 
+# 21. `xs.items[i] <- v` — a WRITE through the element-storage pointer of a BORROWED
+#     `darray[T]&` (how stores_core writes its region table). A darray is not a Struct, so
+#     both chain resolvers bailed and the assignment declined. Writes through `.items` but
+#     reads back through ORDINARY indexing, and leaves one slot untouched, so a store to
+#     the wrong base is caught rather than confirmed by its own read.
+differential darray_items_write "$(cat <<'EOF'
+def fill(xs: mutable darray[i64]&, at: usize, value: i64) -> void can[Abort.Panic]:
+    assert xs.items != null
+    xs.items[at] <- value
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[i64] = [1, 2, 3]
+        fill(&xs, 0.usize(), 10)
+        fill(&xs, 2.usize(), 30)
+        return xs[0] + xs[1] + xs[2]
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
