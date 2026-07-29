@@ -684,6 +684,33 @@ def main() -> i64:
 EOF
 )" 42
 
+# 27. `p.cast[uintptr]` where p is an OPTIONAL pointer — the string-length cache compares
+#     `entry.ptr.cast[uintptr] == ptr.cast[uintptr]`. Only a plain pointer source was
+#     accepted. stage0 holds an optional pointer as a bare pointer, so its ptrtoint reads
+#     the same value stage1 gets from payload field 1. Checked BOTH ways: the address
+#     taken through the optional must equal the one taken directly (so extracting the tag
+#     field, or the whole aggregate, fails), and an ABSENT optional must convert to 0.
+differential optional_pointer_uintptr_cast "$(cat <<'EOF'
+def addr_opt(p: u8&?) -> uintptr:
+    trusted Unsafe.PointerCast:
+        return p.cast[uintptr]
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        storage: mutable u8[8] = zeroed
+        direct: uintptr = (&storage[4]).uintptr()
+        via_opt: uintptr = addr_opt(&storage[4])
+        absent: uintptr = addr_opt(null)
+        total: mutable i64 = 0
+        if direct == via_opt:
+            total <- total + 40
+        if absent == 0.uintptr():
+            total <- total + 2
+        return total
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
