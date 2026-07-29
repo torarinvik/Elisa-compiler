@@ -12,18 +12,21 @@
 #            (gen2 trapped on any `when`)
 #   abddf8f  short-circuit `and`/`or` temporaries alloca'd once PER LOOP ITERATION, so a
 #            flat loop over ~200k tokens walked into the stack guard page
-#   OPEN     `ctx_aos_store_record` returns 0 inside Backend.disjoint_scan_expr — see
-#            memory `self-host-fixpoint-gap.md` and the tracked task
+#            an OR-chain of `is` tests gave each alternative its OWN binding slot, so a
+#            short-circuited alternative left the body reading a slot nothing ever stored
+#            (the garbage AST handle that reached ctx_aos_store_record)
+#            block-local declarations outlived their block, so a later sibling block
+#            resolved a shared name to the inner, never-stored slot
 #
 # Every one of those needed real input to surface. This script provides it.
 #
-# Deliberately NOT named *_smoke.sh: the aggregate gate runner globs `*_smoke.sh`, and
-# bootstrap closure is still open, so wiring this in would leave the gate permanently red
-# and train everyone to ignore it. Run it directly, and RENAME it to
-# self_host_gen3_smoke.sh the moment stage B reaches rc=0.
+# BOOTSTRAP IS CLOSED as of the scope/binding fixes: gen2 compiles the whole compiler and
+# gen3 reproduces itself byte-for-byte. All three stages are hard assertions now — this is
+# named *_smoke.sh so the aggregate gate runs it, and any regression turns the gate red.
 #
-# Stage A is a hard regression guard on the three fixed blockers.
-# Stage B is a ratchet on how far gen2 gets compiling the compiler itself.
+# Stage A is a hard regression guard on the fixed blockers.
+# Stage B requires gen2 to compile the compiler itself.
+# Stage C requires the FIXPOINT: gen3.o == gen4.o, byte-identical.
 set -uo pipefail
 set +m   # a crashing gen2 is an EXPECTED outcome here; don't let job control narrate it
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -31,13 +34,13 @@ BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 GEN2="$ROOT/build/self_host_gen2/elisac-stage1-gen2"
 WORK="$ROOT/build/gen3_check"; rm -rf "$WORK"; mkdir -p "$WORK"
 
-# The exit code stage B currently produces. 0 means the fixpoint CLOSED.
-# Any other value is a CHANGE and must be investigated, not silently re-baselined.
-BASELINE_GEN3_RC="${BASELINE_GEN3_RC:-139}"
+# The exit code stage B must produce. 0 = bootstrap closed; anything else is a REGRESSION
+# and must be investigated, not silently re-baselined.
+BASELINE_GEN3_RC="${BASELINE_GEN3_RC:-0}"
 
-fail() { echo "self_host_gen3_check FAIL: $1" >&2; exit 1; }
+fail() { echo "self_host_gen3_smoke FAIL: $1" >&2; exit 1; }
 
-[ -x "$BIN" ] || { echo "self_host_gen3_check SKIP: no seed ($BIN); run scripts/elisac_stage1.sh --seed"; exit 0; }
+[ -x "$BIN" ] || { echo "self_host_gen3_smoke SKIP: no seed ($BIN); run scripts/elisac_stage1.sh --seed"; exit 0; }
 # The seed is a CACHED artifact and nothing rebuilds it automatically — `self_host_gen2.sh`
 # happily builds gen2 from a stale gen1, which silently tests old code (this bit during
 # development: stage A read 0/4 purely because the seed predated the fixes). Same failure
@@ -73,7 +76,7 @@ guard when_or_columns \
   '05b3c03 — wildcard/or patterns in a when table'
 
 [ "$a_pass" -eq "$a_total" ] || fail "stage A regression: $a_pass/$a_total (a previously FIXED self-host blocker is back)"
-echo "self_host_gen3_check stage A OK: $a_pass/$a_total (fixed blockers still fixed)"
+echo "self_host_gen3_smoke stage A OK: $a_pass/$a_total (fixed blockers still fixed)"
 
 # ---- Stage B: gen2 compiles the compiler itself ----
 # Flattened the same way scripts/elisac_stage1.sh does, so this is exactly the gen3 input.
@@ -96,15 +99,32 @@ PY
 rc=0
 { ( { printf '%s\n' "$WORK/gen3.o"; cat "$WORK/flat.elisa"; } | "$GEN2" >"$WORK/gen3.log" 2>&1 ) || rc=$?; } 2>/dev/null
 
-if [ "$rc" -eq 0 ]; then
-    [ -s "$WORK/gen3.o" ] || fail "gen2 exited 0 but wrote no gen3 object"
-    echo "self_host_gen3_check: BOOTSTRAP CLOSED — gen2 compiled the compiler into gen3 ($(wc -c <"$WORK/gen3.o") bytes)."
-    echo "  Next: link gen3, diff it against gen2 (ideally byte-identical), rename this to *_smoke.sh, set BASELINE_GEN3_RC=0."
+[ "$rc" -eq "$BASELINE_GEN3_RC" ] \
+  || fail "stage B exit $rc, baseline $BASELINE_GEN3_RC — bootstrap closure BROKE. Re-diagnose (lldb bt on the gen3 input); do not just re-baseline."
+[ -s "$WORK/gen3.o" ] || fail "gen2 exited 0 but wrote no gen3 object"
+echo "self_host_gen3_smoke stage B OK: gen2 compiled the compiler into gen3 ($(wc -c <"$WORK/gen3.o") bytes)."
+
+# ---- Stage C: the FIXPOINT — gen3 must reproduce itself exactly ----
+# Compiling is only half the claim. If gen2 and gen3 disagree about any emission, gen3's
+# own output differs from what built it, and the compiler is not a fixed point of itself.
+# gen4 is built from the SAME input file and the SAME output path as gen3, so a byte diff
+# here is a real semantic difference, not a path or timestamp artifact.
+LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+if [ ! -x "$LLVM_CONFIG" ]; then
+    echo "self_host_gen3_smoke stage C SKIP: no llvm-config at $LLVM_CONFIG"
     exit 0
 fi
+LIBDIR="$("$LLVM_CONFIG" --libdir)"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+[ -f "$RUNTIME_OBJ" ] || fail "no runtime object at $RUNTIME_OBJ (run scripts/build_runtime_object.sh)"
+clang -Wl,-dead_strip -o "$WORK/elisac-stage1-gen3" "$WORK/gen3.o" "$RUNTIME_OBJ" \
+      -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" >"$WORK/gen3.link.log" 2>&1 \
+  || fail "gen3 object did not link (see $WORK/gen3.link.log)"
 
-[ "$rc" -eq "$BASELINE_GEN3_RC" ] \
-  || fail "stage B exit $rc, baseline $BASELINE_GEN3_RC — the bootstrap failure CHANGED. Re-diagnose (lldb bt on the gen3 input); do not just re-baseline."
-echo "self_host_gen3_check stage B: gen2 still cannot compile the compiler (exit $rc == known baseline)."
-echo "  Open blocker: see memory self-host-fixpoint-gap.md. Stage A proves no regression."
+rc4=0
+{ ( { printf '%s\n' "$WORK/gen4.o"; cat "$WORK/flat.elisa"; } | "$WORK/elisac-stage1-gen3" >"$WORK/gen4.log" 2>&1 ) || rc4=$?; } 2>/dev/null
+[ "$rc4" -eq 0 ] || fail "gen3 could not compile the compiler (exit $rc4) — gen2 and gen3 disagree"
+cmp -s "$WORK/gen3.o" "$WORK/gen4.o" \
+  || fail "gen3.o != gen4.o — the compiler does not reproduce itself; gen2 and gen3 emit differently"
+echo "self_host_gen3_smoke stage C OK: gen3.o == gen4.o byte-identical (FIXPOINT)."
 exit 0
