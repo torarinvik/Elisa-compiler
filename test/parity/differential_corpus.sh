@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# BEHAVIOURAL differential: compile a corpus of real programs with BOTH compilers, RUN
+# both, and require the same exit code.
+#
+# Every other parity check asks whether stage1 ACCEPTS what stage0 accepts. None of them
+# ask whether it computes the SAME ANSWER. That gap is not theoretical: `.uintptr()` on a
+# ref returned the pointee instead of the address, so `&a[0]` and `&a[4]` compared equal —
+# no decline, no link error, a fully green 132-check gate, and a byte-identical gen3
+# fixpoint, because the compiler's own source only ever takes `&xs[0]`. A construct the
+# compiler uses only in its degenerate form is invisible to self-hosting.
+#
+# Outcomes per program:
+#   MATCH     both compiled, linked, ran, same exit code                — the good case
+#   MISMATCH  both ran, DIFFERENT exit codes                            — a silent miscompile
+#   DECLINED  stage0 built it, stage1 could not compile or link it      — the acceptance gap
+#   SKIP      stage0 itself could not build/link/run it                 — not a parity signal
+#
+# MISMATCH is ratcheted at zero: a wrong answer is worse than a decline, because a decline
+# is loud (an undefined symbol at link) and a wrong answer is not. DECLINED is ratcheted
+# separately and is expected to fall as backend coverage grows.
+#
+#   Usage: test/parity/differential_corpus.sh [--verbose]
+set -uo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+ELISACORE_BIN="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
+STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+BASELINE="$ROOT/test/fixtures/differential_corpus.baseline"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
+VERBOSE=0
+[[ "${1:-}" == "--verbose" ]] && VERBOSE=1
+
+[ -x "$ELISACORE_BIN" ] || { echo "differential_corpus SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
+[ -x "$STAGE1" ]        || { echo "differential_corpus SKIP: no stage1 seed at $STAGE1"; exit 0; }
+[ -f "$RUNTIME_OBJ" ]   || { echo "differential_corpus SKIP: no runtime object"; exit 0; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+
+# A program that loops forever is a FAILURE, not a hang: bound every run. Compilation is
+# bounded too — a backend that diverges would otherwise stall the gate.
+RUN() { timeout 10 "$@" >/dev/null 2>&1 </dev/null; }
+COMPILE_TIMEOUT=60
+
+match=0; mismatch=0; declined=0; skipped=0
+: > "$WORK/mismatches.txt"
+: > "$WORK/declines.txt"
+
+# The corpus: every .elisa in the stage1 tree with a top-level `main`. Excludes build
+# outputs and the vendored runtime (compiled as a unit elsewhere, not as a program).
+# (a while-read loop, not `mapfile`: the system bash here is 3.2, which lacks it)
+# -print0/-0 is REQUIRED: the repo path contains spaces, and plain xargs split on them,
+# silently yielding an EMPTY corpus and a green "0 programs" run.
+# stage0's own tree is included when present: it is far larger than this repo's fixtures
+# and exercises constructs stage1's source never uses — which is exactly where a
+# degenerate-form blind spot like the `.uintptr()` bug hides. Self-filtering: anything
+# stage0 cannot build and run is skipped, so scratch files cost nothing but time.
+# An ARRAY, not a space-joined string: these paths contain spaces, and word-splitting a
+# joined string yields nonexistent directories and a silent EMPTY corpus.
+CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
+[ -d "$ELISA_CORE" ] && CORPUS_DIRS+=("$ELISA_CORE")
+find "${CORPUS_DIRS[@]}" -name '*.elisa' -print0 2>/dev/null \
+  | xargs -0 grep -l '^def main' 2>/dev/null | sort > "$WORK/programs.txt"
+
+# Read the list on FD 3, and give every child /dev/null for stdin. Reading it on plain
+# stdin loses the corpus: a compiled program that reads input DRAINS the list, and the loop
+# silently stops after one entry (observed: "1 programs" from a 59-program corpus).
+while IFS= read -r src <&3; do
+    [ -n "$src" ] || continue
+    name="$(basename "$src" .elisa)"
+
+    # ---- stage0 is the ORACLE. If IT cannot produce a running program, this file is not
+    # a parity signal (a fixture meant to fail to compile, a driver needing stdin, ...).
+    if ! timeout "$COMPILE_TIMEOUT" "$ELISACORE_BIN" -emit obj -o "$WORK/$name.s0.o" "$src" >/dev/null 2>&1 </dev/null; then
+        skipped=$((skipped + 1)); continue
+    fi
+    if ! clang -Wl,-dead_strip -o "$WORK/$name.s0" "$WORK/$name.s0.o" "$RUNTIME_OBJ" >/dev/null 2>&1; then
+        skipped=$((skipped + 1)); continue
+    fi
+    RUN "$WORK/$name.s0"; s0_rc=$?
+    # 124 = timeout. An oracle that hangs cannot arbitrate.
+    if [ "$s0_rc" -eq 124 ]; then skipped=$((skipped + 1)); continue; fi
+
+    # ---- stage1. A compile or link failure is the ACCEPTANCE gap, not a wrong answer:
+    # a declined function is dropped, so the link fails with an undefined symbol.
+    if ! timeout "$COMPILE_TIMEOUT" env ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" \
+            -o "$WORK/$name.s1.o" "$src" >/dev/null 2>&1 </dev/null; then
+        declined=$((declined + 1)); echo "$name (compile)" >> "$WORK/declines.txt"; continue
+    fi
+    if ! clang -Wl,-dead_strip -o "$WORK/$name.s1" "$WORK/$name.s1.o" "$RUNTIME_OBJ" >/dev/null 2>&1; then
+        declined=$((declined + 1)); echo "$name (link: a declined function was dropped)" >> "$WORK/declines.txt"; continue
+    fi
+    RUN "$WORK/$name.s1"; s1_rc=$?
+
+    if [ "$s0_rc" -eq "$s1_rc" ]; then
+        match=$((match + 1))
+    else
+        mismatch=$((mismatch + 1))
+        printf '%-44s stage0=%-4s stage1=%-4s  %s\n' "$name" "$s0_rc" "$s1_rc" "$src" >> "$WORK/mismatches.txt"
+    fi
+done 3< "$WORK/programs.txt"
+
+# The loop body runs in THIS shell (redirect, not a pipe), so the counters below are the
+# real totals — piping `find` straight into `while` would subshell them away to zero.
+
+total=$((match + mismatch + declined + skipped))
+echo "differential corpus: $total programs — $match match, $mismatch MISMATCH, $declined declined, $skipped skipped (stage0 could not arbitrate)" >&2
+
+if [ "$mismatch" -gt 0 ]; then
+    echo "SILENT MISCOMPILES — both compilers ran the program, answers differ:" >&2
+    cat "$WORK/mismatches.txt" >&2
+fi
+if [ "$VERBOSE" -eq 1 ] && [ "$declined" -gt 0 ]; then
+    echo "declined by stage1:" >&2
+    cat "$WORK/declines.txt" >&2
+fi
+
+# Ratchet. MISMATCH must be 0 — a wrong answer is never acceptable. DECLINED rides a
+# baseline that should only ever fall.
+allowed_declines=0
+[ -f "$BASELINE" ] && allowed_declines="$(tr -d '[:space:]' < "$BASELINE")"
+
+rc=0
+if [ "$mismatch" -gt 0 ]; then
+    echo "differential corpus FAILED: $mismatch program(s) produce a DIFFERENT ANSWER under stage1" >&2
+    rc=1
+fi
+if [ "$declined" -gt "$allowed_declines" ]; then
+    echo "differential corpus FAILED: $declined declines exceeds baseline $allowed_declines" >&2
+    echo "  (see test/fixtures/differential_corpus.baseline)" >&2
+    rc=1
+fi
+if [ "$declined" -lt "$allowed_declines" ]; then
+    echo "differential corpus: IMPROVED to $declined declines (baseline $allowed_declines) — commit it: echo $declined > $BASELINE" >&2
+fi
+[ "$rc" -eq 0 ] && echo "differential corpus OK: $match match, 0 mismatches, $declined declined (baseline $allowed_declines)" >&2
+exit "$rc"
