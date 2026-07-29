@@ -549,36 +549,34 @@ def main() -> i64:
 EOF
 )" 42
 
-# 22. The same `.items` write where the ELEMENT is an OPTIONAL (`darray[heap Node&?]`,
-#     which is what stores_core's region table actually holds). The ref-base index path
-#     accepted only struct and numeric elements, so an optional element declined. Optional
-#     is `{i1, T}`, so it strides like any aggregate — but this is a WRITE, where a wrong
-#     stride corrupts SILENTLY, so the fixture stores two distinct payloads at
-#     non-adjacent slots and reads both back: a half-element stride mixes the tag bit into
-#     the payload and the sum breaks.
-differential darray_items_write_optional_element "$(cat <<'EOF'
-struct Node:
+# 22. A const extent on an annotation whose HEAD IS NOT A BARE NAME (`heap Entry&?[NB]`).
+#     Case 20 covers `i64[CAP]`, which dispatches on the named path; a qualified element
+#     type takes the OTHER branch, which still required a literal. The runtime's two string
+#     caches are declared exactly this way. Reads slot 3, so an extent folded
+#     to the wrong bound traps rather than passing.
+differential array_global_const_extent_qualified_head "$(cat <<'EOF'
+const NB: usize = 4
+
+
+struct Entry:
     tag: mutable i64
 
 
-def fill(xs: mutable darray[heap Node&?]&, at: usize, n: heap Node&?) -> void can[Abort.Panic]:
-    assert xs.items != null
-    xs.items[at] <- n
+global mutable cache: heap Entry&?[NB] = zeroed
+
+
+def peek(bucket: usize) -> i64 can[Abort.Panic]:
+    entry: mutable heap Entry&? = cache[bucket]
+    if entry == null:
+        return 0
+    return entry.tag
 
 
 def main() -> i64:
-    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
-        a: mutable Node = Node{tag: 7}
-        b: mutable Node = Node{tag: 35}
-        xs: mutable darray[heap Node&?] = [null, null, null]
-        fill(&xs, 0.usize(), (&a).cast[heap Node&])
-        fill(&xs, 2.usize(), (&b).cast[heap Node&])
-        total: mutable i64 = 0
-        if xs[0] is first:
-            total <- total + first.tag
-        if xs[2] is second:
-            total <- total + second.tag
-        return total
+    can Abort.Panic, Unsafe.PointerCast:
+        a: mutable Entry = Entry{tag: 7}
+        cache[0] <- (&a).cast[heap Entry&]
+        return peek(0.usize()) * 6 + peek(1.usize()) + peek(3.usize())
 EOF
 )" 42
 
