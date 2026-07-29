@@ -1,0 +1,434 @@
+# Stage1 parser — `func` declarations (`extend Parser: private:`). Covers the function
+# header (generic params, parameter list with defaults and refinements, return type and
+# effects, declared thread slots) and both body forms. Continues
+# parser_types_extern.elisa; split out to keep each part file under 600 lines.
+
+extend Parser:
+    private:
+        def record_generic_func_metadata(parser: lmut Parser, declaration: Ast::Decl, name: sview, line: u32) -> void:
+            has_generic: mutable bool = false
+            for parameter_line in parser.generic_param_lines |has_generic, line|:
+                has_generic <- true if parameter_line < 2147483648 and parameter_line == line
+            return if not has_generic
+            parser.generic_func_decls <- parser.generic_func_decls.push(declaration)
+            parser.generic_func_decl_names <- parser.generic_func_decl_names.push(name)
+            parser.generic_func_decl_lines <- parser.generic_func_decl_lines.push(line)
+
+        def function_declaration(parser: lmut Parser) -> Ast::Decl?:
+            rebind token: Token, parser = parser.expect(TokenKind.Def)
+            rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            function_name: sview = Lexer::text_or_empty(name_token, parser.source)
+            # Capture this method's own `changes self.FIELD` set for frame-condition conformance
+            # (the signature clause is otherwise skipped). Keyed under the impl sentinel; only
+            # methods whose name matches a protocol method are checked, so plain functions are inert.
+            parser <- parser.capture_signature_changes(function_name, 3900000003)
+            parser <- parser.scan_preserves_conflict(function_name)
+            error_family: sview = parser.header_error_family()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: "__error_return", line: token.line}) if error_family != ""
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: error_family, line: token.line}) if error_family != ""
+            parser <- parser.capture_header_error_families(token.line) if error_family != ""
+            parser.declared_thread_slots <- parser.declared_thread_slots.truncate(0)
+            parser.lmut_param_names <- parser.lmut_param_names.truncate(0)
+            parser.mutable_param_names <- parser.mutable_param_names.truncate(0)
+
+            # Leading `@name` decorators were captured just before dispatch; snapshot them
+            # now before any nested parse clobbers the parser's pending buffer.
+            decorators: mutable darray[Ast::Annotation] = []
+            for decorator in parser.pending_decorators |decorators|:
+                decorators.push(decorator)
+
+            # Optional generic/region params `[T]`, `[K, V]`, `[@r]` between name and `(`.
+            rebind accepted_lbracket: bool, parser = parser.accept(TokenKind.LBracket)
+            parser <- parser.reject_legacy_region_params() if accepted_lbracket
+            parser <- parser.capture_function_generic_params(token.line) if accepted_lbracket
+
+            param_items: mutable darray[Ast::ParamDecl] = []
+            rebind accepted_lparen: bool, parser = parser.accept(TokenKind.LParen)
+            parser <- parser.parse_param_list(param_items, token.line) if accepted_lparen
+
+            effects: mutable darray[sview] = []
+
+            rebind accepted_arrow: bool, parser = parser.accept(TokenKind.Arrow)
+            parser <- parser.validate_conditional_ensures_return() if accepted_arrow
+            parser <- parser.capture_typestate_postcondition(function_name, param_items, token.line)
+            rebind return_type: Ast::Expr?, parser = parser.capture_return_type_and_effects(accepted_arrow)
+            return_region_token: Token = parser.cursor()
+            rebind accepted_return_region: bool, parser = parser.accept(TokenKind.At)
+            return_region_name_token: Token = parser.cursor()
+            # Consume the region name ONLY after an `@`; a bare identifier here is the first word
+            # of a signature clause (`ensures`/`requires`) and must survive for capture.
+            has_return_region: bool = accepted_return_region and parser.peek() == TokenKind.Ident
+            parser <- parser.advance_region_name(has_return_region)
+            parser.local_region_annotations <- parser.local_region_annotations.push(Ast::LocalRegionAnnotation{name: "__region_return", type_expression: get return_type else (Ast::Expr.Invalid), region: Lexer::text_or_empty(return_region_name_token, parser.source), line: token.line}) if has_return_region
+            parser <- parser.error_at(Ast::ParseErrorKind.ExpectedToken, return_region_token) if accepted_return_region and not has_return_region
+            parser <- parser.validate_declared_thread_slots(token)
+            # The return-type `expression()` consumes a trailing effect grant
+            # (`-> T can[...]`) via skip_trailing_can; recover it from the parser. The
+            # copy lives HERE, where `effects` is locally owned — growing it through a
+            # ref param inside the helper detaches the growth from its arena ("darray
+            # reserve requires an active in <arena>: scope" at codegen).
+            effects.extend(parser.captured_effects) if accepted_arrow
+
+            # Remaining signature clauses before the body colon: a bare `can` grant when
+            # there is no return type, plus error sets (`raises ...`) and contracts
+            # (`requires`/`ensures`), which are consumed without modeling.
+            parser <- parser.parse_signature_clauses(effects)
+
+            # Drain this signature's captured `requires`/`ensures` into the file-level side-channel,
+            # keyed by the owning function's line. (Snapshot BEFORE the body parse — a nested `def`
+            # re-enters parse_signature_clauses and clobbers the per-signature buffers.)
+            parser <- parser.drain_signature_contracts(token.line)
+
+            # Drain this signature's plain `fulfills LawName` clauses, keyed by the owning
+            # function name (sentinel line 3900000021), for the effect-law fulfillment check.
+            fulfills_index: mutable usize = 0
+            while fulfills_index < parser.pending_fulfills.count |parser, fulfills_index|:
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: parser.pending_fulfills[fulfills_index], line: 3900000021})
+                fulfills_index <- fulfills_index + 1
+            parser.pending_fulfills <- parser.pending_fulfills.truncate(0)
+
+            # Drain `fulfills SUBJECT is LAW` clauses as lockstep (law, subject) annotation
+            # pairs keyed by the function name (sentinels 3900000029 law, 3900000030 subject),
+            # for the frame-law conformance check.
+            is_index: mutable usize = 0
+            while is_index < parser.pending_fulfills_is_law.count |parser, is_index|:
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: parser.pending_fulfills_is_law[is_index], line: 3900000029})
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: parser.pending_fulfills_is_subject[is_index], line: 3900000030})
+                is_index <- is_index + 1
+            parser.pending_fulfills_is_subject <- parser.pending_fulfills_is_subject.truncate(0)
+            parser.pending_fulfills_is_law <- parser.pending_fulfills_is_law.truncate(0)
+
+            # Record this function's line if its signature declared an `error[...]` return
+            # set, so the RaiseWithoutErrorSet check can exempt it (drained into
+            # File.error_set_func_lines by parse_file).
+            parser.error_set_func_lines <- parser.error_set_func_lines.push(token.line) if parser.signature_has_error_set
+
+            rebind accepted_assign: bool, parser = parser.accept(TokenKind.Assign)
+            is_block_body: bool = not accepted_assign and parser.peek() == TokenKind.Colon
+            # Expression-bodied function `def f(...) -> T = EXPR` == a body of a single
+            # `return EXPR` (same `=` "definition is this expression" as law/type/alias).
+            signature_has_pool: mutable bool = false
+            for effect in effects |signature_has_pool|:
+                signature_has_pool <- true if effect == "Pool" or (sview_len(effect) > 4 and effect[0:4] == "Pool")
+            parser.active_pool_depth <- parser.active_pool_depth + 1 if signature_has_pool
+            rebind resolved_body: darray[Ast::Stmt], parser = parser.resolve_function_body(accepted_assign, is_block_body)
+            parser.active_pool_depth <- parser.active_pool_depth - 1 if signature_has_pool
+
+            return (Ast::Decl.Func(function_name, param_items, return_type, resolved_body, effects, decorators, token.line))
+
+        # Capture the declaration names in a function generic header, entered just
+        # after `[`. A top-level identifier immediately after `[` or `,` is a generic
+        # parameter (`T`, `N`); constraints after `:` are skipped. Region parameters
+        # beginning with `@` are intentionally omitted from value-name resolution.
+        def capture_function_generic_params(parser: lmut Parser, function_line: u32) -> void:
+            expect_name: mutable bool = true
+            expect_bound: mutable bool = false
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof |parser, expect_name, expect_bound, depth|:
+                kind: TokenKind = parser.peek()
+                break if depth == 0 and kind == TokenKind.RBracket
+                token: Token = parser.cursor()
+                # `errorset R` — an error-set generic parameter. Record R on the side-table
+                # (keyed by the function line, matching Decl.Func's line) and do NOT treat the
+                # `errorset` keyword itself as a generic type name.
+                is_errorset_kw: bool = depth == 0 and expect_name and kind == TokenKind.Ident and Lexer::text_or_empty(token, parser.source) == "errorset" and parser.peek_at(1) == TokenKind.Ident
+                errorset_name_token: Token = parser.tokens[parser.position + 1] if is_errorset_kw else token
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__errorset_param", name: Lexer::text_or_empty(errorset_name_token, parser.source), line: function_line}) if is_errorset_kw
+                is_generic_name: bool = depth == 0 and expect_name and kind == TokenKind.Ident and not is_errorset_kw
+                is_bound_name: bool = depth == 0 and expect_bound and kind == TokenKind.Ident
+                region_parameter: bool = depth == 0 and kind == TokenKind.At and parser.peek_at(1) == TokenKind.Ident
+                region_name_token: Token = parser.tokens[parser.position + 1] if region_parameter else token
+                parser.local_region_annotations <- parser.local_region_annotations.push(Ast::LocalRegionAnnotation{name: "__region_param", type_expression: (Ast::Expr.Invalid), region: Lexer::text_or_empty(region_name_token, parser.source), line: function_line}) if region_parameter
+                parser.generic_param_lines <- parser.generic_param_lines.push(function_line) if is_generic_name
+                parser.generic_param_names <- parser.generic_param_names.push(Lexer::text_or_empty(token, parser.source)) if is_generic_name
+                # Bound rows share the proven-stable generic side table. The high line
+                # bit distinguishes metadata from ordinary parameter rows, so existing
+                # exact-line scope consumers ignore it.
+                parser.generic_param_lines <- parser.generic_param_lines.push(function_line + 2147483648) if is_bound_name
+                parser.generic_param_names <- parser.generic_param_names.push(Lexer::text_or_empty(token, parser.source)) if is_bound_name
+                expect_name <- false if depth == 0 and (is_generic_name or is_errorset_kw or kind == TokenKind.At)
+                expect_bound <- true if depth == 0 and kind == TokenKind.Colon
+                expect_bound <- false if is_bound_name or (depth == 0 and kind == TokenKind.Comma)
+                expect_name <- true if depth == 0 and kind == TokenKind.Comma
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket
+                depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket
+                parser, _ <- parser.advance()
+            parser, _ <- parser.expect(TokenKind.RBracket)
+
+        def param_type_has_ref_ahead(parser: Parser&) -> bool:
+            scan: mutable usize = 0
+            depth: mutable int = 0
+            while parser.peek_at(scan) != TokenKind.Eof and parser.peek_at(scan) != TokenKind.Newline |scan, depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                true return if kind == TokenKind.Ampersand or kind == TokenKind.Lmut
+                break if depth == 0 and kind == TokenKind.Comma
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket
+                depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket
+                scan <- scan + 1
+            return false
+
+        # Dispatch the function body form. A region-polymorphic `darray[Ast::Stmt]`
+        # can't be threaded out through a mutable-ref out-param (the callee's `in
+        # auto:` region doesn't survive the store into the caller's ref — "value
+        # escapes its `in auto:` scope") the way a plain-value out-param can, and a
+        # 3-way ternary chain of real calls doesn't thread `parser` reliably either, so
+        # each branch is a sequential value-first exit guard instead: call the one real
+        # function that applies and return its (region-poly) result directly.
+        def resolve_function_body(parser: lmut Parser, accepted_assign: bool, is_block_body: bool) -> darray[Ast::Stmt]:
+            no_declared_body: darray[Ast::Stmt] = []
+            no_declared_body return if not accepted_assign and not is_block_body
+            # The expression-body parse must be cond-guarded: calling it unconditionally
+            # consumes the block `:` as an expression and breaks every block-bodied def.
+            # Both branches are re-materialized locally: a darray forwarded straight out
+            # of this frame dies with this frame's auto region (see parse_block).
+            rebind expr_body: darray[Ast::Stmt], parser = parser.parse_expression_bodied_function_if(accepted_assign)
+            adopted_expr_body: darray[Ast::Stmt] = [statement for statement in expr_body]
+            adopted_expr_body return if accepted_assign
+            rebind block_body: darray[Ast::Stmt], parser = parser.parse_block()
+            return [statement for statement in block_body]
+
+        def parse_expression_bodied_function_if(parser: lmut Parser, cond: bool) -> darray[Ast::Stmt]:
+            no_body: darray[Ast::Stmt] = []
+            no_body return if not cond
+            rebind body: darray[Ast::Stmt], parser = parser.parse_expression_bodied_function()
+            return [statement for statement in body]
+
+        # Parse the balanced `(param, ...)` list into `param_items`, entered with the
+        # cursor just past the opening `(`.
+        def parse_param_list(parser: lmut Parser, param_items: mutable darray[Ast::ParamDecl]&, function_line: u32) -> void:
+            while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser|:
+                rebind keep_going: bool, parser = parser.parse_one_param(param_items, function_line)
+                break if not keep_going
+            parser, _ <- parser.expect(TokenKind.RParen)
+
+        # Parse the contextual `where PRED` suffix used on type annotations. The
+        # base expression is already parsed; retain the predicate structurally.
+        def parse_refinement_suffix(parser: lmut Parser, base: Ast::Expr) -> Ast::Expr:
+            where_token: Token = parser.cursor()
+            has_where: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(where_token, parser.source) == "where"
+            parser, _ <- parser.advance() if has_where
+            rebind predicate_opt: Ast::Expr?, parser = parser.expression_if(has_where)
+            if predicate_opt is predicate:
+                return (Ast::Expr.Refinement(base, predicate, where_token.line))
+            return base
+
+        # A default-value expression is evaluated in a scope WITHOUT the function's own
+        # parameters (`def f(x: i64, y: i64 = x)` — `x` is undefined there). The parser
+        # discards the default expr, so record a `__default_param_ref` marker for every
+        # bare-Ident reference to an already-seen parameter; the semantic layer turns each
+        # into an `undefined identifier` diagnostic (unless the name also names a global).
+        def record_default_param_refs_ahead(parser: lmut Parser, param_items: darray[Ast::ParamDecl]&, function_line: u32) -> void:
+            scan: mutable usize = 0
+            depth: mutable int = 0
+            while parser.peek_at(scan) != TokenKind.Eof and parser.peek_at(scan) != TokenKind.Newline |scan, depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                break if depth == 0 and (kind == TokenKind.Comma or kind == TokenKind.RParen)
+                if kind == TokenKind.Ident and (scan == 0 or parser.peek_at(scan - 1) != TokenKind.Dot):
+                    token: Token = parser.tokens[parser.position + scan]
+                    name: sview = Lexer::text_or_empty(token, parser.source)
+                    for parameter in param_items:
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__default_param_ref", name: name, line: function_line}) if parameter.name == name
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket
+                depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket
+                scan <- scan + 1
+
+        # Parse one `(param, ...)` entry, appending it to `param_items` when a full name
+        # + type clause was captured. Returns whether the caller's comma-separated loop
+        # should continue (a trailing comma was accepted).
+        def record_tuple_type(parser: lmut Parser, expression: Ast::Expr) -> void:
+            if expression is Expr.Tuple(elements, line):
+                parser.tuple_type_starts <- parser.tuple_type_starts.push(parser.tuple_type_elements.count)
+                parser.tuple_type_counts <- parser.tuple_type_counts.push(elements.count)
+                parser.tuple_type_lines <- parser.tuple_type_lines.push(line)
+                for element in elements |parser|:
+                    parser.tuple_type_elements <- parser.tuple_type_elements.push(element)
+
+        def parse_one_param(parser: lmut Parser, param_items: mutable darray[Ast::ParamDecl]&, function_line: u32) -> bool:
+            # Legacy leading `mutable name:` form; the canonical `name: mutable T&` form
+            # is captured by the type expression itself.
+            rebind leading_mutable: bool, parser = parser.accept(TokenKind.Mutable)
+            rebind param_name: Token, parser = parser.expect(TokenKind.Ident)
+            parser, _ <- parser.expect(TokenKind.Colon)
+            parser <- parser.reject_positional_tuple_type_ahead()
+            is_lmut_param: bool = parser.peek() == TokenKind.Lmut
+            is_ref_type_ahead: bool = parser.param_type_has_ref_ahead()
+            parser.lmut_param_names <- parser.lmut_param_names.push(Lexer::text_or_empty(param_name, parser.source)) if is_lmut_param
+            is_mutable_param: bool = leading_mutable or parser.peek() == TokenKind.Mutable or is_lmut_param
+            parser.mutable_param_names <- parser.mutable_param_names.push(Lexer::text_or_empty(param_name, parser.source)) if is_mutable_param
+            # Parameter annotations are type context too. In particular, a callback
+            # parameter such as `body: fn(Slice[T]) -> R` must be parsed as a function-type
+            # expression rather than as an ordinary `fn(...)` call/reference. Keep the
+            # context scoped so defaults and subsequent signature clauses retain their
+            # normal expression parsing rules.
+            previous_type_context: bool = parser.in_type_annotation
+            parser.in_type_annotation <- true
+            # `fn(...) -> R` is ambiguous with a call to a value named `fn`. In a
+            # declaration parameter's type slot the grammar is unambiguous, so dispatch
+            # directly to the lambda/type parser; this also preserves each complete
+            # callback parameter expression for backend ABI resolution.
+            function_type_token: Token = parser.cursor()
+            is_function_type_head: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(function_type_token, parser.source) == "fn"
+            rebind parsed_type_expression: Ast::Expr?, parser = parser.expression()
+            parser.in_type_annotation <- previous_type_context
+            type_expression: mutable Ast::Expr? = parsed_type_expression
+            if type_expression is param_type:
+                rebind refined_type: Ast::Expr, parser = parser.parse_refinement_suffix(param_type)
+                type_expression <- refined_type
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(param_name, parser.source), name: "__typestate_ref_param", line: function_line}) if is_ref_type_ahead
+
+            # Function-type error set: `fn(...) -> T error[R]`. The function type is
+            # represented by the existing expression shape; consume its error-set
+            # selector so it remains part of this parameter rather than an orphan token.
+            parser <- parser.record_parameter_error_union(param_name.line) if type_expression is param_type and not is_function_type_head
+            if parser.peek() == TokenKind.Error:
+                parser, _ <- parser.advance()
+                rebind accepted_error_lbracket: bool, parser = parser.accept(TokenKind.LBracket)
+                parser <- parser.skip_bracketed_group() if accepted_error_lbracket
+
+            # Optional `@region` binding on the param type (`out: darray[u8]& @r`) pinning
+            # the parameter to a region-polymorphic region declared in the `[@r]` generic
+            # list. The region name is a selector, not a value ref; retain it in the
+            # File side table for call-result lifetime inference.
+            rebind accepted_at: bool, parser = parser.accept(TokenKind.At)
+            region_name_token: Token = parser.cursor()
+            rebind accepted_region_name: bool, parser = parser.accept(TokenKind.Ident)
+            parser.local_region_annotations <- parser.local_region_annotations.push(Ast::LocalRegionAnnotation{name: Lexer::text_or_empty(param_name, parser.source), type_expression: get type_expression else (Ast::Expr.Invalid), region: Lexer::text_or_empty(region_name_token, parser.source), line: function_line}) if accepted_at and accepted_region_name and function_line > 0
+
+            # Trailing function-type effect clause on the param type (`body: fn(usize) ->
+            # i64 can[Abort.Panic]`): skip the balanced `can[...]` so it isn't mistaken
+            # for the next parameter.
+            can_clause_cursor: Token = parser.cursor()
+            is_can_clause: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(can_clause_cursor, parser.source) == "can" and parser.peek_at(1) == TokenKind.LBracket
+            has_param_effects: bool = is_can_clause or parser.captured_effects.count > 0
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__effect_param", name: Lexer::text_or_empty(param_name, parser.source), line: function_line}) if has_param_effects
+            parser <- parser.skip_param_can_clause() if is_can_clause
+
+            # Optional default value `param: T = <expression>`. Recorded on the
+            # ParamDecl (pushed below, once the full param clause is known) so arity
+            # checking can split required from defaultable parameters.
+            rebind param_has_default: bool, parser = parser.accept(TokenKind.Assign)
+            if param_has_default:
+                parser <- parser.record_default_param_refs_ahead(param_items, function_line)
+                rebind default_expression: Ast::Expr?, parser = parser.expression()
+
+            if type_expression is param_type:
+                param: Ast::ParamDecl = Ast::ParamDecl{name: Lexer::text_or_empty(param_name, parser.source), type_expression: param_type, is_mutable: leading_mutable, has_default: param_has_default}
+                parser <- parser.record_tuple_type(param_type)
+                param_items.push(param)
+
+            rebind accepted_comma: bool, parser = parser.accept(TokenKind.Comma)
+            return accepted_comma
+
+        # Skip a param's trailing `can[...]` effect clause, entered with the cursor on
+        # the `can` identifier.
+        def skip_param_can_clause(parser: lmut Parser) -> void:
+            parser, _ <- parser.advance()               # `can`
+            parser, _ <- parser.accept(TokenKind.LBracket)
+            parser <- parser.skip_bracketed_group()
+
+        # Capture the return-type expression and any trailing effect grant (`-> T
+        # can[...]`, recovered from `parser.captured_effects` via skip_trailing_can
+        # inside `expression()`) when `has_arrow` holds; a no-operator (returns `null`)
+        # otherwise. `Ast::Expr?` can't be an out-param (`mutable Ast::Expr?&` doesn't
+        # parse — the `?` closes the type before `&` can bind) and threading it plus
+        # `parser` out of a two-real-branch ternary at the call site isn't reliable
+        # (also true of `-> T` vs "no type" here), so the branch is folded into this
+        # single call via a value-first exit guard instead.
+        def advance_region_name(parser: lmut Parser, gate: bool) -> void:
+            return if not gate
+            parser, _ <- parser.advance()
+
+        # Move the per-signature captured contracts into the file-level accumulators, tagged with
+        # the owning function's line, then clear the per-signature buffers.
+        def drain_signature_contracts(parser: lmut Parser, function_line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                contract_index: mutable usize = 0
+                while contract_index < parser.captured_contract_kinds.count |parser, contract_index|:
+                    parser.signature_contract_lines <- parser.signature_contract_lines.push(function_line)
+                    parser.signature_contract_kinds <- parser.signature_contract_kinds.push(parser.captured_contract_kinds[contract_index])
+                    parser.signature_contract_exprs <- parser.signature_contract_exprs.push(parser.captured_contract_exprs[contract_index])
+                    contract_index <- contract_index + 1
+                parser.captured_contract_kinds <- parser.captured_contract_kinds.truncate(0)
+                parser.captured_contract_exprs <- parser.captured_contract_exprs.truncate(0)
+
+        def capture_return_type_and_effects(parser: lmut Parser, has_arrow: bool) -> Ast::Expr?:
+            null return if not has_arrow
+            parser <- parser.reject_positional_tuple_type_ahead()
+            parser <- parser.capture_declared_thread_slots()
+            # A `fn(A)->R` RETURN type is followed by the function's own `:` body; mark type
+            # context so a lambda-type's block-body branch does not swallow that body.
+            parser.in_type_annotation <- true
+            rebind return_type_opt: Ast::Expr?, parser = parser.expression()
+            parser.in_type_annotation <- false
+            if return_type_opt is return_type:
+                rebind refined_return_type: Ast::Expr, parser = parser.parse_refinement_suffix(return_type)
+                parser <- parser.record_tuple_type(refined_return_type)
+                return refined_return_type
+            return return_type_opt
+
+        def capture_declared_thread_slots(parser: lmut Parser) -> void:
+            return if parser.peek() != TokenKind.LParen
+            scan: mutable usize = 1
+            depth: mutable int = 1
+            while depth > 0 and parser.peek_at(scan) != TokenKind.Eof |parser, scan, depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                if depth == 1 and kind == TokenKind.Ident and parser.peek_at(scan + 1) == TokenKind.Colon:
+                    label_token: Token = parser.tokens[parser.position + scan]
+                    is_lmut_slot: bool = parser.peek_at(scan + 2) == TokenKind.Lmut
+                    parser.declared_thread_slots <- parser.declared_thread_slots.push(Lexer::text_or_empty(label_token, parser.source)) if is_lmut_slot
+                depth <- depth + 1 if kind == TokenKind.LParen
+                depth <- depth - 1 if kind == TokenKind.RParen
+                scan <- scan + 1
+
+        def validate_declared_thread_slots(parser: lmut Parser, token: Token) -> void:
+            for slot in parser.declared_thread_slots |parser|:
+                found: mutable bool = false
+                for param in parser.lmut_param_names |found|:
+                    found <- true if slot == param
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not found
+
+        # Expression-bodied function `def f(...) -> T = EXPR`: builds the one-element
+        # body as a list literal (not `[]`+push): a push-only fresh darray does not
+        # survive the region-polymorphic return, but a seeded literal is adopted.
+        def parse_expression_bodied_function(parser: lmut Parser) -> darray[Ast::Stmt]:
+            value_token: Token = parser.cursor()
+            return_value: mutable Ast::Expr? = null
+            rebind value_expr_opt: Ast::Expr?, parser = parser.expression()
+            if value_expr_opt is value_expr:
+                return_value <- value_expr
+            rebind body: darray[Ast::Stmt], parser = parser.single_statement_body((Ast::Stmt.Return(return_value, value_token.line)))
+            return [statement for statement in body]
+
+
+        # Guest-overlay member clause (`struct X layout(guest, size: N):`): a trailing
+        # `at OFFSET [requires size >= N]` after a field. The offset and minimum-size guard
+        # aren't modeled in stage1; consume them so the member line parses. A no-op when the
+        # next token isn't the contextual `at` keyword.
+        def skip_guest_overlay_clause(parser: lmut Parser, field_name: sview) -> void:
+            at_token: Token = parser.cursor()
+            is_at_clause: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(at_token, parser.source) == "at"
+            parser <- parser.consume_guest_overlay_at_clause(field_name) if is_at_clause
+
+        # `at OFFSET [requires size >= N]`, entered with the cursor on `at`. The offset
+        # (and any minimum-size guard) is RECORDED (owner "__overlay_field" /
+        # "__overlay_reqsize", the numeric riding in `line`) so the guest-overlay checks
+        # can validate accesses; fields follow their struct's "__overlay_struct" marker.
+        def consume_guest_overlay_at_clause(parser: lmut Parser, field_name: sview) -> void:
+            parser, _ <- parser.advance()               # `at`
+            offset_token: Token = parser.cursor()
+            parser, _ <- parser.advance()               # OFFSET (int/hex literal)
+            offset_value: u32 = parse_layout_number(Lexer::text_or_empty(offset_token, parser.source))
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__overlay_field", name: field_name, line: offset_value})
+            requires_token: Token = parser.cursor()
+            has_requires: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(requires_token, parser.source) == "requires"
+            if has_requires:
+                # `requires size >= N` — capture N before skipping the tail.
+                bound_value: mutable u32 = 0
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |parser, scan, bound_value|:
+                    scan_token: Token = parser.tokens[parser.position + scan]
+                    candidate: u32 = parse_layout_number(Lexer::text_or_empty(scan_token, parser.source)) if scan_token.kind == TokenKind.IntLit else 0
+                    bound_value <- candidate if candidate != 0
+                    scan <- scan + 1
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__overlay_reqsize", name: field_name, line: bound_value})
+            parser <- parser.skip_to_line_end() if has_requires

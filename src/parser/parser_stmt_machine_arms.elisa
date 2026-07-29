@@ -1,0 +1,383 @@
+# Stage1 parser — `machine` arm parsing and coverage (`extend Parser: public:`). Covers
+# arm parsing, transition validation, arm-body lowering, the arm-condition builder, and
+# the literal-domain coverage check. Continues parser_stmt_machine.elisa; split out to
+# keep each part file under 600 lines.
+
+extend Parser:
+    public:
+        def parse_machine_state_decl(parser: lmut Parser) -> MachineStateAst:
+            parser, _ <- parser.advance()   # `state`
+            rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            name_text: sview = Lexer::text_or_empty(name_token, parser.source)
+            field_names: mutable darray[sview] = []
+            rebind accepted_paren: bool, parser = parser.accept(TokenKind.LParen)
+            if accepted_paren:
+                while true |parser, field_names|:
+                    rebind field_token: Token, parser = parser.expect(TokenKind.Ident)
+                    field_names.push(Lexer::text_or_empty(field_token, parser.source))
+                    parser, _ <- parser.expect(TokenKind.Colon)
+                    # The field type is a resolution selector, parsed and dropped (the
+                    # scalarized local is untyped, like a loop-header accumulator).
+                    parser, _ <- parser.expression()
+                    # Optional `where COND` refinement: consumed and dropped (stage1
+                    # does not model refinement types; stage0 enforces them).
+                    where_token: Token = parser.cursor()
+                    if where_token.kind == TokenKind.Ident and Lexer::text_or_empty(where_token, parser.source) == "where":
+                        parser, _ <- parser.advance()
+                        parser, _ <- parser.expression()
+                    rebind accepted_comma: bool, parser = parser.accept(TokenKind.Comma)
+                    break if not accepted_comma
+                parser, _ <- parser.expect(TokenKind.RParen)
+            parser, _ <- parser.accept(TokenKind.Newline)
+            return MachineStateAst{name: name_text, field_names: field_names, line: name_token.line}
+
+        # docs/123 §5 (the machine arm law): an arm body is STRAIGHT-LINE. All discrimination
+        # lives in the arm HEADER (`State, input if guard:`), so hidden branching/looping
+        # (`if`/`match`/`while`/`for`) inside a body is refused — as is `continue` (every arm
+        # ends in `-> State`, `return`, or `break`). `return`/`break` stay legal: they are arm
+        # EXITS. Stage1 now OWNS this refusal (docs/125 step 13) rather than deferring to
+        # stage0; mirrors stage0's validateMachineArmStmt (parser/machine.go). A `can`/`with`/…
+        # wrapper is transparent — its body is retested one level down.
+        def machine_over_arm_stmt_illegal(statement: Ast::Stmt) -> bool:
+            return match statement:
+                Ast::Stmt.If(condition, then_body, else_body, line):
+                    true
+                Ast::Stmt.While(condition, body, line):
+                    true
+                Ast::Stmt.For(bind, variables, iterable, body, line):
+                    true
+                Ast::Stmt.Match(scrutinee, arms, line):
+                    true
+                Ast::Stmt.Continue(label, line):
+                    true
+                Ast::Stmt.Block(kind, clause, binding, body, line):
+                    any inner in body where machine_over_arm_stmt_illegal(inner)
+                _:
+                    false
+
+        def parse_machine_arm(parser: lmut Parser) -> MachineArmAst:
+            rebind state_token: Token, parser = parser.expect(TokenKind.Ident)
+            state_text: sview = Lexer::text_or_empty(state_token, parser.source)
+            payloads: mutable darray[MachinePayloadPat] = []
+            rebind accepted_paren: bool, parser = parser.accept(TokenKind.LParen)
+            if accepted_paren:
+                if parser.peek() != TokenKind.RParen:
+                    while true |parser, payloads|:
+                        rebind pat: MachinePayloadPat, parser = parser.parse_machine_payload_pat()
+                        payloads.push(pat)
+                        rebind accepted_comma: bool, parser = parser.accept(TokenKind.Comma)
+                        break if not accepted_comma
+                parser, _ <- parser.expect(TokenKind.RParen)
+            parser, _ <- parser.expect(TokenKind.Comma)
+
+            input_literals: mutable darray[Ast::Expr] = []
+            input_ranges: mutable darray[MachineRange] = []
+            input_wild: mutable bool = false
+            input_bind: mutable sview = ""
+            input_token: Token = parser.cursor()
+            if input_token.kind == TokenKind.Ident and Lexer::text_or_empty(input_token, parser.source) == "_":
+                parser, _ <- parser.advance()
+                input_wild <- true
+            elif input_token.kind == TokenKind.Ident and (parser.peek_at(1) == TokenKind.If or parser.peek_at(1) == TokenKind.Colon):
+                # Input BIND pattern: matches any input, names it for the guard/body.
+                parser, _ <- parser.advance()
+                input_bind <- Lexer::text_or_empty(input_token, parser.source)
+                input_wild <- true
+            else:
+                while true |parser, input_literals, input_ranges|:
+                    rebind literal_opt: Ast::Expr?, parser = parser.unary_expression()
+                    literal: Ast::Expr = get literal_opt else (Ast::Expr.Invalid)
+                    # docs/122 §5.2: a `..<` / `..=` after the alternative is a range bound.
+                    if parser.peek() == TokenKind.RangeLt or parser.peek() == TokenKind.RangeLe:
+                        rebind range_token: Token, parser = parser.advance()
+                        rebind hi_opt: Ast::Expr?, parser = parser.unary_expression()
+                        hi_expression: Ast::Expr = get hi_opt else (Ast::Expr.Invalid)
+                        input_ranges.push(MachineRange{lo: literal, hi: hi_expression, inclusive: range_token.kind == TokenKind.RangeLe})
+                    else:
+                        input_literals.push(literal)
+                    rebind accepted_pipe: bool, parser = parser.accept(TokenKind.Pipe)
+                    break if not accepted_pipe
+
+            guard: mutable Ast::Expr = (Ast::Expr.Absent)
+            if parser.peek() == TokenKind.If:
+                parser, _ <- parser.advance()
+                rebind guard_opt: Ast::Expr?, parser = parser.expression()
+                guard_value: Ast::Expr = get guard_opt else (Ast::Expr.Invalid)
+                guard <- guard_value
+
+            parser, _ <- parser.expect(TokenKind.Colon)
+            parser, _ <- parser.expect(TokenKind.Newline)
+            parser, _ <- parser.expect(TokenKind.Indent)
+
+            body: mutable darray[Ast::Stmt] = []
+            has_transition: mutable bool = false
+            target: mutable sview = ""
+            target_line: mutable u32 = state_token.line
+            transition_args: mutable darray[Ast::Expr] = []
+            saw_decision: mutable bool = false
+            while true |parser, body, has_transition, target, target_line, transition_args, saw_decision|:
+                parser <- parser.skip_newlines()
+                break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+                match parser.peek():
+                    TokenKind.Arrow:
+                        rebind arrow_token: Token, parser = parser.advance()
+                        rebind target_token: Token, parser = parser.expect(TokenKind.Ident)
+                        has_transition <- true
+                        saw_decision <- true
+                        target <- Lexer::text_or_empty(target_token, parser.source)
+                        target_line <- arrow_token.line
+                        rebind accepted_args: bool, parser = parser.accept(TokenKind.LParen)
+                        if accepted_args:
+                            rebind parsed_args: darray[Ast::Expr], parser = parser.parse_machine_call_arguments()
+                            transition_args <- parsed_args
+                            parser, _ <- parser.expect(TokenKind.RParen)
+                        parser, _ <- parser.accept(TokenKind.Newline)
+                    _:
+                        body_head_token: Token = parser.cursor()
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, body_head_token) if saw_decision
+                        rebind stmt_opt: Ast::Stmt?, parser = parser.statement()
+                        if stmt_opt is body_statement:
+                            # Arm law: refuse a branch/loop/`continue` in the body (see
+                            # machine_over_arm_stmt_illegal). Keep the statement structurally.
+                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, body_head_token) if machine_over_arm_stmt_illegal(body_statement)
+                            body.push(body_statement)
+                            saw_decision <- true if machine_statement_exits(body_statement)
+                            parser <- parser.skip_trailing_can(true)
+                            parser, _ <- parser.accept(TokenKind.Newline)
+                        else:
+                            parser, _ <- parser.advance()   # error recovery: never spin
+            parser, _ <- parser.expect(TokenKind.Dedent)
+
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, state_token) if not saw_decision
+
+            return MachineArmAst{
+                state_name: state_text,
+                payloads: payloads,
+                input_literals: input_literals,
+                input_ranges: input_ranges,
+                input_wild: input_wild,
+                input_bind: input_bind,
+                guard: guard,
+                body: body,
+                has_transition: has_transition,
+                target: target,
+                target_line: target_line,
+                transition_args: transition_args,
+                line: state_token.line
+            }
+
+        def machine_statement_exits(statement: Ast::Stmt) -> bool:
+            return match statement:
+                Ast::Stmt.Return(value, line): true
+                Ast::Stmt.Break(label, line): true
+                _: false
+
+        def machine_assignment_root(statement: Ast::Stmt) -> sview:
+            return match statement:
+                Ast::Stmt.Assign(target, operator, value, line): machine_over_root(target)
+                _: ""
+
+        def validate_machine_transitions(parser: lmut Parser, states: darray[MachineStateAst], arms: darray[MachineArmAst], start_state: sview, start_args: darray[Ast::Expr], input_expression: Ast::Expr, token: Token) -> void:
+            over_root: sview = machine_over_root(input_expression)
+            start_found: mutable bool = start_state == ""
+            for state in states |parser, start_found|:
+                if state.name == start_state:
+                    start_found <- true
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if start_args.count != state.field_names.count
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not start_found
+            for arm in arms |parser|:
+                target_found: mutable bool = not arm.has_transition
+                for state in states |parser, target_found|:
+                    if arm.has_transition and state.name == arm.target:
+                        target_found <- true
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if arm.transition_args.count != state.field_names.count
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not target_found
+                for statement in arm.body |parser|:
+                    root: sview = machine_assignment_root(statement)
+                    if root != "":
+                        for payload in arm.payloads |parser|:
+                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if payload.bind != "" and root == payload.bind
+                        for param in parser.mutable_param_names |parser|:
+                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if root == param and root != over_root
+
+        # Lower one arm: payload-pattern conds AND input conds AND guard; body plus the
+        # transition's payload assigns + mode rebind (self-state rebinds and
+        # `field <- field` no-op assigns elided, mirroring stage0).
+        def lower_machine_arm_body(arm: MachineArmAst&, states: darray[MachineStateAst], state_fields: darray[sview], enum_name: sview, mode_var: sview, line: u32) -> darray[Ast::Stmt]:
+            lowered: mutable darray[Ast::Stmt] = []
+            # Payload bind aliases (bind name != field name).
+            for index in 0..<arm.payloads.count:
+                continue if index >= state_fields.count
+                pat: MachinePayloadPat = arm.payloads[index]
+                lowered.push((Ast::Stmt.VarDecl(pat.bind, (Ast::Expr.Invalid), (Ast::Expr.Ident(state_fields[index], arm.line)), arm.line))) if pat.bind != "" and pat.bind != state_fields[index]
+            for statement in arm.body:
+                lowered.push(statement)
+            for target_state in states:
+                # `depth <- depth` no-op assigns elided (arg ident == field name).
+                continue if not arm.has_transition or target_state.name != arm.target
+                for index in 0..<target_state.field_names.count:
+                    lowered.push((Ast::Stmt.Assign((Ast::Expr.Ident(target_state.field_names[index], arm.target_line)), TokenKind.LArrow, arm.transition_args[index], arm.target_line))) if index < arm.transition_args.count and machine_expr_ident_name(arm.transition_args[index]) != target_state.field_names[index]
+                lowered.push((Ast::Stmt.Assign((Ast::Expr.Ident(mode_var, arm.target_line)), TokenKind.LArrow, (Ast::Expr.Field((Ast::Expr.Ident(enum_name, arm.target_line)), arm.target, arm.target_line)), arm.target_line))) if arm.target != arm.state_name
+            lowered.push((Ast::Stmt.Expr((Ast::Expr.Invalid), line))) if lowered.count == 0
+            return lowered
+
+        # Build the arm's dispatch condition (Invalid when irrefutable).
+        def machine_arm_condition(arm: MachineArmAst&, state_fields: darray[sview], input_var: sview) -> Ast::Expr:
+            condition: mutable Ast::Expr = (Ast::Expr.Invalid)
+            for index in 0..<arm.payloads.count:
+                continue if index >= state_fields.count
+                pat: MachinePayloadPat = arm.payloads[index]
+                # Only literal payload patterns (not wildcards or binders) become equality tests.
+                continue if pat.is_wild or pat.bind != ""
+                # Literal payload pattern = equality test; predicate used verbatim.
+                term: mutable Ast::Expr = pat.condition
+                term <- (Ast::Expr.Binary((Ast::Expr.Ident(state_fields[index], arm.line)), TokenKind.EqEq, pat.condition, arm.line)) if machine_expr_is_literal(pat.condition)
+                condition <- term if machine_expr_is_invalid(condition) else (Ast::Expr.Binary(condition, TokenKind.And, term, arm.line))
+            if not arm.input_wild:
+                input_condition: mutable Ast::Expr = (Ast::Expr.Invalid)
+                for literal in arm.input_literals:
+                    comparison: Ast::Expr = (Ast::Expr.Binary((Ast::Expr.Ident(input_var, arm.line)), TokenKind.EqEq, literal, arm.line))
+                    input_condition <- comparison if machine_expr_is_invalid(input_condition) else (Ast::Expr.Binary(input_condition, TokenKind.Or, comparison, arm.line))
+                # Range alternatives lower to `input >= lo and input <(=) hi`, OR'd in.
+                for range in arm.input_ranges:
+                    lo_test: Ast::Expr = (Ast::Expr.Binary((Ast::Expr.Ident(input_var, arm.line)), TokenKind.GtEq, range.lo, arm.line))
+                    hi_operator: TokenKind = TokenKind.LtEq if range.inclusive else TokenKind.Lt
+                    hi_test: Ast::Expr = (Ast::Expr.Binary((Ast::Expr.Ident(input_var, arm.line)), hi_operator, range.hi, arm.line))
+                    range_test: Ast::Expr = (Ast::Expr.Binary(lo_test, TokenKind.And, hi_test, arm.line))
+                    input_condition <- range_test if machine_expr_is_invalid(input_condition) else (Ast::Expr.Binary(input_condition, TokenKind.Or, range_test, arm.line))
+                condition <- input_condition if machine_expr_is_invalid(condition) else (Ast::Expr.Binary(condition, TokenKind.And, input_condition, arm.line))
+            condition <- (arm.guard if machine_expr_is_invalid(condition) else (Ast::Expr.Binary(condition, TokenKind.And, arm.guard, arm.line))) if not machine_expr_is_invalid(arm.guard)
+            return condition
+
+        # docs/123 §5 per-state coverage, stage1-OWNED (docs/125 step 13). All three
+        # refusals are parser-decidable (no types), 0-FP, and faithful to stage0's
+        # parser/machine.go (~L518-561) — stage0 already accepts stage1's own machines and
+        # runs these same checks, so a faithful port cannot regress self-hostable.
+
+        # A payload list is unconditional when no element is a literal/predicate condition
+        # (a condition is a non-wild, non-binding payload — mirrors machine_arm_condition).
+        def machine_payloads_unconditional(arm: MachineArmAst&) -> bool:
+            return not (any pat in arm.payloads where not pat.is_wild and pat.bind == "")
+
+        # An arm matches EVERY input: an unguarded `_`/bind input with an unconditional
+        # payload. Such an arm discharges a state's coverage.
+        def machine_arm_irrefutable(arm: MachineArmAst&) -> bool:
+            return arm.input_wild and machine_expr_is_invalid(arm.guard) and machine_payloads_unconditional(arm)
+
+        # An open-domain (char/int) input literal — a state carrying one can never be
+        # exhaustive without a final `_`, and the parser proves it without types.
+        def machine_expr_open_domain(expression: Ast::Expr) -> bool:
+            return match expression:
+                Ast::Expr.IntLit(value): true
+                Ast::Expr.CharLit(text): true
+                _: false
+
+        def machine_arm_open_domain(arm: MachineArmAst&) -> bool:
+            return not arm.input_wild and (arm.input_ranges.count > 0 or (any literal in arm.input_literals where machine_expr_open_domain(literal)))
+
+        # Exact literal equality for the per-state duplicate-input check (0-FP: fires only
+        # when the SAME literal is handled twice, never on possibly-overlapping forms).
+        def machine_literal_equal(a: Ast::Expr, b: Ast::Expr) -> bool:
+            match a:
+                Ast::Expr.IntLit(a_value):
+                    match b:
+                        Ast::Expr.IntLit(b_value):
+                            return a_value == b_value
+                        _:
+                            return false
+                Ast::Expr.CharLit(a_text):
+                    match b:
+                        Ast::Expr.CharLit(b_text):
+                            return when_text_equal(a_text, b_text)
+                        _:
+                            return false
+                Ast::Expr.StringLit(a_text):
+                    match b:
+                        Ast::Expr.StringLit(b_text):
+                            return when_text_equal(a_text, b_text)
+                        _:
+                            return false
+                Ast::Expr.BoolLit(a_value):
+                    match b:
+                        Ast::Expr.BoolLit(b_value):
+                            return a_value == b_value
+                        _:
+                            return false
+                _:
+                    return false
+            return false
+
+        # Per declared state: no arms is an error; an irrefutable arm before the last makes
+        # the rest unreachable; an open-domain state with no irrefutable arm cannot be
+        # total. Errors anchor at the machine head token.
+        def check_machine_coverage(parser: lmut Parser, states: darray[MachineStateAst], arms: darray[MachineArmAst], machine_token: Token) -> void:
+            state_index: mutable usize = 0
+            while state_index < states.count |parser, state_index|:
+                state_name: sview = states[state_index].name
+                total_for_state: mutable usize = 0
+                counting: mutable usize = 0
+                while counting < arms.count |total_for_state, counting|:
+                    total_for_state <- total_for_state + 1 if arms[counting].state_name == state_name
+                    counting <- counting + 1
+                has_wildcard: mutable bool = false
+                has_open_domain: mutable bool = false
+                seen: mutable usize = 0
+                # Literal inputs already handled by an earlier unguarded, payload-
+                # unconditional arm of this state — a repeat is unreachable (docs/123 §5).
+                seen_literals: mutable darray[Ast::Expr] = []
+                arm_index: mutable usize = 0
+                while arm_index < arms.count |parser, has_wildcard, has_open_domain, seen, seen_literals, arm_index|:
+                    if arms[arm_index].state_name == state_name:
+                        seen <- seen + 1
+                        if machine_arm_irrefutable(arms[arm_index]):
+                            has_wildcard <- true
+                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, machine_token) if seen < total_for_state
+                        has_open_domain <- true if machine_arm_open_domain(arms[arm_index])
+                        # Only an unguarded, payload-unconditional arm claims exclusive
+                        # coverage of a literal, so only those participate in the check.
+                        if machine_expr_is_invalid(arms[arm_index].guard) and machine_payloads_unconditional(arms[arm_index]):
+                            literal_index: mutable usize = 0
+                            while literal_index < arms[arm_index].input_literals.count |parser, seen_literals, literal_index|:
+                                literal: Ast::Expr = arms[arm_index].input_literals[literal_index]
+                                duplicate: mutable bool = false
+                                for previous in seen_literals:
+                                    duplicate <- true if machine_literal_equal(previous, literal)
+                                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, machine_token) if duplicate
+                                seen_literals.push(literal) if not duplicate
+                                literal_index <- literal_index + 1
+                    arm_index <- arm_index + 1
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, machine_token) if total_for_state == 0
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, machine_token) if has_open_domain and not has_wildcard
+                state_index <- state_index + 1
+
+        # docs/125 §9 Tier-2: the classifier function name of a `machine over` input, or "" when
+        # the input is not a bare free-function call (a method-call / char input is open-domain,
+        # already handled by the parser's per-state coverage check).
+        def machine_input_callee(expression: Ast::Expr) -> sview:
+            match expression:
+                Ast::Expr.Call(callee, arguments, argument_names, call_line):
+                    return machine_expr_ident_name(callee)
+                _:
+                    return ""
+
+        # The variant name of a `Enum.Variant` tag input (a Field expr), or "" for a literal /
+        # range / non-tag input.
+        def machine_arm_variant_tag(expression: Ast::Expr) -> sview:
+            match expression:
+                Ast::Expr.Field(object, field, field_line):
+                    return field
+                _:
+                    return ""
+
+        # Record MachineCoverageRow arm-atoms of a classifier-input machine (docs/125 §9 Tier-2):
+        # one row per spelled variant tag + one wildcard-marker row per wildcard/bind arm.
+        # Non-classifier inputs record nothing — open-domain totality is the parser's job.
+        def record_machine_coverage(parser: lmut Parser, arms: darray[MachineArmAst], input_expression: Ast::Expr, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                input_callee: sview = machine_input_callee(input_expression)
+                return if input_callee == ""
+                for arm in arms |parser|:
+                    parser.machine_coverage <- parser.machine_coverage.push(Ast::MachineCoverageRow{input_callee: input_callee, state_name: arm.state_name, tag: "", has_wildcard: true, line: line}) if arm.input_wild
+                    for literal in arm.input_literals |parser|:
+                        tag: sview = machine_arm_variant_tag(literal)
+                        parser.machine_coverage <- parser.machine_coverage.push(Ast::MachineCoverageRow{input_callee: input_callee, state_name: arm.state_name, tag: tag, has_wildcard: false, line: line}) if tag != ""

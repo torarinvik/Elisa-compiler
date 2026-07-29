@@ -1,0 +1,469 @@
+# Stage1 parser — `extern` and `export` declarations (`extend Parser: private:`). Covers
+# the extern signature and its trailing body, the export forms (type, global, alias,
+# re-export), and the header probes that read effect grants, contracts, segment
+# ownership, and error families off an extern line. Continues parser_types.elisa; split
+# out to keep each part file under 600 lines.
+
+extend Parser:
+    private:
+        # `extern <signature>` / `extern <Name>` (FFI import or opaque type) and
+        # `export fn name -> target` / `extern:`/`export:` blocks. Their internals
+        # aren't modeled yet; consume the declaration line (and any indented block) so
+        # the surrounding module parses. Recorded as an Invalid declaration node.
+        def extern_declaration(parser: lmut Parser) -> Ast::Decl?:
+            rebind token: Token, parser = parser.advance()              # `extern` / `export`
+            is_export: bool = Lexer::text_or_empty(token, parser.source) == "export"
+            is_export_global: bool = is_export and parser.peek() == TokenKind.Global
+            export_head: Token = parser.cursor()
+            is_export_type: bool = is_export and parser.peek() == TokenKind.Ident and Lexer::text_or_empty(export_head, parser.source) == "type"
+            # Threading both the parsed `Ast::Decl` and the advanced `parser` out of a
+            # two-real-branch ternary (`A() if cond else B()`) isn't reliable here, so
+            # each branch is routed through a dedicated single-call out-param helper
+            # instead (guarded single-target reassigns, like `advance_when` elsewhere).
+            decl: mutable Ast::Decl = (Ast::Decl.Invalid)
+            parser <- parser.capture_export_global_decl(token, decl) if is_export_global
+            parser <- parser.capture_export_type_decl(token, decl) if is_export_type
+            parser <- parser.capture_extern_signature_decl(token, decl) if not is_export_global and not is_export_type
+            return decl
+
+        def capture_export_type_decl(parser: lmut Parser, token: Token, decl: mutable Ast::Decl&) -> void:
+            parser, _ <- parser.advance()
+            target_token: Token = parser.cursor()
+            target_name: sview = Lexer::text_or_empty(target_token, parser.source) if parser.peek() == TokenKind.Ident else ""
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_name, name: "__export_type", line: token.line}) if target_name != ""
+            # Preserve the public spelling of a concrete export (`export type T as Public`).
+            # The old parser discarded everything after T, which made the backend unable to
+            # name exported aggregate definitions in a C ABI header.
+            alias_name: mutable sview = ""
+            scan: mutable usize = 1
+            while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |parser, alias_name|:
+                if parser.peek_at(scan) == TokenKind.As and parser.peek_at(scan + 1) == TokenKind.Ident:
+                    alias_token: Token = parser.tokens[parser.position + scan + 1]
+                    alias_name <- Lexer::text_or_empty(alias_token, parser.source)
+                scan <- scan + 1
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: alias_name, name: target_name, line: token.line}) if alias_name != "" and target_name != ""
+            parser <- parser.skip_extern_line_remainder()
+            decl <- (Ast::Decl.Extern(target_name, parser.extern_params.count.u32(), 0, false, false, "", parser.pending_decorators, token.line))
+
+        # `is_export_global` branch of `extern_declaration`, isolated to a single real
+        # call so the caller's guarded reassign threads `parser` cleanly.
+        def capture_export_global_decl(parser: lmut Parser, token: Token, decl: mutable Ast::Decl&) -> void:
+            rebind parsed: Ast::Decl, parser = parser.parse_export_global_extern(token)
+            decl <- parsed
+
+        # The non-`export global` branch of `extern_declaration`. Same single-call
+        # isolation as `capture_export_global_decl` above.
+        def capture_extern_signature_decl(parser: lmut Parser, token: Token, decl: mutable Ast::Decl&) -> void:
+            rebind parsed: Ast::Decl, parser = parser.parse_extern_signature_and_body(token)
+            decl <- parsed
+
+        # `export global Mod::name [as alias]`: record the public alias when present,
+        # otherwise the final target segment. The full target is stage0's concern;
+        # stage1 only needs one symbol name.
+        def parse_export_global_extern(parser: lmut Parser, token: Token) -> Ast::Decl:
+            parser, _ <- parser.advance()               # `global`
+            exported_name: mutable sview = ""
+            target_name: mutable sview = ""
+            while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, exported_name|:
+                is_alias: bool = parser.peek() == TokenKind.As and parser.peek_at(1) == TokenKind.Ident
+                is_plain_ident: bool = not is_alias and parser.peek() == TokenKind.Ident
+                parser <- parser.capture_export_alias(exported_name) if is_alias
+                parser <- parser.capture_export_part(exported_name) if is_plain_ident
+                target_name <- exported_name if is_plain_ident else target_name
+                parser <- parser.advance_when(not is_alias and not is_plain_ident)
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_name, name: "__export_global", line: token.line}) if target_name != ""
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: exported_name, name: target_name, line: token.line}) if exported_name != "" and target_name != ""
+            return (Ast::Decl.Extern(exported_name, parser.extern_params.count.u32(), 0, false, false, "", parser.pending_decorators, token.line))
+
+        # `as alias` — consume the `as` and record the alias identifier's text.
+        def capture_export_alias(parser: lmut Parser, exported_name: mutable sview&) -> void:
+            parser, _ <- parser.advance()               # `as`
+            rebind alias_token: Token, parser = parser.advance()
+            exported_name <- Lexer::text_or_empty(alias_token, parser.source)
+
+        # A bare `Mod::name` path segment — consume it and record its text (later
+        # segments overwrite earlier ones, matching "the final target segment").
+        def capture_export_part(parser: lmut Parser, exported_name: mutable sview&) -> void:
+            rebind part_token: Token, parser = parser.advance()
+            exported_name <- Lexer::text_or_empty(part_token, parser.source)
+
+        # The non-`export global` extern forms: `export fn NAME …` / `export def NAME …`
+        # / typed `extern name: T` / `extern:`/`export:` blocks.
+        def parse_extern_signature_and_body(parser: lmut Parser, token: Token) -> Ast::Decl:
+            # `export fn NAME …` / `export def NAME …`: skip the leading func/def word
+            # so the captured name is the exported symbol, not the keyword.
+            parser, _ <- parser.accept(TokenKind.Def)
+            parser <- parser.skip_export_func_word() if parser.peek() == TokenKind.Ident
+            # The external name is the first identifier; record it so it becomes a symbol.
+            name_cursor: Token = parser.cursor()
+            is_name_ident: bool = parser.peek() == TokenKind.Ident
+            name: mutable sview = Lexer::text_or_empty(name_cursor, parser.source) if is_name_ident else ""
+            parser <- parser.advance_when(is_name_ident)
+            rebind accepted_generic_header: bool, parser = parser.accept(TokenKind.LBracket)
+            parser <- parser.skip_bracketed_group() if accepted_generic_header
+            error_family: sview = parser.header_error_family()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__error_return", line: token.line}) if error_family != ""
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: error_family, line: token.line}) if error_family != ""
+            parser <- parser.capture_header_error_families(token.line) if error_family != ""
+            is_export_signature: bool = Lexer::text_or_empty(token, parser.source) == "export"
+            fixed_array_scan: mutable usize = 0
+            has_fixed_array_type: mutable bool = false
+            while is_export_signature and parser.peek_at(fixed_array_scan) != TokenKind.Newline and parser.peek_at(fixed_array_scan) != TokenKind.Eof |fixed_array_scan, has_fixed_array_type|:
+                has_fixed_array_type <- true if parser.peek_at(fixed_array_scan) == TokenKind.LBracket and (parser.peek_at(fixed_array_scan + 1) == TokenKind.IntLit or parser.peek_at(fixed_array_scan + 1) == TokenKind.HexLit)
+                fixed_array_scan <- fixed_array_scan + 1
+            has_fixed_array_boundary: bool = has_fixed_array_type
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__export_array", line: token.line}) if has_fixed_array_boundary
+            has_params: bool = parser.peek() == TokenKind.LParen
+            parser <- parser.reject_extern_param_defaults() if is_export_signature and has_params
+            arity: mutable u32 = 0
+            variadic: mutable bool = false
+            param_start: u32 = parser.extern_params.count.u32()
+            parser <- parser.scan_extern_params(arity, variadic) if has_params
+            extern_return_type: mutable sview = parser.extern_return_type_head()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__extern_return", name: extern_return_type, line: token.line}) if extern_return_type != ""
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__extern_return_ptr", name: name, line: token.line}) if extern_return_type != "" and parser.extern_return_is_pointer()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__extern_effect", line: token.line}) if parser.header_has_signature_can()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__extern_segment_owner", line: token.line}) if parser.header_grants_segment_owner()
+            parser <- parser.record_extern_segment_flow(name, token.line) if name != ""
+            extern_shape: sview = parser.extern_return_darray_shape()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__extern_return_shape", name: extern_shape, line: token.line}) if extern_shape != ""
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__extern_return_shape_fn", name: name, line: token.line}) if extern_shape != ""
+            extern_effect_ref: sview = parser.header_signature_can_ref()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__extern_effect_ref", name: extern_effect_ref, line: token.line}) if extern_effect_ref != ""
+            # A `@blocking` extern requires `Blocking.RawExtern` at every call site (verified
+            # against stage0: fires even under `can Blocking.Wait:` — a distinct member). Register
+            # it as an extern effect (owner + adjacent ref) so the ungranted-effect check sees it.
+            has_blocking: mutable bool = false
+            for decorator in parser.pending_decorators |has_blocking|:
+                has_blocking <- true if decorator.name == "blocking"
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__extern_effect", line: token.line}) if has_blocking
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__extern_effect_ref", name: "Blocking.RawExtern", line: token.line}) if has_blocking
+            # Retain the export-vs-extern distinction and the `= TARGET` re-export target on
+            # the side-table (the node signature drops both), so semantic can validate
+            # duplicate export names and undefined re-export targets.
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__export_fn", line: token.line}) if is_export_signature and name != ""
+            parser <- parser.capture_export_reexport_target(name, token.line) if is_export_signature
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__extern_contract", line: token.line}) if name != "" and parser.header_has_signature_contract()
+            parser <- parser.capture_extern_header_contracts(token.line)  # capture `requires`, then skip the rest to the block colon or end of line
+            # Only `extern:` / `export:` followed by a newline opens an indented block;
+            # a typed `extern name: T` stops at the colon (skip the rest of the line).
+            has_trailing_block: bool = parser.peek() == TokenKind.Colon and parser.peek_at(1) == TokenKind.Newline
+            # A non-call extern uses the same return-type side table as a callable
+            # extern, even though its type follows `:` rather than `->`.
+            extern_return_type <- parser.typed_extern_global_type() if not has_params
+            parser <- parser.parse_extern_trailing_block() if has_trailing_block
+            # Typed `extern name: T` (or any single-line extern): consume the remainder
+            # of the line (the `: T`) so it isn't reparsed.
+            parser <- parser.skip_extern_line_remainder() if not has_trailing_block
+            return (Ast::Decl.Extern(name, param_start, arity, variadic, has_params, extern_return_type, parser.pending_decorators, token.line))
+
+
+        # `extern errno_value: i32` — capture the first type name after the colon
+        # without consuming it. The line skipper below owns cursor advancement.
+        def typed_extern_global_type(parser: Parser&) -> sview:
+            can Abort.Panic:
+                "" return if parser.peek() != TokenKind.Colon
+                scan: mutable usize = 1
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |parser, scan|:
+                    scanned: Token = parser.tokens[parser.position + scan]
+                    Lexer::text_or_empty(scanned, parser.source) return if scanned.kind == TokenKind.Ident
+                    scan <- scan + 1
+                return ""
+
+
+        def extern_return_type_head(parser: Parser&) -> sview:
+            can Abort.Panic:
+                "" return if parser.peek() != TokenKind.Arrow
+                scan: mutable usize = 1
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof and parser.peek_at(scan) != TokenKind.Colon |scan|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    Lexer::text_or_empty(token, parser.source) return if token.kind == TokenKind.Ident
+                    scan <- scan + 1
+                return ""
+
+        # Whether the `-> T` clause names a POINTER return (`T&`, including the
+        # `heap T&` / `mutable heap T&?` forms). The `return_type_name` side table
+        # keeps only the bare head name — exactly as `ExternParam.type_name` drops a
+        # param's `&` — so without this an `extern malloc(n: usize) -> mutable heap
+        # void&?` lowers to a `void` return instead of a `ptr`, and every FFI
+        # allocator is undeclarable. Mirrors `ExternParam.provenance_bearing`, but
+        # for the return.
+        def extern_return_is_pointer(parser: Parser&) -> bool:
+            can Abort.Panic:
+                false return if parser.peek() != TokenKind.Arrow
+                scan: mutable usize = 1
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof and parser.peek_at(scan) != TokenKind.Colon |scan|:
+                    true return if parser.peek_at(scan) == TokenKind.Ampersand
+                    scan <- scan + 1
+                return false
+
+        # The extern return type's darray SHAPE argument ("shape_out" from
+        # `-> darray[i32, shape_out]`), or "" when the return is not a
+        # two-argument darray. Fresh-shape provenance (docs/86-style shape pairs)
+        # needs it to seed instance counters for extern producers.
+        def extern_return_darray_shape(parser: Parser&) -> sview:
+            can Abort.Panic:
+                "" return if parser.peek() != TokenKind.Arrow
+                scan: mutable usize = 1
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof and parser.peek_at(scan) != TokenKind.Colon |scan|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    if token.kind == TokenKind.Ident and Lexer::text_or_empty(token, parser.source) == "darray" and parser.peek_at(scan + 1) == TokenKind.LBracket and parser.peek_at(scan + 2) == TokenKind.Ident and parser.peek_at(scan + 3) == TokenKind.Comma and parser.peek_at(scan + 4) == TokenKind.Ident:
+                        candidate_shape: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan + 4], parser.source)
+                        # Shape-preserving externs name the SAME shape in a parameter;
+                        # only a return-exclusive shape marks a fresh producer.
+                        param_scan: mutable usize = 0
+                        while param_scan < scan |param_scan|:
+                            param_token: Token = parser.tokens[parser.position + param_scan]
+                            "" return if param_token.kind == TokenKind.Ident and Lexer::text_or_empty(param_token, parser.source) == candidate_shape
+                            param_scan <- param_scan + 1
+                        return candidate_shape
+                    scan <- scan + 1
+                return ""
+
+        def header_has_signature_can(parser: Parser&) -> bool:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    true return if token.kind == TokenKind.Ident and Lexer::text_or_empty(token, parser.source) == "can" and parser.peek_at(scan + 1) == TokenKind.LBracket
+                    scan <- scan + 1
+                return false
+
+        # Whether the extern signature header declares a `requires`/`ensure`/`ensures` boundary
+        # contract (consumed by skip_declaration_header_clauses without being modeled). Used to
+        # mark contract-bearing externs for the -strict-externs check.
+        def header_has_signature_contract(parser: Parser&) -> bool:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    if token.kind == TokenKind.Ident:
+                        keyword: sview = Lexer::text_or_empty(token, parser.source)
+                        true return if keyword == "requires" or keyword == "ensure" or keyword == "ensures"
+                    scan <- scan + 1
+                return false
+
+        # Whether the signature header's `can[...]` grants a segment-transition owner: it
+        # establishes an owner only when it contains BOTH `Unsafe.SegmentMutation` AND one of
+        # `Segment.Guest` / `Segment.Host` (mirrors stage0 permissionRefsTransitionOwner). Such an
+        # extern needs an explicit @segment_transition so the owner is a typed contract.
+        def header_grants_segment_owner(parser: Parser&) -> bool:
+            can Abort.Panic:
+                has_mutation: mutable bool = false
+                has_owner: mutable bool = false
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan, has_mutation, has_owner|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    if token.kind == TokenKind.Ident and parser.peek_at(scan + 1) == TokenKind.Dot and parser.peek_at(scan + 2) == TokenKind.Ident:
+                        head_text: sview = Lexer::text_or_empty(token, parser.source)
+                        member_text: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan + 2], parser.source)
+                        has_mutation <- true if head_text == "Unsafe" and member_text == "SegmentMutation"
+                        has_owner <- true if head_text == "Segment" and (member_text == "Guest" or member_text == "Host")
+                    scan <- scan + 1
+                return has_mutation and has_owner
+
+        # The specific `Segment.Host` / `Segment.Guest` member named in the signature
+        # `can[...]` ("Host"/"Guest"), or "" when none. Used to derive both the
+        # transition owner (with Unsafe.SegmentMutation) and a plain required owner.
+        def header_segment_owner_member(parser: Parser&) -> sview:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.position + scan < parser.tokens.count |parser, scan|:
+                    break if parser.peek_at(scan) == TokenKind.Newline or parser.peek_at(scan) == TokenKind.Eof
+                    token: Token = parser.tokens[parser.position + scan]
+                    if token.kind == TokenKind.Ident and parser.peek_at(scan + 1) == TokenKind.Dot and parser.peek_at(scan + 2) == TokenKind.Ident:
+                        head_text: sview = Lexer::text_or_empty(token, parser.source)
+                        member_text: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan + 2], parser.source)
+                        member_text return if head_text == "Segment" and (member_text == "Host" or member_text == "Guest")
+                    scan <- scan + 1
+                return ""
+
+        def header_has_segment_mutation(parser: Parser&) -> bool:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.position + scan < parser.tokens.count |parser, scan|:
+                    break if parser.peek_at(scan) == TokenKind.Newline or parser.peek_at(scan) == TokenKind.Eof
+                    token: Token = parser.tokens[parser.position + scan]
+                    if token.kind == TokenKind.Ident and parser.peek_at(scan + 1) == TokenKind.Dot and parser.peek_at(scan + 2) == TokenKind.Ident:
+                        head_text: sview = Lexer::text_or_empty(token, parser.source)
+                        member_text: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan + 2], parser.source)
+                        true return if head_text == "Unsafe" and member_text == "SegmentMutation"
+                    scan <- scan + 1
+                return false
+
+        # The segment owner ("Host"/"Guest") a `@segment_transition(host|guest)` decorator
+        # on the just-parsed signature establishes, or "" when absent. Reads the decorator's
+        # first captured argument from `annotation_args`.
+        def pending_decorator_segment_owner(parser: Parser&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                for decorator in parser.pending_decorators:
+                    continue if decorator.name != "segment_transition" or decorator.arg_count == 0
+                    arg: sview = parser.annotation_args[decorator.arg_start.usize()]
+                    "Host" return if arg == "host" or arg == "Host" or arg == "Segment.Host"
+                    "Guest" return if arg == "guest" or arg == "Guest" or arg == "Segment.Guest"
+                return ""
+
+        # Emit the segment-flow side-table fact for an extern signature: which ambient
+        # segment a call TRANSITIONS to (mutation + member, or a @segment_transition
+        # decorator), or which ambient it REQUIRES (a plain Segment.X with no transition).
+        # Mirrors stage0 funcTypeSegmentTransitionOwner / funcTypeRequiredSegmentOwner.
+        def record_extern_segment_flow(parser: lmut Parser, name: sview, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                member: sview = parser.header_segment_owner_member()
+                mutation: bool = parser.header_has_segment_mutation()
+                deco_owner: sview = parser.pending_decorator_segment_owner()
+                transition_owner: sview = deco_owner if deco_owner != "" else (member if mutation and member != "" else "")
+                required_owner: sview = "" if transition_owner != "" else member
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__seg_transition_host", line: line}) if transition_owner == "Host"
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__seg_transition_guest", line: line}) if transition_owner == "Guest"
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__seg_required_host", line: line}) if required_owner == "Host"
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name, name: "__seg_required_guest", line: line}) if required_owner == "Guest"
+
+        # The FIRST effect ref inside a signature `can[...]` ("Console.Write",
+        # "Abort", ...), spanning dotted segments, or "" when absent. Rendered into
+        # stage0's exact ungranted-call warning for extern callees.
+        def header_signature_can_ref(parser: Parser&) -> sview:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    if token.kind == TokenKind.Ident and Lexer::text_or_empty(token, parser.source) == "can" and parser.peek_at(scan + 1) == TokenKind.LBracket and parser.peek_at(scan + 2) == TokenKind.Ident:
+                        ref_start: u32 = parser.tokens[parser.position + scan + 2].start
+                        ref_end: mutable u32 = ref_start + parser.tokens[parser.position + scan + 2].length
+                        segment: mutable usize = scan + 3
+                        while parser.peek_at(segment) == TokenKind.Dot and parser.peek_at(segment + 1) == TokenKind.Ident |ref_end, segment|:
+                            ref_end <- parser.tokens[parser.position + segment + 1].start + parser.tokens[parser.position + segment + 1].length
+                            segment <- segment + 2
+                        return Lexer::source_view_or_empty(parser.source, ref_start.usize(), ref_end.usize())
+                    scan <- scan + 1
+                return ""
+
+        def header_error_family(parser: Parser&) -> sview:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan|:
+                    Lexer::text_or_empty(parser.tokens[parser.position + scan + 2], parser.source) return if parser.peek_at(scan) == TokenKind.Error and parser.peek_at(scan + 1) == TokenKind.LBracket and parser.peek_at(scan + 2) == TokenKind.Ident
+                    scan <- scan + 1
+                return ""
+
+        # Preserve every family named by a function's `error[...]` destination. The
+        # compact return-type AST intentionally omits the suffix; semantic raise/try
+        # validation consumes these line-keyed rows instead.
+        def capture_header_error_families(parser: lmut Parser, function_line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                inside_error_set: mutable bool = false
+                # `{...}` after a family (`error[FooError{Bad1}]`) restricts the allowed
+                # variant subset; capture the family (__error_variant_family) and each allowed
+                # variant (__error_variant_allow) keyed by function line so a raise of another
+                # variant of that family can be rejected.
+                inside_variant_set: mutable bool = false
+                restricted_family: mutable sview = ""
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |parser, scan, inside_error_set, inside_variant_set, restricted_family|:
+                    kind: TokenKind = parser.peek_at(scan)
+                    starts_error_set: bool = kind == TokenKind.Error and parser.peek_at(scan + 1) == TokenKind.LBracket
+                    inside_error_set <- true if starts_error_set
+                    token: Token = parser.tokens[parser.position + scan]
+                    previous_kind: TokenKind = parser.peek_at(scan - 1) if scan > 0 else TokenKind.Eof
+                    family: bool = inside_error_set and kind == TokenKind.Ident and (previous_kind == TokenKind.LBracket or previous_kind == TokenKind.Comma)
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_family", name: Lexer::text_or_empty(token, parser.source), line: function_line}) if family
+                    # Entering a `{` right after a family opens its variant-restriction set.
+                    restricted_family <- Lexer::text_or_empty(token, parser.source) if family and parser.peek_at(scan + 1) == TokenKind.LBrace
+                    inside_variant_set <- true if kind == TokenKind.LBrace and restricted_family != ""
+                    if inside_variant_set and kind == TokenKind.Ident and (previous_kind == TokenKind.LBrace or previous_kind == TokenKind.Comma):
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_family", name: restricted_family, line: function_line})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_allow", name: Lexer::text_or_empty(token, parser.source), line: function_line})
+                    if kind == TokenKind.RBrace:
+                        inside_variant_set <- false
+                        restricted_family <- ""
+                    inside_error_set <- false if inside_error_set and kind == TokenKind.RBracket
+                    scan <- scan + 1
+
+        # Consume an extern's balanced parameter list while counting only top-level
+        # `name:` entries. This deliberately leaves foreign/variadic type syntax opaque,
+        # matching the old permissive skipper while retaining enough shape for arity.
+        def scan_extern_params(parser: lmut Parser, arity: mutable u32&, variadic: mutable bool&) -> void:
+            parser, _ <- parser.expect(TokenKind.LParen)
+            depth: mutable int = 0
+            param_name: mutable sview = ""
+            type_name: mutable sview = ""
+            protocol_state: mutable sview = ""
+            generic_ident_count: mutable u32 = 0
+            provenance: mutable bool = false
+            after_colon: mutable bool = false
+            mutable_ref: mutable bool = false
+            while parser.peek() != TokenKind.Eof |parser, depth, arity, variadic, param_name, type_name, protocol_state, generic_ident_count, provenance, after_colon, mutable_ref|:
+                current_token: Token = parser.cursor()
+                kind: TokenKind = current_token.kind
+                break if depth == 0 and kind == TokenKind.RParen
+                is_param_head: bool = depth == 0 and kind == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon
+                param_name <- Lexer::text_or_empty(current_token, parser.source) if is_param_head else param_name
+                arity <- arity + 1 if is_param_head else arity
+                after_colon <- true if is_param_head else after_colon
+                is_type_head: bool = depth == 0 and after_colon and kind == TokenKind.Ident and type_name == "" and parser.peek_at(1) != TokenKind.Colon
+                type_name <- Lexer::text_or_empty(current_token, parser.source) if is_type_head else type_name
+                is_generic_ident: bool = depth == 1 and after_colon and kind == TokenKind.Ident
+                generic_ident_count <- generic_ident_count + 1 if is_generic_ident else generic_ident_count
+                protocol_state <- Lexer::text_or_empty(current_token, parser.source) if is_generic_ident and generic_ident_count == 2 else protocol_state
+                provenance <- true if after_colon and (kind == TokenKind.Ampersand or kind == TokenKind.Lmut)
+                # A `mutable`/`lmut` marker anywhere in the param makes it a mutable binding.
+                mutable_ref <- true if depth == 0 and (kind == TokenKind.Mutable or kind == TokenKind.Lmut)
+                variadic <- true if depth == 0 and kind == TokenKind.Ellipsis
+                finishes_param: bool = depth == 0 and kind == TokenKind.Comma and param_name != ""
+                retained_type: sview = protocol_state if protocol_state != "" and (type_name == "Thread" or type_name == "Task") else type_name
+                parser.extern_params <- parser.extern_params.push(Ast::ExternParam{name: param_name, type_name: retained_type, provenance_bearing: provenance, mutable_ref: mutable_ref}) if finishes_param
+                param_name <- "" if finishes_param else param_name
+                type_name <- "" if finishes_param else type_name
+                protocol_state <- "" if finishes_param else protocol_state
+                generic_ident_count <- 0 if finishes_param else generic_ident_count
+                provenance <- false if finishes_param else provenance
+                mutable_ref <- false if finishes_param else mutable_ref
+                after_colon <- false if finishes_param else after_colon
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket
+                depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket
+                parser, _ <- parser.advance()
+            retained_type: sview = protocol_state if protocol_state != "" and (type_name == "Thread" or type_name == "Task") else type_name
+            parser.extern_params <- parser.extern_params.push(Ast::ExternParam{name: param_name, type_name: retained_type, provenance_bearing: provenance, mutable_ref: mutable_ref}) if param_name != ""
+            parser, _ <- parser.expect(TokenKind.RParen)
+
+        def reject_extern_param_defaults(parser: lmut Parser) -> void:
+            return if parser.peek() != TokenKind.LParen
+            scan: mutable usize = 1
+            depth: mutable int = 1
+            while depth > 0 and parser.peek_at(scan) != TokenKind.Eof |parser, scan, depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                scanned_token: Token = parser.tokens[parser.position + scan]
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, scanned_token) if depth == 1 and kind == TokenKind.Assign
+                depth <- depth + 1 if kind == TokenKind.LParen
+                depth <- depth - 1 if kind == TokenKind.RParen
+                scan <- scan + 1
+
+        # `func`/`fn` word immediately after `export`/`extern` before the name.
+        def skip_export_func_word(parser: lmut Parser) -> void:
+            func_word: Token = parser.cursor()
+            func_word_text: sview = Lexer::text_or_empty(func_word, parser.source)
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, func_word) if func_word_text == "func"
+            parser <- parser.advance_when(func_word_text == "func" or func_word_text == "fn")
+
+        # `extern:`/`export:` indented block, entered with the cursor on the opening `:`.
+        def parse_extern_trailing_block(parser: lmut Parser) -> void:
+            parser, _ <- parser.advance()               # `:`
+            parser <- parser.skip_indented_block()
+
+        # Scan (without consuming) the rest of an `export fn` signature line for a `= TARGET`
+        # re-export clause and record TARGET on the side-table for the undefined-target check.
+        def capture_export_reexport_target(parser: lmut Parser, export_name: sview, line: u32) -> void:
+            scan: mutable usize = 0
+            while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Dedent and parser.peek_at(scan) != TokenKind.Eof |scan, parser|:
+                if parser.peek_at(scan) == TokenKind.Assign and parser.peek_at(scan + 1) == TokenKind.Ident:
+                    target_token: Token = parser.tokens[parser.position + scan + 1]
+                    target_name: sview = Lexer::text_or_empty(target_token, parser.source)
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: export_name, name: target_name, line: line}) if export_name != "" and target_name != ""
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_name, name: "__export_target_ref", line: line}) if target_name != ""
+                scan <- scan + 1
+
+        # Consume the remainder of a single-line extern (the `: T`), stopping before
+        # the newline/dedent/eof.
+        def skip_extern_line_remainder(parser: lmut Parser) -> void:
+            while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser|:
+                parser, _ <- parser.advance()

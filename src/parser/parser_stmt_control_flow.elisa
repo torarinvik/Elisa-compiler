@@ -1,0 +1,232 @@
+# Stage1 parser — `if`/`while`/`return` (`extend Parser: private:`). Covers the plain
+# control-flow statements, the block-`if` exemption predicates that decide whether an
+# `if` may keep its indented form, and declared-thread-slot return validation.
+# Continues parser_stmt_control.elisa; split out to keep each part under 600 lines.
+
+extend Parser:
+    private:
+        # docs/125 §6b: whether a statement-position block `if` is a sanctioned conditional
+        # COMPUTATION (a guard), not a hidden decision, so the flow-strict census exempts it.
+        # Mirrors stage0's condContainsIsTest + isLegitimateGuardBlock (the common, decidable
+        # subset): an `is`-test condition (checked destructure), a branch that binds a local,
+        # a single loop/match body, a multi-statement branch, or uneven if/else alternation.
+        # An elif chain (else is a lone `if`) is a decision TABLE and stays flagged.
+        def block_if_is_exempt(condition: Ast::Expr, then_body: darray[Ast::Stmt], else_body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if expr_contains_is_test(condition)
+                # An elif chain (else is a lone `if`) is a decision TABLE — stays flagged.
+                false return if else_body.count == 1 and first_stmt_is_if(else_body)
+                true return if body_binds_local(then_body) or body_binds_local(else_body)
+                # Single loop/match body (no else): a computation / sanctioned decision form.
+                true return if else_body.count == 0 and then_body.count == 1 and stmt_is_loop_or_match(then_body[0])
+                # Straight-line multi-effect guard, or if/else with a 2+-statement branch.
+                true return if else_body.count == 0 and then_body.count >= 2
+                true return if else_body.count > 0 and (then_body.count >= 2 or else_body.count >= 2)
+                return false
+
+        # Whether the branch's first statement is a block `if` (used to detect an elif chain).
+        def first_stmt_is_if(body: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic:
+                return match body[0]:
+                    Ast::Stmt.If(if_cond, if_then, if_else, if_line): true
+                    _: false
+
+        # Whether a statement is a loop or a match (the guarded-computation exemption).
+        def stmt_is_loop_or_match(statement: Ast::Stmt) -> bool:
+            can Abort.Panic:
+                return match statement:
+                    Ast::Stmt.While(w_cond, w_body, w_line): true
+                    Ast::Stmt.For(f_bind, f_vars, f_iter, f_body, f_line): true
+                    Ast::Stmt.Match(m_scrut, m_arms, m_line): true
+                    _: false
+
+        # Whether an `if` condition contains a top-level (or boolean-combined) `is` refinement
+        # test — `if x is Foo:` / `if a and x is Foo:` — a checked destructure, not a decision.
+        def expr_contains_is_test(condition: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Ast::Expr.Binary(left, operator, right, line):
+                        true return if operator == TokenKind.Is
+                        return expr_contains_is_test(left) or expr_contains_is_test(right)
+                    Ast::Expr.Unary(operator, operand, line):
+                        return expr_contains_is_test(operand)
+                    Ast::Expr.Paren(inner, line):
+                        return expr_contains_is_test(inner)
+                    _:
+                        return false
+
+        # Whether any statement in the branch binds a local (`x = …` / `x: T = …`).
+        def stmt_is_vardecl(statement: Ast::Stmt) -> bool:
+            can Abort.Panic:
+                return match statement:
+                    Ast::Stmt.VarDecl(name, type_expression, value, line): true
+                    _: false
+
+        def body_binds_local(body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return any statement in body where stmt_is_vardecl(statement)
+
+        def if_statement(parser: lmut Parser) -> Ast::Stmt?:
+            rebind if_token: Token, parser = parser.expect(TokenKind.If)
+            rebind if_stmt_option: Ast::Stmt?, parser = parser.if_tail(if_token)
+            # A statement-position block `if` (docs/125 §6b flow-strict target); postfix
+            # guards / value-ifs never reach this parse path. Tag it for the flow-strict
+            # census UNLESS it is inside a `can ComplexFlow:` grant (the escape hatch) or is a
+            # sanctioned guard shape (binds a local, single loop/match, multi-statement, …).
+            if if_stmt_option is if_stmt:
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__block_if", name: "__block_if", line: if_token.line}) if not parser.in_complex_flow
+            return if_stmt_option
+
+
+        # Shared tail for `if` and `elif`: parse `<condition> <block>` then an optional
+        # `elif`/`else` continuation. An `elif` chain desugars into a nested If stored
+        # as the single statement of the parent's else_body — no separate elif node.
+        def if_tail(parser: lmut Parser, token: Token) -> Ast::Stmt?:
+            # Optional branch-prediction hint `if likely COND:` / `if unlikely COND:`
+            # (contextual idents, also valid on `elif`). Only consumed when an operand
+            # follows, so a bool local literally named `likely` still works bare.
+            hint_token: Token = parser.cursor()
+            hint_kind: mutable sview = ""
+            if parser.peek() == TokenKind.Ident:
+                hint_text: sview = Lexer::text_or_empty(hint_token, parser.source)
+                if (hint_text == "likely" or hint_text == "unlikely") and tokenStartsValue(parser.peek_at(1)):
+                    hint_kind <- hint_text
+                    parser, _ <- parser.advance()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__branch_hint", name: hint_kind, line: token.line}) if hint_kind != ""
+            rebind condition: Ast::Expr, parser = get parser.expression()
+            rebind then_body: darray[Ast::Stmt], parser = parser.parse_block()
+
+            else_body: mutable darray[Ast::Stmt] = []
+            parser <- parser.skip_newlines()
+
+            next_kind: TokenKind = parser.peek()
+            match next_kind:
+                TokenKind.Elif:
+                    rebind elif_token: Token, parser = parser.advance()
+                    # An `elif` chain desugars into a nested If as the single statement of the
+                    # parent's else body.
+                    rebind __m_264: Ast::Stmt?, parser = parser.if_tail(elif_token)
+                    else_body.push(nested_if) if __m_264 is nested_if
+                TokenKind.Else:
+                    parser, _ <- parser.advance()
+                    else_body, parser <- parser.parse_block()
+                _:
+                    pass
+
+            return (Ast::Stmt.If(condition, then_body, else_body, token.line))
+
+
+        def while_statement(parser: lmut Parser) -> Ast::Stmt?:
+            rebind while_token: Token, parser = parser.expect(TokenKind.While)
+            hint_token: Token = parser.cursor()
+            hint_kind: mutable sview = ""
+            has_hint: bool = parser.peek() == TokenKind.Ident and (Lexer::text_or_empty(hint_token, parser.source) == "likely" or Lexer::text_or_empty(hint_token, parser.source) == "unlikely") and tokenStartsValue(parser.peek_at(1))
+            hint_kind <- Lexer::text_or_empty(hint_token, parser.source) if has_hint
+            parser, _ <- parser.advance() if has_hint
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__branch_hint", name: hint_kind, line: while_token.line}) if has_hint
+            # docs/119 §3: binary parsing stops at a header's opening `|` (loop_header_at),
+            # so the ordinary condition parse already yields the pre-header expression.
+            rebind condition: Ast::Expr, parser = get parser.expression()
+            if not parser.loop_header_at():
+                rebind body: darray[Ast::Stmt], parser = parser.parse_block()
+                return (Ast::Stmt.While(condition, body, while_token.line))
+            header_declarations: mutable darray[Ast::Stmt] = []
+            header_captures: mutable darray[sview] = []
+            header_has_yield: mutable bool = false
+            rebind header_yield: Ast::Expr, parser = parser.parse_loop_header(header_declarations, header_captures, header_has_yield)
+            rebind loop_body: darray[Ast::Stmt], parser = parser.parse_block()
+            rebind __ret_285: Ast::Stmt, parser = parser.wrap_loop_header(header_declarations, header_yield, (Ast::Stmt.While(condition, loop_body, while_token.line)), while_token.line, header_captures)
+            return __ret_285
+
+
+        def return_statement(parser: lmut Parser) -> Ast::Stmt?:
+            rebind return_token: Token, parser = parser.expect(TokenKind.Return)
+
+            # `return if COND: THEN else: ELSE` is a value expression. Its leading tokens
+            # overlap the postfix guard `return if COND`; a top-level colon before the
+            # newline distinguishes the value form.
+            rebind accepted_if: bool, parser = parser.accept(TokenKind.If)
+            if accepted_if:
+                rebind condition: Ast::Expr, parser = get parser.expression()
+                if parser.peek() == TokenKind.Colon:
+                    parser, _ <- parser.advance()
+                    rebind then_value: Ast::Expr, parser = parser.parse_bare_block_value()
+                    parser <- parser.skip_newlines()
+                    parser, _ <- parser.expect(TokenKind.Else)
+                    parser, _ <- parser.expect(TokenKind.Colon)
+                    rebind else_value: Ast::Expr, parser = parser.parse_bare_block_value()
+                    conditional: Ast::Expr = (Ast::Expr.If(condition, then_value, else_value, return_token.line))
+                    return (Ast::Stmt.Return(conditional, return_token.line))
+                # No colon: bare postfix guard `return if COND` (== `if COND: return`).
+                body: mutable darray[Ast::Stmt] = []
+                body.push((Ast::Stmt.Return(null, return_token.line)))
+                no_else: darray[Ast::Stmt] = []
+                return (Ast::Stmt.If(condition, body, no_else, return_token.line))
+            else:
+                value: mutable Ast::Expr? = null
+                value_start: usize = parser.position
+                parser, value <- parser.expression() if parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof
+                if value is value_present:
+                    parser, _ <- parser.consume_removed_as_cast(value_present)
+
+                # Multi-value return `return a, b` (a named-tuple result type's value
+                # list) — collect the remaining values into a Tuple.
+                if parser.peek() == TokenKind.Comma and value is first_value:
+                    return_elements: mutable darray[Ast::Expr] = [first_value]
+                    while parser.accept(TokenKind.Comma) |parser|:
+                        break if parser.peek() == TokenKind.Newline or parser.peek() == TokenKind.Eof
+                        rebind return_element_option: Ast::Expr?, parser = parser.expression()
+                        return_elements.push(return_element) if return_element_option is return_element
+                    value <- (Ast::Expr.Tuple(return_elements, return_token.line))
+
+                value_end: usize = parser.position
+                parser <- parser.validate_declared_thread_return_tokens(value_start, value_end, return_token)
+
+                # Trailing guard `return VALUE if COND` (== `if COND: return VALUE`).
+                rebind accepted_if_2: bool, parser = parser.accept(TokenKind.If)
+                if accepted_if_2:
+                    rebind value_condition: Ast::Expr, parser = get parser.expression()
+                    value_body: mutable darray[Ast::Stmt] = []
+                    value_body.push((Ast::Stmt.Return(value, return_token.line)))
+                    value_no_else: darray[Ast::Stmt] = []
+                    return (Ast::Stmt.If(value_condition, value_body, value_no_else, return_token.line))
+                else:
+                    return (Ast::Stmt.Return(value, return_token.line))
+
+        # A declared-threading return (`-> (ch: i64, lx: lmut L)`) must end with the
+        # threaded slots, named in order. Everything BEFORE them is an ordinary value
+        # expression: the old rule demanded the first element be a single identifier and
+        # required exactly one leading value, so `return 1, lx` (a literal) and a
+        # value-less `-> (lx: lmut L)` were both rejected -- forms stage0 accepts.
+        def validate_declared_thread_return_tokens(parser: lmut Parser, start: mutable usize, end: mutable usize, token: Token) -> void:
+            return if parser.declared_thread_slots.count == 0
+            if end > start and parser.tokens[start].kind == TokenKind.LParen and parser.tokens[end - 1].kind == TokenKind.RParen:
+                start <- start + 1
+                end <- end - 1
+            element_is_ident: mutable darray[bool] = []
+            element_names: mutable darray[sview] = []
+            segment_start: mutable usize = start
+            scan: mutable usize = start
+            depth: mutable int = 0
+            while scan <= end |parser, scan, depth, segment_start, element_is_ident, element_names, start, end|:
+                at_end: bool = scan == end
+                kind: TokenKind = parser.tokens[scan].kind if not at_end else TokenKind.Comma
+                depth <- depth + 1 if not at_end and (kind == TokenKind.LParen or kind == TokenKind.LBracket)
+                depth <- depth - 1 if not at_end and (kind == TokenKind.RParen or kind == TokenKind.RBracket)
+                is_separator: bool = at_end or (kind == TokenKind.Comma and depth == 0)
+                if is_separator:
+                    segment_length: usize = scan - segment_start
+                    is_ident: bool = segment_length == 1 and parser.tokens[segment_start].kind == TokenKind.Ident
+                    element_is_ident.push(is_ident)
+                    element_names.push(Lexer::text_or_empty(parser.tokens[segment_start], parser.source) if is_ident else sview("", 0, 0))
+                    segment_start <- scan + 1
+                scan <- scan + 1
+            slot_count: usize = parser.declared_thread_slots.count
+            valid: mutable bool = element_is_ident.count >= slot_count
+            if valid:
+                lead: usize = element_is_ident.count - slot_count
+                for slot_index in 0..<slot_count |valid, lead, element_is_ident, element_names, parser|:
+                    valid <- false if not element_is_ident[lead + slot_index]
+                    valid <- false if element_names[lead + slot_index] != parser.declared_thread_slots[slot_index]
+            return if valid
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token)

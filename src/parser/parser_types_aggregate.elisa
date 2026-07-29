@@ -1,0 +1,368 @@
+# Stage1 parser — struct/enum/const declarations (`extend Parser: private:`). Covers
+# `struct`, `enum`, and `const` parsing, the layout/parent header probes, and the
+# recursive-enum side table. Continues parser_types_signature.elisa; split out to keep
+# each part file under 600 lines.
+
+extend Parser:
+    private:
+        def struct_declaration(parser: lmut Parser) -> Ast::Decl?:
+            parser.pending_packed_decl <- false
+            token: Token = parser.cursor()
+            # Optional single-use discipline modifier (struct-only in stage0): `linear`
+            # = must be consumed exactly once before scope exit; `affine` = may be used
+            # at most once but silently dropped. Contextual keywords, so matched by
+            # text on the leading Ident before the `struct` keyword itself.
+            head: Token = parser.cursor()
+            head_is_ident: bool = parser.peek() == TokenKind.Ident
+            head_text: sview = Lexer::text_or_empty(head, parser.source)
+            affinity: mutable sview = ""
+            affinity <- "linear" if head_is_ident and head_text == "linear"
+            affinity <- "affine" if head_is_ident and head_text == "affine"
+            parser <- parser.advance_if(affinity != "")
+
+            parser, _ <- parser.expect(TokenKind.Struct)
+            rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            # Record this struct's decorators (owner=struct name) so the removed-annotation
+            # checks (e.g. `@c_bind_prefix`) can see them — mirrors enum_declaration.
+            struct_name_text: sview = Lexer::text_or_empty(name_token, parser.source)
+            for decorator in parser.pending_decorators |parser|:
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: struct_name_text, name: decorator.name, line: token.line})
+                # Keep the concrete alignment value in the compact annotation side table.
+                # `EnumAnnotation.line` is otherwise only a source location; for this
+                # backend-only metadata it is an intentionally value-bearing slot.
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: struct_name_text, name: "__align", line: parse_int_literal_value(parser.annotation_args[decorator.arg_start.usize()]).u32()}) if decorator.name == "align" and decorator.arg_count > 0 and decorator.arg_start.usize() < parser.annotation_args.count
+            has_c_layout: bool = parser.header_has_c_layout()
+            has_soa_layout: bool = parser.header_has_soa_layout()
+
+            # Typestate header `struct X[state A | B]:` — a `[` immediately followed by the
+            # contextual `state` keyword. Detected here (before the header is skipped) so
+            # `Decl.Struct.has_named_states` can be paired with the body's `derive` flag.
+            # A generic header `[T]` or refinement clause does not open with `state`.
+            has_named_states: bool = parser.peek() == TokenKind.LBracket and parser.position + 1 < parser.tokens.count and Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source) == "state"
+            aggregate_arity: u32 = parser.aggregate_state_arity()
+
+            # A leading `[T, U]` (not `[state …]`) is a generic header: capture its param
+            # names before the balanced skipper discards the tokens.
+            parser <- parser.capture_struct_generic_params(token.line) if parser.peek() == TokenKind.LBracket and not has_named_states
+            parser <- parser.validate_layout_and_generic_header(true)
+            parser <- parser.skip_declaration_header_clauses()
+
+            name_text: sview = Lexer::text_or_empty(name_token, parser.source)
+            parser.struct_names <- parser.struct_names.push(name_text)
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: "__layout_c", line: token.line}) if has_c_layout
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: "__layout_soa", line: token.line}) if has_soa_layout
+            aggregate_index: mutable u32 = 0
+            while aggregate_index < aggregate_arity |aggregate_index, parser|:
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: "__aggregate_state", line: token.line})
+                aggregate_index <- aggregate_index + 1
+            empty_members: darray[Ast::StructMember] = []
+            no_invariants: darray[Ast::Expr] = []
+            if parser.peek() != TokenKind.Colon:
+                parser.struct_member_starts <- parser.struct_member_starts.push(parser.struct_member_rows.count)
+                parser.struct_member_counts <- parser.struct_member_counts.push(0)
+                declaration: Ast::Decl = Ast::Decl.Struct(name_text, empty_members, affinity, has_named_states, false, no_invariants, token.line)
+                parser <- parser.record_generic_struct_metadata(declaration, name_text, token.line)
+                return declaration
+
+            rebind members: darray[Ast::StructMember], parser = parser.struct_member_block(name_text)
+            parser.struct_member_starts <- parser.struct_member_starts.push(parser.struct_member_rows.count)
+            parser.struct_member_counts <- parser.struct_member_counts.push(members.count)
+            for member in members |parser|:
+                parser.struct_member_rows <- parser.struct_member_rows.push(member)
+            # Drain the body-parse capture buffers (mirror of the `captured_effects`
+            # read pattern): both were reset at the start of `struct_member_block`.
+            has_derive: bool = parser.captured_has_derive
+            invariants: mutable darray[Ast::Expr] = []
+            for inv in parser.captured_invariants |invariants|:
+                invariants.push(inv)
+
+            declaration: Ast::Decl = Ast::Decl.Struct(name_text, members, affinity, has_named_states, has_derive, invariants, token.line)
+            parser <- parser.record_generic_struct_metadata(declaration, name_text, token.line)
+            return declaration
+
+
+        def header_has_c_layout(parser: Parser&) -> bool:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Colon and parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    parser.peek_at(scan - 1) == TokenKind.LParen return if Lexer::text_or_empty(token, parser.source) == "c" and scan > 0
+                    scan <- scan + 1
+                return false
+
+        # `layout(soa)`: the word `soa` immediately after a `(` in the struct header.
+        def header_has_soa_layout(parser: Parser&) -> bool:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Colon and parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan|:
+                    token: Token = parser.tokens[parser.position + scan]
+                    parser.peek_at(scan - 1) == TokenKind.LParen return if Lexer::text_or_empty(token, parser.source) == "soa" and scan > 0
+                    scan <- scan + 1
+                return false
+
+        # Whether the header carries a `sparse` layout word (`layout(aos, sparse)`) before the
+        # block colon — anywhere, since `sparse` is a comma-separated layout flag.
+        def header_has_sparse_layout(parser: Parser&) -> bool:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Colon and parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan|:
+                    true return if Lexer::text_or_empty(parser.tokens[parser.position + scan], parser.source) == "sparse"
+                    scan <- scan + 1
+                return false
+
+        def aggregate_state_arity(parser: Parser&) -> u32:
+            can Abort.Panic:
+                0 return if parser.peek() != TokenKind.LBracket
+                count: mutable u32 = 0
+                depth: mutable u32 = 0
+                scan: mutable usize = 0
+                while parser.position + scan < parser.tokens.count |scan, count, depth|:
+                    kind: TokenKind = parser.peek_at(scan)
+                    depth <- depth + 1 if kind == TokenKind.LBracket
+                    count <- count + 1 if kind == TokenKind.Question and depth == 1
+                    depth <- depth - 1 if kind == TokenKind.RBracket
+                    break if depth == 0
+                    scan <- scan + 1
+                return count
+
+
+        # The parent named by an enum header's `is Parent` clause (`enum Sub is Root`), or "" when
+        # absent. Peek-only scan up to the block colon / newline. A qualified `is Mod::Root` keeps
+        # only the leaf name (rare); the common single-ident form is the hierarchy parent.
+        def header_enum_parent(parser: Parser&) -> sview:
+            can Abort.Panic:
+                scan: mutable usize = 0
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |scan|:
+                    kind: TokenKind = parser.peek_at(scan)
+                    break if kind == TokenKind.Colon
+                    Lexer::text_or_empty(parser.tokens[parser.position + scan + 1], parser.source) return if kind == TokenKind.Is and parser.peek_at(scan + 1) == TokenKind.Ident
+                    scan <- scan + 1
+                return sview("", 0, 0)
+
+        def record_enum_metadata(parser: lmut Parser, name: sview, storage_head: sview, is_const: bool, variants: darray[Ast::EnumVariant]) -> void:
+            has_payload: mutable bool = false
+            for field_count in parser.captured_enum_variant_field_counts |has_payload|:
+                has_payload <- true if field_count > 0
+            if has_payload:
+                parser.payload_enum_names <- parser.payload_enum_names.push(name)
+                parser.payload_enum_is_const <- parser.payload_enum_is_const.push(is_const)
+                parser.payload_enum_variant_starts <- parser.payload_enum_variant_starts.push(parser.payload_enum_variant_names.count)
+                parser.payload_enum_variant_counts <- parser.payload_enum_variant_counts.push(parser.captured_enum_variant_names.count)
+                for variant_index in 0..<parser.captured_enum_variant_names.count |parser|:
+                    parser.payload_enum_variant_names <- parser.payload_enum_variant_names.push(parser.captured_enum_variant_names[variant_index])
+                    field_start: usize = parser.captured_enum_variant_field_starts[variant_index]
+                    field_count: usize = parser.captured_enum_variant_field_counts[variant_index]
+                    parser.payload_enum_variant_field_starts <- parser.payload_enum_variant_field_starts.push(parser.payload_enum_variant_fields.count)
+                    parser.payload_enum_variant_field_counts <- parser.payload_enum_variant_field_counts.push(field_count)
+                    for field_index in 0..<field_count |parser, field_start|:
+                        parser.payload_enum_variant_fields <- parser.payload_enum_variant_fields.push(parser.captured_enum_variant_fields[field_start + field_index])
+                        parser.payload_enum_variant_field_names <- parser.payload_enum_variant_field_names.push(parser.captured_enum_variant_field_names[field_start + field_index])
+                return
+            parser.enum_decl_names <- parser.enum_decl_names.push(name)
+            parser.enum_decl_storage_heads <- parser.enum_decl_storage_heads.push(storage_head)
+            parser.enum_decl_is_const <- parser.enum_decl_is_const.push(is_const)
+            parser.enum_decl_variant_starts <- parser.enum_decl_variant_starts.push(parser.enum_decl_variant_names.count)
+            parser.enum_decl_variant_counts <- parser.enum_decl_variant_counts.push(variants.count)
+            for variant in variants |parser|:
+                parser.enum_decl_variant_names <- parser.enum_decl_variant_names.push(variant.name)
+
+        def enum_declaration(parser: lmut Parser, is_const: bool) -> Ast::Decl?:
+            rebind token: Token, parser = parser.expect(TokenKind.Enum)
+            rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            name_text: sview = Lexer::text_or_empty(name_token, parser.source)
+            for decorator in parser.pending_decorators |parser|:
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: decorator.name, line: token.line})
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: parser.annotation_args[decorator.arg_start.usize()], line: 3900000041}) if decorator.name == "packed_profile" and decorator.arg_count > 0 and decorator.arg_start < parser.annotation_args.count.u32()
+            # Record the enum's layout flags (soa/sparse) for the sparse-requires-soa check.
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: "__layout_soa", line: token.line}) if parser.header_has_soa_layout()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: "__layout_sparse", line: token.line}) if parser.header_has_sparse_layout()
+            # Mark a DECLARED `packed enum` distinctly from one auto-promoted by
+            # record_recursive_enum: an auto-promoted recursive enum must not inherit the
+            # explicit store-clause requirement (stage0 accepts `match t:` on one).
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: "__declared_packed", line: token.line}) if parser.pending_packed_decl
+            parser.packed_enum_names <- parser.packed_enum_names.push(name_text) if parser.pending_packed_decl
+            parser.pending_packed_decl <- false
+            # Optional `of T` storage type (const enums declare an integer backing type).
+            # Captured before the generic header skip so the const-enum checks can read it.
+            storage_type: mutable Ast::Expr = (Ast::Expr.Invalid)
+            of_token: Token = parser.cursor()
+            has_of: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(of_token, parser.source) == "of"
+            parser <- parser.advance_if(has_of)
+            has_storage_name: bool = has_of and parser.peek() == TokenKind.Ident
+            storage_name_token: Token = parser.cursor()
+            parser <- parser.advance_if(has_storage_name)
+            storage_type <- (Ast::Expr.Ident(Lexer::text_or_empty(storage_name_token, parser.source), storage_name_token.line)) if has_storage_name
+            parser <- parser.validate_layout_and_generic_header(false)
+            # Capture the `is Parent` hierarchy clause (skipped by the header skipper) so the
+            # exhaustiveness check can treat `enum Sub is Root` variants as covering `Root`.
+            enum_parent: sview = parser.header_enum_parent()
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: enum_parent, line: 3900000008}) if enum_parent != ""
+            parser <- parser.skip_declaration_header_clauses()
+
+            no_variants: darray[Ast::EnumVariant] = []
+            parser <- parser.record_recursive_enum(name_text, no_variants, false)
+            # `record_enum_metadata` reads `parser.captured_enum_variant_*`, which is only
+            # populated for THIS enum by `enum_variant_block` below. Calling it here — before
+            # the body is parsed — records whatever the PREVIOUS enum left in the capture
+            # buffers: for a payload enum with a body, that is a spurious duplicate metadata
+            # entry carrying the prior enum's variant slice, and it WINS registration (the
+            # backend's packed-enum registrar keeps the first entry per name). That misaligned
+            # every AST-refinement's variant table (`Stmt`/`Decl`/`Pattern` inherited the
+            # preceding enum's variants), so every `Decl.Func`/`Stmt.While`/… match in the
+            # self-hosted backend declined. A genuine no-body enum has no payload variants, so
+            # it needs no payload metadata; only record it on the early no-body return.
+            if parser.peek() != TokenKind.Colon:
+                parser <- parser.record_enum_metadata(name_text, Lexer::text_or_empty(storage_name_token, parser.source) if has_storage_name else "", is_const, no_variants)
+                return (Ast::Decl.Enum(name_text, no_variants, is_const, storage_type, token.line))
+
+            # Inline empty body `enum Color: pass` — a memberless hierarchy root.
+            is_inline_pass: bool = parser.peek_at(1) == TokenKind.Pass
+            if is_inline_pass:
+                parser, _ <- parser.advance()                       # `:`
+                parser, _ <- parser.advance()                       # `pass`
+                parser <- parser.record_recursive_enum(name_text, no_variants, true)
+                return (Ast::Decl.Enum(name_text, no_variants, is_const, storage_type, token.line))
+            rebind variants: darray[Ast::EnumVariant], parser = parser.enum_variant_block(name_text)
+            parser <- parser.record_recursive_enum(name_text, variants, false)
+            parser <- parser.record_enum_metadata(name_text, Lexer::text_or_empty(storage_name_token, parser.source) if has_storage_name else "", is_const, variants)
+            parser.enum_common_owners <- parser.enum_common_owners.push(name_text) if parser.captured_enum_common_count > 0
+            parser.enum_common_counts <- parser.enum_common_counts.push(parser.captured_enum_common_count) if parser.captured_enum_common_count > 0
+            return (Ast::Decl.Enum(name_text, variants, is_const, storage_type, token.line))
+
+
+        # Handles `const`/`global` value bindings plus the `const enum`/`const struct`/
+        # `const module` qualified forms. Both type and initializer are optional:
+        # `const X = 1`, `const X: T = 1`, and `global buf: T` all parse.
+        def const_declaration(parser: lmut Parser) -> Ast::Decl?:
+            rebind token: Token, parser = parser.advance()          # consume `const` or `global`
+            # A plain `const` is immutable; a `global` (with or without `mutable`) may be
+            # written. Recorded so the resolver can reject `<-` on an immutable const.
+            is_global: bool = Lexer::text_or_empty(token, parser.source) == "global"
+
+            # Qualified declarations: `const enum`, `const struct`, `const module`
+            # (and `const extend`, which routes to the same module reader).
+            current_token: Token = parser.cursor()
+            head_text: sview = Lexer::text_or_empty(current_token, parser.source)
+            is_enum_form: bool = parser.peek() == TokenKind.Enum
+            is_struct_form: bool = parser.peek() == TokenKind.Struct
+            is_module_form: bool = parser.peek() == TokenKind.Ident and (head_text == "module" or head_text == "extend")
+            rebind qualified_declaration: Ast::Decl?, parser = parser.parse_qualified_const_decl(is_enum_form, is_struct_form, is_module_form)
+            qualified_declaration return if is_enum_form or is_struct_form or is_module_form
+
+            # `global mutable NAME: T = ...` — mutable globals. The `mutable` keyword is otherwise
+            # dropped (Decl.Const's 4th field is is_global, not is_mutable), so record mutable-ness
+            # in the annotation side-table (`{owner: NAME, name: "__global_mutable"}`) — a mutable
+            # global is NOT a compile-time constant (the const-fold prover must not fold it).
+            rebind accepted_global_mutable: bool, parser = parser.accept(TokenKind.Mutable)
+
+            rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(name_token, parser.source), name: "__global_mutable", line: token.line}) if accepted_global_mutable
+
+            type_expression: mutable Ast::Expr = (Ast::Expr.Absent)
+            rebind accepted_colon: bool, parser = parser.accept(TokenKind.Colon)
+            rebind parsed_type_opt: Ast::Expr?, parser = parser.expression_if(accepted_colon)
+            if parsed_type_opt is parsed_type:
+                type_expression <- parsed_type
+
+            initializer: mutable Ast::Expr = (Ast::Expr.Invalid)
+            rebind accepted_assign: bool, parser = parser.accept(TokenKind.Assign)
+            rebind parsed_value_opt: Ast::Expr?, parser = parser.expression_if(accepted_assign)
+            if parsed_value_opt is parsed_value:
+                initializer <- parsed_value
+
+            return (Ast::Decl.Const(Lexer::text_or_empty(name_token, parser.source), type_expression, initializer, is_global, token.line))
+
+        # Recursive plain enums are region-backed packed trees in stage0. The parser
+        # already retains hierarchy parents in enum_annotations; after the complete file
+        # is known, promote each directly recursive leaf to its hierarchy root in the same
+        # packed-name side table used by explicit `packed enum` declarations.
+        def recursive_type_mentions(expression: Ast::Expr, wanted: sview) -> bool:
+            if expression is Expr.Ident(name, line):
+                return name == wanted
+            if expression is Expr.Scope(base, name, line):
+                return name == wanted or recursive_type_mentions(base, wanted)
+            if expression is Expr.Index(head, extent, line):
+                return recursive_type_mentions(head, wanted) or recursive_type_mentions(extent, wanted)
+            if expression is Expr.IndexN(head, arguments, line):
+                true return if recursive_type_mentions(head, wanted)
+                found_argument: mutable bool = false
+                for argument in arguments |found_argument|:
+                    found_argument <- true if recursive_type_mentions(argument, wanted)
+                return found_argument
+            if expression is Expr.Unary(operator, operand, line):
+                return recursive_type_mentions(operand, wanted)
+            if expression is Expr.Paren(inner, line):
+                return recursive_type_mentions(inner, wanted)
+            if expression is Expr.Refinement(base, predicate, line):
+                return recursive_type_mentions(base, wanted)
+            return false
+
+
+        def enum_parent_name(parser: Parser&, owner: sview) -> sview:
+            for annotation in parser.enum_annotations:
+                annotation.name return if annotation.owner == owner and annotation.line == 3900000008
+            return ""
+
+
+        def enum_hierarchy_root(parser: Parser&, owner: sview) -> sview:
+            root: mutable sview = owner
+            for _step in 0..=32 |root, parser|:
+                parent: sview = enum_parent_name(parser, root)
+                break if parent == ""
+                root <- parent
+            return root
+
+
+        # `sealed` marks the `enum Node: pass` spelling — the compiler's sealed AST root.
+        # It cannot be inferred from `variants`: the first call site runs BEFORE the body is
+        # parsed and always passes an empty list, so every enum named Node looked sealed.
+        def record_recursive_enum(parser: lmut Parser, owner: sview, variants: darray[Ast::EnumVariant], sealed: bool) -> void:
+            recursive: mutable bool = false
+            for annotation in parser.enum_annotations |recursive, owner|:
+                recursive <- true if annotation.owner == owner and annotation.name == "__recursive_field"
+            # AST refinements are part of the sealed Node hierarchy even when a
+            # particular declaration has no direct self-typed payload in the parsed
+            # field list. Promote them from their `is Node` ancestry as well; otherwise
+            # `Ast::Expr` remains an ordinary enum and functions returning `Expr?`
+            # (notably Parser.expression) are rejected by the backend's type pass.
+            parent: sview = enum_parent_name(parser, owner)
+            root: sview = enum_hierarchy_root(parser, owner)
+            # The built-in AST declarations live in module Ast, but their declaration
+            # names are intentionally unqualified in the AST type expressions. Keep this
+            # explicit fallback alongside the ancestry check so promotion does not depend
+            # on header metadata surviving parser recovery.
+            # The name fallback only applies to a declaration that actually sits in a Node
+            # hierarchy: an ordinary user enum that happens to be called `Expr` is NOT an
+            # AST refinement. Promoting purely by name silently turned such an enum into a
+            # packed one, which suppressed the ordinary-enum diagnostics stage0 reports.
+            # `enum_hierarchy_root(X)` is X itself when X has no parent, so `root == "Node"`
+            # was trivially true for ANY enum literally named Node. The compiler's own root is
+            # the SEALED, variant-less `enum Node: pass`; a user's `packed enum Node: Leaf(…)`
+            # is not it.
+            sealed_root: bool = owner == "Node" and sealed
+            is_builtin_ast_node: bool = (owner == "Node" or owner == "Expr" or owner == "Stmt" or owner == "Decl" or owner == "Pattern") and (parent != "" or sealed_root)
+            is_ast_refinement: bool = is_builtin_ast_node or (parent != "" and root == "Node")
+            return if not recursive and not is_ast_refinement
+            # Mark a genuine Node-hierarchy member. The backend keyed "is this one of MY AST
+            # refinements?" on the bare NAME, so a program declaring its own
+            # `packed enum Expr:` was re-homed into the (empty) AST root store and declined.
+            ast_marked: mutable bool = false
+            for annotation in parser.enum_annotations |ast_marked, owner|:
+                ast_marked <- true if annotation.owner == owner and annotation.name == "__ast_refinement"
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: owner, name: "__ast_refinement", line: 3900000043}) if is_ast_refinement and not ast_marked
+            root_seen: mutable bool = false
+            for packed_name in parser.packed_enum_names |root_seen|:
+                root_seen <- true if packed_name == root
+            parser.packed_enum_names <- parser.packed_enum_names.push(root) if not root_seen
+            aos_seen: mutable bool = false
+            for annotation in parser.enum_annotations |aos_seen|:
+                aos_seen <- true if annotation.owner == root and annotation.name == "__aos"
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: root, name: "__aos", line: 3900000042}) if not aos_seen
+            # Each refinement is a valid type name at use sites (`Ast.Expr`, `Ast.Stmt`,
+            # `Ast.Decl`). Keep the names as well as the canonical root; the backend can
+            # then register the refinement declarations into the shared store rather than
+            # treating them as ordinary inline enums.
+            owner_seen: mutable bool = false
+            for packed_name in parser.packed_enum_names |owner_seen|:
+                owner_seen <- true if packed_name == owner
+            parser.packed_enum_names <- parser.packed_enum_names.push(owner) if not owner_seen
