@@ -335,6 +335,28 @@ def main() -> i64:
 EOF
 )" 6
 
+# 12. A narrowed OPTIONAL-of-pointer LOCAL reinterpreted by `.cast[T&]` — the std's
+#     *_or_panic allocator shape. Gated on the narrowing proof AND on a plain-Ident source:
+#     the same unwrap on a struct FIELD read compiles but returns the wrong answer, so that
+#     shape is deliberately still declined. Compares the unwrapped address against the one
+#     passed in, so an unwrap that yields a wrong-but-non-null pointer fails.
+differential narrowed_optional_local_cast "$(cat <<'EOF'
+def unwrap_addr(raw: mutable void&?) -> uintptr:
+    can Abort.Panic:
+        assert raw != null
+        trusted Unsafe.PointerCast:
+            return raw.cast[void&].cast[u8&].uintptr()
+
+
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        storage: mutable u8[8] = zeroed
+        direct: uintptr = (&storage[0]).cast[u8&].uintptr()
+        opt: mutable void&? = (&storage[0]).cast[mutable void&]
+        return 1 if unwrap_addr(opt) == direct else 0
+EOF
+)" 1
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
