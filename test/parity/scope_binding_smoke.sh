@@ -444,6 +444,38 @@ def main() -> i64:
 EOF
 )" 2
 
+# 18. The same unwrap through a struct FIELD (`a.data: mutable u8&?`) — the std fixed-buffer
+#     allocator shape. Excluded for several rounds on a "10 vs 20" measurement that was
+#     itself wrong: that fixture ran through `.uintptr()`, which was returning the pointee.
+#     Checks a pointer INSIDE the buffer and one OUTSIDE, so an unwrap yielding a plausible
+#     but wrong base fails.
+differential narrowed_optional_field_cast "$(cat <<'EOF'
+struct Buf:
+    data: mutable u8&?
+    capacity: mutable usize
+
+
+def owns(a: Buf&, ptr: void&) -> bool:
+    false return if a.data == null
+
+    trusted Unsafe.PointerCast:
+        base: uintptr = a.data.cast[u8&].uintptr()
+        raw: uintptr = ptr.cast[u8&].uintptr()
+        limit: uintptr = base + a.capacity.uintptr()
+        return raw >= base and raw < limit
+
+
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        storage: mutable u8[16] = zeroed
+        b: mutable Buf = Buf{data: &storage[0], capacity: 16.usize()}
+        inside: bool = owns(b, (&storage[4]).cast[void&])
+        outside_target: mutable i64 = 0
+        outside: bool = owns(b, (&outside_target).cast[void&])
+        return 10 if inside and not outside else 20
+EOF
+)" 10
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
