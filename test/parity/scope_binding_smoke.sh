@@ -357,6 +357,47 @@ def main() -> i64:
 EOF
 )" 1
 
+# 13. `.uintptr()` on a ref is the ADDRESS; `.i64()` is the POINTEE. stage1 dereferenced
+#     for BOTH, so `&a[0]` and `&a[4]` reported the same address — a SILENT miscompile with
+#     no decline and no link error. Invisible to the self-host: the compiler only ever takes
+#     `&xs[0]`, where a dereferenced address still looks plausible. The two bytes are given
+#     DIFFERENT values so a fix that swapped the two rules also fails.
+differential ref_uintptr_is_address_not_pointee "$(cat <<'EOF'
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        local: mutable u8[16] = zeroed
+        local[0] <- 7
+        local[4] <- 9
+        p0: u8& = &local[0]
+        p4: u8& = &local[4]
+        addr_gap: i64 = (p4.uintptr() - p0.uintptr()).usize().i64()
+        byte0: i64 = p0.i64()
+        byte4: i64 = p4.i64()
+        gap_ok: i64 = 1 if addr_gap == 4 else 0
+        b0_ok: i64 = 1 if byte0 == 7 else 0
+        b4_ok: i64 = 1 if byte4 == 9 else 0
+        return gap_ok * 100 + b0_ok * 10 + b4_ok
+EOF
+)" 111
+
+# 14. The same address rule reached through a struct FIELD's fixed array, which is the shape
+#     the std allocators use (`&a.storage[i]`).
+differential struct_field_array_element_address "$(cat <<'EOF'
+struct Buf:
+    storage: mutable u8[16]
+
+
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        b: mutable Buf = zeroed
+        f0: uintptr = (&b.storage[0]).cast[u8&].uintptr()
+        f4: uintptr = (&b.storage[4]).cast[u8&].uintptr()
+        differ: i64 = 1 if f0 != f4 else 0
+        gap: i64 = (f4 - f0).usize().i64()
+        return differ * 100 + gap
+EOF
+)" 104
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
