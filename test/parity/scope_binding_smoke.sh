@@ -628,6 +628,27 @@ def main() -> i64:
 EOF
 )" 15
 
+# 25. `s.len` on a CSTR. It reads like a field, but a cstr is a bare pointer — stage0
+#     CALLS ctx_strlen. This is why the std's FNV hash `for ch in s[0:s.len]` declined on
+#     the BOUND: slicing a cstr and iterating an sview both already worked. Sums the bytes
+#     of a 3-char string, so a length off by one (or a pointer read as a length) is caught
+#     rather than yielding a plausible total.
+differential cstr_len_is_strlen_call "$(cat <<'EOF'
+def hash_it(s: cstr) -> u64 can[Abort.Panic]:
+    h: mutable u64 = 0.u64()
+    for ch in s[0:s.len]:
+        h <- h + ch.u64()
+    return h
+
+
+def main() -> i64:
+    can Abort.Panic:
+        # A + B + C = 65 + 66 + 67 = 198. A length short by one drops 67; a length long
+        # by one reads past the terminator. Either way the total moves off 42.
+        return hash_it("ABC").i64() - 156
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
