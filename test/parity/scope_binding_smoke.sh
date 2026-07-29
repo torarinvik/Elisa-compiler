@@ -306,6 +306,35 @@ def main() -> i64:
 EOF
 )" 90
 
+# 11. WHILE-condition narrowing. The condition holds INSIDE the body, exactly as in an
+#     `if`'s then-arm, so `while cursor != null:` lets the body take `cursor` as a plain
+#     ref. stage1 recorded narrowing for `if` only, so the std's region walks — which take
+#     the loop-carried optional as a ref on the body's first line — declined. Walking three
+#     nodes means a body that ran zero or once still gives the wrong sum.
+differential while_condition_narrowing "$(cat <<'EOF'
+struct Node:
+    value: i64
+    next: mutable Node&?
+
+
+def total(head: mutable Node&?) -> i64:
+    sum: mutable i64 = 0
+    cursor: mutable Node&? = head
+    while cursor != null |sum, cursor|:
+        here: mutable Node& = cursor
+        sum <- sum + here.value
+        cursor <- here.next
+    return sum
+
+
+def main() -> i64:
+    c: mutable Node = Node{value: 3, next: null}
+    b: mutable Node = Node{value: 2, next: &c}
+    a: mutable Node = Node{value: 1, next: &b}
+    return total(&a)
+EOF
+)" 6
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
