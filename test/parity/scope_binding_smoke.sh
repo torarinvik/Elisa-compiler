@@ -398,6 +398,34 @@ def main() -> i64:
 EOF
 )" 104
 
+# 15. `for x in CALL()` — iterating a darray a function RETURNED. A call result has no
+#     header address, so the loop has to spill the value; stage1 declined instead, and that
+#     one construct dropped `Easm.verify_module`, which every easm_* program reaches. Worth
+#     26 of the 29 corpus programs stage1 could not build. Sums distinct values so a loop
+#     that runs the wrong number of times fails.
+differential for_over_call_result "$(cat <<'EOF'
+def make() -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = []
+        out.push(1)
+        out.push(2)
+        out.push(4)
+        return out
+
+
+def total() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        sum: mutable i64 = 0
+        for v in make() |sum|:
+            sum <- sum + v
+        return sum
+
+
+def main() -> i64:
+    return total()
+EOF
+)" 7
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
