@@ -501,6 +501,34 @@ def main() -> i64:
 EOF
 )" 5
 
+# 20. A fixed-array GLOBAL whose extent is a named const (`i64[CAP]`), not a literal.
+#     The annotation accepted only Expr.IntLit, so the global never registered and every
+#     read and write of it declined — which is how the runtime's five trace/cache tapes
+#     dropped ~20 functions. Writes TWO distinct slots and sums them, so an extent folded
+#     to the wrong bound (or a base that is not the global) gives a wrong total rather
+#     than passing on a single lucky slot.
+differential array_global_const_extent "$(cat <<'EOF'
+const CAP: usize = 8
+
+
+global mutable tape: i64[CAP] = zeroed
+
+
+def put(index: usize, value: i64) -> void:
+    tape[index] <- value
+
+
+def get(index: usize) -> i64:
+    return tape[index]
+
+
+def main() -> i64:
+    put(0.usize(), 7)
+    put((CAP - 1.usize()), 35)
+    return get(0.usize()) + get((CAP - 1.usize()))
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
