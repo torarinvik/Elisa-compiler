@@ -1,0 +1,343 @@
+# Stage1 semantic — constant folding and substitution rules (`extend Semantic:
+# private:`). Folds a goal to a literal where it can, and proves the remaining shapes by
+# substituting the return expression for `result`: inline `>=`, modular preservation,
+# product bounds, non-null, and goals that merely restate a requires clause. Continues
+# check_ensure_strict_overflow.elisa; split out to keep each part under 600 lines.
+
+extend Semantic:
+    private:
+        # Fold a goal side to an integer constant AFTER resolving `result`/`result.FIELD`
+        # against the return expression: `result.val` on `return Box{val: 5}` is 5.
+        def es_const_fold(expression: Ast::Expr, return_expression: Ast::Expr, has_return: bool, found: mutable bool&, depth: u32) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                if depth > 32:
+                    found <- false
+                    return 0
+                resolved: Ast::Expr = resolve_result(expression, return_expression, has_return)
+                match resolved:
+                    Expr.IntLit(value):
+                        found <- true
+                        return value
+                    Expr.Paren(inner, paren_line):
+                        return es_const_fold(inner, return_expression, has_return, found, depth + 1)
+                    Expr.Unary(operator, operand, unary_line):
+                        if operator == TokenKind.Minus:
+                            inner_value: i64 = es_const_fold(operand, return_expression, has_return, found, depth + 1)
+                            return 0 - inner_value
+                        found <- false
+                        return 0
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_found: mutable bool = false
+                        right_found: mutable bool = false
+                        left_value: i64 = es_const_fold(left, return_expression, has_return, left_found, depth + 1)
+                        right_value: i64 = es_const_fold(right, return_expression, has_return, right_found, depth + 1)
+                        if not (left_found and right_found):
+                            found <- false
+                            return 0
+                        found <- true
+                        (left_value + right_value) return if operator == TokenKind.Plus
+                        (left_value - right_value) return if operator == TokenKind.Minus
+                        (left_value * right_value) return if operator == TokenKind.Star
+                        found <- false
+                        return 0
+                    _:
+                        found <- false
+                        return 0
+
+        # A goal `L op R` whose sides both fold to integer constants (after resolving
+        # `result`/`result.FIELD`) is DECIDED outright: `ensure result.val > 0` on
+        # `return Box{val: 5}` evaluates `5 > 0`.
+        def es_const_goal_true(goal: Ast::Expr, return_expression: Ast::Expr, has_return: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if not has_return
+                match goal:
+                    Expr.Binary(left, operator, right, binary_line):
+                        left_found: mutable bool = false
+                        right_found: mutable bool = false
+                        left_value: i64 = es_const_fold(left, return_expression, has_return, left_found, 0)
+                        right_value: i64 = es_const_fold(right, return_expression, has_return, right_found, 0)
+                        false return if not (left_found and right_found)
+                        (left_value == right_value) return if operator == TokenKind.EqEq
+                        (left_value != right_value) return if operator == TokenKind.BangEq
+                        (left_value < right_value) return if operator == TokenKind.Lt
+                        (left_value > right_value) return if operator == TokenKind.Gt
+                        (left_value <= right_value) return if operator == TokenKind.LtEq
+                        (left_value >= right_value) return if operator == TokenKind.GtEq
+                        return false
+                    _:
+                        return false
+
+        # Strip a trailing `+ NONNEG_LITERAL` from an expression (`p.x + p.y + 1` -> `p.x + p.y`).
+        def es_strip_trailing_nonneg(expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, paren_line):
+                        return es_strip_trailing_nonneg(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.Plus:
+                            is_nonneg_literal: bool = match right:
+                                Expr.IntLit(literal_value): literal_value >= 0
+                                _: false
+                            left return if is_nonneg_literal
+                        return expression
+                    _:
+                        return expression
+
+        # `ensure result >= f(args)` where f is a pure single-return callee (body E) whose args are the
+        # SAME identifiers as its parameters, and this function's own return is `E + k` (k a trailing
+        # non-negative literal): then result = E + k >= E = f(args). Bypasses the linear tier, so it
+        # discharges goals over struct fields (`result >= manhattan(p)` with `return p.x + p.y + 1`).
+        def es_ge_inline_proven(goal: Ast::Expr, return_expression: Ast::Expr, has_return: bool, inl_names: darray[sview]&, inl_param_starts: darray[usize]&, inl_param_counts: darray[usize]&, all_inl_params: darray[sview]&, inl_bodies: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if not has_return
+                if goal is Expr.Binary(goal_left, goal_operator, goal_right, goal_line):
+                    if goal_operator == TokenKind.GtEq and ident_name_of(goal_left) == "result":
+                        if goal_right is Expr.Call(callee, arguments, argument_names, call_line):
+                            callee_name: sview = ident_name_of(callee)
+                            slot: mutable i64 = -1
+                            probe: mutable usize = 0
+                            while probe < inl_names.count |slot, probe, callee_name, inl_names|:
+                                slot <- probe.i64() if inl_names[probe] == callee_name and slot < 0
+                                probe <- probe + 1
+                            false return if slot < 0 or inl_param_counts[slot.usize()] != arguments.count
+                            args_match: mutable bool = true
+                            arg_index: mutable usize = 0
+                            while arg_index < arguments.count |args_match, arg_index, slot, arguments, all_inl_params, inl_param_starts|:
+                                args_match <- false if ident_name_of(arguments[arg_index]) != all_inl_params[inl_param_starts[slot.usize()] + arg_index]
+                                arg_index <- arg_index + 1
+                            false return if not args_match
+                            base: Ast::Expr = es_strip_trailing_nonneg(return_expression)
+                            return equal_normalized(base, inl_bodies[slot.usize()], Ast::Expr.Invalid, false)
+                return false
+
+        # The modulus of a predicate body of shape `X % m == 0` (m a positive literal), else 0.
+        def es_modulus_of_body(body: Ast::Expr) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                if body is Expr.Binary(eq_left, eq_operator, eq_right, eq_line):
+                    if eq_operator == TokenKind.EqEq and es_int_literal_value(eq_right) == 0:
+                        if eq_left is Expr.Binary(mod_left, mod_operator, mod_right, mod_line):
+                            if mod_operator == TokenKind.Percent:
+                                m: i64 = es_int_literal_value(mod_right)
+                                return m if m > 0 else 0
+                return 0
+
+        # A `base + k` return (base any expression, k a literal), else not-found.
+        def es_return_base_k(return_expression: Ast::Expr) -> (found: bool, base: Ast::Expr, k: i64):
+            can Memory.Allocate, Abort.Panic:
+                match return_expression:
+                    Expr.Paren(inner, paren_line):
+                        return es_return_base_k(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        is_lit: bool = match right:
+                            Expr.IntLit(v): true
+                            _: false
+                        if operator == TokenKind.Plus and is_lit:
+                            return (true, left, es_int_literal_value(right))
+                        return (false, (Ast::Expr.Absent), 0)
+                    _:
+                        return (false, (Ast::Expr.Absent), 0)
+
+        # Whether a `requires` states `callee(base)` — the same predicate the ensure applies, on the
+        # return's base operand.
+        def es_requires_has_predicate_call(requires_predicates: darray[Ast::Expr]&, callee_name: sview, base: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for predicate in requires_predicates:
+                    match predicate:
+                        Expr.Call(callee, arguments, argument_names, call_line):
+                            if ident_name_of(callee) == callee_name and arguments.count == 1:
+                                true return if equal_normalized(arguments[0], base, Ast::Expr.Invalid, false)
+                        _:
+                            pass
+                return false
+
+        # `ensure f(result)` where f is a pure predicate `X % m == 0`, the return is `base + k` with
+        # k a multiple of m, and `requires f(base)` holds: then f(base + k) == f(base) (mod m preserved),
+        # so the postcondition holds. Proves parity/divisibility preservation without a solver.
+        def es_modular_preserve_proven(goal: Ast::Expr, return_expression: Ast::Expr, has_return: bool, requires_predicates: darray[Ast::Expr]&, inl_names: darray[sview]&, inl_param_starts: darray[usize]&, inl_param_counts: darray[usize]&, all_inl_params: darray[sview]&, inl_bodies: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if not has_return
+                if goal is Expr.Call(callee, arguments, argument_names, goal_call_line):
+                    if ident_name_of(callee) != "" and arguments.count == 1 and ident_name_of(arguments[0]) == "result":
+                        callee_name: sview = ident_name_of(callee)
+                        slot: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < inl_names.count |slot, probe, callee_name, inl_names|:
+                            slot <- probe.i64() if inl_names[probe] == callee_name and slot < 0
+                            probe <- probe + 1
+                        false return if slot < 0
+                        modulus: i64 = es_modulus_of_body(inl_bodies[slot.usize()])
+                        false return if modulus == 0
+                        base_k: (found: bool, base: Ast::Expr, k: i64) = es_return_base_k(return_expression)
+                        false return if not base_k.found or (base_k.k % modulus) != 0
+                        return es_requires_has_predicate_call(requires_predicates, callee_name, base_k.base)
+                return false
+
+        # Whether an expression is an integer literal.
+        def es_is_int_literal(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match expression:
+                    Expr.IntLit(literal_value): true
+                    _: false
+
+        # Resolve a one-level `type` alias name to its target type expression, else unchanged.
+        def es_resolve_alias(type_expression: Ast::Expr, alias_names: darray[sview]&, alias_targets: darray[Ast::Expr]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                alias_name: sview = ident_name_of(type_expression)
+                type_expression return if alias_name == ""
+                probe: mutable usize = 0
+                while probe < alias_names.count |probe, alias_name, alias_names, alias_targets|:
+                    alias_targets[probe] return if alias_names[probe] == alias_name
+                    probe <- probe + 1
+                return type_expression
+
+        # `ensure result <= K` whose return is `param * c` (c a positive literal), where param carries a
+        # refinement upper bound `hi` (directly or via a `type` alias): if hi*c <= K the product cannot
+        # exceed K (and so cannot overflow a type that holds K) — the postcondition holds. Bypasses the
+        # linear tier, so it is sound WITHOUT the overflow-fit hazard of boxing the param there.
+        def es_product_bound_proven(goal: Ast::Expr, return_expression: Ast::Expr, has_return: bool, parameters: darray[Ast::ParamDecl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, alias_names: darray[sview]&, alias_targets: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if not has_return
+                if goal is Expr.Binary(goal_left, goal_operator, goal_right, goal_line):
+                    if goal_operator == TokenKind.LtEq and ident_name_of(goal_left) == "result":
+                        bound_k: i64 = es_int_literal_value(goal_right)
+                        false return if not es_is_int_literal(goal_right)
+                        if return_expression is Expr.Binary(mul_left, mul_operator, mul_right, mul_line):
+                            if mul_operator == TokenKind.Star:
+                                param_name: mutable sview = sview("", 0, 0)
+                                factor: mutable i64 = 0
+                                left_factor: bool = es_is_int_literal(mul_left)
+                                if left_factor:
+                                    param_name <- ident_name_of(mul_right)
+                                    factor <- es_int_literal_value(mul_left)
+                                else:
+                                    param_name <- ident_name_of(mul_left)
+                                    factor <- es_int_literal_value(mul_right)
+                                false return if param_name == "" or factor <= 0
+                                for parameter in parameters:
+                                    if parameter.name == param_name:
+                                        resolved: Ast::Expr = es_resolve_alias(parameter.type_expression, alias_names, alias_targets)
+                                        bounds: (found: bool, lo: i64, hi: i64) = refined_param_bounds(resolved, law_names, law_predicates)
+                                        return bounds.found and bounds.hi * factor <= bound_k
+                return false
+
+        # `result != null` (through parens) — discharged for a reference-typed return.
+        def es_goal_is_result_nonnull(goal: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match goal:
+                    Expr.Paren(inner, paren_line):
+                        return es_goal_is_result_nonnull(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        return operator == TokenKind.BangEq and ident_name_of(left) == "result" and ident_name_of(right) == "null"
+                    _:
+                        return false
+
+        # A goal that RESTATES a `requires` clause verbatim after substituting `result`
+        # with the return expression: `ensure result == 5` given `return s.x` and
+        # `requires s.x == 5`. Sound only for a body that performs no mutation (checked by
+        # the caller), so the entry fact still holds at the return.
+        # The struct/type NAME under any reference/mutable/optional markers: `Counter&`,
+        # `mutable Counter&`, `Counter?` all unwrap to `Counter`.
+        def es_unwrap_type_name(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        return name
+                    Expr.Unary(operator, operand, unary_line):
+                        return es_unwrap_type_name(operand)
+                    Expr.Refinement(base, predicate, refinement_line):
+                        return es_unwrap_type_name(base)
+                    Expr.Paren(inner, paren_line):
+                        return es_unwrap_type_name(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        # Structural equality of GOAL and REQUIRED where each `result` in GOAL stands for the
+        # return expression (no allocation). Proves `ensure all_nonneg(result)` restates
+        # `requires all_nonneg(t)` on `return t` — a predicate-call identity the Binary tier
+        # cannot express.
+        def es_equal_result_subst(goal: Ast::Expr, required: Ast::Expr, return_expression: Ast::Expr, has_return: bool, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 40
+                goal_resolved: Ast::Expr = resolve_result(goal, return_expression, has_return)
+                match goal_resolved:
+                    Expr.Ident(goal_name, goal_line):
+                        return match required:
+                            Expr.Ident(req_name, req_line): goal_name == req_name
+                            _: false
+                    Expr.IntLit(goal_value):
+                        return match required:
+                            Expr.IntLit(req_value): goal_value == req_value
+                            _: false
+                    Expr.Paren(goal_inner, goal_paren):
+                        return es_equal_result_subst(goal_inner, required, return_expression, has_return, depth + 1)
+                    Expr.Binary(goal_left, goal_operator, goal_right, goal_bin):
+                        return match required:
+                            Expr.Paren(req_inner, req_paren): es_equal_result_subst(goal_resolved, req_inner, return_expression, has_return, depth + 1)
+                            Expr.Binary(req_left, req_operator, req_right, req_bin): goal_operator == req_operator and es_equal_result_subst(goal_left, req_left, return_expression, has_return, depth + 1) and es_equal_result_subst(goal_right, req_right, return_expression, has_return, depth + 1)
+                            _: false
+                    Expr.Unary(goal_operator, goal_operand, goal_un):
+                        return match required:
+                            Expr.Unary(req_operator, req_operand, req_un): goal_operator == req_operator and es_equal_result_subst(goal_operand, req_operand, return_expression, has_return, depth + 1)
+                            _: false
+                    Expr.Field(goal_object, goal_field, goal_fl):
+                        return match required:
+                            Expr.Field(req_object, req_field, req_fl): goal_field == req_field and es_equal_result_subst(goal_object, req_object, return_expression, has_return, depth + 1)
+                            _: false
+                    Expr.Call(goal_callee, goal_arguments, goal_argnames, goal_cl):
+                        return match required:
+                            Expr.Call(req_callee, req_arguments, req_argnames, req_cl): ident_name_of(goal_callee) != "" and ident_name_of(goal_callee) == ident_name_of(req_callee) and es_call_args_equal_result_subst(goal_arguments, req_arguments, return_expression, has_return, depth)
+                            _: false
+                    _:
+                        return false
+
+        def es_call_args_equal_result_subst(goal_arguments: darray[Ast::Expr], req_arguments: darray[Ast::Expr], return_expression: Ast::Expr, has_return: bool, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if goal_arguments.count != req_arguments.count
+                index: mutable usize = 0
+                while index < goal_arguments.count |index, goal_arguments, req_arguments, return_expression, has_return, depth|:
+                    false return if not es_equal_result_subst(goal_arguments[index], req_arguments[index], return_expression, has_return, depth + 1)
+                    index <- index + 1
+                return true
+
+        def es_goal_restates_requires(goal: Ast::Expr, return_expression: Ast::Expr, has_return: bool, requires_predicates: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if not has_return
+                match goal:
+                    Expr.Binary(left, operator, right, binary_line):
+                        resolved_left: Ast::Expr = resolve_result(left, return_expression, has_return)
+                        resolved_right: Ast::Expr = resolve_result(right, return_expression, has_return)
+                        for required in requires_predicates |resolved_left, resolved_right, operator|:
+                            match required:
+                                Expr.Binary(req_left, req_operator, req_right, req_line):
+                                    true return if operator == req_operator and expressions_equal(resolved_left, req_left) and expressions_equal(resolved_right, req_right)
+                                _:
+                                    pass
+                        return false
+                    Expr.Call(call_callee, call_arguments, call_argnames, call_line):
+                        # A predicate-call goal (`all_nonneg(result)`) that restates a `requires`
+                        # verbatim once `result` is the return expression.
+                        for required in requires_predicates |goal, return_expression, has_return|:
+                            true return if es_equal_result_subst(goal, required, return_expression, has_return, 0)
+                        return false
+                    _:
+                        return false
+
+        # Whether an expression is a conditional (ternary `A if C else B`) — a value the
+        # reflexive prover cannot substitute soundly, since the result depends on the branch.
+        def is_conditional_expression(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                return match expression:
+                    Expr.If(condition, then_expression, else_expression, line): true
+                    _: false
+
+        # Whether NAME is a sized integer type (the domain where the linear tier's strict
+        # bound tightening `x > c  =>  x >= c+1` is exact).
+        def ensure_int_type_name(name: sview) -> bool:
+            can Abort.Panic:
+                return name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "usize" or name == "isize" or name == "int" or name == "uint"
+
+
+        # Whether NAME is an UNSIGNED integer type (contributes an implicit `>= 0` bound).
+        def ensure_unsigned_type_name(name: sview) -> bool:
+            can Abort.Panic:
+                return name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "usize" or name == "uint"

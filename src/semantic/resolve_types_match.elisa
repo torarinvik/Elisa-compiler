@@ -1,0 +1,309 @@
+# Stage1 semantic — match arm typing and exhaustiveness (`extend Semantic: private:`).
+# Covers enum, hierarchy, scalar, and sequence arms, variant-path coverage, and the
+# ternary-condition check. Continues resolve_types_infer.elisa; split out to keep each
+# part file under 600 lines.
+
+extend Semantic:
+    private:
+        # Flag a `match` that omits at least one variant of its (known enum) scrutinee and
+        # has no catch-all — parity with stage0's `non-exhaustive match`. SOUND SUBSET: it
+        # reports only when the scrutinee is a plain identifier whose local-type is a
+        # registered enum AND every arm is a variant / or-of-variants pattern; a catch-all
+        # (`_`/binding) or any unclassifiable arm (literal/struct/tuple/typebind/…) BAILS,
+        # so it can never falsely claim a covered value is missing.
+        # NOTE: Multi-scrutinee tuple matches (`match a, b:`) still need cartesian
+        # product coverage for exhaustiveness (arity validation is supported); the
+        # exhaustiveness checking (the cartesian product of both types is complex to model).
+        # Every arm variant pattern qualified by an enum name (`Other.V`) must name the scrutinee
+        # enum or a refinement of it (itself or a hierarchy child). A qualifier that is a DIFFERENT
+        # known enum is rejected ("match arm expects enum X or a refinement of it, got Y").
+        def check_arm_enum_types(enum_name: sview, arms: darray[Ast::MatchArm], line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                paths: mutable darray[sview] = []
+                for arm in arms |paths|:
+                    _ = collect_arm_variant_paths(arm.pattern, paths)
+                for path in paths |table| -> table:
+                    owner_index: mutable usize = 0
+                    matched: mutable bool = false
+                    while owner_index < table.enum_variant_owner.count |table, owner_index, matched| -> table:
+                        candidate: sview = table.enum_variant_owner[owner_index]
+                        if not matched and path_names_enum(path, candidate):
+                            matched <- true
+                            valid: bool = candidate == enum_name or enum_in_hierarchy(candidate, enum_name, table)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MatchArmEnumType, name: candidate, line: line, expected: enum_name, actual: ""}) if not valid
+                        owner_index <- owner_index + 1
+
+        # Whether ENUM's parent (transitively) is ROOT — a child of the hierarchy rooted at ROOT.
+        def enum_in_hierarchy(child: sview, root: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                index: mutable usize = 0
+                found: mutable bool = false
+                while index < table.enum_hierarchy_child.count |found|:
+                    found <- true if table.enum_hierarchy_child[index] == child and table.enum_hierarchy_parent[index] == root
+                    index <- index + 1
+                return found
+
+        # Exhaustiveness over a hierarchy ROOT: every variant of every child enum must be covered
+        # (or the match has a catch-all). Reports the first missing variant as `Child.Variant`.
+        def check_hierarchy_exhaustive(root: sview, arms: darray[Ast::MatchArm], line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                covered: mutable darray[sview] = []
+                for arm in arms:
+                    guarded: bool = match arm.guard:
+                        Expr.Invalid: false
+                        Expr.Absent: false
+                        _:            true
+                    continue if guarded
+                    return if not collect_arm_variant_paths(arm.pattern, covered)
+                # Report the first (child, variant) whose variant name no arm covers.
+                variant_index: mutable usize = 0
+                while variant_index < table.enum_variant_owner.count |table, variant_index| -> table:
+                    child: sview = table.enum_variant_owner[variant_index]
+                    if enum_in_hierarchy(child, root, table):
+                        variant_name: sview = table.enum_variant_name[variant_index]
+                        already_covered: bool = paths_cover_variant(covered, variant_name)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonExhaustiveMatch, name: root, line: line, expected: variant_name, actual: ""}) if not already_covered
+                        break if not already_covered
+                    variant_index <- variant_index + 1
+
+        def check_match_exhaustive(scrutinee: Ast::Expr, arms: darray[Ast::MatchArm], line: u32, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                scrutinee_name: sview = match scrutinee:
+                    Expr.Ident(name, ident_line): name
+                    _:                            ""
+                return if scrutinee_name == ""
+                enum_name: sview = local_type_of(names, types, scrutinee_name)
+                return if enum_name == ""
+                # A hierarchy root (`enum Root: pass` with `enum Child is Root` members) has no own
+                # variants; its match must cover every child enum's variants. Handle that separately.
+                is_hierarchy_root: bool = any parent in table.enum_hierarchy_parent where parent == enum_name
+                # Wrong-enum arm qualifier is checked for both hierarchy roots and plain enums.
+                table <- check_arm_enum_types(enum_name, arms, line, table) if is_hierarchy_root or enum_is_known(enum_name, table)
+                if is_hierarchy_root:
+                    table <- check_hierarchy_exhaustive(enum_name, arms, line, table)
+                    return
+                return if not enum_is_known(enum_name, table)
+                # Every arm must be a variant (or or-of-variants) cover; anything else bails.
+                covered: mutable darray[sview] = []
+                for arm in arms:
+                    # docs/122 §5.1: a guarded arm can fail at runtime, so its variant
+                    # paths never count toward coverage (mirrors stage0's coverage sink).
+                    guarded: bool = match arm.guard:
+                        Expr.Invalid: false
+                        Expr.Absent: false
+                        _:            true
+                    continue if guarded
+                    return if not collect_arm_variant_paths(arm.pattern, covered)
+                # Report the first declared variant of `enum_name` no arm covers.
+                while variant_index < table.enum_variant_owner.count |variant_index: usize = 0|:
+                    if table.enum_variant_owner[variant_index] == enum_name:
+                        variant_name: sview = table.enum_variant_name[variant_index]
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonExhaustiveMatch, name: enum_name, line: line, expected: variant_name, actual: ""}) if not paths_cover_variant(covered, variant_name)
+                        return if not paths_cover_variant(covered, variant_name)
+                    variant_index <- variant_index + 1
+
+
+        def scalar_match_pattern_valid(pattern: Ast::Pattern, scalar_family: sview) -> bool:
+            can Abort.Panic:
+                return match pattern:
+                    Pattern.Wildcard: true
+                    Pattern.Literal(text):
+                        first: u8 = sview_at(text, 0) if sview_len(text) > 0 else 0
+                        numeric_text: bool = (first >= 48 and first <= 57) or first == 45
+                        not numeric_text if scalar_family == "string" else numeric_text
+                    Pattern.Or(options):
+                        all option in options where scalar_match_pattern_valid(option, scalar_family)
+                    _: false
+
+
+        def check_scalar_match_arm_types(scrutinee: Ast::Expr, arms: darray[Ast::MatchArm], line: u32, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                scalar_family: mutable sview = infer_family(scrutinee, names, types, table)
+                scalar_family <- "string" if scalar_family == "" and scrutinee is Expr.Ident(scrutinee_name, scrutinee_line) and local_type_of(names, types, scrutinee_name) == "StringView"
+                return if scalar_family != "int" and scalar_family != "string"
+                # A catch block desugars to a Match whose arms are error-set members —
+                # stage0 is silent there, so catch-tagged matches are out of scope.
+                return if any catch_line in table.catch_match_lines where catch_line == line
+                for arm in arms |table|:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.InvalidTopLevelScalarMatchArm, name: scalar_family, line: line, expected: "", actual: ""}) if not scalar_match_pattern_valid(arm.pattern, scalar_family)
+
+
+        def check_sequence_match_arm_types(scrutinee: Ast::Expr, arms: darray[Ast::MatchArm], line: u32, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                scrutinee_type: InferType = infer_expression_type(scrutinee, names, types, table)
+                known_sequence: bool = scrutinee_type.kind == TypeKind.Container and scrutinee_type.name in {"array", "darray", "view"}
+                return if not known_sequence
+                for arm in arms |table|:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.InvalidTopLevelSequenceMatchArm, name: scrutinee_type.name, line: line, expected: "", actual: ""}) if arm.pattern is Pattern.Variant(_, _)
+
+
+        # True if `enum_name` is a declared enum (has at least one variant in the registry).
+        def enum_is_known(enum_name: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return any owner in table.enum_variant_owner where owner == enum_name
+
+
+        # Append the variant path(s) an arm pattern covers to `covered`, returning true.
+        # Returns FALSE for a catch-all (`_`/binding) or any pattern that is not a variant
+        # or or-of-variants — the signal for the caller to bail (cannot soundly report).
+        def collect_arm_variant_paths(pattern: Ast::Pattern, covered: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                ok: mutable bool = false
+                match pattern:
+                    Pattern.Variant(path, fields):
+                        covered.push(path)
+                        ok <- true
+                    Pattern.Or(options):
+                        ok <- true
+                        for option in options |ok, covered|:
+                            ok <- false if not collect_arm_variant_paths(option, covered)
+                    Pattern.Wildcard:
+                        ok <- false
+                    Pattern.Binding(binding_name):
+                        ok <- false
+                    Pattern.Pin(binding_name):
+                        ok <- false
+                    Pattern.Literal(literal_text):
+                        ok <- false
+                    Pattern.Struct(struct_path, struct_fields):
+                        ok <- false
+                    Pattern.Field(selector, inner):
+                        ok <- false
+                    Pattern.Tuple(elements):
+                        ok <- false
+                    Pattern.Rest(name):
+                        ok <- false
+                    Pattern.TypeBind(bound_type, binder):
+                        ok <- false
+                    Pattern.Range(range_lo, range_hi, range_inclusive):
+                        ok <- false
+                    Pattern.As(as_name, as_inner):
+                        # docs/122 §5.4: coverage comes from the wrapped variant pattern.
+                        ok <- true
+                        for inner_pattern in as_inner |ok, covered|:
+                            ok <- false if not collect_arm_variant_paths(inner_pattern, covered)
+                    Pattern.Other(other_text):
+                        ok <- false
+                return ok
+
+
+        # True if some collected variant path has a final `.`-tail equal to `variant_name`.
+        def paths_cover_variant(covered: darray[sview]&, variant_name: sview) -> bool:
+            can Abort.Panic:
+                return any path in covered where path_tail_equals(path, variant_name)
+
+
+        # True if the tail of `path` after its last `.` equals `variant_name` (a bare `path` with
+        # no `.` compares whole).
+        def path_tail_equals(path: sview, variant_name: sview) -> bool:
+            can Abort.Panic:
+                path_length: usize = sview_len(path)
+                variant_length: usize = sview_len(variant_name)
+                # Fold: the index of the last `.` (or -1) as a loop-expression.
+                dot: isize =
+                    for char_index in 0..<path_length |last_dot_index: isize = -1| -> last_dot_index:
+                        last_dot_index <- char_index.isize() if sview_at(path, char_index) == '.' else last_dot_index
+                tail_start: usize = (dot + 1).usize()
+                false return if path_length - tail_start != variant_length
+                for char_index in 0..<variant_length:
+                    false return if sview_at(path, tail_start + char_index) != sview_at(variant_name, char_index)
+                return true
+
+
+        # Literal-vs-declared-type checks across a body: `x: PRIM = LITERAL`
+        # declarations, `x <- LITERAL` mutations (via the flat local-type table),
+        # and `return LITERAL` against the declared return type. Recurses nested
+        # bodies; only the oracle-verified impossible pairs are flagged.
+        # A ternary `A if COND else B` (Expr.If) requires COND to be bool, mirroring
+        # if/while. Checked in value positions (parity with stage0's `ternary condition
+        # must be bool, got T`); recurses into the branches so chained ternaries are all
+        # covered. Sound like NonBoolCondition: only fires when infer_family is certain
+        # AND not bool (the `!x` volatile-read sigil preserves operand type, not bool).
+        def check_ternary_condition(expression: Ast::Expr, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Ast::Expr.If(condition, then_expression, else_expression, line):
+                        family: sview = infer_family(condition, names, types, table)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonBoolCondition, name: "ternary", line: line, expected: "bool", actual: family}) if family != "" and family != "bool"
+                        table <- check_ternary_condition(then_expression, names, types, table)
+                        table <- check_ternary_condition(else_expression, names, types, table)
+                    _:
+                        pass
+
+
+        # Whether an operand's inferred kind is a firm (known) non-bool — the flaggable
+        # case for a logical `and`/`or`/`not`. Unknown/Void/Named/Bool are never flagged.
+        def kind_is_firm_non_bool(inferred_type: InferType) -> bool:
+            can Abort.Panic:
+                scalar_non_bool: bool = inferred_type.kind == TypeKind.Int or inferred_type.kind == TypeKind.Float or inferred_type.kind == TypeKind.String or inferred_type.kind == TypeKind.Char
+                true return if scalar_non_bool
+                # The structural kinds are firmly non-bool too (oracle-verified: stage0
+                # flags `o and p` for `o: i64?` and `xs and ys` for darray operands).
+                # Sound for the same reason as kind_is_firm_non_numeric: a logical
+                # operator requires a bool operand OUTRIGHT — it never compares against a
+                # declared type — so no structural operand can be a false positive.
+                # `Named` stays excluded: a struct may carry a bool-yielding overload.
+                return inferred_type.kind == TypeKind.Optional or inferred_type.kind == TypeKind.Container or inferred_type.kind == TypeKind.Tuple
+
+
+        # Whether an operand's inferred kind is a firm non-numeric — the flaggable case
+        # for arithmetic `+ - * / %`. Only the hard bool/string walls; char is numeric-
+        # adjacent (char arithmetic is legal) and int/float/unknown/named never flag.
+        def kind_is_firm_non_numeric(inferred_type: InferType) -> bool:
+            can Abort.Panic:
+                # Bool / String / Tuple are firmly non-numeric: none is ever a valid operand to
+                # ordering (`<`), shift/bitwise, arithmetic, or compound-assign. Tuple joins here
+                # so those operator checks fire on a whole-tuple operand (previously Unknown ->
+                # silent miss). Sound: these consumers require a numeric operand outright and do
+                # not compare against a declared type, so a tuple can never be a false positive.
+                return inferred_type.kind == TypeKind.Bool or inferred_type.kind == TypeKind.String or inferred_type.kind == TypeKind.Tuple
+
+
+        # Comparison-compatibility group of a kind (for `==`/`!=`): 1 = bool, 2 = string,
+        # 3 = numeric (int/float/char are mutually comparable — Elisa inter-converts
+        # numerics and char is numeric-adjacent). 0 = not firm-comparable (Unknown/Void/
+        # Named — never used to flag). Two firm operands in DIFFERENT non-zero groups can
+        # never be equal, so an `==`/`!=` between them is a type error.
+        def comparison_group(inferred_type: InferType) -> u8:
+            can Abort.Panic:
+                1 return if inferred_type.kind == TypeKind.Bool
+                2 return if inferred_type.kind == TypeKind.String
+                # String slices retain their structural `sview` head so diagnostics can
+                # use the surface name, but equality follows the same rules as strings.
+                2 return if inferred_type.kind == TypeKind.Container and inferred_type.name == "sview"
+                3 return if inferred_type.kind == TypeKind.Int or inferred_type.kind == TypeKind.Float or inferred_type.kind == TypeKind.Char
+                # KNOWN container heads are their own group: `xs == 5` can never be
+                # equal (oracle: "cannot compare darray[i64] and int"); container-vs-
+                # container comparisons are legal and stay silent (same group). User
+                # generics are EXCLUDED — a newtype like `id[T]` compares as its
+                # backing scalar (corpus-verified: `!value != 0` in test.elisa).
+                4 return if inferred_type.kind == TypeKind.Container and (inferred_type.name == "darray" or inferred_type.name == "dict" or inferred_type.name == "set" or inferred_type.name == "list" or inferred_type.name == "array" or inferred_type.name == "view")
+                return 0
+
+
+        def check_atomic_rmw_call(callee: Ast::Expr, arguments: darray[Ast::Expr]&, line: u32, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Ident(rmw_name, rmw_line):
+                        numeric_rmw: bool = rmw_name in {"fetch_add", "fetch_sub", "fetch_or", "fetch_and", "fetch_xor"}
+                        rmw_value_type: InferType = infer_expression_type(arguments[1], names, types, table) if arguments.count > 1 else primitive_type(TypeKind.Unknown)
+                        rmw_value_id: u32 = structural_type_id_of(arguments[1], names, types, table) if arguments.count > 1 else 0
+                        rmw_value_ref: bool = interned_kind(rmw_value_id, table) == TypeKind.Ref
+                        rmw_actual: mutable sview = type_name_of_row(interned_elem(rmw_value_id, 0, table), table) if rmw_value_ref else "bool"
+                        rmw_actual <- local_type_of(names, types, rmw_value_name) if rmw_value_ref and arguments[1] is Expr.Ident(rmw_value_name, rmw_value_line) and local_type_of(names, types, rmw_value_name) != ""
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AtomicRmwNonNumeric, name: rmw_name, line: line, expected: "ref" if rmw_value_ref else "", actual: rmw_actual}) if numeric_rmw and arguments.count > 1 and (rmw_value_type.kind == TypeKind.Bool or rmw_value_ref)
+                    _:
+                        pass
+
+
+        # Operator-operand type checks (docs: the type-inference engine's first real
+        # unlock). Walks value expressions; a logical `and`/`or` with a firm non-bool
+        # operand, or an arithmetic `+ - * / %` with a firm non-numeric operand, is
+        # flagged. Sound SUBSET: only firmly-known incompatible operand kinds fire, so
+        # any Unknown operand (the common case under the flat type table) is silent.
+        # Whether EXPR is a bare `..` range (`LO..HI`, not a spelled `..<`/`..=`/`..` step).
+        def expr_is_bare_range(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                if expression is Expr.Binary(range_left, range_operator, range_right, range_line):
+                    return range_operator == TokenKind.Range
+                return false

@@ -1,0 +1,382 @@
+# Stage1 semantic — refined call arguments (`extend Semantic: private:`). Computes an
+# argument's interval with the small interval algebra, tracks which locals are poisoned
+# by reassignment or address-taking, and reports arguments that cannot be shown to sit
+# inside the callee's refined parameter. Continues
+# check_refinement_return_function.elisa; split out to keep each part under 600 lines.
+
+extend Semantic:
+    private:
+        # --- Argument-site refinement checking (sound interval containment) ---
+        # For every refined function parameter, record (name, param-index, lo, hi). At a
+        # call, an argument whose EXACT interval (a literal, or a refined local/param whose
+        # bounds are known) provably escapes the target parameter's [lo, hi] cannot satisfy
+        # the refinement — stage0 emits "refinement on argument N could not be proven". The
+        # exact-interval requirement makes `escape ⇒ emit` sound (never a false positive);
+        # arguments whose interval is unknown (arithmetic, calls, plain unrefined locals)
+        # are left unreported (a sound miss the interval engine can later extend).
+        # "upper" when a law predicate is `self < _` (exclusive), "lower" when `self > _`; else "".
+        # Distinct from predicate_shape (inclusive `<=`/`>=` only), so touching this cannot perturb
+        # the inclusive-law paths that share predicate_shape.
+        def exclusive_bound_shape(predicate: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                "upper" return if comparison_on_self(predicate, TokenKind.Lt)
+                "lower" return if comparison_on_self(predicate, TokenKind.Gt)
+                return sview("", 0, 0)
+
+        # A single-bound EXCLUSIVE-law refinement `T is Law[k]` with Law `self < n` -> [min, k-1],
+        # or `self > n` -> [k+1, max]. Complements return_refinement_bounds (which only reads the
+        # INCLUSIVE single-bound laws `self <= n` / `self >= n`).
+        def exclusive_single_bound(type_expression: Ast::Expr, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&) -> (found: bool, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Binary(base, operator, application, line):
+                        (false, 0, 0) return if operator != TokenKind.Is
+                        match application:
+                            Expr.Index(law_object, index_expression, index_line):
+                                law_name: sview = ident_name_of(law_object)
+                                bound: (found: bool, value: i64) = signed_int_literal(index_expression)
+                                (false, 0, 0) return if not bound.found
+                                shape: sview = exclusive_bound_shape(law_predicate_by_name(law_name, law_names, law_predicates))
+                                (true, -9223372036854775807 - 1, bound.value - 1) return if shape == "upper"
+                                (true, bound.value + 1, 9223372036854775807) return if shape == "lower"
+                                return (false, 0, 0)
+                            _:
+                                return (false, 0, 0)
+                    _:
+                        return (false, 0, 0)
+
+        def collect_refined_signatures(declarations: darray[Ast::Decl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, sig_names: mutable darray[sview]&, sig_index: mutable darray[usize]&, sig_lo: mutable darray[i64]&, sig_hi: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            while param_probe < parameters.count |param_probe: usize = 0, sig_names, sig_index, sig_lo, sig_hi|:
+                                inclusive_bounds: (found: bool, lo: i64, hi: i64) = return_refinement_bounds(parameters[param_probe].type_expression, law_names, law_predicates)
+                                exclusive_bounds: (found: bool, lo: i64, hi: i64) = exclusive_single_bound(parameters[param_probe].type_expression, law_names, law_predicates) if not inclusive_bounds.found else (false, 0, 0)
+                                param_bounds: (found: bool, lo: i64, hi: i64) = inclusive_bounds if inclusive_bounds.found else exclusive_bounds
+                                sig_names.push(function_name) if param_bounds.found
+                                sig_index.push(param_probe) if param_bounds.found
+                                sig_lo.push(param_bounds.lo) if param_bounds.found
+                                sig_hi.push(param_bounds.hi) if param_bounds.found
+                                param_probe <- param_probe + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_refined_signatures(module_body, law_names, law_predicates, sig_names, sig_index, sig_lo, sig_hi)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_refined_signatures(scoped_body, law_names, law_predicates, sig_names, sig_index, sig_lo, sig_hi)
+                        _:
+                            pass
+
+        # The exact interval of an argument expression, or found=false. Only literals and
+        # refined locals/params (whose bounds are exact) qualify — keeping `escape ⇒ emit`
+        # sound.
+        def argument_interval(argument: Ast::Expr, local_names: darray[sview]&, local_lo: darray[i64]&, local_hi: darray[i64]&) -> (found: bool, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.IntLit(value):
+                        return (true, value, value)
+                    Expr.Ident(name, line):
+                        found_local: mutable bool = false
+                        result_lo: mutable i64 = 0
+                        result_hi: mutable i64 = 0
+                        while probe < local_names.count |probe: usize = 0, found_local, result_lo, result_hi|:
+                            matched: bool = local_names[probe] == name
+                            found_local <- true if matched
+                            result_lo <- local_lo[probe] if matched
+                            result_hi <- local_hi[probe] if matched
+                            probe <- probe + 1
+                        return (found_local, result_lo, result_hi)
+                    Expr.Paren(inner, line):
+                        return argument_interval(inner, local_names, local_lo, local_hi)
+                    Expr.Binary(left, operator, right, line):
+                        # Exact interval arithmetic over a constant: `x * c`, `c * x`,
+                        # `x + c`, `x - c`. Keeps the interval exact so containment stays sound.
+                        left_interval: (found: bool, lo: i64, hi: i64) = argument_interval(left, local_names, local_lo, local_hi)
+                        right_interval: (found: bool, lo: i64, hi: i64) = argument_interval(right, local_names, local_lo, local_hi)
+                        left_constant: (found: bool, value: i64) = signed_int_literal(left)
+                        right_constant: (found: bool, value: i64) = signed_int_literal(right)
+                        interval_times_const(left_interval.lo, left_interval.hi, right_constant.value) return if operator == TokenKind.Star and left_interval.found and right_constant.found
+                        interval_times_const(right_interval.lo, right_interval.hi, left_constant.value) return if operator == TokenKind.Star and right_interval.found and left_constant.found
+                        interval_shift(left_interval.lo, left_interval.hi, right_constant.value) return if operator == TokenKind.Plus and left_interval.found and right_constant.found
+                        interval_shift(left_interval.lo, left_interval.hi, 0 - right_constant.value) return if operator == TokenKind.Minus and left_interval.found and right_constant.found
+                        # Two-VARIABLE interval arithmetic (both operands have intervals):
+                        # `a + b`, `a - b`, `a * b`. Exact, so containment stays sound.
+                        interval_add(left_interval.lo, left_interval.hi, right_interval.lo, right_interval.hi) return if operator == TokenKind.Plus and left_interval.found and right_interval.found
+                        interval_sub(left_interval.lo, left_interval.hi, right_interval.lo, right_interval.hi) return if operator == TokenKind.Minus and left_interval.found and right_interval.found
+                        interval_mul(left_interval.lo, left_interval.hi, right_interval.lo, right_interval.hi) return if operator == TokenKind.Star and left_interval.found and right_interval.found
+                        return (false, 0, 0)
+                    Expr.Unary(operator, operand, line):
+                        # `-x` negates the interval (endpoints swap): [lo, hi] -> [-hi, -lo].
+                        operand_interval: (found: bool, lo: i64, hi: i64) = argument_interval(operand, local_names, local_lo, local_hi)
+                        (true, 0 - operand_interval.hi, 0 - operand_interval.lo) return if operator == TokenKind.Minus and operand_interval.found
+                        return (false, 0, 0)
+                    Expr.If(condition, then_expression, else_expression, if_line):
+                        # A ternary `a if cond else b` yields the UNION of both branches: the
+                        # value is one of them, so its interval is [min lo, max hi]. Exact, so
+                        # containment stays sound (only fires when BOTH branches are bounded).
+                        then_interval: (found: bool, lo: i64, hi: i64) = argument_interval(then_expression, local_names, local_lo, local_hi)
+                        else_interval: (found: bool, lo: i64, hi: i64) = argument_interval(else_expression, local_names, local_lo, local_hi)
+                        union_lo: i64 = then_interval.lo if then_interval.lo < else_interval.lo else else_interval.lo
+                        union_hi: i64 = then_interval.hi if then_interval.hi > else_interval.hi else else_interval.hi
+                        (true, union_lo, union_hi) return if then_interval.found and else_interval.found
+                        return (false, 0, 0)
+                    _:
+                        return (false, 0, 0)
+
+        # Exact interval of `[lo, hi] * c` — reversed endpoints when c is negative.
+        def interval_times_const(lo: i64, hi: i64, factor: i64) -> (found: bool, lo: i64, hi: i64):
+            can Abort.Panic:
+                return (true, lo * factor, hi * factor) if factor >= 0 else (true, hi * factor, lo * factor)
+
+        # Exact interval of `[lo, hi] + delta`.
+        def interval_shift(lo: i64, hi: i64, delta: i64) -> (found: bool, lo: i64, hi: i64):
+            can Abort.Panic:
+                return (true, lo + delta, hi + delta)
+
+        # `[l1,h1] + [l2,h2]` = `[l1+l2, h1+h2]`.
+        def interval_add(l1: i64, h1: i64, l2: i64, h2: i64) -> (found: bool, lo: i64, hi: i64):
+            can Abort.Panic:
+                return (true, l1 + l2, h1 + h2)
+
+        # `[l1,h1] - [l2,h2]` = `[l1-h2, h1-l2]`.
+        def interval_sub(l1: i64, h1: i64, l2: i64, h2: i64) -> (found: bool, lo: i64, hi: i64):
+            can Abort.Panic:
+                return (true, l1 - h2, h1 - l2)
+
+        # `[l1,h1] * [l2,h2]` = [min, max] over the four corner products.
+        def interval_mul(l1: i64, h1: i64, l2: i64, h2: i64) -> (found: bool, lo: i64, hi: i64):
+            can Abort.Panic:
+                p1: i64 = l1 * l2
+                p2: i64 = l1 * h2
+                p3: i64 = h1 * l2
+                p4: i64 = h1 * h2
+                low: mutable i64 = p1
+                low <- p2 if p2 < low
+                low <- p3 if p3 < low
+                low <- p4 if p4 < low
+                high: mutable i64 = p1
+                high <- p2 if p2 > high
+                high <- p3 if p3 > high
+                high <- p4 if p4 > high
+                return (true, low, high)
+
+        # Report each call argument whose exact interval escapes the callee's refined param.
+        # Whether signature row `probe` matches this call AND its argument's exact interval
+        # escapes the parameter's [lo, hi]. Guarded so the argument access is in-bounds.
+        def signature_argument_escapes(probe: usize, callee_name: sview, arguments: darray[Ast::Expr], sig_names: darray[sview]&, sig_index: darray[usize]&, sig_lo: darray[i64]&, sig_hi: darray[i64]&, local_names: darray[sview]&, local_lo: darray[i64]&, local_hi: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if sig_names[probe] != callee_name
+                false return if sig_index[probe] >= arguments.count
+                interval: (found: bool, lo: i64, hi: i64) = argument_interval(arguments[sig_index[probe]], local_names, local_lo, local_hi)
+                return interval.found and (interval.lo > interval.hi or interval.lo < sig_lo[probe] or interval.hi > sig_hi[probe])
+
+        def check_call_arguments(callee: Ast::Expr, arguments: darray[Ast::Expr], line: u32, sig_names: darray[sview]&, sig_index: darray[usize]&, sig_lo: darray[i64]&, sig_hi: darray[i64]&, local_names: darray[sview]&, local_lo: darray[i64]&, local_hi: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                callee_name: sview = ident_name_of(callee)
+                return if callee_name == ""
+                while probe < sig_names.count |probe: usize = 0, table| -> table:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementArgNotProven, name: callee_name, line: line, expected: "", actual: "", expected_count: (sig_index[probe] + 1).u32()}) if signature_argument_escapes(probe, callee_name, arguments, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi)
+                    probe <- probe + 1
+
+        def check_arg_expression(expression: Ast::Expr, line: u32, sig_names: darray[sview]&, sig_index: darray[usize]&, sig_lo: darray[i64]&, sig_hi: darray[i64]&, local_names: darray[sview]&, local_lo: darray[i64]&, local_hi: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        table <- check_call_arguments(callee, arguments, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        for argument in arguments |table| -> table:
+                            table <- check_arg_expression(argument, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- check_arg_expression(left, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        table <- check_arg_expression(right, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- check_arg_expression(inner, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                    _:
+                        pass
+
+        # The literal [lo, hi] window of an `is Law[lo, hi]` application (shape-blind:
+        # any two-literal application narrows; the law's own predicate was validated at
+        # its declaration).
+        def narrow_application_window(application: Ast::Expr) -> (found: bool, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                match application:
+                    Expr.IndexN(law_object, law_arguments, law_line):
+                        (false, 0, 0) return if law_arguments.count != 2
+                        lo_literal: (found: bool, value: i64) = signed_int_literal(law_arguments[0])
+                        hi_literal: (found: bool, value: i64) = signed_int_literal(law_arguments[1])
+                        (true, lo_literal.value, hi_literal.value) return if lo_literal.found and hi_literal.found
+                        return (false, 0, 0)
+                    _:
+                        return (false, 0, 0)
+
+
+        # POISON a narrowed local when the branch reassigns it from an interval-less
+        # source (an empty [1, 0] row shadows the narrow; last row wins).
+        def poison_reassigned(statements: darray[Ast::Stmt], subject: sview, names: mutable darray[sview]&, lows: mutable darray[i64]&, highs: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, lows, highs, subject|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            continue if ident_name_of(target) != subject
+                            reassigned_literal: (found: bool, value: i64) = signed_int_literal(value)
+                            if reassigned_literal.found:
+                                names.push(subject)
+                                lows.push(reassigned_literal.value)
+                                highs.push(reassigned_literal.value)
+                            else:
+                                names.push(subject)
+                                lows.push(1)
+                                highs.push(0)
+                        _:
+                            pass
+
+
+        def check_arg_statements(statements: darray[Ast::Stmt], sig_names: darray[sview]&, sig_index: darray[usize]&, sig_lo: darray[i64]&, sig_hi: darray[i64]&, local_names: darray[sview]&, local_lo: darray[i64]&, local_hi: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- check_arg_expression(expression, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- check_arg_expression(value, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- check_arg_expression(value, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- check_arg_expression(returned, line, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            # `if X is Law[lo, hi]:` narrows X inside the THEN branch; a
+                            # reassignment from an interval-less source POISONS it (the
+                            # narrow no longer holds, so a refined call site warns).
+                            narrowed_names: mutable darray[sview] = [entry_name for entry_name in local_names]
+                            narrowed_lo: mutable darray[i64] = [entry_lo2 for entry_lo2 in local_lo]
+                            narrowed_hi: mutable darray[i64] = [entry_hi2 for entry_hi2 in local_hi]
+                            match condition:
+                                Expr.Binary(narrow_subject, narrow_operator, narrow_application, narrow_line):
+                                    if narrow_operator == TokenKind.Is:
+                                        subject_name: sview = ident_name_of(narrow_subject)
+                                        narrow_window: (found: bool, lo: i64, hi: i64) = narrow_application_window(narrow_application)
+                                        if subject_name != "" and narrow_window.found:
+                                            narrowed_names.push(subject_name)
+                                            narrowed_lo.push(narrow_window.lo)
+                                            narrowed_hi.push(narrow_window.hi)
+                                            poison_reassigned(then_body, subject_name, narrowed_names, narrowed_lo, narrowed_hi)
+                                _:
+                                    pass
+                            table <- check_arg_statements(then_body, sig_names, sig_index, sig_lo, sig_hi, narrowed_names, narrowed_lo, narrowed_hi, table)
+                            table <- check_arg_statements(else_body, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- check_arg_statements(while_body, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            table <- check_arg_statements(block_body, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        # A RANGE loop binds its variable to a known interval:
+                        # `for i in 0..<n` is [0, n-1] — unbounded above when n is not a
+                        # literal (escapes every finite window, matching stage0's warn);
+                        # `for i in 0..=9` is [0, 9].
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            loop_names: mutable darray[sview] = [entry for entry in local_names]
+                            loop_lo: mutable darray[i64] = [entry_lo for entry_lo in local_lo]
+                            loop_hi: mutable darray[i64] = [entry_hi for entry_hi in local_hi]
+                            match iterable:
+                                Expr.Binary(range_low, range_operator, range_high, range_line):
+                                    is_range: bool = range_operator == TokenKind.Range or range_operator == TokenKind.RangeLt or range_operator == TokenKind.RangeLe
+                                    low_literal: (found: bool, value: i64) = signed_int_literal(range_low)
+                                    high_literal: (found: bool, value: i64) = signed_int_literal(range_high)
+                                    if is_range and low_literal.found and variables.count > 0:
+                                        loop_names.push(variables[0])
+                                        loop_lo.push(low_literal.value)
+                                        inclusive: bool = range_operator == TokenKind.RangeLe
+                                        bounded_high: i64 = (high_literal.value if inclusive else high_literal.value - 1) if high_literal.found else 9223372036854775807
+                                        loop_hi.push(bounded_high)
+                                _:
+                                    pass
+                            table <- check_arg_statements(for_body, sig_names, sig_index, sig_lo, sig_hi, loop_names, loop_lo, loop_hi, table)
+                        _:
+                            pass
+
+        # Whether an expression takes the ADDRESS of NAME (`&name`) — a mutable-ref pass that
+        # can re-seed the local's range (e.g. an `ensures p is Law` out-param), invalidating
+        # its declared-init interval.
+        def expr_takes_address(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Unary(operator, operand, line):
+                        true return if operator == TokenKind.Ampersand and ident_name_of(operand) == name
+                        return expr_takes_address(operand, name)
+                    Expr.Paren(inner, line):
+                        return expr_takes_address(inner, name)
+                    Expr.Binary(left, op, right, line):
+                        true return if expr_takes_address(left, name)
+                        return expr_takes_address(right, name)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments:
+                            true return if expr_takes_address(argument, name)
+                        return false
+                    Expr.If(condition, then_expression, else_expression, line):
+                        true return if expr_takes_address(then_expression, name)
+                        return expr_takes_address(else_expression, name)
+                    _:
+                        return false
+
+        # Whether NAME is a `<-` reassignment target OR has its address taken (a reseed-capable
+        # mutable-ref pass) anywhere in the body. Either invalidates a carried declared-init
+        # interval, so the local is not carried (a sound MISS, never a false positive).
+        def body_reassigns(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            true return if operator == TokenKind.LArrow and ident_name_of(target) == name
+                            true return if expr_takes_address(value, name)
+                        Stmt.Expr(expression, line):
+                            true return if expr_takes_address(expression, name)
+                        Stmt.VarDecl(vname, vtype, vvalue, vline):
+                            true return if expr_takes_address(vvalue, name)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                true return if expr_takes_address(returned, name)
+                        Stmt.If(condition, then_body, else_body, line):
+                            true return if body_reassigns(then_body, name)
+                            true return if body_reassigns(else_body, name)
+                        Stmt.While(condition, while_body, line):
+                            true return if body_reassigns(while_body, name)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            true return if body_reassigns(for_body, name)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            true return if body_reassigns(block_body, name)
+                        _:
+                            pass
+                return false
+
+        def check_arg_walk(declarations: darray[Ast::Decl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, sig_names: darray[sview]&, sig_index: darray[usize]&, sig_lo: darray[i64]&, sig_hi: darray[i64]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            local_names: mutable darray[sview] = []
+                            local_lo: mutable darray[i64] = []
+                            local_hi: mutable darray[i64] = []
+                            for parameter in parameters |local_names, local_lo, local_hi|:
+                                pbounds: (found: bool, lo: i64, hi: i64) = return_refinement_bounds(parameter.type_expression, law_names, law_predicates)
+                                local_names.push(parameter.name) if pbounds.found
+                                local_lo.push(pbounds.lo) if pbounds.found
+                                local_hi.push(pbounds.hi) if pbounds.found
+                            # A top-level local `r = <expr>` whose value has a computable exact
+                            # interval (a refined-param arithmetic/ternary) carries that interval
+                            # forward, so a later call passing `r` to a refined arg is checked.
+                            # Flow-insensitive: only added if `r` is never reassigned (`<-`).
+                            for statement in body |local_names, local_lo, local_hi|:
+                                match statement:
+                                    Stmt.VarDecl(local_name, local_type, local_value, local_line):
+                                        local_iv: (found: bool, lo: i64, hi: i64) = argument_interval(local_value, local_names, local_lo, local_hi)
+                                        if local_iv.found and not body_reassigns(body, local_name):
+                                            local_names.push(local_name)
+                                            local_lo.push(local_iv.lo)
+                                            local_hi.push(local_iv.hi)
+                                    _:
+                                        pass
+                            table <- check_arg_statements(body, sig_names, sig_index, sig_lo, sig_hi, local_names, local_lo, local_hi, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_arg_walk(module_body, law_names, law_predicates, sig_names, sig_index, sig_lo, sig_hi, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_arg_walk(scoped_body, law_names, law_predicates, sig_names, sig_index, sig_lo, sig_hi, table)
+                        _:
+                            pass

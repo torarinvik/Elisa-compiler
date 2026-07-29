@@ -1,0 +1,292 @@
+# Stage1 semantic — the strict-unsafe statement and expression walks (`extend Semantic:
+# private:`). `strict_unsafe_walk` threads the bounds facts a guard establishes through
+# a body; `strict_unsafe_expression` decides one indexing or global read against them.
+# Continues check_strict_unsafe_ops.elisa; split out to keep each part under 600 lines.
+
+extend Semantic:
+    private:
+        def strict_unsafe_walk(statements: darray[Ast::Stmt], array_params: darray[sview]&, index_params: darray[sview]&, unsigned_indexes: darray[sview]&, mutable_params: darray[sview]&, ref_params: darray[sview]&, mutable_globals: darray[sview]&, local_names: darray[sview]&, checked_get_lines: darray[u32]&, mr_fns: darray[sview]&, mr_positions: darray[usize]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Shrinks as bounds guards prove index names: `if i >= xs.count: return`
+                # makes `i` proven for every statement below it.
+                live_index_params: mutable darray[sview] = []
+                for carried in index_params |live_index_params|:
+                    live_index_params.push(carried)
+                # Locals already MUTABLY borrowed in this statement list. A second mutable
+                # borrow of the same local creates two live mutable references to it, which
+                # is `Unsafe.Alias` -- stage0 flags exactly this and accepts one borrow,
+                # borrows of DIFFERENT locals, and immutable borrows (all verified).
+                mutably_borrowed: mutable darray[sview] = []
+                # ALL live borrows (stack/& bindings) of locals, with the borrowing
+                # binding's mutability: a second borrow where EITHER side is mutable, a
+                # rebind adding one, or a mutable-ref CALL on a borrowed local is
+                # Unsafe.Alias (stage0's strict rule; pinned four shapes).
+                borrow_targets: mutable darray[sview] = []
+                borrow_mut: mutable darray[bool] = []
+                borrow_binders: mutable darray[sview] = []
+                for statement in statements |table, live_index_params, mutably_borrowed, borrow_targets, borrow_mut, borrow_binders| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- strict_unsafe_expression(expression, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                            table <- strict_borrowed_call_check(expression, line, borrow_targets, mr_fns, mr_positions, in_grant, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- strict_unsafe_expression(value, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                            borrow_target: sview = address_of_target(value)
+                            takes_mutable_borrow: bool = borrow_target != "" and type_marker_present(type_expression, TokenKind.Mutable) and type_marker_present(type_expression, TokenKind.Ampersand)
+                            already_borrowed: bool = takes_mutable_borrow and (any b in mutably_borrowed where b == borrow_target)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableAliasUngranted, name: "", line: line, expected: "", actual: ""}) if already_borrowed and not in_grant
+                            mutably_borrowed.push(borrow_target) if takes_mutable_borrow
+                            # Stack/& borrows generally: mixing with a MUTABLE-flavored
+                            # binding of the same local aliases it.
+                            takes_any_borrow: bool = borrow_target != "" and type_marker_present(type_expression, TokenKind.Ampersand)
+                            binding_mut: bool = type_marker_present(type_expression, TokenKind.Mutable)
+                            if takes_any_borrow:
+                                mixed: mutable bool = false
+                                borrow_probe: mutable usize = 0
+                                while borrow_probe < borrow_targets.count |mixed, borrow_probe, borrow_target, binding_mut, borrow_targets, borrow_mut|:
+                                    same_target: bool = borrow_targets[borrow_probe] == borrow_target
+                                    mixed <- true if same_target and (binding_mut or borrow_mut[borrow_probe])
+                                    borrow_probe <- borrow_probe + 1
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableAliasUngranted, name: "", line: line, expected: "", actual: ""}) if mixed and not in_grant and not already_borrowed
+                                borrow_targets.push(borrow_target)
+                                borrow_mut.push(binding_mut)
+                                borrow_binders.push(name)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- strict_unsafe_expression(target, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                            table <- strict_unsafe_expression(value, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                            # A REBIND storing `&node` into a ref slot adds a live borrow.
+                            rebind_target: sview = address_of_target(value)
+                            if rebind_target != "":
+                                # Rebinding a SLOT releases its previous borrow first.
+                                slot_name: sview = ident_name_of(target)
+                                release_probe: mutable usize = 0
+                                while release_probe < borrow_binders.count |release_probe, slot_name, borrow_targets, borrow_binders|:
+                                    borrow_targets[release_probe] <- sview("", 0, 0) if slot_name != "" and borrow_binders[release_probe] == slot_name
+                                    release_probe <- release_probe + 1
+                                rebind_mixed: mutable bool = false
+                                rebind_probe: mutable usize = 0
+                                while rebind_probe < borrow_targets.count |rebind_mixed, rebind_probe, rebind_target, borrow_targets|:
+                                    rebind_mixed <- true if borrow_targets[rebind_probe] == rebind_target
+                                    rebind_probe <- rebind_probe + 1
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableAliasUngranted, name: "", line: line, expected: "", actual: ""}) if rebind_mixed and not in_grant
+                                borrow_targets.push(rebind_target)
+                                borrow_mut.push(true)
+                                borrow_binders.push(slot_name)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- strict_unsafe_expression(returned, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- strict_unsafe_expression(condition, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                            # Inside the THEN arm, `i < xs.count` holds.
+                            # The proof survives only a body that neither REASSIGNS the index
+                            # nor CALLS anything: `i <- i + 99` moves the index out of range,
+                            # and `xs.truncate(0)` shrinks the container the bound was about.
+                            # stage0 flags both (verified); this is the conservative form of
+                            # its dataflow -- it can lose a benign call, never over-prove.
+                            guarded_now: mutable sview = bounds_guard_name(condition, true, unsigned_indexes)
+                            guarded_now <- sview("", 0, 0) if body_invalidates_bounds(then_body, guarded_now)
+                            then_index_params: darray[sview] = index_params_without(live_index_params, guarded_now)
+                            table <- strict_unsafe_walk(then_body, array_params, then_index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, mr_fns, mr_positions, in_grant, table)
+                            table <- strict_unsafe_walk(else_body, array_params, live_index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, mr_fns, mr_positions, in_grant, table)
+                            # `if i >= xs.count: return` — below the guard, `i` is in bounds
+                            # on the only path that reaches there.
+                            early_guarded: sview = bounds_guard_name(condition, false, unsigned_indexes)
+                            live_index_params <- index_params_without(live_index_params, early_guarded) if early_guarded != "" and body_terminates(then_body)
+                        Stmt.While(condition, body, line):
+                            table <- strict_unsafe_expression(condition, line, array_params, live_index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                            table <- strict_unsafe_walk(body, array_params, live_index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, mr_fns, mr_positions, in_grant, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            block_kind: sview = kind
+                            grant_here: bool = in_grant or block_kind == "can" or block_kind == "trusted"
+                            table <- strict_unsafe_walk(body, array_params, live_index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, mr_fns, mr_positions, grant_here, table)
+                            # An `assert i < xs.count` INSIDE the block is an established
+                            # fact for the statements after it (`can Abort.Panic: assert
+                            # i < xs.count` then `return xs[i]` — stage0 accepts).
+                            for block_statement in body |live_index_params, unsigned_indexes|:
+                                match block_statement:
+                                    Stmt.Contract(contract_kind, contract_expression, contract_line):
+                                        asserted: sview = bounds_guard_name(contract_expression, true, unsigned_indexes) if contract_kind == "assert" else sview("", 0, 0)
+                                        live_index_params <- index_params_without(live_index_params, asserted) if asserted != ""
+                                    _:
+                                        pass
+                        Stmt.Contract(contract_kind, contract_expression, contract_line):
+                            asserted_here: sview = bounds_guard_name(contract_expression, true, unsigned_indexes) if contract_kind == "assert" else sview("", 0, 0)
+                            live_index_params <- index_params_without(live_index_params, asserted_here) if asserted_here != ""
+                        _:
+                            pass
+
+        # Mutable-ref parameter POSITIONS of every declared function.
+        def collect_mutable_ref_positions(declarations: darray[Ast::Decl], out_fns: mutable darray[sview]&, out_positions: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_fns, out_positions|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            position: mutable usize = 0
+                            for parameter in parameters |out_fns, out_positions, position, name|:
+                                out_fns.push(name) if param_is_mutable_ref(parameter)
+                                out_positions.push(position) if param_is_mutable_ref(parameter)
+                                position <- position + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_mutable_ref_positions(module_body, out_fns, out_positions)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_mutable_ref_positions(scoped_body, out_fns, out_positions)
+                        _:
+                            pass
+
+
+        # A call passing a BORROWED local at a mutable-ref position aliases the borrow.
+        def strict_borrowed_call_check(expression: Ast::Expr, line: u32, borrow_targets: darray[sview]&, mr_fns: darray[sview]&, mr_positions: darray[usize]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if in_grant
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        called: sview = ident_name_of(callee)
+                        return if called == ""
+                        row: mutable usize = 0
+                        while row < mr_fns.count |row, table| -> table:
+                            applies: bool = mr_fns[row] == called and mr_positions[row] < arguments.count
+                            if applies:
+                                passed: sview = ident_name_of(arguments[mr_positions[row]])
+                                aliased: bool = passed != "" and (any b in borrow_targets where b == passed)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableAliasUngranted, name: "", line: line, expected: "", actual: ""}) if aliased
+                            row <- row + 1
+                    _:
+                        pass
+
+
+        # An access (read or write) to a mutable global (`global`/`global mutable`) requires
+        # `can Unsafe.MutableGlobal`. A name shadowed by a param/local is excluded (it is not
+        # the global). `const` values (immutable) never require the grant.
+        def is_ungranted_mutable_global(name: sview, mutable_globals: darray[sview]&, local_names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                false return if name == ""
+                false return if any local_name in local_names where local_name == name
+                return any global_name in mutable_globals where global_name == name
+
+        # Whether an operand is provably an integer: a literal, or an identifier bound to a
+        # plain-integer parameter. Used to confirm `ref +/- <int>` is pointer arithmetic.
+        def is_int_operand(expression: Ast::Expr, index_params: darray[sview]&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(value):
+                        return true
+                    Expr.Ident(name, line):
+                        return any integer_param in index_params where integer_param == name
+                    _:
+                        return false
+
+        # A FREE-FUNCTION call as an index carries no range facts, so the access cannot be
+        # proven in bounds -- `t[g()]`. stage0 flags this for both `array` and `darray`
+        # receivers (verified against `-emit unsafe` both ways).
+        #
+        # A METHOD-STYLE call is excluded: `table[c.u32()]` is an enum-TAG index, and stage0
+        # proves it in bounds from the variant count (check_enum_tag_index carries the
+        # too-many-variants half). Treating those as unproven reported two enum lookups
+        # stage0 accepts, which is what made a blanket call rule net-negative.
+        def index_is_call(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        return match callee:
+                            Expr.Field(object, field, field_line): false
+                            _: true
+                    _:
+                        return false
+
+
+        # Scan an expression for mutable-global reads ONLY (never unchecked-index / pointer
+        # arithmetic), for positions where the enclosing access is already checked.
+        def strict_global_only(expression: Ast::Expr, line: u32, mutable_globals: darray[sview]&, local_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if in_grant
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableGlobalUngranted, name: name, line: line, expected: "", actual: ""}) if is_ungranted_mutable_global(name, mutable_globals, local_names)
+                    Expr.Field(object, field, field_line):
+                        table <- strict_global_only(object, line, mutable_globals, local_names, in_grant, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- strict_global_only(inner, line, mutable_globals, local_names, in_grant, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- strict_global_only(operand, line, mutable_globals, local_names, in_grant, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- strict_global_only(left, line, mutable_globals, local_names, in_grant, table)
+                        table <- strict_global_only(right, line, mutable_globals, local_names, in_grant, table)
+                    Expr.Index(object, index_argument, index_line):
+                        table <- strict_global_only(object, line, mutable_globals, local_names, in_grant, table)
+                        table <- strict_global_only(index_argument, line, mutable_globals, local_names, in_grant, table)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        table <- strict_global_only(callee, line, mutable_globals, local_names, in_grant, table)
+                        for argument in arguments |table| -> table:
+                            table <- strict_global_only(argument, line, mutable_globals, local_names, in_grant, table)
+                    _:
+                        pass
+
+        def strict_unsafe_expression(expression: Ast::Expr, line: u32, array_params: darray[sview]&, index_params: darray[sview]&, mutable_params: darray[sview]&, ref_params: darray[sview]&, mutable_globals: darray[sview]&, local_names: darray[sview]&, checked_get_lines: darray[u32]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if in_grant
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableGlobalUngranted, name: name, line: line, expected: "", actual: ""}) if is_ungranted_mutable_global(name, mutable_globals, local_names)
+                    Expr.Index(object, index, index_line):
+                        object_name: sview = ident_name_of(object)
+                        index_name: sview = ident_name_of(index)
+                        # A bare `get xs[i]` parses to a plain Index (the recovery-less
+                        # checked read binding an optional); the parser records its line
+                        # so the CHECKED access is exempt here.
+                        checked_get: bool = any g in checked_get_lines where g == line
+                        index_unproven: bool = ((any i in index_params where i == index_name) or index_is_call(index)) and not checked_get
+                        # Prefer an explicit membership walk over `any … where` so the stage1
+                        # self-resolver sees `object_name` as a bound local use (not a free name
+                        # inside a quantified predicate).
+                        is_array_param: mutable bool = false
+                        for array_param in array_params |is_array_param, object_name|:
+                            is_array_param <- true if array_param == object_name
+                        is_unproven: bool = is_array_param and index_unproven
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UncheckedIndexUngranted, name: object_name, line: line, expected: "", actual: ""}) if is_unproven and object_name != ""
+                        table <- strict_unsafe_expression(object, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        seen: mutable darray[sview] = []
+                        aliased: mutable bool = false
+                        for argument in arguments |seen, aliased|:
+                            base: sview = argument_alias_base(argument, mutable_params)
+                            continue if base == ""
+                            aliased <- true if any s in seen where s == base
+                            seen.push(base)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableAliasUngranted, name: "", line: line, expected: "", actual: ""}) if aliased
+                        for argument in arguments |table| -> table:
+                            table <- strict_unsafe_expression(argument, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        # `xs[i] else FALLBACK` — Binary(Index, Else, fallback) is the
+                        # inline CHECKED access: the left index never flags; only the
+                        # fallback is walked.
+                        if operator == TokenKind.Else:
+                            table <- strict_unsafe_expression(right, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                            return
+                        # Pointer arithmetic: `ref +/- int` or `int + ref` (matching stage0's
+                        # binaryExprRequiresUnsafePointerArithmetic — note `int - ref` is NOT).
+                        left_ref: bool = any r in ref_params where r == ident_name_of(left)
+                        right_ref: bool = any r in ref_params where r == ident_name_of(right)
+                        is_add: bool = operator == TokenKind.Plus
+                        pointer_arith: bool = ((is_add or operator == TokenKind.Minus) and left_ref and is_int_operand(right, index_params)) or (is_add and right_ref and is_int_operand(left, index_params))
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PointerArithmeticUngranted, name: "", line: line, expected: "", actual: ""}) if pointer_arith
+                        table <- strict_unsafe_expression(left, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                        table <- strict_unsafe_expression(right, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- strict_unsafe_expression(operand, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- strict_unsafe_expression(inner, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                    # `get xs[i] else 0` — Refinement(fallback, guarded): the guarded
+                    # access is CHECKED (absence propagates to the fallback), never an
+                    # unchecked index. The fallback itself is still walked.
+                    Expr.Refinement(fallback_base, guarded_predicate, refinement_line):
+                        table <- strict_unsafe_expression(fallback_base, line, array_params, index_params, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, in_grant, table)
+                        # The GUARDED value of a `get EXPR else FALLBACK` is a CHECKED access
+                        # (absence propagates), so it must NOT be walked for unchecked-index —
+                        # but a mutable-global READ inside it (`get counter else 0`) still
+                        # requires the grant. Scan it for mutable-global only.
+                        table <- strict_global_only(guarded_predicate, line, mutable_globals, local_names, in_grant, table)
+                    # `get xs[i] else return/break` — same: the guarded access is checked.
+                    Expr.GetElse(guarded_value, recovery_body, getelse_line):
+                        pass
+                    _:
+                        pass

@@ -1,0 +1,201 @@
+# Stage1 semantic — the per-function return check (`extend Semantic: private:`).
+# `check_refinement_return_function` decides one function's returns against its declared
+# refinement; `collect_laws` and the walk feed it. Continues
+# check_refinement_return_range.elisa; split out to keep each part under 600 lines.
+
+extend Semantic:
+    private:
+        def check_refinement_return_function(return_type: Ast::Expr, parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], function_name: sview, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, ret_alias_names: darray[sview]&, ret_alias_bases: darray[Ast::Expr]&, rr_struct_names: darray[sview]&, rr_field_starts: darray[usize]&, rr_field_counts: darray[usize]&, rr_field_names: darray[sview]&, rr_field_types: darray[Ast::Expr]&, rr_fn_names: darray[sview]&, rr_fn_lo: darray[i64]&, rr_fn_hi: darray[i64]&, enable_smt: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Resolve the return refinement window THROUGH a refine-alias return type
+                # (`-> Small` where `type Small = i64 is Bounded[2, 10]`), not only a direct
+                # `i64 is Law` annotation — param_refinement_window handles both.
+                # Window resolves through: parametric `Law[lo,hi]` + refine-alias
+                # (param_refinement_window), else a NO-ARG single-bound law like `NonNeg`
+                # (`self >= 0` -> [0, max]) / `Positive` (`self > 0` -> [1, max]) via
+                # refined_param_bounds' subject_interval.
+                alias_bounds: (found: bool, lo: i64, hi: i64) = param_refinement_window(return_type, law_names, law_predicates, ret_alias_names, ret_alias_bases)
+                bounds: (found: bool, lo: i64, hi: i64) = alias_bounds if alias_bounds.found else refined_param_bounds(return_type, law_names, law_predicates)
+                single_bound_window: bool = not alias_bounds.found and bounds.found
+                dependent: (found: bool, lo: i64, hi_var: sview, strict_upper: bool) = dependent_return_window(return_type, law_names, law_predicates) if not bounds.found else (false, 0, sview("", 0, 0), false)
+                return if not bounds.found and not dependent.found
+                # Raw `requires` predicates (for the dependent RELATIONAL tier: a variable return
+                # `raw` into `[0, cap]` needs `requires raw < cap` / `raw <= cap` per strictness).
+                dep_requires: mutable darray[Ast::Expr] = []
+                for dep_statement in body |dep_requires|:
+                    match dep_statement:
+                        Stmt.Contract(dep_kind, dep_expression, dep_line):
+                            dep_requires.push(dep_expression) if dep_kind == "requires"
+                        _:
+                            pass
+                # A SINGLE straight-line return is additionally judged by RANGE over the
+                # parameter windows: an out-of-window or unboundable (division, cast,
+                # windowless leaf) result is unproven. Branchy bodies may prove the
+                # window via guards, so only the straight-line form is decided.
+                # Requires-derived two-sided windows for unrefined params.
+                req_all_names: mutable darray[sview] = []
+                req_all_has_lo: mutable darray[bool] = []
+                req_all_lo: mutable darray[i64] = []
+                req_all_has_hi: mutable darray[bool] = []
+                req_all_hi: mutable darray[i64] = []
+                for parameter in parameters |req_all_names, req_all_has_lo, req_all_lo, req_all_has_hi, req_all_hi|:
+                    req_all_names.push(parameter.name)
+                    req_all_has_lo.push(false)
+                    req_all_lo.push(0)
+                    req_all_has_hi.push(false)
+                    req_all_hi.push(0)
+                for statement in body |req_all_names, req_all_has_lo, req_all_lo, req_all_has_hi, req_all_hi|:
+                    match statement:
+                        Stmt.Contract(req_kind, req_expression, req_line):
+                            lin_collect_fact(req_expression, req_all_names, req_all_has_lo, req_all_lo, req_all_has_hi, req_all_hi) if req_kind == "requires"
+                        _:
+                            pass
+                req_names: mutable darray[sview] = []
+                req_lo: mutable darray[i64] = []
+                req_hi: mutable darray[i64] = []
+                floor_names: mutable darray[sview] = []
+                floor_values: mutable darray[i64] = []
+                req_index: mutable usize = 0
+                while req_index < req_all_names.count |req_names, req_lo, req_hi, floor_names, floor_values, req_index, req_all_names, req_all_has_lo, req_all_lo, req_all_has_hi, req_all_hi|:
+                    if req_all_has_lo[req_index] and req_all_has_hi[req_index]:
+                        req_names.push(req_all_names[req_index])
+                        req_lo.push(req_all_lo[req_index])
+                        req_hi.push(req_all_hi[req_index])
+                    if req_all_has_lo[req_index]:
+                        floor_names.push(req_all_names[req_index])
+                        floor_values.push(req_all_lo[req_index])
+                    req_index <- req_index + 1
+                # Carried-local intervals are EXACT (not requires-derived), so unlike req_*
+                # windows they are consulted in DEFAULT mode too. Kept in their own arrays.
+                carry_names: mutable darray[sview] = []
+                carry_lo: mutable darray[i64] = []
+                carry_hi: mutable darray[i64] = []
+                collect_carried_locals(body, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, enable_smt, carry_names, carry_lo, carry_hi)
+                straight_return: mutable Ast::Expr = Ast::Expr.Absent
+                return_count: mutable usize = 0
+                branchy: mutable bool = false
+                for statement in body |straight_return, return_count, branchy|:
+                    match statement:
+                        Stmt.Return(value, straight_line):
+                            return_count <- return_count + 1
+                            straight_return <- returned2 if value is returned2
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            branchy <- true
+                        Stmt.While(condition, while_body, while_line):
+                            branchy <- true
+                        Stmt.Match(scrutinee, arms, match_line):
+                            branchy <- true
+                        Stmt.Block(kind2, clause2, binding2, block_body2, block_line2):
+                            branchy <- true
+                        _:
+                            pass
+                for statement in body |table| -> table:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                # Bitwise-valued returns are judged by the interval engine, not
+                                # blanket-warned: `return_expr_range` bounds a mask (`x & MASK` =
+                                # [0, MASK]) and the sign-extension idiom (`(x << k) >> k`) — both
+                                # of which stage0's default prover proves — while a bare/other
+                                # shift (`x >> k`, `x | 1`) stays kind 0 (unboundable) and fires
+                                # through the kind-zero path below, matching stage0's warn.
+                                range_unproven: mutable bool = false
+                                # DEPENDENT window: only a constant return provably at or
+                                # below the upper-bound variable's requires-derived floor
+                                # fits (`return 0` into [0, limit] with limit > 0); any
+                                # non-constant return is unproven.
+                                if dependent.found and return_count == 1 and not branchy:
+                                    dep_literal: (found: bool, value: i64) = signed_int_literal(returned)
+                                    dep_floor_slot: mutable i64 = -1
+                                    dep_probe: mutable usize = 0
+                                    while dep_probe < floor_names.count |dep_probe, dep_floor_slot, floor_names|:
+                                        dep_floor_slot <- dep_probe.i64() if floor_names[dep_probe] == dependent.hi_var and dep_floor_slot < 0
+                                        dep_probe <- dep_probe + 1
+                                    dep_floor_known: bool = dep_floor_slot >= 0
+                                    dep_const_ok: bool = dep_literal.found and dep_literal.value >= dependent.lo and dep_floor_known and dep_literal.value <= floor_values[dep_floor_slot.usize()]
+                                    # RELATIONAL tier: a plain-variable return `raw` into `[0, cap]`
+                                    # is proven iff a `requires` entails `raw < cap` (strict law) or
+                                    # `raw <= cap` (inclusive). lo<=0 keeps the free unsigned lower
+                                    # bound sound; other lows are left unproven (a sound miss).
+                                    dep_var: sview = ident_name_of(returned)
+                                    dep_relational_ok: bool = dep_var != "" and dependent.lo <= 0 and requires_proves_relation(dep_requires, dep_var, dependent.hi_var, dependent.strict_upper)
+                                    range_unproven <- not (dep_const_ok or dep_relational_ok)
+                                if bounds.found and return_count == 1 and not branchy:
+                                    # Requires-derived windows are an SMT-tier fact:
+                                    # stage0's basic prover does not consume `requires`
+                                    # bounds for the return refinement (a fitting product
+                                    # over them is still flagged without -smt).
+                                    smt_req_names: mutable darray[sview] = [cn for cn in carry_names]
+                                    smt_req_lo: mutable darray[i64] = [cl for cl in carry_lo]
+                                    smt_req_hi: mutable darray[i64] = [ch for ch in carry_hi]
+                                    if enable_smt:
+                                        smt_req_names.extend(req_names)
+                                        smt_req_lo.extend(req_lo)
+                                        smt_req_hi.extend(req_hi)
+                                    value_range: (kind: i64, lo: i64, hi: i64) = return_expr_range(returned, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, smt_req_names, smt_req_lo, smt_req_hi, enable_smt, 0)
+                                    out_of_window: bool = value_range.kind == 1 and (value_range.lo < bounds.lo or value_range.hi > bounds.hi)
+                                    # Interval arithmetic is exact only when each variable
+                                    # occurs ONCE; under -smt a correlated expression
+                                    # (`a*(256-w) + b*w`) may be provable tighter, so a
+                                    # loose out-of-window verdict is not reported there.
+                                    repeated: bool = return_expr_repeats_variable(returned)
+                                    # For a single-bound window, an un-computable (kind 0) leaf
+                                    # is NOT reported (stage0 may prove a literal `.len` /
+                                    # forall-guarded index against the half-open side); only a
+                                    # computed out-of-window violation is.
+                                    kind_zero_unproven: bool = value_range.kind == 0 and not single_bound_window
+                                    range_unproven <- kind_zero_unproven or (out_of_window and not (enable_smt and repeated))
+                                    # stage0's DEFAULT (non-SMT) prover cannot bound a
+                                    # VARIABLE*VARIABLE product (only `x * const` scaling), so
+                                    # it reports a fitting product-of-refined return as unproven
+                                    # — the interval engine proves it, matching stage0 only with
+                                    # -smt. Mirror the bitwise rule: warn in default mode.
+                                    range_unproven <- true if not enable_smt and return_expr_has_var_product(returned)
+                                    # A PLAIN unrefined-param return stays with the
+                                    # dedicated requires-mention rule elsewhere.
+                                    range_unproven <- false if ident_name_of(returned) != "" and value_range.kind == 0
+                                    # EXCEPT: a plain SIGNED-int param returned into a law with a
+                                    # non-negative lower bound (lo >= 0) is unprovable — a signed
+                                    # value may be < lo — unless a requires/assert fact establishes
+                                    # `p >= lo`. Unsigned params get lo=0 free, so signed only.
+                                    # stage0 rejects (witness p=lo-1); the suppression above erased
+                                    # this, so re-flag the definite lower-bound violation.
+                                    # Gated to non-SMT: under -smt a boolean-hypothesis
+                                    # (`implies`/disjunction) may entail the lower bound in a form
+                                    # this crude `p >= K` fact-scan can't see; defer to that tier.
+                                    signed_return_name: sview = ident_name_of(returned)
+                                    if not enable_smt and signed_return_name != "" and value_range.kind == 0 and bounds.lo >= 0 and refret_param_is_signed(parameters, signed_return_name):
+                                        signed_lower_fact: (found: bool, value: i64) = refret_lower_fact(body, signed_return_name)
+                                        range_unproven <- true if not (signed_lower_fact.found and signed_lower_fact.value >= bounds.lo)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefinementReturnNotProven, name: function_name, line: line, expected: "", actual: ""}) if range_unproven
+                        Stmt.Block(kind, clause, binding, block_body, block_line):
+                            table <- check_refinement_return_function(return_type, parameters, block_body, function_name, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, enable_smt, table)
+                        _:
+                            pass
+
+        def collect_laws(declarations: darray[Ast::Decl], law_names: mutable darray[sview]&, law_predicates: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Law(name, predicate, line):
+                            law_names.push(name)
+                            law_predicates.push(predicate)
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_laws(module_body, law_names, law_predicates)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_laws(scoped_body, law_names, law_predicates)
+                        _:
+                            pass
+
+        def check_refinement_return_walk(declarations: darray[Ast::Decl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, ret_alias_names: darray[sview]&, ret_alias_bases: darray[Ast::Expr]&, rr_struct_names: darray[sview]&, rr_field_starts: darray[usize]&, rr_field_counts: darray[usize]&, rr_field_names: darray[sview]&, rr_field_types: darray[Ast::Expr]&, rr_fn_names: darray[sview]&, rr_fn_lo: darray[i64]&, rr_fn_hi: darray[i64]&, enable_smt: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- check_refinement_return_function(present_return_type, parameters, body, function_name, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, enable_smt, table) if return_type is present_return_type
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- check_refinement_return_walk(module_body, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, enable_smt, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- check_refinement_return_walk(scoped_body, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, enable_smt, table)
+                        _:
+                            pass

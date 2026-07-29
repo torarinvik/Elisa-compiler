@@ -1,0 +1,280 @@
+# Stage1 semantic — extern calls, stale views, and the check entry (`extend Semantic:
+# private:`). Flags extern calls made without a grant and views read after their backing
+# container was mutated, then `check_strict_unsafe_ops` drives every part. Continues
+# check_strict_unsafe_ops_requires.elisa; split out to keep each part under 600 lines.
+
+extend Semantic:
+    private:
+        # Names of every `extern` function anywhere in the tree. stage0 marks each extern
+        # fnType with an unconditional `Unsafe.RawExtern` permission ref (markRawExternFuncType,
+        # gated only on enforceUnsafePermissions), so EVERY call to one requires the grant.
+        def collect_extern_names(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Extern(name, param_start, arity, variadic, callable, return_type_name, decorators, line):
+                            out.push(name)
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_extern_names(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_extern_names(scoped_body, out)
+                        _:
+                            pass
+
+        # Flag a direct call to a raw extern (`c_puts(text)`) outside any effect grant. A
+        # METHOD/UFCS callee (`x.f()`) is not a bare extern name; only Ident callees match.
+        def strict_extern_call_expression(expression: Ast::Expr, line: u32, extern_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        called: sview = ident_name_of(callee)
+                        is_extern: bool = called != "" and (any e in extern_names where e == called)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: called, line: line, expected: "Unsafe.RawExtern", actual: "Unsafe"}) if is_extern and not in_grant
+                        for argument in arguments |table| -> table:
+                            table <- strict_extern_call_expression(argument, line, extern_names, in_grant, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- strict_extern_call_expression(left, line, extern_names, in_grant, table)
+                        table <- strict_extern_call_expression(right, line, extern_names, in_grant, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- strict_extern_call_expression(operand, line, extern_names, in_grant, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- strict_extern_call_expression(inner, line, extern_names, in_grant, table)
+                    Expr.Index(object, index, index_line):
+                        table <- strict_extern_call_expression(object, line, extern_names, in_grant, table)
+                        table <- strict_extern_call_expression(index, line, extern_names, in_grant, table)
+                    _:
+                        pass
+
+        def strict_extern_call_walk(statements: darray[Ast::Stmt], extern_names: darray[sview]&, in_grant: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- strict_extern_call_expression(expression, line, extern_names, in_grant, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- strict_extern_call_expression(value, line, extern_names, in_grant, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- strict_extern_call_expression(target, line, extern_names, in_grant, table)
+                            table <- strict_extern_call_expression(value, line, extern_names, in_grant, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- strict_extern_call_expression(returned, line, extern_names, in_grant, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- strict_extern_call_expression(condition, line, extern_names, in_grant, table)
+                            table <- strict_extern_call_walk(then_body, extern_names, in_grant, table)
+                            table <- strict_extern_call_walk(else_body, extern_names, in_grant, table)
+                        Stmt.While(condition, body, line):
+                            table <- strict_extern_call_expression(condition, line, extern_names, in_grant, table)
+                            table <- strict_extern_call_walk(body, extern_names, in_grant, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- strict_extern_call_walk(body, extern_names, in_grant, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            grant_here: bool = in_grant or kind == "can" or kind == "trusted"
+                            table <- strict_extern_call_walk(body, extern_names, grant_here, table)
+                        _:
+                            pass
+
+        # Every raw-extern call obligation: skip functions with signature effects (a
+        # conservative over-grant, mirroring the bounds/alias pass) and grant blocks.
+        def strict_extern_call_decls(declarations: darray[Ast::Decl], extern_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            continue if effects.count > 0
+                            table <- strict_extern_call_walk(body, extern_names, false, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- strict_extern_call_decls(module_body, extern_names, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- strict_extern_call_decls(scoped_body, extern_names, table)
+                        _:
+                            pass
+
+        # Whether TYPE_EXPRESSION spells a `view[T]` / `sview` — a borrowed window whose
+        # backing can be invalidated out from under it.
+        def is_view_annotation(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Index(object, index, line):
+                        head: sview = ident_name_of(object)
+                        return head == "view" or head == "sview"
+                    Expr.Ident(name, line):
+                        return name == "sview" or name == "view"
+                    Expr.Unary(operator, operand, line):
+                        return is_view_annotation(operand)
+                    Expr.Paren(inner, line):
+                        return is_view_annotation(inner)
+                    _:
+                        return false
+
+        # The CONTAINER a slice/index initializer borrows from, when it is one of the known
+        # mutable containers; "" otherwise. `items[0:items.count]` and `items[i]` both borrow.
+        def slice_source_container(value: Ast::Expr, containers: darray[sview]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Slice(object, low, high, line):
+                        name: sview = ident_name_of(object)
+                        return name if (any c in containers where c == name) else sview("", 0, 0)
+                    Expr.Index(object, index, line):
+                        iname: sview = ident_name_of(object)
+                        return iname if (any c in containers where c == iname) else sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # Definite darray mutators — a call to one of these invalidates every live view of
+        # the receiver. A conservative whitelist (never a read accessor), so marking a view
+        # stale is always sound.
+        def is_container_mutator(method: sview) -> bool:
+            can Abort.Panic:
+                return method == "clear" or method == "push" or method == "pop" or method == "truncate" or method == "insert" or method == "remove" or method == "extend" or method == "resize" or method == "sort" or method == "reverse" or method == "append" or method == "drain" or method == "retain" or method == "swap_remove"
+
+        # The receiver container an expression MUTATES (`items.clear()`), or "".
+        def mutating_container(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        match callee:
+                            Expr.Field(object, field, field_line):
+                                return ident_name_of(object) if is_container_mutator(field) else sview("", 0, 0)
+                            _:
+                                return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # Whether EXPRESSION reads through a now-stale view: an index over it (`view[0]`) or a
+        # bare mention (returning/forwarding the stale window).
+        def expression_reads_stale_view(expression: Ast::Expr, stale_views: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return any s in stale_views where s == name
+                    Expr.Index(object, index, line):
+                        return expression_reads_stale_view(object, stale_views) or expression_reads_stale_view(index, stale_views)
+                    Expr.Slice(object, low, high, line):
+                        return expression_reads_stale_view(object, stale_views) or expression_reads_stale_view(low, stale_views) or expression_reads_stale_view(high, stale_views)
+                    Expr.Binary(left, operator, right, line):
+                        return expression_reads_stale_view(left, stale_views) or expression_reads_stale_view(right, stale_views)
+                    Expr.Unary(operator, operand, line):
+                        return expression_reads_stale_view(operand, stale_views)
+                    Expr.Paren(inner, line):
+                        return expression_reads_stale_view(inner, stale_views)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments:
+                            true return if expression_reads_stale_view(argument, stale_views)
+                        return false
+                    _:
+                        return false
+
+        # Linear staleness walk: register `view[T]` locals sliced from a mutable container,
+        # mark them stale at the container's first mutator call, and flag any read through a
+        # stale view NOT covered by a `Unsafe.StaleRef` grant. `stale_granted` is inherited
+        # from an enclosing `can/trusted Unsafe.StaleRef:` (a DIFFERENT grant does not
+        # discharge it). view_names/view_srcs/view_stale are parallel; state is
+        # function-scoped, so nested blocks share and mutate it.
+        def stale_view_walk(statements: darray[Ast::Stmt], containers: darray[sview]&, view_names: mutable darray[sview]&, view_srcs: mutable darray[sview]&, view_stale: mutable darray[bool]&, stale_granted: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                stale_now: mutable darray[sview] = []
+                probe0: mutable usize = 0
+                while probe0 < view_names.count |stale_now, probe0, view_names, view_stale|:
+                    stale_now.push(view_names[probe0]) if view_stale[probe0]
+                    probe0 <- probe0 + 1
+                for statement in statements |table, view_names, view_srcs, view_stale, stale_now| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: "stale reference", line: line, expected: "Unsafe.StaleRef", actual: "Unsafe"}) if not stale_granted and expression_reads_stale_view(value, stale_now)
+                            source: sview = slice_source_container(value, containers)
+                            if is_view_annotation(type_expression) and source != "":
+                                view_names.push(name)
+                                view_srcs.push(source)
+                                view_stale.push(false)
+                        Stmt.Assign(target, operator, value, line):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: "stale reference", line: line, expected: "Unsafe.StaleRef", actual: "Unsafe"}) if not stale_granted and (expression_reads_stale_view(value, stale_now) or expression_reads_stale_view(target, stale_now))
+                        Stmt.Expr(expression, line):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: "stale reference", line: line, expected: "Unsafe.StaleRef", actual: "Unsafe"}) if not stale_granted and expression_reads_stale_view(expression, stale_now)
+                            mutated: sview = mutating_container(expression)
+                            if mutated != "":
+                                mark_probe: mutable usize = 0
+                                while mark_probe < view_names.count |mark_probe, mutated, view_srcs, view_stale, stale_now|:
+                                    if view_srcs[mark_probe] == mutated:
+                                        view_stale[mark_probe] <- true
+                                        stale_now.push(view_names[mark_probe])
+                                    mark_probe <- mark_probe + 1
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: "stale reference", line: line, expected: "Unsafe.StaleRef", actual: "Unsafe"}) if not stale_granted and expression_reads_stale_view(returned, stale_now)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- stale_view_walk(then_body, containers, view_names, view_srcs, view_stale, stale_granted, table)
+                            table <- stale_view_walk(else_body, containers, view_names, view_srcs, view_stale, stale_granted, table)
+                        Stmt.While(condition, body, line):
+                            table <- stale_view_walk(body, containers, view_names, view_srcs, view_stale, stale_granted, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- stale_view_walk(body, containers, view_names, view_srcs, view_stale, stale_granted, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            grants_stale: bool = stale_granted or ((kind == "can" or kind == "trusted") and (any grant in clause where grant == "Unsafe.StaleRef" or grant == "StaleRef"))
+                            table <- stale_view_walk(body, containers, view_names, view_srcs, view_stale, grants_stale, table)
+                        _:
+                            pass
+
+        def stale_view_decls(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            continue if effects.count > 0
+                            containers: mutable darray[sview] = []
+                            for parameter in parameters |containers|:
+                                containers.push(parameter.name) if param_is_mutable_ref(parameter)
+                            continue if containers.count == 0
+                            view_names: mutable darray[sview] = []
+                            view_srcs: mutable darray[sview] = []
+                            view_stale: mutable darray[bool] = []
+                            table <- stale_view_walk(body, containers, view_names, view_srcs, view_stale, false, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- stale_view_decls(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- stale_view_decls(scoped_body, table)
+                        _:
+                            pass
+
+        # `enforce_raw_unsafe` is stage0's pure EnforceUnsafePermissions (NOT the strict-proofs
+        # union): the raw-extern obligation fires only under it.
+        def check_strict_unsafe_ops(file: Ast::File&, enforce_raw_unsafe: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                mutable_globals: mutable darray[sview] = []
+                collect_mutable_globals(file.top_decls, mutable_globals)
+                extern_names: mutable darray[sview] = []
+                collect_extern_names(file.top_decls, extern_names)
+                table <- strict_extern_call_decls(file.top_decls, extern_names, table) if enforce_raw_unsafe and extern_names.count > 0
+                table <- stale_view_decls(file.top_decls, table) if enforce_raw_unsafe
+                checked_get_lines: mutable darray[u32] = []
+                for annotation in file.enum_annotations |checked_get_lines|:
+                    checked_get_lines.push(annotation.line) if annotation.owner == "__checked_get"
+                mr_fns: mutable darray[sview] = []
+                mr_positions: mutable darray[usize] = []
+                collect_mutable_ref_positions(file.top_decls, mr_fns, mr_positions)
+                law_names: mutable darray[sview] = []
+                law_predicates: mutable darray[Ast::Expr] = []
+                collect_laws(file.top_decls, law_names, law_predicates)
+                table <- strict_unsafe_decls(file.top_decls, mutable_globals, checked_get_lines, mr_fns, mr_positions, law_names, law_predicates, table)
+
+        # Append every ident name in EXPRESSION to OUT (requires-mention collection).
+        def collect_expression_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        out.push(name)
+                    Expr.Binary(left, operator, right, line):
+                        collect_expression_idents(left, out)
+                        collect_expression_idents(right, out)
+                    Expr.Unary(operator, operand, line):
+                        collect_expression_idents(operand, out)
+                    Expr.Paren(inner, line):
+                        collect_expression_idents(inner, out)
+                    Expr.Index(object, index, line):
+                        collect_expression_idents(object, out)
+                        collect_expression_idents(index, out)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments |out|:
+                            collect_expression_idents(argument, out)
+                    _:
+                        pass

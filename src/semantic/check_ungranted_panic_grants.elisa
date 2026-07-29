@@ -1,0 +1,226 @@
+# Stage1 semantic — inline grants and the ungranted-call walk (`extend Semantic:
+# private:`). Decides whether a line is covered by an inline `can ...:` grant or a
+# permission parameter, collects the names a body binds, and reports the calls that need
+# an effect nobody granted. Continues check_ungranted_panic.elisa; split out to keep each
+# part file under 600 lines.
+
+extend Semantic:
+    private:
+        # Whether `target` is one of `names` (content equality on the copied spans). Used to
+        # suppress the effect-call fire when the callee is shadowed by a local/param binder.
+        def names_contains(names: darray[sview], target: sview) -> bool:
+            for candidate in names:
+                candidate_name: sview = candidate
+                true return if candidate_name == target
+            return false
+
+
+        # Whether the postfix grant on `line` covers `family` (a required permission
+        # family like "Unsafe"): any recorded granted ref on that line whose family
+        # prefix matches. The bare "__inline_can" marker itself never matches.
+        def line_inline_grant_covers(names: darray[sview]&, lines: darray[u32]&, line: u32, family: sview) -> bool:
+            can Abort.Panic:
+                false return if family == ""
+                while index < lines.count |index: usize = 0|:
+                    true return if lines[index] == line and names[index] != "__inline_can" and effect_ref_family(names[index]) == family
+                    index <- index + 1
+                return false
+
+        # The first DECLARED effect ref of `owner` whose family is NOT covered by
+        # the postfix grant on `line` ("" when every declared family is granted).
+        def first_uncovered_declared_ref(table: SymbolTable&, owner: sview, names: darray[sview]&, lines: darray[u32]&, line: u32) -> sview:
+            can Abort.Panic:
+                while declared_index < table.function_effect_owner.count |declared_index: usize = 0|:
+                    if table.function_effect_owner[declared_index] == owner:
+                        candidate: sview = table.function_effect_name[declared_index]
+                        candidate return if not line_inline_grant_covers(names, lines, line, effect_ref_family(candidate))
+                    declared_index <- declared_index + 1
+                return ""
+
+        def line_has_inline_grant(names: darray[sview]&, lines: darray[u32]&, line: u32) -> bool:
+            can Abort.Panic:
+                while index < lines.count |index: usize = 0|:
+                    true return if names[index] == "__inline_can" and lines[index] == line
+                    index <- index + 1
+                return false
+
+
+        def effect_param_on_line(annotations: darray[Ast::EnumAnnotation]&, name: sview, function_line: u32) -> bool:
+            for annotation in annotations:
+                true return if annotation.owner == "__effect_param" and annotation.name == name and annotation.line == function_line
+            return false
+
+
+        def line_has_annotation_owner(annotations: darray[Ast::EnumAnnotation]&, owner: sview, line: u32) -> bool:
+            for annotation in annotations:
+                true return if annotation.owner == owner and annotation.line == line
+            return false
+
+
+        def concrete_effect_wrapper_line(annotations: darray[Ast::EnumAnnotation]&, line: u32) -> bool:
+            return line_has_annotation_owner(annotations, "__effect_param", line) and not line_has_annotation_owner(annotations, "__permission_param_decl", line)
+
+
+        def concrete_effect_wrapper_name(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, name: sview) -> bool:
+            for symbol in table.symbols:
+                true return if symbol.kind == SymbolKind.Func and symbol.name == name and concrete_effect_wrapper_line(annotations, symbol.line)
+            return false
+
+
+        def calls_concrete_effect_wrapper(expression: Ast::Expr, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&) -> bool:
+            callee_name: sview = called_function_name(expression)
+            return callee_name != "" and concrete_effect_wrapper_name(table, annotations, callee_name)
+
+
+        def unknown_permission_member_diagnostics(annotations: darray[Ast::EnumAnnotation]&) -> darray[Diagnostic]:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable darray[Diagnostic] = []
+                for annotation in annotations |result|:
+                    result.push(Diagnostic{kind: DiagnosticKind.UnknownPermissionMember, name: "Console", line: annotation.line, expected: "", actual: annotation.name}) if annotation.owner == "__invalid_console"
+                    result.push(Diagnostic{kind: DiagnosticKind.PermissionParamMemberAccess, name: annotation.name, line: annotation.line, expected: "", actual: ""}) if annotation.owner == "__permission_param_member"
+                return result
+
+
+        # Collect every name a pattern binds (recursively), pushing into `names` in place.
+        def pattern_bound_names(pattern: Ast::Pattern, names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name):
+                        names.push(name)
+                    Pattern.TypeBind(type_name, binder):
+                        names.push(binder)
+                    Pattern.As(name, inner):
+                        names.push(name)
+                        for sub in inner:
+                            pattern_bound_names(sub, names)
+                    Pattern.Variant(path, fields):
+                        for sub in fields:
+                            pattern_bound_names(sub, names)
+                    Pattern.Struct(path, fields):
+                        for sub in fields:
+                            pattern_bound_names(sub, names)
+                    Pattern.Field(selector, inner):
+                        for sub in inner:
+                            pattern_bound_names(sub, names)
+                    Pattern.Tuple(elements):
+                        for sub in elements:
+                            pattern_bound_names(sub, names)
+                    Pattern.Or(options):
+                        for sub in options:
+                            pattern_bound_names(sub, names)
+                    _:
+                        pass
+
+
+        # Collect every name bound anywhere in a statement list (params handled by the caller):
+        # local var-decls, for-loop variables, block bindings, and match-arm pattern bindings.
+        # Over-collection is sound here — it only ever SUPPRESSES the effect-call fire, so a name
+        # bound in any scope of the function shadows the top-level callee for the whole function.
+        def collect_bound_names(statements: darray[Ast::Stmt], names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            names.push(name)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            for loop_variable in variables:
+                                names.push(loop_variable)
+                            collect_bound_names(body, names)
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_bound_names(then_body, names)
+                            collect_bound_names(else_body, names)
+                        Stmt.While(condition, body, line):
+                            collect_bound_names(body, names)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            names.push(binding)
+                            collect_bound_names(body, names)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                pattern_bound_names(arm.pattern, names)
+                                collect_bound_names(arm.body, names)
+                        _:
+                            pass
+
+
+        # Walk a statement list tracking whether a conservative enclosing grant is active.
+        # Concrete effect-bearing callback parameters are the precision exception: invoking
+        # one (or a wrapper carrying one) still requires a local grant, while permission-row
+        # polymorphic callbacks retain Stage0's generic-context suppression.
+        def check_ungranted_call_expression(expression: Ast::Expr, line: u32, function_line: u32, annotations: darray[Ast::EnumAnnotation]&, bound_names: darray[sview], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                callee_name: sview = called_function_name(expression)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedPanic, name: "", line: line, expected: "", actual: ""}) if callee_name == "panic"
+                return if callee_name == "panic" or callee_name == ""
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: callee_name, line: line, expected: function_first_effect_ref(table, callee_name), actual: effect_ref_family(function_first_effect_ref(table, callee_name))}) if effect_param_on_line(annotations, callee_name, function_line)
+                return if effect_param_on_line(annotations, callee_name, function_line)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: callee_name, line: line, expected: function_first_effect_ref(table, callee_name), actual: effect_ref_family(function_first_effect_ref(table, callee_name))}) if not names_contains(bound_names, callee_name) and direct_function_count(table, callee_name) == 1 and function_has_effect(table, callee_name)
+
+
+        # Recurse through compound expression shapes so a call NESTED in an
+        # operand (`1 + emit(2)`) is checked like a top-level one. Unhandled
+        # shapes stay un-walked (sound miss, never a false fire).
+        def check_ungranted_expression_deep(expression: Ast::Expr, line: u32, function_line: u32, annotations: darray[Ast::EnumAnnotation]&, bound_names: darray[sview], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        table <- check_ungranted_call_expression(expression, line, function_line, annotations, bound_names, table)
+                        for argument in arguments |table| -> table:
+                            table <- check_ungranted_expression_deep(argument, line, function_line, annotations, bound_names, table)
+                    Expr.Binary(left, operator, right, binary_line):
+                        table <- check_ungranted_expression_deep(left, line, function_line, annotations, bound_names, table)
+                        table <- check_ungranted_expression_deep(right, line, function_line, annotations, bound_names, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        table <- check_ungranted_expression_deep(operand, line, function_line, annotations, bound_names, table)
+                    Expr.Paren(inner, paren_line):
+                        table <- check_ungranted_expression_deep(inner, line, function_line, annotations, bound_names, table)
+                    _:
+                        pass
+
+
+        def check_ungranted_panic_statements(statements: darray[Ast::Stmt], allocation_names: darray[sview]&, allocation_lines: darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, function_line: u32, in_grant: bool, strict_unsafe: bool, bound_names: darray[sview], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            if not in_grant and not line_has_inline_grant(allocation_names, allocation_lines, line):
+                                table <- check_ungranted_expression_deep(expression, line, function_line, annotations, bound_names, table)
+                            # A postfix grant that OMITS a required family still leaves
+                            # the call ungranted for that family (stage0 parity).
+                            if not in_grant and line_has_inline_grant(allocation_names, allocation_lines, line):
+                                grant_callee: sview = called_function_name(expression)
+                                # A grant naming an UNKNOWN permission member (`can
+                                # Console.Read`) does not cover anything (stage0 still
+                                # warns with the callee's declared ref as the suggestion).
+                                invalid_member_grant: bool = line_has_annotation_owner(annotations, "__invalid_console", line)
+                                uncovered_ref: mutable sview = first_uncovered_declared_ref(table, grant_callee, allocation_names, allocation_lines, line) if grant_callee != "" else ""
+                                uncovered_ref <- function_first_declared_effect_ref(table, grant_callee) if invalid_member_grant and grant_callee != ""
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UngrantedEffectCall, name: grant_callee, line: line, expected: uncovered_ref, actual: effect_ref_family(uncovered_ref)}) if uncovered_ref != "" and (strict_unsafe or effect_ref_family(uncovered_ref) != "Unsafe")
+                        Stmt.Block(kind, clause, binding, body, line):
+                            block_grant: bool = in_grant or kind == "can" or kind == "trusted"
+                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, block_grant, strict_unsafe, bound_names, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- check_ungranted_panic_statements(then_body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
+                            table <- check_ungranted_panic_statements(else_body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
+                        Stmt.While(condition, body, line):
+                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- check_ungranted_panic_statements(body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- check_ungranted_panic_statements(arm.body, allocation_names, allocation_lines, annotations, function_line, in_grant, strict_unsafe, bound_names, table)
+                        Stmt.Return(value, line):
+                            if value is return_expression:
+                                needs_local_grant: bool = not in_grant or calls_concrete_effect_wrapper(return_expression, table, annotations)
+                                table <- check_ungranted_expression_deep(return_expression, line, function_line, annotations, bound_names, table) if needs_local_grant and not line_has_inline_grant(allocation_names, allocation_lines, line)
+                        Stmt.Contract(kind, expression, line):
+                            pass
+                        Stmt.Invalid:
+                            pass
+                        Stmt.Break(label, line):
+                            pass
+                        Stmt.Continue(label, line):
+                            pass
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            pass
+                        Stmt.Assign(target, operator, value, line):
+                            pass

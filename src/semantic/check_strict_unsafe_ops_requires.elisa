@@ -1,0 +1,223 @@
+# Stage1 semantic — requires-clause bounds evidence (`extend Semantic: private:`). Reads
+# the bounds a requires predicate establishes for an index parameter, and collects the
+# mutable globals and local names the declaration walk needs. Continues
+# check_strict_unsafe_ops_walk.elisa; split out to keep each part under 600 lines.
+
+extend Semantic:
+    private:
+        # Whether PRED is a STRICT `.count` upper bound for NAME (`name < recv.count`,
+        # mirrored, or an and-conjunct containing one).
+        def requires_predicate_bounds(predicate: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return requires_predicate_bounds(inner, name)
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.And:
+                            true return if requires_predicate_bounds(left, name)
+                            return requires_predicate_bounds(right, name)
+                        (ident_name_of(left) == name and expression_is_count_field(right)) return if operator == TokenKind.Lt
+                        (ident_name_of(right) == name and expression_is_count_field(left)) return if operator == TokenKind.Gt
+                        return false
+                    _:
+                        return false
+
+
+        # The guaranteed MINIMUM `.count` a requires predicate establishes for any
+        # container (`regs.count >= 32` → 32, `regs.count > 31` → 32, mirrored forms
+        # too); -1 when the predicate says nothing about a count. Conjunctions take the
+        # strongest (largest) floor. Used to prove a refined index `[0, hi]` is in
+        # bounds: it is safe iff floor >= hi + 1 (worst index hi must be < count).
+        def requires_count_floor(predicate: Ast::Expr) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return requires_count_floor(inner)
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.And:
+                            a: i64 = requires_count_floor(left)
+                            b: i64 = requires_count_floor(right)
+                            return a if a > b else b
+                        if expression_is_count_field(left):
+                            literal: (found: bool, value: i64) = fold_const_int(right)
+                            literal.value return if literal.found and operator == TokenKind.GtEq
+                            literal.value + 1 return if literal.found and operator == TokenKind.Gt
+                            return (-1)
+                        if expression_is_count_field(right):
+                            mirror: (found: bool, value: i64) = fold_const_int(left)
+                            mirror.value return if mirror.found and operator == TokenKind.LtEq
+                            mirror.value + 1 return if mirror.found and operator == TokenKind.Lt
+                            return (-1)
+                        return (-1)
+                    _:
+                        return (-1)
+
+        # Whether a refined integer index NAME (its refinement window bounds it to
+        # `[lo, hi]`) is PROVABLY in bounds for every array subscript it can reach, so
+        # stage0's strict unchecked-index pass stays silent. Sound, structural subset:
+        #   - a reassignment of NAME in the body invalidates the window (`idx <- 200`);
+        #   - a FIXED-array param (`array[T, N]`) whose extent N > hi bounds it;
+        #   - otherwise a `requires C.count >= K` with K > hi bounds it, but ONLY when no
+        #     MUTABLE container param is present (a `mutable darray&` can be resized, so the
+        #     count fact is not stable — stage0 flags those).
+        # Anything else (unknown extent, insufficient bound) leaves it UNPROVEN, so it is
+        # treated like a plain integer index and needs `can Unsafe.UncheckedIndex`.
+        def refined_index_bounded(name: sview, hi: i64, parameters: darray[Ast::ParamDecl], requires_predicates: darray[Ast::Expr]&, body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if body_invalidates_bounds(body, name)
+                for parameter in parameters |hi|:
+                    true return if fixed_array_extent(parameter.type_expression) > hi
+                has_mutable_container: bool = any parameter in parameters where is_fixed_array_annotation(parameter.type_expression) and param_is_mutable_ref(parameter)
+                if not has_mutable_container:
+                    best_floor: mutable i64 = -1
+                    for predicate in requires_predicates |best_floor|:
+                        floor: i64 = requires_count_floor(predicate)
+                        best_floor <- floor if floor > best_floor
+                    true return if best_floor >= hi + 1
+                return false
+
+        # Whether every requires clause mentioning NAME is a `.count` COMPARISON (the
+        # shapes whose non-strict forms stage0 still flags). A requires that constrains
+        # the index some OTHER way (`i * 2 < n`, a law application, ...) keeps the
+        # original conservative mention-clears-it behavior.
+        def requires_only_count_comparisons(predicates: darray[Ast::Expr]&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for predicate in predicates |name|:
+                    mentioned2: mutable darray[sview] = []
+                    collect_expression_idents(predicate, mentioned2)
+                    continue if not (any m in mentioned2 where m == name)
+                    false return if not requires_count_comparison_shape(predicate, name)
+                return true
+
+
+        def requires_count_comparison_shape(predicate: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, line):
+                        return requires_count_comparison_shape(inner, name)
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.And:
+                            false return if not requires_count_comparison_shape(left, name)
+                            return requires_count_comparison_shape(right, name)
+                        is_comparison: bool = is_comparison_operator(operator)
+                        left_is_name: bool = ident_name_of(left) == name
+                        right_is_name: bool = ident_name_of(right) == name
+                        (expression_is_count_field(right)) return if is_comparison and left_is_name
+                        (expression_is_count_field(left)) return if is_comparison and right_is_name
+                        return not (left_is_name or right_is_name)
+                    _:
+                        return false
+
+
+        # Whether PARAM is spelled `mutable T&`: the canonical borrow spelling keeps
+        # BOTH markers in the type expression (a Mutable unary and an Ampersand unary;
+        # see canonical-mutable-borrow-syntax — never trust ParamDecl.is_mutable alone).
+        def param_is_mutable_ref(parameter: Ast::ParamDecl) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return type_marker_present(parameter.type_expression, TokenKind.Mutable) and type_marker_present(parameter.type_expression, TokenKind.Ampersand)
+
+        def type_marker_present(type_expression: Ast::Expr, marker: TokenKind) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        true return if operator == marker
+                        return type_marker_present(operand, marker)
+                    _:
+                        return false
+
+        # Names of `global`/`global mutable` bindings (Decl.Const with is_mutable) anywhere in
+        # the tree. `const` (is_mutable == false) is immutable and never requires the grant.
+        def collect_mutable_globals(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Const(name, type_expression, value, is_mutable, line):
+                            out.push(name) if is_mutable
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_mutable_globals(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_mutable_globals(scoped_body, out)
+                        _:
+                            pass
+
+        # Every local binding introduced in a function body (recursively), so a mutable-global
+        # name shadowed by a local is not misreported.
+        def collect_local_names(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            out.push(name)
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_local_names(then_body, out)
+                            collect_local_names(else_body, out)
+                        Stmt.While(condition, body, line):
+                            collect_local_names(body, out)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            collect_local_names(body, out)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            collect_local_names(body, out)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out|:
+                                collect_local_names(arm.body, out)
+                        _:
+                            pass
+
+        def strict_unsafe_decls(declarations: darray[Ast::Decl], mutable_globals: darray[sview]&, checked_get_lines: darray[u32]&, mr_fns: darray[sview]&, mr_positions: darray[usize]&, law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            # Signature `can[...]` effects conservatively grant everything.
+                            continue if effects.count > 0
+                            # Generic contexts (impl[T] members, generic fns) keep
+                            # stage0's generic-context suppression.
+                            continue if any generic_line in table.generic_param_lines where generic_line == line or generic_line == line + 2147483648
+                            array_params: mutable darray[sview] = []
+                            index_params: mutable darray[sview] = []
+                            unsigned_indexes: mutable darray[sview] = []
+                            mutable_params: mutable darray[sview] = []
+                            ref_params: mutable darray[sview] = []
+                            local_names: mutable darray[sview] = []
+                            requires_names: mutable darray[sview] = []
+                            requires_predicates2: mutable darray[Ast::Expr] = []
+                            for statement in body |requires_names, requires_predicates2|:
+                                match statement:
+                                    Stmt.Contract(kind, expression, contract_line):
+                                        contract_kind: sview = kind
+                                        collect_expression_idents(expression, requires_names) if contract_kind == "requires"
+                                        requires_predicates2.push(expression) if contract_kind == "requires"
+                                    _:
+                                        pass
+                            for parameter in parameters |array_params, index_params, unsigned_indexes, mutable_params, ref_params, local_names, parameters, body, requires_predicates2, law_names, law_predicates|:
+                                array_params.push(parameter.name) if is_fixed_array_annotation(parameter.type_expression)
+                                is_plain_integer: bool = bare_type_name(parameter.type_expression) == "i64" or bare_type_name(parameter.type_expression) == "usize" or bare_type_name(parameter.type_expression) == "u64" or bare_type_name(parameter.type_expression) == "int" or bare_type_name(parameter.type_expression) == "u32" or bare_type_name(parameter.type_expression) == "i32"
+                                # A `requires` MENTION alone no longer clears an index: the
+                                # clause must be a proper STRICT upper bound against a
+                                # `.count` (`requires i <= xs.count` still leaves i one past
+                                # the end — stage0 flags it).
+                                mentioned: bool = any r in requires_names where r == parameter.name
+                                strictly_bounded: bool = any pred in requires_predicates2 where requires_predicate_bounds(pred, parameter.name)
+                                unconstrained: bool = (not mentioned) or (mentioned and not strictly_bounded and requires_only_count_comparisons(requires_predicates2, parameter.name))
+                                index_params.push(parameter.name) if is_plain_integer and unconstrained
+                                # A REFINED integer index (`idx: u32 is InRange[0, hi]`) is a
+                                # plain integer to bare_type_name (its type is `Binary(u32, Is,
+                                # ...)`), so it slips past the check above. stage0's strict pass
+                                # ignores the refinement UNLESS it provably bounds the index
+                                # below every reachable extent — otherwise it still needs the
+                                # grant. Treat an UNPROVEN refined index like a plain one.
+                                refined_window: (refined: bool, found: bool, lo: i64, hi: i64) = index_annotation_window(parameter.type_expression, law_names, law_predicates)
+                                index_params.push(parameter.name) if refined_window.refined and refined_window.found and not refined_index_bounded(parameter.name, refined_window.hi, parameters, requires_predicates2, body)
+                                is_unsigned: bool = bare_type_name(parameter.type_expression) == "usize" or bare_type_name(parameter.type_expression) == "u64" or bare_type_name(parameter.type_expression) == "u32"
+                                unsigned_indexes.push(parameter.name) if is_unsigned
+                                mutable_params.push(parameter.name) if param_is_mutable_ref(parameter)
+                                ref_params.push(parameter.name) if type_marker_present(parameter.type_expression, TokenKind.Ampersand)
+                                local_names.push(parameter.name)
+                            collect_local_names(body, local_names)
+                            table <- strict_unsafe_walk(body, array_params, index_params, unsigned_indexes, mutable_params, ref_params, mutable_globals, local_names, checked_get_lines, mr_fns, mr_positions, false, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- strict_unsafe_decls(module_body, mutable_globals, checked_get_lines, mr_fns, mr_positions, law_names, law_predicates, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- strict_unsafe_decls(scoped_body, mutable_globals, checked_get_lines, mr_fns, mr_positions, law_names, law_predicates, table)
+                        _:
+                            pass

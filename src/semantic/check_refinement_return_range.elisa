@@ -1,0 +1,244 @@
+# Stage1 semantic — the return-expression range engine (`extend Semantic: private:`).
+# `return_expr_range` computes the interval a return expression can produce from its
+# parameters' refinements, and the collectors gather the carried locals and lower-bound
+# facts it reads. Continues check_refinement_return.elisa; split out to keep each part
+# file under 600 lines.
+
+extend Semantic:
+    private:
+        # The RANGE of a return expression over the parameter windows: affine +/- combine,
+        # products take corner extremes; a division, cast, call, or windowless leaf makes
+        # the range UNKNOWN (kind 0). kind 1 = [lo, hi].
+        def return_expr_range(expression: Ast::Expr, parameters: darray[Ast::ParamDecl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, ret_alias_names: darray[sview]&, ret_alias_bases: darray[Ast::Expr]&, rr_struct_names: darray[sview]&, rr_field_starts: darray[usize]&, rr_field_counts: darray[usize]&, rr_field_names: darray[sview]&, rr_field_types: darray[Ast::Expr]&, rr_fn_names: darray[sview]&, rr_fn_lo: darray[i64]&, rr_fn_hi: darray[i64]&, req_names: darray[sview]&, req_lo: darray[i64]&, req_hi: darray[i64]&, enable_smt: bool, depth: u32) -> (kind: i64, lo: i64, hi: i64):
+            can Memory.Allocate, Abort.Panic:
+                (0, 0, 0) return if depth > 12
+                match expression:
+                    Expr.IntLit(value):
+                        return (1, value, value)
+                    Expr.Paren(inner, line):
+                        return return_expr_range(inner, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, req_names, req_lo, req_hi, enable_smt, depth + 1)
+                    Expr.Ident(name, line):
+                        # A two-sided window in req_names (a requires-bounded param OR a
+                        # carried local whose declared-init interval was recorded) — checked
+                        # first so a non-parameter local (`r = a if c else b`) resolves.
+                        ident_req_probe: mutable usize = 0
+                        ident_req_slot: mutable i64 = -1
+                        while ident_req_probe < req_names.count |ident_req_probe, ident_req_slot, name, req_names|:
+                            ident_req_slot <- ident_req_probe.i64() if req_names[ident_req_probe] == name and ident_req_slot < 0
+                            ident_req_probe <- ident_req_probe + 1
+                        (1, req_lo[ident_req_slot.usize()], req_hi[ident_req_slot.usize()]) return if ident_req_slot >= 0
+                        for parameter in parameters |name, law_names, law_predicates, ret_alias_names, ret_alias_bases, req_names, req_lo, req_hi|:
+                            continue if parameter.name != name
+                            window: (found: bool, lo: i64, hi: i64) = param_refinement_window(parameter.type_expression, law_names, law_predicates, ret_alias_names, ret_alias_bases)
+                            (1, window.lo, window.hi) return if window.found
+                            # An unrefined param may still be two-sided-bounded by the
+                            # function's own `requires` clauses.
+                            req_probe: mutable usize = 0
+                            req_slot: mutable i64 = -1
+                            while req_probe < req_names.count |req_probe, req_slot, name, req_names|:
+                                req_slot <- req_probe.i64() if req_names[req_probe] == name and req_slot < 0
+                                req_probe <- req_probe + 1
+                            (1, req_lo[req_slot.usize()], req_hi[req_slot.usize()]) return if req_slot >= 0
+                            return (0, 0, 0)
+                        return (0, 0, 0)
+                    Expr.Unary(operator, operand, line):
+                        (0, 0, 0) return if operator != TokenKind.Minus
+                        inner_range: (kind: i64, lo: i64, hi: i64) = return_expr_range(operand, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, req_names, req_lo, req_hi, enable_smt, depth + 1)
+                        (0, 0, 0) return if inner_range.kind != 1
+                        return (1, 0 - inner_range.hi, 0 - inner_range.lo)
+                    Expr.Binary(left, operator, right, line):
+                        left_range: (kind: i64, lo: i64, hi: i64) = return_expr_range(left, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, req_names, req_lo, req_hi, enable_smt, depth + 1)
+                        right_range: (kind: i64, lo: i64, hi: i64) = return_expr_range(right, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, req_names, req_lo, req_hi, enable_smt, depth + 1)
+                        # BITMASK `X & MASK` (MASK a non-negative literal) is EXACTLY
+                        # [0, MASK] regardless of X's own range. This is a BITVECTOR fact:
+                        # stage0's DEFAULT (non-SMT) prover does NOT bound a mask over a
+                        # non-constant operand (`(w >> shift) & 0x7f` warns without -smt); only
+                        # its -smt (z3 bitvector) tier proves it. So the short-circuit applies
+                        # under enable_smt, OR when the masked operand is itself statically
+                        # bounded (a constant/affine value the const-eval tier discharges in
+                        # both modes). An unbounded masked operand without -smt stays kind 0.
+                        if operator == TokenKind.Ampersand:
+                            left_mask_literal: (found: bool, value: i64) = signed_int_literal(left)
+                            right_mask_literal: (found: bool, value: i64) = signed_int_literal(right)
+                            right_is_mask: bool = right_mask_literal.found and right_mask_literal.value >= 0
+                            left_is_mask: bool = left_mask_literal.found and left_mask_literal.value >= 0
+                            # When the literal is on the right, the masked operand is `left`.
+                            right_mask_ok: bool = right_is_mask and (enable_smt or left_range.kind == 1)
+                            left_mask_ok: bool = left_is_mask and (enable_smt or right_range.kind == 1)
+                            (1, 0, right_mask_literal.value) return if right_mask_ok
+                            (1, 0, left_mask_literal.value) return if left_mask_ok
+                            return (0, 0, 0)
+                        # SIGN-EXTENSION idiom `(X << k) >> k` on a W-bit signed value keeps the
+                        # low (W-k) bits sign-extended: range [-2^(W-1-k), 2^(W-1-k)-1]. stage0
+                        # proves this exactly; a bare/other shift stays kind 0 (unboundable).
+                        if operator == TokenKind.RShift:
+                            shift_amount: (found: bool, value: i64) = signed_int_literal(right)
+                            if shift_amount.found and shift_amount.value > 0:
+                                match signext_unwrap_paren(left):
+                                    Expr.Binary(sx_left, sx_operator, sx_right, sx_line):
+                                        if sx_operator == TokenKind.LShift:
+                                            up_amount: (found: bool, value: i64) = signed_int_literal(sx_right)
+                                            width: i64 = signext_width(sx_left, parameters) if up_amount.found and up_amount.value == shift_amount.value else 0
+                                            if width > 0 and shift_amount.value < width:
+                                                half: i64 = signext_pow2(width - 1 - shift_amount.value)
+                                                return (1, 0 - half, half - 1)
+                                    _:
+                                        pass
+                            return (0, 0, 0)
+                        # MOD is decidable even with an unknown-but-unsigned base.
+                        if operator == TokenKind.Percent:
+                            mod_divisor0: (found: bool, value: i64) = signed_int_literal(right)
+                            (0, 0, 0) return if not mod_divisor0.found or mod_divisor0.value <= 0
+                            span0: i64 = mod_divisor0.value - 1
+                            (1, 0, span0) return if left_range.kind == 1 and left_range.lo >= 0
+                            (1, 0 - span0, span0) return if left_range.kind == 1
+                            (1, 0, span0) return if return_base_is_unsigned_param(left, parameters)
+                            return (0, 0, 0)
+                        (0, 0, 0) return if left_range.kind != 1 or right_range.kind != 1
+                        (1, left_range.lo + right_range.lo, left_range.hi + right_range.hi) return if operator == TokenKind.Plus
+                        (1, left_range.lo - right_range.hi, left_range.hi - right_range.lo) return if operator == TokenKind.Minus
+                        if operator == TokenKind.Star:
+                            c1: i64 = left_range.lo * right_range.lo
+                            c2: i64 = left_range.lo * right_range.hi
+                            c3: i64 = left_range.hi * right_range.lo
+                            c4: i64 = left_range.hi * right_range.hi
+                            product_min: mutable i64 = c1
+                            product_max: mutable i64 = c1
+                            product_min <- c2 if c2 < product_min
+                            product_min <- c3 if c3 < product_min
+                            product_min <- c4 if c4 < product_min
+                            product_max <- c2 if c2 > product_max
+                            product_max <- c3 if c3 > product_max
+                            product_max <- c4 if c4 > product_max
+                            return (1, product_min, product_max)
+                        # DIVISION by a positive constant is monotone under truncation.
+                        if operator == TokenKind.Slash:
+                            divisor_const: bool = right_range.lo == right_range.hi and right_range.lo > 0
+                            (1, left_range.lo / right_range.lo, left_range.hi / right_range.lo) return if divisor_const
+                            return (0, 0, 0)
+                        return (0, 0, 0)
+                    # A CALL to a function whose RETURN type is refined takes the
+                    # callee's window (`return low_byte(x)` with `-> i64 is
+                    # Bounded[0, 127]`); module-qualified callees resolve by tail name.
+                    # A WIDENING unsigned cast (`rack.usize()`, `.u64()`) preserves the
+                    # receiver's range.
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        if arguments.count == 0:
+                            match callee:
+                                Expr.Field(cast_receiver, cast_method, cast_line):
+                                    widening: bool = cast_method == "usize" or cast_method == "u64"
+                                    if widening:
+                                        receiver_range: (kind: i64, lo: i64, hi: i64) = return_expr_range(cast_receiver, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, req_names, req_lo, req_hi, enable_smt, depth + 1)
+                                        (1, receiver_range.lo, receiver_range.hi) return if receiver_range.kind == 1 and receiver_range.lo >= 0
+                                _:
+                                    pass
+                        called: sview = return_callee_tail_name(callee)
+                        (0, 0, 0) return if called == ""
+                        fn_probe: mutable usize = 0
+                        fn_slot: mutable i64 = -1
+                        while fn_probe < rr_fn_names.count |fn_probe, fn_slot, called, rr_fn_names|:
+                            fn_slot <- fn_probe.i64() if rr_fn_names[fn_probe] == called and fn_slot < 0
+                            fn_probe <- fn_probe + 1
+                        (0, 0, 0) return if fn_slot < 0
+                        return (1, rr_fn_lo[fn_slot.usize()], rr_fn_hi[fn_slot.usize()])
+                    # INDEXING a container whose ELEMENT type is refined yields the
+                    # element window (`xs[i]` with `darray[u32 is UB[0, 127]]`).
+                    Expr.Index(container, index_argument, container_line):
+                        container_name: sview = ident_name_of(container)
+                        (0, 0, 0) return if container_name == ""
+                        for parameter in parameters |container_name, law_names, law_predicates, ret_alias_names, ret_alias_bases|:
+                            continue if parameter.name != container_name
+                            element: Ast::Expr = container_element_annotation(parameter.type_expression)
+                            element_window: (found: bool, lo: i64, hi: i64) = param_refinement_window(element, law_names, law_predicates, ret_alias_names, ret_alias_bases)
+                            (1, element_window.lo, element_window.hi) return if element_window.found
+                            return (0, 0, 0)
+                        return (0, 0, 0)
+                    # A struct FIELD access takes its window from the field's refined
+                    # annotation (`d.sdst` with `sdst: mutable u32 is UB[0, 127]`).
+                    Expr.Field(object, field, field_line):
+                        base: sview = ident_name_of(object)
+                        (0, 0, 0) return if base == ""
+                        for parameter in parameters |base, field, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types|:
+                            continue if parameter.name != base
+                            struct_name: sview = erasure_base_type_name(parameter.type_expression)
+                            member: (found: bool, annotation: Ast::Expr) = struct_field_annotation(struct_name, field, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types)
+                            (0, 0, 0) return if not member.found
+                            field_window: (found: bool, lo: i64, hi: i64) = param_refinement_window(field_annotation_base(member.annotation), law_names, law_predicates, ret_alias_names, ret_alias_bases)
+                            (1, field_window.lo, field_window.hi) return if field_window.found
+                            return (0, 0, 0)
+                        return (0, 0, 0)
+                    Expr.If(condition, then_expression, else_expression, if_line):
+                        # A ternary `a if cond else b` is the UNION of its branch ranges: the
+                        # result is one of them, so [min lo, max hi]. Both must be bounded.
+                        then_range: (kind: i64, lo: i64, hi: i64) = return_expr_range(then_expression, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, req_names, req_lo, req_hi, enable_smt, depth + 1)
+                        else_range: (kind: i64, lo: i64, hi: i64) = return_expr_range(else_expression, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, req_names, req_lo, req_hi, enable_smt, depth + 1)
+                        u_lo: i64 = then_range.lo if then_range.lo < else_range.lo else else_range.lo
+                        u_hi: i64 = then_range.hi if then_range.hi > else_range.hi else else_range.hi
+                        (1, u_lo, u_hi) return if then_range.kind == 1 and else_range.kind == 1
+                        return (0, 0, 0)
+                    _:
+                        return (0, 0, 0)
+
+
+        # Carry top-level locals `r = <expr>` with a computable bounded range into req_names,
+        # so a later `return r` (or refined-arg call) against a refined type is judged. Kept
+        # in its own function so its scratch range does not overlap the caller's req-building
+        # containers (region stack budget). Excludes `<-`-reassigned / address-taken locals.
+        def collect_carried_locals(body: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl], law_names: darray[sview]&, law_predicates: darray[Ast::Expr]&, ret_alias_names: darray[sview]&, ret_alias_bases: darray[Ast::Expr]&, rr_struct_names: darray[sview]&, rr_field_starts: darray[usize]&, rr_field_counts: darray[usize]&, rr_field_names: darray[sview]&, rr_field_types: darray[Ast::Expr]&, rr_fn_names: darray[sview]&, rr_fn_lo: darray[i64]&, rr_fn_hi: darray[i64]&, enable_smt: bool, req_names: mutable darray[sview]&, req_lo: mutable darray[i64]&, req_hi: mutable darray[i64]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body |req_names, req_lo, req_hi|:
+                    match statement:
+                        Stmt.VarDecl(carry_name, carry_type, carry_value, carry_line):
+                            carry_range: (kind: i64, lo: i64, hi: i64) = return_expr_range(carry_value, parameters, law_names, law_predicates, ret_alias_names, ret_alias_bases, rr_struct_names, rr_field_starts, rr_field_counts, rr_field_names, rr_field_types, rr_fn_names, rr_fn_lo, rr_fn_hi, req_names, req_lo, req_hi, enable_smt, 0)
+                            if carry_range.kind == 1 and not body_reassigns(body, carry_name):
+                                req_names.push(carry_name)
+                                req_lo.push(carry_range.lo)
+                                req_hi.push(carry_range.hi)
+                        _:
+                            pass
+
+        # Whether PARAM `name` has a signed-integer declared type (through &/mutable).
+        def refret_param_is_signed(parameters: darray[Ast::ParamDecl], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for parameter in parameters |name|:
+                    continue if parameter.name != name
+                    return si_is_signed_int_name(bare_type_name_through_ref(parameter.type_expression))
+                return false
+
+        # `subject >= K` -> (true, K); `subject > K` -> (true, K+1); recurse through `and`/paren.
+        def refret_lower_from_predicate(predicate: Ast::Expr, subject: sview) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        return refret_lower_from_predicate(inner, subject)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            left_fact: (found: bool, value: i64) = refret_lower_from_predicate(left, subject)
+                            left_fact return if left_fact.found
+                            return refret_lower_from_predicate(right, subject)
+                        (false, 0) return if ident_name_of(left) != subject
+                        bound_literal: (found: bool, value: i64) = signed_int_literal(right)
+                        (false, 0) return if not bound_literal.found
+                        (true, bound_literal.value) return if operator == TokenKind.GtEq
+                        (true, bound_literal.value + 1) return if operator == TokenKind.Gt
+                        return (false, 0)
+                    _:
+                        return (false, 0)
+
+        # The tightest lower-bound fact `subject >= K` from a `requires`/`assert` contract in
+        # BODY (the block that holds the return). found=false when no lower bound is stated.
+        def refret_lower_fact(body: darray[Ast::Stmt], subject: sview) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                best_found: mutable bool = false
+                best_value: mutable i64 = 0
+                for statement in body |best_found, best_value, subject|:
+                    match statement:
+                        Stmt.Contract(kind, expression, line):
+                            continue if kind != "requires" and kind != "assert"
+                            candidate: (found: bool, value: i64) = refret_lower_from_predicate(expression, subject)
+                            if candidate.found and (not best_found or candidate.value > best_value):
+                                best_found <- true
+                                best_value <- candidate.value
+                        _:
+                            pass
+                return (best_found, best_value)

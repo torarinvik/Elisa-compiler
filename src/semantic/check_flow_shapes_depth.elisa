@@ -1,0 +1,294 @@
+# Stage1 semantic — mutation shape, nesting depth, and the shapes walk (`extend Semantic:
+# private:`). Covers fallthrough mutations across branches, probe/statement depth, double
+# self-advance, and `flow_shapes_walk` itself. Continues
+# check_flow_shapes_progress.elisa; split out to keep each part under 600 lines.
+
+extend Semantic:
+    private:
+        # Whether a block's last statement unconditionally diverts control (return/break/continue).
+        def flow_body_ends_in_exit(body: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic:
+                false return if body.count == 0
+                match body[body.count - 1]:
+                    Stmt.Return(value, line):
+                        return true
+                    Stmt.Break(label, line):
+                        return true
+                    Stmt.Continue(label, line):
+                        return true
+                    _:
+                        return false
+
+        # Whether NAME is assigned anywhere in a statement list (any depth).
+        def flow_body_assigns_name(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            true return if target_root_ident(target) == name
+                        Stmt.If(condition, then_body, else_body, line):
+                            true return if flow_body_assigns_name(then_body, name)
+                            true return if flow_body_assigns_name(else_body, name)
+                        Stmt.While(condition, body, line):
+                            true return if flow_body_assigns_name(body, name)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            true return if flow_body_assigns_name(body, name)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            true return if flow_body_assigns_name(body, name)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                true return if flow_body_assigns_name(arm.body, name)
+                        _:
+                            pass
+                return false
+
+        # An arm body mutates NAME and falls through (does not end in an exit).
+        def flow_arm_mutates_and_falls_through(body: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if flow_body_ends_in_exit(body)
+                return flow_body_assigns_name(body, name)
+
+        # Whether any arm of an if/elif/else chain mutates NAME and falls through. The elif chain
+        # is `else_body == [If]`; each nested then is an arm, the final else is the tail arm.
+        def flow_if_has_fallthrough_mutation(then_body: darray[Ast::Stmt], else_body: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if flow_arm_mutates_and_falls_through(then_body, name)
+                scan_else: mutable darray[Ast::Stmt] = []
+                scan_else.extend(else_body)
+                while scanning |scanning: bool = true, scan_else|:
+                    scanning <- false
+                    if scan_else.count == 1:
+                        match scan_else[0]:
+                            Stmt.If(elif_condition, elif_then, elif_else, elif_line):
+                                true return if flow_arm_mutates_and_falls_through(elif_then, name)
+                                next_else: mutable darray[Ast::Stmt] = []
+                                next_else.extend(elif_else)
+                                scan_else <- next_else
+                                scanning <- true
+                            _:
+                                pass
+                return flow_arm_mutates_and_falls_through(scan_else, name)
+
+        # R6: count top-level sequential branches that conditionally mutate NAME and fall through.
+        def flow_sequential_branch_mutations(loop_body: darray[Ast::Stmt], name: sview) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                count: mutable usize = 0
+                for statement in loop_body |count|:
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, line):
+                            count <- count + 1 if flow_if_has_fallthrough_mutation(then_body, else_body, name)
+                        _:
+                            pass
+                return count
+
+        def flow_single_mutation_check(loop_body: darray[Ast::Stmt], carried: darray[sview], loop_line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for capture in carried |table| -> table:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowSingleMutation, name: capture, line: loop_line, expected: "", actual: ""}) if flow_sequential_branch_mutations(loop_body, capture) >= 2
+
+        # The probed value of an `X is PATTERN` condition (ident_name_of(X)), or "" if the
+        # condition is not an is-probe.
+        def flow_probe_value(condition: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, paren_line):
+                        return flow_probe_value(inner)
+                    Expr.Binary(left, operator, right, binary_line):
+                        return ident_name_of(left) if operator == TokenKind.Is else sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        # Collect the bare-identifier binding names introduced by an `is`-pattern RHS
+        # (`Foo(a, Bar(b))` binds a, b); literals/wildcards bind nothing.
+        def flow_collect_is_binds(pattern: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Expr.Ident(name, line):
+                        out.push(name) if name != "_" and name != ""
+                    Expr.Paren(inner, paren_line):
+                        flow_collect_is_binds(inner, out)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        for argument in arguments |out|:
+                            flow_collect_is_binds(argument, out)
+                    Expr.Construct(type_expression, fields, construct_line):
+                        for field in fields |out|:
+                            flow_collect_is_binds(field.value, out)
+                    _:
+                        pass
+
+        # Nested-is-probe depth of an if whose condition is `X is PATTERN`: 1 + the deepest
+        # nested `if Y is PATTERN2:` in its then-body where Y is a name the outer pattern bound.
+        def flow_probe_depth(condition: Ast::Expr, then_body: darray[Ast::Stmt], head_line: u32, member_lines: mutable darray[u32]&) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                0 return if flow_probe_value(condition) == ""
+                member_lines.push(head_line)
+                binds: mutable darray[sview] = []
+                match condition:
+                    Expr.Binary(left, operator, right, binary_line):
+                        flow_collect_is_binds(right, binds)
+                    _:
+                        pass
+                best: mutable usize = 0
+                for statement in then_body |best, member_lines|:
+                    match statement:
+                        Stmt.If(inner_condition, inner_then, inner_else, inner_line):
+                            inner_probed: sview = flow_probe_value(inner_condition)
+                            if inner_probed != "" and (any bind in binds where bind == inner_probed):
+                                d: usize = flow_probe_depth(inner_condition, inner_then, inner_line, member_lines)
+                                best <- d if d > best
+                        _:
+                            pass
+                return 1 + best
+
+        # Maximum conditional-nesting depth of a statement list. An if-chain/`match` collapses to
+        # one level plus its deepest body; block wrappers and `if true:` are transparent; nested
+        # loops reset to 0.
+        def flow_block_depth(statements: darray[Ast::Stmt]) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                deepest: mutable usize = 0
+                for statement in statements |deepest|:
+                    d: usize = flow_stmt_depth(statement)
+                    deepest <- d if d > deepest
+                return deepest
+
+        def flow_stmt_depth(statement: Ast::Stmt) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.If(condition, then_body, else_body, line):
+                        if flow_is_const_true(condition):
+                            then_depth: usize = flow_block_depth(then_body)
+                            else_depth: usize = flow_block_depth(else_body)
+                            return then_depth if then_depth > else_depth else else_depth
+                        inner: mutable usize = flow_block_depth(then_body)
+                        current_else: mutable darray[Ast::Stmt] = []
+                        current_else.extend(else_body)
+                        while continuing |continuing: bool = true, inner, current_else|:
+                            continuing <- false
+                            if current_else.count == 1:
+                                match current_else[0]:
+                                    Stmt.If(chain_condition, chain_then, chain_else, chain_line):
+                                        chain_then_depth: usize = flow_block_depth(chain_then)
+                                        inner <- chain_then_depth if chain_then_depth > inner
+                                        chain_else_copy: mutable darray[Ast::Stmt] = []
+                                        chain_else_copy.extend(chain_else)
+                                        current_else <- chain_else_copy
+                                        continuing <- true
+                                    _:
+                                        pass
+                        tail_depth: usize = flow_block_depth(current_else)
+                        inner <- tail_depth if tail_depth > inner
+                        return 1 + inner
+                    Stmt.Match(scrutinee, arms, line):
+                        deepest_arm: mutable usize = 0
+                        for arm in arms |deepest_arm|:
+                            d: usize = flow_block_depth(arm.body)
+                            deepest_arm <- d if d > deepest_arm
+                        return deepest_arm
+                    Stmt.Block(kind, clause, binding, body, line):
+                        return flow_block_depth(body)
+                    Stmt.Expr(expression, line):
+                        # A scoped-loop header desugars to `Stmt.Expr(Expr.Block([decls, loop]))`;
+                        # the value-block wrapper is transparent to nesting.
+                        match expression:
+                            Expr.Block(block_statements, value, captures, block_line):
+                                return flow_block_depth(block_statements)
+                            _:
+                                return 0
+                    _:
+                        return 0
+
+        # A self-advance statement `v <- v.method()` — (var, method, line), else ("","",0).
+        def flow_self_advance(statement: Ast::Stmt) -> (var: sview, method: sview, line: u32):
+            can Memory.Allocate, Abort.Panic:
+                if statement is Stmt.Assign(target, operator, value, assign_line):
+                    if operator == TokenKind.LArrow and target is Expr.Ident(target_name, target_line):
+                        if value is Expr.Call(callee, arguments, argument_names, call_line):
+                            if callee is Expr.Field(receiver, method_name, field_line):
+                                (target_name, method_name, assign_line) return if ident_name_of(receiver) == target_name and target_name != ""
+                return (sview("", 0, 0), sview("", 0, 0), 0)
+
+        # Flag two ADJACENT identical self-advances (`v <- v.m(); v <- v.m()`) in a statement list —
+        # a double-skip with no guard between. Recurses if/else branch bodies (each its own list).
+        def flow_double_advance(statements: darray[Ast::Stmt], seen: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while index + 1 < statements.count |index: usize = 0, table|:
+                    first: (var: sview, method: sview, line: u32) = flow_self_advance(statements[index])
+                    second: (var: sview, method: sview, line: u32) = flow_self_advance(statements[index + 1])
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowCursorDoubleAdvance, name: first.var, line: second.line, expected: "", actual: first.method}) if first.var != "" and first.var == second.var and first.method == second.method
+                    index <- index + 1
+                for statement in statements |seen, table| -> table:
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- flow_double_advance(then_body, seen, table)
+                            table <- flow_double_advance(else_body, seen, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            table <- flow_double_advance(body, seen, table)
+                        _:
+                            pass
+
+        def flow_shapes_walk(statements: darray[Ast::Stmt], in_complex_flow: bool, seen: mutable darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |seen, table| -> table:
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, line):
+                            if not in_complex_flow and not flow_line_seen(seen, line):
+                                member_lines: mutable darray[u32] = []
+                                chain: (length: usize, scrutinee: sview) = flow_elif_chain(condition, else_body, line, member_lines, table)
+                                for member_line in member_lines |seen|:
+                                    seen.push(member_line)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowElifLadder, name: chain.scrutinee, line: line, expected: "", actual: "", expected_count: chain.length.u32()}) if chain.length >= 3
+                                probe_lines: mutable darray[u32] = []
+                                probe_depth: usize = flow_probe_depth(condition, then_body, line, probe_lines)
+                                for probe_line in probe_lines |seen|:
+                                    seen.push(probe_line)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowRetestLadder, name: "", line: line, expected: "", actual: "", expected_count: probe_depth.u32()}) if probe_depth >= 3
+                            table <- flow_shapes_walk(then_body, in_complex_flow, seen, table)
+                            table <- flow_shapes_walk(else_body, in_complex_flow, seen, table)
+                        Stmt.While(condition, body, line):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowNestingDepth, name: "", line: line, expected: "", actual: ""}) if not in_complex_flow and flow_block_depth(body) > 3
+                            table <- flow_exit_budget_check(body, line, table) if not in_complex_flow
+                            table <- flow_double_advance(body, seen, table) if not in_complex_flow
+                            table <- flow_shapes_walk(body, in_complex_flow, seen, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.FlowNestingDepth, name: "", line: line, expected: "", actual: ""}) if not in_complex_flow and flow_block_depth(body) > 3
+                            table <- flow_exit_budget_check(body, line, table) if not in_complex_flow
+                            table <- flow_double_advance(body, seen, table) if not in_complex_flow
+                            table <- flow_shapes_walk(body, in_complex_flow, seen, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            block_complex_flow: bool = in_complex_flow or (kind == "can" and flow_clause_grants_complex_flow(clause))
+                            table <- flow_shapes_walk(body, block_complex_flow, seen, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |seen, table| -> table:
+                                table <- flow_shapes_walk(arm.body, in_complex_flow, seen, table)
+                        Stmt.Expr(expression, line):
+                            # Descend into a scoped-loop header wrapper `Stmt.Expr(Expr.Block([...]))`
+                            # so the loop/ladders inside a value block are still checked, and run the
+                            # state-flag check over the loop body using the header captures.
+                            match expression:
+                                Expr.Block(block_statements, value, captures, block_line):
+                                    # Loop-carried names = bare captures PLUS accumulator decls
+                                    # (`|acc = init|` desugars to a VarDecl before the loop).
+                                    carried_names: mutable darray[sview] = []
+                                    carried_names.extend(captures)
+                                    for block_statement in block_statements |carried_names|:
+                                        match block_statement:
+                                            Stmt.VarDecl(decl_name, decl_type, decl_value, decl_line):
+                                                carried_names.push(decl_name)
+                                            _:
+                                                pass
+                                    for block_statement in block_statements |table| -> table:
+                                        match block_statement:
+                                            Stmt.While(loop_condition, loop_body, loop_line):
+                                                table <- flow_state_flag_check(loop_body, carried_names, loop_line, table) if not in_complex_flow
+                                                table <- flow_single_mutation_check(loop_body, carried_names, loop_line, table) if not in_complex_flow
+                                                table <- flow_progress_check(loop_body, carried_names, table) if not in_complex_flow
+                                            Stmt.For(loop_bind, loop_variables, loop_iterable, loop_body, loop_line):
+                                                table <- flow_state_flag_check(loop_body, carried_names, loop_line, table) if not in_complex_flow
+                                                table <- flow_single_mutation_check(loop_body, carried_names, loop_line, table) if not in_complex_flow
+                                            _:
+                                                pass
+                                    table <- flow_shapes_walk(block_statements, in_complex_flow, seen, table)
+                                _:
+                                    pass
+                        _:
+                            pass

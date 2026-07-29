@@ -1,0 +1,346 @@
+# Stage1 semantic — body-shape heuristics over locals (`extend Semantic: private:`).
+# Whether a local is wholly reassigned, escapes to a call, is only ever incremented, and
+# the parameter-upper-bound and boolean-literal return rules built on those facts.
+# Continues check_ensure_strict_proven.elisa; split out to keep each part file under
+# 600 lines.
+
+extend Semantic:
+    private:
+        # Bare-parameter return names anywhere in a body (`return a`).
+        def es_collect_param_returns(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                name: sview = ident_name_of(returned)
+                                out.push(name) if name != ""
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            es_collect_param_returns(then_body, out)
+                            es_collect_param_returns(else_body, out)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            es_collect_param_returns(block_body, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |out|:
+                                es_collect_param_returns(arm.body, out)
+                        _:
+                            pass
+
+        # Split a predicate on `and` into its conjuncts.
+        def es_and_conjuncts(predicate: Ast::Expr, out: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match predicate:
+                    Expr.Paren(inner, paren_line):
+                        es_and_conjuncts(inner, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.And:
+                            es_and_conjuncts(left, out)
+                            es_and_conjuncts(right, out)
+                        else:
+                            out.push(predicate)
+                    _:
+                        out.push(predicate)
+
+        # A branchy `ensure result.M(X) and ...` whose conjunct `result.M(P)` becomes the
+        # REFLEXIVE obligation `P.M(P)` in the branch `return P` — unprovable for a bare method
+        # relation unless some protocol law establishes M's reflexivity. No law over M in scope
+        # → stage0 cannot discharge it and reports the ensure unproven.
+        def es_reflexive_obligation_unproven(ensure_expression: Ast::Expr, body: darray[Ast::Stmt], law_spans: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                returns: mutable darray[sview] = []
+                es_collect_param_returns(body, returns)
+                (false) return if returns.count == 0
+                conjuncts: mutable darray[Ast::Expr] = []
+                es_and_conjuncts(ensure_expression, conjuncts)
+                for conjunct in conjuncts |returns, law_spans|:
+                    relation: (found: bool, recv: sview, method: sview, arg: Ast::Expr) = es_method_relation(conjunct)
+                    if relation.found and relation.recv == "result":
+                        arg_name: sview = ident_name_of(relation.arg)
+                        reflexive: bool = arg_name != "" and (any candidate in returns where candidate == arg_name)
+                        law_covers: bool = any law in law_spans where es_span_contains(law, relation.method)
+                        true return if reflexive and not law_covers
+                return false
+
+        # Whether the ensure GOAL is guaranteed by the protocol method whose result we return.
+        def es_protocol_ensure_matches(goal: Ast::Expr, return_expression: Ast::Expr, has_return: bool, body: darray[Ast::Stmt], pe_owners: darray[sview]&, pe_spans: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if not has_return
+                method: sview = es_return_method_name(return_expression, body)
+                false return if method == ""
+                index: mutable usize = 0
+                while index < pe_owners.count |index, method, goal, pe_owners, pe_spans|:
+                    true return if pe_owners[index] == method and es_goal_equals_span(goal, pe_spans[index])
+                    index <- index + 1
+                return false
+
+        # Whether the local `name` is WHOLLY reassigned (`name <- E`) anywhere in the body —
+        # which would invalidate a zeroed-then-field-written model of it.
+        def es_local_wholly_reassigned(body: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            true return if operator == TokenKind.LArrow and ident_name_of(target) == name
+                        _:
+                            pass
+                return false
+
+        # Whether EXPR (through `&`/parens) names the local — a call argument that could alias it.
+        def es_arg_references_local(expression: Ast::Expr, local: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return name == local
+                    Expr.Unary(operator, operand, line):
+                        return es_arg_references_local(operand, local)
+                    Expr.Paren(inner, line):
+                        return es_arg_references_local(inner, local)
+                    _:
+                        return false
+
+        # Whether EXPRESSION contains a call that passes `local` (or `&local`) as an argument —
+        # the callee may mutate its fields through the reference, invalidating field tracking.
+        def es_expr_passes_local_to_call(expression: Ast::Expr, local: sview, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 40
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        for argument in arguments |local|:
+                            true return if es_arg_references_local(argument, local)
+                        for argument in arguments |local, depth|:
+                            true return if es_expr_passes_local_to_call(argument, local, depth + 1)
+                        return es_expr_passes_local_to_call(callee, local, depth + 1)
+                    Expr.Binary(left, operator, right, line):
+                        return es_expr_passes_local_to_call(left, local, depth + 1) or es_expr_passes_local_to_call(right, local, depth + 1)
+                    Expr.Unary(operator, operand, line):
+                        return es_expr_passes_local_to_call(operand, local, depth + 1)
+                    Expr.Paren(inner, line):
+                        return es_expr_passes_local_to_call(inner, local, depth + 1)
+                    Expr.Field(object, field, line):
+                        return es_expr_passes_local_to_call(object, local, depth + 1)
+                    Expr.Index(object, index, line):
+                        return es_expr_passes_local_to_call(object, local, depth + 1) or es_expr_passes_local_to_call(index, local, depth + 1)
+                    _:
+                        return false
+
+        # Whether the body passes `local` to any call — a conservative escape check.
+        def es_local_escapes_to_call(body: darray[Ast::Stmt], local: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            true return if es_expr_passes_local_to_call(expression, local, 0)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            true return if es_expr_passes_local_to_call(value, local, 0)
+                        Stmt.Assign(target, operator, value, line):
+                            true return if es_expr_passes_local_to_call(value, local, 0)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                true return if es_expr_passes_local_to_call(returned, local, 0)
+                        _:
+                            pass
+                return false
+
+        # The non-negative integer literal an expression is, else not-found.
+        def es_nonneg_literal(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.IntLit(literal_value):
+                        return literal_value >= 0
+                    _:
+                        return false
+
+        # Whether a `<- ` value is an increment of `name` by a non-negative constant (`name + c`).
+        def es_is_increment_value(value: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Binary(add_left, add_op, add_right, add_line):
+                        return add_op == TokenKind.Plus and ident_name_of(add_left) == name and es_nonneg_literal(add_right)
+                    _:
+                        return false
+
+        # Whether every write to `name` in the body (at any depth) is an increment `name <- name + c`
+        # with c a NON-NEGATIVE constant — so the value can only grow, never a provable upper bound.
+        def es_all_writes_are_increment(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Assign(target, operator, value, assign_line):
+                            if ident_name_of(target) == name:
+                                false return if operator == TokenKind.LArrow and not es_is_increment_value(value, name)
+                                false return if operator == TokenKind.PlusEq and not es_nonneg_literal(value)
+                                false return if operator != TokenKind.LArrow and operator != TokenKind.PlusEq
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            false return if not es_all_writes_are_increment(then_body, name)
+                            false return if not es_all_writes_are_increment(else_body, name)
+                        Stmt.While(condition, while_body, while_line):
+                            false return if not es_all_writes_are_increment(while_body, name)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            false return if not es_all_writes_are_increment(block_body, name)
+                        _:
+                            pass
+                return true
+
+        # Whether a `requires` clause bounds `name` ABOVE (`name <= M` / `name < M`).
+        def es_requires_bounds_above(requires_predicates: darray[Ast::Expr]&, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for predicate in requires_predicates:
+                    match predicate:
+                        Expr.Binary(left, operator, right, binary_line):
+                            true return if (operator == TokenKind.LtEq or operator == TokenKind.Lt) and ident_name_of(left) == name
+                            true return if (operator == TokenKind.GtEq or operator == TokenKind.Gt) and ident_name_of(right) == name
+                        _:
+                            pass
+                return false
+
+        # `ensure result <= K` (K an integer literal) whose returned value is a bare parameter that is
+        # unconstrained above (no `requires` upper bound) and only ever incremented: the value can
+        # exceed K, so the postcondition is not provable. Sound — an increment-only body (or none)
+        # never caps the parameter, and any non-increment write declines.
+        def es_param_upper_unprovable(goal: Ast::Expr, returned_name: sview, body: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl], requires_predicates: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if returned_name == ""
+                false return if not (any parameter in parameters where parameter.name == returned_name)
+                match goal:
+                    Expr.Binary(left, operator, right, binary_line):
+                        false return if operator != TokenKind.LtEq or ident_name_of(left) != "result"
+                        right_is_literal: bool = match right:
+                            Expr.IntLit(bound_value): true
+                            _: false
+                        false return if not right_is_literal
+                        false return if es_requires_bounds_above(requires_predicates, returned_name)
+                        return es_all_writes_are_increment(body, returned_name)
+                    _:
+                        return false
+
+        # The max representable value of a fixed-width UNSIGNED type, else 0 (unknown/too-wide).
+        def es_uint_type_max(type_name: sview) -> i64:
+            can Abort.Panic:
+                255 return if type_name == "u8"
+                65535 return if type_name == "u16"
+                return 0
+
+        # The FULL inclusive maximum of an unsigned type, when it is representable in i64.
+        # u64/usize maxima overflow i64, so they report known=false (the additive-no-overflow
+        # proof then conservatively declines). Used to confirm a sum CANNOT wrap.
+        def es_uint_full_max(type_name: sview) -> (known: bool, value: i64):
+            can Abort.Panic:
+                (true, 255) return if type_name == "u8"
+                (true, 65535) return if type_name == "u16"
+                (true, 4294967295) return if type_name == "u32"
+                return (false, 0)
+
+        # The declared bare type-name of a parameter, else "".
+        def es_param_bare_type(name: sview, parameters: darray[Ast::ParamDecl]) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                for parameter in parameters:
+                    if parameter.name == name:
+                        base: mutable Ast::Expr = parameter.type_expression
+                        if parameter.type_expression is Expr.Refinement(refined_base, refined_predicate, refinement_line):
+                            base <- refined_base
+                        return bare_type_name(base)
+                return sview("", 0, 0)
+
+        # The tightest known inclusive upper bound of an int param: its requires-derived `hi`
+        # if present, else the type's full unsigned maximum. Reports found=false when neither
+        # is available (an unbounded, non-representable variable).
+        def es_param_upper(name: sview, parameters: darray[Ast::ParamDecl], int_params: darray[sview]&, has_hi: darray[bool]&, hi: darray[i64]&) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                slot: mutable i64 = -1
+                probe: mutable usize = 0
+                while probe < int_params.count |slot, probe, name, int_params|:
+                    slot <- probe.i64() if int_params[probe] == name and slot < 0
+                    probe <- probe + 1
+                (true, hi[slot.usize()]) return if slot >= 0 and has_hi[slot.usize()]
+                full: (known: bool, value: i64) = es_uint_full_max(es_param_bare_type(name, parameters))
+                return (full.known, full.value)
+
+        # The constant truth value of `A op A` (self-comparison): reflexive comparisons
+        # (==, <=, >=) are TRUE; strict/inequality ones (<, >, !=) are FALSE.
+        def es_reflexive_const(operator: TokenKind) -> bool:
+            can Abort.Panic:
+                return operator == TokenKind.EqEq or operator == TokenKind.LtEq or operator == TokenKind.GtEq
+
+        # `SUM >= BASE` (or its flip) where SUM = BASE + EXTRA with BASE, EXTRA unsigned int
+        # params: always TRUE, because EXTRA >= 0 and — verified here — BASE + EXTRA cannot
+        # wrap (the sum of their upper bounds fits the shared unsigned type). Returns the
+        # names' roles: whether the shape holds.
+        def es_additive_ge_true(sum_expr: Ast::Expr, base_expr: Ast::Expr, parameters: darray[Ast::ParamDecl], int_params: darray[sview]&, has_lo: darray[bool]&, lo: darray[i64]&, has_hi: darray[bool]&, hi: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                base: sview = ident_name_of(base_expr)
+                false return if base == ""
+                extra: mutable sview = sview("", 0, 0)
+                match sum_expr:
+                    Expr.Binary(sl, so, sr, sll):
+                        if so == TokenKind.Plus:
+                            sln: sview = ident_name_of(sl)
+                            srn: sview = ident_name_of(sr)
+                            extra <- srn if sln == base and srn != ""
+                            extra <- sln if srn == base and sln != ""
+                    _:
+                        pass
+                false return if extra == "" or extra == base
+                # Both operands must be unsigned (EXTRA >= 0 gives the inequality; both bounded
+                # so the sum cannot overflow) and of the same representable unsigned type.
+                base_type: sview = es_param_bare_type(base, parameters)
+                extra_type: sview = es_param_bare_type(extra, parameters)
+                false return if base_type == "" or base_type != extra_type
+                false return if not ensure_unsigned_type_name(base_type)
+                base_max: (found: bool, value: i64) = es_param_upper(base, parameters, int_params, has_hi, hi)
+                extra_max: (found: bool, value: i64) = es_param_upper(extra, parameters, int_params, has_hi, hi)
+                false return if not base_max.found or not extra_max.found
+                full: (known: bool, value: i64) = es_uint_full_max(base_type)
+                false return if not full.known
+                # No wrap: sum of the maxima stays within the type. (Each max already <= full,
+                # so the addition below cannot overflow i64 for the representable types.)
+                return base_max.value + extra_max.value <= full.value
+
+        # Whether `ensure result == BOOLLIT` is discharged by the returned boolean expression
+        # evaluating to that same constant — a self-comparison's reflexive value, or an
+        # unsigned no-overflow `A + B >= A` (always true). Sound: the additive case is
+        # width-checked, the reflexive case is a pure structural identity.
+        def es_boollit_return_proven(goal: Ast::Expr, return_expression: Ast::Expr, has_return: bool, parameters: darray[Ast::ParamDecl], int_params: darray[sview]&, has_lo: darray[bool]&, lo: darray[i64]&, has_hi: darray[bool]&, hi: darray[i64]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if not has_return
+                expected: mutable bool = false
+                have_goal: mutable bool = false
+                match goal:
+                    Expr.Binary(gl, gop, gr, gll):
+                        if gop == TokenKind.EqEq:
+                            match gr:
+                                Expr.BoolLit(rv):
+                                    expected <- rv if ident_name_of(gl) == "result"
+                                    have_goal <- true if ident_name_of(gl) == "result"
+                                _:
+                                    pass
+                            match gl:
+                                Expr.BoolLit(lv):
+                                    expected <- lv if ident_name_of(gr) == "result"
+                                    have_goal <- true if ident_name_of(gr) == "result"
+                                _:
+                                    pass
+                    _:
+                        pass
+                false return if not have_goal
+                # Evaluate the returned boolean expression to a structural constant.
+                inner: mutable Ast::Expr = return_expression
+                match return_expression:
+                    Expr.Paren(pinner, pline):
+                        inner <- pinner
+                    _:
+                        pass
+                match inner:
+                    Expr.Binary(rl, rop, rr, rll):
+                        false return if not is_comparison_operator(rop)
+                        ln: sview = ident_name_of(rl)
+                        rn: sview = ident_name_of(rr)
+                        # Self-comparison `A op A`.
+                        if ln != "" and ln == rn:
+                            reflexive_value: bool = es_reflexive_const(rop)
+                            return reflexive_value == expected
+                        # `A + B >= A` (or the flip `A <= A + B`) — always true.
+                        expected return if rop == TokenKind.GtEq and es_additive_ge_true(rl, rr, parameters, int_params, has_lo, lo, has_hi, hi)
+                        expected return if rop == TokenKind.LtEq and es_additive_ge_true(rr, rl, parameters, int_params, has_lo, lo, has_hi, hi)
+                    _:
+                        pass
+                return false

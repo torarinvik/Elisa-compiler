@@ -1,0 +1,410 @@
+# Stage1 semantic — overflow and conditional-store rules (`extend Semantic: private:`).
+# Field and local increment maxima, additive-overflow ensures, recursive-match returns,
+# and the zeroed-field/conditional-store obligations. Continues
+# check_ensure_strict_locals.elisa; split out to keep each part file under 600 lines.
+
+extend Semantic:
+    private:
+        # The declared type name of a top-level local, else "".
+        def es_local_declared_type(body: darray[Ast::Stmt], local: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.VarDecl(decl_name, decl_type, decl_value, decl_line):
+                            bare_type_name(decl_type) return if decl_name == local
+                        _:
+                            pass
+                return sview("", 0, 0)
+
+        # The initializer parameter of a top-level local (`y: u8 = x` -> "x"), else "".
+        def es_local_init_ident(body: darray[Ast::Stmt], local: sview) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.VarDecl(decl_name, decl_type, decl_value, decl_line):
+                            ident_name_of(decl_value) return if decl_name == local
+                        _:
+                            pass
+                return sview("", 0, 0)
+
+        # `BASE.FIELD` decomposition of a field expression (BASE a bare ident), else not-ok.
+        def es_base_field(expression: Ast::Expr) -> (ok: bool, base: sview, field: sview):
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Field(object, field, field_line):
+                    base: sview = ident_name_of(object)
+                    (true, base, field) return if base != ""
+                return (false, sview("", 0, 0), sview("", 0, 0))
+
+        # The argument of an `old(EXPR)` call, else Absent.
+        def es_old_arg(expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(callee, arguments, argument_names, call_line):
+                    arguments[0] return if ident_name_of(callee) == "old" and arguments.count == 1
+                return (Ast::Expr.Absent)
+
+        # The largest constant added to `base.field` on any single path (`base.field += c` /
+        # `base.field <- base.field + c`), summing straight-line and maxing over if/else branches.
+        def es_field_increment_max(statements: darray[Ast::Stmt], base: sview, field: sview) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                total: mutable i64 = 0
+                branch_max: mutable i64 = 0
+                for statement in statements |total, branch_max, base, field|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, assign_line):
+                            target_bf: (ok: bool, base: sview, field: sview) = es_base_field(target)
+                            if target_bf.ok and target_bf.base == base and target_bf.field == field:
+                                total <- total + es_int_literal_value(value) if operator == TokenKind.PlusEq
+                                if operator == TokenKind.LArrow:
+                                    if value is Expr.Binary(add_left, add_op, add_right, add_line):
+                                        add_lhs: (ok: bool, base: sview, field: sview) = es_base_field(add_left)
+                                        total <- total + es_int_literal_value(add_right) if add_op == TokenKind.Plus and add_lhs.ok and add_lhs.base == base and add_lhs.field == field
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            then_increment: i64 = es_field_increment_max(then_body, base, field)
+                            else_increment: i64 = es_field_increment_max(else_body, base, field)
+                            branch_max <- then_increment if then_increment > branch_max
+                            branch_max <- else_increment if else_increment > branch_max
+                        _:
+                            pass
+                return total + branch_max
+
+        # `ensure ANTE => base.FIELD > old(base.FIELD) + C` whose body raises `base.FIELD` by at most C
+        # on any path: the consequent demands an increase STRICTLY greater than C, so on the antecedent
+        # path it fails — the postcondition is violated. Parser lowers `=>` to `(not ANTE) or CONSEQ`.
+        def es_field_implication_unproven(goal: Ast::Expr, body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if goal is Expr.Binary(goal_left, goal_operator, consequent, goal_line):
+                    if goal_operator == TokenKind.Or:
+                        antecedent_negated: bool = match goal_left:
+                            Expr.Unary(unary_operator, unary_operand, unary_line): unary_operator == TokenKind.Not
+                            _: false
+                        if antecedent_negated:
+                            if consequent is Expr.Binary(conseq_left, conseq_operator, conseq_right, conseq_line):
+                                if conseq_operator == TokenKind.Gt:
+                                    field_lhs: (ok: bool, base: sview, field: sview) = es_base_field(conseq_left)
+                                    if field_lhs.ok:
+                                        if conseq_right is Expr.Binary(right_left, right_operator, right_right, right_line):
+                                            if right_operator == TokenKind.Plus:
+                                                old_field: (ok: bool, base: sview, field: sview) = es_base_field(es_old_arg(right_left))
+                                                bound: i64 = es_int_literal_value(right_right)
+                                                es_field_increment_max(body, field_lhs.base, field_lhs.field) <= bound return if old_field.ok and old_field.base == field_lhs.base and old_field.field == field_lhs.field and bound > 0
+                return false
+
+        # The integer-literal value of an expression, else 0.
+        def es_int_literal_value(expression: Ast::Expr) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.IntLit(literal_value):
+                        return literal_value
+                    Expr.Paren(inner, paren_line):
+                        return es_int_literal_value(inner)
+                    _:
+                        return 0
+
+        # The constant addend of an `X <- X + c` increment value, else 0.
+        def es_increment_addend(value: Ast::Expr, local: sview) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                if value is Expr.Binary(add_left, add_op, add_right, add_line):
+                    return es_int_literal_value(add_right) if add_op == TokenKind.Plus and ident_name_of(add_left) == local else 0
+                return 0
+
+        # The largest constant added to `local` on any single path (`y += 100` / `y <- y + 100`),
+        # summing straight-line increments and taking the max over if/else branches.
+        def es_local_increment_max(statements: darray[Ast::Stmt], local: sview) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                total: mutable i64 = 0
+                branch_max: mutable i64 = 0
+                for statement in statements |total, branch_max, local|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, assign_line):
+                            if ident_name_of(target) == local:
+                                total <- total + es_int_literal_value(value) if operator == TokenKind.PlusEq
+                                total <- total + es_increment_addend(value, local) if operator == TokenKind.LArrow
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            then_increment: i64 = es_local_increment_max(then_body, local)
+                            else_increment: i64 = es_local_increment_max(else_body, local)
+                            branch_max <- then_increment if then_increment > branch_max
+                            branch_max <- else_increment if else_increment > branch_max
+                        _:
+                            pass
+                return total + branch_max
+
+        # The `requires`-imposed LOWER bound on `name` (`requires name >= L` / `name > L`), else absent.
+        def es_requires_lower_bound(requires_predicates: darray[Ast::Expr]&, name: sview) -> (found: bool, value: i64):
+            can Memory.Allocate, Abort.Panic:
+                for predicate in requires_predicates:
+                    match predicate:
+                        Expr.Binary(left, operator, right, binary_line):
+                            if ident_name_of(left) == name:
+                                right_literal: bool = match right:
+                                    Expr.IntLit(v): true
+                                    _: false
+                                if right_literal:
+                                    (true, es_int_literal_value(right)) return if operator == TokenKind.GtEq
+                                    (true, es_int_literal_value(right) + 1) return if operator == TokenKind.Gt
+                        _:
+                            pass
+                return (false, 0)
+
+        # `ensure result >= P` where the returned local is initialized to param P and then incremented
+        # by C on some path, and P's `requires` lower bound plus C OVERFLOWS the local's unsigned type:
+        # the wrapped value is < P, so the postcondition is violated. Sound — needs a fixed-width type,
+        # a literal increment, and a `requires` lower bound; anything else declines.
+        def es_overflow_ensure_unproven(goal: Ast::Expr, returned_name: sview, body: darray[Ast::Stmt], requires_predicates: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if returned_name == ""
+                match goal:
+                    Expr.Binary(left, operator, right, binary_line):
+                        false return if operator != TokenKind.GtEq or ident_name_of(left) != "result"
+                        param: sview = ident_name_of(right)
+                        false return if param == "" or es_local_init_ident(body, returned_name) != param
+                        type_max: i64 = es_uint_type_max(es_local_declared_type(body, returned_name))
+                        false return if type_max == 0
+                        increment: i64 = es_local_increment_max(body, returned_name)
+                        false return if increment <= 0
+                        lower: (found: bool, value: i64) = es_requires_lower_bound(requires_predicates, param)
+                        false return if not lower.found
+                        return lower.value + increment > type_max
+                    _:
+                        return false
+
+        # Whether the goal compares `result` against an integer literal (`result >= 1`, `result < K`) —
+        # a numeric obligation on the return value (not a trivially-true or structural goal).
+        def es_goal_result_vs_literal(goal: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if goal is Expr.Binary(left, operator, right, binary_line):
+                    if is_comparison_operator(operator) and ident_name_of(left) == "result":
+                        return match right:
+                            Expr.IntLit(literal_value): true
+                            _: false
+                return false
+
+        # Whether an expression contains a call to `function_name` (a recursive self-call).
+        def es_expr_calls(expression: Ast::Expr, function_name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        true return if ident_name_of(callee) == function_name
+                        return any argument in arguments where es_expr_calls(argument, function_name)
+                    Expr.Binary(left, operator, right, binary_line):
+                        return es_expr_calls(left, function_name) or es_expr_calls(right, function_name)
+                    Expr.Unary(operator, operand, unary_line):
+                        return es_expr_calls(operand, function_name)
+                    Expr.Paren(inner, paren_line):
+                        return es_expr_calls(inner, function_name)
+                    _:
+                        return false
+
+        # Whether a `match` arm returns an ARITHMETIC combination (a `Binary`/`Unary`) that contains a
+        # RECURSIVE call to the enclosing function (`size(l) + size(r) + 1`) — combining the callee's
+        # postcondition through arithmetic is an inductive obligation stage1 cannot discharge, nor can
+        # stage0. A BARE tail recursive call (`return size(c)`) is EXCLUDED: stage0 transfers the
+        # callee's own `ensure` to the result directly, so it stays provable.
+        def es_match_returns_recursive(body: darray[Ast::Stmt], function_name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms:
+                                for arm_statement in arm.body:
+                                    match arm_statement:
+                                        Stmt.Return(value, return_line):
+                                            if value is returned:
+                                                is_arithmetic: bool = match returned:
+                                                    Expr.Binary(bin_left, bin_op, bin_right, bin_line): true
+                                                    Expr.Unary(un_op, un_operand, un_line): true
+                                                    _: false
+                                                true return if is_arithmetic and es_expr_calls(returned, function_name)
+                                        _:
+                                            pass
+                        _:
+                            pass
+                return false
+
+        # `result >= P` with P a bare identifier (a parameter) — returns (ok, P).
+        def es_goal_result_ge_param(goal: Ast::Expr) -> (ok: bool, param: sview):
+            can Memory.Allocate, Abort.Panic:
+                if goal is Expr.Binary(left, operator, right, binary_line):
+                    if operator == TokenKind.GtEq and ident_name_of(left) == "result":
+                        param: sview = ident_name_of(right)
+                        return (param != "", param)
+                return (false, sview("", 0, 0))
+
+        # Whether an expression contains an addition `NAME + X` / `X + NAME` where X is not literal 0 —
+        # for an unbounded unsigned NAME this can overflow, wrapping BELOW NAME.
+        def es_expr_adds_param(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Binary(left, operator, right, binary_line):
+                        if operator == TokenKind.Plus:
+                            true return if ident_name_of(left) == name and not int_literal_is(right, 0)
+                            true return if ident_name_of(right) == name and not int_literal_is(left, 0)
+                        return es_expr_adds_param(left, name) or es_expr_adds_param(right, name)
+                    Expr.Paren(inner, paren_line):
+                        return es_expr_adds_param(inner, name)
+                    Expr.Unary(operator, operand, unary_line):
+                        return es_expr_adds_param(operand, name)
+                    _:
+                        return false
+
+        # Whether any return in the body (nested through if/block) adds to `name`.
+        def es_body_return_adds_param(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Return(value, return_line):
+                            true return if value is returned and es_expr_adds_param(returned, name)
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            true return if es_body_return_adds_param(then_body, name)
+                            true return if es_body_return_adds_param(else_body, name)
+                        Stmt.Block(block_kind, clause, binding, block_body, block_line):
+                            true return if es_body_return_adds_param(block_body, name)
+                        _:
+                            pass
+                return false
+
+        # Whether a `requires` upper-bounds an ADDITION involving `param` (`value + alignment <= MAX`) —
+        # an explicit anti-overflow guard that rules the wrap out.
+        def es_requires_bounds_additive(requires_predicates: darray[Ast::Expr]&, param: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for predicate in requires_predicates:
+                    match predicate:
+                        Expr.Binary(left, operator, right, binary_line):
+                            true return if (operator == TokenKind.LtEq or operator == TokenKind.Lt) and es_expr_adds_param(left, param)
+                        _:
+                            pass
+                return false
+
+        # `ensure result >= P` where P is an unbounded unsigned parameter and some return path adds to
+        # P (`value + alignment - 1`): the addition can overflow, wrapping the result below P, so the
+        # postcondition is not provable. Sound — an upper `requires` on P or on the sum rules the wrap
+        # out and declines.
+        def es_additive_overflow_ensure(goal: Ast::Expr, body: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl], requires_predicates: darray[Ast::Expr]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                ge: (ok: bool, param: sview) = es_goal_result_ge_param(goal)
+                false return if not ge.ok
+                is_unsigned: mutable bool = false
+                for parameter in parameters |is_unsigned|:
+                    is_unsigned <- ensure_unsigned_type_name(bare_type_name(parameter.type_expression)) if parameter.name == ge.param
+                false return if not is_unsigned
+                false return if es_requires_bounds_above(requires_predicates, ge.param)
+                false return if es_requires_bounds_additive(requires_predicates, ge.param)
+                return es_body_return_adds_param(body, ge.param)
+
+        # Whether the goal is `result >= 0` (the non-negativity postcondition).
+        def es_goal_is_result_nonneg(goal: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if goal is Expr.Binary(left, operator, right, binary_line):
+                    if operator == TokenKind.GtEq and ident_name_of(left) == "result":
+                        return match right:
+                            Expr.IntLit(literal_value): literal_value == 0
+                            _: false
+                return false
+
+        # Whether a `match` in the body returns, in some arm, a bare identifier that is NEITHER a
+        # function parameter NOR a top-level local NOR a literal — i.e. a pattern PAYLOAD binding whose
+        # value is unconstrained (an `enum`-payload field the prover cannot bound). Such a return
+        # cannot establish `ensure result >= 0`; stage0 (which also cannot unfold the payload) warns.
+        def es_match_returns_unconstrained_binding(body: darray[Ast::Stmt], param_names: darray[sview]&, local_names: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms:
+                                for arm_statement in arm.body:
+                                    match arm_statement:
+                                        Stmt.Return(value, return_line):
+                                            if value is returned:
+                                                returned_name: sview = ident_name_of(returned)
+                                                true return if returned_name != "" and not name_in(param_names, returned_name) and not name_in(local_names, returned_name)
+                                        _:
+                                            pass
+                        _:
+                            pass
+                return false
+
+        # Whether `local.field` is assigned anywhere inside a NESTED block (an `if`/`while` body),
+        # i.e. only conditionally. Scans one level of if/while then/else/loop bodies.
+        def es_field_assigned_conditionally(body: darray[Ast::Stmt], local: sview, field: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            probe_then: mutable bool = false
+                            es_field_store_value(then_body, local, field, probe_then)
+                            true return if probe_then
+                            probe_else: mutable bool = false
+                            es_field_store_value(else_body, local, field, probe_else)
+                            true return if probe_else
+                        Stmt.While(condition, while_body, while_line):
+                            probe_while: mutable bool = false
+                            es_field_store_value(while_body, local, field, probe_while)
+                            true return if probe_while
+                        _:
+                            pass
+                return false
+
+        # A `zeroed`-init returned struct whose `ensure result.FIELD == RHS` (RHS not the zero value) is
+        # established ONLY by a conditional `out.FIELD <- RHS` (never unconditionally at the top level):
+        # the fall-through path leaves the field 0, so the postcondition is not provable. Sound — a
+        # top-level (unconditional) store is required to prove it, and is deliberately excluded here.
+        def es_zeroed_field_conditional_unproven(goal: Ast::Expr, returned_local: sview, returned_zeroed: bool, body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if returned_local == "" or not returned_zeroed
+                match goal:
+                    Expr.Binary(left, operator, right, binary_line):
+                        false return if operator != TokenKind.EqEq
+                        false return if int_literal_is(right, 0)
+                        match left:
+                            Expr.Field(object, field, field_line):
+                                false return if ident_name_of(object) != "result"
+                                top_found: mutable bool = false
+                                es_field_store_value(body, returned_local, field, top_found)
+                                false return if top_found
+                                return es_field_assigned_conditionally(body, returned_local, field)
+                            _:
+                                return false
+                    _:
+                        return false
+
+        # The value last stored into `local.field` by a straight-line `local.FIELD <- value`.
+        def es_field_store_value(body: darray[Ast::Stmt], local: sview, field: sview, found: mutable bool&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                stored: mutable Ast::Expr = Ast::Expr.Absent
+                for statement in body |stored, found, local, field|:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            if operator == TokenKind.LArrow:
+                                match target:
+                                    Expr.Field(object, target_field, field_line):
+                                        if ident_name_of(object) == local and target_field == field:
+                                            stored <- value
+                                            found <- true
+                                    _:
+                                        pass
+                        _:
+                            pass
+                return stored
+
+        # FIELD-STORE ensure: a function that returns a `zeroed`-initialised local struct with
+        # straight-line `out.FIELD <- v` writes proves `ensure result.FIELD == E` — the field's
+        # value is its last write (or 0 when unwritten, from `zeroed`). Sound because the body is
+        # straight-line (single_return, not branchy) and the local is not wholly reassigned.
+        def es_field_store_proves(goal: Ast::Expr, returned_local: sview, returned_zeroed: bool, body: darray[Ast::Stmt]) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if returned_local == "" or not returned_zeroed
+                false return if es_local_wholly_reassigned(body, returned_local)
+                false return if es_local_escapes_to_call(body, returned_local)
+                match goal:
+                    Expr.Binary(left, operator, right, binary_line):
+                        false return if operator != TokenKind.EqEq
+                        match left:
+                            Expr.Field(object, field, field_line):
+                                false return if ident_name_of(object) != "result"
+                                store_found: mutable bool = false
+                                store_value: Ast::Expr = es_field_store_value(body, returned_local, field, store_found)
+                                expressions_equal(store_value, right) return if store_found
+                                return int_literal_is(right, 0)
+                            _:
+                                return false
+                    _:
+                        return false
