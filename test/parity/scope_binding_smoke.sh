@@ -580,6 +580,54 @@ def main() -> i64:
 EOF
 )" 42
 
+# 23. `p == q` on two REFERENCES is ADDRESS IDENTITY (`arena == &perm_arena` asks whether
+#     this IS the permanent arena). A ref operand otherwise auto-dereferences, so the
+#     tempting reading is a pointee compare — this case pins the real one: two refs to
+#     DISTINCT variables holding the SAME value must compare unequal, and two refs to the
+#     same variable equal. A pointee compare returns 6, an address compare 40.
+differential ref_equality_is_address_identity "$(cat <<'EOF'
+def same(a: i64&, b: i64&) -> i64:
+    if a == b:
+        return 1
+    return 0
+
+
+def main() -> i64:
+    can Abort.Panic:
+        x: mutable i64 = 5
+        y: mutable i64 = 5
+        return same(&x, &x) * 40 + same(&x, &y) * 6 + 2
+EOF
+)" 42
+
+# 24. The same rule through a STRUCT ref against the address of a global — the runtime's
+#     `register_perm_string_len(...) if arena == &perm_arena` shape, which declined and
+#     took int_to_string_into with it. The mutating branch must fire for the global and
+#     NOT for the local, so an always-true or always-false compare is caught either way.
+differential ref_equality_struct_global "$(cat <<'EOF'
+struct Box:
+    n: mutable i64
+
+
+global mutable well_known: Box = zeroed
+
+
+def note(b: mutable Box&) -> void:
+    b.n <- b.n + 1
+
+
+def touch(b: mutable Box&) -> i64:
+    note(b) if b == &well_known
+    return b.n
+
+
+def main() -> i64:
+    can Abort.Panic:
+        other: mutable Box = Box{n: 5}
+        return touch(&well_known) * 10 + touch(&other)
+EOF
+)" 15
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
