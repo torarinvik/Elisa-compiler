@@ -280,6 +280,32 @@ def main() -> i64:
 EOF
 )" 40
 
+# 10. EARLY-RETURN narrowing. `X return if PATH == null` only falls through when the
+#     condition was FALSE, so PATH is non-null below it and may be taken as a plain ref.
+#     stage1 recorded narrowing for if-THEN arms only, so the guard shape the std region
+#     and fixed-buffer helpers all open with declined — DROPPING the function. Both a
+#     present and an absent buffer are passed, so a narrowing that is simply assumed
+#     (rather than proven by the guard) gives the wrong answer on the absent one.
+differential early_return_guard_narrowing "$(cat <<'EOF'
+struct Buf:
+    data: mutable u8&?
+
+
+def first_byte(b: Buf&) -> i64:
+    0 return if b.data == null
+    p: mutable u8& = b.data
+    return p.i64()
+
+
+def main() -> i64:
+    storage: mutable u8[4] = zeroed
+    storage[0] <- 9
+    b: mutable Buf = Buf{data: &storage[0]}
+    empty: mutable Buf = Buf{data: null}
+    return first_byte(b) * 10 + first_byte(empty)
+EOF
+)" 90
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
