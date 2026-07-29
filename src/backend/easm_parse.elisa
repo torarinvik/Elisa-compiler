@@ -1,0 +1,402 @@
+# Stage1 EASM — parsing an EASM module and reporting a project-level summary.
+# Part of `module Easm` (see easm_model.elisa); split out to keep each file short.
+
+extend Easm:
+    public:
+        def easm_expand_compositions[@r](module: mutable Module& @r) -> void:
+            expanded_functions: mutable darray[Function] @r = []
+            for function_index in 0..<module.functions.count |module, function_index, expanded_functions|:
+                original: Function = module.functions[function_index]
+                flags: mutable darray[sview] @r = []
+                for instruction in original.instructions:
+                    if not easm_starts(instruction.op, "compose"):
+                        continue
+                    info: ComposeInfo = easm_parse_compose(instruction.text)
+                    if info.flag == "":
+                        continue
+                    seen_flag: mutable bool = false
+                    for existing in flags:
+                        seen_flag <- true if easm_equal(existing, info.flag)
+                    if not seen_flag:
+                        flags.push(info.flag)
+                variant_count: i64 = 1 << flags.count.i64()
+                variant_batch: mutable darray[Function] @r = []
+                for variant_mask in 0..<variant_count |variant_mask, flags, module, original, expanded_functions|:
+                    variant: mutable Function = original
+                    merged_requires: mutable darray[sview] @r = []
+                    merged_clobbers: mutable darray[sview] @r = []
+                    merged_preserves: mutable darray[sview] @r = []
+                    for value in original.requires:
+                        merged_requires.push(value)
+                    for value in original.clobbers:
+                        merged_clobbers.push(value)
+                    for value in original.preserves:
+                        merged_preserves.push(value)
+                    expanded: mutable darray[Instruction] @r = []
+                    for instruction in original.instructions:
+                        if not easm_starts(instruction.op, "compose"):
+                            expanded.push(instruction)
+                            continue
+                        info: ComposeInfo = easm_parse_compose(instruction.text)
+                        active: mutable bool = true
+                        if info.flag != "":
+                            active <- false
+                            for flag_index in 0..<flags.count |flag_index, flags, info, variant_mask, active|:
+                                if easm_equal(flags[flag_index], info.flag) and (variant_mask & (1 << flag_index.i64())) != 0:
+                                    active <- true
+                        continue if not active
+                        found: mutable bool = false
+                        for fragment in module.fragments:
+                            if not easm_equal(fragment.name, info.name):
+                                continue
+                            found <- true
+                            if info.argument_count != fragment.params.count.i64():
+                                easm_issue(module, "fragment-arity", instruction.line, "compose argument count does not match fragment parameters")
+                                continue
+                            if fragment.params.count > 4:
+                                easm_issue(module, "compose-too-many-parameters", instruction.line, "stage1 supports at most four materialized fragment bindings per instruction")
+                            for fragment_instruction in fragment.instructions:
+                                materialized: mutable Instruction = fragment_instruction
+                                materialized.line <- instruction.line
+                                materialized.substitution_count <- fragment.params.count.i64() if fragment.params.count <= 4
+                                for parameter_index in 0..<fragment.params.count |parameter_index, fragment, materialized, instruction|:
+                                    span: ComposeSpan = easm_compose_span(instruction.text, parameter_index.i64())
+                                    binding: Substitution = Substitution{from: fragment.params[parameter_index].name, replacement: instruction.text[span.start:span.end]}
+                                    materialized.substitution0 <- binding if parameter_index == 0
+                                    materialized.substitution1 <- binding if parameter_index == 1
+                                    materialized.substitution2 <- binding if parameter_index == 2
+                                    materialized.substitution3 <- binding if parameter_index == 3
+                                expanded.push(materialized)
+                            for value in fragment.requires:
+                                merged_requires.push(value)
+                            for value in fragment.clobbers:
+                                merged_clobbers.push(value)
+                            for value in fragment.preserves:
+                                merged_preserves.push(value)
+                        if not found:
+                            easm_issue(module, "unknown-fragment", instruction.line, "compose references an unknown fragment")
+                    variant.instructions <- expanded
+                    variant.requires <- merged_requires
+                    variant.clobbers <- merged_clobbers
+                    variant.preserves <- merged_preserves
+                    if flags.count > 0:
+                        name_bytes: mutable darray[u8] @r = []
+                        for byte in original.name:
+                            name_bytes.push(byte)
+                        for flag_index in 0..<flags.count |flag_index, flags, variant_mask, name_bytes|:
+                            if (variant_mask & (1 << flag_index.i64())) != 0:
+                                easm_append_text(name_bytes, "__")
+                                easm_append_text(name_bytes, flags[flag_index])
+                        variant.name <- sview((&name_bytes[0]).cast[u8&], 0, name_bytes.count)
+                    variant_batch.push(variant)
+                easm_prune_conditional_inputs(variant_batch)
+                for variant in variant_batch:
+                    expanded_functions.push(variant)
+            module.functions <- expanded_functions
+
+        # Parse the EASM declaration and body surface. Verification and native assembly consume
+        # this lossless-enough model in later slices; keeping parsing separate makes malformed
+        # source reportable before any LLVM/native side effects occur.
+        def parse_layout_module(source: u8&, length: usize, path: sview) -> Module:
+            out: mutable Module = Module{path: path, name: "", target: "any", issues: [], functions: [], fragments: [], protocols: [], templates: [], layouts: []}
+            cursor: mutable usize = 0
+            line_number: mutable i64 = 0
+            active_layout: mutable i64 = -1
+            current_kind: mutable i64 = 0
+            current_index: mutable i64 = -1
+            section: mutable sview = ""
+            body_mode: mutable i64 = 0
+            active_target: mutable i64 = -1
+            while cursor < length |cursor, length, line_number, active_layout, current_kind, current_index, section, body_mode, active_target, out, source|:
+                line_start: usize = cursor
+                while cursor < length and source[cursor] != 10 |cursor, length, source|:
+                    cursor <- cursor + 1
+                line_view: mutable sview = source[line_start:cursor]
+                line_number <- line_number + 1
+                cursor <- cursor + 1 if cursor < length
+                line_view <- easm_trim(line_view)
+                continue if sview_len(line_view) == 0 or sview_at(line_view, 0) == 35
+                is_export: bool = easm_starts(line_view, "export def ")
+                is_fragment: bool = easm_starts(line_view, "fragment ")
+                is_protocol: bool = easm_starts(line_view, "protocol ")
+                is_template: bool = easm_starts(line_view, "template def ")
+                is_layout: bool = easm_starts(line_view, "layout ")
+                if easm_starts(line_view, "module "):
+                    out.name <- easm_trim(line_view[7:sview_len(line_view)])
+                    active_layout <- -1
+                    current_kind <- 0
+                    section <- ""
+                    body_mode <- 0
+                    active_target <- -1
+                    continue
+                if (current_kind == 1 or current_kind == 2) and easm_starts(line_view, "target "):
+                    target_tail: sview = easm_trim(line_view[7:sview_len(line_view)])
+                    lockstep_at: usize = easm_find(target_tail, " lockstep ")
+                    if lockstep_at < sview_len(target_tail) and current_kind == 1:
+                        arch: sview = easm_trim(target_tail[0:lockstep_at])
+                        ref_name: mutable sview = easm_trim(target_tail[lockstep_at + 10.usize():sview_len(target_tail)])
+                        if sview_len(ref_name) > 0 and sview_at(ref_name, sview_len(ref_name) - 1.usize()) == 58:
+                            ref_name <- easm_trim(ref_name[0:sview_len(ref_name) - 1.usize()])
+                        out.functions[current_index.usize()].targets.push(TargetBody{arch: arch, lockstep: ref_name, instructions: [], line: line_number})
+                        active_target <- out.functions[current_index.usize()].targets.count.i64() - 1
+                        body_mode <- 2
+                        section <- "body"
+                        continue
+                if easm_starts(line_view, "target "):
+                    out.target <- easm_trim(line_view[7:sview_len(line_view)])
+                    active_layout <- -1
+                    current_kind <- 0
+                    section <- ""
+                    body_mode <- 0
+                    active_target <- -1
+                    continue
+                if is_layout:
+                    header: sview = easm_trim(line_view[7:sview_len(line_view)])
+                    colon: mutable usize = sview_len(header)
+                    for index in 0..<sview_len(header) |colon, header|:
+                        colon <- index if sview_at(header, index) == 58
+                    name_end: usize = easm_first_space(header[0:colon])
+                    layout_name: sview = easm_trim(header[0:name_end])
+                    layout_size: mutable i64 = 0
+                    layout_stride: mutable i64 = 0
+                    attributes: sview = easm_trim(header[name_end:colon])
+                    if easm_starts(attributes, "size "):
+                        layout_size <- easm_parse_i64(easm_trim(attributes[5:sview_len(attributes)]))
+                    if easm_starts(attributes, "stride "):
+                        layout_stride <- easm_parse_i64(easm_trim(attributes[7:sview_len(attributes)]))
+                    out.layouts.push(Layout{name: layout_name, fields: [], size: layout_size, stride: layout_stride, line: line_number})
+                    active_layout <- out.layouts.count.i64() - 1
+                    current_kind <- 5
+                    section <- ""
+                    body_mode <- 0
+                    active_target <- -1
+                    continue
+                if active_layout >= 0:
+                    first_end: usize = easm_first_space(line_view)
+                    offset_text: sview = line_view[0:first_end]
+                    rest: sview = easm_trim(line_view[first_end:sview_len(line_view)])
+                    field_end: mutable usize = easm_first_space(rest)
+                    field_colon: usize = easm_find(rest[0:field_end + 1.usize()], ":")
+                    if field_colon < field_end + 1.usize():
+                        field_end <- field_colon
+                    field_name: sview = easm_trim(rest[0:field_end])
+                    type_start: mutable usize = field_end
+                    while type_start < sview_len(rest) and (sview_at(rest, type_start) == 32 or sview_at(rest, type_start) == 9 or sview_at(rest, type_start) == 58) |type_start, rest|:
+                        type_start <- type_start + 1
+                    type_end: usize = easm_first_space(rest[type_start:sview_len(rest)]) + type_start
+                    type_name: sview = rest[type_start:type_end]
+                    width: i64 = easm_type_width(type_name)
+                    requires_size: mutable i64 = 0
+                    guard: usize = easm_find(rest[type_end:sview_len(rest)], "requires size >= ")
+                    if guard < sview_len(rest[type_end:sview_len(rest)]):
+                        guard_start: usize = type_end + guard + sview_len("requires size >= ")
+                        requires_size <- easm_parse_i64(easm_trim(rest[guard_start:sview_len(rest)]))
+                    valid_offset: bool = sview_len(offset_text) > 0 and sview_at(offset_text, 0) >= 48 and sview_at(offset_text, 0) <= 57
+                    if field_name != "" and type_name != "" and valid_offset:
+                        out.layouts[active_layout.usize()].fields.push(LayoutField{offset: easm_parse_i64(offset_text), name: field_name, type_name: type_name, width: width, requires_size_at_least: requires_size, line: line_number})
+                        continue
+                    active_layout <- -1
+                    current_kind <- 0
+                if is_protocol:
+                    header: sview = easm_trim(line_view[9:sview_len(line_view)])
+                    colon: usize = easm_find(header, ":")
+                    proto_name: sview = easm_trim(header[0:colon])
+                    out.protocols.push(Protocol{name: proto_name, methods: [], line: line_number})
+                    current_index <- out.protocols.count.i64() - 1
+                    current_kind <- 3
+                    section <- ""
+                    body_mode <- 0
+                    active_target <- -1
+                    continue
+                if current_kind == 3:
+                    open: usize = easm_find(line_view, "(")
+                    close: usize = easm_find(line_view, ")")
+                    arrow: mutable usize = sview_len(line_view)
+                    if close < sview_len(line_view):
+                        arrow <- easm_find(line_view[close:sview_len(line_view)], "->")
+                    if open < close and arrow < sview_len(line_view[close:sview_len(line_view)]):
+                        method_name: sview = easm_trim(line_view[0:open])
+                        ret_start: usize = close + arrow + 2.usize()
+                        ret_tail: sview = easm_trim(line_view[ret_start:sview_len(line_view)])
+                        out.protocols[current_index.usize()].methods.push(ProtocolMethod{name: method_name, arity: easm_parse_params(line_view[open + 1.usize():close]).count.i64(), return_type: ret_tail})
+                        continue
+                    current_kind <- 0
+                if is_export or is_fragment:
+                    fn: Function = easm_make_function(line_view, line_number, is_fragment)
+                    if is_fragment:
+                        out.fragments.push(fn)
+                        current_index <- out.fragments.count.i64() - 1
+                        current_kind <- 2
+                    else:
+                        out.functions.push(fn)
+                        current_index <- out.functions.count.i64() - 1
+                        current_kind <- 1
+                    active_layout <- -1
+                    section <- ""
+                    body_mode <- 0
+                    active_target <- -1
+                    continue
+                if is_template:
+                    tpl_fn: Function = easm_make_function(line_view, line_number, false)
+                    out.templates.push(Template{name: tpl_fn.name, holes: tpl_fn.params, instructions: [], patch_points: [], line: line_number})
+                    current_index <- out.templates.count.i64() - 1
+                    current_kind <- 4
+                    active_layout <- -1
+                    section <- "body"
+                    body_mode <- 0
+                    active_target <- -1
+                    continue
+                if current_kind == 4:
+                    template_instruction: Instruction = easm_parse_instruction(line_view, line_number)
+                    out.templates[current_index.usize()].instructions.push(template_instruction)
+                    for hole in out.templates[current_index.usize()].holes:
+                        if easm_find(template_instruction.text, hole.name) < sview_len(template_instruction.text):
+                            hole_class: mutable sview = "wide64"
+                            if easm_equal(hole.type_name, "u16") or easm_equal(hole.type_name, "i16"):
+                                hole_class <- "sel16"
+                            out.templates[current_index.usize()].patch_points.push(PatchPoint{hole: hole.name, type_name: hole.type_name, instruction_index: out.templates[current_index.usize()].instructions.count.i64() - 1, class_name: hole_class})
+                    continue
+                if current_kind == 1 or current_kind == 2:
+                    if easm_starts(section, "body") and sview_len(line_view) > 0 and sview_at(line_view, 0) == 114:
+                        body_mode <- 1
+                        section <- "body"
+                        continue
+                    if easm_starts(line_view, "target "):
+                        target_tail: sview = easm_trim(line_view[7:sview_len(line_view)])
+                        lockstep_at: usize = easm_find(target_tail, " lockstep ")
+                        if lockstep_at < sview_len(target_tail):
+                            arch: sview = easm_trim(target_tail[0:lockstep_at])
+                            ref_name: mutable sview = easm_trim(target_tail[lockstep_at + 10.usize():sview_len(target_tail)])
+                            if sview_len(ref_name) > 0 and sview_at(ref_name, sview_len(ref_name) - 1.usize()) == 58:
+                                ref_name <- easm_trim(ref_name[0:sview_len(ref_name) - 1.usize()])
+                            if current_kind == 1:
+                                out.functions[current_index.usize()].targets.push(TargetBody{arch: arch, lockstep: ref_name, instructions: [], line: line_number})
+                                active_target <- out.functions[current_index.usize()].targets.count.i64() - 1
+                                body_mode <- 2
+                                section <- "body"
+                            continue
+                    if line_view == "reference:":
+                        body_mode <- 1
+                        active_target <- -1
+                        section <- "body"
+                        continue
+                    if easm_starts(line_view, "body:"):
+                        section <- "body"
+                        body_mode <- 0
+                        continue
+                    colon: usize = easm_find(line_view, ":")
+                    if section != "body" and colon < sview_len(line_view) and line_view[colon + 1.usize():sview_len(line_view)] == "":
+                        section <- easm_trim(line_view[0:colon])
+                        continue
+                    if section != "" and section != "body":
+                        if current_kind == 1:
+                            out.functions[current_index.usize()].facts.push(line_view) if section == "facts"
+                            out.functions[current_index.usize()].inputs.push(line_view) if section == "inputs"
+                            out.functions[current_index.usize()].outputs.push(line_view) if section == "outputs"
+                            out.functions[current_index.usize()].requires.push(line_view) if section == "requires"
+                            out.functions[current_index.usize()].changes.push(line_view) if section == "changes"
+                            out.functions[current_index.usize()].reads.push(line_view) if section == "reads"
+                            out.functions[current_index.usize()].clobbers.push(line_view) if section == "clobbers"
+                            out.functions[current_index.usize()].preserves.push(line_view) if section == "preserves"
+                            out.functions[current_index.usize()].stack_facts.push(line_view) if section == "stack"
+                            out.functions[current_index.usize()].control.push(line_view) if section == "control"
+                            if section == "labels":
+                                label_colon: usize = easm_find(line_view, ":")
+                                label_name: mutable sview = line_view
+                                preconditions: mutable darray[sview] = []
+                                if label_colon < sview_len(line_view):
+                                    label_name <- line_view[0:label_colon]
+                                    preconditions <- easm_split_values(line_view[label_colon + 1.usize():sview_len(line_view)])
+                                out.functions[current_index.usize()].labels.push(LabelContract{name: easm_trim(label_name), preconditions: preconditions, line: line_number})
+                        continue
+                    inst: Instruction = easm_parse_instruction(line_view, line_number)
+                    if current_kind == 1:
+                        if body_mode == 1:
+                            out.functions[current_index.usize()].reference.push(inst)
+                        elif body_mode == 2 and active_target >= 0:
+                            target_body: mutable TargetBody = out.functions[current_index.usize()].targets[active_target.usize()]
+                            target_body.instructions.push(inst)
+                            out.functions[current_index.usize()].targets[active_target.usize()] <- target_body
+                        else:
+                            out.functions[current_index.usize()].instructions.push(inst)
+                    else:
+                        out.fragments[current_index.usize()].instructions.push(inst)
+                    continue
+                easm_issue(out, "unexpected-top-level", line_number, "expected module, target, export def, fragment, protocol, layout, or template def")
+            easm_expand_compositions(out)
+            analyze_templates(out)
+            for issue in verify_module(out):
+                out.issues.push(issue)
+            return out
+
+        def parse_module(source: u8&, length: usize, path: sview) -> Module:
+            return parse_layout_module(source, length, path)
+
+        def parse_project(sources: darray[ProjectSource], target: sview) -> Project:
+            project: mutable Project = Project{target: target, modules: [], issues: []}
+            for source in sources |project|:
+                length: mutable usize = source.bytes.count
+                if length > 0 and source.bytes[length - 1.usize()] == 0:
+                    length <- length - 1.usize()
+                continue if length == 0
+                parsed: Module = parse_module((&source.bytes[0]).cast[u8&], length, source.path)
+                for issue in parsed.issues |project|:
+                    project.issues.push(issue)
+                if not easm_target_matches(parsed.target, target):
+                    continue
+                duplicate: mutable bool = false
+                for earlier in project.modules:
+                    if earlier.name == parsed.name and parsed.name != "":
+                        duplicate <- true
+                if duplicate:
+                    project.issues.push(Issue{severity: Severity.Error, code: "duplicate-project-module", line: 0, message: "project contains more than one EASM module with the same name"})
+                else:
+                    project.modules.push(parsed)
+            for module_index in 0..<project.modules.count |project|:
+                current: Module = project.modules[module_index]
+                for function in current.functions:
+                    for earlier_module_index in 0..<module_index |project, function|:
+                        for earlier_function in project.modules[earlier_module_index].functions:
+                            if function.name == earlier_function.name and function.name != "":
+                                project.issues.push(Issue{severity: Severity.Error, code: "duplicate-project-export", line: function.line, message: "project contains duplicate EASM exports across source modules"})
+            return project
+
+        def project_has_errors(project: Project) -> bool:
+            for issue in project.issues:
+                true return if issue.severity == Severity.Error
+            return false
+
+        def emit_project_native_assembly(project: Project, out: mutable darray[u8]&) -> bool:
+            false return if project_has_errors(project)
+            for module in project.modules:
+                emit_native_assembly(module, project.target, out)
+            return true
+
+        # Stage0's BuildReport surface, kept deliberately textual so the self-hosted driver can
+        # stream it without depending on a JSON library.  The host wrapper owns discovery; this
+        # function owns the target-filtered module/error report once sources cross the boundary.
+        def emit_project_report(project: Project, out: mutable darray[u8]&) -> void:
+            easm_append_text(out, "Target: ")
+            easm_append_text(out, project.target)
+            easm_append_text(out, "\nModules: ")
+            for module in project.modules:
+                easm_append_text(out, module.name)
+                easm_append_text(out, " @")
+                easm_append_text(out, module.path)
+                easm_append_text(out, "\n")
+                for function in module.functions:
+                    easm_append_text(out, "  export ")
+                    easm_append_text(out, function.name)
+                    easm_append_text(out, "\n")
+                for template in module.templates:
+                    easm_append_text(out, "  template ")
+                    easm_append_text(out, template.name)
+                    easm_append_text(out, "\n")
+            for issue in project.issues:
+                easm_append_text(out, "Issue ")
+                easm_append_text(out, issue.code)
+                easm_append_text(out, " line=")
+                easm_append_text(out, "reported")
+                easm_append_text(out, " ")
+                easm_append_text(out, issue.message)
+                easm_append_text(out, "\n")

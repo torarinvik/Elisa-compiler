@@ -1,0 +1,543 @@
+# Stage1 EASM — provenance and control-flow verification over an EASM function body.
+# Part of `module Easm` (see easm_model.elisa); split out to keep each file short.
+
+extend Easm:
+    public:
+        # Direct two-edge join fallback. This complements the fixed-point state above for the
+        # common EASM shape where a conditional branch skips over one carrier assignment. Multi-hop
+        # carrier chains are resolved so intermediate copies of HostPtr/GuestVAddr still meet.
+        def easm_verify_simple_provenance_joins(fn: Function, issues: mutable darray[Issue]&) -> void:
+            for label_index in 0..<fn.instructions.count |label_index, fn, issues|:
+                continue if fn.instructions[label_index].op != "label"
+                label: sview = easm_label_name(fn.instructions[label_index])
+                continue if label == ""
+                next: mutable usize = label_index + 1
+                while next < fn.instructions.count and fn.instructions[next].op == "label":
+                    next <- next + 1
+                continue if next >= fn.instructions.count or not easm_memory_operand(easm_first_operand(fn.instructions[next].text))
+                base: sview = easm_memory_base_register(easm_first_operand(fn.instructions[next].text))
+                continue if base == ""
+                for jump_index in 0..<label_index |jump_index, label_index, fn, issues, base, label|:
+                    jump: Instruction = fn.instructions[jump_index]
+                    continue if not easm_is_conditional_jump(jump.op) or easm_last_operand(jump.text) != label
+                    before: mutable sview = ""
+                    for probe in 0..<jump_index |probe, fn, base, before|:
+                        candidate: Instruction = fn.instructions[probe]
+                        if easm_starts(candidate.op, "mov") or easm_starts(candidate.op, "lea"):
+                            if easm_register_operand(easm_last_operand(candidate.text)) == base:
+                                before <- easm_register_operand(easm_first_operand(candidate.text))
+                                before <- easm_memory_base_register(easm_first_operand(candidate.text)) if easm_starts(candidate.op, "lea")
+                    after: mutable sview = ""
+                    for probe in jump_index + 1..<label_index |probe, fn, base, after|:
+                        candidate: Instruction = fn.instructions[probe]
+                        if easm_starts(candidate.op, "mov") or easm_starts(candidate.op, "lea"):
+                            if easm_register_operand(easm_last_operand(candidate.text)) == base:
+                                after <- easm_register_operand(easm_first_operand(candidate.text))
+                                after <- easm_memory_base_register(easm_first_operand(candidate.text)) if easm_starts(candidate.op, "lea")
+                    before_type: sview = easm_resolve_carrier_type(fn, before, 8)
+                    after_type: sview = easm_resolve_carrier_type(fn, after, 8)
+                    if before != "" and after != "" and before_type != "" and after_type != "" and before_type != after_type:
+                        issues.push(Issue{severity: Severity.Error, code: "provenance-merge-unsound", line: fn.instructions[next].line, message: "memory base receives different typed carriers on incoming control-flow edges"})
+
+        def verify_control_flow_merges(fn: Function, issues: mutable darray[Issue]&) -> void:
+            count: usize = fn.instructions.count
+            return if count == 0
+            entries: mutable darray[FlowState] = []
+            meets: mutable darray[i64] = []
+            incoming_counts: mutable darray[i64] = []
+            for index in 0..<count |entries, meets, incoming_counts|:
+                entries.push(FlowState{live: 0, stack_delta: 0, stack_mod16: 8, stack_known: true, flags_live: false, valid: false})
+                meets.push(0)
+                incoming_counts.push(0)
+            initial_live: mutable i64 = 0
+            for input in fn.inputs:
+                equals: usize = easm_find(input, "=")
+                if equals < sview_len(input):
+                    initial_live <- initial_live | easm_register_bit(easm_register_operand(input[equals + 1.usize():sview_len(input)]))
+            entries[0] <- FlowState{live: initial_live, stack_delta: 0, stack_mod16: 8, stack_known: true, flags_live: false, valid: true}
+            meets[0] <- initial_live
+            incoming_counts[0] <- 1
+            for round_index in 0..<(count + 1) |round_index, entries, meets, incoming_counts, fn, issues|:
+                changed: mutable bool = false
+                for index in 0..<count |index, entries, meets, incoming_counts, fn, issues, changed|:
+                    continue if not entries[index].valid
+                    instruction: Instruction = fn.instructions[index]
+                    state: FlowState = easm_flow_transfer(instruction, entries[index])
+                    if easm_starts(instruction.op, "j"):
+                        target: sview = easm_last_operand(instruction.text)
+                        if sview_len(target) > 0 and sview_at(target, 0) != 37:
+                            changed <- easm_propagate_flow(easm_label_index(fn.instructions, target), state, entries, meets, incoming_counts) or changed
+                        if easm_is_terminator(instruction.op):
+                            continue
+                    if not easm_is_terminator(instruction.op) and index + 1 < count:
+                        changed <- easm_propagate_flow(index.i64() + 1, state, entries, meets, incoming_counts) or changed
+                break if not changed
+            for index in 0..<count |index, entries, meets, incoming_counts, fn, issues|:
+                continue if fn.instructions[index].op != "label" or incoming_counts[index] < 2
+                label: sview = easm_label_name(fn.instructions[index])
+                continue if sview_len(label) == 0
+                # A declared label contract is the explicit type for the merge and is checked by
+                # the ordinary contract verifier.  Contract-less merges must establish values on
+                # every edge; the meet is the set that is actually safe to carry forward.
+                has_contract: mutable bool = false
+                for contract in fn.labels:
+                    has_contract <- true if easm_equal(contract.name, label)
+                continue if has_contract
+                demanded: mutable i64 = 0
+                probe: mutable usize = index + 1
+                while probe < count:
+                    next: Instruction = fn.instructions[probe]
+                    demanded <- demanded | easm_read_mask(next)
+                    demanded <- demanded & (~easm_written_mask(next))
+                    break if easm_written_mask(next) != 0 or next.op == "label"
+                    probe <- probe + 1
+                missing: i64 = demanded & (~meets[index])
+                if missing != 0:
+                    issues.push(Issue{severity: Severity.Error, code: "merge-state-unsound", line: fn.instructions[index].line, message: "merge label carries a register that is not established on every incoming edge; declare a labels contract or write the register on every edge"})
+                if entries[index].stack_known and entries[index].stack_mod16 != 0:
+                    for probe_instruction in index + 1..<count |probe_instruction, fn, issues, entries|:
+                        break if fn.instructions[probe_instruction].op == "label"
+                        if easm_starts(fn.instructions[probe_instruction].op, "call") and not easm_contract_has_word(fn.requires, "stack.call_alignment.unchecked"):
+                            issues.push(Issue{severity: Severity.Error, code: "merge-stack-alignment-unsound", line: fn.instructions[index].line, message: "merge label does not establish a common stack alignment before call"})
+                            break
+
+        # Stage0's layout size rule: an explicit size wins; otherwise the largest declared
+        # field extent determines the overlay's minimum size. Stride is the fixed record size
+        # for table overlays and takes precedence over the field-derived size.
+        def layout_size(layout: Layout) -> i64:
+            if layout.size > 0:
+                return layout.size
+            if layout.stride > 0:
+                return layout.stride
+            largest: mutable i64 = 0
+            for field in layout.fields |largest|:
+                extent: i64 = field.offset + field.width
+                largest <- extent if extent > largest
+            return largest
+
+        # The width checked by a guest-overlay accessor. -1 means that the named field is not
+        # declared; 0 means declared but width-unknown, matching stage0's layout semantics.
+        def layout_field_width(layout: Layout, field_name: sview) -> i64:
+            for field in layout.fields |field_name|:
+                if field.name == field_name:
+                    return field.width
+            return -1
+
+        # A small, pure verifier primitive shared by the eventual EASM parser and the Elisa
+        # semantic overlay checks: an accessor is valid only when the field exists and its
+        # declared width is either unknown or equals the machine access width.
+        def layout_access_is_valid(layout: Layout, field_name: sview, access_width: i64) -> bool:
+            declared_width: i64 = layout_field_width(layout, field_name)
+            if declared_width < 0:
+                return false
+            return declared_width == 0 or declared_width == access_width
+
+        # Resolve the standalone guest-overlay form that stage0 exposes through
+        # CheckGuestOverlayAccess. This remains separate from instruction verification so a
+        # named field can be checked before it is lowered to a MemoryManager operation.
+        def resolve_guest_overlay_access(layout: Layout, field_name: sview, access_width: i64, issues: mutable darray[Issue]&) -> GuestOverlayAccess:
+            for field in layout.fields:
+                if field.name != field_name:
+                    continue
+                total: i64 = layout_size(layout)
+                if field.width > 0 and field.offset + field.width > total:
+                    issues.push(Issue{severity: Severity.Error, code: "overlay-field-out-of-bounds", line: field.line, message: "guest-overlay field extends beyond the declared layout size"})
+                    return GuestOverlayAccess{layout: layout.name, field: field.name, offset: field.offset, width: field.width, access_width: access_width}
+                if field.width > 0 and field.width != access_width:
+                    issues.push(Issue{severity: Severity.Error, code: "overlay-field-width-mismatch", line: field.line, message: "guest-overlay access width does not match the declared field width"})
+                return GuestOverlayAccess{layout: layout.name, field: field.name, offset: field.offset, width: field.width, access_width: access_width}
+            issues.push(Issue{severity: Severity.Error, code: "overlay-unknown-field", line: 0, message: "guest-overlay field is not declared in the layout"})
+            return GuestOverlayAccess{layout: layout.name, field: field_name, offset: -1, width: 0, access_width: access_width}
+
+        # Parse and lower `base.field[mem]` and `base.field[mem] = value`.  This is the stage1
+        # counterpart of stage0's DesugarGuestOverlayAccessor: resolution remains authoritative,
+        # while the successful result can be written as the exact MemoryManager operation through
+        # emit_guest_overlay_call.  The parser deliberately accepts only identifier-shaped base,
+        # field, and memory names; arbitrary expressions remain the ordinary explicit API.
+        def guest_overlay_identifier(text: sview, cursor: mutable usize&) -> sview:
+            start: usize = cursor
+            while cursor < sview_len(text) |cursor, text|:
+                byte: u8 = sview_at(text, cursor)
+                valid: bool = (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95
+                break if not valid
+                cursor <- cursor + 1
+            end: usize = cursor
+            return text[start:end]
+
+        def guest_overlay_skip_space(text: sview, cursor: mutable usize&) -> void:
+            while cursor < sview_len(text) and (sview_at(text, cursor) == 32 or sview_at(text, cursor) == 9) |cursor, text|:
+                cursor <- cursor + 1
+
+        def guest_overlay_expect(text: sview, cursor: mutable usize&, expected: u8) -> bool:
+            guest_overlay_skip_space(text, cursor)
+            false return if cursor >= sview_len(text) or sview_at(text, cursor) != expected
+            cursor <- cursor + 1
+            return true
+
+        def guest_overlay_accessor_name(width: i64, is_write: bool) -> sview:
+            if is_write:
+                return match width:
+                    1: "MemoryManager_WriteU8"
+                    2: "MemoryManager_WriteU16"
+                    4: "MemoryManager_WriteU32"
+                    8: "MemoryManager_WriteU64"
+                    _: ""
+            return match width:
+                1: "MemoryManager_ReadU8"
+                2: "MemoryManager_ReadU16"
+                4: "MemoryManager_ReadU32"
+                8: "MemoryManager_ReadU64"
+                _: ""
+
+        def desugar_guest_overlay_accessor(layout: Layout, source: sview, issues: mutable darray[Issue]&) -> GuestOverlayDesugar:
+            cursor: mutable usize = 0
+            guest_overlay_skip_space(source, cursor)
+            base: sview = guest_overlay_identifier(source, cursor)
+            if sview_len(base) == 0 or not guest_overlay_expect(source, cursor, 46):
+                issues.push(Issue{severity: Severity.Error, code: "overlay-bad-accessor", line: 0, message: "expected `base.field[mem]` or `base.field[mem] = value`"})
+                return GuestOverlayDesugar{access: GuestOverlayAccess{layout: "", field: "", offset: -1, width: 0, access_width: 0}, base: "", memory: "", value: "", is_write: false, accessor_name: ""}
+            field: sview = guest_overlay_identifier(source, cursor)
+            if sview_len(field) == 0 or not guest_overlay_expect(source, cursor, 91):
+                issues.push(Issue{severity: Severity.Error, code: "overlay-bad-accessor", line: 0, message: "expected a field followed by `[memory]`"})
+                return GuestOverlayDesugar{access: GuestOverlayAccess{layout: "", field: "", offset: -1, width: 0, access_width: 0}, base: "", memory: "", value: "", is_write: false, accessor_name: ""}
+            memory: sview = guest_overlay_identifier(source, cursor)
+            if sview_len(memory) == 0 or not guest_overlay_expect(source, cursor, 93):
+                issues.push(Issue{severity: Severity.Error, code: "overlay-bad-accessor", line: 0, message: "expected a memory identifier inside brackets"})
+                return GuestOverlayDesugar{access: GuestOverlayAccess{layout: "", field: "", offset: -1, width: 0, access_width: 0}, base: "", memory: "", value: "", is_write: false, accessor_name: ""}
+            guest_overlay_skip_space(source, cursor)
+            is_write: mutable bool = false
+            value: mutable sview = ""
+            if cursor < sview_len(source) and sview_at(source, cursor) == 61:
+                is_write <- true
+                cursor <- cursor + 1
+                guest_overlay_skip_space(source, cursor)
+                value <- source[cursor:sview_len(source)]
+                if sview_len(value) == 0:
+                    issues.push(Issue{severity: Severity.Error, code: "overlay-bad-accessor", line: 0, message: "a guest-overlay write requires a value"})
+                    return GuestOverlayDesugar{access: GuestOverlayAccess{layout: "", field: "", offset: -1, width: 0, access_width: 0}, base: "", memory: "", value: "", is_write: false, accessor_name: ""}
+            elif cursor != sview_len(source):
+                issues.push(Issue{severity: Severity.Error, code: "overlay-bad-accessor", line: 0, message: "unexpected text after guest-overlay accessor"})
+                return GuestOverlayDesugar{access: GuestOverlayAccess{layout: "", field: "", offset: -1, width: 0, access_width: 0}, base: "", memory: "", value: "", is_write: false, accessor_name: ""}
+
+            # The named form derives its access width from the declared field, exactly as stage0
+            # does; unknown fields are reported by the shared resolver.
+            width: i64 = layout_field_width(layout, field)
+            access: GuestOverlayAccess = resolve_guest_overlay_access(layout, field, width, issues)
+            accessor: sview = guest_overlay_accessor_name(width, is_write)
+            if sview_len(accessor) == 0:
+                issues.push(Issue{severity: Severity.Error, code: "overlay-field-width-mismatch", line: 0, message: "guest-overlay field width has no MemoryManager accessor"})
+                return GuestOverlayDesugar{access: GuestOverlayAccess{layout: "", field: "", offset: -1, width: 0, access_width: 0}, base: "", memory: "", value: "", is_write: false, accessor_name: ""}
+            return GuestOverlayDesugar{access: access, base: base, memory: memory, value: value, is_write: is_write, accessor_name: accessor}
+
+        def emit_guest_overlay_call(desugar: GuestOverlayDesugar, out: mutable darray[u8]&) -> void:
+            easm_append_text(out, desugar.accessor_name)
+            easm_append_text(out, "(")
+            easm_append_text(out, desugar.memory)
+            easm_append_text(out, ", ")
+            easm_append_text(out, desugar.base)
+            easm_append_text(out, " + ")
+            # Offset is emitted numerically without allocating a temporary string.  The public
+            # resolver remains usable even when callers only need the typed offset.
+            easm_append_i64(out, desugar.access.offset)
+            if desugar.is_write:
+                easm_append_text(out, ", ")
+                easm_append_text(out, desugar.value)
+            easm_append_text(out, ")")
+
+        # Runtime half of stage0 template assembly: copy the llvm-mc-produced image and fill its
+        # typed little-endian patch slots. The caller owns `out` and therefore controls its arena;
+        # the function itself performs no allocation and returns false for a missing hole value or
+        # an out-of-range patch.
+        def instantiate_template(image: TemplateImage, values: darray[PatchValue], out: mutable darray[u8]&) -> bool:
+            for byte in image.bytes:
+                out.push(byte)
+            for patch in image.patches:
+                supplied: mutable bool = false
+                value: mutable u64 = 0
+                for candidate in values:
+                    if easm_equal(candidate.hole, patch.hole):
+                        supplied <- true
+                        value <- candidate.value
+                false return if not supplied
+                false return if patch.offset < 0 or patch.width < 0 or patch.offset + patch.width > out.count.i64()
+                for byte_index in 0..<patch.width.usize() |out, value, patch|:
+                    out[(patch.offset.usize() + byte_index)] <- (value >> (byte_index.u64() * 8)).u8()
+            return true
+
+        # Derive runtime patch bytes from two assembler images. The assembler remains an
+        # external target-description authority (llvm-mc in the host driver), but the byte-diff
+        # algorithm itself is stage1-owned and shared with TemplateImage instantiation. A hole
+        # must preserve instruction length; each contiguous changed range becomes one PatchByte.
+        def derive_template_patches(base: darray[u8], hole: sview, flipped: darray[u8], patches: mutable darray[PatchByte]&) -> bool:
+            false return if base.count != flipped.count
+            cursor: mutable usize = 0
+            while cursor < base.count |cursor, base, flipped, hole, patches|:
+                if base[cursor] == flipped[cursor]:
+                    cursor <- cursor + 1
+                    continue
+                start: usize = cursor
+                while cursor < base.count and base[cursor] != flipped[cursor] |cursor, base, flipped|:
+                    cursor <- cursor + 1
+                patches.push(PatchByte{hole: hole, offset: start.i64(), width: (cursor - start).i64()})
+            return patches.count > 0
+
+        def easm_append_text(out: mutable darray[u8]&, text: sview) -> void:
+            for index in 0..<sview_len(text) |out, text|:
+                out.push(sview_at(text, index))
+
+        def easm_append_i64(out: mutable darray[u8]&, value: i64) -> void:
+            if value < 0:
+                out.push(45)
+                easm_append_i64(out, 0 - value)
+                return
+            if value >= 10:
+                easm_append_i64(out, value / 10)
+            out.push((48 + (value % 10)).u8())
+
+        def easm_append_instruction_text(out: mutable darray[u8]&, instruction: Instruction) -> void:
+            if instruction.substitution_count == 0:
+                easm_append_text(out, instruction.text)
+                return
+            cursor: mutable usize = 0
+            while cursor < sview_len(instruction.text):
+                replaced: mutable bool = false
+                for substitution_index in 0..<instruction.substitution_count.usize() |substitution_index, instruction, out, cursor, replaced|:
+                    substitution: Substitution = easm_substitution_at(instruction, substitution_index.i64())
+                    if cursor + sview_len(substitution.from) <= sview_len(instruction.text) and instruction.text[cursor:cursor + sview_len(substitution.from)] == substitution.from:
+                        easm_append_text(out, substitution.replacement)
+                        cursor <- cursor + sview_len(substitution.from)
+                        replaced <- true
+                        break
+                if not replaced:
+                    out.push(sview_at(instruction.text, cursor))
+                    cursor <- cursor + 1
+
+        def easm_target_matches(declared: sview, target: sview) -> bool:
+            if sview_len(declared) == 0 or easm_equal(declared, "any"):
+                return true
+            if sview_at(declared, 0) == 40:
+                close: usize = easm_find(declared, ")")
+                false return if close >= sview_len(declared)
+                cursor: mutable usize = 1
+                while cursor < close |cursor, declared, target|:
+                    while cursor < close and (sview_at(declared, cursor) == 32 or sview_at(declared, cursor) == 9 or sview_at(declared, cursor) == 44):
+                        cursor <- cursor + 1
+                    break if cursor >= close
+                    end: mutable usize = cursor
+                    while end < close and sview_at(declared, end) != 44 |end, declared|:
+                        end <- end + 1
+                    false return if not easm_platform_key_matches(easm_trim(declared[cursor:end]), target)
+                    cursor <- end + 1.usize()
+                return true
+            return easm_platform_key_matches(declared, target)
+
+        def easm_platform_key_matches(key: sview, target: sview) -> bool:
+            true return if key == "" or easm_equal(key, "any")
+            if easm_equal(key, "x86_64") or easm_equal(key, "amd64"):
+                return easm_starts(target, "x86_64") or easm_starts(target, "amd64")
+            if easm_equal(key, "aarch64") or easm_equal(key, "arm64"):
+                return easm_starts(target, "aarch64") or easm_starts(target, "arm64")
+            return easm_find(target, key) < sview_len(target)
+
+        # Native integration surface corresponding to stage0's nativeEASMAssemblySource: emit
+        # target-filtered exported bodies as ordinary assembler text. The caller supplies the
+        # output buffer/arena; pseudo instructions stay in the model for verification but do not
+        # reach the assembler, and `trap` maps to the platform breakpoint mnemonic.
+        def emit_native_assembly(module: Module, target: sview, out: mutable darray[u8]&) -> void:
+            return if not easm_target_matches(module.target, target)
+            easm_append_text(out, ".text\n")
+            for fn in module.functions:
+                if not easm_target_matches(fn.platform, target):
+                    continue
+                if sview_len(fn.name) == 0:
+                    continue
+                easm_append_text(out, "\n.globl ")
+                if easm_starts(target, "darwin") or easm_starts(target, "macos"):
+                    easm_append_text(out, "_")
+                easm_append_text(out, fn.name)
+                easm_append_text(out, "\n")
+                if easm_starts(target, "darwin") or easm_starts(target, "macos"):
+                    easm_append_text(out, "_")
+                easm_append_text(out, fn.name)
+                easm_append_text(out, ":\n")
+                for instruction in fn.instructions:
+                    continue if instruction.pseudo
+                    easm_append_text(out, "\t")
+                    if easm_equal(instruction.op, "trap"):
+                        easm_append_text(out, "int3")
+                    else:
+                        easm_append_instruction_text(out, instruction)
+                    easm_append_text(out, "\n")
+
+        def easm_trim(text: sview) -> sview:
+            first: mutable usize = 0
+            last: mutable usize = sview_len(text)
+            while first < last and (sview_at(text, first) == 32 or sview_at(text, first) == 9) |first, text, last|:
+                first <- first + 1
+            while last > first and (sview_at(text, last - 1.usize()) == 32 or sview_at(text, last - 1.usize()) == 9) |last, text, first|:
+                last <- last - 1
+            return text[first:last]
+
+        def easm_starts(text: sview, prefix: sview) -> bool:
+            false return if sview_len(text) < sview_len(prefix)
+            for index in 0..<sview_len(prefix) |text, prefix|:
+                false return if sview_at(text, index) != sview_at(prefix, index)
+            return true
+
+        def easm_equal(a: sview, b: sview) -> bool:
+            return sview_len(a) == sview_len(b) and easm_starts(a, b)
+
+        def easm_known_op(op: sview) -> bool:
+            # Keep this list exact.  The previous prefix checks accepted spellings such as
+            # `movgarbage` and every `j*` mnemonic, whereas stage0 admits only this inventory
+            # (plus the parser's internal compose/state/label pseudo-ops).
+            return easm_equal(op, "mov") or easm_equal(op, "movq") or easm_equal(op, "lea") or easm_equal(op, "leaq") or easm_equal(op, "push") or easm_equal(op, "pushq") or easm_equal(op, "pop") or easm_equal(op, "popq") or easm_equal(op, "movb") or easm_equal(op, "movw") or easm_equal(op, "movl") or easm_equal(op, "movsx") or easm_equal(op, "movsxd") or easm_equal(op, "movsbw") or easm_equal(op, "movsbl") or easm_equal(op, "movsbq") or easm_equal(op, "movswl") or easm_equal(op, "movswq") or easm_equal(op, "movslq") or easm_equal(op, "movzx") or easm_equal(op, "movzbw") or easm_equal(op, "movzbl") or easm_equal(op, "movzbq") or easm_equal(op, "movzwl") or easm_equal(op, "movzwq") or easm_equal(op, "xchg") or easm_equal(op, "xchgl") or easm_equal(op, "xchgq") or easm_equal(op, "add") or easm_equal(op, "addq") or easm_equal(op, "sub") or easm_equal(op, "subq") or easm_equal(op, "and") or easm_equal(op, "andq") or easm_equal(op, "or") or easm_equal(op, "orq") or easm_equal(op, "not") or easm_equal(op, "notq") or easm_equal(op, "neg") or easm_equal(op, "negq") or easm_equal(op, "xor") or easm_equal(op, "xorq") or easm_equal(op, "shl") or easm_equal(op, "shlq") or easm_equal(op, "sal") or easm_equal(op, "salq") or easm_equal(op, "shr") or easm_equal(op, "shrq") or easm_equal(op, "sar") or easm_equal(op, "sarq") or easm_equal(op, "cmp") or easm_equal(op, "cmpq") or easm_equal(op, "test") or easm_equal(op, "testq") or easm_equal(op, "inc") or easm_equal(op, "incq") or easm_equal(op, "dec") or easm_equal(op, "decq") or easm_equal(op, "call") or easm_equal(op, "callq") or easm_equal(op, "jmp") or easm_equal(op, "jmpq") or easm_equal(op, "ret") or easm_equal(op, "retq") or easm_equal(op, "je") or easm_equal(op, "jz") or easm_equal(op, "jne") or easm_equal(op, "jnz") or easm_equal(op, "jl") or easm_equal(op, "jle") or easm_equal(op, "jg") or easm_equal(op, "jge") or easm_equal(op, "jb") or easm_equal(op, "jbe") or easm_equal(op, "ja") or easm_equal(op, "jae") or easm_equal(op, "cpuid") or easm_equal(op, "cld") or easm_equal(op, "std") or easm_equal(op, "lfence") or easm_equal(op, "rdtsc") or easm_equal(op, "pause") or easm_equal(op, "yield") or easm_equal(op, "mrs") or easm_equal(op, "isb") or easm_equal(op, "fldcw") or easm_equal(op, "fnstcw") or easm_equal(op, "stmxcsr") or easm_equal(op, "ldmxcsr") or easm_equal(op, "emms") or easm_equal(op, "vzeroall") or easm_equal(op, "trap") or easm_equal(op, "compose") or easm_equal(op, "state") or easm_equal(op, "label")
+
+        # Public operation-table probes used by the parity harness and by future backend passes.
+        # Keeping these wrappers beside the verifier prevents the parser/emitter from silently
+        # drifting from the stage0 operation inventory.
+        def operation_is_known(op: sview) -> bool:
+            return easm_known_op(op)
+
+        def operation_capability(op: sview) -> sview:
+            return easm_required_capability(op)
+
+        def easm_register_operand(operand: sview) -> sview:
+            value: sview = easm_trim(operand)
+            if sview_len(value) > 0 and sview_at(value, 0) == 37:
+                end: mutable usize = 1
+                while end < sview_len(value) |end, value|:
+                    byte: u8 = sview_at(value, end)
+                    break if not ((byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95)
+                    end <- end + 1
+                return value[1:end]
+            # Contract bindings use bare names (`a = rdi`), while instruction operands use
+            # AT&T's `%rdi`.  Both spellings denote the same machine register.
+            return value if easm_register_bit(value) != 0 else ""
+
+        def easm_first_operand(text: sview) -> sview:
+            start: usize = easm_first_space(text)
+            if start >= sview_len(text):
+                return ""
+            rest: sview = easm_trim(text[start:sview_len(text)])
+            comma: usize = easm_find(rest, ",")
+            return rest[0:comma]
+
+        def easm_last_operand(text: sview) -> sview:
+            comma: mutable usize = sview_len(text)
+            for index in 0..<sview_len(text) |comma, text|:
+                comma <- index if sview_at(text, index) == 44
+            if comma >= sview_len(text):
+                start: usize = easm_first_space(text)
+                if start >= sview_len(text):
+                    return ""
+                return easm_trim(text[start:sview_len(text)])
+            return easm_trim(text[comma + 1.usize():sview_len(text)])
+
+        def easm_contract_has_register(values: darray[sview], register: sview) -> bool:
+            for value in values:
+                equals: usize = easm_find(value, "=")
+                if equals < sview_len(value):
+                    declared: sview = easm_register_operand(value[equals + 1.usize():sview_len(value)])
+                    if easm_equal(declared, register):
+                        return true
+                if easm_find(value, register) < sview_len(value):
+                    return true
+            return false
+
+        def easm_contract_has_word(values: darray[sview], needle: sview) -> bool:
+            for value in values:
+                if easm_find(value, needle) < sview_len(value):
+                    return true
+            return false
+
+        def easm_contract_has_exact(values: darray[sview], needle: sview) -> bool:
+            for value in values:
+                cursor: mutable usize = 0
+                while cursor < sview_len(value) |cursor, value, needle|:
+                    while cursor < sview_len(value) and (sview_at(value, cursor) == 32 or sview_at(value, cursor) == 9 or sview_at(value, cursor) == 44):
+                        cursor <- cursor + 1
+                    break if cursor >= sview_len(value)
+                    end: mutable usize = cursor
+                    while end < sview_len(value) and sview_at(value, end) != 44 |end, value|:
+                        end <- end + 1
+                    true return if easm_equal(easm_trim(value[cursor:end]), needle)
+                    cursor <- end + 1.usize()
+            return false
+
+        def easm_effect_present(effects: darray[sview]&, wanted: sview) -> bool:
+            for effect in effects:
+                true return if effect == wanted
+            return false
+
+        def easm_add_effect(effects: mutable darray[sview]&, wanted: sview) -> void:
+            effects.push(wanted) if not easm_effect_present(effects, wanted)
+
+        # Derive the complete caller-facing effect set from the verified EASM contract. This is
+        # the stage1 counterpart of stage0's DerivedEffects: raw EASM always carries the unsafe
+        # floor, while explicit machine capabilities and final fs ownership add narrower effects.
+        def easm_derived_effects(fn: Function) -> darray[sview]:
+            effects: mutable darray[sview] = []
+            easm_add_effect(effects, "Unsafe.RawExtern")
+            for requirement in fn.requires:
+                if requirement == "x86_64.segment.write":
+                    easm_add_effect(effects, "Unsafe.SegmentMutation")
+                elif requirement == "control.indirect" or requirement == "control.target.untyped":
+                    easm_add_effect(effects, "Unsafe.IndirectCall")
+                elif requirement == "memory.base.untyped":
+                    easm_add_effect(effects, "Unsafe.PointerCast")
+            owner: mutable sview = ""
+            for instruction in fn.instructions:
+                continue if instruction.op != "state"
+                text: sview = easm_trim(instruction.text)
+                continue if not easm_starts(text, "fs:")
+                state: sview = easm_trim(text[3:sview_len(text)])
+                owner <- "guest" if easm_starts(state, "guest")
+                owner <- "host" if easm_starts(state, "host")
+            if owner == "guest":
+                easm_add_effect(effects, "Unsafe.GuestSegmentInstall")
+                easm_add_effect(effects, "Segment.Guest")
+            elif owner == "host":
+                easm_add_effect(effects, "Segment.Host")
+            return effects
+
+        # Select the machine body consumed by native/LLVM lowering: the selected target variant
+        # wins, then a primary body, with a reference body as the final fallback for lockstep-only
+        # declarations. The copy is intentional so callers can materialize or rewrite it safely.
+        def easm_emitted_body(fn: Function) -> darray[Instruction]:
+            return fn.targets[0].instructions if fn.targets.count > 0 else fn.reference if fn.instructions.count == 0 and fn.reference.count > 0 else fn.instructions
+
+        def easm_register_contract_atom_valid(atom: sview) -> bool:
+            value: mutable sview = easm_trim(atom)
+            value <- value[1:sview_len(value)] if sview_len(value) > 0 and sview_at(value, 0) == 37
+            true return if value == "memory" or value == "memory.read" or value == "memory.write" or value == "cc" or value == "flags" or value == "callee_saved"
+            return easm_register_bit(value) != 0
+
+        def easm_register_contract_values_valid(value: sview) -> bool:
+            trimmed: sview = easm_trim(value)
+            true return if sview_len(trimmed) == 0
+            start: mutable usize = 0
+            index: mutable usize = 0
+            while index <= sview_len(trimmed) |index, start, trimmed|:
+                if index == sview_len(trimmed) or sview_at(trimmed, index) == 44:
+                    false return if not easm_register_contract_atom_valid(easm_trim(trimmed[start:index]))
+                    start <- index + 1
+                index <- index + 1
+            return true
+
+        def easm_verify_register_contracts(fn: Function, issues: mutable darray[Issue]&) -> void:
+            for clobber in fn.clobbers:
+                if not easm_register_contract_values_valid(clobber):
+                    issues.push(Issue{severity: Severity.Error, code: "invalid-clobber-register", line: fn.line, message: "clobbers contains an unknown register or machine atom"})
+            for preserve in fn.preserves:
+                if not easm_register_contract_values_valid(preserve):
+                    issues.push(Issue{severity: Severity.Error, code: "invalid-preserve-register", line: fn.line, message: "preserves contains an unknown register or machine atom"})
+
+        def easm_live_has(live: darray[sview], register: sview) -> bool:
+            for existing in live:
+                if easm_equal(existing, register):
+                    return true
+            return false
+
+        def easm_memory_operand(operand: sview) -> bool:
+            return easm_find(operand, "(") < sview_len(operand) or easm_find(operand, "[") < sview_len(operand)
