@@ -1,0 +1,457 @@
+# Stage1 backend — `emit_expression`: string literals, identifiers, parenthesised/unary forms and the leading binary operators.
+# A group of the expression emitter's branches, called from codegen_expression.elisa.
+# `handled` is set TRUE on entry and cleared only if no branch here matched, so a
+# branch that DECLINES (returns null) still stops the dispatch — exactly as it did
+# when every branch shared one function body.
+
+extend Backend:
+    private:
+        def emit_expression_idents_binary(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- true
+            if expression is Expr.Ident(ident_name, ident_line):
+                ident_type: ValueType = lookup_type(local_scope, ident_name)
+                # A bare function NAME used where a `fn(…)` value is expected passes its RAW
+                # pointer `@name` (bit0 clear = not a closure) — how `apply(dbl, …)` hands over
+                # `dbl`. Checked before the local/const paths, but only for the Fn expectation,
+                # so an ordinary local of the same name still shadows.
+                if expected.kind == TypeKind.Fn and ident_type.kind == TypeKind.Unmodeled:
+                    fn_value_index: i64 = function_index_of(fns, "", ident_name)
+                    fns.handles[fn_value_index.usize()] return if fn_value_index >= 0
+                # A GLOBAL const is INLINED at its use site, exactly as stage0 does: no
+                # global, no load, just the folded value at the const's own type. Checked
+                # only when the name is not a local, so a local still shadows it.
+                if ident_type.kind == TypeKind.Unmodeled:
+                    extern_global_index: i64 = extern_global_index_of(structs, ident_name)
+                    if extern_global_index >= 0:
+                        extern_global_type: ValueType = copied_type(structs.extern_global_types[extern_global_index.usize()])
+                        return LLVMBuildLoad2(builder, llvm_type_of(extern_global_type, structs, ctx), structs.extern_global_handles[extern_global_index.usize()], "extern.global")
+                    mutable_global_index: i64 = mutable_global_index_of(structs, ident_name)
+                    if mutable_global_index >= 0:
+                        mutable_global_type: ValueType = copied_type(structs.mutable_global_types[mutable_global_index.usize()])
+                        return LLVMBuildLoad2(builder, llvm_type_of(mutable_global_type, structs, ctx), structs.mutable_global_handles[mutable_global_index.usize()], "global")
+                    const_index: i64 = const_index_of(structs, ident_name)
+                    if const_index >= 0 and structs.const_resolved[const_index.usize()]:
+                        const_type: ValueType = copied_type(structs.const_types[const_index.usize()])
+                        if const_type.kind == TypeKind.Array or const_type.kind == TypeKind.Struct:
+                            if structs.const_global_ok[const_index.usize()]:
+                                return LLVMBuildLoad2(builder, llvm_type_of(const_type, structs, ctx), structs.const_globals[const_index.usize()], "global.const")
+                            null return if ident_type.kind == TypeKind.Unmodeled
+                        # A FLOAT const inlines its source text via LLVMConstRealOfString (its
+                        # value never fits/parses as an i64).
+                        if const_type.kind == TypeKind.Float:
+                            const_float_storage: mutable darray[u8] = []
+                            return LLVMConstRealOfString(llvm_type_of(const_type, structs, ctx), sview_to_cstr(structs.const_float_text[const_index.usize()], const_float_storage))
+                        # A bool const is a real i1; its folded value (0/1) inlines like an int.
+                        null return if not is_integer_type(const_type) and const_type.kind != TypeKind.Bool
+                        return LLVMConstInt(llvm_type_of(const_type, structs, ctx), structs.const_values[const_index.usize()].u64(), 0)
+                null return if ident_type.kind == TypeKind.Unmodeled
+                if lookup_slot(local_scope, ident_name) is slot:
+                    # A REF-typed local used in a VALUE context auto-DEREFERENCES: the slot
+                    # holds a pointer, so read the pointer out and then load the pointee.
+                    # This is how `if d.get(k) is a: total <- total + a` reads through the
+                    # `mutable T&` binding (stage0: `%a = load ptr, ...; load i64, ptr %a`).
+                    # Only when `expected` is a concrete NON-ref value type — otherwise the
+                    # ref itself is wanted (passed on, or the context is unknown).
+                    if ident_type.kind == TypeKind.Ref and expected.kind != TypeKind.Ref and expected.kind != TypeKind.Unmodeled:
+                        ref_target: ValueType = ref_target_of(ident_type, structs)
+                        if ref_target.kind == expected.kind and ref_target.bits == expected.bits:
+                            ref_pointer: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), slot, "ref.ptr")
+                            return LLVMBuildLoad2(builder, llvm_type_of(ref_target, structs, ctx), ref_pointer, "ref.value")
+                    # An OPTIONAL-REF local used where its ref PAYLOAD is expected UNWRAPS it:
+                    # extract the payload pointer (field 1 of `{i1, ptr}`). The std does this
+                    # right after `assert opt != null` (`items: Bucket& = m.items`); presence is
+                    # the frontend's proof, not re-checked here.
+                    if ident_type.kind == TypeKind.Optional and expected.kind == TypeKind.Ref:
+                        optional_ref_payload: ValueType = optional_payload_of(ident_type, structs)
+                        if optional_ref_payload.kind == TypeKind.Ref:
+                            optional_ref_llvm: LLVMTypeRef = llvm_type_of(ident_type, structs, ctx)
+                            optional_ref_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_ref_llvm, slot, 1, "unwrap.payload.ptr")
+                            return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), optional_ref_payload_pointer, "unwrap.ref")
+                    # A proven-present optional packed AST handle is likewise passed as its
+                    # bare i32 store index when a recursive packed payload expects `Expr`.
+                    if ident_type.kind == TypeKind.Optional and expected.kind == TypeKind.PackedEnum:
+                        optional_packed_payload: ValueType = optional_payload_of(ident_type, structs)
+                        if optional_packed_payload.kind == TypeKind.PackedEnum and optional_packed_payload.bits == expected.bits:
+                            optional_packed_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "optional.packed.value")
+                            return LLVMBuildExtractValue(builder, optional_packed_value, 1, "optional.packed.handle")
+                    # A local passed where a REFERENCE is wanted: hand over its ADDRESS.
+                    # Locals are already allocas, so `&local` IS the slot — exactly what
+                    # stage0 emits (`call void @bump(ptr %x)`). No `&` operator is needed
+                    # at the call site; the expected type drives it.
+                    if expected.kind == TypeKind.Ref and ident_type.kind != TypeKind.Ref:
+                        # A `cstr` local is ALREADY a pointer value (`char*`); when a ref/ptr param
+                        # is expected (e.g. a duplicate `getenv(name: u8&)` overload bound to a cstr
+                        # argument), pass the LOADED pointer, not the slot's address (`char**`).
+                        # Both cstr and a bare ref lower to `ptr`, so this is a no-op reinterpret.
+                        if ident_type.kind == TypeKind.CStr:
+                            return LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "cstr.as.ref")
+                        null return if ref_target_of(expected, structs).kind != ident_type.kind
+                        return slot
+                    return LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "load")
+                return null
+            if expression is Expr.Paren(paren_inner, paren_line):
+                return emit_expression(paren_inner, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
+                # `&lvalue` — the ADDRESS of a local, a field chain, or an indexed element,
+                # yielded as a `T&` (a raw ptr in LLVM). A bare local IS its own slot; any
+                # deeper place (`&b.value`, `&xs[i].field`) GEPs through struct_chain_address.
+                if unary_operator == TokenKind.Ampersand:
+                    if unary_operand is Expr.Ident(addr_name, addr_line):
+                        if lookup_slot(local_scope, addr_name) is addr_slot:
+                            return addr_slot
+                        # A mutable global is already represented by its LLVM global
+                        # address; taking `&global` must return that handle directly.
+                        return struct_address_of(addr_name, local_scope, structs, ctx, builder)
+                    return struct_chain_address(unary_operand, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # `not x` needs a bool operand, not `expected` (which is itself bool).
+                if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang:
+                    bool_type_n: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                    if emit_expression(unary_operand, bool_type_n, local_scope, fns, structs, generics, runtime, m, ctx, builder) is bool_operand:
+                        # `not` on an i1 is XOR with 1.
+                        return LLVMBuildXor(builder, bool_operand, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), "not")
+                    return null
+                operand_type: ValueType = resolve_type(unary_operand, expected, local_scope, fns, structs, generics)
+                null return if not is_numeric_type(operand_type)
+                if emit_expression(unary_operand, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is operand:
+                    operand return if unary_operator == TokenKind.Plus
+                    if unary_operator == TokenKind.Minus:
+                        # `-x` on a float is fneg; `~x` has no float form.
+                        return finish_float_instruction(LLVMBuildFNeg(builder, operand, "fneg"), runtime.fast_math) if operand_type.kind == TypeKind.Float else LLVMBuildNeg(builder, operand, "neg")
+                    if unary_operator == TokenKind.Tilde:
+                        null return if operand_type.kind == TypeKind.Float
+                        return LLVMBuildNot(builder, operand, "bnot")
+                return null
+            # `opt == null` / `opt != null` — a PRESENCE test against the optional's tag
+            # (field 0), whichever side is the `null` literal. The std dict guards on
+            # `m.items == null` this way. Distinct from `is` narrowing: no binding.
+            if expression is Expr.Binary(null_left, null_operator, null_right, null_line):
+                if null_operator == TokenKind.EqEq or null_operator == TokenKind.BangEq:
+                    left_is_null: bool = is_null_literal(null_left)
+                    right_is_null: bool = is_null_literal(null_right)
+                    if left_is_null or right_is_null:
+                        optional_operand: Expr = null_right if left_is_null else null_left
+                        null_optional_type: ValueType = expression_type(optional_operand, local_scope, fns, structs, generics)
+                        null return if null_optional_type.kind != TypeKind.Optional
+                        if emit_expression(optional_operand, null_optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is null_optional_value:
+                            null_optional_llvm: LLVMTypeRef = llvm_type_of(null_optional_type, structs, ctx)
+                            null_holder: LLVMValueRef = LLVMBuildAlloca(builder, null_optional_llvm, "nullcmp.opt")
+                            _ = LLVMBuildStore(builder, null_optional_value, null_holder)
+                            null_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, null_optional_llvm, null_holder, 0, "nullcmp.tag.ptr")
+                            null_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt1TypeInContext(ctx), null_tag_pointer, "nullcmp.tag")
+                            # tag TRUE = present. `== null` is absence (not tag); `!= null` is
+                            # presence (tag).
+                            if null_operator == TokenKind.EqEq:
+                                return LLVMBuildXor(builder, null_tag, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), "nullcmp.absent")
+                            return null_tag
+                        return null
+            # `v is name` — optional NARROWING. Yields the tag as a bool AND binds the
+            # payload to `name`, which the guarded block then reads. The binding is
+            # introduced unconditionally here; the frontend has already proved it is only
+            # read where the tag is true, so the backend does not re-prove it.
+            if expression is Expr.Binary(is_left, is_operator, is_right, is_line):
+                if is_operator == TokenKind.Is:
+                    # Packed AST variant tests without payload bindings (`x is T.V`).
+                    if is_right is Expr.Field(packed_is_head, packed_is_variant, packed_is_line):
+                        if packed_is_head is Expr.Ident(packed_is_enum, packed_is_enum_line):
+                            packed_is_scrutinee_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                            if packed_is_scrutinee_type.kind == TypeKind.PackedEnum and runtime.packed_mode == 2:
+                                packed_is_ordinal: i64 = packed_variant_index_of_parts(packed_is_enum, packed_is_variant, structs)
+                                null return if packed_is_ordinal < 0
+                                packed_is_root: i64 = packed_root_index_of(structs, packed_is_scrutinee_type.bits.i64())
+                                null return if runtime.active_store_enum != packed_is_root
+                                if emit_expression(is_left, packed_is_scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is packed_is_value:
+                                    packed_is_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "is.packed.state")
+                                    packed_is_index_value: LLVMValueRef = LLVMBuildZExt(builder, packed_is_value, LLVMInt64TypeInContext(ctx), "is.packed.index")
+                                    packed_is_args: mutable darray[LLVMValueRef] = [packed_is_state, packed_is_index_value]
+                                    packed_is_args_pointer: void& = (&packed_is_args[0]).cast[void&] can Unsafe.PointerCast
+                                    packed_is_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_tag_type, runtime.packed_read_tag, packed_is_args_pointer, 2, "is.packed.record")
+                                    packed_is_row_type: LLVMTypeRef = packed_row_llvm_type(structs, packed_is_scrutinee_type.bits.i64(), ctx)
+                                    packed_is_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_is_row_type, packed_is_record, 0, "is.packed.tag.ptr")
+                                    packed_is_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), packed_is_tag_pointer, "is.packed.tag")
+                                    return LLVMBuildICmp(builder, 32, packed_is_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_is_ordinal.u64(), 0), "is.packed.eq")
+                    if is_right is Expr.Ident(bind_name, bind_line):
+                        optional_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                        # A REF scrutinee (`heap T&`, or an extern `-> T&?` return that lowers to a
+                        # bare ptr with null = absent, e.g. `getenv(x) is real`) has no {i1,T} tag:
+                        # stage0 wraps it into `T?` only at an assignment destination; a direct `is`
+                        # has none, so narrow the ptr here — `ptr != null` is the bool and the
+                        # (non-null) ref is the binding.
+                        if optional_type.kind == TypeKind.Ref:
+                            if emit_expression(is_left, optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is heap_ref_value:
+                                heap_ref_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+                                heap_bind_storage: mutable darray[u8] = []
+                                heap_bind_slot: LLVMValueRef = build_entry_alloca(builder, heap_ref_llvm, sview_to_cstr(bind_name, heap_bind_storage))
+                                _ = LLVMBuildStore(builder, heap_ref_value, heap_bind_slot)
+                                declare_local(local_scope, bind_name, heap_bind_slot, optional_type)
+                                return LLVMBuildICmp(builder, 33, heap_ref_value, LLVMConstNull(heap_ref_llvm), "is.heap.nonnull")
+                        # An extern `-> Handle?` whose head is an OPAQUE LLVM handle (modeled as CStr,
+                        # e.g. `LLVMGetNamedFunction(..) -> LLVMValueRef?`) registers with the `?`
+                        # STRIPPED — its return type is a BARE CStr (nullable ptr, null = absent), not
+                        # `{i1, T}`. Narrow the ptr directly like the Ref case: bind the (non-null)
+                        # handle, `ptr != null` is the bool.
+                        if optional_type.kind == TypeKind.CStr:
+                            if emit_expression(is_left, optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is is_handle_value:
+                                is_handle_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+                                is_handle_storage: mutable darray[u8] = []
+                                is_handle_slot: LLVMValueRef = build_entry_alloca(builder, is_handle_llvm, sview_to_cstr(bind_name, is_handle_storage))
+                                _ = LLVMBuildStore(builder, is_handle_value, is_handle_slot)
+                                declare_local(local_scope, bind_name, is_handle_slot, optional_type)
+                                return LLVMBuildICmp(builder, 33, is_handle_value, LLVMConstNull(is_handle_llvm), "is.handle.nonnull")
+                        null return if optional_type.kind != TypeKind.Optional
+                        if emit_expression(is_left, optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is optional_value:
+                            optional_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+                            holder: LLVMValueRef = LLVMBuildAlloca(builder, optional_llvm, "is.opt")
+                            _ = LLVMBuildStore(builder, optional_value, holder)
+                            payload_type: ValueType = optional_payload_of(optional_type, structs)
+                            payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, holder, 1, "is.value.ptr")
+                            bind_storage: mutable darray[u8] = []
+                            bind_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(payload_type, structs, ctx), sview_to_cstr(bind_name, bind_storage))
+                            _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(payload_type, structs, ctx), payload_pointer, "is.value"), bind_slot)
+                            declare_local(local_scope, bind_name, bind_slot, payload_type)
+                            tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, holder, 0, "is.tag.ptr")
+                            return LLVMBuildLoad2(builder, LLVMInt1TypeInContext(ctx), tag_pointer, "is.tag")
+                    # `x is Dir.S` — a PAYLOADLESS payload-enum variant test (RHS is a bare
+                    # `Enum.Variant` Field, no binders). The bool is `tag(x) == ordinal(Variant)`.
+                    if is_right is Expr.Field(ple_head, ple_variant, ple_field_line):
+                        if ple_head is Expr.Ident(ple_enum_name, ple_enum_line):
+                            ple_enum_index: i64 = penum_index_of(structs, ple_enum_name)
+                            if ple_enum_index >= 0:
+                                ple_scrut_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                                null return if ple_scrut_type.kind != TypeKind.PayloadEnum
+                                ple_tag: i64 = penum_variant_index(structs, ple_enum_index, ple_variant)
+                                null return if ple_tag < 0
+                                if emit_expression(is_left, ple_scrut_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ple_value:
+                                    ple_actual_tag: LLVMValueRef = LLVMBuildExtractValue(builder, ple_value, 0, "is.penum.tag")
+                                    return LLVMBuildICmp(builder, 32, ple_actual_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), ple_tag.u64(), 0), "is.penum.eq")
+                                return null
+                    # `d is Dir.S` — a CONST enum variant test. A const enum's value IS its
+                    # ordinal (an integer of the enum's backing width), so the test is a plain
+                    # compare. Only the payload-enum form above was modeled, so every `is` on
+                    # an ordinary enum declined -- including `match`-produced values.
+                    if is_right is Expr.Field(ce_head, ce_variant, ce_field_line):
+                        if ce_head is Expr.Ident(ce_enum_name, ce_enum_line):
+                            ce_enum_index: i64 = enum_index_of(structs, ce_enum_name)
+                            if ce_enum_index >= 0 and penum_index_of(structs, ce_enum_name) < 0:
+                                ce_ordinal: i64 = enum_ordinal_of(structs, ce_enum_index.usize(), ce_variant)
+                                null return if ce_ordinal < 0
+                                ce_scrut_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                                null return if ce_scrut_type.kind != TypeKind.Signed and ce_scrut_type.kind != TypeKind.Unsigned and ce_scrut_type.kind != TypeKind.Bool
+                                if emit_expression(is_left, ce_scrut_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ce_value:
+                                    return LLVMBuildICmp(builder, 32, ce_value, LLVMConstInt(llvm_type_of(ce_scrut_type, structs, ctx), ce_ordinal.u64(), 0), "is.enum.eq")
+                                return null
+                    # `s is Shape.Rect(w, h)` — payload-enum variant NARROWING. Yields the
+                    # tag-equals-ordinal test as the bool AND binds each payload field to its
+                    # name (unconditionally, like the optional case: the frontend proves the
+                    # names are only read where the tag matches). The RHS parses as a
+                    # constructor CALL `Enum.Variant(binders…)`.
+                    if is_right is Expr.Call(pe_callee, pe_args, pe_arg_names, pe_call_line):
+                        if pe_callee is Expr.Field(pe_head, pe_variant, pe_field_line):
+                            if pe_head is Expr.Ident(pe_enum_name, pe_enum_line):
+                                # PACKED narrowing with binders: `x is Expr.Field(a, b, c)` /
+                                # `x is Expr.IntLit(v)` on a packed AST node. Mirrors the match
+                                # emitter's AoS read (record → tag idx0 for the bool, payload idx1,
+                                # bind each field). AST-root layout + plain binder idents only.
+                                pk_scrut: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                                pk_enum_idx: i64 = packed_index_of(structs, pe_enum_name)
+                                if pk_scrut.kind == TypeKind.PackedEnum and runtime.packed_mode == 2 and pk_enum_idx >= 0:
+                                    pk_ordinal: i64 = packed_variant_index_of_parts(pe_enum_name, pe_variant, structs)
+                                    null return if pk_ordinal < 0
+                                    pk_root: i64 = packed_root_index_of(structs, pk_scrut.bits.i64())
+                                    null return if runtime.active_store_enum != pk_root
+                                    null return if not packed_is_ast_root(structs, pk_root)
+                                    pk_local: i64 = packed_variant_local_index(structs, pk_enum_idx, pe_variant)
+                                    null return if pk_local < 0
+                                    pk_slot: usize = structs.packed_variant_start[pk_enum_idx.usize()] + pk_local.usize()
+                                    # Each arg is a plain binder (Ident) OR a NESTED payloadless-
+                                    # variant test (`Expr.If(a, b, Expr.Absent, c)` — the field must
+                                    # equal that sub-variant). Pre-validate every nested Field's
+                                    # ordinal here so the guarded branch below never bails mid-emit.
+                                    pk_args_ok: mutable bool = true
+                                    pk_has_nested: mutable bool = false
+                                    for pk_arg in pe_args |pk_args_ok, pk_has_nested, structs|:
+                                        if pk_arg is Expr.Ident(pk_arg_ident_name, pk_arg_ident_line):
+                                            pk_args_ok <- pk_args_ok
+                                        elif pk_arg is Expr.Field(pk_arg_field_head, pk_arg_field_variant, pk_arg_field_line):
+                                            pk_has_nested <- true
+                                            if pk_arg_field_head is Expr.Ident(pk_arg_field_enum, pk_arg_field_enum_line):
+                                                pk_args_ok <- false if packed_variant_index_of_parts(pk_arg_field_enum, pk_arg_field_variant, structs) < 0
+                                            else:
+                                                pk_args_ok <- false
+                                        else:
+                                            pk_args_ok <- false
+                                    null return if not pk_args_ok
+                                    if emit_expression(is_left, pk_scrut, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pk_index_value:
+                                        pk_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "is.pk.state")
+                                        pk_index64: LLVMValueRef = LLVMBuildZExt(builder, pk_index_value, LLVMInt64TypeInContext(ctx), "is.pk.index")
+                                        pk_record_args: mutable darray[LLVMValueRef] = [pk_state, pk_index64]
+                                        pk_record_pointer: void& = (&pk_record_args[0]).cast[void&] can Unsafe.PointerCast
+                                        pk_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, pk_record_pointer, 2, "is.pk.record")
+                                        pk_row_type: LLVMTypeRef = packed_row_llvm_type(structs, pk_scrut.bits.i64(), ctx)
+                                        pk_payload_hoisted: mutable LLVMValueRef = zeroed
+                                        if pe_args.count > 0 and structs.packed_has_payload[pk_slot]:
+                                            pk_payload: ValueType = copied_type(structs.packed_payloads[pk_slot])
+                                            null return if pk_payload.kind == TypeKind.Unmodeled
+                                            pk_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pk_row_type, pk_record, 1, "is.pk.payload.ptr")
+                                            pk_payload_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(pk_payload, structs, ctx), pk_payload_pointer, "is.pk.payload")
+                                            pk_payload_hoisted <- pk_payload_value
+                                            pk_field_start: usize = structs.packed_field_type_start[pk_slot]
+                                            if pe_args.count == 1:
+                                                if pe_args[0] is Expr.Ident(pk_single_name, pk_single_line):
+                                                    pk_single_storage: mutable darray[u8] = []
+                                                    pk_single_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(pk_payload, structs, ctx), sview_to_cstr(pk_single_name, pk_single_storage))
+                                                    _ = LLVMBuildStore(builder, pk_payload_value, pk_single_slot)
+                                                    declare_local(local_scope, pk_single_name, pk_single_slot, pk_payload)
+                                            if pe_args.count > 1:
+                                                for pk_bind_index in 0..<pe_args.count |pe_args, pk_field_start, pk_payload_value, structs, local_scope, ctx, builder|:
+                                                    if pe_args[pk_bind_index] is Expr.Ident(pk_multi_name, pk_multi_line):
+                                                        pk_multi_type: ValueType = copied_type(structs.packed_field_types[pk_field_start + pk_bind_index])
+                                                        pk_multi_field: LLVMValueRef = LLVMBuildExtractValue(builder, pk_payload_value, pk_bind_index.u32(), "is.pk.field")
+                                                        pk_multi_storage: mutable darray[u8] = []
+                                                        pk_multi_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(pk_multi_type, structs, ctx), sview_to_cstr(pk_multi_name, pk_multi_storage))
+                                                        _ = LLVMBuildStore(builder, pk_multi_field, pk_multi_slot)
+                                                        declare_local(local_scope, pk_multi_name, pk_multi_slot, pk_multi_type)
+                                        pk_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pk_row_type, pk_record, 0, "is.pk.tag.ptr")
+                                        pk_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), pk_tag_pointer, "is.pk.tag")
+                                        pk_outer_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, pk_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), pk_ordinal.u64(), 0), "is.pk.eq")
+                                        pk_no_nested: bool = not pk_has_nested
+                                        pk_outer_hit return if pk_no_nested
+                                        # NESTED field checks: a field's value is a packed HANDLE; read
+                                        # its tag ONLY when the outer tag matched (else the payload — and
+                                        # thus the handle — is garbage and the store read could fault).
+                                        # result = outer_hit AND (each nested field's tag == its ordinal).
+                                        pk_nested_fn: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                        pk_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, LLVMInt1TypeInContext(ctx), "is.pk.nested.result")
+                                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0), pk_result_slot)
+                                        pk_nested_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, pk_nested_fn, "is.pk.nested")
+                                        pk_nested_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, pk_nested_fn, "is.pk.nested.done")
+                                        _ = LLVMBuildCondBr(builder, pk_outer_hit, pk_nested_block, pk_nested_done)
+                                        LLVMPositionBuilderAtEnd(builder, pk_nested_block)
+                                        pk_nested_all: mutable LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0)
+                                        for pk_nidx in 0..<pe_args.count |pk_nested_all, pe_args, pk_payload_hoisted, pk_state, pk_row_type, structs, runtime, ctx, builder|:
+                                            if pe_args[pk_nidx] is Expr.Field(pk_nf_head, pk_nf_variant, pk_nf_line):
+                                                if pk_nf_head is Expr.Ident(pk_nf_enum, pk_nf_enum_line):
+                                                    pk_nested_ord: i64 = packed_variant_index_of_parts(pk_nf_enum, pk_nf_variant, structs)
+                                                    pk_nf_handle: LLVMValueRef = LLVMBuildExtractValue(builder, pk_payload_hoisted, pk_nidx.u32(), "is.pk.nested.handle")
+                                                    pk_nf_handle64: LLVMValueRef = LLVMBuildZExt(builder, pk_nf_handle, LLVMInt64TypeInContext(ctx), "is.pk.nested.h64")
+                                                    pk_nf_args: mutable darray[LLVMValueRef] = [pk_state, pk_nf_handle64]
+                                                    pk_nf_ptr: void& = (&pk_nf_args[0]).cast[void&] can Unsafe.PointerCast
+                                                    pk_nf_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, pk_nf_ptr, 2, "is.pk.nested.record")
+                                                    pk_nf_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, pk_row_type, pk_nf_record, 0, "is.pk.nested.tag.ptr")
+                                                    pk_nf_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), pk_nf_tag_ptr, "is.pk.nested.tag")
+                                                    pk_nf_eq: LLVMValueRef = LLVMBuildICmp(builder, 32, pk_nf_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), pk_nested_ord.u64(), 0), "is.pk.nested.eq")
+                                                    pk_nested_all <- LLVMBuildAnd(builder, pk_nested_all, pk_nf_eq, "is.pk.nested.and")
+                                        _ = LLVMBuildStore(builder, pk_nested_all, pk_result_slot)
+                                        _ = LLVMBuildBr(builder, pk_nested_done)
+                                        LLVMPositionBuilderAtEnd(builder, pk_nested_done)
+                                        return LLVMBuildLoad2(builder, LLVMInt1TypeInContext(ctx), pk_result_slot, "is.pk.nested.load")
+                                    return null
+                                pe_enum_index: i64 = penum_index_of(structs, pe_enum_name)
+                                if pe_enum_index >= 0:
+                                    pe_scrut_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                                    null return if pe_scrut_type.kind != TypeKind.PayloadEnum
+                                    pe_tag: i64 = penum_variant_index(structs, pe_enum_index, pe_variant)
+                                    null return if pe_tag < 0
+                                    pe_slot: usize = structs.penum_variant_start[pe_enum_index.usize()] + pe_tag.usize()
+                                    # Only plain binder idents are modeled; a literal/nested
+                                    # pattern in the RHS is a value test, not this narrowing.
+                                    pe_all_binders: mutable bool = true
+                                    for pe_arg in pe_args |pe_all_binders|:
+                                        pe_all_binders <- false if not (pe_arg is Expr.Ident(pe_arg_name, pe_arg_line))
+                                    null return if not pe_all_binders
+                                    null return if pe_args.count != structs.penum_field_type_count[pe_slot]
+                                    if emit_expression(is_left, pe_scrut_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pe_value:
+                                        pe_llvm: LLVMTypeRef = llvm_type_of(pe_scrut_type, structs, ctx)
+                                        pe_holder: LLVMValueRef = LLVMBuildAlloca(builder, pe_llvm, "is.penum")
+                                        _ = LLVMBuildStore(builder, pe_value, pe_holder)
+                                        pe_field_start: usize = structs.penum_field_type_start[pe_slot]
+                                        if pe_args.count == 1:
+                                            if pe_args[0] is Expr.Ident(pe_single_name, pe_single_line):
+                                                pe_single_type: ValueType = copied_type(structs.penum_field_types[pe_field_start])
+                                                pe_single_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pe_llvm, pe_holder, 1, "is.penum.ptr")
+                                                pe_single_storage: mutable darray[u8] = []
+                                                pe_single_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(pe_single_type, structs, ctx), sview_to_cstr(pe_single_name, pe_single_storage))
+                                                _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(pe_single_type, structs, ctx), pe_single_pointer, "is.penum.val"), pe_single_slot)
+                                                declare_local(local_scope, pe_single_name, pe_single_slot, pe_single_type)
+                                        if pe_args.count > 1:
+                                            pe_tuple_llvm: LLVMTypeRef = penum_field_tuple_type(pe_slot, structs, ctx)
+                                            pe_tuple_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pe_llvm, pe_holder, 1, "is.penum.ptr")
+                                            pe_tuple_value: LLVMValueRef = LLVMBuildLoad2(builder, pe_tuple_llvm, pe_tuple_pointer, "is.penum.tuple")
+                                            for pe_bind_index in 0..<pe_args.count |pe_args, pe_field_start, pe_tuple_value, structs, local_scope, ctx, builder|:
+                                                if pe_args[pe_bind_index] is Expr.Ident(pe_multi_name, pe_multi_line):
+                                                    pe_multi_type: ValueType = copied_type(structs.penum_field_types[pe_field_start + pe_bind_index])
+                                                    pe_multi_value: LLVMValueRef = LLVMBuildExtractValue(builder, pe_tuple_value, pe_bind_index.u32(), "is.penum.field")
+                                                    pe_multi_storage: mutable darray[u8] = []
+                                                    pe_multi_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(pe_multi_type, structs, ctx), sview_to_cstr(pe_multi_name, pe_multi_storage))
+                                                    _ = LLVMBuildStore(builder, pe_multi_value, pe_multi_slot)
+                                                    declare_local(local_scope, pe_multi_name, pe_multi_slot, pe_multi_type)
+                                        pe_tag_value: LLVMValueRef = LLVMBuildExtractValue(builder, pe_value, 0, "is.penum.tag")
+                                        return LLVMBuildICmp(builder, 32, pe_tag_value, LLVMConstInt(LLVMInt32TypeInContext(ctx), pe_tag.u64(), 0), "is.penum.cmp")
+                                    return null
+                    return null
+            # Membership `x in [a, b, …]` over a LITERAL array of a modeled numeric element
+            # type lowers to an OR-chain of equality compares (`x==a or x==b or …`), exactly
+            # as stage0's emitMembershipCompareValueAndExpr does. Empty list is constant false.
+            # Also: `x in lo..hi` / `x in lo..=hi` (char/int ranges used by the lexer helpers).
+            if expression is Expr.Binary(in_left, in_operator, in_right, in_line):
+                if in_operator == TokenKind.In:
+                    # `x in lo..hi` / `x in lo..=hi` / `x in lo..<hi` — range membership.
+                    # `..` (TokenKind.Range) is inclusive on both ends for membership (stage0
+                    # lowers `c in '0'..'9'` to sge/sle); `..<` exclusive high; `..=` inclusive high.
+                    if in_right is Expr.Binary(range_lo, range_op, range_hi, range_line):
+                        if range_op == TokenKind.Range or range_op == TokenKind.RangeLt or range_op == TokenKind.RangeLe:
+                            in_operand_type: ValueType = expression_type(in_left, local_scope, fns, structs, generics)
+                            if is_numeric_type(in_operand_type) or in_operand_type.kind == TypeKind.Signed or in_operand_type.kind == TypeKind.Unsigned:
+                                if emit_expression(in_left, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_left_value:
+                                    if emit_expression(range_lo, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_lo_value:
+                                        if emit_expression(range_hi, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_hi_value:
+                                            signed_cmp: bool = in_operand_type.kind == TypeKind.Signed
+                                            lo_pred: u32 = 39 if signed_cmp else 35
+                                            inclusive_hi: bool = range_op == TokenKind.Range or range_op == TokenKind.RangeLe
+                                            hi_pred: u32 = 41 if signed_cmp and inclusive_hi else (40 if signed_cmp else (37 if inclusive_hi else 36))
+                                            lo_ok: LLVMValueRef = LLVMBuildICmp(builder, lo_pred, in_left_value, in_lo_value, "in.range.lo")
+                                            hi_ok: LLVMValueRef = LLVMBuildICmp(builder, hi_pred, in_left_value, in_hi_value, "in.range.hi")
+                                            return LLVMBuildAnd(builder, lo_ok, hi_ok, "in.range")
+                                        return null
+                                    return null
+                                return null
+                    # `x in s` over a SET — the RHS is a DynSet expression (not an array
+                    # literal). Lowers to `arena_set_contains[T](&s, x) -> bool` (std). Checked
+                    # before the array-literal path below.
+                    in_right_type: ValueType = expression_type(in_right, local_scope, fns, structs, generics)
+                    if in_right_type.kind == TypeKind.Struct:
+                        set_mem_base: mutable sview = ""
+                        set_mem_arg_start: mutable usize = 0
+                        set_mem_arg_count: mutable usize = 0
+                        set_mem_has_inst: bool = generic_struct_instantiation_of(structs, in_right_type, set_mem_base, set_mem_arg_start, set_mem_arg_count)
+                        if set_mem_has_inst and set_mem_base == "DynSet" and set_mem_arg_count == 1:
+                            set_mem_elem_type: ValueType = copied_type(structs.generic_struct_inst_args[set_mem_arg_start])
+                            set_mem_type_args: mutable darray[ValueType] = [set_mem_elem_type]
+                            if instantiate_generic("arena_set_contains", set_mem_type_args, generics, structs, m, ctx) is set_contains_target:
+                                if struct_chain_address(in_right, local_scope, fns, structs, generics, runtime, m, ctx, builder) is set_mem_address:
+                                    if emit_expression(in_left, set_mem_elem_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is set_mem_key:
+                                        set_contains_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(set_contains_target)
+                                        set_contains_args: mutable darray[LLVMValueRef] = [set_mem_address, set_mem_key]
+                                        set_contains_args_pointer: void& = (&set_contains_args[0]).cast[void&] can Unsafe.PointerCast
+                                        return LLVMBuildCall2(builder, set_contains_fn_type, set_contains_target, set_contains_args_pointer, 2, "set.contains")
+                                    return null
+                                return null
+                    if in_right is Expr.Array(in_elements, in_array_line):
+                        in_operand_type: ValueType = expression_type(in_left, local_scope, fns, structs, generics)
+                        null return if not is_numeric_type(in_operand_type)
+                        in_bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
+                        if emit_expression(in_left, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_left_value:
+                            in_result: mutable LLVMValueRef = LLVMConstInt(in_bool_type, 0, 0)
+                            in_declined: mutable bool = false
+                            for in_element in in_elements |in_result, in_declined, in_left_value, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                continue if in_declined
+                                if emit_expression(in_element, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_element_value:
+                                    in_eq: LLVMValueRef = LLVMBuildICmp(builder, 32, in_left_value, in_element_value, "in.eq")
+                                    in_result <- LLVMBuildOr(builder, in_result, in_eq, "in.or")
+                                else:
+                                    in_declined <- true
+                            null return if in_declined
+                            return in_result
+                        return null
+                    return null
+            handled <- false
+            return null

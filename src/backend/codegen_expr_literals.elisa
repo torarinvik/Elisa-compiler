@@ -1,0 +1,470 @@
+# Stage1 backend — `emit_expression`: literal, lambda, optional-wrap, block, comprehension, refinement and catch forms.
+# A group of the expression emitter's branches, called from codegen_expression.elisa.
+# `handled` is set TRUE on entry and cleared only if no branch here matched, so a
+# branch that DECLINES (returns null) still stops the dispatch — exactly as it did
+# when every branch shared one function body.
+
+extend Backend:
+    private:
+        def emit_expression_literals(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- true
+            # A lambda VALUE `fn(params) => body` in a `fn(…)` context — lift it to a closure.
+            # (An empty-body Expr.Lambda is a fn-TYPE annotation, never emitted as a value.)
+            if expected.kind == TypeKind.Fn and expression is Expr.Lambda(lambda_value_params, lambda_value_body, lambda_value_line):
+                lambda_value_ok: bool = lambda_value_body.count > 0
+                emit_lambda_value(lambda_value_params, lambda_value_body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) return if lambda_value_ok
+            # IMPLICIT WRAP: Elisa has no `some(x)` — an expression of payload type in an
+            # optional context IS the optional. Handled before everything else so each
+            # value form stays unaware of optionals: re-emit at the PAYLOAD type, then wrap.
+            # `null` is excluded (it is the empty optional, not a payload).
+            if expected.kind == TypeKind.Optional:
+                payload_type: ValueType = optional_payload_of(expected, structs)
+                # A value-`if` / `match` already threads `expected` DOWN to its arms, so
+                # each arm wraps itself. Wrapping the whole form instead would push the
+                # payload type into the arms and reject `42 if flag else null` — the `null`
+                # arm is not an i64.
+                if not is_null_literal(expression) and not propagates_expected(expression):
+                    own: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+                    if own.kind != TypeKind.Optional:
+                        if emit_expression(expression, payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is payload_value:
+                            return wrap_optional(payload_value, expected, structs, ctx, builder)
+                        return null
+            if expression is Expr.CharLit(char_text):
+                # stage0: char literals lower to i64 code units (e.g. '0' → 48).
+                # Lexer token text is the INTERIOR only (`A`, not `'A'`); quoted form is
+                # also accepted when a pattern/alias re-wraps the content.
+                char_code: mutable i64 = 0
+                if not parse_char_literal_code(char_text, char_code):
+                    return null
+                char_ty: ValueType = expected if is_integer_type(expected) else ValueType{kind: TypeKind.Signed, bits: 64}
+                return LLVMConstInt(llvm_type_of(char_ty, structs, ctx), char_code.u64(), 1)
+            if expression is Expr.IntLit(literal_value):
+                # A literal takes the context's type. sign_extend=1 so a negative literal
+                # fills correctly at any width.
+                null return if not is_integer_type(expected)
+                return LLVMConstInt(llvm_type_of(expected, structs, ctx), literal_value.u64(), 1)
+            if expression is Expr.BoolLit(bool_value):
+                bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
+                return LLVMConstInt(bool_type, 1, 0) if bool_value else LLVMConstInt(bool_type, 0, 0)
+            # `1.5` — built from the SOURCE TEXT, so LLVM's own parser decides the exact
+            # bits rather than the backend re-implementing decimal rounding.
+            if expression is Expr.FloatLit(float_text):
+                null return if expected.kind != TypeKind.Float
+                text_storage: mutable darray[u8] = []
+                return LLVMConstRealOfString(llvm_type_of(expected, structs, ctx), sview_to_cstr(float_text, text_storage))
+            # An ident is a local read: load from its slot, at the slot's own type.
+            # `null` is an IDENT named "null" in the AST, not its own node. It is the
+            # empty optional: `{false, undef}` — the payload half is never read when the
+            # tag is false, so a zeroed struct is the whole value.
+            # `move x` — an ownership TRANSFER, which the backend emits as the value itself.
+            # Verified against stage0's IR: `freeze(move store)` adds no runtime call and no
+            # new instruction, just `%frozen = alloca %Node__Store` + a copy of the store
+            # value. The typestate (`Store[Local]` -> `Store[Frozen]`) is enforced by the
+            # SEMANTIC checker -- same layout, no runtime effect -- so honouring the marker
+            # here would be inventing work stage0 does not do.
+            #
+            # `freeze` itself never reaches the backend: the parser discards the marker and
+            # yields the wrapped value.
+            if expression is Expr.Move(moved_value, move_line):
+                return emit_expression(moved_value, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            # Value blocks are ordinary sequential statements followed by a tail value.
+            # The parser uses this shape for block expressions and for the value-producing
+            # branches of `if`/`match`; treating it as unmodeled made otherwise ordinary
+            # local declarations in an expression position disappear from the backend.
+            if expression is Expr.Block(block_statements, block_value, block_captures, block_line):
+                # `submit task(args)` is represented by the parser as an empty value block
+                # around the task call. Do not silently turn asynchronous submission into a
+                # synchronous call while the pool/task ABI lowering is incomplete.
+                if block_statements.count == 0:
+                    for submit_marker in structs.fn_return_lines |structs, block_line|:
+                        if submit_marker == block_line:
+                            # `submit worker(arg)` lowers to pool_submit1(pool, worker, arg).
+                            # The nursery group receives the already-emitted Task value below;
+                            # re-emitting the call would enqueue the task twice.
+                            null return if local_scope.pool_names.count == 0
+                            if block_value is Expr.Call(submit_callee, submit_arguments, submit_argument_names, submit_line):
+                                null return if submit_arguments.count != 1
+                                if submit_callee is Expr.Ident(submit_worker, submit_worker_line):
+                                    submit_arg_type: mutable ValueType = expression_type(submit_arguments[0], local_scope, fns, structs, generics)
+                                    # Integer literals are intentionally context-free in
+                                    # expression_type; for submit the worker signature is the
+                                    # context that supplies their concrete argument type.
+                                    submit_arg_type <- param_type_of(fns, "", submit_worker, 0.usize()) if submit_arg_type.kind == TypeKind.Unmodeled
+                                    submit_ret_type: ValueType = lookup_return_type(fns, "", submit_worker)
+                                    null return if submit_arg_type.kind == TypeKind.Unmodeled or submit_ret_type.kind == TypeKind.Unmodeled
+                                    submit_pool: sview = local_scope.pool_names[local_scope.pool_names.count - 1.usize()]
+                                    submit_types: mutable darray[ValueType] = [submit_arg_type, submit_ret_type]
+                                    submit_call_arguments: mutable darray[Expr] = [Expr.Ident(submit_pool, submit_line), Expr.Ident(submit_worker, submit_worker_line), submit_arguments[0]]
+                                    if emit_generic_call("pool_submit1", submit_types, submit_call_arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) is submitted_task:
+                                        if local_scope.group_names.count > 0:
+                                            group_name: sview = local_scope.group_names[local_scope.group_names.count - 1.usize()]
+                                            if emit_task_group_add_value(group_name, submitted_task, submit_ret_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is added_task:
+                                                _ = added_task
+                                            else:
+                                                return null
+                                        return LLVMConstNull(LLVMInt1TypeInContext(ctx))
+                                return null
+                            return null
+                    await_task_type: ValueType = expression_type(block_value, local_scope, fns, structs, generics)
+                    await_base: mutable sview = ""
+                    await_arg_start: mutable usize = 0
+                    await_arg_count: mutable usize = 0
+                    await_is_task: bool = generic_struct_instantiation_of(structs, await_task_type, await_base, await_arg_start, await_arg_count) and await_base == "Task" and await_arg_count >= 1
+                    if fn_return_head_at(block_line, structs) == "__await" or await_is_task:
+                        null return if not await_is_task
+                        await_result_type: ValueType = copied_type(structs.generic_struct_inst_args[await_arg_start])
+                        await_types: mutable darray[ValueType] = [await_result_type]
+                        await_arguments: mutable darray[Expr] = [block_value]
+                        return emit_generic_call("pool_await", await_types, await_arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                block_loops: mutable LoopStack = LoopStack{exits: [], continues: []}
+                block_regions: mutable RegionStack = RegionStack{arenas: []}
+                block_status: EmitStatus = emit_statements(block_statements, expected, local_scope, block_loops, block_regions, fns, structs, generics, runtime, m, ctx, builder)
+                null return if block_status != EmitStatus.Open
+                return emit_expression(block_value, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            if expression is Expr.Comprehension(comp_var, comp_iterable, comp_condition, comp_body, comp_line):
+                return emit_comprehension(comp_var, comp_iterable, comp_condition, comp_body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            # `try CALL else FALLBACK` -> Expr.Refinement(fallback, guarded). Modeled only
+            # when the guarded is a call to an ERROR-returning function: call it with a fresh
+            # out-slot, and if the returned i32 code is 0 use the out-value, else the
+            # fallback. Also: `get OPT else FALLBACK` where OPT is optional (same AST node).
+            if expression is Expr.Refinement(try_fallback, try_guarded, try_line):
+                # An ERROR-returning callee must be lowered through its out-param ABI FIRST:
+                # its expression_type is the PAYLOAD, so the optional path below would
+                # otherwise treat the i32 status as an optional aggregate.
+                if emit_try_else_error_call(try_guarded, try_fallback, local_scope, fns, structs, generics, runtime, m, ctx, builder) is try_else_error_value:
+                    return try_else_error_value
+                # `get OPT else FALLBACK` — optional unwrap to expression value (self-host lexer).
+                get_opt_type: ValueType = expression_type(try_guarded, local_scope, fns, structs, generics)
+                if get_opt_type.kind == TypeKind.Optional:
+                    get_payload_type: ValueType = optional_payload_of(get_opt_type, structs)
+                    if emit_expression(try_guarded, get_opt_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is get_opt_value:
+                        get_tag: LLVMValueRef = LLVMBuildExtractValue(builder, get_opt_value, 0, "get.expr.tag")
+                        get_payload: LLVMValueRef = LLVMBuildExtractValue(builder, get_opt_value, 1, "get.expr.payload")
+                        get_fn: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        get_present: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, get_fn, "get.expr.present")
+                        get_absent: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, get_fn, "get.expr.absent")
+                        get_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, get_fn, "get.expr.done")
+                        result_ty: LLVMTypeRef = llvm_type_of(get_payload_type, structs, ctx)
+                        result_slot: LLVMValueRef = LLVMBuildAlloca(builder, result_ty, "get.expr.result")
+                        _ = LLVMBuildCondBr(builder, get_tag, get_present, get_absent)
+                        LLVMPositionBuilderAtEnd(builder, get_present)
+                        _ = LLVMBuildStore(builder, get_payload, result_slot)
+                        _ = LLVMBuildBr(builder, get_done)
+                        LLVMPositionBuilderAtEnd(builder, get_absent)
+                        if emit_expression(try_fallback, get_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is get_fallback_value:
+                            _ = LLVMBuildStore(builder, get_fallback_value, result_slot)
+                            _ = LLVMBuildBr(builder, get_done)
+                            LLVMPositionBuilderAtEnd(builder, get_done)
+                            return LLVMBuildLoad2(builder, result_ty, result_slot, "get.expr.load")
+                        return null
+                    return null
+                # `try VALUE else FALLBACK` also accepts a first-class error-union
+                # value, not only a direct error-returning call. Stage0 extracts the
+                # descriptor's code, keeps the payload on the success path, and runs
+                # the fallback on any nonzero code. This matters for locals and
+                # parameters carrying `T error[E]` values.
+                try_guarded_type: ValueType = expression_type(try_guarded, local_scope, fns, structs, generics)
+                if try_guarded_type.kind == TypeKind.ErrorUnion:
+                    try_payload_type: ValueType = error_union_payload_of(try_guarded_type, structs)
+                    null return if try_payload_type.kind == TypeKind.Unmodeled
+                    if emit_expression(try_guarded, try_guarded_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is try_union_value:
+                        try_union_code: LLVMValueRef = LLVMBuildExtractValue(builder, try_union_value, 0, "try.union.code")
+                        try_union_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, try_union_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.union.ok")
+                        try_union_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        try_union_value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, try_union_function, "try.union.value")
+                        try_union_fallback_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, try_union_function, "try.union.fallback")
+                        try_union_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, try_union_function, "try.union.done")
+                        try_union_payload_llvm: LLVMTypeRef = llvm_type_of(try_payload_type, structs, ctx)
+                        try_union_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, try_union_payload_llvm, "try.union.result")
+                        _ = LLVMBuildCondBr(builder, try_union_ok, try_union_value_block, try_union_fallback_block)
+                        LLVMPositionBuilderAtEnd(builder, try_union_value_block)
+                        try_union_payload_ptr: LLVMValueRef = LLVMBuildExtractValue(builder, try_union_value, 1, "try.union.payload.ptr")
+                        try_union_payload: LLVMValueRef = LLVMBuildLoad2(builder, try_union_payload_llvm, try_union_payload_ptr, "try.union.payload")
+                        _ = LLVMBuildStore(builder, try_union_payload, try_union_result_slot)
+                        _ = LLVMBuildBr(builder, try_union_done_block)
+                        LLVMPositionBuilderAtEnd(builder, try_union_fallback_block)
+                        if emit_expression(try_fallback, try_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is try_union_fallback_value:
+                            _ = LLVMBuildStore(builder, try_union_fallback_value, try_union_result_slot)
+                            _ = LLVMBuildBr(builder, try_union_done_block)
+                            LLVMPositionBuilderAtEnd(builder, try_union_done_block)
+                            return LLVMBuildLoad2(builder, try_union_payload_llvm, try_union_result_slot, "try.union.value")
+                        return null
+                    return null
+                if try_guarded is Expr.Call(try_callee, try_args, try_arg_names, try_call_line):
+                    # Callee is a bare name (`f`) OR an explicit generic instantiation
+                    # (`f[T]` / `f[K, V]`); base-name both so `try dict_put[K,V](...) else …`
+                    # dispatches like `try f(...) else …`. Type args re-inferred from value args.
+                    try_name: sview = generic_call_base_name(try_callee)
+                    if try_name != "":
+                        if error_callee_is(fns, generics, try_name):
+                            try_value_type: ValueType = error_callee_value_type(try_name, try_args, local_scope, fns, structs, generics)
+                            null return if try_value_type.kind == TypeKind.Unmodeled
+                            if error_callee_target(try_name, try_args, local_scope, fns, structs, generics, m, ctx) is try_target:
+                                try_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(try_value_type, structs, ctx), "try.out")
+                                try_call_args: mutable darray[LLVMValueRef] = [try_out_slot]
+                                try_declined: mutable bool = false
+                                try_arg_index: mutable usize = 0
+                                for try_arg in try_args |try_call_args, try_declined, try_arg_index, try_name, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                    if emit_expression(try_arg, error_callee_param_type(try_name, try_args, try_arg_index, local_scope, fns, structs, generics), local_scope, fns, structs, generics, runtime, m, ctx, builder) is try_arg_value:
+                                        try_call_args.push(try_arg_value)
+                                    else:
+                                        try_declined <- true
+                                    try_arg_index <- try_arg_index + 1
+                                null return if try_declined
+                                try_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(try_target)
+                                try_args_pointer: void& = (&try_call_args[0]).cast[void&] can Unsafe.PointerCast
+                                try_code: LLVMValueRef = LLVMBuildCall2(builder, try_fn_type, try_target, try_args_pointer, try_call_args.count.u32(), "try.code")
+                                try_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, try_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                try_value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "try.value")
+                                try_fallback_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "try.fallback")
+                                try_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "try.done")
+                                # alloca+store+load, not phi -- the codebase avoids phi (a
+                                # void phi ICEs stage0, and the two paths merge cleanly here).
+                                try_result_type: LLVMTypeRef = llvm_type_of(try_value_type, structs, ctx)
+                                try_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, try_result_type, "try.result")
+                                _ = LLVMBuildCondBr(builder, try_ok, try_value_block, try_fallback_block)
+                                LLVMPositionBuilderAtEnd(builder, try_value_block)
+                                try_value: LLVMValueRef = LLVMBuildLoad2(builder, try_result_type, try_out_slot, "try.value.load")
+                                _ = LLVMBuildStore(builder, try_value, try_result_slot)
+                                _ = LLVMBuildBr(builder, try_done_block)
+                                LLVMPositionBuilderAtEnd(builder, try_fallback_block)
+                                if emit_expression(try_fallback, try_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is try_fallback_value:
+                                    _ = LLVMBuildStore(builder, try_fallback_value, try_result_slot)
+                                    _ = LLVMBuildBr(builder, try_done_block)
+                                else:
+                                    return null
+                                LLVMPositionBuilderAtEnd(builder, try_done_block)
+                                return LLVMBuildLoad2(builder, try_result_type, try_result_slot, "try.value")
+                # `get OPT else FALLBACK` — the OPTIONAL-unwrap form: evaluate the guarded
+                # optional; if present yield its payload, else the fallback. (The error-call
+                # form above shares this node; a darray-bounds `get arr[i] else f` does not,
+                # since arr[i] is not optional-typed here — it declines.)
+                opt_guarded_type: ValueType = expression_type(try_guarded, local_scope, fns, structs, generics)
+                if opt_guarded_type.kind == TypeKind.Optional:
+                    opt_payload_type: ValueType = optional_payload_of(opt_guarded_type, structs)
+                    null return if opt_payload_type.kind == TypeKind.Unmodeled
+                    if emit_expression(try_guarded, opt_guarded_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is opt_guarded_value:
+                        opt_llvm: LLVMTypeRef = llvm_type_of(opt_guarded_type, structs, ctx)
+                        opt_holder: LLVMValueRef = LLVMBuildAlloca(builder, opt_llvm, "get.opt")
+                        _ = LLVMBuildStore(builder, opt_guarded_value, opt_holder)
+                        opt_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, opt_llvm, opt_holder, 0, "get.tag.ptr")
+                        opt_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt1TypeInContext(ctx), opt_tag_pointer, "get.tag")
+                        opt_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        opt_value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, opt_function, "get.value")
+                        opt_fallback_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, opt_function, "get.fallback")
+                        opt_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, opt_function, "get.done")
+                        opt_payload_llvm: LLVMTypeRef = llvm_type_of(opt_payload_type, structs, ctx)
+                        opt_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, opt_payload_llvm, "get.result")
+                        _ = LLVMBuildCondBr(builder, opt_tag, opt_value_block, opt_fallback_block)
+                        LLVMPositionBuilderAtEnd(builder, opt_value_block)
+                        opt_value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, opt_llvm, opt_holder, 1, "get.value.ptr")
+                        _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, opt_payload_llvm, opt_value_pointer, "get.value.load"), opt_result_slot)
+                        _ = LLVMBuildBr(builder, opt_done_block)
+                        LLVMPositionBuilderAtEnd(builder, opt_fallback_block)
+                        if emit_expression(try_fallback, opt_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is opt_fallback_value:
+                            _ = LLVMBuildStore(builder, opt_fallback_value, opt_result_slot)
+                            _ = LLVMBuildBr(builder, opt_done_block)
+                        else:
+                            return null
+                        LLVMPositionBuilderAtEnd(builder, opt_done_block)
+                        opt_result: LLVMValueRef = LLVMBuildLoad2(builder, opt_payload_llvm, opt_result_slot, "get.value")
+                        return emit_conversion(opt_result, opt_payload_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != opt_payload_type.kind or expected.bits != opt_payload_type.bits) else opt_result
+                    return null
+                return null
+
+            # `catch f(args):` with a success arm and error-variant arms. The callee is an
+            # ERROR fn (i32 status + out-param, stage0's ABI): call it, `code == 0` takes
+            # the SUCCESS arm (arm 0, its Binding pattern names the out-value), a nonzero
+            # code is `ordinal + 1` and dispatches down an icmp chain over the error arms.
+            # Merged through a result slot, not a phi (the codebase avoids phi).
+            if expression is Expr.Catch(catch_guarded, catch_arms, catch_line):
+                null return if catch_arms.count < 1
+                catch_guarded_type: ValueType = expression_type(catch_guarded, local_scope, fns, structs, generics)
+                if catch_guarded_type.kind == TypeKind.ErrorUnion:
+                    if emit_expression(catch_guarded, catch_guarded_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is catch_union_value:
+                        return emit_catch_error_union_value(catch_union_value, catch_guarded_type, catch_arms, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    return null
+                if catch_guarded is Expr.Call(catch_callee, catch_args, catch_arg_names, catch_call_line):
+                    if catch_callee is Expr.Ident(catch_name, catch_name_line):
+                        null return if not error_callee_is(fns, generics, catch_name)
+                        catch_value_type: ValueType = error_callee_value_type(catch_name, catch_args, local_scope, fns, structs, generics)
+                        null return if catch_value_type.kind == TypeKind.Unmodeled
+                        if error_callee_target(catch_name, catch_args, local_scope, fns, structs, generics, m, ctx) is catch_target:
+                            catch_value_llvm: LLVMTypeRef = llvm_type_of(catch_value_type, structs, ctx)
+                            catch_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, catch_value_llvm, "catch.out")
+                            catch_call_args: mutable darray[LLVMValueRef] = [catch_out_slot]
+                            catch_declined: mutable bool = false
+                            catch_arg_index: mutable usize = 0
+                            for catch_arg in catch_args |catch_call_args, catch_declined, catch_arg_index, catch_name, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                if emit_expression(catch_arg, error_callee_param_type(catch_name, catch_args, catch_arg_index, local_scope, fns, structs, generics), local_scope, fns, structs, generics, runtime, m, ctx, builder) is catch_arg_value:
+                                    catch_call_args.push(catch_arg_value)
+                                else:
+                                    catch_declined <- true
+                                catch_arg_index <- catch_arg_index + 1
+                            null return if catch_declined
+                            catch_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(catch_target)
+                            catch_args_pointer: void& = (&catch_call_args[0]).cast[void&] can Unsafe.PointerCast
+                            catch_code: LLVMValueRef = LLVMBuildCall2(builder, catch_fn_type, catch_target, catch_args_pointer, catch_call_args.count.u32(), "catch.code")
+                            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            catch_value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.value")
+                            catch_dispatch_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.dispatch")
+                            catch_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.done")
+                            catch_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, catch_value_llvm, "catch.result")
+                            catch_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, catch_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "catch.ok")
+                            _ = LLVMBuildCondBr(builder, catch_ok, catch_value_block, catch_dispatch_block)
+
+                            # SUCCESS arm: arm 0. A Binding pattern names the out-slot value
+                            # for the arm's body; a Wildcard uses the value unchanged.
+                            LLVMPositionBuilderAtEnd(builder, catch_value_block)
+                            success_arm: MatchArm = catch_arms[0]
+                            null return if arm_has_guard(success_arm.guard)
+                            if success_arm.pattern is Pattern.Binding(success_binding):
+                                declare_local(local_scope, success_binding, catch_out_slot, catch_value_type)
+                            if arm_value_expression(success_arm.body) is success_expression:
+                                if emit_expression(success_expression, catch_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is success_value:
+                                    _ = LLVMBuildStore(builder, success_value, catch_result_slot)
+                                    _ = LLVMBuildBr(builder, catch_done_block)
+                                else:
+                                    return null
+                            else:
+                                return null
+
+                            # ERROR arms: icmp chain over `code == ordinal + 1`. A Wildcard
+                            # arm is the catch-all; without one the chain ends unreachable
+                            # (the checker proved exhaustiveness).
+                            LLVMPositionBuilderAtEnd(builder, catch_dispatch_block)
+                            error_arm_index: mutable usize = 1
+                            error_declined: mutable bool = false
+                            saw_catch_all: mutable bool = false
+                            while error_arm_index < catch_arms.count |error_arm_index, error_declined, saw_catch_all, catch_arms, catch_code, catch_value_type, catch_result_slot, catch_done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                error_arm: MatchArm = catch_arms[error_arm_index]
+                                error_arm_index <- error_arm_index + 1
+                                continue if error_declined or saw_catch_all
+                                if arm_has_guard(error_arm.guard):
+                                    error_declined <- true
+                                    continue
+                                if arm_value_expression(error_arm.body) is error_expression:
+                                    if error_arm.pattern is Pattern.Wildcard:
+                                        # catch-all: emit straight into the current block.
+                                        if emit_expression(error_expression, catch_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is catch_all_value:
+                                            _ = LLVMBuildStore(builder, catch_all_value, catch_result_slot)
+                                            _ = LLVMBuildBr(builder, catch_done_block)
+                                            saw_catch_all <- true
+                                        else:
+                                            error_declined <- true
+                                        continue
+                                    if error_arm.pattern is Pattern.TypeBind(error_type_name, error_binder):
+                                        # `error e:` — the CATCH-ALL handler (same as the statement
+                                        # form). The binder is NOT declared: a body that reads `e`
+                                        # declines on the unknown ident rather than seeing a wrong
+                                        # value. Any other TypeBind type is not a catch form.
+                                        if error_type_name != "error":
+                                            error_declined <- true
+                                            continue
+                                        if emit_expression(error_expression, catch_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is typebind_value:
+                                            _ = LLVMBuildStore(builder, typebind_value, catch_result_slot)
+                                            _ = LLVMBuildBr(builder, catch_done_block)
+                                            saw_catch_all <- true
+                                        else:
+                                            error_declined <- true
+                                        continue
+                                    if error_arm.pattern is Pattern.Variant(error_path, error_fields):
+                                        if error_fields.count != 0:
+                                            error_declined <- true
+                                            continue
+                                        # An error decl registers as a PAYLOAD enum, so its
+                                        # variant index comes from the penum pools; a const
+                                        # enum path is the fallback.
+                                        error_ordinal: mutable i64 = penum_variant_index_of_path(error_path, structs)
+                                        if error_ordinal < 0:
+                                            error_ordinal <- ordinal_of_dotted_path(error_path, structs)
+                                        if error_ordinal < 0:
+                                            error_declined <- true
+                                            continue
+                                        error_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.arm")
+                                        error_next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.next")
+                                        error_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, catch_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), (error_ordinal + 1).u64(), 0), "catch.cmp")
+                                        _ = LLVMBuildCondBr(builder, error_hit, error_arm_block, error_next_block)
+                                        LLVMPositionBuilderAtEnd(builder, error_arm_block)
+                                        if emit_expression(error_expression, catch_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is error_value:
+                                            _ = LLVMBuildStore(builder, error_value, catch_result_slot)
+                                            _ = LLVMBuildBr(builder, catch_done_block)
+                                        else:
+                                            error_declined <- true
+                                        LLVMPositionBuilderAtEnd(builder, error_next_block)
+                                        continue
+                                    error_declined <- true
+                                else:
+                                    error_declined <- true
+                            null return if error_declined
+                            # No catch-all: the residual block is unreachable (stage0's
+                            # catch.fail) -- the checker proved the arms exhaustive.
+                            if not saw_catch_all:
+                                _ = LLVMBuildUnreachable(builder)
+                            LLVMPositionBuilderAtEnd(builder, catch_done_block)
+                            return LLVMBuildLoad2(builder, catch_value_llvm, catch_result_slot, "catch.value")
+                return null
+            if expression is Expr.StringLit(string_text):
+                # `"hi"` in a `dstr` (= darray[u8]) context — build a byte darray in the arena,
+                # exactly as stage0 does (alloc, store each byte, build the {ptr,count,cap}
+                # header). The surrounding fn threads an arena when it returns/holds a dstr.
+                if expected.kind == TypeKind.DArray and darray_element_of(expected, structs).kind == TypeKind.Unsigned and darray_element_of(expected, structs).bits == 8:
+                    dstr_len: usize = sview_len(string_text)
+                    dstr_cap: i64 = 256 if dstr_len.i64() < 256 else dstr_len.i64()
+                    dstr_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                    dstr_slot: LLVMValueRef = LLVMBuildAlloca(builder, dstr_header, "dstr.literal")
+                    _ = LLVMBuildStore(builder, LLVMConstNull(dstr_header), dstr_slot)
+                    dstr_alloc_args: mutable darray[LLVMValueRef] = [runtime.arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), dstr_cap.u64(), 0)]
+                    dstr_alloc_pointer: void& = (&dstr_alloc_args[0]).cast[void&] can Unsafe.PointerCast
+                    dstr_buffer: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, dstr_alloc_pointer, 2, "dstr.alloc")
+                    for dstr_byte_index in 0..<dstr_len |dstr_buffer, string_text, ctx, builder|:
+                        dstr_byte_offset: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), dstr_byte_index.u64(), 0)]
+                        dstr_byte_offset_pointer: void& = (&dstr_byte_offset[0]).cast[void&] can Unsafe.PointerCast
+                        dstr_byte_slot: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), dstr_buffer, dstr_byte_offset_pointer, 1, "dstr.byte.ptr")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt8TypeInContext(ctx), sview_at(string_text, dstr_byte_index).u64(), 0), dstr_byte_slot)
+                    dstr_items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, dstr_header, dstr_slot, 0, "dstr.items.ptr")
+                    _ = LLVMBuildStore(builder, dstr_buffer, dstr_items_pointer)
+                    dstr_count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, dstr_header, dstr_slot, 1, "dstr.count.ptr")
+                    _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), dstr_len.u64(), 0), dstr_count_pointer)
+                    dstr_cap_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, dstr_header, dstr_slot, 2, "dstr.cap.ptr")
+                    _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), dstr_cap.u64(), 0), dstr_cap_pointer)
+                    return LLVMBuildLoad2(builder, dstr_header, dstr_slot, "dstr.literal.value")
+                # A string literal is also a borrowed byte reference (`u8&`) in the
+                # runtime's low-level string helpers.  Treating that form as unsupported
+                # made otherwise ordinary helpers such as `bool_to_string_into` decline
+                # during the gen2 self-host build, even though the LLVM value is the same
+                # global byte pointer as the cstr case.
+                literal_ref_target: ValueType = ref_target_of(expected, structs) if expected.kind == TypeKind.Ref else unmodeled_type()
+                null return if expected.kind != TypeKind.CStr and expected.kind != TypeKind.SView and expected.kind != TypeKind.Ref and expected.kind != TypeKind.Unmodeled
+                if expected.kind == TypeKind.Ref:
+                    # A string literal has static storage, so it can satisfy a borrowed
+                    # `u8&` but must not be accepted as an owning `heap u8&` result.
+                    null return if ref_is_heap_ref(expected, structs)
+                    null return if literal_ref_target.kind != TypeKind.Unsigned or literal_ref_target.bits != 8
+                literal_storage: mutable darray[u8] = []
+                string_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, sview_to_cstr(string_text, literal_storage), "str")
+                # An `sview` context wants the `{ptr, i64 len}` aggregate, not the bare ptr.
+                if expected.kind == TypeKind.SView:
+                    sview_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                    sview_undef: LLVMValueRef = LLVMGetUndef(sview_llvm)
+                    sview_with_ptr: LLVMValueRef = LLVMBuildInsertValue(builder, sview_undef, string_global, 0, "sview.ptr")
+                    sview_len_value: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), sview_len(string_text).u64(), 0)
+                    return LLVMBuildInsertValue(builder, sview_with_ptr, sview_len_value, 1, "sview.len")
+                return string_global
+            if expression is Expr.Ident(null_name, null_line):
+                if null_name == "null":
+                    # `null` is the None of an optional, but also a null POINTER when a ref/cstr is
+                    # expected (e.g. `LLVMFunctionType(ret, null, 0, 0)` for a `void&?` param that
+                    # declare_extern registers as a plain Ref). LLVMConstNull yields a null for any
+                    # of these pointer-shaped types, matching stage0's `ptr null`.
+                    null return if expected.kind != TypeKind.Optional and expected.kind != TypeKind.Ref and expected.kind != TypeKind.CStr
+                    return LLVMConstNull(llvm_type_of(expected, structs, ctx))
+                # `zeroed` — the all-zero value of the CONTEXT type: 0 for a scalar, a null
+                # pointer for a ref, and `zeroinitializer` for a struct/array. The dict grow
+                # path zero-fills fresh buckets with `zeroed`.
+                if null_name == "zeroed":
+                    null return if expected.kind == TypeKind.Unmodeled
+                    return LLVMConstNull(llvm_type_of(expected, structs, ctx))
+            handled <- false
+            return null

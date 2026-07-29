@@ -1,0 +1,528 @@
+# Stage1 backend — `emit_expression`: indexing, struct construction and field/scope access.
+# A group of the expression emitter's branches, called from codegen_expression.elisa.
+# `handled` is set TRUE on entry and cleared only if no branch here matched, so a
+# branch that DECLINES (returns null) still stops the dispatch — exactly as it did
+# when every branch shared one function body.
+
+extend Backend:
+    private:
+        def emit_expression_index_fields(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- true
+            # `{}` may also parse as an empty set literal; same zero-aggregate handling.
+            if expression is Expr.SetLit(set_elements, set_literal_line):
+                null return if expected.kind != TypeKind.Struct
+                set_lit_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                # An empty set `{}` is a zeroed DynSet (null items, 0 counts) — no allocation.
+                if set_elements.count == 0:
+                    return LLVMConstNull(set_lit_llvm)
+                # `{a, b, …}` — a zeroed DynSet in a slot, then `arena_set_add_or_panic(arena,
+                # &set, elem)` per element (the std's frictionless, panic-on-OOM insert; the
+                # error-returning `arena_set_add` is avoided so no error out-param is needed).
+                # Needs the std + the DynSet element type from `expected`'s instantiation args.
+                set_lit_base: mutable sview = ""
+                set_lit_arg_start: mutable usize = 0
+                set_lit_arg_count: mutable usize = 0
+                set_lit_has_inst: bool = generic_struct_instantiation_of(structs, expected, set_lit_base, set_lit_arg_start, set_lit_arg_count)
+                null return if not set_lit_has_inst or set_lit_base != "DynSet" or set_lit_arg_count != 1
+                set_lit_elem_type: ValueType = copied_type(structs.generic_struct_inst_args[set_lit_arg_start])
+                set_lit_type_args: mutable darray[ValueType] = [set_lit_elem_type]
+                if instantiate_generic("arena_set_add_or_panic", set_lit_type_args, generics, structs, m, ctx) is set_add_target:
+                    set_lit_slot: LLVMValueRef = LLVMBuildAlloca(builder, set_lit_llvm, "set.literal")
+                    _ = LLVMBuildStore(builder, LLVMConstNull(set_lit_llvm), set_lit_slot)
+                    set_add_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(set_add_target)
+                    set_lit_declined: mutable bool = false
+                    for set_element in set_elements |set_lit_declined, set_lit_elem_type, set_lit_slot, set_add_target, set_add_fn_type, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        continue if set_lit_declined
+                        if emit_expression(set_element, set_lit_elem_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is set_element_value:
+                            set_add_args: mutable darray[LLVMValueRef] = [runtime.arena, set_lit_slot, set_element_value]
+                            set_add_args_pointer: void& = (&set_add_args[0]).cast[void&] can Unsafe.PointerCast
+                            _ = LLVMBuildCall2(builder, set_add_fn_type, set_add_target, set_add_args_pointer, 3, "set.add")
+                        else:
+                            set_lit_declined <- true
+                    null return if set_lit_declined
+                    return LLVMBuildLoad2(builder, set_lit_llvm, set_lit_slot, "set.literal.value")
+                return null
+            if expression is Expr.Array(array_elements, array_literal_line):
+                # Darray literals use the same allocation/growth path as `.push(...)`.
+                if expected.kind == TypeKind.DArray:
+                    if array_elements.count == 0:
+                        return LLVMConstNull(darray_llvm_type(structs, ctx))
+                    element_type: ValueType = darray_element_of(expected, structs)
+                    null return if element_type.kind == TypeKind.Unmodeled
+                    header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                    temporary: LLVMValueRef = LLVMBuildAlloca(builder, header, "darray.literal")
+                    _ = LLVMBuildStore(builder, LLVMConstNull(header), temporary)
+                    declined: mutable bool = false
+                    for element_expression in array_elements |declined, temporary, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        if emit_darray_push(temporary, expected, element_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder):
+                            declined <- declined
+                        else:
+                            declined <- true
+                    null return if declined
+                    return LLVMBuildLoad2(builder, header, temporary, "darray.literal.value")
+                null return if expected.kind != TypeKind.Array
+                slot_index: usize = expected.bits.usize()
+                null return if array_elements.count > structs.array_extents[slot_index].usize()
+                element_type: ValueType = structs.array_elements[slot_index]
+                array_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                temporary: LLVMValueRef = LLVMBuildAlloca(builder, array_llvm, "array")
+                _ = LLVMBuildStore(builder, LLVMConstNull(array_llvm), temporary)
+                declined: mutable bool = false
+                position: mutable u32 = 0
+                for element_expression in array_elements |declined, position, element_type, array_llvm, temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), LLVMConstInt(LLVMInt64TypeInContext(ctx), position.u64(), 0)]
+                    indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                    pointer: LLVMValueRef = LLVMBuildGEP2(builder, array_llvm, temporary, indices_pointer, 2, "init.ptr")
+                    if emit_expression(element_expression, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_value:
+                        _ = LLVMBuildStore(builder, element_value, pointer)
+                    else:
+                        declined <- true
+                    position <- position + 1
+                null return if declined
+                return LLVMBuildLoad2(builder, array_llvm, temporary, "arrayval")
+
+            # Named-tuple VALUE `(a, b, …)` — construct positionally into the EXPECTED tuple
+            # struct (a synthesized anonymous struct; register_tuple_types resolved its type).
+            if expression is Expr.Tuple(tuple_value_elements, tuple_value_line):
+                null return if expected.kind != TypeKind.Struct
+                tuple_value_slot: usize = expected.bits.usize()
+                null return if structs.field_count[tuple_value_slot] != tuple_value_elements.count
+                tuple_value_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                tuple_value_temporary: LLVMValueRef = LLVMBuildAlloca(builder, tuple_value_llvm, "tuple")
+                tuple_value_field_start: usize = structs.field_start[tuple_value_slot]
+                tuple_value_declined: mutable bool = false
+                tuple_value_position: mutable u32 = 0
+                for tuple_value_element in tuple_value_elements |tuple_value_declined, tuple_value_position, tuple_value_field_start, tuple_value_llvm, tuple_value_temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    tuple_value_field_type: ValueType = copied_type(structs.field_types[tuple_value_field_start + tuple_value_position.usize()])
+                    tuple_value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, tuple_value_llvm, tuple_value_temporary, tuple_value_position, "tuple.field.ptr")
+                    if emit_expression(tuple_value_element, tuple_value_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is tuple_value_field:
+                        _ = LLVMBuildStore(builder, tuple_value_field, tuple_value_pointer)
+                    else:
+                        tuple_value_declined <- true
+                    tuple_value_position <- tuple_value_position + 1
+                null return if tuple_value_declined
+                return LLVMBuildLoad2(builder, tuple_value_llvm, tuple_value_temporary, "tupleval")
+
+            # `x.cast[T]` — a REINTERPRET cast (parsed as Index(Field(x,"cast"), T), no call).
+            # Only pointer<->pointer is modeled (a ref/cstr/void& is a `ptr`, and opaque
+            # pointers make it a no-op) — that is all the std alloc helpers need
+            # (`ptr.cast[mutable T&]`). A non-pointer reinterpret declines.
+            if expression is Expr.Index(cast_index_head, cast_index_type, cast_index_line):
+                if cast_index_head is Expr.Field(cast_source, cast_method, cast_method_line):
+                    if cast_method == "cast":
+                        cast_target: ValueType = annotation_value_type(cast_index_type, structs)
+                        null return if cast_target.kind == TypeKind.Unmodeled
+                        # `ptr.cast[uintptr]` — a POINTER→INTEGER reinterpret (the inverse of the
+                        # `int.cast[T&]` case below). A `uintptr`/`usize` stash of a raw address, as
+                        # in Slice[T]'s `(&da[0]).cast[uintptr]`; this is a `ptrtoint` to the target
+                        # integer width. Handled first so integer targets do not fall to the
+                        # pointer-only decline just below.
+                        if is_integer_type(cast_target):
+                            cast_int_source_type: ValueType = expression_type(cast_source, local_scope, fns, structs, generics)
+                            null return if not type_is_pointer(cast_int_source_type)
+                            if emit_expression(cast_source, cast_int_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cast_ptr_value:
+                                return LLVMBuildPtrToInt(builder, cast_ptr_value, llvm_type_of(cast_target, structs, ctx), "ptrtoint")
+                            return null
+                        # `raw.cast[GuestVAddr[L]]` / `HostPtr[T]` — address-space carriers are
+                        # i64 storage; a cast from uintptr is a pure integer bit-cast (identity
+                        # at the LLVM level), matching stage0's GuestVAddr local-carrier lowering.
+                        if cast_target.kind == TypeKind.GuestCarrier:
+                            cast_guest_source_type: ValueType = expression_type(cast_source, local_scope, fns, structs, generics)
+                            null return if not is_integer_type(cast_guest_source_type) and cast_guest_source_type.kind != TypeKind.GuestCarrier
+                            if emit_expression(cast_source, cast_guest_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cast_guest_value:
+                                return cast_guest_value
+                            return null
+                        # `ptr.cast[T&?]` — an OPTIONAL-of-pointer target. Produce the bare
+                        # pointer, then wrap: wrap_optional already derives a heap ref's tag
+                        # from a null test, so a null source stays ABSENT rather than being
+                        # handed back as a present-but-null reference.
+                        cast_wraps_optional: bool = cast_target.kind == TypeKind.Optional and type_is_pointer(optional_payload_of(cast_target, structs))
+                        null return if not type_is_pointer(cast_target) and not cast_wraps_optional
+                        cast_source_type: ValueType = expression_type(cast_source, local_scope, fns, structs, generics)
+                        # An INTEGER source (`raw: uintptr` -> `mutable heap Region&`) is a
+                        # real reinterpret and needs an `inttoptr`; pointer<->pointer is free
+                        # under opaque pointers. Anything else is not a reinterpret at all.
+                        cast_source_is_int: bool = is_integer_type(cast_source_type)
+                        null return if not type_is_pointer(cast_source_type) and not cast_source_is_int
+                        if emit_expression(cast_source, cast_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cast_source_value:
+                            cast_pointer: mutable LLVMValueRef = cast_source_value
+                            if cast_source_is_int:
+                                cast_pointer <- LLVMBuildIntToPtr(builder, cast_source_value, LLVMPointerTypeInContext(ctx, 0), "inttoptr")
+                            # The SOURCE decides nullability, not the target annotation: an
+                            # integer or a raw heap pointer may be null, so the tag is a null
+                            # test. A safe `T&` source is never null and keeps the constant.
+                            cast_may_be_null: bool = cast_source_is_int or (cast_source_type.kind == TypeKind.Ref and ref_is_heap_ref(cast_source_type, structs))
+                            return wrap_optional_tagged(cast_pointer, cast_target, cast_may_be_null, structs, ctx, builder) if cast_wraps_optional else cast_pointer
+                        return null
+            # `base[lo:hi]` — AST Slice (lexer `source[start:end]`). Byte pointer → sview.
+            if expression is Expr.Slice(slice_object, slice_start_expr, slice_end_expr, slice_line):
+                # A container slice assigned to `view[T]` is a fat view over the darray's
+                # element storage, not a byte `sview`. The old CStr path attempted a GEP of
+                # i8 directly on the darray header, producing invalid LLVM (`getelementptr`
+                # on `{ptr,i64,i64}`) before clone(view) even ran.
+                if expected.kind == TypeKind.View:
+                    slice_source_type: ValueType = expression_type(slice_object, local_scope, fns, structs, generics)
+                    if slice_source_type.kind == TypeKind.DArray:
+                        if emit_expression(slice_object, slice_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slice_source_value:
+                            if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_slice_start:
+                                if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_slice_end:
+                                    source_items: LLVMValueRef = LLVMBuildExtractValue(builder, slice_source_value, 0, "view.slice.items")
+                                    source_element: ValueType = darray_element_of(slice_source_type, structs)
+                                    element_llvm: LLVMTypeRef = llvm_type_of(source_element, structs, ctx)
+                                    view_indices: mutable darray[LLVMValueRef] = [view_slice_start]
+                                    view_indices_pointer: void& = (&view_indices[0]).cast[void&] can Unsafe.PointerCast
+                                    view_data: LLVMValueRef = LLVMBuildGEP2(builder, element_llvm, source_items, view_indices_pointer, 1, "view.slice.data")
+                                    view_len: LLVMValueRef = LLVMBuildSub(builder, view_slice_end, view_slice_start, "view.slice.len")
+                                    view_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                                    view_result: mutable LLVMValueRef = LLVMGetUndef(view_llvm)
+                                    view_result <- LLVMBuildInsertValue(builder, view_result, view_data, 0, "view.slice.ins0")
+                                    view_result <- LLVMBuildInsertValue(builder, view_result, view_len, 1, "view.slice.ins1")
+                                    return view_result
+                # An sview is already a `{data, len}` aggregate, not the raw pointer used by
+                # cstr. Extract its data field before doing byte-pointer arithmetic; feeding
+                # the aggregate directly to GEP produces `getelementptr i8, {ptr, i64} ...`.
+                if expression_type(slice_object, local_scope, fns, structs, generics).kind == TypeKind.SView:
+                    if emit_expression(slice_object, ValueType{kind: TypeKind.SView, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_slice_base:
+                        sview_slice_data: LLVMValueRef = LLVMBuildExtractValue(builder, sview_slice_base, 0, "sview.slice.data")
+                        if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_slice_start:
+                            if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_slice_end:
+                                sview_slice_llvm: LLVMTypeRef = llvm_type_of(ValueType{kind: TypeKind.SView, bits: 0}, structs, ctx)
+                                sview_slice_len: LLVMValueRef = LLVMBuildSub(builder, sview_slice_end, sview_slice_start, "byteslice.len")
+                                sview_slice_indices: mutable darray[LLVMValueRef] = [sview_slice_start]
+                                sview_slice_indices_pointer: void& = (&sview_slice_indices[0]).cast[void&] can Unsafe.PointerCast
+                                sview_slice_data_at: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), sview_slice_data, sview_slice_indices_pointer, 1, "byteslice.data")
+                                sview_slice_result: mutable LLVMValueRef = LLVMGetUndef(sview_slice_llvm)
+                                sview_slice_result <- LLVMBuildInsertValue(builder, sview_slice_result, sview_slice_data_at, 0, "byteslice.ins0")
+                                sview_slice_result <- LLVMBuildInsertValue(builder, sview_slice_result, sview_slice_len, 1, "byteslice.ins1")
+                                return sview_slice_result
+                if emit_expression(slice_object, ValueType{kind: TypeKind.CStr, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slice_base:
+                    if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slice_start:
+                        if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slice_end:
+                            sview_type: ValueType = ValueType{kind: TypeKind.SView, bits: 0}
+                            sview_llvm: LLVMTypeRef = llvm_type_of(sview_type, structs, ctx)
+                            slice_len: LLVMValueRef = LLVMBuildSub(builder, slice_end, slice_start, "byteslice.len")
+                            slice_gep_indices: mutable darray[LLVMValueRef] = [slice_start]
+                            slice_gep_ptr: void& = (&slice_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                            slice_data: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), slice_base, slice_gep_ptr, 1, "byteslice.data")
+                            slice_agg: mutable LLVMValueRef = LLVMGetUndef(sview_llvm)
+                            slice_agg <- LLVMBuildInsertValue(builder, slice_agg, slice_data, 0, "byteslice.ins0")
+                            slice_agg <- LLVMBuildInsertValue(builder, slice_agg, slice_len, 1, "byteslice.ins1")
+                            return slice_agg
+                        return null
+                    return null
+                return null
+            # `xs[i]` — an index READ. Only a local array receiver is modeled: the address
+            # comes from the local's slot, so no temporary spill is needed.
+            if expression is Expr.Index(indexed_object, index_expression, index_line):
+                # Guest-overlay accessor `base.field[mem]` (docs/107): desugars to
+                # MemoryManager_ReadU<W>(mem, base + offset), matching stage0's analyzer
+                # rewrite. The carrier is a GuestVAddr[L]/HostPtr address integer.
+                if indexed_object is Expr.Field(overlay_base, overlay_field, overlay_field_line):
+                    overlay_base_type: ValueType = expression_type(overlay_base, local_scope, fns, structs, generics)
+                    if overlay_base_type.kind == TypeKind.GuestCarrier:
+                        overlay_layout: sview = guest_carrier_layout(overlay_base_type, structs)
+                        overlay_info: (offset: i64, width: u32) = overlay_field_info(structs, overlay_layout, overlay_field)
+                        if overlay_info.offset >= 0 and (overlay_info.width == 1 or overlay_info.width == 2 or overlay_info.width == 4 or overlay_info.width == 8):
+                            if emit_expression(overlay_base, overlay_base_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is overlay_base_value:
+                                if emit_expression(index_expression, ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is overlay_mem_value:
+                                    overlay_offset_const: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), overlay_info.offset.u64(), 0)
+                                    overlay_addr: LLVMValueRef = LLVMBuildAdd(builder, overlay_base_value, overlay_offset_const, "overlay.addr")
+                                    overlay_ret_bits: u32 = 8 if overlay_info.width == 1 else (16 if overlay_info.width == 2 else (32 if overlay_info.width == 4 else 64))
+                                    overlay_ret_llvm: LLVMTypeRef = LLVMInt8TypeInContext(ctx) if overlay_ret_bits == 8 else (LLVMInt16TypeInContext(ctx) if overlay_ret_bits == 16 else (LLVMInt32TypeInContext(ctx) if overlay_ret_bits == 32 else LLVMInt64TypeInContext(ctx)))
+                                    overlay_param_types: mutable darray[LLVMTypeRef] = [LLVMInt64TypeInContext(ctx), LLVMInt64TypeInContext(ctx)]
+                                    overlay_param_pointer: void& = (&overlay_param_types[0]).cast[void&] can Unsafe.PointerCast
+                                    overlay_fn_type: LLVMTypeRef = LLVMFunctionType(overlay_ret_llvm, overlay_param_pointer, 2, 0)
+                                    overlay_fn: LLVMValueRef = declare_or_get_named(m, "MemoryManager_ReadU8", overlay_fn_type) if overlay_info.width == 1 else (declare_or_get_named(m, "MemoryManager_ReadU16", overlay_fn_type) if overlay_info.width == 2 else (declare_or_get_named(m, "MemoryManager_ReadU32", overlay_fn_type) if overlay_info.width == 4 else declare_or_get_named(m, "MemoryManager_ReadU64", overlay_fn_type)))
+                                    overlay_args: mutable darray[LLVMValueRef] = [overlay_mem_value, overlay_addr]
+                                    overlay_args_pointer: void& = (&overlay_args[0]).cast[void&] can Unsafe.PointerCast
+                                    overlay_raw: LLVMValueRef = LLVMBuildCall2(builder, overlay_fn_type, overlay_fn, overlay_args_pointer, 2, "overlay.read")
+                                    overlay_as_i64: mutable LLVMValueRef = overlay_raw
+                                    if overlay_ret_bits < 64:
+                                        overlay_as_i64 <- LLVMBuildZExt(builder, overlay_raw, LLVMInt64TypeInContext(ctx), "overlay.zext")
+                                    overlay_result_type: ValueType = ValueType{kind: TypeKind.Unsigned, bits: 64}
+                                    return emit_conversion(overlay_as_i64, overlay_result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != overlay_result_type.kind or expected.bits != overlay_result_type.bits) else overlay_as_i64
+                            return null
+                # `sv[i]` — a byte read from a string view via `ctx_string_view_index(sv, i)`
+                # (the view passed BY VALUE). Returns i64.
+                sview_index_recv_type: ValueType = expression_type(indexed_object, local_scope, fns, structs, generics)
+                if sview_index_recv_type.kind == TypeKind.SView:
+                    if emit_expression(indexed_object, sview_index_recv_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_index_recv:
+                        if emit_expression(index_expression, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_index_arg:
+                            sview_index_args: mutable darray[LLVMValueRef] = [sview_index_recv, sview_index_arg]
+                            sview_index_args_pointer: void& = (&sview_index_args[0]).cast[void&] can Unsafe.PointerCast
+                            sview_index_value: LLVMValueRef = LLVMBuildCall2(builder, runtime.sview_index_type, runtime.sview_index, sview_index_args_pointer, 2, "sview.index")
+                            sview_index_result: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                            return emit_conversion(sview_index_value, sview_index_result, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != sview_index_result.kind or expected.bits != sview_index_result.bits) else sview_index_value
+                        return null
+                    return null
+                # `s[i]` — a byte read from a cstr via `ctx_string_index(s, i)` (stage0's
+                # lowering), returning i64. The pointer is passed by value.
+                if sview_index_recv_type.kind == TypeKind.CStr:
+                    if emit_expression(indexed_object, sview_index_recv_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cstr_index_recv:
+                        if emit_expression(index_expression, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cstr_index_arg:
+                            cstr_index_param_types: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), LLVMInt64TypeInContext(ctx)]
+                            cstr_index_param_pointer: void& = (&cstr_index_param_types[0]).cast[void&] can Unsafe.PointerCast
+                            cstr_index_fn_type: LLVMTypeRef = LLVMFunctionType(LLVMInt64TypeInContext(ctx), cstr_index_param_pointer, 2, 0)
+                            cstr_index_fn: LLVMValueRef = declare_or_get_named(m, "ctx_string_index", cstr_index_fn_type)
+                            cstr_index_args: mutable darray[LLVMValueRef] = [cstr_index_recv, cstr_index_arg]
+                            cstr_index_args_pointer: void& = (&cstr_index_args[0]).cast[void&] can Unsafe.PointerCast
+                            cstr_index_value: LLVMValueRef = LLVMBuildCall2(builder, cstr_index_fn_type, cstr_index_fn, cstr_index_args_pointer, 2, "cstr.index")
+                            cstr_index_result: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                            return emit_conversion(cstr_index_value, cstr_index_result, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != cstr_index_result.kind or expected.bits != cstr_index_result.bits) else cstr_index_value
+                        return null
+                    return null
+                # `view.data[i]` — a byte read through the data pointer field of an sview.
+                # This is equivalent to `view[i]`, but some stdlib helpers use the explicit
+                # pointer field. Handle the field-backed base directly instead of requiring
+                # the pointer to be a bare local identifier.
+                if indexed_object is Expr.Field(sview_data_owner, sview_data_field, sview_data_line) and sview_data_field == "data":
+                    sview_data_owner_type: ValueType = expression_type(sview_data_owner, local_scope, fns, structs, generics)
+                    if sview_data_owner_type.kind == TypeKind.SView:
+                        if emit_expression(sview_data_owner, sview_data_owner_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_data_owner_value:
+                            sview_data_base: LLVMValueRef = LLVMBuildExtractValue(builder, sview_data_owner_value, 0, "sview.data.base")
+                            if emit_expression(index_expression, ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_data_index:
+                                sview_data_indices: mutable darray[LLVMValueRef] = [sview_data_index]
+                                sview_data_indices_pointer: void& = (&sview_data_indices[0]).cast[void&] can Unsafe.PointerCast
+                                sview_data_pointer: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), sview_data_base, sview_data_indices_pointer, 1, "sview.data.ptr")
+                                sview_data_value: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt8TypeInContext(ctx), sview_data_pointer, "sview.data.byte")
+                                sview_data_result: ValueType = ValueType{kind: TypeKind.Unsigned, bits: 8}
+                                return emit_conversion(sview_data_value, sview_data_result, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != sview_data_result.kind or expected.bits != sview_data_result.bits) else sview_data_value
+                            return null
+                        return null
+                if indexed_object is Expr.Ident(array_name, array_name_line):
+                    array_type: ValueType = lookup_type(local_scope, array_name)
+                    # A BORROWED darray (`darray[T]&`) indexes exactly like a local one once
+                    # its header address is loaded out of the parameter slot.
+                    borrowed_type: ValueType = darray_type_behind(local_scope, array_name, structs)
+                    if borrowed_type.kind == TypeKind.DArray and array_type.kind == TypeKind.Ref:
+                        if darray_address_of(local_scope, array_name, structs, ctx, builder) is borrowed_slot:
+                            if emit_darray_index_address(borrowed_slot, borrowed_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is borrowed_pointer:
+                                borrowed_element: ValueType = darray_element_of(borrowed_type, structs)
+                                borrowed_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(borrowed_element, structs, ctx), borrowed_pointer, "darray.elem")
+                                tag_disjoint_darray_access(borrowed_value, borrowed_pointer, runtime, ctx)
+                                return borrowed_value
+                        return null
+                    if lookup_slot(local_scope, array_name) is array_slot:
+                        # A darray indexes through its `items` pointer; a fixed array
+                        # indexes the storage directly.
+                        if array_type.kind == TypeKind.DArray:
+                            if emit_darray_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is darray_pointer:
+                                darray_element: ValueType = darray_element_of(array_type, structs)
+                                darray_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(darray_element, structs, ctx), darray_pointer, "darray.elem")
+                                tag_disjoint_darray_access(darray_value, darray_pointer, runtime, ctx)
+                                return darray_value
+                            return null
+                        # `a[i]` where `a: T[N]&` — a REF to a fixed array. The slot holds the
+                        # array's ADDRESS; load it and GEP in like a local array.
+                        if array_type.kind == TypeKind.Ref and ref_target_of(array_type, structs).kind == TypeKind.Array:
+                            ref_read_array_type: ValueType = ref_target_of(array_type, structs)
+                            ref_read_base: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), array_slot, "arr.ref.base")
+                            if emit_index_address(ref_read_base, ref_read_array_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ref_read_pointer:
+                                ref_read_element: ValueType = array_element_of(ref_read_array_type, structs)
+                                return LLVMBuildLoad2(builder, llvm_type_of(ref_read_element, structs, ctx), ref_read_pointer, "arr.ref.elem")
+                            return null
+                        # `p[i]` where `p: T&` is a ref to a NUMERIC scalar — a C-style pointer
+                        # base. Slice[T] reads its backing this way (`p: T& = s.base.cast[T&];
+                        # p[i]`). Scoped to numeric elements: a ref-to-struct (dict's
+                        # `items[i]` on a `DictBucket&`) is handled by the chain fallback below, and
+                        # a ref-to-array by the branch above. The loaded value is converted to the
+                        # surrounding context's expected type so it composes like any scalar read.
+                        if array_type.kind == TypeKind.Ref:
+                            scalar_ref_elem: ValueType = ref_target_of(array_type, structs)
+                            if scalar_ref_elem.kind == TypeKind.Signed or scalar_ref_elem.kind == TypeKind.Unsigned or scalar_ref_elem.kind == TypeKind.Float:
+                                scalar_ref_base: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), array_slot, "scalar.ref.base")
+                                if emit_expression(index_expression, ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scalar_ref_index:
+                                    scalar_ref_elem_llvm: LLVMTypeRef = llvm_type_of(scalar_ref_elem, structs, ctx)
+                                    scalar_ref_gep_indices: mutable darray[LLVMValueRef] = [scalar_ref_index]
+                                    scalar_ref_gep_pointer: void& = (&scalar_ref_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                                    scalar_ref_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, scalar_ref_elem_llvm, scalar_ref_base, scalar_ref_gep_pointer, 1, "scalar.ref.elem.ptr")
+                                    scalar_ref_value: LLVMValueRef = LLVMBuildLoad2(builder, scalar_ref_elem_llvm, scalar_ref_elem_ptr, "scalar.ref.elem")
+                                    return emit_conversion(scalar_ref_value, scalar_ref_elem, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != scalar_ref_elem.kind or expected.bits != scalar_ref_elem.bits) else scalar_ref_value
+                                return null
+                        # `found[0]` where `found: T&?` is an OPTIONAL ref to a numeric scalar
+                        # (`{i1, ptr}`), narrowed non-null by an earlier `null return if found ==
+                        # null`. Extract the payload ptr (field 1) and index it like a scalar ref.
+                        # index_map_find_index reads the dict's `usize&?` result this way.
+                        if array_type.kind == TypeKind.Optional:
+                            opt_ref_payload: ValueType = optional_payload_of(array_type, structs)
+                            if opt_ref_payload.kind == TypeKind.Ref:
+                                opt_ref_elem: ValueType = ref_target_of(opt_ref_payload, structs)
+                                if opt_ref_elem.kind == TypeKind.Signed or opt_ref_elem.kind == TypeKind.Unsigned or opt_ref_elem.kind == TypeKind.Float:
+                                    opt_ref_aggregate: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(array_type, structs, ctx), array_slot, "opt.ref.aggr")
+                                    opt_ref_base: LLVMValueRef = LLVMBuildExtractValue(builder, opt_ref_aggregate, 1, "opt.ref.base")
+                                    if emit_expression(index_expression, ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is opt_ref_index:
+                                        opt_ref_elem_llvm: LLVMTypeRef = llvm_type_of(opt_ref_elem, structs, ctx)
+                                        opt_ref_gep_indices: mutable darray[LLVMValueRef] = [opt_ref_index]
+                                        opt_ref_gep_pointer: void& = (&opt_ref_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                                        opt_ref_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, opt_ref_elem_llvm, opt_ref_base, opt_ref_gep_pointer, 1, "opt.ref.elem.ptr")
+                                        opt_ref_value: LLVMValueRef = LLVMBuildLoad2(builder, opt_ref_elem_llvm, opt_ref_elem_ptr, "opt.ref.elem")
+                                        return emit_conversion(opt_ref_value, opt_ref_elem, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != opt_ref_elem.kind or expected.bits != opt_ref_elem.bits) else opt_ref_value
+                                    return null
+                        null return if array_type.kind != TypeKind.Array
+                        if emit_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer:
+                            element_type: ValueType = array_element_of(array_type, structs)
+                            return LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), pointer, "elem")
+                # A darray reached through a struct FIELD (`b.items[i]`): resolve the header
+                # address via the _expr helper, then index like any darray.
+                field_darray_type: ValueType = darray_type_behind_expr(indexed_object, local_scope, structs)
+                if field_darray_type.kind == TypeKind.DArray:
+                    if darray_address_of_expr(indexed_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is field_darray_slot:
+                        if emit_darray_index_address(field_darray_slot, field_darray_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is field_darray_pointer:
+                            field_darray_element: ValueType = darray_element_of(field_darray_type, structs)
+                            field_darray_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(field_darray_element, structs, ctx), field_darray_pointer, "darray.elem")
+                            tag_disjoint_darray_access(field_darray_value, field_darray_pointer, runtime, ctx)
+                            return field_darray_value
+                    return null
+                # Any other receiver chain (`m[i][j]`, `s.grid[i]`): the chain resolver
+                # yields the ELEMENT's type and address; load through it.
+                chain_element_type: ValueType = struct_chain_type(expression, local_scope, structs)
+                if chain_element_type.kind == TypeKind.Unmodeled:
+                    return null
+                if struct_chain_address(expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is chain_element_address:
+                    return LLVMBuildLoad2(builder, llvm_type_of(chain_element_type, structs, ctx), chain_element_address, "elem")
+                return null
+
+            # `Point{x: 40, y: 2}` — build the value in a temporary slot, store each
+            # field, then load the whole struct back. mem2reg/SROA turn this into plain
+            # registers at -O2, so the temporary costs nothing in the output.
+            #
+            # Fields may be given by NAME or position (empty name). Start from a zero aggregate so omitted fields have
+            # the same deterministic default as stage0's aggregate construction.
+            if expression is Expr.Construct(construct_type, construct_fields, construct_line):
+                built_type: mutable ValueType = annotation_value_type(construct_type, structs)
+                null return if built_type.kind != TypeKind.Struct
+                struct_slot: usize = built_type.bits.usize()
+                # `StringView` is the named source spelling for the builtin `sview` ABI.
+                # Its field registry is useful for labelled construction, but the value must
+                # use the same anonymous `{ptr, i64}` LLVM type as every `sview` signature;
+                # returning `%StringView` where the function returns `{ptr, i64}` is invalid.
+                built_type <- ValueType{kind: TypeKind.SView, bits: 0} if structs.names[struct_slot] == "StringView"
+
+                struct_llvm: LLVMTypeRef = llvm_type_of(built_type, structs, ctx)
+                temporary: LLVMValueRef = LLVMBuildAlloca(builder, struct_llvm, "construct")
+                _ = LLVMBuildStore(builder, LLVMConstNull(struct_llvm), temporary)
+                declined: mutable bool = false
+                field_order: mutable u32 = 0
+                for field_init in construct_fields |declined, field_order, struct_slot, struct_llvm, temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    position: mutable i64 = field_index_of(structs, struct_slot, field_init.name)
+                    if field_init.name == "":
+                        position <- field_order.i64()
+                    field_order <- field_order + 1
+                    if position < 0:
+                        declined <- true
+                    else:
+                        field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
+                        if emit_expression(field_init.value, field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is field_value:
+                            _ = LLVMBuildStore(builder, field_value, LLVMBuildStructGEP2(builder, struct_llvm, temporary, position.u32(), "field.ptr"))
+                        else:
+                            declined <- true
+                null return if declined
+                return LLVMBuildLoad2(builder, struct_llvm, temporary, "constructed")
+
+            # Bitset flag read: `token.flags.has_suffix` — outer field is the packed u8,
+            # inner name is a 1-bit flag (stage0: load i8, and mask, icmp ne 0). For the
+            # self-host Token shape the only flag is bit 0 (`has_suffix`).
+            if expression is Expr.Field(flag_container, flag_name, flag_line):
+                if flag_container is Expr.Field(flag_owner, flag_field, flag_field_line):
+                    if flag_name == "has_suffix" or flag_name == "has_prefix":
+                        flag_bit: u64 = 0 if flag_name == "has_suffix" else 1
+                        flag_pack_type: ValueType = expression_type(flag_container, local_scope, fns, structs, generics)
+                        if flag_pack_type.kind == TypeKind.Unsigned:
+                            if emit_expression(flag_container, flag_pack_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is flag_pack:
+                                flag_mask: LLVMValueRef = LLVMConstInt(llvm_type_of(flag_pack_type, structs, ctx), 1.u64() << flag_bit, 0)
+                                flag_bits: LLVMValueRef = LLVMBuildAnd(builder, flag_pack, flag_mask, "bitset.and")
+                                flag_zero: LLVMValueRef = LLVMConstInt(llvm_type_of(flag_pack_type, structs, ctx), 0, 0)
+                                return LLVMBuildICmp(builder, 33, flag_bits, flag_zero, "bitset.test")
+                            return null
+            # `Color.Green` / `Lexer::TokenKind.Ident` — a CONST ENUM member is a constant of
+            # the enum's backing type: its declaration-order ordinal.
+            if expression is Expr.Field(enum_object, enum_variant, enum_field_line):
+                enum_type_name: mutable sview = ""
+                if enum_object is Expr.Ident(enum_ident_name, enum_ident_line):
+                    enum_type_name <- enum_ident_name
+                if enum_object is Expr.Scope(enum_mod_head, enum_mod_name, enum_mod_line):
+                    enum_type_name <- enum_mod_name
+                if enum_type_name != "":
+                    enum_slot: i64 = enum_index_of(structs, enum_type_name)
+                    if enum_slot >= 0:
+                        ordinal: i64 = enum_ordinal_of(structs, enum_slot.usize(), enum_variant)
+                        null return if ordinal < 0
+                        backing: ValueType = copied_type(structs.enum_backings[enum_slot.usize()])
+                        return LLVMConstInt(llvm_type_of(backing, structs, ctx), ordinal.u64(), 0)
+                    # `Opt.None` — a PAYLOAD-FREE variant of a payload enum, used as a bare
+                    # value rather than called. It is still the tagged union: the tag, with
+                    # the payload slot left zeroed.
+                    penum_slot_index: i64 = penum_index_of(structs, enum_type_name)
+                    if penum_slot_index >= 0:
+                        penum_tag: i64 = penum_variant_index(structs, penum_slot_index, enum_variant)
+                        null return if penum_tag < 0
+                        # A variant WITH a payload is a constructor and must be called; a
+                        # bare mention of one is not a value.
+                        null return if structs.penum_has_payload[structs.penum_variant_start[penum_slot_index.usize()] + penum_tag.usize()]
+                        penum_value_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: penum_slot_index.u32()}
+                        penum_llvm: LLVMTypeRef = llvm_type_of(penum_value_type, structs, ctx)
+                        penum_ctor_slot: LLVMValueRef = LLVMBuildAlloca(builder, penum_llvm, "enum.ctor")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(penum_llvm), penum_ctor_slot)
+                        penum_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, penum_llvm, penum_ctor_slot, 0, "enum.tag.ptr")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), penum_tag.u64(), 0), penum_tag_pointer)
+                        return LLVMBuildLoad2(builder, penum_llvm, penum_ctor_slot, "enum.value")
+                    # A payload-free recursive AST refinement variant (`Ast::Pattern.Wildcard`,
+                    # `Ast::Expr.Invalid`). Payload-bearing packed variants remain constructors
+                    # and must be called with their fields.
+                    #
+                    # This MUST allocate a store row, exactly as the constructor path does. A
+                    # packed value is an AoS row INDEX, and every reader resolves it with
+                    # `ctx_aos_store_record(state, handle)` before reading the tag. Returning the
+                    # variant's ORDINAL as if it were a handle — which is what this did — made
+                    # `Ast::Pattern.Wildcard` evaluate to 57, so readers fetched record #57: a
+                    # row that was never written, whose zeroed tag 0 matched no arm. The
+                    # exhaustive 14-arm match in `Parser.when_atom_pattern_illegal` then fell off
+                    # its end into the `unreachable`, which is why gen2 trapped on ANY `when`.
+                    packed_slot_index: i64 = packed_index_of(structs, enum_type_name)
+                    if packed_slot_index >= 0:
+                        packed_tag: i64 = packed_variant_index(structs, packed_slot_index, enum_variant)
+                        null return if packed_tag < 0
+                        packed_variant_slot: usize = structs.packed_variant_start[packed_slot_index.usize()] + packed_variant_local_index(structs, packed_slot_index, enum_variant).usize()
+                        null return if structs.packed_has_payload[packed_variant_slot]
+                        bare_store_index: i64 = packed_root_index_of(structs, packed_slot_index)
+                        null return if bare_store_index < 0
+                        null return if runtime.active_store_enum != bare_store_index
+                        bare_arena: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 0, "packed.arena")
+                        bare_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "packed.state")
+                        bare_alloc_args: mutable darray[LLVMValueRef] = [bare_arena, bare_state, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0)]
+                        if runtime.packed_mode == 2:
+                            bare_alloc_args <- [bare_arena, bare_state]
+                        bare_alloc_pointer: void& = (&bare_alloc_args[0]).cast[void&] can Unsafe.PointerCast
+                        bare_alloc_result: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_alloc_type, runtime.packed_alloc, bare_alloc_pointer, 2 if runtime.packed_mode == 2 else 3, "packed.variant.alloc")
+                        bare_row: LLVMValueRef = LLVMBuildExtractValue(builder, bare_alloc_result, 0, "packed.alloc.ptr")
+                        bare_handle_llvm: LLVMTypeRef = packed_row_llvm_type(structs, packed_slot_index, ctx)
+                        _ = LLVMBuildStore(builder, LLVMConstNull(bare_handle_llvm), bare_row)
+                        bare_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, bare_handle_llvm, bare_row, 0, "packed.tag.ptr")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0), bare_tag_pointer)
+                        return LLVMBuildExtractValue(builder, bare_alloc_result, 1, "packed.alloc.index")
+
+            # `xs.count` — read the darray header's count field.
+            if expression is Expr.Field(darray_object, darray_field, darray_field_line):
+                if true:
+                    darray_type: mutable ValueType = darray_type_behind_expr(darray_object, local_scope, structs)
+                    # The ordinary expression typer already resolves a darray field through
+                    # references and generic-struct bindings. Use it as a fallback for the
+                    # header accessor too; this keeps `map.entries.count` aligned with the
+                    # working `map.entries.reserve()` path.
+                    darray_type <- expression_type(darray_object, local_scope, fns, structs, generics) if darray_type.kind != TypeKind.DArray
+                    if darray_type.kind == TypeKind.DArray and darray_field == "count":
+                        if darray_address_of_expr(darray_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is darray_slot:
+                            count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), darray_slot, 1, "darray.count.ptr")
+                            return LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), count_pointer, "darray.count")
+
+            # `s.len` on an sview — field 1 of `{ptr, i64}`. (stage0 exposes `.len`, not
+            # `.count`, on a string view.)
+            if expression is Expr.Field(sview_object, sview_field, sview_field_line):
+                sview_recv_type: ValueType = expression_type(sview_object, local_scope, fns, structs, generics)
+                if sview_recv_type.kind == TypeKind.SView and (sview_field == "data" or sview_field == "len"):
+                    if emit_expression(sview_object, sview_recv_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_value:
+                        if sview_field == "data":
+                            return LLVMBuildExtractValue(builder, sview_value, 0, "sview.data")
+                        return LLVMBuildExtractValue(builder, sview_value, 1, "sview.len")
+            handled <- false
+            return null

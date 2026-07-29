@@ -1,0 +1,162 @@
+# Stage1 backend — `emit_expression`: the remaining binary operators.
+# A group of the expression emitter's branches, called from codegen_expression.elisa.
+# `handled` is set TRUE on entry and cleared only if no branch here matched, so a
+# branch that DECLINES (returns null) still stops the dispatch — exactly as it did
+# when every branch shared one function body.
+
+extend Backend:
+    private:
+        def emit_expression_binary_tail(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- true
+            if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
+                # `and`/`or` SHORT-CIRCUIT: the right side must only be emitted on the path
+                # that reaches it, so they cannot go through emit_binary.
+                if binary_operator == TokenKind.And or binary_operator == TokenKind.Or:
+                    return emit_short_circuit(binary_left, binary_operator, binary_right, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # The OPERANDS' type is not the result type: `a < b` yields bool but must
+                # compare at a's type. Take whichever side is known; a literal defers.
+                operand_type: mutable ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                if operand_type.kind == TypeKind.Unmodeled:
+                    operand_type <- expression_type(binary_right, local_scope, fns, structs, generics)
+                if operand_type.kind == TypeKind.Unmodeled:
+                    # Both sides are literals (`2 + 3`): fall back to the context, which
+                    # for a comparison is bool — so use i64 there.
+                    operand_type <- expected if is_numeric_type(expected) else ValueType{kind: TypeKind.Signed, bits: 64}
+                # `heap T& + int` / `- int` — RAW-pointer arithmetic: advance by `int` elements
+                # of T (a GEP at T's stride). The heap flag (not the kind) distinguishes this
+                # from a SAFE `T&`, which value-adds below. The arena allocator (arena.elisa)
+                # walks its backing store as `heap u8&`. A void pointee strides by bytes (i8).
+                if ref_is_heap_ref(operand_type, structs) and (binary_operator == TokenKind.Plus or binary_operator == TokenKind.Minus):
+                    heap_ptr_pointee: ValueType = ref_target_of(operand_type, structs)
+                    heap_ptr_stride: LLVMTypeRef = LLVMInt8TypeInContext(ctx) if heap_ptr_pointee.kind == TypeKind.Void else llvm_type_of(heap_ptr_pointee, structs, ctx)
+                    if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is heap_ptr_base:
+                        if emit_expression(binary_right, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is heap_ptr_offset:
+                            heap_ptr_index: LLVMValueRef = heap_ptr_offset if binary_operator == TokenKind.Plus else LLVMBuildNeg(builder, heap_ptr_offset, "heap.ptr.neg")
+                            heap_ptr_indices: mutable darray[LLVMValueRef] = [heap_ptr_index]
+                            heap_ptr_indices_pointer: void& = (&heap_ptr_indices[0]).cast[void&] can Unsafe.PointerCast
+                            return LLVMBuildGEP2(builder, heap_ptr_stride, heap_ptr_base, heap_ptr_indices_pointer, 1, "heap.ptr.arith")
+                        return null
+                    return null
+                # `ptr + int` / `ptr - int` on a BYTE pointer — `void&` or `u8&` — is pointer
+                # arithmetic (a GEP over i8), NOT a deref-then-add. The std's
+                # collections_void_from_data_at walks raw bytes as `data.cast[u8&] + offset`,
+                # and a `u8& + i8` emitted as an integer `add` is invalid IR that llc rejects
+                # outright (it also truncated the offset to i8, silently capping it at 255).
+                #
+                # `u8&` and `void&` ONLY — verified against stage0 across referents: u8 GEPs,
+                # while i8/u16/i32/u64/f64 all dereference and value-add. `u8&` is stage0's
+                # designated raw-byte-pointer type, and the asymmetry with `i8&` is deliberate,
+                # so this cannot be generalized to "any small integer referent".
+                byte_ptr_target: ValueType = ref_target_of(operand_type, structs)
+                is_byte_pointer: bool = byte_ptr_target.kind == TypeKind.Void or (byte_ptr_target.kind == TypeKind.Unsigned and byte_ptr_target.bits == 8)
+                if operand_type.kind == TypeKind.Ref and is_byte_pointer and (binary_operator == TokenKind.Plus or binary_operator == TokenKind.Minus):
+                    if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ptr_arith_base:
+                        if emit_expression(binary_right, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ptr_arith_offset:
+                            ptr_arith_index: LLVMValueRef = ptr_arith_offset if binary_operator == TokenKind.Plus else LLVMBuildNeg(builder, ptr_arith_offset, "ptr.neg")
+                            ptr_arith_indices: mutable darray[LLVMValueRef] = [ptr_arith_index]
+                            ptr_arith_indices_pointer: void& = (&ptr_arith_indices[0]).cast[void&] can Unsafe.PointerCast
+                            return LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), ptr_arith_base, ptr_arith_indices_pointer, 1, "ptr.arith")
+                        return null
+                    return null
+                # A ref operand auto-dereferences: compare/compute at its target type.
+                operand_type <- ref_target_of(operand_type, structs) if operand_type.kind == TypeKind.Ref
+                # `a == C.R` / `a != C.R` — a PAYLOAD-enum value equality. The value is a
+                # `{i32 tag, …}` aggregate, so compare the TAG fields (stage0 compares the
+                # ordinal). A payloadless plain enum is this representation, and equality is the
+                # one operation on it not already covered by match/ctor/return.
+                if operand_type.kind == TypeKind.PayloadEnum and (binary_operator == TokenKind.EqEq or binary_operator == TokenKind.BangEq):
+                    if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is penum_eq_left:
+                        if emit_expression(binary_right, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is penum_eq_right:
+                            penum_eq_left_tag: LLVMValueRef = LLVMBuildExtractValue(builder, penum_eq_left, 0, "penum.eq.ltag")
+                            penum_eq_right_tag: LLVMValueRef = LLVMBuildExtractValue(builder, penum_eq_right, 0, "penum.eq.rtag")
+                            penum_eq_value: LLVMValueRef = LLVMBuildICmp(builder, int_predicate_of(binary_operator), penum_eq_left_tag, penum_eq_right_tag, "penum.eq")
+                            penum_eq_result: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                            return emit_conversion(penum_eq_value, penum_eq_result, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != penum_eq_result.kind or expected.bits != penum_eq_result.bits) else penum_eq_value
+                        return null
+                    return null
+                # `cstr == cstr` / `cstr != cstr`: stage0 lowers to `ctx_streq(a, b)` (i64,
+                # nonzero = equal) — a CONTENT compare, not a pointer compare. Reduce it to an
+                # i64 `streq_code <op> 0` and reuse the ordinary integer-comparison machinery so
+                # the surrounding-context widening is identical. `==` is `streq != 0`, `!=` is
+                # `streq == 0` (the operator inverts against the zero test).
+                if operand_type.kind == TypeKind.CStr and (binary_operator == TokenKind.EqEq or binary_operator == TokenKind.BangEq):
+                    cstr_type: ValueType = ValueType{kind: TypeKind.CStr, bits: 0}
+                    if emit_expression(binary_left, cstr_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is streq_left:
+                        if emit_expression(binary_right, cstr_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is streq_right:
+                            streq_args: mutable darray[LLVMValueRef] = [streq_left, streq_right]
+                            streq_args_pointer: void& = (&streq_args[0]).cast[void&] can Unsafe.PointerCast
+                            streq_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.streq_type, runtime.streq, streq_args_pointer, 2, "streq")
+                            streq_inner_op: TokenKind = TokenKind.BangEq if binary_operator == TokenKind.EqEq else TokenKind.EqEq
+                            streq_zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)
+                            streq_int64: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                            streq_result_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                            if emit_binary(streq_inner_op, streq_code, streq_zero, streq_int64, structs, runtime.fast_math, ctx, builder) is streq_value:
+                                return emit_conversion(streq_value, streq_result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != streq_result_type.kind or expected.bits != streq_result_type.bits) else streq_value
+                            return null
+                        return null
+                    return null
+                # `sview == sview` / `!=`: `ctx_string_views_eq(a, b)` (BY VALUE, i64 nonzero =
+                # equal), then the same `code <op> 0` reduction as the cstr path.
+                if operand_type.kind == TypeKind.SView and (binary_operator == TokenKind.EqEq or binary_operator == TokenKind.BangEq):
+                    if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sveq_left:
+                        if emit_expression(binary_right, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sveq_right:
+                            sveq_args: mutable darray[LLVMValueRef] = [sveq_left, sveq_right]
+                            sveq_args_pointer: void& = (&sveq_args[0]).cast[void&] can Unsafe.PointerCast
+                            sveq_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, sveq_args_pointer, 2, "sview.eq")
+                            sveq_inner_op: TokenKind = TokenKind.BangEq if binary_operator == TokenKind.EqEq else TokenKind.EqEq
+                            sveq_zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)
+                            sveq_int64: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                            sveq_result_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                            if emit_binary(sveq_inner_op, sveq_code, sveq_zero, sveq_int64, structs, runtime.fast_math, ctx, builder) is sveq_value:
+                                return emit_conversion(sveq_value, sveq_result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != sveq_result_type.kind or expected.bits != sveq_result_type.bits) else sveq_value
+                            return null
+                        return null
+                    return null
+                # `bool == bool` / `bool != bool` compare as `icmp eq i1` (stage0's shape).
+                # Equality is the only bool operator; ordering/arithmetic on bool stays declined.
+                bool_equality: bool = operand_type.kind == TypeKind.Bool and (binary_operator == TokenKind.EqEq or binary_operator == TokenKind.BangEq)
+                null return if not is_numeric_type(operand_type) and not bool_equality
+                # A comparison/`is` operator yields `bool` regardless of the OPERAND type, so
+                # the value handed to the surrounding-context conversion is a bool, not an
+                # `operand_type`-width int. Widening it as if it were `operand_type` (e.g.
+                # `bool` <- `i64`) declines and strips the whole function.
+                result_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1} if int_predicate_of(binary_operator) >= 0 else operand_type
+                # Elisa's operation type is anchored by the left operand (stage0 converts
+                # the right operand to that type, then widens the result to the surrounding
+                # context if needed). This is observable for `i32 + i64`: the i64 is narrowed
+                # to i32 for the arithmetic, and the resulting i32 is widened at assignment.
+                # A REF operand auto-dereferences to its target, so compare the TARGET's
+                # width/kind, not the pointer (`total + a` where `a: i64&` from a dict `.get`
+                # binding must not read as a mixed-width Ref-vs-i64 mismatch).
+                left_own_raw: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                right_own_raw: ValueType = expression_type(binary_right, local_scope, fns, structs, generics)
+                left_own: ValueType = ref_target_of(left_own_raw, structs) if left_own_raw.kind == TypeKind.Ref else left_own_raw
+                right_own: ValueType = ref_target_of(right_own_raw, structs) if right_own_raw.kind == TypeKind.Ref else right_own_raw
+                if left_own.kind != TypeKind.Unmodeled and right_own.kind != TypeKind.Unmodeled:
+                    null return if left_own.kind != operand_type.kind or left_own.bits != operand_type.bits
+                    null return if not is_integer_type(left_own) and (right_own.kind != operand_type.kind or right_own.bits != operand_type.bits)
+                if emit_expression(binary_left, left_own if left_own.kind != TypeKind.Unmodeled else operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is left_raw:
+                    if emit_expression(binary_right, right_own if right_own.kind != TypeKind.Unmodeled else operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is right_raw:
+                        if left_own.kind == TypeKind.Unmodeled:
+                            if right_own.kind == TypeKind.Unmodeled:
+                                if emit_binary(binary_operator, left_raw, right_raw, operand_type, structs, runtime.fast_math, ctx, builder) is binary_value:
+                                    return emit_conversion(binary_value, result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != result_type.kind or expected.bits != result_type.bits) else binary_value
+                                return null
+                            if emit_conversion(right_raw, right_own, operand_type, structs, ctx, builder) is converted_right:
+                                if emit_binary(binary_operator, left_raw, converted_right, operand_type, structs, runtime.fast_math, ctx, builder) is binary_value:
+                                    return emit_conversion(binary_value, result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != result_type.kind or expected.bits != result_type.bits) else binary_value
+                                return null
+                            return null
+                        if emit_conversion(left_raw, left_own, operand_type, structs, ctx, builder) is converted_left:
+                            if right_own.kind == TypeKind.Unmodeled:
+                                if emit_binary(binary_operator, converted_left, right_raw, operand_type, structs, runtime.fast_math, ctx, builder) is binary_value:
+                                    return emit_conversion(binary_value, result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != result_type.kind or expected.bits != result_type.bits) else binary_value
+                                return null
+                            if emit_conversion(right_raw, right_own, operand_type, structs, ctx, builder) is converted_right:
+                                if emit_binary(binary_operator, converted_left, converted_right, operand_type, structs, runtime.fast_math, ctx, builder) is binary_value:
+                                    return emit_conversion(binary_value, result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != result_type.kind or expected.bits != result_type.bits) else binary_value
+                                return null
+                        return null
+                return null
+            handled <- false
+            return null

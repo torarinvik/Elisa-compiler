@@ -1,0 +1,145 @@
+# Stage1 backend — `emit_expression`: call expressions.
+# A group of the expression emitter's branches, called from codegen_expression.elisa.
+# `handled` is set TRUE on entry and cleared only if no branch here matched, so a
+# branch that DECLINES (returns null) still stops the dispatch — exactly as it did
+# when every branch shared one function body.
+
+extend Backend:
+    private:
+        def emit_expression_calls(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- true
+            # `p.x` — a field READ. Only a local struct receiver is modeled: the address
+            # comes from the local's slot, so there is no need to spill a temporary.
+            if expression is Expr.Field(field_object, field_name, field_line):
+                # The receiver may be a bare Ident (`p.x`) OR a nested field access
+                # (`o.i.v`), both addressed by struct_chain_address. Looks through a
+                # reference, so `p.x` works the same for `p: P` and `p: P&`.
+                object_type: mutable ValueType = struct_type_of_name(field_object_name, local_scope, structs) if field_object is Expr.Ident(field_object_name, field_object_line) else struct_chain_type(field_object, local_scope, structs)
+                object_type <- ref_target_of(object_type, structs) if object_type.kind == TypeKind.Ref
+                if object_type.kind == TypeKind.Optional:
+                    object_payload: ValueType = optional_payload_of(object_type, structs)
+                    object_type <- ref_target_of(object_payload, structs) if object_payload.kind == TypeKind.Ref and ref_is_heap_ref(object_payload, structs)
+                object_type <- arena_user_struct(structs) if object_type.kind == TypeKind.Arena
+                if object_type.kind == TypeKind.Struct:
+                    struct_slot: usize = object_type.bits.usize()
+                    position: i64 = field_index_of(structs, struct_slot, field_name)
+                    null return if position < 0
+                    if struct_chain_address(field_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is object_address:
+                        field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
+                        struct_llvm: LLVMTypeRef = llvm_type_of(object_type, structs, ctx)
+                        pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, struct_llvm, object_address, position.u32(), "field.ptr")
+                        # An OPTIONAL-REF field read where a plain ref is expected UNWRAPS the
+                        # payload pointer (field 1) — `mut_items_from_data(dst.data)` passes the
+                        # `void&?` field as a `void&`. Without this the whole {i1,ptr} is handed
+                        # over as the pointer (garbage → segfault).
+                        if field_type.kind == TypeKind.Optional and expected.kind == TypeKind.Ref:
+                            field_optional_payload: ValueType = optional_payload_of(field_type, structs)
+                            if field_optional_payload.kind == TypeKind.Ref:
+                                field_optional_llvm: LLVMTypeRef = llvm_type_of(field_type, structs, ctx)
+                                field_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, field_optional_llvm, pointer, 1, "field.unwrap.ptr")
+                                return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), field_payload_pointer, "field.unwrap")
+                        # A field passed where a REF is expected (`arena_dict_put(a, map.by_key,
+                        # …)` with a `mutable dict&` param): pass the field's ADDRESS, not its
+                        # loaded value — stage0 auto-addresses an lvalue arg for a ref param.
+                        # Without this the whole struct is passed by value and the callee reads
+                        # its bytes as a pointer (garbage → segfault). Mirrors the Ident case.
+                        if expected.kind == TypeKind.Ref and field_type.kind != TypeKind.Ref and field_type.kind != TypeKind.Optional:
+                            return pointer
+                        return LLVMBuildLoad2(builder, llvm_type_of(field_type, structs, ctx), pointer, "field")
+                    return null
+                # A struct-valued receiver with no address -- a call result (`mk().x`) or any
+                # temporary. Emit it as a value, SPILL to a temp, then GEP the field.
+                fallback_type: ValueType = expression_type(field_object, local_scope, fns, structs, generics)
+                if fallback_type.kind == TypeKind.Struct:
+                    fallback_slot: usize = fallback_type.bits.usize()
+                    fallback_position: i64 = field_index_of(structs, fallback_slot, field_name)
+                    null return if fallback_position < 0
+                    if emit_expression(field_object, fallback_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fallback_value:
+                        fallback_struct_llvm: LLVMTypeRef = llvm_type_of(fallback_type, structs, ctx)
+                        fallback_temp: LLVMValueRef = LLVMBuildAlloca(builder, fallback_struct_llvm, "field.recv.spill")
+                        _ = LLVMBuildStore(builder, fallback_value, fallback_temp)
+                        fallback_field_type: ValueType = structs.field_types[structs.field_start[fallback_slot] + fallback_position.usize()]
+                        fallback_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, fallback_struct_llvm, fallback_temp, fallback_position.u32(), "field.ptr")
+                        return LLVMBuildLoad2(builder, llvm_type_of(fallback_field_type, structs, ctx), fallback_ptr, "field")
+                    return null
+
+            if expression is Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
+                # Labels are preserved through call lowering. Payload-enum constructors use a
+                # label to identify their payload field; ordinary and generic calls reorder
+                # expressions against declared parameter names in emit_direct_call/
+                # emit_generic_call.
+                labelled: mutable bool = false
+                for argument_name in call_argument_names |labelled|:
+                    labelled <- true if argument_name != ""
+                if labelled:
+                    null return if not penum_ctor_labels_match(call_callee, call_argument_names, structs) and not packed_ctor_labels_match(call_callee, call_argument_names, structs)
+                # `x.u8()` is a CAST, not a call: postfix call unifies cast and UFCS, so a
+                # TYPE-NAME receiver-method is a conversion. A receiver-method that is NOT a
+                # type name falls through to emit_call, which resolves it as UFCS.
+                if call_callee is Expr.Field(cast_object, cast_name, cast_line):
+                    target_type: ValueType = scalar_type_of_name(cast_name)
+                    if target_type.kind != TypeKind.Unmodeled:
+                        null return if call_arguments.count != 0
+                        # The source's own type decides; only a bare literal receiver needs a
+                        # default, and `1.5.i64()` is not a form the subset needs to model.
+                        source_type: mutable ValueType = resolve_type(cast_object, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
+                        # A numeric cast whose receiver is a REFERENCE converts the POINTEE, not the
+                        # address: stage0's `p.i64()` on a `u8&` yields the byte, while converting
+                        # the pointer silently produced an address byte (a differential repro gave
+                        # 98 instead of 67). Load through the ref, then convert.
+                        if source_type.kind == TypeKind.Ref:
+                            cast_pointee: ValueType = ref_target_of(source_type, structs)
+                            if cast_pointee.kind == TypeKind.Signed or cast_pointee.kind == TypeKind.Unsigned or cast_pointee.kind == TypeKind.Float or cast_pointee.kind == TypeKind.Bool:
+                                if emit_expression(cast_object, source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cast_ref_pointer:
+                                    cast_loaded: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(cast_pointee, structs, ctx), cast_ref_pointer, "cast.deref")
+                                    return emit_conversion(cast_loaded, cast_pointee, target_type, structs, ctx, builder)
+                                return null
+                        if emit_expression(cast_object, source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is source_value:
+                            return emit_conversion(source_value, source_type, target_type, structs, ctx, builder)
+                        return null
+                # A call whose callee is a `fn(…)`-typed LOCAL/param (not a named function) is
+                # an indirect call through a function value — the tagged-pointer dispatch.
+                if call_callee is Expr.Ident(fn_local_name, fn_local_line):
+                    if lookup_type(local_scope, fn_local_name).kind == TypeKind.Fn:
+                        return emit_fn_value_call(call_callee, call_arguments, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                if call_callee is Expr.Ident(error_value_name, error_value_line) and expected.kind == TypeKind.ErrorUnion:
+                    if emit_error_union_call_value(error_value_name, call_arguments, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is error_union_value:
+                        return error_union_value
+                # `try f[K, V](args) else …` — the same error-union value, but with EXPLICIT
+                # type arguments, so the callee is an Index/IndexN rather than an Ident.
+                if expected.kind == TypeKind.ErrorUnion and call_callee is Expr.Index(eu_generic_callee, eu_generic_arg, eu_generic_line):
+                    if eu_generic_callee is Expr.Ident(eu_generic_name, eu_generic_name_line):
+                        eu_single_type: ValueType = annotation_value_type(eu_generic_arg, structs)
+                        if eu_single_type.kind != TypeKind.Unmodeled:
+                            eu_single_args: mutable darray[ValueType] = [eu_single_type]
+                            if emit_error_union_generic_call_value(eu_generic_name, eu_single_args, call_arguments, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is eu_single_value:
+                                return eu_single_value
+                if expected.kind == TypeKind.ErrorUnion and call_callee is Expr.IndexN(eu_multi_callee, eu_multi_args_exprs, eu_multi_line):
+                    if eu_multi_callee is Expr.Ident(eu_multi_name, eu_multi_name_line):
+                        eu_multi_types: mutable darray[ValueType] = []
+                        eu_multi_declined: mutable bool = false
+                        for eu_multi_arg in eu_multi_args_exprs |eu_multi_types, eu_multi_declined, structs|:
+                            eu_resolved: ValueType = annotation_value_type(eu_multi_arg, structs)
+                            eu_multi_declined <- true if eu_resolved.kind == TypeKind.Unmodeled
+                            eu_multi_types.push(eu_resolved)
+                        if not eu_multi_declined:
+                            if emit_error_union_generic_call_value(eu_multi_name, eu_multi_types, call_arguments, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is eu_multi_value:
+                                return eu_multi_value
+                if emit_clone_value_builtin(call_callee, call_arguments, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cloned_value:
+                    return cloned_value
+                if emit_clone_darray_builtin(call_callee, call_arguments, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cloned_darray:
+                    return cloned_darray
+                call_result_type: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+                if emit_call(call_callee, call_arguments, call_argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder) is call_value:
+                    # Parser helpers return `Expr?`, while recursive packed AST payloads
+                    # store a bare `Expr` handle. The optional tag is already validated by
+                    # the parser's control flow; pass only its handle into the packed row.
+                    if expected.kind == TypeKind.PackedEnum and call_result_type.kind == TypeKind.Optional:
+                        optional_call_payload: ValueType = optional_payload_of(call_result_type, structs)
+                        if optional_call_payload.kind == TypeKind.PackedEnum and optional_call_payload.bits == expected.bits:
+                            optional_call_llvm: LLVMTypeRef = llvm_type_of(call_result_type, structs, ctx)
+                            return LLVMBuildExtractValue(builder, call_value, 1, "optional.packed.handle")
+                    return call_value
+                return null
+            handled <- false
+            return null

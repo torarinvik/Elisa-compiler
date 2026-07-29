@@ -1,0 +1,325 @@
+# Stage1 backend — `emit_statement`: the `match` STATEMENT: optional, call and packed-AST scrutinees.
+# A group of the statement emitter's branches, called from codegen_statement.elisa.
+# `handled` is set TRUE on entry and cleared only if no branch here matched, so a branch
+# that DECLINES still stops the dispatch — exactly as it did when every branch shared one
+# function body.
+
+extend Backend:
+    private:
+        def emit_statement_match(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            handled <- true
+            # `for i in a..<b:` / `for i in a..=b:` over an integer range. Only the range
+            # forms are modeled: iterating a container needs the container ABI.
+            #
+            # Lowered as: i = a; head: i < b ? body : exit; body -> step: i = i + 1 -> head.
+            # The increment lives in its OWN block so `continue` can target it — jumping
+            # straight back to the head would skip the step and spin forever.
+            # STATEMENT-position `catch f(args):` — the parser lowers it to Stmt.Match
+            # whose scrutinee is the fallible CALL. Modeled when the callee is an ERROR
+            # fn: call through the out-param ABI, `code == 0` runs the success arm (a
+            # Binding pattern names the out value), a nonzero code is `ordinal + 1` and
+            # dispatches down the error arms; `error e:` / `_` is the catch-all. Arm
+            # bodies are full statement blocks (usually `return …`), joined at a done
+            # block for any arm left open.
+            if statement is Stmt.Match(stmt_match_scrutinee, stmt_match_arms, stmt_match_line):
+                EmitStatus.Declined return if stmt_match_arms.count < 1
+                # `match OPT: null: … binding: …` — a match whose scrutinee is an OPTIONAL value.
+                # Two arms: a `null` (or `_`) arm and a BINDING arm that binds the payload. Lowered
+                # like `if OPT is v:` but as a match: test the tag (field 0), branch to the binding
+                # arm (bind v = payload) or the null arm. IndexMap's put/find use exactly this.
+                match_opt_type: ValueType = expression_type(stmt_match_scrutinee, local_scope, fns, structs, generics)
+                if match_opt_type.kind == TypeKind.Optional and stmt_match_arms.count == 2:
+                    mo_payload_type: ValueType = optional_payload_of(match_opt_type, structs)
+                    mo_null_arm_index: mutable i64 = -1
+                    mo_bind_arm_index: mutable i64 = -1
+                    mo_bind_name: mutable sview = ""
+                    for mo_arm_i in 0..<stmt_match_arms.count |mo_null_arm_index, mo_bind_arm_index, mo_bind_name, stmt_match_arms|:
+                        mo_arm: MatchArm = stmt_match_arms[mo_arm_i]
+                        if mo_arm.pattern is Pattern.Literal(mo_lit_text):
+                            mo_null_arm_index <- mo_arm_i.i64() if mo_lit_text == "null"
+                        if mo_arm.pattern is Pattern.Wildcard:
+                            mo_null_arm_index <- mo_arm_i.i64() if mo_null_arm_index < 0
+                        if mo_arm.pattern is Pattern.Binding(mo_pat_name):
+                            mo_bind_arm_index <- mo_arm_i.i64()
+                            mo_bind_name <- mo_pat_name
+                    if mo_null_arm_index >= 0 and mo_bind_arm_index >= 0:
+                        # A guarded arm is not the plain null/binding split modeled here.
+                        if stmt_match_arms[mo_null_arm_index.usize()].guard is Expr.Absent and stmt_match_arms[mo_bind_arm_index.usize()].guard is Expr.Absent:
+                            if emit_expression(stmt_match_scrutinee, match_opt_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is mo_opt_value:
+                                mo_opt_llvm: LLVMTypeRef = llvm_type_of(match_opt_type, structs, ctx)
+                                mo_tag: LLVMValueRef = LLVMBuildExtractValue(builder, mo_opt_value, 0, "match.opt.tag")
+                                mo_payload: LLVMValueRef = LLVMBuildExtractValue(builder, mo_opt_value, 1, "match.opt.payload")
+                                mo_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                mo_bind_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mo_function, "match.opt.present")
+                                mo_null_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mo_function, "match.opt.absent")
+                                mo_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mo_function, "match.opt.done")
+                                _ = LLVMBuildCondBr(builder, mo_tag, mo_bind_block, mo_null_block)
+                                # PRESENT: bind the payload to the arm's name, run its body.
+                                LLVMPositionBuilderAtEnd(builder, mo_bind_block)
+                                mo_bind_storage: mutable darray[u8] = []
+                                mo_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(mo_payload_type, structs, ctx), sview_to_cstr(mo_bind_name, mo_bind_storage))
+                                _ = LLVMBuildStore(builder, mo_payload, mo_bind_slot)
+                                declare_local(local_scope, mo_bind_name, mo_bind_slot, mo_payload_type)
+                                mo_bind_status: EmitStatus = emit_statements(stmt_match_arms[mo_bind_arm_index.usize()].body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                EmitStatus.Declined return if mo_bind_status == EmitStatus.Declined
+                                branch_if_open(mo_bind_status, builder, mo_done_block)
+                                # ABSENT: run the null arm's body.
+                                LLVMPositionBuilderAtEnd(builder, mo_null_block)
+                                mo_null_status: EmitStatus = emit_statements(stmt_match_arms[mo_null_arm_index.usize()].body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                EmitStatus.Declined return if mo_null_status == EmitStatus.Declined
+                                branch_if_open(mo_null_status, builder, mo_done_block)
+                                LLVMPositionBuilderAtEnd(builder, mo_done_block)
+                                return EmitStatus.Open
+                            return EmitStatus.Declined
+                if stmt_match_scrutinee is Expr.Call(smc_callee, smc_args, smc_arg_names, smc_call_line):
+                    if smc_callee is Expr.Ident(smc_name, smc_name_line):
+                        EmitStatus.Declined return if not error_callee_is(fns, generics, smc_name)
+                        smc_value_type: ValueType = error_callee_value_type(smc_name, smc_args, local_scope, fns, structs, generics)
+                        EmitStatus.Declined return if smc_value_type.kind == TypeKind.Unmodeled
+                        if error_callee_target(smc_name, smc_args, local_scope, fns, structs, generics, m, ctx) is smc_target:
+                            smc_value_llvm: LLVMTypeRef = llvm_type_of(smc_value_type, structs, ctx)
+                            smc_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, smc_value_llvm, "catch.out")
+                            smc_call_args: mutable darray[LLVMValueRef] = [smc_out_slot]
+                            smc_declined: mutable bool = false
+                            smc_arg_index: mutable usize = 0
+                            for smc_arg in smc_args |smc_call_args, smc_declined, smc_arg_index, smc_name, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                if emit_expression(smc_arg, error_callee_param_type(smc_name, smc_args, smc_arg_index, local_scope, fns, structs, generics), local_scope, fns, structs, generics, runtime, m, ctx, builder) is smc_arg_value:
+                                    smc_call_args.push(smc_arg_value)
+                                else:
+                                    smc_declined <- true
+                                smc_arg_index <- smc_arg_index + 1
+                            EmitStatus.Declined return if smc_declined
+                            smc_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(smc_target)
+                            smc_args_pointer: void& = (&smc_call_args[0]).cast[void&] can Unsafe.PointerCast
+                            smc_code: LLVMValueRef = LLVMBuildCall2(builder, smc_fn_type, smc_target, smc_args_pointer, smc_call_args.count.u32(), "catch.code")
+                            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            smc_value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.value")
+                            smc_dispatch_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.dispatch")
+                            smc_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.done")
+                            smc_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, smc_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "catch.ok")
+                            _ = LLVMBuildCondBr(builder, smc_ok, smc_value_block, smc_dispatch_block)
+
+                            LLVMPositionBuilderAtEnd(builder, smc_value_block)
+                            smc_success: MatchArm = stmt_match_arms[0]
+                            EmitStatus.Declined return if arm_has_guard(smc_success.guard)
+                            if smc_success.pattern is Pattern.Binding(smc_success_binding):
+                                declare_local(local_scope, smc_success_binding, smc_out_slot, smc_value_type)
+                            smc_any_open: mutable bool = false
+                            smc_success_status: EmitStatus = emit_statements(smc_success.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                            EmitStatus.Declined return if smc_success_status == EmitStatus.Declined
+                            smc_any_open <- true if smc_success_status == EmitStatus.Open
+                            branch_if_open(smc_success_status, builder, smc_done_block)
+
+                            LLVMPositionBuilderAtEnd(builder, smc_dispatch_block)
+                            smc_arm_index: mutable usize = 1
+                            smc_error_declined: mutable bool = false
+                            smc_saw_catch_all: mutable bool = false
+                            while smc_arm_index < stmt_match_arms.count |smc_arm_index, smc_error_declined, smc_saw_catch_all, smc_any_open, stmt_match_arms, smc_code, smc_done_block, return_type, function, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                                smc_arm: MatchArm = stmt_match_arms[smc_arm_index]
+                                smc_arm_index <- smc_arm_index + 1
+                                continue if smc_error_declined or smc_saw_catch_all
+                                if arm_has_guard(smc_arm.guard):
+                                    smc_error_declined <- true
+                                    continue
+                                # `error e:` (TypeBind) and `_` are both the CATCH-ALL: run
+                                # the body in the current dispatch block. The binder is NOT
+                                # declared — a body that reads `e` declines on the unknown
+                                # ident rather than seeing a wrong value.
+                                smc_is_catch_all: mutable bool = false
+                                if smc_arm.pattern is Pattern.Wildcard:
+                                    smc_is_catch_all <- true
+                                if smc_arm.pattern is Pattern.TypeBind(smc_type_name, smc_binder):
+                                    smc_is_catch_all <- true if smc_type_name == "error"
+                                if smc_is_catch_all:
+                                    smc_all_status: EmitStatus = emit_statements(smc_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                    if smc_all_status == EmitStatus.Declined:
+                                        smc_error_declined <- true
+                                        continue
+                                    smc_any_open <- true if smc_all_status == EmitStatus.Open
+                                    branch_if_open(smc_all_status, builder, smc_done_block)
+                                    smc_saw_catch_all <- true
+                                    continue
+                                if smc_arm.pattern is Pattern.Variant(smc_path, smc_fields):
+                                    if smc_fields.count != 0:
+                                        smc_error_declined <- true
+                                        continue
+                                    smc_ordinal: mutable i64 = penum_variant_index_of_path(smc_path, structs)
+                                    if smc_ordinal < 0:
+                                        smc_ordinal <- ordinal_of_dotted_path(smc_path, structs)
+                                    if smc_ordinal < 0:
+                                        smc_error_declined <- true
+                                        continue
+                                    smc_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.arm")
+                                    smc_next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.next")
+                                    smc_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, smc_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), (smc_ordinal + 1).u64(), 0), "catch.cmp")
+                                    _ = LLVMBuildCondBr(builder, smc_hit, smc_arm_block, smc_next_block)
+                                    LLVMPositionBuilderAtEnd(builder, smc_arm_block)
+                                    smc_arm_status: EmitStatus = emit_statements(smc_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                    if smc_arm_status == EmitStatus.Declined:
+                                        smc_error_declined <- true
+                                        continue
+                                    smc_any_open <- true if smc_arm_status == EmitStatus.Open
+                                    branch_if_open(smc_arm_status, builder, smc_done_block)
+                                    LLVMPositionBuilderAtEnd(builder, smc_next_block)
+                                    continue
+                                smc_error_declined <- true
+                            EmitStatus.Declined return if smc_error_declined
+                            if not smc_saw_catch_all:
+                                _ = LLVMBuildUnreachable(builder)
+                            LLVMPositionBuilderAtEnd(builder, smc_done_block)
+                            # Every arm returned: the done block has no predecessors, so the
+                            # whole catch is a TERMINATOR (terminate the dead block too).
+                            if not smc_any_open:
+                                _ = LLVMBuildUnreachable(builder)
+                                return EmitStatus.Terminated
+                            return EmitStatus.Open
+                # A `match SCRUTINEE:` STATEMENT over a PACKED AST node (Expr/Stmt/Decl/Pattern over
+                # the Node store) — mirrors emit_expression's packed arm reads but with STATEMENT arm
+                # bodies. Handles `T.Variant(binders):` and `T.A(b)|T.B(b):` (OR, same payload layout)
+                # and `_`; binders may be Binding or Wildcard; guards supported; AST-root only.
+                spm_type: ValueType = resolve_type(stmt_match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
+                if spm_type.kind == TypeKind.PackedEnum and runtime.packed_mode == 2:
+                    spm_root: i64 = packed_root_index_of(structs, spm_type.bits.i64())
+                    EmitStatus.Declined return if runtime.active_store_enum != spm_root
+                    EmitStatus.Declined return if not packed_is_ast_root(structs, spm_root)
+                    if emit_expression(stmt_match_scrutinee, spm_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is spm_index_value:
+                        spm_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        spm_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "spm.state")
+                        spm_index64: LLVMValueRef = LLVMBuildZExt(builder, spm_index_value, LLVMInt64TypeInContext(ctx), "spm.index")
+                        spm_record_args: mutable darray[LLVMValueRef] = [spm_state, spm_index64]
+                        spm_record_pointer: void& = (&spm_record_args[0]).cast[void&] can Unsafe.PointerCast
+                        spm_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_record_pointer, 2, "spm.record")
+                        spm_row_type: LLVMTypeRef = packed_row_llvm_type(structs, spm_type.bits.i64(), ctx)
+                        spm_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_row_type, spm_record, 0, "spm.tag.ptr")
+                        spm_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), spm_tag_pointer, "spm.tag")
+                        spm_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.done")
+                        spm_declined: mutable bool = false
+                        spm_saw_default: mutable bool = false
+                        spm_any_open: mutable bool = false
+                        for spm_arm in stmt_match_arms |spm_declined, spm_saw_default, spm_any_open, spm_type, spm_record, spm_row_type, spm_tag, spm_function, spm_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                            continue if spm_declined or spm_saw_default
+                            if arm_has_guard(spm_arm.guard) and is_catch_all_pattern(spm_arm.pattern):
+                                spm_declined <- true
+                                continue
+                            spm_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.arm")
+                            if is_catch_all_pattern(spm_arm.pattern):
+                                _ = LLVMBuildBr(builder, spm_arm_block)
+                                LLVMPositionBuilderAtEnd(builder, spm_arm_block)
+                                spm_default_status: EmitStatus = emit_statements(spm_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                spm_declined <- true if spm_default_status == EmitStatus.Declined
+                                spm_any_open <- true if spm_default_status == EmitStatus.Open
+                                branch_if_open(spm_default_status, builder, spm_done)
+                                spm_saw_default <- true if spm_default_status != EmitStatus.Declined
+                                continue
+                            spm_ordinals: mutable darray[i64] = []
+                            spm_slot: mutable i64 = -1
+                            spm_fields: mutable darray[Pattern] = []
+                            spm_arm_ok: mutable bool = false
+                            if spm_arm.pattern is Pattern.Variant(spm_path, spm_v_fields):
+                                spm_v_ord: i64 = packed_variant_index_of_path(spm_path, structs)
+                                spm_v_slot: i64 = packed_slot_of_path(spm_path, structs)
+                                if spm_v_ord >= 0 and spm_v_slot >= 0:
+                                    spm_ordinals.push(spm_v_ord)
+                                    spm_slot <- spm_v_slot
+                                    spm_fields <- spm_v_fields
+                                    spm_arm_ok <- true
+                            if spm_arm.pattern is Pattern.Or(spm_or_opts):
+                                spm_or_ok: mutable bool = spm_or_opts.count > 0
+                                spm_ref_payload: mutable ValueType = unmodeled_type()
+                                spm_ref_slot: mutable i64 = -1
+                                for spm_opt in spm_or_opts |spm_or_ok, spm_ordinals, spm_slot, spm_fields, spm_ref_payload, spm_ref_slot, structs|:
+                                    if spm_opt is Pattern.Variant(spm_opt_path, spm_opt_fields):
+                                        spm_opt_ord: i64 = packed_variant_index_of_path(spm_opt_path, structs)
+                                        spm_opt_slot: i64 = packed_slot_of_path(spm_opt_path, structs)
+                                        if spm_opt_ord < 0 or spm_opt_slot < 0 or not structs.packed_has_payload[spm_opt_slot.usize()]:
+                                            spm_or_ok <- false
+                                        else:
+                                            spm_opt_payload: ValueType = copied_type(structs.packed_payloads[spm_opt_slot.usize()])
+                                            if spm_ref_payload.kind == TypeKind.Unmodeled:
+                                                spm_ref_payload <- spm_opt_payload
+                                                spm_ref_slot <- spm_opt_slot
+                                                spm_slot <- spm_opt_slot
+                                                spm_fields <- spm_opt_fields
+                                            else:
+                                                spm_or_ok <- false if not packed_slots_same_field_layout(spm_ref_slot, spm_opt_slot, structs)
+                                            spm_ordinals.push(spm_opt_ord)
+                                    else:
+                                        spm_or_ok <- false
+                                spm_arm_ok <- true if spm_or_ok and spm_slot >= 0
+                            if not spm_arm_ok:
+                                spm_declined <- true
+                                continue
+                            if true:
+                                spm_all_binders: mutable bool = true
+                                for spm_bf in spm_fields |spm_all_binders|:
+                                    spm_all_binders <- false if not (spm_bf is Pattern.Binding(spm_bf_name)) and not (spm_bf is Pattern.Wildcard)
+                                if not spm_all_binders:
+                                    spm_declined <- true
+                                    continue
+                                spm_next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.next")
+                                spm_hit: mutable LLVMValueRef = zeroed
+                                spm_hit_first: mutable bool = true
+                                for spm_ord in spm_ordinals |spm_hit, spm_hit_first, spm_tag, ctx, builder|:
+                                    spm_cmp: LLVMValueRef = LLVMBuildICmp(builder, 32, spm_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), spm_ord.u64(), 0), "spm.cmp")
+                                    if spm_hit_first:
+                                        spm_hit <- spm_cmp
+                                        spm_hit_first <- false
+                                    else:
+                                        spm_hit <- LLVMBuildOr(builder, spm_hit, spm_cmp, "spm.or")
+                                _ = LLVMBuildCondBr(builder, spm_hit, spm_arm_block, spm_next_block)
+                                LLVMPositionBuilderAtEnd(builder, spm_arm_block)
+                                if spm_fields.count > 0 and structs.packed_has_payload[spm_slot.usize()]:
+                                    spm_payload: ValueType = copied_type(structs.packed_payloads[spm_slot.usize()])
+                                    if spm_payload.kind == TypeKind.Unmodeled:
+                                        spm_declined <- true
+                                    else:
+                                        spm_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_row_type, spm_record, 1, "spm.payload.ptr")
+                                        spm_payload_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(spm_payload, structs, ctx), spm_payload_pointer, "spm.payload")
+                                        spm_field_start: usize = structs.packed_field_type_start[spm_slot.usize()]
+                                        if spm_fields.count == 1:
+                                            if spm_fields[0] is Pattern.Binding(spm_single_name):
+                                                spm_single_storage: mutable darray[u8] = []
+                                                spm_single_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_payload, structs, ctx), sview_to_cstr(spm_single_name, spm_single_storage))
+                                                _ = LLVMBuildStore(builder, spm_payload_value, spm_single_slot)
+                                                declare_local(local_scope, spm_single_name, spm_single_slot, spm_payload)
+                                        if spm_fields.count > 1:
+                                            for spm_bind_index in 0..<spm_fields.count |spm_fields, spm_field_start, spm_payload_value, structs, local_scope, ctx, builder|:
+                                                if spm_fields[spm_bind_index] is Pattern.Binding(spm_multi_name):
+                                                    spm_multi_type: ValueType = copied_type(structs.packed_field_types[spm_field_start + spm_bind_index])
+                                                    spm_multi_field: LLVMValueRef = LLVMBuildExtractValue(builder, spm_payload_value, spm_bind_index.u32(), "spm.field")
+                                                    spm_multi_storage: mutable darray[u8] = []
+                                                    spm_multi_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_multi_type, structs, ctx), sview_to_cstr(spm_multi_name, spm_multi_storage))
+                                                    _ = LLVMBuildStore(builder, spm_multi_field, spm_multi_slot)
+                                                    declare_local(local_scope, spm_multi_name, spm_multi_slot, spm_multi_type)
+                                if not spm_declined and arm_has_guard(spm_arm.guard):
+                                    if emit_condition(spm_arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is spm_guard_bit:
+                                        spm_guard_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.guard")
+                                        _ = LLVMBuildCondBr(builder, spm_guard_bit, spm_guard_body, spm_next_block)
+                                        LLVMPositionBuilderAtEnd(builder, spm_guard_body)
+                                    else:
+                                        spm_declined <- true
+                                if spm_declined:
+                                    LLVMPositionBuilderAtEnd(builder, spm_next_block)
+                                else:
+                                    spm_arm_status: EmitStatus = emit_statements(spm_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                    spm_declined <- true if spm_arm_status == EmitStatus.Declined
+                                    spm_any_open <- true if spm_arm_status == EmitStatus.Open
+                                    branch_if_open(spm_arm_status, builder, spm_done)
+                                    LLVMPositionBuilderAtEnd(builder, spm_next_block)
+                        EmitStatus.Declined return if spm_declined
+                        if not spm_saw_default:
+                            _ = LLVMBuildUnreachable(builder)
+                        LLVMPositionBuilderAtEnd(builder, spm_done)
+                        if not spm_any_open:
+                            _ = LLVMBuildUnreachable(builder)
+                            return EmitStatus.Terminated
+                        return EmitStatus.Open
+                    return EmitStatus.Declined
+
+                # Integer / const-enum / cstr / sview / payload-enum scrutinees — the
+                # remaining shapes, split into codegen_stmt_match_scalar.elisa. It returns
+                # Declined for a shape it does not model, exactly as this branch's tail did.
+                match_scalar_handled: mutable bool = false
+                return emit_statement_match_scalar(stmt_match_scrutinee, stmt_match_arms, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, match_scalar_handled)
+            handled <- false
+            return EmitStatus.Declined
