@@ -252,6 +252,34 @@ def main() -> i64:
 EOF
 )" 79
 
+# 9. `xs.items` — the darray header's element-storage POINTER. stage1 typed it Unmodeled
+#    (only `.count` was known), so `assert s.indices.items != null` declined and DROPPED
+#    every std function guarding its storage that way. Both branches are exercised: an
+#    empty darray has no storage, a pushed one does, so a constant-folded answer fails.
+differential darray_items_pointer "$(cat <<'EOF'
+struct Store:
+    indices: mutable darray[usize]
+
+
+def has_storage(s: Store&) -> bool:
+    return s.indices.items != null
+
+
+def probe(s: Store&) -> i64:
+    assert s.indices.items != null
+    assert s.indices.count > 0
+    return 4
+
+
+def main() -> i64:
+    empty: mutable Store = Store{indices: []}
+    filled: mutable Store = Store{indices: []}
+    filled.indices.push(1.usize())
+    empty_flag: i64 = 1 if has_storage(empty) else 0
+    return probe(filled) * 10 + empty_flag
+EOF
+)" 40
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
