@@ -711,6 +711,35 @@ def main() -> i64:
 EOF
 )" 42
 
+# 28. Field access through a PLAIN (non-heap) optional ref. The optional field paths were
+#     scoped to `heap T&?` for want of a stage0 precedent; stores_rows supplies one with
+#     `&variant_rows.rows` on a `PackedStoreVariantRows&?`, which stage0 compiles. Reads
+#     the SECOND field both by value and by address, and weights it so a chain that lands
+#     on the FIRST field (100) answers 700 rather than 42.
+differential field_through_plain_optional_ref "$(cat <<'EOF'
+struct Pair:
+    first: mutable i64
+    second: mutable i64
+
+
+def read_second(p: Pair&?) -> i64 can[Abort.Panic]:
+    assert p != null
+    return p.second
+
+
+def second_addr(p: Pair&?) -> i64 can[Abort.Panic]:
+    assert p != null
+    slot: i64& = &p.second
+    return slot
+
+
+def main() -> i64:
+    can Abort.Panic:
+        pair: mutable Pair = Pair{first: 100, second: 6}
+        return read_second(&pair) * 6 + second_addr(&pair)
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
