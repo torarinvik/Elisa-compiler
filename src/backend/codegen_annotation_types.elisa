@@ -1,0 +1,335 @@
+# Stage1 backend — resolving a TYPE ANNOTATION to a ValueType, and lowering a ValueType to its LLVM type.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # A Fn ValueType carrying `return_type` + `param_types` in the parallel side-pools at
+        # `bits` (fn_pool_returns and the fn_pool_param_* span are index-parallel).
+        def intern_fn_type(return_type: ValueType, param_types: darray[ValueType]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            structs.fn_pool_returns.push(return_type)
+            structs.fn_pool_param_start.push(structs.fn_pool_params.count)
+            structs.fn_pool_param_count.push(param_types.count)
+            for param_type in param_types |structs|:
+                structs.fn_pool_params.push(copied_type(param_type))
+            return ValueType{kind: TypeKind.Fn, bits: (structs.fn_pool_returns.count - 1).u32()}
+
+        # The RETURN type a Fn value produces when called, or Unmodeled if unknown.
+        def fn_return_type_of(fn_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if fn_type.kind != TypeKind.Fn
+            unmodeled_type() return if fn_type.bits.usize() >= structs.fn_pool_returns.count
+            return copied_type(structs.fn_pool_returns[fn_type.bits.usize()])
+
+        def annotation_unary_value_type(qualifier: TokenKind, qualified_type: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+                # `mutable T` — a QUALIFIER, not part of the type: mutability is the
+                # frontend's business, so the underlying type is what matters.
+                if qualifier == TokenKind.Mutable:
+                    return annotation_value_type(qualified_type, structs)
+                # `lmut T` — linear-mutable exclusive access (docs/120). ABI is a pointer to T,
+                # same as `T&` / provenance-bearing params; stage0 lowers it as a reference.
+                # Without this the qualifier fell through to Unmodeled and every `lmut Parser`
+                # / `lmut Lexer` signature in the self-host corpus was declined.
+                if qualifier == TokenKind.Lmut:
+                    lmut_target: ValueType = annotation_value_type(qualified_type, structs)
+                    unmodeled_type() return if lmut_target.kind == TypeKind.Unmodeled
+                    # `lmut T&` is already a ref; do not double-wrap.
+                    if lmut_target.kind == TypeKind.Ref:
+                        return lmut_target
+                    return intern_ref_type(lmut_target, structs)
+                # `heap T` / `stack T` — a STORAGE qualifier the region checker uses. `stack` is
+                # transparent (representation-identical). `heap T&` marks a RAW pointer: keep it
+                # a Ref (same `ptr`, same deref/field/index) but flag it heap so `+`/`-` become
+                # pointer arithmetic — the arena allocator walks its backing store this way.
+                if qualifier == TokenKind.Stack:
+                    return annotation_value_type(qualified_type, structs)
+                if qualifier == TokenKind.Heap:
+                    heap_qualified: ValueType = annotation_value_type(qualified_type, structs)
+                    if heap_qualified.kind == TypeKind.Ref:
+                        return intern_heap_ref_type(ref_target_of(heap_qualified, structs), structs)
+                    # `heap T&?` nests the `?` INSIDE the `heap` qualifier, so the recursion
+                    # hands back an Optional and the heap flag would be dropped on the way
+                    # out — leaving the payload an ordinary (never-null) ref, which is what
+                    # made `malloc`'s null result wrap as PRESENT. Re-intern through the
+                    # optional so the heap-ness survives.
+                    if heap_qualified.kind == TypeKind.Optional:
+                        heap_payload: ValueType = optional_payload_of(heap_qualified, structs)
+                        if heap_payload.kind == TypeKind.Ref:
+                            return intern_optional_type(intern_heap_ref_type(ref_target_of(heap_payload, structs), structs), structs)
+                    return heap_qualified
+                # `T&` — a POSTFIX unary in the AST (the parser distinguishes it from infix
+                # bitwise-and by looking past the whole `&` run).
+                if qualifier == TokenKind.Ampersand:
+                    return intern_ref_type(annotation_value_type(qualified_type, structs), structs)
+                # `T?` — also a postfix unary.
+                if qualifier == TokenKind.Question:
+                    return intern_optional_type(annotation_value_type(qualified_type, structs), structs)
+                # `tail T` — a flexible/tail array member (the inline data at a struct's end).
+                # stage0 lays it out as a plain `ptr`; model it as a heap ref to T (a `ptr` of
+                # pointer stride), so a struct carrying one gets a body and the right size.
+                if qualifier == TokenKind.Tail:
+                    return intern_heap_ref_type(annotation_value_type(qualified_type, structs), structs)
+                return unmodeled_type()
+
+
+		def annotation_index_store_value_type(array_head: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            if array_head is Expr.Field(store_enum_expr, store_member, store_member_line):
+                if store_enum_expr is Expr.Ident(store_enum_name, store_enum_line):
+                    if store_member == "Store":
+                        store_index: i64 = packed_index_of(structs, store_enum_name)
+                        ValueType{kind: TypeKind.PackedStore, bits: store_index.u32()} return if store_index >= 0
+            return unmodeled_type()
+
+
+		def annotation_index_fixed_value_type(array_head: Expr, array_extent: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            if array_extent is Expr.IntLit(extent_value):
+                element: ValueType = annotation_value_type(array_head, structs)
+                unmodeled_type() return if element.kind == TypeKind.Unmodeled
+                unmodeled_type() return if extent_value <= 0
+                return intern_array_type(element, extent_value.u32(), structs)
+            return unmodeled_type()
+
+
+		def annotation_index_named_value_type(array_head: Expr, container_name: sview, array_extent: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            if array_extent is Expr.IntLit(enum_array_extent):
+                enum_array_slot: i64 = enum_index_of(structs, container_name)
+                if enum_array_slot >= 0:
+                    enum_array_backing: ValueType = copied_type(structs.enum_backings[enum_array_slot.usize()])
+                    intern_array_type(enum_array_backing, enum_array_extent.u32(), structs) return if enum_array_extent > 0
+            if container_name == "GuestVAddr" or container_name == "HostPtr" or container_name == "NativeMappedGuestPtr":
+                if array_extent is Expr.Ident(carrier_layout, carrier_layout_line):
+                    return intern_guest_carrier(carrier_layout, structs)
+                return unmodeled_type()
+            if container_name == "darray":
+                darray_element: mutable ValueType = annotation_value_type(array_extent, structs)
+                if array_extent is Expr.Ident(darray_opaque_name, darray_opaque_line):
+                    darray_element <- ValueType{kind: TypeKind.CStr, bits: 0} if llvm_opaque_handle_name(darray_opaque_name)
+                unmodeled_type() return if darray_element.kind == TypeKind.Unmodeled
+                unmodeled_type() return if darray_element.kind == TypeKind.Array
+                return intern_darray_type(darray_element, structs)
+            if container_name == "view":
+                view_element: ValueType = annotation_value_type(array_extent, structs)
+                unmodeled_type() return if view_element.kind == TypeKind.Unmodeled
+                return intern_view_type(view_element, structs)
+            if array_extent is Expr.IntLit(extent_value):
+                element: ValueType = annotation_value_type(array_head, structs)
+                unmodeled_type() return if element.kind == TypeKind.Unmodeled
+                unmodeled_type() return if extent_value <= 0
+                return intern_array_type(element, extent_value.u32(), structs)
+            mapped_generic_base: sview = "DynSet" if container_name == "set" else container_name
+            if generic_struct_index_of(structs, mapped_generic_base) >= 0:
+                single_argument: ValueType = annotation_value_type(array_extent, structs)
+                single_argument_list: mutable darray[ValueType] = [single_argument]
+                return instantiate_generic_struct(mapped_generic_base, single_argument_list, structs)
+            return unmodeled_type()
+
+
+		def annotation_index_value_type(array_head: Expr, array_extent: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            return match array_head:
+                Expr.Field(_, _, _): annotation_index_store_value_type(array_head, structs)
+                Expr.Ident(container_name, container_line): annotation_index_named_value_type(array_head, container_name, array_extent, structs)
+                _: annotation_index_fixed_value_type(array_head, array_extent, structs)
+
+
+		def annotation_tuple_value_type(tuple_type_elements: darray[Expr], tuple_type_line: i64, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+			tuple_labels: darray[sview] = tuple_labels_at(tuple_type_line, structs)
+			unmodeled_type() return if tuple_type_elements.count == 0 or tuple_labels.count != tuple_type_elements.count
+			tuple_element_types: mutable darray[ValueType] = []
+			tuple_declined: mutable bool = false
+			for tuple_element in tuple_type_elements |tuple_element_types, tuple_declined, structs|:
+				tuple_element_type: ValueType = annotation_value_type(tuple_element, structs)
+				tuple_declined <- true if tuple_element_type.kind == TypeKind.Unmodeled
+				tuple_element_types.push(tuple_element_type)
+			unmodeled_type() return if tuple_declined
+			tuple_slot: i64 = tuple_struct_lookup(tuple_labels, tuple_element_types, structs)
+			ValueType{kind: TypeKind.Struct, bits: tuple_slot.u32()} return if tuple_slot >= 0
+			return unmodeled_type()
+
+
+        def annotation_application_value_type(application_head: Expr, application_args: darray[Expr], structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            return match application_head:
+                Expr.Ident(application_name, application_name_line): annotation_application_ident_value_type(application_name, application_args, structs)
+                _: unmodeled_type()
+
+
+        def annotation_application_ident_value_type(application_name: sview, application_args: darray[Expr], structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            if application_args.count == 2 and application_args[0] is Expr.Ident(enum_array_name, enum_array_line) and application_args[1] is Expr.IntLit(enum_array_extent):
+                enum_array_slot: i64 = enum_index_of(structs, enum_array_name)
+                if enum_array_slot >= 0:
+                    enum_array_backing: ValueType = copied_type(structs.enum_backings[enum_array_slot.usize()])
+                    intern_array_type(enum_array_backing, enum_array_extent.u32(), structs) return if enum_array_extent > 0
+            # `array[T, N]` — the explicit fixed-array spelling (stage0 accepts it
+            # alongside the canonical `T[N]`). Element type in arg 0, extent literal in
+            # arg 1; resolves to the same interned Array type as `T[N]`.
+            if application_name == "array" and application_args.count == 2:
+                array_n_element: ValueType = annotation_value_type(application_args[0], structs)
+                unmodeled_type() return if array_n_element.kind == TypeKind.Unmodeled
+                if application_args[1] is Expr.IntLit(array_n_extent):
+                    unmodeled_type() return if array_n_extent <= 0
+                    return intern_array_type(array_n_element, array_n_extent.u32(), structs)
+                return unmodeled_type()
+            return annotation_application_generic_value_type(application_name, application_args, structs)
+
+
+        def annotation_application_generic_value_type(application_name: sview, application_args: darray[Expr], structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            resolved_base: sview = "DynDict" if application_name == "dict" else ("DynSet" if application_name == "set" else application_name)
+            if generic_struct_index_of(structs, resolved_base) >= 0:
+                argument_types: mutable darray[ValueType] = []
+                application_declined: mutable bool = false
+                for argument_expression in application_args |argument_types, application_declined, structs|:
+                    argument_type: ValueType = annotation_value_type(argument_expression, structs)
+                    application_declined <- true if argument_type.kind == TypeKind.Unmodeled
+                    argument_types.push(argument_type)
+                unmodeled_type() return if application_declined
+                return instantiate_generic_struct(resolved_base, argument_types, structs)
+            return unmodeled_type()
+
+
+        def annotation_scope_value_type(type_scope_head: Expr, type_scope_name: sview, type_scope_line: i64, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            # `Lexer::Token` / `M::T` — module-qualified type name. Stage1 registers
+            # nested types under their bare name; the qualifier is only a namespace path.
+            return match type_scope_head:
+                Expr.Ident(type_module_name, type_module_line): annotation_value_type(Expr.Ident(type_scope_name, type_scope_line), structs)
+                _: unmodeled_type()
+
+
+		def annotation_ident_value_type(type_name: sview, type_line: i64, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+			# A TYPE PARAMETER shadows everything: inside an instantiation of
+			# `identity[T]` with T=i64, the annotation `T` denotes i64.
+			bound: ValueType = bound_type_of(structs, type_name)
+			bound return if bound.kind != TypeKind.Unmodeled
+			scalar: ValueType = scalar_type_of_name(type_name)
+			scalar return if scalar.kind != TypeKind.Unmodeled
+			ValueType{kind: TypeKind.CStr, bits: 0} return if llvm_opaque_handle_name(type_name)
+			ValueType{kind: TypeKind.Arena, bits: 0} return if type_name == "Arena"
+			# `dstr` (dynamic string) IS a `darray[u8]`.
+			intern_darray_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs) return if type_name == "dstr"
+			# An ALIAS denotes its target and has no representation of its own. An
+			# unresolved alias must not shadow a same-named struct/enum.
+			alias_index: i64 = alias_index_of(structs, type_name)
+			if alias_index >= 0:
+				aliased: ValueType = copied_type(structs.alias_types[alias_index.usize()])
+				aliased return if aliased.kind != TypeKind.Unmodeled
+			# A CONST ENUM name denotes its backing scalar.
+			enum_index: i64 = enum_index_of(structs, type_name)
+			copied_type(structs.enum_backings[enum_index.usize()]) return if enum_index >= 0
+			packed_annotation_index: i64 = packed_index_of(structs, type_name)
+			# A RESERVED AST header (`Node`/`Expr`/… with no variants) is a placeholder, not
+			# a declared type: it must not shadow a program's own `struct Node:`. Real packed
+			# enums keep their precedence; the placeholder is only used if nothing else
+			# declares the name.
+			packed_is_placeholder: mutable bool = false
+			if packed_annotation_index >= 0:
+				packed_is_placeholder <- structs.packed_variant_count[packed_annotation_index.usize()] == 0
+			ValueType{kind: TypeKind.PackedEnum, bits: packed_annotation_index.u32()} return if packed_annotation_index >= 0 and not packed_is_placeholder
+			penum_index: i64 = penum_index_of(structs, type_name)
+			ValueType{kind: TypeKind.PayloadEnum, bits: penum_index.u32()} return if penum_index >= 0
+			struct_index: i64 = struct_index_of(structs, type_name)
+			ValueType{kind: TypeKind.Struct, bits: struct_index.u32()} return if struct_index >= 0
+			ValueType{kind: TypeKind.PackedEnum, bits: packed_annotation_index.u32()} return if packed_annotation_index >= 0
+			return unmodeled_type()
+
+
+		def annotation_lambda_value_type(fn_type_line: i64, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+			fn_return_head: sview = fn_return_head_at(fn_type_line, structs)
+			fn_return_resolved: ValueType = resolve_type_head(fn_return_head, structs) if fn_return_head != "" else unmodeled_type()
+			# Collect this fn-type's param types from the parser metadata into a local list.
+			fn_param_type_list: mutable darray[ValueType] = []
+			fn_param_probe: mutable usize = 0
+			fn_full_type_probe: mutable usize = 0
+			while fn_param_probe < structs.fn_param_lines.count |fn_param_type_list, fn_param_probe, fn_type_line, structs|:
+				if structs.fn_param_lines[fn_param_probe] == fn_type_line:
+					while fn_full_type_probe < structs.fn_type_param_lines.count and structs.fn_type_param_lines[fn_full_type_probe] != fn_type_line |fn_full_type_probe, structs, fn_type_line|:
+						fn_full_type_probe <- fn_full_type_probe + 1
+					if fn_full_type_probe < structs.fn_type_param_lines.count:
+						fn_param_type_list.push(annotation_value_type(structs.fn_type_param_exprs[fn_full_type_probe], structs))
+						fn_full_type_probe <- fn_full_type_probe + 1
+					else:
+						fn_param_type_list.push(resolve_type_head(structs.fn_param_heads[fn_param_probe], structs))
+				fn_param_probe <- fn_param_probe + 1
+			return intern_fn_type(fn_return_resolved, fn_param_type_list, structs)
+
+
+        def annotation_value_type(type_expression: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return match type_expression:
+                Expr.Unary(qualifier, qualified_type, qualifier_line): annotation_unary_value_type(qualifier, qualified_type, structs)
+                Expr.Index(array_head, array_extent, array_line): annotation_index_value_type(array_head, array_extent, structs)
+                Expr.Tuple(tuple_type_elements, tuple_type_line): annotation_tuple_value_type(tuple_type_elements, tuple_type_line, structs)
+                Expr.IndexN(application_head, application_args, application_line): annotation_application_value_type(application_head, application_args, structs)
+                Expr.Scope(type_scope_head, type_scope_name, type_scope_line): annotation_scope_value_type(type_scope_head, type_scope_name, type_scope_line, structs)
+                Expr.Field(type_field_head, type_field_name, type_field_line): annotation_scope_value_type(type_field_head, type_field_name, type_field_line.i64(), structs)
+                Expr.Ident(type_name, type_line): annotation_ident_value_type(type_name, type_line, structs)
+                Expr.Lambda(fn_type_params, fn_type_body, fn_type_line): annotation_lambda_value_type(fn_type_line, structs)
+                _: unmodeled_type()
+
+
+        # The LLVM type backing a ValueType.
+        def llvm_type_of(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
+            LLVMVoidTypeInContext(ctx) return if value_type.kind == TypeKind.Void
+            LLVMInt1TypeInContext(ctx) return if value_type.kind == TypeKind.Bool
+            # A cstr is an opaque `ptr`, exactly as stage0 passes it (`define i64
+            # @take(ptr)`).
+            LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.CStr
+            # A `fn(…)->R` value is a (possibly tagged) `ptr` — see the TypeKind.Fn note.
+            LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.Fn
+            # GuestVAddr/HostPtr carriers are raw address integers (stage0: i64).
+            LLVMInt64TypeInContext(ctx) return if value_type.kind == TypeKind.GuestCarrier
+            arena_llvm_type(ctx) return if value_type.kind == TypeKind.Arena
+            # A packed handle is an **i32 INDEX** into the store, NOT the row. stage0:
+            # `%n = alloca i32`, `store i32 %packed.alloc.index, ptr %n`, and the match
+            # passes that index to the runtime. The `{i32, [N x i64]}` struct below is only
+            # the ROW LAYOUT, used when WRITING a row -- it is never the value's type.
+            LLVMInt32TypeInContext(ctx) return if value_type.kind == TypeKind.PackedEnum
+            # `{ptr arena, i64 row_bytes, ptr state}` — stage0's `%Node__Store`.
+            if value_type.kind == TypeKind.PackedStore:
+                store_fields: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), LLVMInt64TypeInContext(ctx), LLVMPointerTypeInContext(ctx, 0)]
+                store_pointer: void& = (&store_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, store_pointer, 3, 0)
+            # `{ i32, [N x i64] }` — stage0's tagged-union layout for a payload enum.
+            if value_type.kind == TypeKind.PayloadEnum:
+                words: u32 = structs.penum_payload_words[value_type.bits.usize()]
+                penum_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt64TypeInContext(ctx), words)]
+                penum_pointer: void& = (&penum_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, penum_pointer, 2, 0)
+            structs.handles[value_type.bits.usize()] return if value_type.kind == TypeKind.Struct
+            if value_type.kind == TypeKind.Array:
+                slot: usize = value_type.bits.usize()
+                return LLVMArrayType(llvm_type_of(structs.array_elements[slot], structs, ctx), structs.array_extents[slot])
+            # `{i1 has_value, T value}` — stage0's Optional layout.
+            if value_type.kind == TypeKind.Optional:
+                payload: ValueType = copied_type(structs.optional_targets[value_type.bits.usize()])
+                fields: mutable darray[LLVMTypeRef] = [LLVMInt1TypeInContext(ctx), llvm_type_of(payload, structs, ctx)]
+                fields_pointer: void& = (&fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, fields_pointer, 2, 0)
+            # Value-carrying error unions are descriptors: the status code is zero on
+            # success and nonzero on failure; the payload pointer is valid on success.
+            if value_type.kind == TypeKind.ErrorUnion:
+                error_union_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMPointerTypeInContext(ctx, 0)]
+                error_union_pointer: void& = (&error_union_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, error_union_pointer, 2, 0)
+            # A reference is just a pointer; the referent matters only at the load/store.
+            LLVMPointerTypeInContext(ctx, 0) return if value_type.kind == TypeKind.Ref
+            # `{ptr items, i64 count, i64 capacity}` — stage0's DynArray layout, which the
+            # shared runtime dictates.
+            if value_type.kind == TypeKind.DArray:
+                return darray_llvm_type(structs, ctx)
+            # A `view[T]` lowers to the one `DynArrayView` struct regardless of its element.
+            if value_type.kind == TypeKind.View:
+                view_llvm_struct: ValueType = view_struct_type(value_type, structs)
+                if view_llvm_struct.kind == TypeKind.Struct:
+                    return structs.handles[view_llvm_struct.bits.usize()]
+                # The runtime's DynArrayView declaration is not present in every standalone
+                # stage1 input, but its ABI is fixed: `{ptr data, i64 len}`. Do not fall back
+                # to a raw pointer, since view clone/slice lowering uses extractvalue on it.
+                view_fields: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), LLVMInt64TypeInContext(ctx)]
+                view_fields_pointer: void& = (&view_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, view_fields_pointer, 2, 0)
+            # `%StringView = type { ptr, i64 }` — stage0's byte-pointer + length pair.
+            if value_type.kind == TypeKind.SView:
+                sview_fields: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), LLVMInt64TypeInContext(ctx)]
+                sview_pointer: void& = (&sview_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, sview_pointer, 2, 0)
+            if value_type.kind == TypeKind.Float:
+                return LLVMFloatTypeInContext(ctx) if value_type.bits == 32 else LLVMDoubleTypeInContext(ctx)
+            LLVMInt8TypeInContext(ctx) return if value_type.bits == 8
+            LLVMInt16TypeInContext(ctx) return if value_type.bits == 16
+            LLVMInt32TypeInContext(ctx) return if value_type.bits == 32
+            return LLVMInt64TypeInContext(ctx)

@@ -1,0 +1,76 @@
+# Stage1 backend — export wrappers and generic instantiation bodies.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # `export fn public(args) -> T = internal` is represented by the parser as an
+        # extern-shaped declaration plus side-table metadata. For the scalar/like-for-like
+        # ABI, emit the public symbol as a thin LLVM wrapper around the internal function.
+        # Aggregate C ABI lowering is intentionally left to the dedicated export/header path;
+        # declining here is safer than silently using the language ABI for a C boundary.
+        def emit_export_wrapper(export_name: sview, target_name: sview, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            wrapper_index: i64 = function_index_of(fns, "", export_name)
+            target_index: i64 = function_index_of(fns, "", target_name)
+            false return if wrapper_index < 0 or target_index < 0
+            false return if fns.needs_arena[wrapper_index.usize()] or fns.needs_arena[target_index.usize()]
+            false return if fns.is_error[wrapper_index.usize()] or fns.is_error[target_index.usize()]
+            false return if fns.param_count[wrapper_index.usize()] != fns.param_count[target_index.usize()]
+            target: LLVMValueRef = fns.handles[target_index.usize()]
+            entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
+            LLVMPositionBuilderAtEnd(builder, entry)
+            argument_count: usize = fns.param_count[wrapper_index.usize()]
+            arguments: mutable darray[LLVMValueRef] = []
+            for position in 0..<argument_count |arguments, fn|:
+                arguments.push(LLVMGetParam(fn, position.u32()))
+            target_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+            call_result: mutable LLVMValueRef = zeroed
+            if argument_count == 0:
+                call_result <- LLVMBuildCall2(builder, target_type, target, zeroed, 0, "export.call")
+            else:
+                arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+                call_result <- LLVMBuildCall2(builder, target_type, target, arguments_pointer, argument_count.u32(), "export.call")
+            if fns.returns[wrapper_index.usize()].kind == TypeKind.Void:
+                _ = LLVMBuildRetVoid(builder)
+            else:
+                _ = LLVMBuildRet(builder, call_result)
+            return true
+
+        # Emit the body of one queued instantiation, with its type parameter BOUND for the
+        # whole emission — so every `T` inside resolves to the concrete type.
+        def emit_instantiation_body(index: usize, generics: mutable GenericTable&, fns: FnTable&, structs: mutable StructTable&, runtime: mutable Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            base: sview = generics.pending_bases[index]
+            handle: LLVMValueRef = generics.pending_handles[index]
+            # Use the RECORDED slot, not generic_index_of(base): for an overloaded name the latter
+            # returns the first overload, whose body would be wrong for this instantiation.
+            slot: usize = generics.pending_slots[index]
+
+            # Rebuild this instantiation's type-argument tuple from the pending pool and bind
+            # every K/T for the body emission.
+            arg_start: usize = generics.pending_arg_start[index]
+            arg_count: usize = generics.pending_arg_count[index]
+            type_args: mutable darray[ValueType] = []
+            for offset in 0..<arg_count |type_args, generics, arg_start|:
+                type_args.push(copied_type(generics.pending_args[arg_start + offset]))
+            bound: usize = push_type_bindings(generics, structs, slot, type_args)
+            # An error-returning template (`arena_dict_put[K,T] … error[E]`) must emit its body
+            # under the error ABI. emit_function_body keys that off `error_lines` by the decl's
+            # line, so hand it a one-line list containing the template's line when it is error-
+            # returning; empty otherwise.
+            template_error_lines: mutable darray[u32] = []
+            template_error_lines.push(function_line_of(generics.decls[slot])) if generics.is_error[slot]
+            # A generic INSTANTIATION is emitted here, AFTER emit_debug_info ran, so it has no
+            # DISubprogram. Attaching a DWARF local/parameter to a subprogram-less function builds
+            # metadata with a NULL scope, which segfaults the O2 pipeline. Emit the monomorph's
+            # body with debug OFF (no DWARF locals for the instantiation — sound; a crash is not),
+            # then restore so ordinary functions keep their debug info.
+            saved_debug_active: bool = runtime.debug_active
+            runtime.debug_active <- false
+            emitted: bool = emit_function_body(generics.decls[slot], "", handle, template_error_lines, fns, structs, generics, runtime, m, ctx, builder)
+            runtime.debug_active <- saved_debug_active
+            pop_type_bindings(structs, bound)
+            # Report the MANGLED name: one template has many instantiations, and the base
+            # name alone does not say which type arguments failed.
+            record_declined_instantiation(handle, generics.pending_bases[index], m, ctx) if not emitted
+            # An instantiation is never `main`, so it always internalizes.
+            set_defined_function_linkage(generics.pending_bases[index], handle) if emitted
+            return emitted

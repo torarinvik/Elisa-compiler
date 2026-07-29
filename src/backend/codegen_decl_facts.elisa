@@ -1,0 +1,540 @@
+# Stage1 backend — declaration FACTS read off the AST plus generic template registration.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # A function declaration's name, or "" for any other declaration. (Only reached
+        # after declare_function accepted, i.e. it IS a Func.)
+        # A function declaration's name, or "" for anything else (a struct, an enum, an
+        # extern). Used to skip non-function declarations in the function passes.
+        def function_name_of(declaration: Decl) -> sview can[Abort.Panic]:
+            return match declaration:
+                Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line): function_name
+                _: ""
+
+
+        def function_needs_store_for_declaration(declaration: Decl, fns: FnTable&) -> bool can[Abort.Panic]:
+            name: sview = function_name_of(declaration)
+            line: u32 = function_line_of(declaration)
+            for index in 0..<fns.names.count |fns, name, line|:
+                if fns.names[index] == name and fns.lines[index] == line:
+                    return fns.needs_store[index]
+            return false
+
+
+        # AST handles are opaque in function signatures, but Parser/Lexer routines
+        # routinely return nodes whose nested darrays are allocated while parsing.
+        # Their region must therefore be borrowed from the caller for the whole
+        # frontend call graph. This is deliberately owner-based until the AST side
+        # tables become explicit in the type model.
+        def frontend_function_threads_arena(owner: sview, name: sview) -> bool can[Abort.Panic]:
+            true return if owner == "Parser" or owner == "Lexer"
+            # `extend Parser:` declarations are flattened by the frontend and can
+            # arrive here with the qualified module name embedded in `name` and an
+            # empty owner. Match that representation as well.
+            true return if sview_len(name) > 7 and sview_matches_prefix(name, "Parser.", 0, 7)
+            true return if sview_len(name) > 6 and sview_matches_prefix(name, "Lexer.", 0, 6)
+            return false
+
+        # Declared parameter count for a Func (0 for non-functions). Used to pick the
+        # correct overload handle when several entries share a bare name.
+        def function_param_count_of(declaration: Decl) -> usize can[Abort.Panic]:
+            return match declaration:
+                Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line): params.count
+                _: 0
+
+
+        def function_line_of(declaration: Decl) -> u32 can[Abort.Panic]:
+            return match declaration:
+                Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line): line
+                _: 0
+
+
+        # Does `owner::name` take the implicit trailing arena parameter?
+        def callee_needs_arena(fns: FnTable&, owner: sview, name: sview) -> bool can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.needs_arena[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return false
+
+
+        # The index of function `owner::name` in the table, or -1.
+        def function_is_error(fns: FnTable&, owner: sview, name: sview) -> bool can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.is_error[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return false
+
+
+        # `try`/`catch` accept an error callee that is a plain function OR a GENERIC template
+        # (the std dict's `catch arena_dict_put(…)` / `try arena_dict_reserve(…)`). These four
+        # helpers resolve, uniformly, whichever it is — a generic is inferred from its call
+        # arguments and instantiated on demand (with the error ABI its is_error flag forces).
+        # The simple NAME under a call's callee, looking through an explicit generic
+        # instantiation: `f` -> "f", `f[T]` -> "f", `f[K, V]` -> "f". "" for any other shape.
+        def generic_call_base_name(callee: Expr) -> sview can[Abort.Panic]:
+            if callee is Expr.Ident(base_ident_name, base_ident_line):
+                return base_ident_name
+            if callee is Expr.Index(base_index_head, base_index_arg, base_index_line):
+                if base_index_head is Expr.Ident(base_index_name, base_index_name_line):
+                    return base_index_name
+            if callee is Expr.IndexN(base_multi_head, base_multi_args, base_multi_line):
+                if base_multi_head is Expr.Ident(base_multi_name, base_multi_name_line):
+                    return base_multi_name
+            return ""
+
+
+        def error_callee_is(fns: FnTable&, generics: GenericTable&, name: sview) -> bool can[Abort.Panic]:
+            true return if function_is_error(fns, "", name)
+            generic_index: i64 = generic_index_of(generics, name)
+            return generic_index >= 0 and generics.is_error[generic_index.usize()]
+
+
+        # `try f(args)` in statement position — call the error fn with a fresh out-slot; on a
+        # nonzero status code PROPAGATE it: unwind live regions and return that code from the
+        # (error-returning) caller. On success, fall through. The success value is discarded.
+        def emit_propagating_try(name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            propagate_value_type: ValueType = error_callee_value_type(name, arguments, local_scope, fns, structs, generics)
+            EmitStatus.Declined return if propagate_value_type.kind == TypeKind.Unmodeled
+            if error_callee_target(name, arguments, local_scope, fns, structs, generics, m, ctx) is propagate_target:
+                # The out-slot holds the success value; a VOID-success fn writes nothing there
+                # (its `raise` still stores an i64 0, so an i64 dummy is the safe minimum).
+                propagate_out_llvm: LLVMTypeRef = LLVMInt64TypeInContext(ctx) if propagate_value_type.kind == TypeKind.Void else llvm_type_of(propagate_value_type, structs, ctx)
+                propagate_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, propagate_out_llvm, "try.out")
+                propagate_args: mutable darray[LLVMValueRef] = [propagate_out_slot]
+                propagate_declined: mutable bool = false
+                propagate_index: mutable usize = 0
+                for propagate_arg in arguments |propagate_args, propagate_declined, propagate_index, name, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    propagate_wanted: ValueType = error_callee_param_type(name, arguments, propagate_index, local_scope, fns, structs, generics)
+                    if emit_expression(propagate_arg, propagate_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is propagate_arg_value:
+                        propagate_args.push(propagate_arg_value)
+                    else:
+                        propagate_declined <- true
+                    propagate_index <- propagate_index + 1
+                EmitStatus.Declined return if propagate_declined
+                propagate_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(propagate_target)
+                propagate_args_pointer: void& = (&propagate_args[0]).cast[void&] can Unsafe.PointerCast
+                propagate_status: LLVMValueRef = LLVMBuildCall2(builder, propagate_fn_type, propagate_target, propagate_args_pointer, propagate_args.count.u32(), "try.code")
+                propagate_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, propagate_status, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                propagate_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                propagate_cont_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, propagate_function, "try.cont")
+                propagate_fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, propagate_function, "try.propagate")
+                _ = LLVMBuildCondBr(builder, propagate_ok, propagate_cont_block, propagate_fail_block)
+                LLVMPositionBuilderAtEnd(builder, propagate_fail_block)
+                emit_region_unwind(regions, runtime, builder)
+                _ = LLVMBuildRet(builder, propagate_status)
+                LLVMPositionBuilderAtEnd(builder, propagate_cont_block)
+                return EmitStatus.Open
+            return EmitStatus.Declined
+
+
+        # Emit an error-returning call as a first-class `T error[E]` descriptor rather than
+        # consuming it with `try`. This is selected when the destination local explicitly has
+        # an error-union type; the existing split status/out-payload call ABI remains unchanged.
+        def emit_error_union_call_value(name: sview, arguments: darray[Expr]&, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if expected.kind != TypeKind.ErrorUnion or not error_callee_is(fns, generics, name)
+            payload_type: ValueType = error_callee_value_type(name, arguments, local_scope, fns, structs, generics)
+            expected_payload: ValueType = error_union_payload_of(expected, structs)
+            null return if payload_type.kind != expected_payload.kind or payload_type.bits != expected_payload.bits
+            if error_callee_target(name, arguments, local_scope, fns, structs, generics, m, ctx) is target:
+                payload_llvm: LLVMTypeRef = llvm_type_of(payload_type, structs, ctx)
+                out_slot: LLVMValueRef = LLVMBuildAlloca(builder, payload_llvm, "error.union.out")
+                call_args: mutable darray[LLVMValueRef] = [out_slot]
+                declined: mutable bool = false
+                argument_index: mutable usize = 0
+                for argument in arguments |call_args, declined, argument_index, name, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    wanted: ValueType = error_callee_param_type(name, arguments, argument_index, local_scope, fns, structs, generics)
+                    if emit_expression(argument, wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is argument_value:
+                        call_args.push(argument_value)
+                    else:
+                        declined <- true
+                    argument_index <- argument_index + 1
+                null return if declined
+                fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                args_pointer: void& = (&call_args[0]).cast[void&] can Unsafe.PointerCast
+                status: LLVMValueRef = LLVMBuildCall2(builder, fn_type, target, args_pointer, call_args.count.u32(), "error.union.status")
+                result: mutable LLVMValueRef = LLVMGetUndef(llvm_type_of(expected, structs, ctx))
+                result <- LLVMBuildInsertValue(builder, result, status, 0, "error.union.code")
+                result <- LLVMBuildInsertValue(builder, result, out_slot, 1, "error.union.payload")
+                return result
+            return null
+
+
+        # `try CALL else FALLBACK` as a VALUE. An error-returning function's ABI is a
+        # leading OUT-POINTER plus an i32 status, so the produced value lives in the out
+        # slot and the fallback runs on any nonzero status. Handles a plain error fn and a
+        # generic one, with inferred (`f(x)`) or explicit (`f[K, V](x)`) type arguments.
+        #
+        # Without this the guarded call was emitted at its PAYLOAD type, so a `T?`-returning
+        # error fn took the optional-unwrap path and `extractvalue`d the i32 status as if it
+        # were an optional aggregate -- which crashes LLVM outright.
+        def emit_try_else_error_call(guarded: Expr, fallback: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if guarded is Expr.Call(te_callee, te_args, te_arg_names, te_call_line):
+                te_name: mutable sview = ""
+                te_type_args: mutable darray[ValueType] = []
+                te_explicit: mutable bool = false
+                te_bad_type_arg: mutable bool = false
+                if te_callee is Expr.Ident(te_ident_name, te_ident_line):
+                    te_name <- te_ident_name
+                if te_callee is Expr.Index(te_index_head, te_index_arg, te_index_line):
+                    if te_index_head is Expr.Ident(te_index_name, te_index_name_line):
+                        te_name <- te_index_name
+                        te_explicit <- true
+                        te_single: ValueType = annotation_value_type(te_index_arg, structs)
+                        te_bad_type_arg <- true if te_single.kind == TypeKind.Unmodeled
+                        te_type_args.push(te_single)
+                if te_callee is Expr.IndexN(te_multi_head, te_multi_arg_exprs, te_multi_line):
+                    if te_multi_head is Expr.Ident(te_multi_name, te_multi_name_line):
+                        te_name <- te_multi_name
+                        te_explicit <- true
+                        for te_multi_arg in te_multi_arg_exprs |te_type_args, te_bad_type_arg, structs|:
+                            te_resolved: ValueType = annotation_value_type(te_multi_arg, structs)
+                            te_bad_type_arg <- true if te_resolved.kind == TypeKind.Unmodeled
+                            te_type_args.push(te_resolved)
+                null return if te_name == "" or te_bad_type_arg
+                te_generic_slot: i64 = generic_index_of(generics, te_name)
+                te_is_generic: bool = te_generic_slot >= 0
+                if te_is_generic and not te_explicit:
+                    te_inferred: darray[ValueType] = infer_generic_args(te_generic_slot.usize(), te_args, local_scope, fns, structs, generics)
+                    null return if te_inferred.count == 0
+                    for te_inferred_arg in te_inferred |te_type_args|:
+                        te_type_args.push(copied_type(te_inferred_arg))
+                te_plain_error: bool = function_is_error(fns, "", te_name)
+                te_generic_error: mutable bool = false
+                if te_is_generic:
+                    te_generic_error <- generics.is_error[te_generic_slot.usize()]
+                null return if not te_plain_error and not te_generic_error
+                te_payload: mutable ValueType = unmodeled_type()
+                if te_generic_error:
+                    te_payload <- generic_return_type(te_name, te_type_args, generics, structs)
+                else:
+                    te_payload <- lookup_return_type(fns, "", te_name)
+                null return if te_payload.kind == TypeKind.Unmodeled or te_payload.kind == TypeKind.Void
+                te_target_opt: mutable LLVMValueRef? = null
+                if te_generic_error:
+                    te_target_opt <- instantiate_generic(te_name, te_type_args, generics, structs, m, ctx)
+                else:
+                    te_target_opt <- lookup_function(fns, "", te_name)
+                if te_target_opt is te_target:
+                    te_payload_llvm: LLVMTypeRef = llvm_type_of(te_payload, structs, ctx)
+                    te_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, te_payload_llvm, "try.else.out")
+                    te_call_values: mutable darray[LLVMValueRef] = [te_out_slot]
+                    te_declined: mutable bool = false
+                    te_position: mutable usize = 0
+                    for te_argument in te_args |te_call_values, te_declined, te_position, te_name, te_type_args, te_generic_error, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        te_wanted: mutable ValueType = unmodeled_type()
+                        if te_generic_error:
+                            te_wanted <- instantiation_param_type(te_name, te_type_args, te_position, generics, structs)
+                        else:
+                            te_wanted <- param_type_of(fns, "", te_name, te_position)
+                        if te_wanted.kind == TypeKind.Unmodeled:
+                            te_declined <- true
+                        elif emit_expression(te_argument, te_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is te_argument_value:
+                            te_call_values.push(te_argument_value)
+                        else:
+                            te_declined <- true
+                        te_position <- te_position + 1
+                    null return if te_declined
+                    if te_generic_error:
+                        te_call_values.push(runtime.arena) if instantiation_wants_arena(te_name, te_type_args, generics, structs)
+                    else:
+                        te_fn_index: i64 = function_index_of(fns, "", te_name)
+                        null return if te_fn_index < 0
+                        for _ in 0..<fns.arena_counts[te_fn_index.usize()] |te_call_values, runtime|:
+                            te_call_values.push(runtime.arena)
+                    te_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(te_target)
+                    te_args_pointer: void& = (&te_call_values[0]).cast[void&] can Unsafe.PointerCast
+                    te_status: LLVMValueRef = LLVMBuildCall2(builder, te_fn_type, te_target, te_args_pointer, te_call_values.count.u32(), "try.else.code")
+                    te_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, te_status, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.else.ok")
+                    te_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                    te_ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, te_function, "try.else.value")
+                    te_recover_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, te_function, "try.else.recover")
+                    te_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, te_function, "try.else.done")
+                    te_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, te_payload_llvm, "try.else.result")
+                    _ = LLVMBuildCondBr(builder, te_ok, te_ok_block, te_recover_block)
+                    LLVMPositionBuilderAtEnd(builder, te_ok_block)
+                    te_loaded: LLVMValueRef = LLVMBuildLoad2(builder, te_payload_llvm, te_out_slot, "try.else.loaded")
+                    _ = LLVMBuildStore(builder, te_loaded, te_result_slot)
+                    _ = LLVMBuildBr(builder, te_done_block)
+                    LLVMPositionBuilderAtEnd(builder, te_recover_block)
+                    if emit_expression(fallback, te_payload, local_scope, fns, structs, generics, runtime, m, ctx, builder) is te_fallback_value:
+                        _ = LLVMBuildStore(builder, te_fallback_value, te_result_slot)
+                        _ = LLVMBuildBr(builder, te_done_block)
+                        LLVMPositionBuilderAtEnd(builder, te_done_block)
+                        return LLVMBuildLoad2(builder, te_payload_llvm, te_result_slot, "try.else.load")
+                    return null
+                return null
+            return null
+
+
+        # `try f[K, V](args) else …` — the error-union VALUE of a GENERIC error-returning
+        # call with EXPLICIT type arguments. emit_error_union_call_value only handles a bare
+        # Ident callee and infers the type args from argument 0, which the std's
+        # `arena_dict_put[K, usize](…)` cannot supply. Without this the call fell through to
+        # the plain generic lowering, which returns the i32 STATUS -- and the caller's
+        # `extractvalue` on that i32 crashed LLVM.
+        def emit_error_union_generic_call_value(base: sview, type_args: darray[ValueType]&, arguments: darray[Expr]&, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if expected.kind != TypeKind.ErrorUnion
+            generic_slot: i64 = generic_index_of(generics, base)
+            null return if generic_slot < 0
+            null return if not generics.is_error[generic_slot.usize()]
+            payload_type: ValueType = generic_return_type(base, type_args, generics, structs)
+            expected_payload: ValueType = error_union_payload_of(expected, structs)
+            null return if payload_type.kind == TypeKind.Unmodeled
+            null return if payload_type.kind != expected_payload.kind or payload_type.bits != expected_payload.bits
+            if instantiate_generic(base, type_args, generics, structs, m, ctx) is generic_target:
+                generic_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(payload_type, structs, ctx), "error.union.generic.out")
+                generic_call_args: mutable darray[LLVMValueRef] = [generic_out_slot]
+                generic_declined: mutable bool = false
+                generic_arg_index: mutable usize = 0
+                for generic_argument in arguments |generic_call_args, generic_declined, generic_arg_index, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    generic_wanted: ValueType = instantiation_param_type(base, type_args, generic_arg_index, generics, structs)
+                    if emit_expression(generic_argument, generic_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is generic_arg_value:
+                        generic_call_args.push(generic_arg_value)
+                    else:
+                        generic_declined <- true
+                    generic_arg_index <- generic_arg_index + 1
+                null return if generic_declined
+                generic_call_args.push(runtime.arena) if instantiation_wants_arena(base, type_args, generics, structs)
+                generic_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(generic_target)
+                generic_args_pointer: void& = (&generic_call_args[0]).cast[void&] can Unsafe.PointerCast
+                generic_status: LLVMValueRef = LLVMBuildCall2(builder, generic_fn_type, generic_target, generic_args_pointer, generic_call_args.count.u32(), "error.union.generic.status")
+                generic_result: mutable LLVMValueRef = LLVMGetUndef(llvm_type_of(expected, structs, ctx))
+                generic_result <- LLVMBuildInsertValue(builder, generic_result, generic_status, 0, "error.union.generic.code")
+                generic_result <- LLVMBuildInsertValue(builder, generic_result, generic_out_slot, 1, "error.union.generic.payload")
+                return generic_result
+            return null
+
+
+        # The VALUE form of `try f(args)` — `v: T = try f(x)`: same propagate-on-error path as
+        # the statement form, but on SUCCESS it LOADS and returns the out-slot's success value
+        # (rather than discarding it). Null on decline.
+        def emit_propagating_try_value(name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            value_try_type: ValueType = error_callee_value_type(name, arguments, local_scope, fns, structs, generics)
+            null return if value_try_type.kind == TypeKind.Unmodeled or value_try_type.kind == TypeKind.Void
+            if error_callee_target(name, arguments, local_scope, fns, structs, generics, m, ctx) is value_try_target:
+                value_try_out_llvm: LLVMTypeRef = llvm_type_of(value_try_type, structs, ctx)
+                value_try_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, value_try_out_llvm, "try.out")
+                value_try_args: mutable darray[LLVMValueRef] = [value_try_out_slot]
+                value_try_declined: mutable bool = false
+                value_try_index: mutable usize = 0
+                for value_try_arg in arguments |value_try_args, value_try_declined, value_try_index, name, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    value_try_wanted: ValueType = error_callee_param_type(name, arguments, value_try_index, local_scope, fns, structs, generics)
+                    if emit_expression(value_try_arg, value_try_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is value_try_arg_value:
+                        value_try_args.push(value_try_arg_value)
+                    else:
+                        value_try_declined <- true
+                    value_try_index <- value_try_index + 1
+                null return if value_try_declined
+                value_try_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(value_try_target)
+                value_try_args_pointer: void& = (&value_try_args[0]).cast[void&] can Unsafe.PointerCast
+                value_try_status: LLVMValueRef = LLVMBuildCall2(builder, value_try_fn_type, value_try_target, value_try_args_pointer, value_try_args.count.u32(), "try.code")
+                value_try_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, value_try_status, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                value_try_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                value_try_cont_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, value_try_function, "try.cont")
+                value_try_fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, value_try_function, "try.propagate")
+                _ = LLVMBuildCondBr(builder, value_try_ok, value_try_cont_block, value_try_fail_block)
+                LLVMPositionBuilderAtEnd(builder, value_try_fail_block)
+                emit_region_unwind(regions, runtime, builder)
+                _ = LLVMBuildRet(builder, value_try_status)
+                LLVMPositionBuilderAtEnd(builder, value_try_cont_block)
+                return LLVMBuildLoad2(builder, value_try_out_llvm, value_try_out_slot, "try.value")
+            return null
+
+
+        def error_callee_value_type(name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            lookup_return_type(fns, "", name) return if function_is_error(fns, "", name)
+            generic_index: i64 = generic_index_of(generics, name)
+            unmodeled_type() return if generic_index < 0
+            # The inferred type-arg darray is scratch: hold it in an explicit region (the
+            # helper is otherwise too small for auto-region inference to place it). The
+            # result is a POD ValueType, so it escapes the region cleanly.
+            result: mutable ValueType = unmodeled_type()
+            region scratch(4096):
+                inferred: darray[ValueType] = infer_generic_args(generic_index.usize(), arguments, local_scope, fns, structs, generics)
+                result <- generic_return_type(name, inferred, generics, structs) if inferred.count != 0
+            return result
+
+
+        def error_callee_target(name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if function_is_error(fns, "", name):
+                return lookup_function(fns, "", name)
+            generic_index: i64 = generic_index_of(generics, name)
+            null return if generic_index < 0
+            result: mutable LLVMValueRef? = null
+            region scratch(4096):
+                inferred: darray[ValueType] = infer_generic_args(generic_index.usize(), arguments, local_scope, fns, structs, generics)
+                result <- instantiate_generic(name, inferred, generics, structs, m, ctx) if inferred.count != 0
+            return result
+
+
+        def error_callee_param_type(name: sview, arguments: darray[Expr]&, position: usize, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            param_type_of(fns, "", name, position) return if function_is_error(fns, "", name)
+            generic_index: i64 = generic_index_of(generics, name)
+            unmodeled_type() return if generic_index < 0
+            result: mutable ValueType = unmodeled_type()
+            region scratch(4096):
+                inferred: darray[ValueType] = infer_generic_args(generic_index.usize(), arguments, local_scope, fns, structs, generics)
+                result <- instantiation_param_type(name, inferred, position, generics, structs) if inferred.count != 0
+            return result
+
+
+        def function_index_of(fns: FnTable&, owner: sview, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                index.i64() return if fns.names[index] == name and fns.owners[index] == owner
+            return -1
+
+        def function_index_of_arity(fns: FnTable&, owner: sview, name: sview, arity: usize) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, arity|:
+                index.i64() return if fns.names[index] == name and fns.owners[index] == owner and fns.param_count[index] == arity
+            return -1
+
+        def function_index_of_line(fns: FnTable&, owner: sview, name: sview, line: u32) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, line|:
+                index.i64() return if fns.names[index] == name and fns.owners[index] == owner and fns.lines[index] == line
+            return -1
+
+
+        # Register generic function templates from parser side tables, avoiding recursive
+        # packed Decl.Func matching in the backend's discovery pass.
+        def register_generics(file: Ast::File&, top: darray[Decl]&, generics: mutable GenericTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for generic_index in 0..<file.generic_func_decls.count |generic_index, generics, file|:
+                function_name: sview = file.generic_func_decl_names[generic_index]
+                line: u32 = file.generic_func_decl_lines[generic_index]
+                start: usize = generics.params.count
+                for row in 0..<file.generic_param_lines.count |generics, file, line|:
+                    # High bit set => a BOUND row (`[T: Ord]`), not a type parameter.
+                    continue if file.generic_param_lines[row] >= 2147483648
+                    continue if file.generic_param_lines[row] != line
+                    generics.params <- generics.params.push(file.generic_param_names[row])
+                added: usize = generics.params.count - start
+                continue if added == 0
+                generics.names <- generics.names.push(function_name)
+                generics.decls <- generics.decls.push(file.generic_func_decls[generic_index])
+                generics.param_start <- generics.param_start.push(start)
+                generics.param_count <- generics.param_count.push(added)
+                generics.is_error <- generics.is_error.push(line_is_error_returning(file.error_set_func_lines, line))
+
+
+        # The source-level spelling a type contributes to a mangled name. Must agree with
+        # stage0's scheme (`identity__i64`), read from its emitted IR.
+        def push_type_name(value_type: ValueType, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            text: mutable sview = "unknown"
+            if value_type.kind == TypeKind.Bool:
+                text <- "bool"
+            if value_type.kind == TypeKind.Float:
+                text <- "f32" if value_type.bits == 32 else "f64"
+            if value_type.kind == TypeKind.Signed:
+                text <- "i8" if value_type.bits == 8 else ("i16" if value_type.bits == 16 else ("i32" if value_type.bits == 32 else "i64"))
+            if value_type.kind == TypeKind.Unsigned:
+                text <- "u8" if value_type.bits == 8 else ("u16" if value_type.bits == 16 else ("u32" if value_type.bits == 32 else "u64"))
+            for index in 0..<sview_len(text) |storage, text|:
+                storage.push(sview_at(text, index))
+
+
+        # A type argument's contribution to a monomorphized name. Only needs to be readable
+        # and reasonably distinct (the instantiation memo is the real key, and LLVM
+        # uniquifies a duplicate named-struct anyway).
+        def push_generic_arg_name(value_type: ValueType, structs: StructTable&, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if value_type.kind == TypeKind.Struct:
+                struct_name: sview = structs.names[value_type.bits.usize()]
+                for index in 0..<sview_len(struct_name) |storage, struct_name|:
+                    storage.push(sview_at(struct_name, index))
+                return
+            push_type_name(value_type, storage)
+
+
+        # Build `identity` + i64 -> "identity__i64" into `storage`, NUL-terminated.
+        #
+        # The result is transient by design: LLVMAddFunction COPIES the name, so the buffer
+        # can die immediately. Nothing keeps an sview to it — the instantiation cache is
+        # keyed by (base, type), precisely so no name has to outlive this call.
+        def mangled_name_into(base: sview, type_argument: ValueType, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<sview_len(base) |storage, base|:
+                storage.push(sview_at(base, index))
+            storage.push(95)
+            storage.push(95)
+            push_type_name(type_argument, storage)
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        # `arena_dict_put` + [i64, i64] -> "arena_dict_put__i64__i64". One `__ARG` per type
+        # argument, so a two-parameter generic gets a distinct name per (K, T) tuple. Struct
+        # arguments contribute their registered name (push_generic_arg_name).
+        # Append `value` as ASCII decimal digits to `storage` (used to make an overloaded
+        # instantiation's symbol name unique by its template slot).
+        def append_usize_decimal(value: usize, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if value == 0.usize():
+                storage.push(48)
+                return
+            digits: mutable darray[u8] = []
+            remaining: mutable usize = value
+            for _step in 0..<24 |digits, remaining|:
+                break if remaining == 0.usize()
+                digits.push((48.usize() + (remaining % 10.usize())).u8())
+                remaining <- remaining / 10.usize()
+            # digits are least-significant-first; append reversed.
+            for reverse_index in 0..<digits.count |storage, digits|:
+                storage.push(digits[digits.count - 1.usize() - reverse_index])
+
+
+        # `slot_suffix >= 0` appends `__ov<slot>` before the terminator, disambiguating the LLVM
+        # symbol for an OVERLOADED template (unique names pass -1 and keep their exact symbol).
+        def mangled_name_multi_into(base: sview, type_args: darray[ValueType]&, slot_suffix: i64, structs: StructTable&, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<sview_len(base) |storage, base|:
+                storage.push(sview_at(base, index))
+            # UNROLLED rather than a loop: growing `storage` through a nested call INSIDE a
+            # loop is not a region-inferable pattern (the callee's growth site can't reach a
+            # loop-carried region), so each arg is appended on a straight-line path. Four
+            # covers every modeled generic (dict is two); a 5+-parameter generic would alias
+            # names, which only costs readability since the instantiation memo is the key.
+            append_mangled_arg(type_args, 0, structs, storage)
+            append_mangled_arg(type_args, 1, structs, storage)
+            append_mangled_arg(type_args, 2, structs, storage)
+            append_mangled_arg(type_args, 3, structs, storage)
+            if slot_suffix >= 0:
+                storage.push(95)
+                storage.push(95)
+                storage.push(111)
+                storage.push(118)
+                append_usize_decimal(slot_suffix.usize(), storage)
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        # Append `__<argname>` for type_args[position] when it exists. A no-op past the end,
+        # so mangled_name_multi_into can call it a fixed number of times.
+        def append_mangled_arg(type_args: darray[ValueType]&, position: usize, structs: StructTable&, storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            return if position >= type_args.count
+            storage.push(95)
+            storage.push(95)
+            push_generic_arg_name(type_args[position], structs, storage)
+
+
+        # Pass 1: create the NAMED (empty) LLVM type for a struct declaration and record
+        # its name. Bodies are set separately so declaration order never matters.
+        # Index of a registered generic struct TEMPLATE by base name (-1 = none).
+        def generic_struct_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<structs.generic_struct_names.count |structs, name|:
+                index.i64() return if structs.generic_struct_names[index] == name
+            return -1
+
+
+        # Register generic struct templates from parser side tables. The declaration payload is
+        # retained for later field-body instantiation, while this pass avoids packed Decl matching.
+        def register_generic_structs(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for generic_index in 0..<file.generic_struct_decls.count |generic_index, structs, file|:
+                struct_name: sview = file.generic_struct_decl_names[generic_index]
+                struct_line: u32 = file.generic_struct_decl_lines[generic_index]
+                start: usize = structs.generic_struct_param_names.count
+                row: mutable usize = 0
+                while row < file.generic_param_lines.count |row, structs, file, struct_line|:
+                    # High-bit rows are constraint metadata, not fresh params.
+                    if file.generic_param_lines[row] < 2147483648 and file.generic_param_lines[row] == struct_line:
+                        structs.generic_struct_param_names <- structs.generic_struct_param_names.push(file.generic_param_names[row])
+                    row <- row + 1
+                param_count: usize = structs.generic_struct_param_names.count - start
+                continue if param_count == 0
+                structs.generic_struct_names <- structs.generic_struct_names.push(struct_name)
+                structs.generic_struct_decls <- structs.generic_struct_decls.push(file.generic_struct_decls[generic_index])
+                structs.generic_struct_param_start <- structs.generic_struct_param_start.push(start)
+                structs.generic_struct_param_count <- structs.generic_struct_param_count.push(param_count)

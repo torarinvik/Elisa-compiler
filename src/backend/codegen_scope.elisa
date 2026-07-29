@@ -1,0 +1,548 @@
+# Stage1 backend — the local Scope (lookup/declare) and literal decoding.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # The handle for `owner::name`, or null when there is no such function.
+        # When overloads share a bare name, the first registered entry is returned —
+        # prefer `lookup_function_arity` at call sites with a known argument count.
+        def lookup_function(fns: FnTable&, owner: sview, name: sview) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.handles[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return null
+
+        # Overload-aware lookup: match bare name + owner + declared parameter count
+        # (arena / error-out params are not included in `arity`).
+        def lookup_function_arity(fns: FnTable&, owner: sview, name: sview, arity: usize) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, arity|:
+                fns.handles[index] return if fns.names[index] == name and fns.owners[index] == owner and fns.param_count[index] == arity
+            return null
+
+
+        # The index of `name` in the scope, or -1. Scanned back to front so a later
+        # (shadowing) declaration wins.
+        def lookup_index(local_scope: mutable Scope&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable i64 = local_scope.names.count.i64() - 1
+            while index >= 0 |local_scope, name, index|:
+                index return if local_scope.names[index.usize()] == name
+                index <- index - 1
+            return -1
+
+
+        # The alloca backing `name`, or null when the name is not a local.
+        def lookup_slot(local_scope: mutable Scope&, name: sview) -> LLVMValueRef? can[Abort.Panic]:
+            index: i64 = lookup_index(local_scope, name)
+            null return if index < 0
+            return local_scope.slots[index.usize()]
+
+
+        # The declared type of `name`, or Unmodeled when it is not a local.
+        def lookup_type(local_scope: mutable Scope&, name: sview) -> ValueType can[Abort.Panic]:
+            index: i64 = lookup_index(local_scope, name)
+            unmodeled_type() return if index < 0
+            return copied_type(local_scope.types[index.usize()])
+
+
+        # Record a local: name, slot and declared type, kept index-parallel.
+        def declare_local(local_scope: mutable Scope&, name: sview, slot: LLVMValueRef, value_type: ValueType) -> void can[Abort.Panic, Memory.Allocate]:
+            local_scope.names <- local_scope.names.push(name)
+            local_scope.slots <- local_scope.slots.push(slot)
+            local_scope.types <- local_scope.types.push(value_type)
+
+
+        # The declared type of function `name`'s parameter `position`, or Unmodeled.
+        # Emitting each argument at its parameter's type is what makes a literal argument
+        # adopt the parameter type instead of defaulting to i64.
+        def param_type_of(fns: FnTable&, owner: sview, name: sview, position: usize) -> ValueType can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, position|:
+                if fns.names[index] == name and fns.owners[index] == owner:
+                    unmodeled_type() return if position >= fns.param_count[index]
+                    return copied_type(fns.param_types[fns.param_start[index] + position])
+            return unmodeled_type()
+
+
+        def param_type_count(fns: FnTable&, owner: sview, name: sview) -> usize can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.param_count[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return 0
+
+
+        # Return the source-argument index that supplies parameter `wanted`. Positional
+        # arguments fill the next unassigned parameter; labelled arguments select by name.
+        # `first_position` is 1 for UFCS calls because parameter 0 is the implicit receiver.
+        def named_argument_index(argument_names: darray[sview]&, parameter_names: darray[sview]&, parameter_start: usize, parameter_count: usize, first_position: usize, wanted: usize) -> i64 can[Abort.Panic, Memory.Allocate]:
+            -1 return if wanted < first_position or wanted >= parameter_count
+            assigned: mutable darray[bool] = [false for _slot in 0..<parameter_count]
+            assigned[0] <- true if first_position == 1 and parameter_count > 0
+            next_pos: mutable usize = first_position
+            for argument_index in 0..<argument_names.count |assigned, next_pos, argument_names, parameter_names, parameter_start, parameter_count, first_position, wanted|:
+                argument_name: sview = argument_names[argument_index]
+                selected: mutable usize = parameter_count
+                if argument_name != "":
+                    for parameter_index in first_position..<parameter_count |selected, argument_name, parameter_names, parameter_start|:
+                        if parameter_names[parameter_start + parameter_index] == argument_name:
+                            selected <- parameter_index
+                            break
+                else:
+                    while next_pos < parameter_count and assigned[next_pos] |next_pos, assigned|:
+                        next_pos <- next_pos + 1
+                    selected <- next_pos
+                    next_pos <- next_pos + 1 if next_pos < parameter_count
+                argument_index.i64() return if selected == wanted and selected < parameter_count and not assigned[selected]
+                -1 return if selected >= parameter_count or assigned[selected]
+                assigned[selected] <- true
+            return -1
+
+
+        # Generic declarations retain their parameter names in the AST rather than in FnTable.
+        # Use the same source-to-parameter assignment rules as ordinary calls.
+        def generic_named_argument_index(argument_names: darray[sview]&, parameters: darray[ParamDecl], wanted: usize) -> i64 can[Abort.Panic, Memory.Allocate]:
+            assigned: mutable darray[bool] = [false for _slot in 0..<parameters.count]
+            next_pos: mutable usize = 0
+            for argument_index in 0..<argument_names.count |assigned, next_pos, argument_names, parameters, wanted|:
+                argument_name: sview = argument_names[argument_index]
+                selected: mutable usize = parameters.count
+                if argument_name != "":
+                    for parameter_index in 0..<parameters.count |selected, argument_name, parameters|:
+                        if parameters[parameter_index].name == argument_name:
+                            selected <- parameter_index
+                            break
+                else:
+                    while next_pos < parameters.count and assigned[next_pos] |next_pos, assigned|:
+                        next_pos <- next_pos + 1
+                    selected <- next_pos
+                    next_pos <- next_pos + 1 if next_pos < parameters.count
+                argument_index.i64() return if selected == wanted and selected < parameters.count and not assigned[selected]
+                -1 return if selected >= parameters.count or assigned[selected]
+                assigned[selected] <- true
+            return -1
+
+
+        # Whether `owner::name` is a C variadic declaration. Only externs may currently
+        # populate this flag; ordinary Elisa functions remain fixed-arity.
+        def function_is_variadic(fns: FnTable&, owner: sview, name: sview) -> bool can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.is_variadic[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return false
+
+
+        # C default argument promotions for the unnamed tail of a variadic call.
+        def c_variadic_promoted_type(value_type: ValueType) -> ValueType can[Abort.Panic]:
+            ValueType{kind: TypeKind.Signed, bits: 32} return if value_type.kind == TypeKind.Bool
+            ValueType{kind: TypeKind.Signed, bits: 32} return if (value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned) and value_type.bits < 32
+            ValueType{kind: TypeKind.Float, bits: 64} return if value_type.kind == TypeKind.Float and value_type.bits == 32
+            return copied_type(value_type)
+
+
+        # The declared return type of `name`, or Unmodeled when the module has no such
+        # function.
+        def lookup_return_type(fns: FnTable&, owner: sview, name: sview) -> ValueType can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                copied_type(fns.returns[index]) return if fns.names[index] == name and fns.owners[index] == owner
+            return unmodeled_type()
+
+
+        # The type an expression yields, WITHOUT emitting anything.
+        #
+        # Bottom-up, and deliberately partial: an integer LITERAL has no type of its own
+        # (Unmodeled) and adopts whatever its context supplies. That is why the emitters
+        # thread an `expected` type downward — `a: u8 = 200` must make 200 a u8, not an
+        # i64 that is then silently truncated.
+        def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic]:
+            if expression is Expr.Ident(ident_name, ident_line):
+                # A LOCAL shadows a global const, so the scope is consulted first.
+                local_type: ValueType = lookup_type(local_scope, ident_name)
+                local_type return if local_type.kind != TypeKind.Unmodeled
+                extern_global_index: i64 = extern_global_index_of(structs, ident_name)
+                copied_type(structs.extern_global_types[extern_global_index.usize()]) return if extern_global_index >= 0
+                mutable_global_index: i64 = mutable_global_index_of(structs, ident_name)
+                copied_type(structs.mutable_global_types[mutable_global_index.usize()]) return if mutable_global_index >= 0
+                const_index: i64 = const_index_of(structs, ident_name)
+                copied_type(structs.const_types[const_index.usize()]) return if const_index >= 0 and structs.const_resolved[const_index.usize()]
+                # A global const AGGREGATE is not scalar-folded but still has a known type.
+                copied_type(structs.const_types[const_index.usize()]) return if const_index >= 0 and structs.const_global_ok[const_index.usize()]
+                return unmodeled_type()
+            if expression is Expr.Paren(paren_inner, paren_line):
+                return expression_type(paren_inner, local_scope, fns, structs, generics)
+            # A move has the moved value's type: it transfers ownership, not representation.
+            if expression is Expr.Move(moved_value, move_line):
+                return expression_type(moved_value, local_scope, fns, structs, generics)
+            if expression is Expr.BoolLit(bool_value):
+                return ValueType{kind: TypeKind.Bool, bits: 1}
+            if expression is Expr.CharLit(char_text):
+                return ValueType{kind: TypeKind.Signed, bits: 64}
+            if expression is Expr.Slice(slice_object, slice_start_expr, slice_end_expr, slice_line):
+                return ValueType{kind: TypeKind.SView, bits: 0}
+            # A STRING literal has a type of its own (cstr) — unlike an int literal, which
+            # defers to its context. There is no other string type in the subset for it to
+            # adopt, and stage0 gives `"hi"` a cstr regardless of context.
+            if expression is Expr.StringLit(string_text):
+                return ValueType{kind: TypeKind.CStr, bits: 0}
+            # A FLOAT literal, like an int literal, defers to its context (`x: f32 = 1.5`),
+            # so it reports Unmodeled here rather than pinning itself to f64.
+            if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
+                # `not x` is a bool whatever `x` is; `-x` / `~x` keep the operand's type.
+                ValueType{kind: TypeKind.Bool, bits: 1} return if unary_operator == TokenKind.Not or unary_operator == TokenKind.Bang
+                # `&place` is a reference to the place's type.
+                if unary_operator == TokenKind.Ampersand:
+                    place_type: ValueType = expression_type(unary_operand, local_scope, fns, structs, generics)
+                    unmodeled_type() return if place_type.kind == TypeKind.Unmodeled
+                    return intern_ref_type(place_type, structs)
+                return expression_type(unary_operand, local_scope, fns, structs, generics)
+            if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
+                # A comparison, logical, `is` narrowing, or `in` membership yields bool
+                # regardless of operands.
+                ValueType{kind: TypeKind.Bool, bits: 1} return if binary_operator == TokenKind.Is
+                ValueType{kind: TypeKind.Bool, bits: 1} return if binary_operator == TokenKind.In
+                ValueType{kind: TypeKind.Bool, bits: 1} return if int_predicate_of(binary_operator) >= 0
+                ValueType{kind: TypeKind.Bool, bits: 1} return if binary_operator == TokenKind.And or binary_operator == TokenKind.Or
+                # Arithmetic keeps the operands' type: take whichever side is known, since
+                # a literal contributes nothing.
+                left_type: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                left_type return if left_type.kind != TypeKind.Unmodeled
+                return expression_type(binary_right, local_scope, fns, structs, generics)
+            # `x.cast[T]` — a reinterpret cast has the target type.
+            if expression is Expr.Index(cast_type_head, cast_type_arg, cast_type_line):
+                if cast_type_head is Expr.Field(cast_type_source, cast_type_method, cast_type_method_line):
+                    if cast_type_method == "cast":
+                        return annotation_value_type(cast_type_arg, structs)
+            # `xs[i]` — an index READ yields the element type of an array, a darray, OR a
+            # `Struct&` used as a C-style pointer base (`items[i]` on a `DictBucket[K,T]&`).
+            if expression is Expr.Index(indexed_object, index_expression, index_line):
+                indexed_type: ValueType = expression_type(indexed_object, local_scope, fns, structs, generics)
+                # A byte read from a string (cstr / view[u8]) is an i64 (the runtime index
+                # helpers return i64), matching stage0.
+                ValueType{kind: TypeKind.Signed, bits: 64} return if indexed_type.kind == TypeKind.CStr or indexed_type.kind == TypeKind.SView
+                darray_element_of(indexed_type, structs) return if indexed_type.kind == TypeKind.DArray
+                if indexed_type.kind == TypeKind.Ref:
+                    ref_indexed_element: ValueType = ref_target_of(indexed_type, structs)
+                    ref_indexed_element return if ref_indexed_element.kind == TypeKind.Struct
+                    # `p[i]` where `p: T&` is a ref to a NUMERIC scalar used as a pointer base
+                    # (Slice's `p: T& = base.cast[T&]; p[i]` / `&p[lo]`): the element IS that scalar.
+                    ref_indexed_element return if ref_indexed_element.kind == TypeKind.Signed or ref_indexed_element.kind == TypeKind.Unsigned or ref_indexed_element.kind == TypeKind.Float
+                    # `da[i]` where `da: darray[T]&` — a borrowed darray param: the element is the
+                    # darray's element (so `&da[i]` types as a ref to it, which slice() needs).
+                    darray_element_of(ref_indexed_element, structs) return if ref_indexed_element.kind == TypeKind.DArray
+                # `found[0]` where `found: T&?` is an optional ref to a numeric scalar (narrowed
+                # non-null): the element is that scalar. index_map_find_index reads it this way.
+                if indexed_type.kind == TypeKind.Optional:
+                    opt_indexed_payload: ValueType = optional_payload_of(indexed_type, structs)
+                    if opt_indexed_payload.kind == TypeKind.Ref:
+                        opt_indexed_elem: ValueType = ref_target_of(opt_indexed_payload, structs)
+                        opt_indexed_elem return if opt_indexed_elem.kind == TypeKind.Signed or opt_indexed_elem.kind == TypeKind.Unsigned or opt_indexed_elem.kind == TypeKind.Float
+                return array_element_of(indexed_type, structs)
+            # `p.x` — a field READ has the field's declared type. (A cast `x.u8()` is a
+            # Field under a Call, handled below, so a bare Field is always a field read.)
+            # `Color.Green` / `Lexer::TokenKind.Ident` has the enum's BACKING type.
+            if expression is Expr.Field(enum_head, enum_member, enum_head_line):
+                enum_head_name: mutable sview = ""
+                if enum_head is Expr.Ident(enum_ident_name, enum_ident_line):
+                    enum_head_name <- enum_ident_name
+                # Module-qualified enum type: `Lexer::TokenKind.Ident`.
+                if enum_head is Expr.Scope(enum_scope_head, enum_scope_name, enum_scope_line):
+                    enum_head_name <- enum_scope_name
+                if enum_head_name != "":
+                    penum_head_index: i64 = penum_index_of(structs, enum_head_name)
+                    ValueType{kind: TypeKind.PayloadEnum, bits: penum_head_index.u32()} return if penum_head_index >= 0
+                    enum_slot: i64 = enum_index_of(structs, enum_head_name)
+                    if enum_slot >= 0:
+                        copied_type(structs.enum_backings[enum_slot.usize()]) return if enum_ordinal_of(structs, enum_slot.usize(), enum_member) >= 0
+            if expression is Expr.Field(field_object, field_name, field_line):
+                # Bitset flag names type as bool (`token.flags.has_suffix`).
+                ValueType{kind: TypeKind.Bool, bits: 1} return if field_name == "has_suffix" or field_name == "has_prefix"
+                object_type: mutable ValueType = expression_type(field_object, local_scope, fns, structs, generics)
+                # AUTO-DEREF: `p.x` where `p: P&` reads P's field. A reference is
+                # transparent for member access — the frontend has already decided the
+                # access is legal, so the backend just looks through it. An optional HEAP
+                # ref (`heap T&?`) is looked through too: stage0 represents it as a bare
+                # ptr and permits flow-guarded access without narrowing.
+                if object_type.kind == TypeKind.Optional:
+                    field_opt_payload: ValueType = optional_payload_of(object_type, structs)
+                    object_type <- field_opt_payload if field_opt_payload.kind == TypeKind.Ref and ref_is_heap_ref(field_opt_payload, structs)
+                object_type <- ref_target_of(object_type, structs) if object_type.kind == TypeKind.Ref
+                # Builtin string views are anonymous `{ptr, i64}` values rather than entries
+                # in StructTable. Their two ABI fields are still source-visible as `.data` and
+                # `.len`; resolve them directly before the named-struct path below.
+                if object_type.kind == TypeKind.SView:
+                    if field_name == "data":
+                        return intern_ref_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs)
+                    if field_name == "len":
+                        return ValueType{kind: TypeKind.Signed, bits: 64}
+                    return unmodeled_type()
+                # An arena CARRIER's fields read the user-declared `struct Arena`.
+                object_type <- arena_user_struct(structs) if object_type.kind == TypeKind.Arena
+                # `xs.count` is a usize-shaped i64.
+                ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "count"
+                # A `view[T]` field read goes through its DynArrayView struct.
+                object_type <- view_struct_type(object_type, structs) if object_type.kind == TypeKind.View
+                unmodeled_type() return if object_type.kind != TypeKind.Struct
+                struct_slot: usize = object_type.bits.usize()
+                position: i64 = field_index_of(structs, struct_slot, field_name)
+                unmodeled_type() return if position < 0
+                return copied_type(structs.field_types[structs.field_start[struct_slot] + position.usize()])
+            # `Point{x: 1, y: 2}` — a brace construction has the constructed type.
+            if expression is Expr.Construct(construct_type, construct_fields, construct_line):
+                return annotation_value_type(construct_type, structs)
+            if expression is Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
+                # A call through a `fn(…)`-typed local is an indirect call; its type is the
+                # fn value's declared RETURN type (so `f(f(x))` types its inner call).
+                if call_callee is Expr.Ident(fn_call_name, fn_call_name_line):
+                    fn_call_type: ValueType = lookup_type(local_scope, fn_call_name)
+                    fn_return_type_of(fn_call_type, structs) return if fn_call_type.kind == TypeKind.Fn
+                # `x.u8()` is a CAST (postfix call unifies cast and UFCS: `recv.Name()`
+                # where Name is a type name is a conversion).
+                if call_callee is Expr.Field(cast_object, cast_name, cast_line):
+                    if cast_object is Expr.Ident(packed_call_enum, packed_call_enum_line):
+                        packed_call_index: i64 = packed_index_of(structs, packed_call_enum)
+                        ValueType{kind: TypeKind.PackedEnum, bits: packed_call_index.u32()} return if packed_call_index >= 0 and cast_name != "Store"
+                    qualified_packed_name: sview = packed_constructor_enum_name(cast_object)
+                    if qualified_packed_name != "":
+                        qualified_packed_index: i64 = packed_index_of(structs, qualified_packed_name)
+                        ValueType{kind: TypeKind.PackedEnum, bits: qualified_packed_index.u32()} return if qualified_packed_index >= 0 and cast_name != "Store"
+                    if cast_object is Expr.Ident(store_type_enum, store_type_enum_line):
+                        if cast_name == "Store":
+                            store_type_index: i64 = packed_index_of(structs, store_type_enum)
+                            ValueType{kind: TypeKind.PackedStore, bits: store_type_index.u32()} return if store_type_index >= 0
+                    # `Shape.Circle(42)` is a payload-enum CONSTRUCTOR and has the enum's
+                    # type. Checked before the cast/UFCS split: the head is an enum NAME, so
+                    # neither of those readings applies.
+                    if cast_object is Expr.Ident(ctor_enum_name, ctor_enum_line):
+                        ctor_index: i64 = penum_index_of(structs, ctor_enum_name)
+                        ValueType{kind: TypeKind.PayloadEnum, bits: ctor_index.u32()} return if ctor_index >= 0
+                    # A dict receiver's `.get`/`.put`/… is a synthesized std-generic call —
+                    # its type is that helper's return annotation resolved under the receiver's
+                    # (K, T). Needed so `if d.get(k) is v:` can see the `T&?` it narrows.
+                    dict_return_args: darray[ValueType] = dict_type_args_of(cast_object, local_scope, fns, structs, generics)
+                    if dict_return_args.count != 0:
+                        dict_return_helper: sview = dict_method_helper(cast_name)
+                        if dict_return_helper != "":
+                            return generic_return_type(dict_return_helper, dict_return_args, generics, structs)
+                    # A type name is a CAST and has that type; anything else is UFCS
+                    # (`p.get()` == `get(p)`) and has the FUNCTION's return type. Without
+                    # the second case a UFCS call reports Unmodeled and every
+                    # type-directed check downstream silently stops applying.
+                    cast_type: ValueType = scalar_type_of_name(cast_name)
+                    cast_type return if cast_type.kind != TypeKind.Unmodeled
+                    top_ufcs: ValueType = lookup_return_type(fns, "", cast_name)
+                    top_ufcs return if top_ufcs.kind != TypeKind.Unmodeled
+                    # Module methods (`module Lexer: def match_char`) live under owner M.
+                    # Prefer arity match: UFCS has implicit receiver + call_arguments.
+                    ufcs_arity: usize = call_arguments.count + 1
+                    for ufcs_ret_scan in 0..<fns.names.count |cast_name, fns, ufcs_arity|:
+                        if fns.names[ufcs_ret_scan] == cast_name and fns.param_count[ufcs_ret_scan] == ufcs_arity:
+                            return copied_type(fns.returns[ufcs_ret_scan])
+                    ufcs_owner: mutable sview = ""
+                    ufcs_hits: mutable i64 = 0
+                    for ufcs_ret_scan2 in 0..<fns.names.count |ufcs_owner, ufcs_hits, cast_name, fns|:
+                        if fns.names[ufcs_ret_scan2] == cast_name:
+                            ufcs_hits <- ufcs_hits + 1
+                            ufcs_owner <- fns.owners[ufcs_ret_scan2]
+                    lookup_return_type(fns, ufcs_owner, cast_name) return if ufcs_hits == 1
+                    return unmodeled_type()
+                # `f[i64](x)` — an explicit generic call. Its type is the template's return
+                # annotation resolved under that binding, which for `-> T` is the type
+                # argument itself.
+                if call_callee is Expr.Index(generic_head, generic_type_argument, generic_head_line):
+                    if generic_head is Expr.Ident(generic_head_name, generic_head_name_line):
+                        if generic_head_name == "clone":
+                            clone_payload_type: ValueType = annotation_value_type(generic_type_argument, structs)
+                            clone_error_family: sview = clone_error_family_at(generic_head_line, structs)
+                            if clone_error_family != "":
+                                return intern_error_union_type(clone_payload_type, clone_error_family, structs)
+                            return clone_payload_type
+                        if generic_index_of(generics, generic_head_name) >= 0:
+                            single_return_args: mutable darray[ValueType] = [annotation_value_type(generic_type_argument, structs)]
+                            return generic_return_type(generic_head_name, single_return_args, generics, structs)
+                # `f[K, V](x)` — an explicit MULTI-argument generic call's type.
+                if call_callee is Expr.IndexN(multi_head, multi_head_args, multi_head_line):
+                    if multi_head is Expr.Ident(multi_head_name, multi_head_name_line):
+                        if multi_head_name == "clone" and multi_head_args.count > 0:
+                            clone_multi_payload: ValueType = annotation_value_type(multi_head_args[0], structs)
+                            clone_multi_family: sview = clone_error_family_at(multi_head_line, structs)
+                            if clone_multi_family != "":
+                                return intern_error_union_type(clone_multi_payload, clone_multi_family, structs)
+                            return clone_multi_payload
+                        if generic_index_of(generics, multi_head_name) >= 0:
+                            multi_return_args: mutable darray[ValueType] = []
+                            for multi_return_arg_expr in multi_head_args |multi_return_args, structs|:
+                                multi_return_args.push(annotation_value_type(multi_return_arg_expr, structs))
+                            return generic_return_type(multi_head_name, multi_return_args, generics, structs)
+                if call_callee is Expr.Ident(callee_name, callee_line):
+                    # The `ctx_hash_value` builtin returns u64.
+                    ValueType{kind: TypeKind.Unsigned, bits: 64} return if callee_name == "ctx_hash_value"
+                    # `__fstr(…)` builds a dstr (`darray[u8]`).
+                    intern_darray_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs) return if callee_name == "__fstr"
+                    ValueType{kind: TypeKind.Unsigned, bits: 64} return if callee_name == "size_of"
+                    intern_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs) return if callee_name == "arena_alloc"
+                    # `i64(x)` / `u8(x)` — a prefix value CONVERSION (the canonical `T(x)`
+                    # spelling; postfix `x.i64()` is on the cast path). A scalar type name applied
+                    # to one argument has that scalar type. Checked before the generic/function
+                    # lookup so a downstream `i64(x) - k` sees an i64 operand, not Unmodeled.
+                    prefix_conversion_type: ValueType = scalar_type_of_name(callee_name)
+                    prefix_conversion_type return if prefix_conversion_type.kind != TypeKind.Unmodeled and call_arguments.count == 1
+                    # A GENERIC template is NOT in `fns` — only its instantiations are —
+                    # so it must be resolved through the template. Without this a generic
+                    # call reports Unmodeled and every type-directed check downstream
+                    # (operand typing, the mixed-width guard) silently stops applying.
+                    if generic_index_of(generics, callee_name) >= 0:
+                        unmodeled_type() return if call_arguments.count == 0
+                        inferred_return_slot: usize = generic_index_of(generics, callee_name).usize()
+                        inferred_return_args: darray[ValueType] = infer_generic_args(inferred_return_slot, call_arguments, local_scope, fns, structs, generics)
+                        unmodeled_type() return if inferred_return_args.count == 0
+                        return generic_return_type(callee_name, inferred_return_args, generics, structs)
+                    top_return: ValueType = lookup_return_type(fns, "", callee_name)
+                    top_return return if top_return.kind != TypeKind.Unmodeled
+                    # Bare sibling call inside a module. Prefer arity-matched overload
+                    # (Token 4-arg forwarding to 5-arg); unique-name fallback otherwise.
+                    bare_ret_arity: usize = call_arguments.count
+                    for bare_ret_scan in 0..<fns.names.count |callee_name, fns, bare_ret_arity|:
+                        if fns.names[bare_ret_scan] == callee_name and fns.param_count[bare_ret_scan] == bare_ret_arity:
+                            return copied_type(fns.returns[bare_ret_scan])
+                    bare_ret_owner: mutable sview = ""
+                    bare_ret_hits: mutable i64 = 0
+                    for bare_ret_scan2 in 0..<fns.names.count |bare_ret_owner, bare_ret_hits, callee_name, fns|:
+                        if fns.names[bare_ret_scan2] == callee_name:
+                            bare_ret_hits <- bare_ret_hits + 1
+                            bare_ret_owner <- fns.owners[bare_ret_scan2]
+                    lookup_return_type(fns, bare_ret_owner, callee_name) return if bare_ret_hits == 1
+                    return unmodeled_type()
+                # A module-qualified call's type is the qualified function's return type.
+                if call_callee is Expr.Scope(scope_head, scope_name, scope_line):
+                    if scope_head is Expr.Ident(module_name, module_name_line):
+                        return lookup_return_type(fns, module_name, scope_name)
+            return unmodeled_type()
+
+
+        # Map an Elisa comparison token to an LLVMIntPredicate, or -1 when the operator is
+        # not a comparison. Signed predicates (SLT/SLE/SGT/SGE): the subset is i64.
+        def int_predicate_of(operator: TokenKind) -> i32:
+            32 return if operator == TokenKind.EqEq
+            33 return if operator == TokenKind.BangEq
+            40 return if operator == TokenKind.Lt
+            41 return if operator == TokenKind.LtEq
+            38 return if operator == TokenKind.Gt
+            39 return if operator == TokenKind.GtEq
+            return -1
+
+
+        # The same comparison for an UNSIGNED operand type. Equality is signedness-free
+        # (32/33); ordering is not — SLT(40)/SLE(41)/SGT(38)/SGE(39) become
+        # ULT(36)/ULE(37)/UGT(34)/UGE(35). Comparing `u8 200 < 3` with SLT reads 200 as
+        # -56 and answers TRUE.
+        def unsigned_predicate_of(predicate: i32) -> i32:
+            36 return if predicate == 40
+            37 return if predicate == 41
+            34 return if predicate == 38
+            35 return if predicate == 39
+            return predicate
+
+
+        # Emit `left <op> right` for the modeled signed-i64 operators. `null` = unmodeled,
+        # so a bitwise/logical op declines rather than emitting something wrong.
+        #
+        # A comparison yields an `i1`; every modeled value is an i64, so the i1 is
+        # zero-extended back to i64. Conditions re-narrow with `!= 0` (emit_condition),
+        # which keeps ONE uniform value representation instead of tracking i1-vs-i64.
+        #
+        # SDiv/SRem (not UDiv/URem): the subset is signed. Elisa's `%` is LLVM's `srem`
+        # (sign follows the DIVIDEND: -7 % 2 == -1) — verified against stage0, which
+        # selects the same instruction for a signed operand type.
+        # The ORDERED float predicate matching an integer one. Ordered = any comparison
+        # with NaN is false, which is IEEE `==` / `<` semantics.
+        # OEQ=1, OGT=2, OGE=3, OLT=4, OLE=5, ONE=6.
+        def float_predicate_of(operator: TokenKind) -> i32:
+            1 return if operator == TokenKind.EqEq
+            6 return if operator == TokenKind.BangEq
+            4 return if operator == TokenKind.Lt
+            5 return if operator == TokenKind.LtEq
+            2 return if operator == TokenKind.Gt
+            3 return if operator == TokenKind.GtEq
+            return -1
+
+
+        def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, structs: mutable StructTable&, fast_math: bool, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            # Floats are a different instruction family end to end: fadd/fdiv/fcmp, never
+            # add/sdiv/icmp. Bitwise and shifts have no float form and decline.
+            if operand_type.kind == TypeKind.Float:
+                finish_float_instruction(LLVMBuildFAdd(builder, left, right, "fadd"), fast_math) return if operator == TokenKind.Plus
+                finish_float_instruction(LLVMBuildFSub(builder, left, right, "fsub"), fast_math) return if operator == TokenKind.Minus
+                finish_float_instruction(LLVMBuildFMul(builder, left, right, "fmul"), fast_math) return if operator == TokenKind.Star
+                finish_float_instruction(LLVMBuildFDiv(builder, left, right, "fdiv"), fast_math) return if operator == TokenKind.Slash
+                finish_float_instruction(LLVMBuildFRem(builder, left, right, "frem"), fast_math) return if operator == TokenKind.Percent
+                float_predicate: i32 = float_predicate_of(operator)
+                finish_float_instruction(LLVMBuildFCmp(builder, float_predicate, left, right, "fcmp"), fast_math) return if float_predicate >= 0
+                return null
+            unsigned: bool = operand_type.kind == TypeKind.Unsigned
+            LLVMBuildAdd(builder, left, right, "add") return if operator == TokenKind.Plus
+            LLVMBuildSub(builder, left, right, "sub") return if operator == TokenKind.Minus
+            LLVMBuildMul(builder, left, right, "mul") return if operator == TokenKind.Star
+            LLVMBuildAnd(builder, left, right, "and") return if operator == TokenKind.Ampersand
+            LLVMBuildOr(builder, left, right, "or") return if operator == TokenKind.Pipe
+            LLVMBuildXor(builder, left, right, "xor") return if operator == TokenKind.Caret
+            LLVMBuildShl(builder, left, right, "shl") return if operator == TokenKind.LShift
+
+            # Signedness picks the INSTRUCTION, and it is observable: stage0 gives
+            # `u8 200 / 3` == 66 (udiv) and `u8 200 >> 1` == 100 (lshr); the signed forms
+            # answer -56 and 228.
+            if operator == TokenKind.Slash:
+                return LLVMBuildUDiv(builder, left, right, "div") if unsigned else LLVMBuildSDiv(builder, left, right, "div")
+            if operator == TokenKind.Percent:
+                return LLVMBuildURem(builder, left, right, "rem") if unsigned else LLVMBuildSRem(builder, left, right, "rem")
+            if operator == TokenKind.RShift:
+                return LLVMBuildLShr(builder, left, right, "shr") if unsigned else LLVMBuildAShr(builder, left, right, "shr")
+
+            predicate: i32 = int_predicate_of(operator)
+            if predicate >= 0:
+                resolved: i32 = unsigned_predicate_of(predicate) if unsigned else predicate
+                # A comparison yields an i1 — the modeled `bool` — NOT a widened int.
+                return LLVMBuildICmp(builder, resolved, left, right, "cmp")
+            return null
+
+
+        # Parse an integer pattern's literal TEXT (`Pattern.Literal` carries raw source
+        # text, not a value). False when it is not a plain decimal integer, so a
+        # char/string/float pattern DECLINES instead of being misread as a number.
+        def parse_int_literal(text: sview, out_value: mutable i64&) -> bool can[Abort.Panic]:
+            false return if sview_len(text) == 0
+            negative: bool = sview_at(text, 0) == 45
+            start: usize = 1 if negative else 0
+            false return if sview_len(text) == start
+            accumulated: mutable i64 = 0
+            ok: mutable bool = true
+            for index in start..<sview_len(text) |accumulated, ok, text|:
+                byte: u8 = sview_at(text, index)
+                if byte < 48 or byte > 57:
+                    ok <- false
+                else:
+                    accumulated <- accumulated * 10 + (byte.i64() - 48)
+            false return if not ok
+            out_value <- 0 - accumulated if negative else accumulated
+            return true
+
+
+        # Char pattern / CharLit interior → Unicode code unit as i64.
+        # Accepts lexer interior form (`A`, `\n`) and quoted form (`'A'`, `'\n'`).
+        def parse_char_literal_code(text: sview, out_value: mutable i64&) -> bool can[Abort.Panic]:
+            false return if sview_len(text) == 0
+            # Quoted: `'x'` / `'\n'`.
+            if sview_len(text) >= 3 and sview_at(text, 0) == 39 and sview_at(text, sview_len(text) - 1) == 39:
+                inner_start: usize = 1
+                inner_end: usize = sview_len(text) - 1
+                false return if inner_end <= inner_start
+                first: u8 = sview_at(text, inner_start)
+                if first == 92:
+                    false return if inner_start + 1 >= inner_end
+                    esc: u8 = sview_at(text, inner_start + 1)
+                    out_value <- 10 if esc == 110 else (9 if esc == 116 else (13 if esc == 114 else (0 if esc == 48 else (92 if esc == 92 else (39 if esc == 39 else esc.i64())))))
+                    return true
+                out_value <- first.i64()
+                return true
+            # Interior-only (lexer CharLit token text).
+            if sview_len(text) == 1:
+                out_value <- sview_at(text, 0).i64()
+                return true
+            if sview_len(text) >= 2 and sview_at(text, 0) == 92:
+                esc2: u8 = sview_at(text, 1)
+                out_value <- 10 if esc2 == 110 else (9 if esc2 == 116 else (13 if esc2 == 114 else (0 if esc2 == 48 else (92 if esc2 == 92 else (39 if esc2 == 39 else esc2.i64())))))
+                return true
+            return false

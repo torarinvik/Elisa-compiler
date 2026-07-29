@@ -1,0 +1,575 @@
+# Stage1 backend — LLVM codegen (`module Backend`).
+#
+# The stage0 counterpart is compiler/src/backend/llvm_*.go (~54k lines of cgo). This is
+# the growing port of that: it walks the stage1 AST and drives LLVM-C (see llvm_c.elisa).
+#
+# Sound SUBSET, mirroring how the frontend was ported: only firmly-modeled constructs
+# emit. Every emitter returns a "declined" signal for anything it does not model, and
+# `emit_module` turns ANY decline into a whole-module decline, so the driver reports an
+# honest UNSUPPORTED instead of handing back a module that is quietly missing code.
+# Coverage grows one construct at a time, each with a compile-and-run fixture asserting
+# real behavior (an exit code), plus a differential against stage0 where the reference
+# compiler can compile the same source.
+#
+# Modeled today: `def f(a: i64, …) -> i64` over signed i64 — int literals, idents,
+# `+ - * / %`, unary `+`/`-`, comparisons, parens, locals (`x: i64 = …`), assignment,
+# `if`/`else`, `while`, `return`, and direct calls to other modeled functions.
+
+include "../parser/parser.elisa"
+include "llvm_c.elisa"
+include "c_header.elisa"
+include "easm_model.elisa"
+using Ast
+
+module Backend:
+    private:
+        # LLVM-C takes NUL-terminated `const char*`, but an `sview` is a (ptr, len) view
+        # into the source buffer with no terminator — taking `&view[0]` would hand LLVM a
+        # string that runs to the end of the FILE. Copy the bytes and terminate.
+        # `storage` is caller-owned on purpose: the returned pointer aliases it, so it
+        # must outlive the LLVM call that consumes the name.
+        def sview_to_cstr(name: sview, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<sview_len(name) |storage|:
+                storage.push(sview_at(name, index))
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        # `-fnoalias` is an explicit opt-in in stage0 because an incorrect noalias
+        # promise is a silent optimizer miscompile. The stage1 driver is itself a
+        # native program, so mirror the CLI's process configuration through libc's
+        # environment rather than changing the source-language ABI.
+        def noalias_mutable_refs_enabled() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            flag_storage: mutable darray[u8] = []
+            flag_name: cstr = sview_to_cstr("ELISACORE_NOALIAS_MUTABLE_REFS", flag_storage)
+            if getenv(flag_name) is real:
+                return true
+            return false
+
+
+        # `-fbounds-check` is an opt-in debugging mode in stage0. Keep the switch in
+        # the process environment so the self-hosted product and the stage0-seeded
+        # driver use the same configuration path.
+        def force_bounds_check_enabled() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            flag_storage: mutable darray[u8] = []
+            flag_name: cstr = sview_to_cstr("ELISACORE_FORCE_BOUNDS_CHECK", flag_storage)
+            if getenv(flag_name) is real:
+                return true
+            return false
+
+
+        # TEMP decline tracer (gated on ELISA_DBG_DECLINE): prints "<fn>: <tag>" when a
+        # statement declines inside the named function, to locate self-host blockers.
+        def dbg_decline_enabled() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            flag_storage: mutable darray[u8] = []
+            flag_name: cstr = sview_to_cstr("ELISA_DBG_DECLINE", flag_storage)
+            if getenv(flag_name) is real:
+                return true
+            return false
+
+        def dbg_stmt_kind(statement: Stmt) -> sview can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if statement is Stmt.Block(_, _, _, _, _): return "Block"
+            if statement is Stmt.VarDecl(_, _, _, _): return "VarDecl"
+            if statement is Stmt.Assign(_, _, _, _): return "Assign"
+            if statement is Stmt.Expr(_, _): return "Expr"
+            if statement is Stmt.Return(_, _): return "Return"
+            if statement is Stmt.If(_, _, _, _): return "If"
+            if statement is Stmt.While(_, _, _): return "While"
+            if statement is Stmt.For(_, _, _, _, _): return "For"
+            if statement is Stmt.Match(_, _, _): return "Match"
+            if statement is Stmt.Break(_, _): return "Break"
+            if statement is Stmt.Continue(_, _): return "Continue"
+            return "?Stmt"
+
+        def dbg_push_sview(storage: mutable darray[u8]&, s: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<sview_len(s) |storage|:
+                storage.push(sview_at(s, index))
+            return 0
+
+
+        def dbg_stmt_line(statement: Stmt) -> u32 can[Abort.Panic]:
+            if statement is Stmt.Block(_, _, _, _, bl): return bl
+            if statement is Stmt.VarDecl(_, _, _, vl): return vl
+            if statement is Stmt.Assign(_, _, _, al): return al
+            if statement is Stmt.Expr(_, el): return el
+            if statement is Stmt.Return(_, rl): return rl
+            if statement is Stmt.If(_, _, _, il): return il
+            if statement is Stmt.While(_, _, wl): return wl
+            if statement is Stmt.For(_, _, _, _, fl): return fl
+            if statement is Stmt.Match(_, _, ml): return ml
+            return 0
+
+        def dbg_push_int(storage: mutable darray[u8]&, value: u32) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if value == 0:
+                storage.push(48)
+                return 0
+            digits: mutable darray[u8] = []
+            remaining: mutable u32 = value
+            while remaining > 0 |digits, remaining|:
+                digits.push(48 + (remaining % 10).u8())
+                remaining <- remaining / 10
+            for rev in 0..<digits.count |storage, digits|:
+                storage.push(digits[digits.count - 1 - rev])
+            return 0
+
+        def dbg_cond_fail(function: sview, condition: Expr) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            0 return if function != "declare_or_get_abort" and function != "declare_or_get_named" and function != "tag_disjoint_darray_access"
+            msg_storage: mutable darray[u8] = []
+            _ = dbg_push_sview(msg_storage, "  COND.FAIL ")
+            if condition is Expr.Binary(cf_left, cf_op, cf_right, cf_line):
+                _ = dbg_push_sview(msg_storage, "Binary @")
+                _ = dbg_push_int(msg_storage, cf_line)
+            elif condition is Expr.Call(cf_callee, cf_args, cf_names, cf_cl):
+                _ = dbg_push_sview(msg_storage, "Call @")
+                _ = dbg_push_int(msg_storage, cf_cl)
+            elif condition is Expr.Unary(cf_uop, cf_uoperand, cf_ul):
+                _ = dbg_push_sview(msg_storage, "Unary @")
+                _ = dbg_push_int(msg_storage, cf_ul)
+            elif condition is Expr.Ident(cf_name, cf_il):
+                _ = dbg_push_sview(msg_storage, "Ident ")
+                _ = dbg_push_sview(msg_storage, cf_name)
+            else:
+                _ = dbg_push_sview(msg_storage, "other")
+            msg_storage.push(0)
+            return puts((&msg_storage[0]).cast[cstr] can Unsafe.PointerCast)
+
+        def dbg_decline(function: sview, statement: Stmt) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            msg_storage: mutable darray[u8] = []
+            _ = dbg_push_sview(msg_storage, function)
+            _ = dbg_push_sview(msg_storage, ": DECLINE ")
+            _ = dbg_push_sview(msg_storage, dbg_stmt_kind(statement))
+            _ = dbg_push_sview(msg_storage, " @line ")
+            _ = dbg_push_int(msg_storage, dbg_stmt_line(statement))
+            msg_storage.push(0)
+            return puts((&msg_storage[0]).cast[cstr] can Unsafe.PointerCast)
+
+        # The INNER bytes of a string-literal pattern span, which arrives quote-INCLUSIVE
+        # (`"yes"`) because a pattern literal keeps its raw source text. Strips the surrounding
+        # double quotes and returns a NUL-terminated cstr of the content. Declines (null) on a
+        # backslash: escape decoding would have to match stage0's exactly, so a `"a\n"` pattern
+        # is left to decline rather than risk a mis-encoded compare.
+        def string_pattern_content_cstr(text: sview, storage: mutable darray[u8]&) -> cstr? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            length: usize = sview_len(text)
+            null return if length == 0
+            # The span may or may not include the surrounding double quotes depending on how
+            # the pattern lexer captured it; strip a matched pair when present.
+            quoted: bool = length >= 2 and sview_at(text, 0) == 34 and sview_at(text, length - 1) == 34
+            start: usize = 1 if quoted else 0
+            stop: usize = length - 1 if quoted else length
+            index: mutable usize = start
+            while index < stop |storage, index|:
+                byte: u8 = sview_at(text, index)
+                null return if byte == 92
+                storage.push(byte)
+                index <- index + 1
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        # The LLVM SYMBOL name for `owner::name`: stage0 emits `module M: def get()` as
+        # `define i64 @M.get` — DOT-separated, even though the call spelling is `M::get()`.
+        # An empty owner is a top-level function and keeps its bare name.
+        def qualified_name_cstr(owner: sview, name: sview, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            sview_to_cstr(name, storage) return if sview_len(owner) == 0
+            for index in 0..<sview_len(owner) |storage|:
+                storage.push(sview_at(owner, index))
+            storage.push(46)
+            for index in 0..<sview_len(name) |storage|:
+                storage.push(sview_at(name, index))
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+        # A modeled value's type. `bits` is the integer width; `Bool` is i1 (LLVM's
+        # natural boolean) and carries no width of its own.
+        #
+        # Signedness is not cosmetic: stage0 lowers `u8 200 / 3` to `udiv` (66) and
+        # `u8 200 >> 1` to `lshr` (100). Reading those as signed gives -56 and 228 — so a
+        # backend that ignores signedness silently miscompiles unsigned arithmetic.
+        const enum TypeKind of u8:
+            Unmodeled
+            Signed
+            Unsigned
+            Bool
+            Float
+            # `void` — legal ONLY as a return type. It has no values, so nothing can be a
+            # `void` local, parameter, or operand; every other position rejects it because
+            # `unmodeled_type()` is what those paths test for and Void is not that.
+            Void
+            # A user struct. `bits` is its index in the StructTable — a ValueType must stay
+            # POD (an sview name would be fine, but an index also gives O(1) field lookup).
+            Struct
+            # A fixed array `T[N]`. `bits` indexes the StructTable's ARRAY side-pool
+            # (`array_elements` / `array_extents`) — same reason as Struct: ValueType is
+            # POD, so a nested element type cannot live inline.
+            Array
+            # A `packed enum`'s HANDLE. Same `{i32, [N x i64]}` shape as a payload enum, but
+            # the value is a row in an AoS store rather than inline data: the tag and payload
+            # are read back through ctx_packed_store_* rather than by extractvalue/GEP.
+            # `bits` indexes the PACKED side-pool.
+            PackedEnum
+            # `Node.Store[Local]` — `{ptr arena, i64 row_bytes, ptr state}`. `bits` indexes
+            # the PACKED side-pool of the enum it stores.
+            PackedStore
+            # `Arena` — the runtime's region carrier, `{ptr, ptr, i64, i64}`, passed BY
+            # VALUE (stage0: `define i64 @build(%Arena %0)` and `%r1 = load %Arena, ptr %r`
+            # at the call site). Note the asymmetry: `Arena` is legal as a PARAMETER type
+            # but rejected as a region ANNOTATION (`-> darray[i64] @owner` is "internal
+            # runtime carrier type ... not supported in user-facing code").
+            Arena
+            # A PAYLOAD-carrying enum (`enum Shape: Circle(r: i64)`). In LLVM a TAGGED UNION
+            # `{ i32, [N x i64] }`: field 0 is the variant ORDINAL, field 1 is payload
+            # storage sized to the largest variant (stage0's `%Shape = type { i32, [1 x
+            # i64] }`, read from its IR). NOT the AoS packed store -- that is `packed enum`,
+            # a different subsystem. `bits` indexes the PAYLOAD-ENUM side-pool.
+            PayloadEnum
+            # `cstr` — a NUL-terminated string constant. In LLVM just a `ptr`: stage0
+            # lowers `s: cstr = "hi"` to `@str = private unnamed_addr constant [3 x i8]
+            # c"hi\00"` plus `store ptr @str`. Carries no length, so `.count`, indexing and
+            # comparison are NOT modeled (they need the runtime) and decline.
+            CStr
+            # A reference `T&` / `mutable T&`. `bits` indexes the REF side-pool
+            # (`ref_targets`). In LLVM it is just a `ptr` — stage0 lowers
+            # `def bump(n: mutable i64&)` to `define void @bump(ptr)` and `bump(x)` to
+            # `call void @bump(ptr %x)`. Mutability is a FRONTEND concern (it already
+            # rejects writes through a `T&`), so the backend models only the referent.
+            Ref
+            # An optional `T?`. `bits` indexes the OPTIONAL side-pool (`optional_targets`).
+            # Represented exactly as stage0 does — `{i1 has_value, T value}` (read from its
+            # `-emit llvm`: `%Optional__i64 = type { i1, i64 }`).
+            Optional
+            # A value-carrying `T error[E]`. `bits` indexes the ERROR-UNION side-pools;
+            # LLVM uses stage0's `{i32 error_code, ptr payload}` descriptor.
+            ErrorUnion
+            # A `darray[T]`. `bits` indexes the DARRAY side-pool (`darray_elements`).
+            # Represented exactly as stage0 does — `{ptr items, i64 count, i64 capacity}`,
+            # backed by an Arena — because both link the SAME runtime, so the layout is
+            # dictated, not chosen.
+            DArray
+            # A `view[T]` — the runtime's `DynArrayView` fat pointer `{data, len}`. `bits`
+            # indexes the VIEW side-pool (`view_elements`), carrying the phantom element T
+            # so a generic call like `arena_da_fill(view, …)` can INFER T from the argument.
+            # Lowers to the one `DynArrayView` struct regardless of T (like darray).
+            View
+            # `sview` — a string VIEW, stage0's `%StringView = type { ptr, i64 }` (a byte
+            # pointer plus a length). Distinct from `cstr` (bare `ptr`, NUL-terminated) and
+            # from `view[T]` (DynArrayView). A literal `s: sview = "hi"` is the aggregate
+            # `{ptr @str, i64 2}`; equality goes through `ctx_string_views_eq` BY VALUE.
+            SView
+            # `fn(A, …) -> R` — a first-class function value. Represented as stage0 does: a
+            # low-bit-TAGGED `ptr`. Bit0 clear = a raw function pointer (`@f`), called directly;
+            # bit0 set = points (after `& ~1`) at an `%ElisaCoreLambdaClosure = {ptr code, ptr
+            # env}`, called `code(env, args…)`. The result type at a call site comes from the
+            # EXPECTED type (a `return f(x)` / `y: R = f(x)` supplies it), so `bits` is unused.
+            Fn
+            # `GuestVAddr[L]` / `HostPtr[T]` address-space carriers (docs/107). ABI storage is
+            # `i64`/`uintptr`; `bits` indexes `guest_layouts` with the layout/pointee name so
+            # overlay accessors can resolve field offsets. HostPtr uses the same kind because
+            # both are raw address integers at the LLVM boundary.
+            GuestCarrier
+
+
+        struct ValueType:
+            kind: TypeKind
+            bits: u32
+
+        # The `{value, overflow}` result returned by LLVM's checked integer intrinsics.
+        # Stage0 uses these for every allocation-size multiplication and for darray capacity
+        # growth; keeping the pair explicit lets the stage1 emitter choose between trapping
+        # and the safe-capacity fallback without silently dropping the flag.
+        struct OverflowResult:
+            value: LLVMValueRef
+            overflow: LLVMValueRef
+
+
+        def unmodeled_type() -> ValueType:
+            return ValueType{kind: TypeKind.Unmodeled, bits: 0}
+
+
+        def is_integer_type(value_type: ValueType) -> bool:
+            return value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned
+
+
+        # The i1 test for a `Pattern.Range` arm (`lo..<hi` / `lo..=hi`) over an INTEGER
+        # scrutinee: `scrutinee >= lo AND scrutinee </<= hi`. Signed/unsigned drives the
+        # predicate (a u8 range must compare with U* predicates). Returns null when either
+        # bound is not an integer literal (e.g. a char-literal range) so the caller declines.
+        # LLVM IntPredicate: UGE=35 ULT=36 ULE=37 SGE=39 SLT=40 SLE=41.
+        def emit_range_test(scrutinee: LLVMValueRef, scrutinee_type: ValueType, lo_text: sview, hi_text: sview, inclusive: bool, compare_type: LLVMTypeRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            lo_value: mutable i64 = 0
+            hi_value: mutable i64 = 0
+            null return if not parse_pattern_scalar(lo_text, lo_value)
+            null return if not parse_pattern_scalar(hi_text, hi_value)
+            unsigned: bool = scrutinee_type.kind == TypeKind.Unsigned
+            lo_pred: u32 = 35 if unsigned else 39
+            hi_pred: mutable u32 = 40
+            hi_pred <- 41 if inclusive
+            if unsigned:
+                hi_pred <- 37 if inclusive else 36
+            lo_hit: LLVMValueRef = LLVMBuildICmp(builder, lo_pred, scrutinee, LLVMConstInt(compare_type, lo_value.u64(), 1), "range.lo")
+            hi_hit: LLVMValueRef = LLVMBuildICmp(builder, hi_pred, scrutinee, LLVMConstInt(compare_type, hi_value.u64(), 1), "range.hi")
+            return LLVMBuildAnd(builder, lo_hit, hi_hit, "range.in")
+
+
+        # The i1 test for ONE simple, binding-free arm pattern against an already-lowered
+        # `scrutinee` (a raw integer, or a payload-enum's extracted i32 tag when `penum`).
+        # Handles integer/const-enum-ordinal literals, field-less variant paths, and integer
+        # ranges — the sub-patterns an OR-pattern (`0 | 2 | 4`, `E.A | E.B`) is built from.
+        # Returns null for anything with a binding or payload (an OR alternative cannot bind).
+        def emit_simple_pattern_hit(pattern: Pattern, scrutinee: LLVMValueRef, scrutinee_type: ValueType, penum: bool, compare_type: LLVMTypeRef, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            if pattern is Pattern.Literal(literal_text):
+                literal_value: mutable i64 = 0
+                null return if not parse_pattern_scalar(literal_text, literal_value)
+                return LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(compare_type, literal_value.u64(), 1), "or.cmp")
+            if pattern is Pattern.Variant(variant_path, variant_fields):
+                null return if variant_fields.count != 0
+                ordinal: mutable i64 = penum_variant_index_of_path(variant_path, structs) if penum else ordinal_of_dotted_path(variant_path, structs)
+                null return if ordinal < 0
+                return LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(compare_type, ordinal.u64(), 1), "or.cmp")
+            if pattern is Pattern.Range(range_lo, range_hi, range_inclusive):
+                null return if penum
+                return emit_range_test(scrutinee, scrutinee_type, range_lo, range_hi, range_inclusive, compare_type, ctx, builder)
+            return null
+
+
+        # The combined i1 test for an OR-pattern's option list: hit if ANY option hits.
+        # Returns null if any option is not a simple binding-free pattern.
+        def emit_or_pattern_hit(options: darray[Pattern], scrutinee: LLVMValueRef, scrutinee_type: ValueType, penum: bool, compare_type: LLVMTypeRef, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            null return if options.count == 0
+            combined: mutable LLVMValueRef = zeroed
+            have: mutable bool = false
+            failed: mutable bool = false
+            for option in options |combined, have, failed, scrutinee, scrutinee_type, penum, compare_type, structs, ctx, builder|:
+                continue if failed
+                if emit_simple_pattern_hit(option, scrutinee, scrutinee_type, penum, compare_type, structs, ctx, builder) is option_hit:
+                    combined <- option_hit if not have
+                    combined <- LLVMBuildOr(builder, combined, option_hit, "or.any") if have
+                    have <- true
+                else:
+                    failed <- true
+            null return if failed or not have
+            return combined
+
+
+        def is_numeric_type(value_type: ValueType) -> bool:
+            return is_integer_type(value_type) or value_type.kind == TypeKind.Float
+
+
+        # Whether the type lowers to an LLVM `ptr` — a reference or a cstr. Used to keep a
+        # `.cast[T]` reinterpret to the pointer<->pointer no-op the std alloc helpers need.
+        def type_is_pointer(value_type: ValueType) -> bool:
+            return value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.CStr
+
+
+        # The named scalar types the backend models. Anything else (f32/f64, containers,
+        # user types) yields Unmodeled and DECLINES rather than being guessed at.
+        #
+        # `int` is stage0's signed 64-bit default; `usize` is pointer-width (64 here — the
+        # port targets arm64/x86-64, and a 32-bit target would need this to follow the
+        # target triple).
+        def scalar_type_of_name(name: sview) -> ValueType:
+            ValueType{kind: TypeKind.CStr, bits: 0} return if name == "cstr"
+            ValueType{kind: TypeKind.SView, bits: 0} return if name == "sview"
+            ValueType{kind: TypeKind.Signed, bits: 8} return if name == "i8"
+            ValueType{kind: TypeKind.Signed, bits: 16} return if name == "i16"
+            ValueType{kind: TypeKind.Signed, bits: 32} return if name == "i32"
+            # `isize` is the signed pointer-width counterpart of `usize` and is used by
+            # the portable runtime's sysconf/ callback seams.
+            ValueType{kind: TypeKind.Signed, bits: 64} return if name == "i64" or name == "int" or name == "isize"
+            ValueType{kind: TypeKind.Unsigned, bits: 8} return if name == "u8"
+            ValueType{kind: TypeKind.Unsigned, bits: 16} return if name == "u16"
+            ValueType{kind: TypeKind.Unsigned, bits: 32} return if name == "u32"
+            ValueType{kind: TypeKind.Unsigned, bits: 64} return if name == "u64" or name == "usize" or name == "uintptr"
+            ValueType{kind: TypeKind.Bool, bits: 1} return if name == "bool"
+            # stage0 lowers `char` to i64 (`define i64 @f(i64)`, `icmp eq i64`) — a full-width
+            # signed scalar, not a byte. Model it identically so char arithmetic/compares work.
+            ValueType{kind: TypeKind.Signed, bits: 64} return if name == "char"
+            ValueType{kind: TypeKind.Float, bits: 32} return if name == "f32"
+            ValueType{kind: TypeKind.Float, bits: 64} return if name == "f64"
+            ValueType{kind: TypeKind.Void, bits: 0} return if name == "void"
+            return unmodeled_type()
+
+
+        # LLVM-C exposes opaque handle typedefs as pointer-sized values. They are declared
+        # as bare extern names in llvm_c.elisa, so resolve them explicitly while registering
+        # aggregate fields as well as function parameters; waiting for the extern declaration
+        # pass leaves fields such as `Scope.slots: darray[LLVMValueRef]` unmodeled.
+        def llvm_opaque_handle_name(name: sview) -> bool:
+            return name == "LLVMContextRef" or name == "LLVMModuleRef" or name == "LLVMTypeRef" or name == "LLVMValueRef" or name == "LLVMBuilderRef" or name == "LLVMBasicBlockRef" or name == "LLVMTargetRef" or name == "LLVMTargetMachineRef" or name == "LLVMTargetDataRef" or name == "LLVMMetadataRef" or name == "LLVMAttributeRef" or name == "LLVMDIBuilderRef" or name == "LLVMDbgRecordRef" or name == "LLVMPassBuilderOptionsRef"
+
+
+        # What `name` is bound to in the CURRENT instantiation, or Unmodeled if it is not a
+        # type parameter (i.e. it is an ordinary type name).
+        def bound_type_of(structs: mutable StructTable&, name: sview) -> ValueType can[Abort.Panic]:
+            # Scan most-recent-first so an inner instantiation's binding shadows an outer
+            # one that reuses the same parameter name (`DictBucket[K, T]` nested inside
+            # `DynDict[K, T]`). For a single instantiation there are no duplicates, so this
+            # is identical to a forward scan.
+            count: usize = structs.binding_names.count
+            for offset in 0..<count |structs, name, count|:
+                index: usize = count - 1 - offset
+                copied_type(structs.binding_types[index]) return if structs.binding_names[index] == name
+            return unmodeled_type()
+
+
+        # The return type of generic `base` instantiated at `type_argument`: its return
+        # annotation resolved under that binding.
+        def generic_return_type(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            index: i64 = generic_index_of(generics, base)
+            unmodeled_type() return if index < 0
+            return generic_return_type_at(index.usize(), type_args, generics, structs)
+
+
+        def generic_return_type_at(slot: usize, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if slot >= generics.names.count
+            unmodeled_type() return if generics.param_count[slot] != type_args.count
+            if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                # A missing return annotation is `void` — so a call to it names its result ""
+                # (LLVM rejects a named void instruction).
+                resolved: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+                if return_type_opt is declared_return:
+                    bound: usize = push_type_bindings(generics, structs, slot, type_args)
+                    resolved <- annotation_value_type(declared_return, structs)
+                    pop_type_bindings(structs, bound)
+                return resolved
+            return unmodeled_type()
+
+
+        # The type an annotation denotes. Only a bare scalar name is modeled.
+        #
+        # `mutable` is a QUALIFIER on the annotation, not part of the type: `x: mutable
+        # i64` denotes i64 and just says the binding can be reassigned. It rides as a
+        # Unary node wrapping the type, so it is unwrapped here — mutability is the
+        # frontend's business (it already rejects `x <- 1` on an immutable local), and the
+        # backend only needs the underlying type.
+        # Record every `fn(…)->R` type's RETURN-type head (parser side-table __lambda_return,
+        # keyed by the fn-type's line) so a Fn ValueType can carry its result type.
+        def register_fn_signatures(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for annotation in file.enum_annotations |structs|:
+                if annotation.owner == "__lambda_return":
+                    structs.fn_return_lines.push(annotation.line)
+                    structs.fn_return_heads.push(annotation.name)
+                if annotation.owner == "__lambda_param":
+                    structs.fn_param_lines.push(annotation.line)
+                    structs.fn_param_heads.push(annotation.name)
+                if annotation.owner == "__submit":
+                    # Reuse the line-keyed return side table as a compact marker; submit
+                    # lines never collide with a function-type expression's line.
+                    structs.fn_return_lines.push(annotation.line)
+                    structs.fn_return_heads.push("__submit")
+                if annotation.owner == "__await":
+                    structs.fn_return_lines.push(annotation.line)
+                    structs.fn_return_heads.push("__await")
+                if annotation.owner == "__wait_all":
+                    structs.fn_return_lines.push(annotation.line)
+                    structs.fn_return_heads.push("__wait_all")
+                if annotation.owner == "__clone_error_union":
+                    structs.clone_error_lines.push(annotation.line)
+                    structs.clone_error_families.push(annotation.name)
+                if annotation.owner == "__local_error_union":
+                    structs.local_error_lines.push(annotation.line)
+                    structs.local_error_families.push(annotation.name)
+                if annotation.owner == "__field_error_union":
+                    structs.field_error_lines.push(annotation.line)
+                    structs.field_error_families.push(annotation.name)
+                if annotation.owner == "__param_error_union":
+                    structs.param_error_lines.push(annotation.line)
+                    structs.param_error_families.push(annotation.name)
+                if annotation.owner == "__tuple_label":
+                    structs.tuple_label_lines.push(annotation.line)
+                    structs.tuple_label_names.push(annotation.name)
+                # Guest-overlay field offsets: `__overlay_field` carries the byte offset in
+                # `line`; width is filled after struct bodies are registered (see
+                # finalize_overlay_field_widths). Layout association uses `__overlay_struct`
+                # markers in source order for fields declared under that layout.
+                if annotation.owner == "__overlay_field":
+                    structs.overlay_field_names.push(annotation.name)
+                    structs.overlay_field_offsets.push(annotation.line)
+                    structs.overlay_field_widths.push(0)
+                    structs.overlay_field_layouts.push(sview("", 0, 0))
+            # Associate overlay fields with their layout struct: the parser emits
+            # `__overlay_struct` for the layout, then field annotations for its members.
+            # Walk annotations in order and bind each field to the most recent overlay struct.
+            current_overlay: mutable sview = sview("", 0, 0)
+            field_cursor: mutable usize = 0
+            for annotation in file.enum_annotations |structs, current_overlay, field_cursor|:
+                if annotation.owner == "__overlay_struct":
+                    current_overlay <- annotation.name
+                elif annotation.owner == "__overlay_field" and field_cursor < structs.overlay_field_names.count:
+                    structs.overlay_field_layouts[field_cursor] <- current_overlay
+                    field_cursor <- field_cursor + 1
+            structs.fn_type_param_lines <- file.fn_type_param_lines
+            structs.fn_type_param_exprs <- file.fn_type_param_exprs
+
+        # The recorded return-type head for the fn-type declared at `line`, or "".
+        def fn_return_head_at(line: u32, structs: mutable StructTable&) -> sview can[Abort.Panic]:
+            probe: mutable usize = 0
+            while probe < structs.fn_return_lines.count |probe, line, structs|:
+                structs.fn_return_heads[probe] return if structs.fn_return_lines[probe] == line
+                probe <- probe + 1
+            return sview("", 0, 0)
+
+
+        def error_family_at(lines: darray[u32]&, families: darray[sview]&, line: u32) -> sview can[Abort.Panic]:
+            for index in 0..<lines.count |lines, families, line|:
+                families[index] return if lines[index] == line
+            return sview("", 0, 0)
+
+
+        def clone_error_family_at(line: u32, structs: mutable StructTable&) -> sview can[Abort.Panic]:
+            return error_family_at(structs.clone_error_lines, structs.clone_error_families, line)
+
+
+        def local_error_family_at(line: u32, structs: mutable StructTable&) -> sview can[Abort.Panic]:
+            return error_family_at(structs.local_error_lines, structs.local_error_families, line)
+
+
+        def type_expression_line(expression: Expr) -> u32:
+            return match expression:
+                Expr.Ident(_, ident_line): ident_line
+                Expr.Index(_, _, index_line): index_line
+                Expr.IndexN(_, _, indexn_line): indexn_line
+                Expr.Unary(_, _, unary_line): unary_line
+                Expr.Field(_, _, field_line): field_line
+                Expr.Scope(_, _, scope_line): scope_line
+                Expr.Tuple(_, tuple_line): tuple_line
+                Expr.Lambda(_, _, lambda_line): lambda_line
+                _: 0
+
+
+        def field_error_family_for(expression: Expr, structs: mutable StructTable&) -> sview can[Abort.Panic]:
+            return error_family_at(structs.field_error_lines, structs.field_error_families, type_expression_line(expression))
+
+
+        def parameter_value_type(expression: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            payload: ValueType = annotation_value_type(expression, structs)
+            family: sview = error_family_at(structs.param_error_lines, structs.param_error_families, type_expression_line(expression))
+            if family != "":
+                return intern_error_union_type(payload, family, structs)
+            return payload
+
+        # Resolve a bare type HEAD NAME (`i64`, `dstr`, a struct) to a ValueType. Only the
+        # forms a fn return head can name in the modeled subset; Unmodeled otherwise.
+        def resolve_type_head(head: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            scalar: ValueType = scalar_type_of_name(head)
+            scalar return if scalar.kind != TypeKind.Unmodeled
+            ValueType{kind: TypeKind.CStr, bits: 0} return if llvm_opaque_handle_name(head)
+            intern_darray_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs) return if head == "dstr"
+            head_struct: i64 = struct_index_of(structs, head)
+            ValueType{kind: TypeKind.Struct, bits: head_struct.u32()} return if head_struct >= 0
+            # An alias head (`type A = B` where B is itself an alias). resolve_aliases fills
+            # the table in declaration order, so a target declared earlier is already
+            # resolved here; a cycle stays Unmodeled and declines, as before.
+            head_alias: i64 = alias_index_of(structs, head)
+            if head_alias >= 0:
+                aliased: ValueType = copied_type(structs.alias_types[head_alias.usize()])
+                aliased return if aliased.kind != TypeKind.Unmodeled
+            # The parser's compact fn-type side table retains only the type HEAD (`Slice`),
+            # not its bracket arguments (`Slice[T]`). When the surrounding signature has
+            # already resolved the concrete generic field before reaching `fn(Slice[T])`,
+            # recover that ready instance by base name. This preserves the parameter's real
+            # LLVM aggregate type without guessing when no matching instance exists.
+            for instance in 0..<structs.generic_struct_inst_bases.count |structs, head|:
+                continue if structs.generic_struct_inst_bases[instance] != head
+                ValueType{kind: TypeKind.Struct, bits: structs.generic_struct_inst_index[instance].u32()} return if structs.generic_struct_inst_ready[instance]
+            return unmodeled_type()

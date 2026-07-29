@@ -1,0 +1,253 @@
+# Stage1 backend — the module entry points: `emit_module` and its debug/trace variants.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    public:
+        def select_module_declarations(file: Ast::File&, structs: mutable StructTable&) -> darray[Decl] can[Abort.Panic, Memory.Allocate]:
+            register_target_consts(structs)
+            register_fn_signatures(file, structs)
+            static_branch_lines: darray[u32] = file.static_if_lines
+            top: mutable darray[Decl] = []
+            for _selection_round in 0..<(file.static_if_lines.count + 1) |top, structs, file, static_branch_lines|:
+                round_taken: darray[u32] = selected_static_if_lines(file, structs)
+                round_top: mutable darray[Decl] = []
+                flatten_static_branches(file.top_decls, static_branch_lines, round_taken, round_top)
+                settled: bool = round_top.count == top.count
+                top <- round_top
+                break if settled
+                for round_index in 0..<top.count |structs|:
+                    round_declaration: Decl = top[round_index]
+                    if declaration_is_module(round_declaration):
+                        for nested_index in 0..<declaration_module_count(round_declaration) |file, structs, round_declaration|:
+                            register_const(declaration_module_at(round_declaration, nested_index), file.enum_annotations, structs)
+                    else:
+                        register_const(round_declaration, file.enum_annotations, structs)
+                fold_consts(file, top, structs)
+            structs.static_branch_lines <- file.static_if_lines
+            selected_lines: darray[u32] = selected_static_if_lines(file, structs)
+            structs.static_taken_lines <- structs.static_taken_lines.truncate(0)
+            for selected_line in selected_lines |structs|:
+                structs.static_taken_lines <- structs.static_taken_lines.push(selected_line)
+            return top
+
+        def register_module_types(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            register_generic_structs(file, top, structs)
+            reserve_ast_packed_headers(structs)
+            register_struct_names(file, structs, ctx)
+            # Packed AST variants can contain ordinary fieldless enums and aliases
+            # such as TokenKind. Resolve those dependencies before inspecting packed
+            # payloads; otherwise Expr/Stmt/Decl are conservatively discarded.
+            register_aliases(file, structs)
+            register_enums_from_metadata(file, structs)
+            resolve_aliases(file, structs)
+            register_packed_enums_from_metadata(file, structs)
+            register_payload_enums_from_metadata(file, file.packed_enum_names, structs)
+            apply_struct_alignments(file.enum_annotations, structs)
+            set_struct_bodies_from_metadata(file, structs, ctx)
+            finalize_overlay_field_widths(structs)
+            for declaration_index in 0..<top.count |structs|:
+                declaration: Decl = top[declaration_index]
+                if declaration_is_module(declaration):
+                    for nested_index in 0..<declaration_module_count(declaration) |file, structs, declaration|:
+                        register_const(declaration_module_at(declaration, nested_index), file.enum_annotations, structs)
+                else:
+                    register_const(declaration, file.enum_annotations, structs)
+            fold_consts(file, top, structs)
+            materialize_const_aggregates(file, top, structs, m, ctx)
+            materialize_mutable_globals(file, top, structs, m, ctx)
+            materialize_export_global_aliases(file.enum_annotations, structs, m, ctx)
+            register_tuple_types(file.tuple_type_elements, file.tuple_type_starts, file.tuple_type_counts, file.tuple_type_lines, structs, ctx)
+            register_disjoint_facts(top, structs)
+
+
+        def emit_module_core(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, want_trace: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            structs: mutable StructTable = new_struct_table(ctx)
+            for annotation in file.enum_annotations |structs|:
+                if annotation.owner == "__branch_hint":
+                    structs.branch_hint_lines <- structs.branch_hint_lines.push(annotation.line)
+                    structs.branch_hint_kinds <- structs.branch_hint_kinds.push(annotation.name)
+                structs.ast_refinement_names <- structs.ast_refinement_names.push(annotation.owner) if annotation.name == "__ast_refinement"
+            # The runtime is declared once per module; each function gets its own arena
+            # value below (the `arena` field here is a placeholder until then).
+            runtime: mutable Runtime = declare_runtime(m, ctx, want_trace, packed_profile_mode(file.enum_annotations))
+            runtime.trace_enabled <- want_trace
+            generics: mutable GenericTable = new_generic_table()
+            top: mutable darray[Decl] = select_module_declarations(file, structs)
+
+            # Templates must be known before any body is emitted: a call decides between
+            # "ordinary function" and "instantiate a generic" by looking here.
+            register_generics(file, top, generics)
+            fns: mutable FnTable = FnTable{names: [], lines: [], owners: [], needs_arena: [], arena_counts: [], needs_store: [], is_error: [], is_variadic: [], handles: [], returns: [], param_types: [], param_names: [], param_start: [], param_count: []}
+            declined: mutable bool = false
+
+            # THREE passes. Structs first: a function signature can name a struct, and a
+            # struct field can name another struct, so every struct type must exist before
+            # any signature is resolved. Named-empty-then-set-body (see llvm_c.elisa) is
+            # what makes the field pass tolerate any declaration order.
+            # Generic struct templates first: a concrete struct's field may name a
+            # `Base[args]` application, and register_struct_name must know to SKIP a template
+            # rather than register it as a (fieldless) concrete type.
+            register_module_types(file, top, structs, m, ctx)
+            # Passes 3 and 4 cover FUNCTIONS only: a struct declaration emits no code of
+            # its own (its type was built above), so it is skipped rather than declined.
+            # The body pass looks its handle up by NAME — `fns` is no longer index-parallel
+            # with `top_decls` now that non-function declarations exist.
+            # A function whose SIGNATURE cannot be modeled is simply not declared: it has
+            # no entry in `fns`, so every call to it declines its CALLER (which is then
+            # stripped below). Only `main` failing is fatal to the module.
+            declare_module_functions(file, top, fns, structs, generics, m, ctx)
+
+            # BEFORE the bodies: each alloca needs its function's subprogram already
+            # attached to hang a parameter/local variable off. (The declare pass above has
+            # run, so every handle is in `fns`.)
+            emit_debug_info(file, top, m, fns, structs, runtime, source_name, ctx) if want_debug
+            main_ok: mutable bool = false
+            emitted_count: i64 = emit_module_bodies(file, top, fns, structs, generics, runtime, m, ctx, builder, main_ok)
+            # Without a successfully emitted `main` the module is not a program: decline.
+            -1 return if not main_ok
+            # Finalize AFTER the bodies: the declares added during emission must exist
+            # before the metadata is resolved. Creation itself ran BEFORE them (below the
+            # declare pass), so each alloca had its subprogram to hang a variable off.
+            LLVMDIBuilderFinalize(runtime.debug_builder) if want_debug and runtime.debug_active
+            return emitted_count
+
+
+        def emit_module_with_debug_trace(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, want_trace: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return emit_module_core(file, m, ctx, builder, want_debug, want_trace, source_name)
+
+        def emit_module_with_debug(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, want_debug: bool, source_name: sview) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return emit_module_with_debug_trace(file, m, ctx, builder, want_debug, false, source_name)
+
+        # The original entry point, unchanged for every caller that does not want debug info.
+        def emit_module(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return emit_module_with_debug(file, m, ctx, builder, false, "")
+
+
+        # Lower the verified EASM surface into LLVM inline assembly.  Stage0 does this in
+        # llvm_easm.go after the project loader has collected `.easm` modules; keeping this
+        # entry point separate from emit_module is deliberate because EASM functions are
+        # declarations with machine-level contracts, not Elisa AST declarations.
+        def easm_llvm_scalar_type(name: sview, ctx: LLVMContextRef) -> LLVMTypeRef:
+            LLVMVoidTypeInContext(ctx) return if name == "void"
+            LLVMInt1TypeInContext(ctx) return if name == "bool"
+            LLVMInt8TypeInContext(ctx) return if name == "i8" or name == "u8"
+            LLVMInt16TypeInContext(ctx) return if name == "i16" or name == "u16"
+            LLVMInt32TypeInContext(ctx) return if name == "i32" or name == "u32"
+            LLVMInt64TypeInContext(ctx) return if name == "i64" or name == "u64" or name == "int" or name == "usize" or name == "uintptr"
+            LLVMFloatTypeInContext(ctx) return if name == "f32"
+            LLVMDoubleTypeInContext(ctx) return if name == "f64"
+            # EASM address-space carriers and opaque host callable handles are pointers at
+            # the ABI boundary; their layout/permission meaning was already checked by the
+            # EASM verifier.
+            LLVMPointerTypeInContext(ctx, 0) return if name == "cstr" or name == "HostCallable" or name == "HostFsSelector" or Easm::easm_starts(name, "HostPtr[") or Easm::easm_starts(name, "GuestVAddr[") or Easm::easm_starts(name, "NativeMappedGuestPtr[")
+            return LLVMInt64TypeInContext(ctx)
+
+
+        def easm_append_constraint(out: mutable darray[u8]&, value: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            if out.count > 0:
+                out.push(44)
+            for index in 0..<sview_len(value) |out, value|:
+                out.push(sview_at(value, index))
+
+
+        def easm_append_clobber(out: mutable darray[u8]&, value: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            if out.count > 0:
+                out.push(44)
+            out.push(126)
+            out.push(123)
+            for index in 0..<sview_len(value) |out, value|:
+                out.push(sview_at(value, index))
+            out.push(125)
+
+
+        def easm_append_output_constraint(fn: Easm::Function, out: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            if fn.outputs.count == 0:
+                easm_append_constraint(out, "=r")
+                return
+            output: sview = Easm::easm_trim(fn.outputs[0])
+            equals: usize = Easm::easm_find(output, "=")
+            register: mutable sview = output
+            register <- Easm::easm_register_operand(output[equals + 1.usize():sview_len(output)]) if equals < sview_len(output)
+            if register == "":
+                easm_append_constraint(out, "=r")
+                return
+            if out.count > 0:
+                out.push(44)
+            out.push(61)
+            out.push(123)
+            for index in 0..<sview_len(register) |out, register|:
+                out.push(sview_at(register, index))
+            out.push(125)
+
+
+        def easm_inline_constraints(fn: Easm::Function, out: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            # LLVM requires one output constraint even for a void EASM wrapper.  The result
+            # is discarded by the wrapper, but the constraint keeps the inline-asm call's
+            # type well-formed just as stage0's dummy output does.
+            easm_append_output_constraint(fn, out)
+            for _param in fn.params:
+                easm_append_constraint(out, "r")
+            if fn.params.count == 0:
+                easm_append_constraint(out, "r")
+            for clobber in fn.clobbers:
+                lower: sview = Easm::easm_trim(clobber)
+                if lower == "flags":
+                    easm_append_clobber(out, "cc")
+                elif lower == "cc" or lower == "memory":
+                    easm_append_clobber(out, lower)
+                else:
+                    easm_append_clobber(out, lower)
+
+
+        def emit_easm_module(module: Easm::Module, target: sview, llvm_module: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            error_count: mutable i64 = 0
+            for issue in module.issues:
+                error_count <- error_count + 1 if issue.severity == Easm::Severity.Error
+            -1 return if error_count != 0 or not Easm::easm_target_matches(module.target, target)
+            emitted: mutable i64 = 0
+            for fn in module.functions:
+                continue if not Easm::easm_target_matches(fn.platform, target)
+                continue if fn.name == ""
+                name_storage: mutable darray[u8] = []
+                fn_name: cstr = sview_to_cstr(fn.name, name_storage)
+                if LLVMGetNamedFunction(llvm_module, fn_name) is existing:
+                    return -1
+                param_types: mutable darray[LLVMTypeRef] = []
+                for param in fn.params:
+                    param_types.push(easm_llvm_scalar_type(param.type_name, ctx))
+                zero_param: bool = param_types.count == 0
+                if zero_param:
+                    param_types.push(LLVMInt32TypeInContext(ctx))
+                result_type: LLVMTypeRef = easm_llvm_scalar_type(fn.return_type, ctx)
+                inline_result_type: LLVMTypeRef = LLVMInt32TypeInContext(ctx) if fn.return_type == "void" else result_type
+                param_pointer: void& = (&param_types[0]).cast[void&] can Unsafe.PointerCast
+                fn_type: LLVMTypeRef = LLVMFunctionType(result_type, param_pointer, fn.params.count.u32(), 0) if not zero_param else LLVMFunctionType(result_type, null, 0, 0)
+                handle: LLVMValueRef = LLVMAddFunction(llvm_module, fn_name, fn_type)
+                entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, handle, "entry")
+                LLVMPositionBuilderAtEnd(builder, entry)
+                body: mutable darray[u8] = []
+                for instruction in fn.instructions:
+                    continue if instruction.pseudo
+                    Easm::easm_append_instruction_text(body, instruction)
+                    body.push(10)
+                body.push(0)
+                constraints: mutable darray[u8] = []
+                easm_inline_constraints(fn, constraints)
+                constraints.push(0)
+                inline_params_pointer: void& = (&param_types[0]).cast[void&] can Unsafe.PointerCast
+                inline_type: LLVMTypeRef = LLVMFunctionType(inline_result_type, inline_params_pointer, param_types.count.u32(), 0)
+                body_length: usize = body.count - 1.usize()
+                constraints_length: usize = constraints.count - 1.usize()
+                body_pointer: cstr = (&body[0]).cast[cstr] can Unsafe.PointerCast
+                constraints_pointer: cstr = (&constraints[0]).cast[cstr] can Unsafe.PointerCast
+                asm_value: LLVMValueRef = LLVMGetInlineAsm(inline_type, body_pointer, body_length, constraints_pointer, constraints_length, 1, 0, 0, 0)
+                args: mutable darray[LLVMValueRef] = []
+                for index in 0..<fn.params.count |args, handle|:
+                    args.push(LLVMGetParam(handle, index.u32()))
+                if zero_param:
+                    args.push(LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0))
+                args_pointer: void& = (&args[0]).cast[void&] can Unsafe.PointerCast
+                call: LLVMValueRef = LLVMBuildCall2(builder, inline_type, asm_value, args_pointer, args.count.u32(), "easm.call")
+                LLVMBuildRetVoid(builder) if fn.return_type == "void" else LLVMBuildRet(builder, call)
+                emitted <- emitted + 1
+            return emitted

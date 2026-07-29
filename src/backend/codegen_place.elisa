@@ -1,0 +1,384 @@
+# Stage1 backend — PLACE expressions: struct field addresses and chained field access.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # The ADDRESS of a struct-typed local, and the struct's type.
+        #
+        # For a plain local that is its alloca. For a `P&` parameter the alloca holds a
+        # POINTER, so the address is that pointer LOADED — one indirection more. Everything
+        # downstream (field GEP, field store) is then identical, which is why field access
+        # needs no ref-specific path of its own.
+        def struct_address_of(name: sview, local_scope: mutable Scope&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            declared: ValueType = lookup_type(local_scope, name)
+            if lookup_slot(local_scope, name) is slot:
+                slot return if declared.kind == TypeKind.Struct
+                # A `view[T]` local IS its slot (it holds the DynArrayView value inline).
+                slot return if declared.kind == TypeKind.View
+                if declared.kind == TypeKind.Ref:
+                    ref_addr_target: mutable ValueType = ref_target_of(declared, structs)
+                    # `a.begin` where `a: mutable Arena&` -- field access through the arena
+                    # CARRIER reads the user-declared `struct Arena` (see arena_user_struct).
+                    ref_addr_target <- arena_user_struct(structs) if ref_addr_target.kind == TypeKind.Arena
+                    null return if ref_addr_target.kind != TypeKind.Struct and ref_addr_target.kind != TypeKind.View
+                    return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), slot, "ref.deref")
+                # `cursor.count` where `cursor: heap Node&?` -- field access through an
+                # UN-NARROWED optional heap ref. stage0 represents `heap T&?` as a bare ptr
+                # and emits the load unconditionally (the null case is guarded by program
+                # flow, e.g. `while cursor != null`), so stage1 matches by reading the
+                # optional's ptr payload out of its `{i1, ptr}` slot. Heap refs only: a
+                # plain `T&?` has no such stage0 precedent.
+                if declared.kind == TypeKind.Optional:
+                    opt_payload: ValueType = optional_payload_of(declared, structs)
+                    if opt_payload.kind == TypeKind.Ref and ref_is_heap_ref(opt_payload, structs):
+                        opt_addr_target: ValueType = ref_target_of(opt_payload, structs)
+                        null return if opt_addr_target.kind != TypeKind.Struct
+                        opt_llvm: LLVMTypeRef = llvm_type_of(declared, structs, ctx)
+                        opt_value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, opt_llvm, slot, 1, "opt.heap.ptr")
+                        return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), opt_value_pointer, "opt.heap.deref")
+            const_global_index: i64 = const_index_of(structs, name)
+            if const_global_index >= 0 and structs.const_global_ok[const_global_index.usize()]:
+                return structs.const_globals[const_global_index.usize()]
+            mutable_global_index: i64 = mutable_global_index_of(structs, name)
+            if mutable_global_index >= 0:
+                return structs.mutable_global_handles[mutable_global_index.usize()]
+            return null
+
+
+        # The struct type behind a name, looking through one reference.
+        def struct_type_of_name(name: sview, local_scope: mutable Scope&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            declared: ValueType = lookup_type(local_scope, name)
+            declared return if declared.kind == TypeKind.Struct
+            # A `view[T]` accesses fields (`dst.data`, `dst.len`) through its DynArrayView.
+            view_struct_type(declared, structs) return if declared.kind == TypeKind.View
+            view_struct_type(ref_target_of(declared, structs), structs) return if declared.kind == TypeKind.Ref and ref_target_of(declared, structs).kind == TypeKind.View
+            # An optional HEAP ref looks through both wrappers (see struct_address_of).
+            if declared.kind == TypeKind.Optional:
+                opt_name_payload: ValueType = optional_payload_of(declared, structs)
+                ref_target_of(opt_name_payload, structs) return if opt_name_payload.kind == TypeKind.Ref and ref_is_heap_ref(opt_name_payload, structs)
+            behind_ref: ValueType = ref_target_of(declared, structs)
+            # An arena CARRIER's fields read the user-declared `struct Arena`.
+            arena_user_struct(structs) return if behind_ref.kind == TypeKind.Arena
+            return behind_ref
+
+
+        # The struct type of a field-access CHAIN (`o`, `o.i`, `o.i.j`, ...). Recurses so
+        # nested field reads resolve their receiver's type, not just a bare Ident's.
+        def struct_chain_type(object: Expr, local_scope: mutable Scope&, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            if object is Expr.Ident(chain_name, chain_name_line):
+                chain_local_type: ValueType = lookup_type(local_scope, chain_name)
+                chain_local_type return if chain_local_type.kind != TypeKind.Unmodeled
+                chain_const_index: i64 = const_index_of(structs, chain_name)
+                copied_type(structs.const_types[chain_const_index.usize()]) return if chain_const_index >= 0 and structs.const_global_ok[chain_const_index.usize()]
+                chain_mutable_index: i64 = mutable_global_index_of(structs, chain_name)
+                copied_type(structs.mutable_global_types[chain_mutable_index.usize()]) return if chain_mutable_index >= 0
+                return struct_type_of_name(chain_name, local_scope, structs)
+            if object is Expr.Field(chain_inner, chain_field, chain_field_line):
+                inner_type: mutable ValueType = struct_chain_type(chain_inner, local_scope, structs)
+                # Member access auto-dereferences references just like expression_type.
+                # This matters for p.field where p: T&: the chain resolver is used by
+                # both field assignment and address formation, so rejecting the ref here
+                # silently strips the whole function body and leaves only a declaration.
+                inner_type <- ref_target_of(inner_type, structs) if inner_type.kind == TypeKind.Ref
+                if inner_type.kind == TypeKind.Optional:
+                    inner_payload: ValueType = optional_payload_of(inner_type, structs)
+                    inner_type <- ref_target_of(inner_payload, structs) if inner_payload.kind == TypeKind.Ref and ref_is_heap_ref(inner_payload, structs)
+                inner_type <- arena_user_struct(structs) if inner_type.kind == TypeKind.Arena
+                unmodeled_type() return if inner_type.kind != TypeKind.Struct
+                inner_slot: usize = inner_type.bits.usize()
+                position: i64 = field_index_of(structs, inner_slot, chain_field)
+                unmodeled_type() return if position < 0
+                return copied_type(structs.field_types[structs.field_start[inner_slot] + position.usize()])
+            # `a[i]` -> the container's element type. Enables `a[i].field`.
+            if object is Expr.Index(indexed_container, index_expr, index_line):
+                # A bare local is looked up directly; any OTHER receiver (a nested index
+                # `m[i][j]`, a field chain `s.grid[i]`) resolves recursively.
+                container_type: mutable ValueType = struct_chain_type(indexed_container, local_scope, structs)
+                if indexed_container is Expr.Ident(container_name, container_name_line):
+                    local_container_type: ValueType = lookup_type(local_scope, container_name)
+                    container_type <- local_container_type if local_container_type.kind != TypeKind.Unmodeled
+                    # A global const ARRAY (`const xs: i64[3]`) is not a local: take its type
+                    # from the const table so `xs[i]` resolves its element type.
+                    if local_container_type.kind == TypeKind.Unmodeled:
+                        const_container_index: i64 = const_index_of(structs, container_name)
+                        container_type <- copied_type(structs.const_types[const_container_index.usize()]) if const_container_index >= 0 and structs.const_global_ok[const_container_index.usize()]
+                        mutable_container_index: i64 = mutable_global_index_of(structs, container_name)
+                        container_type <- copied_type(structs.mutable_global_types[mutable_container_index.usize()]) if mutable_container_index >= 0
+                darray_element_of(container_type, structs) return if container_type.kind == TypeKind.DArray
+                array_element_of(container_type, structs) return if container_type.kind == TypeKind.Array
+                # `items[i]` where `items: Struct&` — a C-style pointer base. The element is
+                # the referent struct (the std indexes `DictBucket[K,T]&` this way).
+                if container_type.kind == TypeKind.Ref:
+                    ref_element: ValueType = ref_target_of(container_type, structs)
+                    ref_element return if ref_element.kind == TypeKind.Struct
+                    # `p[i]` where `p: T&` is a ref to a NUMERIC scalar (Slice's `p[i] <- v` assign
+                    # target): the element IS that scalar, so the write fallback can type its value.
+                    ref_element return if ref_element.kind == TypeKind.Signed or ref_element.kind == TypeKind.Unsigned or ref_element.kind == TypeKind.Float
+                # `d.items[i]` where the field `items` is an OPTIONAL ref `T&?` used as a buffer
+                # pointer (Deque). The element is the ref's referent — unwrap the optional first.
+                if container_type.kind == TypeKind.Optional:
+                    opt_ref_payload: ValueType = optional_payload_of(container_type, structs)
+                    if opt_ref_payload.kind == TypeKind.Ref:
+                        opt_ref_element: ValueType = ref_target_of(opt_ref_payload, structs)
+                        opt_ref_element return if opt_ref_element.kind == TypeKind.Struct or opt_ref_element.kind == TypeKind.Signed or opt_ref_element.kind == TypeKind.Unsigned or opt_ref_element.kind == TypeKind.Float
+            return unmodeled_type()
+
+
+        # The ADDRESS of a field-access chain's struct value. A bare Ident is its slot; a
+        # nested field GEPs into its receiver's address. This is what makes `o.i.v` work:
+        # the receiver `o.i` is itself a Field, addressed recursively rather than requiring
+        # an Ident.
+        def struct_chain_address(object: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if object is Expr.Ident(chain_name, chain_name_line):
+                if struct_address_of(chain_name, local_scope, structs, ctx, builder) is base_address:
+                    emit_pointer_deref_guard(base_address, runtime, m, ctx, builder)
+                    return base_address
+                return null
+            if object is Expr.Field(chain_inner, chain_field, chain_field_line):
+                inner_type: mutable ValueType = struct_chain_type(chain_inner, local_scope, structs)
+                inner_type <- ref_target_of(inner_type, structs) if inner_type.kind == TypeKind.Ref
+                if inner_type.kind == TypeKind.Optional:
+                    inner_payload: ValueType = optional_payload_of(inner_type, structs)
+                    inner_type <- ref_target_of(inner_payload, structs) if inner_payload.kind == TypeKind.Ref and ref_is_heap_ref(inner_payload, structs)
+                inner_type <- arena_user_struct(structs) if inner_type.kind == TypeKind.Arena
+                null return if inner_type.kind != TypeKind.Struct
+                inner_slot: usize = inner_type.bits.usize()
+                position: i64 = field_index_of(structs, inner_slot, chain_field)
+                null return if position < 0
+                if struct_chain_address(chain_inner, local_scope, fns, structs, generics, runtime, m, ctx, builder) is inner_address:
+                    inner_llvm: LLVMTypeRef = llvm_type_of(inner_type, structs, ctx)
+                    emit_pointer_deref_guard(inner_address, runtime, m, ctx, builder)
+                    return LLVMBuildStructGEP2(builder, inner_llvm, inner_address, position.u32(), "field.chain.ptr")
+                return null
+            # `a[i]` -> the element's ADDRESS, so `a[i].field` reads/writes in place rather
+            # than spilling a copy. darray and fixed array use their own index-address paths.
+            if object is Expr.Index(indexed_container, index_expr, index_line):
+                if indexed_container is Expr.Ident(container_name, container_name_line):
+                    container_type: ValueType = lookup_type(local_scope, container_name)
+                    # A BORROWED darray param (`da: darray[T]&`) indexed and address-taken
+                    # (`&da[i]`, as in Slice's `slice(&da)` → `(&da[0]).cast[uintptr]`): the header
+                    # address is loaded out of the parameter slot, then the element is GEP'd like
+                    # any darray. Checked before the plain-local and ref-to-struct cases.
+                    chain_borrowed_type: ValueType = darray_type_behind(local_scope, container_name, structs)
+                    if chain_borrowed_type.kind == TypeKind.DArray and container_type.kind == TypeKind.Ref:
+                        if darray_address_of(local_scope, container_name, structs, ctx, builder) is chain_borrowed_slot:
+                            return emit_darray_index_address(chain_borrowed_slot, chain_borrowed_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        return null
+                    if lookup_slot(local_scope, container_name) is container_slot:
+                        if container_type.kind == TypeKind.DArray:
+                            return emit_darray_index_address(container_slot, container_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        if container_type.kind == TypeKind.Array:
+                            return emit_index_address(container_slot, container_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        # `p[i]` where `p: T&` is a ref used as a C-style pointer base: the slot
+                        # holds a pointer to element 0; the element ADDRESS is a GEP by index at the
+                        # element stride. Covers a STRUCT element (how the std walks DictBucket rows)
+                        # AND a NUMERIC scalar (Slice's `&p[lo]` / `p[i] <- v`, where the assign
+                        # target and address-of both resolve here).
+                        if container_type.kind == TypeKind.Ref:
+                            ref_element: ValueType = ref_target_of(container_type, structs)
+                            if ref_element.kind == TypeKind.Struct or ref_element.kind == TypeKind.Signed or ref_element.kind == TypeKind.Unsigned or ref_element.kind == TypeKind.Float:
+                                base_pointer: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), container_slot, "ref.base")
+                                if emit_expression(index_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is index_value:
+                                    element_llvm: LLVMTypeRef = llvm_type_of(ref_element, structs, ctx)
+                                    ref_indices: mutable darray[LLVMValueRef] = [index_value]
+                                    ref_indices_pointer: void& = (&ref_indices[0]).cast[void&] can Unsafe.PointerCast
+                                    return LLVMBuildGEP2(builder, element_llvm, base_pointer, ref_indices_pointer, 1, "ref.index.ptr")
+                                return null
+                    # `xs[i]` where `xs` is a global const ARRAY — the base "slot" is the
+                    # `@xs` global itself, GEP'd exactly like a local fixed array.
+                    const_array_index: i64 = const_index_of(structs, container_name)
+                    if const_array_index >= 0 and structs.const_global_ok[const_array_index.usize()]:
+                        const_array_type: ValueType = copied_type(structs.const_types[const_array_index.usize()])
+                        return emit_index_address(structs.const_globals[const_array_index.usize()], const_array_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    mutable_array_index: i64 = mutable_global_index_of(structs, container_name)
+                    if mutable_array_index >= 0:
+                        mutable_array_type: ValueType = copied_type(structs.mutable_global_types[mutable_array_index.usize()])
+                        return emit_index_address(structs.mutable_global_handles[mutable_array_index.usize()], mutable_array_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    return null
+                # A NESTED index (`m[i][j]`): address the inner element recursively, then
+                # index into it.
+                inner_container_type: ValueType = struct_chain_type(indexed_container, local_scope, structs)
+                if struct_chain_address(indexed_container, local_scope, fns, structs, generics, runtime, m, ctx, builder) is inner_container_address:
+                    if inner_container_type.kind == TypeKind.DArray:
+                        return emit_darray_index_address(inner_container_address, inner_container_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    if inner_container_type.kind == TypeKind.Array:
+                        return emit_index_address(inner_container_address, inner_container_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    # `b.items[i]` where the FIELD `items` is a ref (`T&`) or optional-ref (`T&?`)
+                    # used as a C-style buffer pointer — Deque's `d.items[phys]` (`items: T&?`). The
+                    # field slot holds the ref (an optional is {i1, ptr}; take field 1). Load the raw
+                    # pointer, then GEP by index at the element stride.
+                    field_ref_payload: mutable ValueType = inner_container_type
+                    field_ref_is_optional: bool = inner_container_type.kind == TypeKind.Optional
+                    field_ref_payload <- optional_payload_of(inner_container_type, structs) if field_ref_is_optional
+                    if field_ref_payload.kind == TypeKind.Ref:
+                        field_ref_elem: ValueType = ref_target_of(field_ref_payload, structs)
+                        null return if field_ref_elem.kind == TypeKind.Unmodeled
+                        field_ref_raw: mutable LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), inner_container_address, "field.ref.ptr")
+                        if field_ref_is_optional:
+                            field_opt_llvm: LLVMTypeRef = llvm_type_of(inner_container_type, structs, ctx)
+                            field_opt_value: LLVMValueRef = LLVMBuildLoad2(builder, field_opt_llvm, inner_container_address, "field.opt")
+                            field_ref_raw <- LLVMBuildExtractValue(builder, field_opt_value, 1, "field.opt.ptr")
+                        if emit_expression(index_expr, ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is field_ref_index:
+                            field_ref_elem_llvm: LLVMTypeRef = llvm_type_of(field_ref_elem, structs, ctx)
+                            field_ref_gep_indices: mutable darray[LLVMValueRef] = [field_ref_index]
+                            field_ref_gep_pointer: void& = (&field_ref_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                            return LLVMBuildGEP2(builder, field_ref_elem_llvm, field_ref_raw, field_ref_gep_pointer, 1, "field.ref.elem.ptr")
+                        return null
+                return null
+            return null
+
+
+        # Whether an expression threads its `expected` type down to sub-expressions rather
+        # than producing a value directly. Such a form must NOT be implicitly wrapped: its
+        # ARMS each wrap themselves, which is what makes `42 if flag else null` work.
+        def propagates_expected(expression: Expr) -> bool can[Abort.Panic]:
+            if expression is Expr.If(condition, then_expression, else_expression, line):
+                return true
+            if expression is Expr.Match(scrutinee, arms, match_line):
+                return true
+            if expression is Expr.Paren(inner, paren_line):
+                return propagates_expected(inner)
+            return false
+
+
+        # Whether an expression is the `null` literal (an IDENT named "null" in the AST).
+        def is_null_literal(expression: Expr) -> bool can[Abort.Panic]:
+            if expression is Expr.Ident(name, line):
+                return name == "null"
+            return false
+
+
+        # Wrap `value` (of type `payload`) into a `T?` — `{true, value}`.
+        #
+        # Built through a slot rather than insertvalue: the tag and payload are two plain
+        # stores, and SROA collapses it at -O2 exactly the same. An Elisa expression of
+        # payload type in an optional context is implicitly wrapped — the language has no
+        # `some(x)`, so this is where that happens.
+        # `force_null_test` — derive the tag from `value != null` even when the payload type
+        # says the reference cannot be null. A REINTERPRET (`heapptr.cast[u8&?]`) is exactly
+        # that case: the payload annotation is a plain `u8&`, but the value came from a raw
+        # pointer that may well be null, and a constant `true` tag would hand the program a
+        # null it believes is a real reference.
+        def wrap_optional_tagged(value: LLVMValueRef, optional_type: ValueType, force_null_test: bool, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            optional_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+            slot: LLVMValueRef = LLVMBuildAlloca(builder, optional_llvm, "opt")
+            tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, slot, 0, "opt.tag.ptr")
+            # A HEAP pointer carries its own absence: null IS the empty case, which is how
+            # stage0 represents `heap T&?` (a bare `ptr`, tested with `icmp ne ptr, null`).
+            # Wrapping one with a hardcoded `true` tag would report a FAILED `malloc` as
+            # present and hand the program a null it believes is real. An ordinary `T&` is
+            # never null, so it keeps the constant tag.
+            payload_type: ValueType = optional_payload_of(optional_type, structs)
+            # An opaque extern handle (`LLVMBasicBlockRef`, modeled as CStr) and a `cstr`
+            # are BARE pointers whose absence is null — an extern declared `-> T?` returns
+            # exactly that. A constant `true` tag turned `LLVMGetFirstBasicBlock` on a
+            # body-less function into `Some(null)`, and the caller then handed null to
+            # LLVMDeleteBasicBlock.
+            if force_null_test or payload_type.kind == TypeKind.CStr or (payload_type.kind == TypeKind.Ref and ref_is_heap_ref(payload_type, structs)):
+                null_pointer: LLVMValueRef = LLVMConstNull(LLVMPointerTypeInContext(ctx, 0))
+                _ = LLVMBuildStore(builder, LLVMBuildICmp(builder, 33, value, null_pointer, "opt.present"), tag_pointer)
+            else:
+                _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), tag_pointer)
+            value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, slot, 1, "opt.value.ptr")
+            _ = LLVMBuildStore(builder, value, value_pointer)
+            return LLVMBuildLoad2(builder, optional_llvm, slot, "opt.wrapped")
+
+
+        # The ordinary wrap: the payload TYPE decides whether the tag is a null test.
+        def wrap_optional(value: LLVMValueRef, optional_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return wrap_optional_tagged(value, optional_type, false, structs, ctx, builder)
+
+
+        # Catch a first-class value-carrying error union. Calls have a separate lowering
+        # below because their ABI is split into an i32 status plus an out pointer; locals,
+        # fields, and parameters already use the stage0 descriptor `{i32 code, ptr payload}`.
+        def emit_catch_error_union_value(union_value: LLVMValueRef, value_type: ValueType, catch_arms: darray[MatchArm]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if catch_arms.count < 1
+            payload_type: ValueType = error_union_payload_of(value_type, structs)
+            null return if payload_type.kind == TypeKind.Unmodeled
+            union_code: LLVMValueRef = LLVMBuildExtractValue(builder, union_value, 0, "catch.union.code")
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.value")
+            dispatch_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.dispatch")
+            done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.done")
+            payload_llvm: LLVMTypeRef = llvm_type_of(payload_type, structs, ctx)
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, payload_llvm, "catch.union.result")
+            ok: LLVMValueRef = LLVMBuildICmp(builder, 32, union_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "catch.union.ok")
+            _ = LLVMBuildCondBr(builder, ok, value_block, dispatch_block)
+
+            LLVMPositionBuilderAtEnd(builder, value_block)
+            success_arm: MatchArm = catch_arms[0]
+            null return if arm_has_guard(success_arm.guard)
+            if success_arm.pattern is Pattern.Binding(success_name):
+                success_payload_ptr: LLVMValueRef = LLVMBuildExtractValue(builder, union_value, 1, "catch.union.payload.ptr")
+                declare_local(local_scope, success_name, success_payload_ptr, payload_type)
+            if arm_value_expression(success_arm.body) is success_expression:
+                if emit_expression(success_expression, payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is success_result:
+                    _ = LLVMBuildStore(builder, success_result, result_slot)
+                    _ = LLVMBuildBr(builder, done_block)
+                else:
+                    return null
+            else:
+                return null
+
+            LLVMPositionBuilderAtEnd(builder, dispatch_block)
+            error_arm_index: mutable usize = 1
+            declined: mutable bool = false
+            saw_catch_all: mutable bool = false
+            while error_arm_index < catch_arms.count |error_arm_index, declined, saw_catch_all, catch_arms, union_code, payload_type, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                error_arm: MatchArm = catch_arms[error_arm_index]
+                error_arm_index <- error_arm_index + 1
+                continue if declined or saw_catch_all
+                if arm_has_guard(error_arm.guard):
+                    declined <- true
+                    continue
+                if arm_value_expression(error_arm.body) is error_expression:
+                    if error_arm.pattern is Pattern.Wildcard:
+                        if emit_expression(error_expression, payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is wildcard_result:
+                            _ = LLVMBuildStore(builder, wildcard_result, result_slot)
+                            _ = LLVMBuildBr(builder, done_block)
+                            saw_catch_all <- true
+                        else:
+                            declined <- true
+                        continue
+                    if error_arm.pattern is Pattern.TypeBind(error_type_name, error_binder):
+                        if error_type_name != "error":
+                            declined <- true
+                            continue
+                        if emit_expression(error_expression, payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is error_bind_result:
+                            _ = LLVMBuildStore(builder, error_bind_result, result_slot)
+                            _ = LLVMBuildBr(builder, done_block)
+                            saw_catch_all <- true
+                        else:
+                            declined <- true
+                        continue
+                    if error_arm.pattern is Pattern.Variant(error_path, error_fields):
+                        if error_fields.count != 0:
+                            declined <- true
+                            continue
+                        ordinal: mutable i64 = penum_variant_index_of_path(error_path, structs)
+                        if ordinal < 0:
+                            ordinal <- ordinal_of_dotted_path(error_path, structs)
+                        if ordinal < 0:
+                            declined <- true
+                            continue
+                        arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.arm")
+                        next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.next")
+                        hit: LLVMValueRef = LLVMBuildICmp(builder, 32, union_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), (ordinal + 1).u64(), 0), "catch.union.cmp")
+                        _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
+                        LLVMPositionBuilderAtEnd(builder, arm_block)
+                        if emit_expression(error_expression, payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is arm_result:
+                            _ = LLVMBuildStore(builder, arm_result, result_slot)
+                            _ = LLVMBuildBr(builder, done_block)
+                        else:
+                            declined <- true
+                        LLVMPositionBuilderAtEnd(builder, next_block)
+                        continue
+                    declined <- true
+                else:
+                    declined <- true
+            null return if declined
+            if not saw_catch_all:
+                _ = LLVMBuildUnreachable(builder)
+            LLVMPositionBuilderAtEnd(builder, done_block)
+            return LLVMBuildLoad2(builder, payload_llvm, result_slot, "catch.union.value")

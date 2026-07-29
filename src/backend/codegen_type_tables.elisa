@@ -1,0 +1,521 @@
+# Stage1 backend — the StructTable registry plus the darray/arena/array/view type constructors.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # The module's struct types.
+        #
+        # Field names/types live in FLAT pools with a per-struct span, the same shape as
+        # FnTable's parameters — a nested `darray[darray[…]]` would make this
+        # region-polymorphic for no benefit.
+        struct StructTable:
+            names: mutable darray[sview]
+            handles: mutable darray[LLVMTypeRef]
+            alignments: mutable darray[u32]
+            field_names: mutable darray[sview]
+            field_types: mutable darray[ValueType]
+            field_start: mutable darray[usize]
+            field_count: mutable darray[usize]
+            # Named-tuple field LABELS recovered from the parser's `__tuple_label` side-table
+            # (labels are stripped from the Expr.Tuple node, recorded by line). A named tuple
+            # type `(x: i64, y: i64)` is modeled as a synthesized anonymous (empty-named)
+            # struct pre-registered by register_tuple_types; these give the `.field` names.
+            tuple_label_lines: mutable darray[u32]
+            tuple_label_names: mutable darray[sview]
+            # Guest-overlay / address-space carriers (docs/107). `guest_layouts[i]` is the
+            # layout name for a GuestCarrier ValueType with `bits == i`. Overlay field offsets
+            # and widths come from the parser's `__overlay_field` annotations plus the field
+            # type width on the layout struct.
+            guest_layouts: mutable darray[sview]
+            overlay_field_names: mutable darray[sview]
+            overlay_field_offsets: mutable darray[u32]
+            overlay_field_widths: mutable darray[u32]
+            overlay_field_layouts: mutable darray[sview]
+            # GENERIC struct templates. A `struct Box[T]:` is NOT a concrete type — it is
+            # a template materialized per type-argument tuple into an ordinary registered
+            # struct named `Box__i64` (the concrete name doubles as the instantiation memo:
+            # struct_index_of finding it means it is already built). The template stores its
+            # own Decl so its member types can be re-resolved with the type parameters bound.
+            # Param names live in a FLAT pool with a per-template span, like struct fields.
+            generic_struct_names: mutable darray[sview]
+            generic_struct_decls: mutable darray[Decl]
+            generic_struct_param_names: mutable darray[sview]
+            generic_struct_param_start: mutable darray[usize]
+            generic_struct_param_count: mutable darray[usize]
+            # Instantiation memo, keyed by (base, type-argument tuple) — NOT by a mangled
+            # name, so no synthetic name sview has to outlive the call that builds it. Args
+            # are flattened into a pool with a per-instantiation span; `inst_index` is the
+            # resulting entry's slot in `names`/`handles`.
+            generic_struct_inst_bases: mutable darray[sview]
+            generic_struct_inst_args: mutable darray[ValueType]
+            generic_struct_inst_arg_start: mutable darray[usize]
+            generic_struct_inst_arg_count: mutable darray[usize]
+            generic_struct_inst_index: mutable darray[usize]
+            # Whether the corresponding generic instance has a completed LLVM body. A false
+            # entry is visible only while its base is in generic_struct_inprogress; this lets
+            # pointer-mediated recursion refer to the opaque placeholder without making a
+            # declined instance look usable on a later lookup.
+            generic_struct_inst_ready: mutable darray[bool]
+            # Base names currently mid-instantiation. A self-recursive generic struct that
+            # recurses BY VALUE (infinite size) is declined rather than looped on; the valid
+            # by-pointer case (`Node[T]: next: Node[T]&?`) is not modeled yet and also
+            # declines here, conservatively.
+            generic_struct_inprogress: mutable darray[sview]
+            # The module's LLVM context, stashed so annotation_value_type — which has no ctx
+            # parameter — can LAZILY materialize a `Base[args]` instantiation (create its
+            # named struct and set its body) the first time an annotation names it.
+            context: LLVMContextRef
+            # Fixed-array types, interned on demand: `array_elements[i]` is the element
+            # type and `array_extents[i]` the length of the array whose ValueType has
+            # `bits == i`. Interning (rather than a fresh entry per mention) keeps
+            # `i64[3]` one type, so two locals of the same array type compare equal.
+            array_elements: mutable darray[ValueType]
+            array_extents: mutable darray[u32]
+            # `darray[T]` element types, interned the same way.
+            darray_elements: mutable darray[ValueType]
+            # `view[T]` element types, interned the same way — the phantom element the
+            # `DynArrayView` fat pointer carries for type checking / generic inference.
+            view_elements: mutable darray[ValueType]
+            # `T&` referent types, interned the same way.
+            ref_targets: mutable darray[ValueType]
+            # Parallel to ref_targets: whether each interned ref is a RAW HEAP pointer (`heap
+            # T&`) rather than a safe reference. A heap ref does POINTER arithmetic on `+`/`-`
+            # (advance by stride); a safe ref value-adds (deref then add). The `kind` stays Ref
+            # for both, so deref / field / index handling is identical — only arithmetic asks.
+            ref_is_heap: mutable darray[bool]
+            # `T?` payload types, interned the same way.
+            optional_targets: mutable darray[ValueType]
+            # Value-carrying `T error[E]` types. The value representation is the stage0
+            # descriptor `{i32 error_code, ptr payload}`; the side pools retain the
+            # payload type and error-set family.
+            error_union_values: mutable darray[ValueType] = []
+            error_union_families: mutable darray[sview] = []
+            # CONST enums. A `const enum Color of u8` IS its backing scalar (stage0 lowers
+            # `def code(c: Color)` to `define i64 @code(i8 %0)`), and a variant is its
+            # ORDINAL — `match c: Color.Red:` is `icmp eq i8 %c, 0`. So the backend needs
+            # only name -> backing type, and (enum, variant) -> ordinal. Flat pools with a
+            # per-enum span, same shape as struct fields.
+            enum_names: mutable darray[sview]
+            enum_backings: mutable darray[ValueType]
+            enum_variants: mutable darray[sview]
+            enum_variant_start: mutable darray[usize]
+            enum_variant_count: mutable darray[usize]
+            # PAYLOAD-carrying enums, in a side-pool parallel to the const-enum one above.
+            # `penum_payloads` is the payload ValueType of each variant (one per variant, in
+            # declaration order); a variant with NO payload still takes a slot so that a
+            # variant's index within its enum IS its tag.
+            penum_names: mutable darray[sview]
+            penum_variants: mutable darray[sview]
+            penum_payloads: mutable darray[ValueType]
+            penum_has_payload: mutable darray[bool]
+            # The payload field's declared NAME (""), used to check a LABELLED constructor
+            # argument: `Shape.Circle(r: 42)` is only that constructor if `r` is the field's
+            # real name -- otherwise it is a different program and must not be emitted.
+            penum_field_names: mutable darray[sview]
+            # MULTI-FIELD payload variants (`Rect(i64, i64)`): each variant's field types and
+            # declared names in a flat pool, spanned per variant-slot by _start/_count. A
+            # single-field variant keeps its proven single-value path (penum_payloads /
+            # penum_has_payload above); a variant with COUNT>1 fields is emitted through these
+            # pools instead (tuple store on construction, tuple extract on match). Every
+            # variant-slot gets a span (0 fields = empty span) so the pools stay index-parallel.
+            penum_field_types: mutable darray[ValueType]
+            penum_field_flat_names: mutable darray[sview]
+            penum_field_type_start: mutable darray[usize]
+            penum_field_type_count: mutable darray[usize]
+            # PACKED enums (`packed enum Node:`) — the same per-variant pools as penum_*, but
+            # a separate table because the REPRESENTATION differs: a packed value is a store
+            # row, not inline data. Kept apart so neither path can silently claim the other's
+            # enums (which is exactly the bug 5403a62 fixed).
+            packed_names: mutable darray[sview]
+            packed_variants: mutable darray[sview]
+            packed_payloads: mutable darray[ValueType]
+            packed_has_payload: mutable darray[bool]
+            packed_field_names: mutable darray[sview]
+            packed_variant_start: mutable darray[usize]
+            packed_variant_count: mutable darray[usize]
+            packed_payload_words: mutable darray[u32]
+            # Full payload field spans for aggregate packed variants.
+            packed_field_types: mutable darray[ValueType]
+            packed_field_flat_names: mutable darray[sview]
+            packed_field_type_start: mutable darray[usize]
+            packed_field_type_count: mutable darray[usize]
+            # How many leading fields of each variant are COMMON (shared across variants).
+            # The parser PREPENDS them to every variant's field list, so from here a common
+            # block just means "the first N fields are shared". They are stored INLINE
+            # between the tag and the payload: stage0 lays out `%Expr = {i32, i64, [1 x i64]}`
+            # for one common field, vs `{i32, [1 x i64]}` for none.
+            packed_common_counts: mutable darray[u32]
+            # Names the PARSER marked as members of the sealed Node hierarchy
+            # (`__ast_refinement`). Keyed on the declaration's ancestry, not on the bare
+            # name, so a program's own `packed enum Expr:` is an ordinary packed enum.
+            ast_refinement_names: mutable darray[sview]
+            penum_variant_start: mutable darray[usize]
+            penum_variant_count: mutable darray[usize]
+            # Payload words (i64 units) of the WIDEST variant — the `[N x i64]` extent.
+            penum_payload_words: mutable darray[u32]
+            # `alias Num = i64` — a NAME for an existing type, carrying no representation of
+            # its own, so it resolves to the target's ValueType and disappears.
+            #
+            # Resolved to a FIXPOINT at registration rather than by recursing at each
+            # mention: `alias A = B` / `alias B = A` would otherwise recurse forever (the
+            # same shape as the value-binding cycle that stack-overflows a naive resolver).
+            # A cycle simply never resolves, stays Unmodeled, and DECLINES.
+            alias_names: mutable darray[sview]
+            alias_types: mutable darray[ValueType]
+            # GLOBAL consts. stage0 INLINES them: `const LIMIT: i64 = 42` emits no `@LIMIT`
+            # global and no load — `LIMIT + NAME.i64()` lowers to `sadd(42, 7)` (read from
+            # its -emit llvm output). So a const is a compile-time VALUE substituted at the
+            # use site, and the backend needs only name -> (type, folded value).
+            #
+            # Folded to a FIXPOINT, unlike aliases: stage0 ACCEPTS a forward reference here
+            # (`const A: i64 = B + 2` before `const B` works — verified), so an in-order pass
+            # would decline a program the reference compiler compiles. A CYCLE never folds
+            # and stays unresolved, which declines — stage0 rejects it too ("const \"A\"
+            # initializer must be a compile-time i64 value").
+            const_names: mutable darray[sview]
+            const_types: mutable darray[ValueType]
+            const_values: mutable darray[i64]
+            const_resolved: mutable darray[bool]
+            # A FLOAT const's source text (`const PI: f64 = 3.0` → "3.0"), inlined at the use
+            # site via LLVMConstRealOfString (never re-parse the decimal). "" for non-float.
+            const_float_text: mutable darray[sview]
+            # A global const AGGREGATE (array) is backed by a real module GLOBAL rather than a
+            # folded scalar: `const_globals[i]` is its `@name` handle (indexed by GEP at use)
+            # and `const_global_ok[i]` marks the slot as materialized. Scalar consts leave the
+            # handle null and stay on the fold path above.
+            const_globals: mutable darray[LLVMValueRef]
+            const_global_ok: mutable darray[bool]
+            # External C globals. Unlike Elisa `const` values these remain addressable LLVM
+            # declarations and are loaded/stored at each use site.
+            extern_global_names: mutable darray[sview]
+            extern_global_types: mutable darray[ValueType]
+            extern_global_handles: mutable darray[LLVMValueRef]
+            # Mutable Elisa globals have owned module storage and are distinct from
+            # immutable folded consts and external C globals.
+            mutable_global_names: mutable darray[sview]
+            mutable_global_types: mutable darray[ValueType]
+            mutable_global_handles: mutable darray[LLVMValueRef]
+            # `static if` selection results, stashed here because StructTable already
+            # reaches every emitter: branch head lines (all of them) and the taken subset.
+            # A Stmt.Block("static") whose line is a branch line emits only when taken;
+            # a bare `static:` block (line in neither) emits unconditionally.
+            static_branch_lines: mutable darray[u32]
+            static_taken_lines: mutable darray[u32]
+            # The `ensure PRED` postconditions of the function CURRENTLY being emitted.
+            # Refilled per function by emit_function_body and read at every `return`, which
+            # is where stage0 checks them: it allocates `%result`, stores the returned value
+            # into it, then branches on each predicate. Threaded on StructTable rather than
+            # Runtime because Runtime is COPIED per function (copied_runtime) and this is a
+            # container -- the side-table channel static_branch_lines already uses.
+            pending_ensures: mutable darray[Expr]
+            # Paths proven non-null by an `assert PATH != null` in the function currently
+            # being emitted. stage0 NARROWS on that assert: `assert m.items != null` makes
+            # the following `items: DictBucket[K,T]& = m.items` legal (it rejects the same
+            # assignment WITHOUT the assert -- verified against stage0 both ways). The std
+            # dict's find/get/put all depend on it.
+            #
+            # A path is `owner.field` (field == "" for a bare local). Recorded per function
+            # and dropped as soon as anything ASSIGNS to the path, since the proof dies with
+            # the value it was about.
+            narrowed_owners: mutable darray[sview]
+            narrowed_fields: mutable darray[sview]
+            # The CURRENT generic instantiation's type-parameter bindings: `binding_names[i]`
+            # (e.g. "T") stands for `binding_types[i]` (e.g. i64). Empty outside one.
+            #
+            # These live in the registry rather than as their own threaded parameter: the
+            # registry already reaches every place a type is resolved, and constructing a
+            # fresh empty bindings table per call site is REGION-POLYMORPHIC (so illegal in
+            # a non-region-inferable context). Set on entry to an instantiation, cleared on
+            # exit. `binding_names` are sviews into the source buffer, so nothing dangles.
+            binding_names: mutable darray[sview]
+            binding_types: mutable darray[ValueType]
+            # `fn(…)->R` signature reconstruction. The parser drops fn-type param/return types
+            # from the AST, recording only HEAD NAMES on the __lambda_return / __lambda_param
+            # annotations keyed by the fn-type's line. Populated ONCE (register_fn_signatures)
+            # from file.enum_annotations: `fn_return_lines[i]` -> `fn_return_heads[i]`. A resolved
+            # Fn ValueType carries its RETURN type in the `fn_pool_returns` side-pool at `bits`,
+            # so a call through a fn value knows its result type even in argument position.
+            fn_return_lines: mutable darray[u32]
+            fn_return_heads: mutable darray[sview]
+            fn_pool_returns: mutable darray[ValueType]
+            fn_param_lines: mutable darray[u32]
+            fn_param_heads: mutable darray[sview]
+            fn_pool_param_start: mutable darray[usize]
+            fn_pool_param_count: mutable darray[usize]
+            fn_pool_params: mutable darray[ValueType]
+            # Full function-value parameter type expressions copied from Ast::File. These
+            # preserve generic arguments that the legacy head-only annotation rows discard.
+            fn_type_param_lines: mutable darray[u32]
+            fn_type_param_exprs: mutable darray[Expr]
+            # Explicit `clone[T error[E]]` targets preserved by the parser side table.
+            clone_error_lines: mutable darray[u32] = []
+            clone_error_families: mutable darray[sview] = []
+            # Local `x: T error[E]` declarations preserved by the parser side table.
+            local_error_lines: mutable darray[u32] = []
+            local_error_families: mutable darray[sview] = []
+            field_error_lines: mutable darray[u32] = []
+            field_error_families: mutable darray[sview] = []
+            param_error_lines: mutable darray[u32] = []
+            param_error_families: mutable darray[sview] = []
+            branch_hint_lines: mutable darray[u32]
+            branch_hint_kinds: mutable darray[sview]
+            # Whole-program facts used by the opt-in disjoint-parameter alias metadata.
+            # A mask bit marks a source parameter that is proven distinct from every other
+            # eligible darray reference parameter at every observed call site.
+            disjoint_function_names: mutable darray[sview] = []
+            disjoint_function_masks: mutable darray[u64] = []
+            disjoint_candidate_masks: mutable darray[u64] = []
+
+
+        # The LLVM type of ANY darray: `{ptr, i64, i64}` = {items, count, capacity}.
+        #
+        # One shape for every element type — the element only affects the STRIDE when
+        # indexing, never the header. Matches stage0's `%DynArray__T` (verified by reading
+        # its `-emit llvm` output); the layout is dictated by the shared runtime.
+        def darray_llvm_type(structs: mutable StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            fields: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0), int64_type, int64_type]
+            fields_pointer: void& = (&fields[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, fields_pointer, 3, 0)
+
+
+        # The `Arena` header: `{ptr, ptr, i64, i64}`. Field 3 is the STRATEGY, which the
+        # runtime reads; stage0 stores 2 (lazy) for an auto region, so this does too.
+        def arena_llvm_type(ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            fields: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, int64_type, int64_type]
+            fields_pointer: void& = (&fields[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, fields_pointer, 4, 0)
+
+
+        # Copy a ValueType out of the region-backed registry.
+        #
+        # ValueType is POD, but a value read straight out of `structs`' darrays is a
+        # BORROW tied to the registry's region — returning it region-less is (correctly)
+        # rejected. Rebuilding it from its fields severs the borrow at zero cost.
+        def copied_type(value_type: ValueType) -> ValueType:
+            return ValueType{kind: value_type.kind, bits: value_type.bits}
+
+
+        # Intern a fixed-array type `element[extent]`, returning its ValueType. Same
+        # element+extent always yields the same index, so `i64[3]` is one type.
+        def intern_array_type(element: ValueType, extent: u32, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<structs.array_elements.count |structs, element, extent|:
+                existing: ValueType = structs.array_elements[index]
+                if existing.kind == element.kind and existing.bits == element.bits and structs.array_extents[index] == extent:
+                    return ValueType{kind: TypeKind.Array, bits: index.u32()}
+            structs.array_elements <- structs.array_elements.push(element)
+            structs.array_extents <- structs.array_extents.push(extent)
+            return ValueType{kind: TypeKind.Array, bits: (structs.array_elements.count - 1).u32()}
+
+
+        # Intern a guest/host address-space carrier (`GuestVAddr[L]`, `HostPtr[T]`).
+        def intern_guest_carrier(layout: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<structs.guest_layouts.count |structs, layout|:
+                ValueType{kind: TypeKind.GuestCarrier, bits: index.u32()} return if structs.guest_layouts[index] == layout
+            structs.guest_layouts.push(layout)
+            return ValueType{kind: TypeKind.GuestCarrier, bits: (structs.guest_layouts.count - 1).u32()}
+
+
+        def guest_carrier_layout(value_type: ValueType, structs: mutable StructTable&) -> sview can[Abort.Panic]:
+            sview("", 0, 0) return if value_type.kind != TypeKind.GuestCarrier
+            sview("", 0, 0) return if value_type.bits.usize() >= structs.guest_layouts.count
+            return structs.guest_layouts[value_type.bits.usize()]
+
+
+        # Fill overlay field widths from the layout struct's field types once bodies exist.
+        def finalize_overlay_field_widths(structs: mutable StructTable&) -> void can[Abort.Panic]:
+            for index in 0..<structs.overlay_field_names.count |structs|:
+                continue if structs.overlay_field_widths[index] != 0
+                layout: sview = structs.overlay_field_layouts[index]
+                continue if layout == ""
+                layout_slot: i64 = struct_index_of(structs, layout)
+                continue if layout_slot < 0
+                field_pos: i64 = field_index_of(structs, layout_slot.usize(), structs.overlay_field_names[index])
+                continue if field_pos < 0
+                field_type: ValueType = copied_type(structs.field_types[structs.field_start[layout_slot.usize()] + field_pos.usize()])
+                width: mutable u32 = 0
+                if field_type.kind == TypeKind.Signed or field_type.kind == TypeKind.Unsigned:
+                    width <- 1 if field_type.bits == 8 else width
+                    width <- 2 if field_type.bits == 16 else width
+                    width <- 4 if field_type.bits == 32 else width
+                    width <- 8 if field_type.bits == 64 else width
+                    # Default unknown scalar overlays to 8 (u64) — stage0's common guest word.
+                    width <- 8 if width == 0 else width
+                structs.overlay_field_widths[index] <- width
+
+
+        # Look up a guest-overlay field's (offset, width) for a layout, or (-1, 0) if unknown.
+        def overlay_field_info(structs: mutable StructTable&, layout: sview, field: sview) -> (offset: i64, width: u32) can[Abort.Panic]:
+            for index in 0..<structs.overlay_field_names.count |structs, layout, field|:
+                if structs.overlay_field_names[index] == field and (structs.overlay_field_layouts[index] == layout or structs.overlay_field_layouts[index] == ""):
+                    return (structs.overlay_field_offsets[index].i64(), structs.overlay_field_widths[index])
+            return (0 - 1, 0)
+
+
+        # Intern a `darray[T]` type.
+        def intern_darray_type(element: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<structs.darray_elements.count |structs, element|:
+                existing: ValueType = structs.darray_elements[index]
+                if existing.kind == element.kind and existing.bits == element.bits:
+                    return ValueType{kind: TypeKind.DArray, bits: index.u32()}
+            structs.darray_elements <- structs.darray_elements.push(element)
+            return ValueType{kind: TypeKind.DArray, bits: (structs.darray_elements.count - 1).u32()}
+
+
+        # Intern a `view[T]` type — one interned entry per element, lowering to DynArrayView.
+        def intern_view_type(element: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<structs.view_elements.count |structs, element|:
+                existing: ValueType = structs.view_elements[index]
+                if existing.kind == element.kind and existing.bits == element.bits:
+                    return ValueType{kind: TypeKind.View, bits: index.u32()}
+            structs.view_elements <- structs.view_elements.push(element)
+            return ValueType{kind: TypeKind.View, bits: (structs.view_elements.count - 1).u32()}
+
+
+        def view_element_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.View
+            return copied_type(structs.view_elements[value_type.bits.usize()])
+
+
+        # A `view[T]` decays to the `DynArrayView` STRUCT for every representation purpose
+        # (LLVM type, field access) — only inference cares about the element. Unmodeled if
+        # DynArrayView is not in scope (a program using `view[T]` without the std).
+        def view_struct_type(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.View
+            view_struct_index: i64 = struct_index_of(structs, "DynArrayView")
+            unmodeled_type() return if view_struct_index < 0
+            return ValueType{kind: TypeKind.Struct, bits: view_struct_index.u32()}
+
+
+        # Intern a reference type `T&`.
+        def intern_ref_type(target: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if target.kind == TypeKind.Unmodeled
+            for index in 0..<structs.ref_targets.count |structs, target|:
+                existing: ValueType = structs.ref_targets[index]
+                if existing.kind == target.kind and existing.bits == target.bits and not structs.ref_is_heap[index]:
+                    return ValueType{kind: TypeKind.Ref, bits: index.u32()}
+            structs.ref_targets <- structs.ref_targets.push(target)
+            structs.ref_is_heap <- structs.ref_is_heap.push(false)
+            return ValueType{kind: TypeKind.Ref, bits: (structs.ref_targets.count - 1).u32()}
+
+        # Intern a RAW HEAP pointer `heap T&` — a Ref (same LLVM `ptr`, same deref/field/index
+        # handling) distinguished only by its heap flag, which makes `+`/`-` pointer arithmetic.
+        def intern_heap_ref_type(target: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if target.kind == TypeKind.Unmodeled
+            for index in 0..<structs.ref_targets.count |structs, target|:
+                existing: ValueType = structs.ref_targets[index]
+                if existing.kind == target.kind and existing.bits == target.bits and structs.ref_is_heap[index]:
+                    return ValueType{kind: TypeKind.Ref, bits: index.u32()}
+            structs.ref_targets <- structs.ref_targets.push(target)
+            structs.ref_is_heap <- structs.ref_is_heap.push(true)
+            return ValueType{kind: TypeKind.Ref, bits: (structs.ref_targets.count - 1).u32()}
+
+        # Whether a value type is a raw heap pointer (`heap T&`) — the query arithmetic asks.
+        def ref_is_heap_ref(value_type: ValueType, structs: StructTable&) -> bool can[Abort.Panic]:
+            return value_type.kind == TypeKind.Ref and structs.ref_is_heap[value_type.bits.usize()]
+
+
+        # Intern an optional type `T?`.
+        def intern_optional_type(payload: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if payload.kind == TypeKind.Unmodeled or payload.kind == TypeKind.Optional
+            for index in 0..<structs.optional_targets.count |structs, payload|:
+                existing: ValueType = structs.optional_targets[index]
+                if existing.kind == payload.kind and existing.bits == payload.bits:
+                    return ValueType{kind: TypeKind.Optional, bits: index.u32()}
+            structs.optional_targets <- structs.optional_targets.push(payload)
+            return ValueType{kind: TypeKind.Optional, bits: (structs.optional_targets.count - 1).u32()}
+
+
+        # The payload type of a `T?`.
+        def optional_payload_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.Optional
+            return copied_type(structs.optional_targets[value_type.bits.usize()])
+
+
+        # Intern a value-carrying error union. Error-family names are source-backed sviews;
+        # keeping them beside the payload type mirrors the stage0 ErrorUnionType pair.
+        def intern_error_union_type(payload: ValueType, family: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if payload.kind == TypeKind.Unmodeled or family == ""
+            for index in 0..<structs.error_union_values.count |structs, payload, family|:
+                existing: ValueType = structs.error_union_values[index]
+                if existing.kind == payload.kind and existing.bits == payload.bits and structs.error_union_families[index] == family:
+                    return ValueType{kind: TypeKind.ErrorUnion, bits: index.u32()}
+            structs.error_union_values.push(payload)
+            structs.error_union_families.push(family)
+            return ValueType{kind: TypeKind.ErrorUnion, bits: (structs.error_union_values.count - 1).u32()}
+
+
+        def error_union_payload_of(value_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if value_type.kind != TypeKind.ErrorUnion
+            return copied_type(structs.error_union_values[value_type.bits.usize()])
+
+
+        def error_union_family_of(value_type: ValueType, structs: mutable StructTable&) -> sview can[Abort.Panic]:
+            sview("", 0, 0) return if value_type.kind != TypeKind.ErrorUnion
+            return structs.error_union_families[value_type.bits.usize()]
+
+
+        # The referent type of a `T&`.
+        # A function gains an implicit trailing `ptr` arena parameter — and allocates from
+        # THAT rather than its own auto region — when a container it touches must outlive
+        # the call. Two triggers, both verified against stage0's IR:
+        #
+        #   * a GROWABLE container REF param: `def fill(out: mutable darray[i64]&)` emits as
+        #     `define void @fill(ptr, ptr)` and grows via `arena_alloc(ptr %1, ...)`;
+        #   * a container RETURN type: `def build() -> darray[i64]` emits as
+        #     `define %DynArray__i64 @build(ptr %0)` and allocates the returned darray's
+        #     backing from the CALLER's region.
+        #
+        # Both are the same rule: the backing belongs to the caller, so a callee-local
+        # region would free it at return and hand back freed memory. The return case IS
+        # region-return inference, and it is why returning an owned container no longer has
+        # to decline (see 95915b5, which declined it precisely because this was missing).
+        # libc `abort()` for a failed contract's fail path. Declared once; a repeat
+        # LLVMAddFunction would create a duplicate, so reuse an existing declaration.
+        def declare_or_get_abort(m: LLVMModuleRef, abort_type: LLVMTypeRef) -> LLVMValueRef can[Abort.Panic, Unsafe.PointerCast]:
+            if LLVMGetNamedFunction(m, "abort") is existing:
+                return existing
+            return LLVMAddFunction(m, "abort", abort_type)
+
+
+        # Declare a runtime symbol (by name) once, reusing an existing declaration. Used for
+        # compiler-emitted builtins whose implementation lives in elisacore_runtime.o.
+        def declare_or_get_named(m: LLVMModuleRef, name: cstr, fn_type: LLVMTypeRef) -> LLVMValueRef can[Abort.Panic, Unsafe.PointerCast]:
+            if LLVMGetNamedFunction(m, name) is existing:
+                return existing
+            return LLVMAddFunction(m, name, fn_type)
+
+
+        # `ctx_hash_value(key)` — the compiler-emitted hash builtin the runtime dict uses.
+        # stage0's lowering (llvm_hash.go): a cstr key hashes its content via ctx_hash_cstr
+        # (FNV-1a); every fixed-size scalar key zero-extends to u64 and runs ctx_hash_u64
+        # (splitmix64). Both return u64 and live in elisacore_runtime.o.
+        def emit_hash_builtin(key_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            key_type: ValueType = expression_type(key_expression, local_scope, fns, structs, generics)
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            # A cstr key: hash the content.
+            if key_type.kind == TypeKind.CStr:
+                if emit_expression(key_expression, key_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cstr_value:
+                    cstr_params: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+                    cstr_pointer: void& = (&cstr_params[0]).cast[void&] can Unsafe.PointerCast
+                    cstr_hash_type: LLVMTypeRef = LLVMFunctionType(int64_type, cstr_pointer, 1, 0)
+                    cstr_hash_fn: LLVMValueRef = declare_or_get_named(m, "ctx_hash_cstr", cstr_hash_type)
+                    cstr_args: mutable darray[LLVMValueRef] = [cstr_value]
+                    cstr_args_pointer: void& = (&cstr_args[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMBuildCall2(builder, cstr_hash_type, cstr_hash_fn, cstr_args_pointer, 1, "hash.cstr")
+                return null
+            # A fixed-size scalar (integer / bool / char / const enum): zero-extend to u64.
+            null return if not is_integer_type(key_type) and key_type.kind != TypeKind.Bool
+            if emit_expression(key_expression, key_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scalar_value:
+                extended: mutable LLVMValueRef = scalar_value
+                extended <- LLVMBuildZExt(builder, scalar_value, int64_type, "hash.zext") if key_type.bits < 64
+                u64_params: mutable darray[LLVMTypeRef] = [int64_type]
+                u64_pointer: void& = (&u64_params[0]).cast[void&] can Unsafe.PointerCast
+                u64_hash_type: LLVMTypeRef = LLVMFunctionType(int64_type, u64_pointer, 1, 0)
+                u64_hash_fn: LLVMValueRef = declare_or_get_named(m, "ctx_hash_u64", u64_hash_type)
+                u64_args: mutable darray[LLVMValueRef] = [extended]
+                u64_args_pointer: void& = (&u64_args[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildCall2(builder, u64_hash_type, u64_hash_fn, u64_args_pointer, 1, "hash.u64")
+            return null

@@ -1,0 +1,550 @@
+# Stage1 backend — declaring a function's LLVM signature and emitting its body.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        def apply_branch_hint(branch: LLVMValueRef, hint: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if hint == ""
+            marker: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "branch_weights", 14)
+            likely_weight: LLVMMetadataRef = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ctx), 2000, 0))
+            unlikely_weight: LLVMMetadataRef = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ctx), 1, 0))
+            weights: mutable darray[LLVMMetadataRef] = [marker, likely_weight, unlikely_weight]
+            weights <- [marker, unlikely_weight, likely_weight] if hint == "unlikely"
+            weights_pointer: void& = (&weights[0]).cast[void&] can Unsafe.PointerCast
+            weights_node: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, weights_pointer, 3)
+            prof_kind: u32 = LLVMGetMDKindIDInContext(ctx, "prof", 4)
+            LLVMSetMetadata(branch, prof_kind, LLVMMetadataAsValue(ctx, weights_node))
+
+
+        def function_callconv(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&) -> u32 can[Abort.Panic]:
+            for decorator in decorators |annotation_args|:
+                continue if decorator.name != "callconv" or decorator.arg_count == 0 or decorator.arg_start.usize() >= annotation_args.count
+                convention: sview = annotation_args[decorator.arg_start.usize()]
+                # LLVM's stable C API enum values: C=0, fast=8, cold=9, x86 fastcall=65,
+                # and x86 stdcall/winapi=64. The semantic pass rejects every other spelling.
+                if convention == "fast":
+                    return 8
+                elif convention == "cold" or convention == "coldcc":
+                    return 9
+                elif convention == "fastcall":
+                    return 65
+                elif convention == "stdcall" or convention == "x86_stdcall" or convention == "x86-stdcall" or convention == "winapi" or convention == "windows":
+                    return 64
+                return 0
+            return 0
+
+
+        def apply_function_decorators(fn: LLVMValueRef, decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&, stamp_nounwind: bool, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for decorator in decorators |annotation_args, ctx, fn|:
+                attribute_name: mutable sview = ""
+                if decorator.name == "hot" or decorator.name == "cold" or decorator.name == "noinline" or decorator.name == "norecurse":
+                    attribute_name <- decorator.name
+                if decorator.name == "inline":
+                    # @inline(always) and @inline(never) are the two source-level modes;
+                    # a bare @inline is LLVM's non-binding inline hint.
+                    if decorator.arg_count == 0:
+                        attribute_name <- "inlinehint"
+                    elif decorator.arg_start.usize() < annotation_args.count:
+                        mode: sview = annotation_args[decorator.arg_start.usize()]
+                        attribute_name <- "alwaysinline" if mode == "always"
+                        attribute_name <- "noinline" if mode == "never"
+                add_function_attribute(fn, attribute_name, ctx) if attribute_name != ""
+                if decorator.name == "async_entry" or decorator.name == "segment_agnostic" or decorator.name == "segment_establishing" or decorator.name == "segment_transition" or decorator.name == "reentrant_safe":
+                    add_function_string_attribute(fn, "elisacore.async_entry", "true", ctx) if decorator.name == "async_entry"
+                    add_function_string_attribute(fn, "elisacore.segment_agnostic", "true", ctx) if decorator.name == "segment_agnostic"
+                    add_function_string_attribute(fn, "elisacore.segment_establishing", "true", ctx) if decorator.name == "segment_establishing"
+                    add_function_string_attribute(fn, "elisacore.segment_transition", "true", ctx) if decorator.name == "segment_transition"
+                    add_function_string_attribute(fn, "elisacore.reentrant_safe", "true", ctx) if decorator.name == "reentrant_safe"
+            add_function_attribute(fn, "nounwind", ctx) if stamp_nounwind
+            LLVMSetFunctionCallConv(fn, function_callconv(decorators, annotation_args)) if function_callconv(decorators, annotation_args) != 0
+
+
+        def apply_export_target_decorators(declarations: darray[Decl], target_name: sview, annotation_args: darray[sview]&, wrapper: LLVMValueRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration in declarations |annotation_args, target_name, wrapper, ctx|:
+                if declaration_is_module(declaration):
+                    for nested_index in 0..<declaration_module_count(declaration) |declarations, target_name, annotation_args, wrapper, ctx, declaration|:
+                        region nested_declaration(4096):
+                            apply_export_target_decorators([declaration_module_at(declaration, nested_index)], target_name, annotation_args, wrapper, ctx)
+                elif declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                    apply_function_decorators(wrapper, decorators, annotation_args, true, ctx) if function_name == target_name
+
+
+        # Declare `def name(a: T, …) -> R` in the module WITHOUT a body, recording its
+        # types in `fns`. Null when the signature is outside the modeled subset.
+        #
+        # Signature types are REAL now: any modeled scalar width/signedness, not just i64.
+        def declare_function(declaration: Decl, owner: sview, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return match declaration:
+                Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line): declare_function_impl(function_name, params, return_type_opt, body, effects, decorators, line, owner, error_lines, annotation_args, fns, structs, generics, m, ctx)
+                _: zeroed
+
+
+        def declared_function_name(owner: sview, function_name: sview, overload_count: i64, arity: usize, name_storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if overload_count > 0:
+                if sview_len(owner) > 0:
+                    for oi in 0..<sview_len(owner) |name_storage, owner|:
+                        name_storage.push(sview_at(owner, oi))
+                    name_storage.push(46)
+                for ni in 0..<sview_len(function_name) |name_storage, function_name|:
+                    name_storage.push(sview_at(function_name, ni))
+                name_storage.push(46)
+                arity_digits: mutable darray[u8] = []
+                arity_n: mutable i64 = arity.i64()
+                arity_digits.push(48) if arity_n == 0
+                while arity_n > 0 |arity_n, arity_digits|:
+                    arity_digits.push((48 + (arity_n % 10)).u8())
+                    arity_n <- arity_n / 10
+                di: mutable i64 = arity_digits.count.i64() - 1
+                while di >= 0 |di, arity_digits, name_storage|:
+                    name_storage.push(arity_digits[di.usize()])
+                    di <- di - 1
+                name_storage.push(0)
+                return (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            return qualified_name_cstr(owner, function_name, name_storage)
+
+
+        def declared_parameter_llvm_types(declared_param_types: darray[ValueType], arena_count: usize, wants_store: bool, structs: mutable StructTable&, ctx: LLVMContextRef) -> darray[LLVMTypeRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            llvm_param_types: mutable darray[LLVMTypeRef] = []
+            for declared_param_type in declared_param_types |llvm_param_types, structs, ctx|:
+                llvm_param_types.push(llvm_type_of(declared_param_type, structs, ctx))
+            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if arena_count > 0
+            if wants_store:
+                ast_store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: 0}
+                llvm_param_types.push(llvm_type_of(ast_store_type, structs, ctx))
+            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if arena_count > 1
+            return llvm_param_types
+
+
+        def add_declared_function_with_params(fn_name: cstr, params_pointer: void&, total_params: u32, llvm_return: LLVMTypeRef, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fn_type: LLVMTypeRef = LLVMFunctionType(llvm_return, params_pointer, total_params, 0)
+            return LLVMAddFunction(m, fn_name, fn_type)
+
+
+        def build_declared_function(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, overload_count: i64, force_ast_store: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            name_storage: mutable darray[u8] = []
+            fn_name: cstr = declared_function_name(owner, function_name, overload_count, params.count, name_storage)
+            wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store or params_include_packed_ast(declared_param_types, structs)
+            # Parser/Lexer functions construct opaque AST handles whose nested side
+            # tables are not visible in the source signature. Keep their allocations
+            # in the caller's region just like an explicit darray return.
+            signature_wants_arena: bool = signature_needs_arena(params, return_value_type, structs)
+            arena_count: usize = frontend_arena_count(owner, function_name, signature_wants_arena, wants_store)
+            llvm_param_types: mutable darray[LLVMTypeRef] = declared_parameter_llvm_types(declared_param_types, arena_count, wants_store, structs, ctx)
+            is_error_fn: bool = line_is_error_returning(error_lines, line)
+            if is_error_fn:
+                error_out_param: mutable darray[LLVMTypeRef] = []
+                error_out_param.push(LLVMPointerTypeInContext(ctx, 0))
+                for existing in llvm_param_types |error_out_param|:
+                    error_out_param.push(existing)
+                llvm_param_types <- error_out_param
+            llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
+            llvm_return <- LLVMInt32TypeInContext(ctx) if is_error_fn
+            params_pointer: void& = (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
+            handle: LLVMValueRef = add_declared_function_with_params(fn_name, params_pointer, llvm_param_types.count.u32(), llvm_return, m, ctx)
+            apply_function_decorators(handle, decorators, annotation_args, true, ctx)
+            apply_noalias_parameter_attributes(handle, params, 1 + (1 if is_error_fn else 0), structs, ctx)
+            return handle
+
+
+        def declare_function_from_types(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, force_ast_store: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            overload_count: mutable i64 = 0
+            for oi in 0..<fns.names.count |oi, fns, owner, function_name, overload_count|:
+                overload_count <- overload_count + 1 if fns.names[oi] == function_name and fns.owners[oi] == owner
+            wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store or params_include_packed_ast(declared_param_types, structs)
+            signature_wants_arena: bool = signature_needs_arena(params, return_value_type, structs)
+            arena_count: usize = frontend_arena_count(owner, function_name, signature_wants_arena, wants_store)
+            is_error_fn: bool = line_is_error_returning(error_lines, line)
+            handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, declared_param_types, decorators, line, owner, overload_count, force_ast_store, error_lines, annotation_args, structs, m, ctx)
+            fns.names <- fns.names.push(function_name)
+            fns.lines <- fns.lines.push(line)
+            fns.owners <- fns.owners.push(owner)
+            fns.needs_arena <- fns.needs_arena.push(arena_count > 0)
+            fns.arena_counts <- fns.arena_counts.push(arena_count)
+            fns.needs_store <- fns.needs_store.push(wants_store)
+            fns.is_error <- fns.is_error.push(is_error_fn)
+            fns.is_variadic <- fns.is_variadic.push(false)
+            fns.handles <- fns.handles.push(handle)
+            fns.returns <- fns.returns.push(return_value_type)
+            fns.param_start <- fns.param_start.push(fns.param_types.count)
+            fns.param_count <- fns.param_count.push(params.count)
+            for parameter_index in 0..<declared_param_types.count |fns, params|:
+                fns.param_names <- fns.param_names.push(params[parameter_index].name)
+                fns.param_types <- fns.param_types.push(declared_param_types[parameter_index])
+            return handle
+
+
+        def declare_function_impl(function_name: sview, params: darray[ParamDecl], return_type_opt: Expr?, body: darray[Stmt], effects: darray[sview], decorators: darray[Ast::Annotation], line: u32, owner: sview, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if true:
+                # An implicit-void function (no `-> T`) must STILL be declared — gating the whole
+                # declaration on a present return type left every `def f(…):` (void, e.g. a
+                # mutating helper) undeclared, so its calls/body all declined. Default to void.
+                declared_return_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+                if return_type_opt is return_type:
+                    declared_return_type <- annotation_value_type(return_type, structs)
+                    null return if declared_return_type.kind == TypeKind.Unmodeled
+                if true:
+                    return_value_type: ValueType = declared_return_type
+
+                    declared_param_types: mutable darray[ValueType] = []
+                    for parameter in params |declared_param_types, structs|:
+                        parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
+                        null return if parameter_type.kind == TypeKind.Unmodeled
+                        declared_param_types.push(parameter_type)
+                    return declare_function_from_types(function_name, params, return_value_type, declared_param_types, decorators, line, owner, statements_mention_ast_store_call(body, structs), error_lines, annotation_args, fns, structs, m, ctx)
+
+                return null
+            return null
+
+
+        # `extern strlen(s: cstr) -> usize` -> `declare i64 @strlen(ptr)`. No body: the
+        # symbol is resolved at link time.
+        #
+        # Param and return types are bare NAMES here, not Exprs: the params live in the
+        # `File.extern_params` SIDE TABLE (`param_start`/`arity` index it) and the return
+        # type is `return_type_name` on the node. So both resolve through
+        # scalar_type_of_name rather than annotation_value_type -- there is no type
+        # expression to walk. An empty return name is `-> void`.
+        # Whether the parser side-tabled this extern's `-> T` clause as a POINTER
+        # return (`__extern_return_ptr` owner, extern name in `name`). The node
+        # signature keeps only the bare head name, so this is the only channel.
+        def extern_return_is_pointer(annotations: darray[Ast::EnumAnnotation]&, extern_name: sview) -> bool can[Abort.Panic]:
+            for annotation in annotations |extern_name|:
+                true return if annotation.owner == "__extern_return_ptr" and annotation.name == extern_name
+            return false
+
+        # `@link_name(c_symbol)` changes only the linker spelling. The source-level name
+        # remains the key used by parser/semantic tables and call sites.
+        def extern_link_name(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&, source_name: sview) -> sview can[Abort.Panic]:
+            for decorator in decorators |annotation_args, source_name|:
+                if decorator.name == "link_name" and decorator.arg_count > 0 and decorator.arg_start.usize() < annotation_args.count:
+                    return annotation_args[decorator.arg_start.usize()]
+            return source_name
+
+        # Intrinsics are declarations owned by LLVM, not ordinary extern symbols. The
+        # frontend stores the requested intrinsic name as the single @intrinsic argument;
+        # retain the source name separately in FnTable so Elisa calls still resolve by it.
+        def extern_intrinsic_name(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&) -> sview can[Abort.Panic]:
+            for decorator in decorators |annotation_args|:
+                if decorator.name == "intrinsic" and decorator.arg_count > 0 and decorator.arg_start.usize() < annotation_args.count:
+                    return annotation_args[decorator.arg_start.usize()]
+            return sview("", 0, 0)
+
+
+        def export_target_of(annotations: darray[Ast::EnumAnnotation]&, export_name: sview) -> sview can[Abort.Panic]:
+            for annotation in annotations |export_name|:
+                if annotation.owner == export_name and annotation.name != "__export_fn":
+                    return annotation.name
+            return ""
+
+
+        def export_global_target_of(annotations: darray[Ast::EnumAnnotation]&, export_name: sview) -> sview can[Abort.Panic]:
+            for annotation in annotations |export_name|:
+                if annotation.owner == export_name and annotation.name != "__export_global":
+                    return annotation.name
+            return ""
+
+
+        def declare_export_global_alias(alias_name: sview, target_name: sview, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            target: mutable LLVMValueRef = zeroed
+            target_type: mutable ValueType = unmodeled_type()
+            mutable_index: i64 = mutable_global_index_of(structs, target_name)
+            if mutable_index >= 0:
+                target <- structs.mutable_global_handles[mutable_index.usize()]
+                target_type <- copied_type(structs.mutable_global_types[mutable_index.usize()])
+            else:
+                const_index: i64 = const_index_of(structs, target_name)
+                false return if const_index < 0 or not structs.const_resolved[const_index.usize()]
+                target_type <- copied_type(structs.const_types[const_index.usize()])
+                if structs.const_global_ok[const_index.usize()]:
+                    target <- structs.const_globals[const_index.usize()]
+                else:
+                    target_type_llvm: LLVMTypeRef = llvm_type_of(target_type, structs, ctx)
+                    target_name_storage: mutable darray[u8] = []
+                    target <- LLVMAddGlobal(m, target_type_llvm, sview_to_cstr(target_name, target_name_storage))
+                    initializer: mutable LLVMValueRef = LLVMConstNull(target_type_llvm)
+                    if target_type.kind == TypeKind.Float and structs.const_float_text[const_index.usize()] != "":
+                        float_storage: mutable darray[u8] = []
+                        initializer <- LLVMConstRealOfString(target_type_llvm, sview_to_cstr(structs.const_float_text[const_index.usize()], float_storage))
+                    elif is_integer_type(target_type) or target_type.kind == TypeKind.Bool:
+                        initializer <- LLVMConstInt(target_type_llvm, structs.const_values[const_index.usize()].u64(), 0)
+                    else:
+                        return false
+                    LLVMSetInitializer(target, initializer)
+            false return if target_type.kind == TypeKind.Unmodeled
+            alias_type: LLVMTypeRef = llvm_type_of(target_type, structs, ctx)
+            alias_storage: mutable darray[u8] = []
+            _ = LLVMAddAlias2(m, alias_type, 0, target, sview_to_cstr(alias_name, alias_storage))
+            return true
+
+        # `export global target as public` is represented by the parser as an annotation
+        # pair. Materialize aliases after all globals exist, before the extern declaration
+        # pass; doing it from the extern row is order-sensitive and can see only a zero
+        # placeholder for the target handle.
+        def materialize_export_global_aliases(annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for annotation in annotations |structs, m, ctx|:
+                continue if annotation.name == "__export_global"
+                if mutable_global_index_of(structs, annotation.name) >= 0 or const_index_of(structs, annotation.name) >= 0:
+                    _ = declare_export_global_alias(annotation.owner, annotation.name, structs, m, ctx)
+
+
+        def declare_extern(declaration: Decl, extern_params: darray[ExternParam]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, return_is_pointer: bool, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if declaration is Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
+                linker_name: sview = extern_link_name(decorators, annotation_args, extern_name)
+                # `extern name: T` (a typed non-call extern) is a GLOBAL, not a function.
+                if not callable:
+                    # `extern LLVMModuleRef` / other opaque handle types: arity 0 and no
+                    # return type. Stage0 treats these as unnamed pointer types; register
+                    # them as aliases of `cstr` (LLVM `ptr`) so annotations resolve and
+                    # Backend functions that take LLVM handles can be declared under
+                    # stage1 meta-compile (gen2 self-host).
+                    if arity == 0 and return_type_name == "":
+                        if alias_index_of(structs, extern_name) < 0:
+                            structs.alias_names <- structs.alias_names.push(extern_name)
+                            structs.alias_types <- structs.alias_types.push(ValueType{kind: TypeKind.CStr, bits: 0})
+                        return true
+                    export_global_target: sview = export_global_target_of(annotations, extern_name)
+                    true return if export_global_target != ""
+                    global_type: mutable ValueType = scalar_type_of_name(return_type_name)
+                    global_type <- ValueType{kind: TypeKind.CStr, bits: 0} if return_type_name == "cstr"
+                    # Typed non-call externs retain only the bare head in the compact
+                    # declaration (`extern stderr: void&` becomes `void`). A bare `void`
+                    # global is therefore the pointer spelling used by the C runtime, not
+                    # an LLVM `void` object (LLVM rejects `global void` during codegen).
+                    global_type <- intern_heap_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs) if return_type_name == "void"
+                    false return if global_type.kind == TypeKind.Unmodeled
+                    global_name_storage: mutable darray[u8] = []
+                    global_handle: LLVMValueRef = LLVMAddGlobal(m, llvm_type_of(global_type, structs, ctx), sview_to_cstr(linker_name, global_name_storage))
+                    structs.extern_global_names <- structs.extern_global_names.push(extern_name)
+                    structs.extern_global_types <- structs.extern_global_types.push(global_type)
+                    structs.extern_global_handles <- structs.extern_global_handles.push(global_handle)
+                    return true
+                return_value_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+                if return_type_name != "":
+                    # A POINTER return lowers to `ptr` whatever the referent is — and the
+                    # referent may be `void`, which has no by-value lowering at all. Stage0
+                    # represents `heap T&?` as a BARE ptr (null = absent), so the optional
+                    # needs no extra tag here; the call site wraps it when the destination
+                    # is a `T?`. Checked before the scalar path so `void&` never reaches
+                    # `scalar_type_of_name("void")`.
+                    if return_is_pointer:
+                        return_value_type <- intern_heap_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs)
+                    else:
+                        return_value_type <- scalar_type_of_name(return_type_name)
+                        # `cstr` is not a scalar name but is a legal extern return.
+                        return_value_type <- ValueType{kind: TypeKind.CStr, bits: 0} if return_type_name == "cstr"
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            ret_alias: i64 = alias_index_of(structs, return_type_name)
+                            return_value_type <- copied_type(structs.alias_types[ret_alias.usize()]) if ret_alias >= 0 else return_value_type
+                        false return if return_value_type.kind == TypeKind.Unmodeled
+
+                extern_param_types: mutable darray[LLVMTypeRef] = []
+                declared_param_types: mutable darray[ValueType] = []
+                declined: mutable bool = false
+                for offset in 0..<arity.usize() |extern_param_types, declared_param_types, declined, extern_params, param_start, structs, ctx|:
+                    param_name: sview = extern_params[param_start.usize() + offset].type_name
+                    # A provenance-bearing param is a REFERENCE (`T&` / `lmut T`), so it is a
+                    # POINTER regardless of the referent — the type_name side table keeps only
+                    # the bare base name, dropping the `&`. Without this a `void&` param lowers
+                    # to an (invalid) `void` argument, and any `T&` extern param to a by-value T.
+                    if extern_params[param_start.usize() + offset].provenance_bearing:
+                        extern_param_types.push(LLVMPointerTypeInContext(ctx, 0))
+                        declared_param_types.push(intern_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs))
+                    else:
+                        param_value_type: mutable ValueType = scalar_type_of_name(param_name)
+                        param_value_type <- ValueType{kind: TypeKind.CStr, bits: 0} if param_name == "cstr"
+                        # Opaque `extern TypeName` handles (LLVMModuleRef, …) are registered
+                        # as aliases of ptr/`cstr` — resolve them for extern params too.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            opaque_alias: i64 = alias_index_of(structs, param_name)
+                            param_value_type <- copied_type(structs.alias_types[opaque_alias.usize()]) if opaque_alias >= 0 else param_value_type
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            declined <- true
+                        else:
+                            extern_param_types.push(llvm_type_of(param_value_type, structs, ctx))
+                            declared_param_types.push(param_value_type)
+                false return if declined
+
+                llvm_return: LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
+                fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
+                if arity != 0:
+                    extern_pointer: void& = (&extern_param_types[0]).cast[void&] can Unsafe.PointerCast
+                    fn_type <- LLVMFunctionType(llvm_return, extern_pointer, arity, 1 if variadic else 0)
+                intrinsic_name: sview = extern_intrinsic_name(decorators, annotation_args)
+                handle: mutable LLVMValueRef = zeroed
+                if intrinsic_name != "":
+                    intrinsic_storage: mutable darray[u8] = []
+                    intrinsic_cstr: cstr = sview_to_cstr(intrinsic_name, intrinsic_storage)
+                    intrinsic_id: u32 = LLVMLookupIntrinsicID(intrinsic_cstr, sview_len(intrinsic_name))
+                    false return if intrinsic_id == 0
+                    intrinsic_pointer: mutable void&? = null
+                    if extern_param_types.count > 0:
+                        intrinsic_pointer <- (&extern_param_types[0]).cast[void&] can Unsafe.PointerCast
+                    handle <- LLVMGetIntrinsicDeclaration(m, intrinsic_id, intrinsic_pointer, extern_param_types.count)
+                else:
+                    name_storage: mutable darray[u8] = []
+                    extern_cstr: cstr = sview_to_cstr(linker_name, name_storage)
+                    handle <- LLVMAddFunction(m, extern_cstr, fn_type)
+                apply_function_decorators(handle, decorators, annotation_args, false, ctx)
+
+                fns.names <- fns.names.push(extern_name)
+                fns.lines <- fns.lines.push(extern_line)
+                fns.owners <- fns.owners.push("")
+                fns.needs_arena <- fns.needs_arena.push(false)
+                fns.arena_counts <- fns.arena_counts.push(0)
+                fns.needs_store <- fns.needs_store.push(false)
+                fns.is_error <- fns.is_error.push(false)
+                fns.is_variadic <- fns.is_variadic.push(variadic)
+                fns.handles <- fns.handles.push(handle)
+                fns.returns <- fns.returns.push(return_value_type)
+                fns.param_start <- fns.param_start.push(fns.param_types.count)
+                fns.param_count <- fns.param_count.push(arity.usize())
+                for parameter_index in 0..<declared_param_types.count |fns, extern_params, param_start|:
+                    fns.param_names <- fns.param_names.push(extern_params[param_start.usize() + parameter_index].name)
+                    fns.param_types <- fns.param_types.push(declared_param_types[parameter_index])
+                return true
+            return false
+
+
+        # Emit the body of an already-declared function. False = declined.
+        def emit_function_body(declaration: Decl, owner: sview, fn: LLVMValueRef, error_lines: darray[u32]&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                # From the ANNOTATION, not from `fns`: a generic TEMPLATE has no fns entry
+                # (only its instantiations do), and with bindings active the annotation
+                # already resolves `T` to this instantiation's concrete type.
+                # A MISSING return annotation means `void` — `def zero_buckets[K,T](…):` with
+                # no `-> T` is a void procedure (the std dict's zero-fill / place / clear
+                # helpers are all written this way). Only a PRESENT but unmodeled annotation
+                # declines.
+                return_value_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+                if return_type_opt is declared_return:
+                    return_value_type <- annotation_value_type(declared_return, structs)
+                false return if return_value_type.kind == TypeKind.Unmodeled
+                # `ensure` clauses and narrowing proofs are per-FUNCTION: drop the previous
+                # function's, or they would apply to a body that never asserted them.
+                while structs.pending_ensures.count > 0 |structs|:
+                    _ = structs.pending_ensures.pop()
+                clear_narrowings(structs)
+                entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
+                LLVMPositionBuilderAtEnd(builder, entry)
+
+                # This function's AUTO REGION — the first real piece of Elisa's region
+                # model here. stage0 gives every function one: an Arena alloca, zeroed,
+                # with strategy 0 (CHAINED), which
+                # backs any container the function builds and is arena_free'd on return.
+                local_runtime: mutable Runtime = copied_runtime(runtime)
+                local_runtime.disjoint_function_name <- function_name
+                local_runtime.disjoint_function_mask <- disjoint_function_mask(function_name, structs)
+                local_runtime.fast_math <- false
+                for decorator in decorators |local_runtime|:
+                    local_runtime.fast_math <- true if decorator.name == "fast_math"
+                if local_runtime.trace_enabled:
+                    trace_name_storage: mutable darray[u8] = []
+                    local_runtime.trace_name <- LLVMBuildGlobalStringPtr(builder, sview_to_cstr(function_name, trace_name_storage), "trace.function")
+                    _ = LLVMBuildCall2(builder, local_runtime.trace_fault_install_type, local_runtime.trace_fault_install, null, 0, "")
+                # A function taking a growable container by reference grows the CALLER's
+                # region, handed over as the implicit trailing parameter, rather than its
+                # own: the container's backing outlives this call, so allocating it from a
+                # region freed at return would hand the caller freed memory.
+                # An error fn's out-param is LLVM param 0; declared params (and the arena)
+                # shift past it by one.
+                fn_is_error: bool = line_is_error_returning(error_lines, function_line_of(declaration))
+                error_param_offset: u32 = 1 if fn_is_error else 0
+                if fn_is_error:
+                    local_runtime.error_out <- LLVMGetParam(fn, 0)
+                    local_runtime.in_error_fn <- true
+                ast_store_needed: bool = function_needs_store_for_declaration(declaration, fns)
+                signature_wants_arena: bool = signature_needs_arena(params, return_value_type, structs)
+                arena_count: usize = frontend_arena_count(owner, function_name, signature_wants_arena, ast_store_needed)
+                threads_arena: bool = arena_count > 0
+                if threads_arena:
+                    local_runtime.arena <- LLVMGetParam(fn, params.count.u32() + error_param_offset)
+                    local_runtime.owns_arena <- false
+                else:
+                    arena_type: LLVMTypeRef = arena_llvm_type(ctx)
+                    arena_slot: LLVMValueRef = LLVMBuildAlloca(builder, arena_type, "auto.region")
+                    _ = LLVMBuildStore(builder, LLVMConstNull(arena_type), arena_slot)
+                    strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, arena_type, arena_slot, 3, "region.strategy")
+                    _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), strategy_pointer)
+                    local_runtime.arena <- arena_slot
+                if ast_store_needed:
+                    store_parameter_index: u32 = params.count.u32() + error_param_offset + (1 if threads_arena else 0)
+                    local_runtime.active_store <- LLVMGetParam(fn, store_parameter_index)
+                    # The AST hierarchy is a single compiler-internal store rooted at
+                    # `Node`. Use the actual registered root index so constructors and
+                    # matches in Parser/Backend bodies can validate the hidden store ABI.
+                    local_runtime.active_store_enum <- packed_index_of(structs, "Node")
+                # Stage0's executable entry point is deliberately store-free in its public
+                # signature, but it creates the compiler AST store before calling the
+                # frontend.  The frontend wrappers receive that value as their hidden store
+                # context.  Without this entry initialization, stage1 passes a null store
+                # into `frontend_parser_parse_file`; parsing can appear to work until the
+                # first nested AST handle is resolved, at which point the AoS index is
+                # interpreted against an uninitialized store and eventually goes out of
+                # range.
+                # ...only when `Node` is the compiler's own AST ROOT (the reserved,
+                # variant-less header). A program that declares its own `packed enum Node:`
+                # got a free active store here, so its constructor emitted where stage0
+                # rejects it ("requires an active in Node.Store: scope").
+                if owner == "" and function_name == "main" and packed_is_ast_root(structs, packed_index_of(structs, "Node")):
+                    root_index: i64 = packed_index_of(structs, "Node")
+                    false return if root_index < 0
+                    row_bytes: i64 = packed_row_bytes(structs, root_index)
+                    state_args: mutable darray[LLVMValueRef] = [local_runtime.arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), row_bytes.u64(), 0)]
+                    state_pointer: void& = (&state_args[0]).cast[void&] can Unsafe.PointerCast
+                    state: LLVMValueRef = LLVMBuildCall2(builder, local_runtime.packed_state_new_type, local_runtime.packed_state_new, state_pointer, 2, "main.packed.store.state")
+                    store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: root_index.u32()}
+                    store_llvm: LLVMTypeRef = llvm_type_of(store_type, structs, ctx)
+                    with_arena: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetUndef(store_llvm), local_runtime.arena, 0, "main.packed.store.arena")
+                    with_row: LLVMValueRef = LLVMBuildInsertValue(builder, with_arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), row_bytes.u64(), 0), 1, "main.packed.store.row_bytes")
+                    local_runtime.active_store <- LLVMBuildInsertValue(builder, with_row, state, 2, "main.packed.store")
+                    local_runtime.active_store_enum <- root_index
+
+                # Each parameter gets a slot too, so a parameter reads and assigns exactly
+                # like a local and emit_expression's Ident path needs no param special
+                # case. mem2reg removes the copy.
+                local_scope: mutable Scope = Scope{names: [], slots: [], types: [], pool_names: [], group_names: [], deferred: []}
+                loops: mutable LoopStack = LoopStack{exits: [], continues: []}
+                # The function's auto region is the outermost OWNED region — unless the arena
+                # is threaded in, in which case it is the CALLER's and nothing here frees it,
+                # so the stack stays empty.
+                regions: mutable RegionStack = RegionStack{arenas: []}
+                regions.arenas.push(local_runtime.arena) if not threads_arena
+                parameter_index: mutable u32 = error_param_offset
+                for parameter in params |local_scope, parameter_index, fn, ctx, builder|:
+                    parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
+                    name_storage: mutable darray[u8] = []
+                    slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(parameter_type, structs, ctx), sview_to_cstr(parameter.name, name_storage))
+                    _ = LLVMBuildStore(builder, LLVMGetParam(fn, parameter_index), slot)
+                    declare_local(local_scope, parameter.name, slot, parameter_type)
+                    source_parameter_index: u32 = parameter_index - error_param_offset
+                    if local_runtime.disjoint_function_mask != 0 and disjoint_numeric_darray_ref(parameter.type_expression, structs):
+                        bit: mutable u64 = 1
+                        for _ in 0..<source_parameter_index |bit|:
+                            bit <- bit * 2
+                        if (local_runtime.disjoint_function_mask / bit) % 2 == 1:
+                            local_runtime.disjoint_param_slots <- local_runtime.disjoint_param_slots.push(slot)
+                            local_runtime.disjoint_param_indices <- local_runtime.disjoint_param_indices.push(source_parameter_index)
+                    # DWARF argument numbers start at 1, and count DECLARED parameters --
+                    # the error out-param and the threaded arena are ABI additions the
+                    # source never named, so they are not numbered here.
+                    declare_debug_variable(parameter.name, slot, parameter_type, parameter_index + 1 - error_param_offset, line, fn, local_runtime, structs, ctx, builder)
+                    parameter_index <- parameter_index + 1
+
+                body_status: mutable EmitStatus = EmitStatus.Open
+                body_status <- emit_statements(body, return_value_type, local_scope, loops, regions, fns, structs, generics, local_runtime, m, ctx, builder)
+                false return if body_status == EmitStatus.Declined
+                # A `-> void` function may legitimately run off the end: close it with
+                # `ret void` (and free the region first, like any other return path). A
+                # value-returning function that falls through is NOT modeled — rather than
+                # invent a return value, decline; LLVM would reject the open block anyway.
+                if body_status == EmitStatus.Open:
+                    false return if return_value_type.kind != TypeKind.Void
+                    emit_region_free(local_runtime, builder)
+                    # A `void error[E]` fn that runs off the end succeeds — return the 0 code.
+                    if fn_is_error:
+                        _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0))
+                    else:
+                        _ = LLVMBuildRetVoid(builder)
+                    return true
+                return true
+            return false

@@ -1,0 +1,551 @@
+# Stage1 backend — parameter/function ATTRIBUTES: noalias, disjointness facts, branch hints.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        def add_parameter_attribute(fn: LLVMValueRef, index: u32, attr_name: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if attr_name == ""
+            name_storage: mutable darray[u8] = []
+            attr_cstr: cstr = sview_to_cstr(attr_name, name_storage)
+            kind: u32 = LLVMGetEnumAttributeKindForName(attr_cstr, sview_len(attr_name))
+            return if kind == 0
+            attribute: LLVMAttributeRef = LLVMCreateEnumAttribute(ctx, kind, 0)
+            LLVMAddAttributeAtIndex(fn, index, attribute)
+
+
+        def type_contains_token(expression: Expr, wanted: TokenKind) -> bool can[Abort.Panic]:
+            return match expression:
+                Expr.Unary(operator, operand, line): true if operator == wanted else type_contains_token(operand, wanted)
+                Expr.Binary(left, operator, right, line): type_contains_token(left, wanted) or type_contains_token(right, wanted)
+                Expr.Paren(inner, line): type_contains_token(inner, wanted)
+                Expr.Refinement(base, predicate, line): type_contains_token(base, wanted)
+                _: false
+
+
+        def noalias_pointee_eligible(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            false return if value_type.kind != TypeKind.Ref or ref_is_heap_ref(value_type, structs)
+            pointee: ValueType = ref_target_of(value_type, structs)
+            return is_numeric_type(pointee) or pointee.kind == TypeKind.DArray
+
+
+        # Stamp noalias only on the stage0-proven subset: plain mutable scalar or
+        # darray references. Struct, view, void, heap, and immutable references
+        # remain deliberately unannotated.
+        def apply_noalias_parameter_attributes(fn: LLVMValueRef, params: darray[Ast::ParamDecl], parameter_base: u32, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not noalias_mutable_refs_enabled()
+            parameter_index: mutable usize = 0
+            for parameter in params |parameter_index, fn, parameter_base, structs, ctx|:
+                parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
+                if parameter_type.kind == TypeKind.Ref and type_contains_token(parameter.type_expression, TokenKind.Mutable) and type_contains_token(parameter.type_expression, TokenKind.Ampersand) and noalias_pointee_eligible(parameter_type, structs):
+                    add_parameter_attribute(fn, parameter_base + parameter_index.u32(), "noalias", ctx)
+                parameter_index <- parameter_index + 1
+
+
+        # Conservative whole-program subset of stage0's disjoint-parameter proof. A function is
+        # stamped only when this file contains a direct call passing distinct address-of-ident
+        # arguments. Any missing or indirect call leaves it unstamped; this can lose an
+        # optimization, but cannot assert a false alias fact.
+        def disjoint_numeric_darray_ref(type_expression: Expr, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            value_type: ValueType = annotation_value_type(type_expression, structs)
+            if value_type.kind != TypeKind.Ref or ref_is_heap_ref(value_type, structs):
+                return false
+            pointee: ValueType = ref_target_of(value_type, structs)
+            return pointee.kind == TypeKind.DArray and is_numeric_type(darray_element_of(pointee, structs)) and type_contains_token(type_expression, TokenKind.Mutable) and type_contains_token(type_expression, TokenKind.Ampersand)
+
+
+        def disjoint_addr_ident(expression: Expr) -> sview can[Abort.Panic]:
+            if expression is Expr.Unary(operator, operand, line):
+                if operator == TokenKind.Ampersand and operand is Expr.Ident(name, ident_line):
+                    return name
+            return ""
+
+
+        def disjoint_expr_proves(expression: Expr, function_name: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            if expression is Expr.Call(callee, arguments, argument_names, line):
+                if not (callee is Expr.Ident(callee_name, callee_line) and callee_name == function_name):
+                    return false
+                names: mutable darray[sview] = []
+                for argument in arguments |names|:
+                    root: sview = disjoint_addr_ident(argument)
+                    if root != "":
+                        duplicate: mutable bool = false
+                        for known in names |duplicate, root|:
+                            duplicate <- true if known == root
+                        names.push(root) if not duplicate
+                return names.count >= 2
+            return false
+
+
+        def disjoint_name_present(names: darray[sview]&, wanted: sview) -> bool can[Abort.Panic]:
+            for name in names |wanted|:
+                true return if name == wanted
+            return false
+
+
+        def disjoint_fresh_initializer(expression: Expr) -> bool can[Abort.Panic]:
+            if expression is Expr.Array(elements, line):
+                return true
+            if expression is Expr.Call(callee, arguments, argument_names, line):
+                if callee is Expr.Ident(name, ident_line):
+                    return name == "clone"
+                if callee is Expr.Index(object, index, index_line):
+                    if object is Expr.Ident(name, object_line):
+                        return name == "clone"
+                if callee is Expr.IndexN(object, type_arguments, index_n_line):
+                    if object is Expr.Ident(name, object_line):
+                        return name == "clone"
+            if expression is Expr.IndexN(callee, arguments, line):
+                if callee is Expr.Ident(name, ident_line):
+                    return name == "clone"
+            return false
+
+
+        def disjoint_collect_fresh(statements: darray[Stmt], fresh: mutable darray[sview]&, dead: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for statement in statements |fresh, dead|:
+                if statement is Stmt.VarDecl(name, type_expression, value, line):
+                    if disjoint_fresh_initializer(value):
+                        fresh.push(name) if not disjoint_name_present(fresh, name)
+                    else:
+                        dead.push(name) if not disjoint_name_present(dead, name)
+                        if value is Expr.Ident(source, source_line):
+                            dead.push(source) if not disjoint_name_present(dead, source)
+                if statement is Stmt.Assign(target, operator, value, line):
+                    if target is Expr.Ident(target_name, target_line):
+                        dead.push(target_name) if not disjoint_name_present(dead, target_name)
+                    if value is Expr.Ident(source, source_line):
+                        dead.push(source) if not disjoint_name_present(dead, source)
+                if statement is Stmt.If(condition, then_body, else_body, line):
+                    disjoint_collect_fresh(then_body, fresh, dead)
+                    disjoint_collect_fresh(else_body, fresh, dead)
+                if statement is Stmt.While(condition, body, line):
+                    disjoint_collect_fresh(body, fresh, dead)
+                if statement is Stmt.For(bind, variables, iterable, body, line):
+                    disjoint_collect_fresh(body, fresh, dead)
+                if statement is Stmt.Block(kind, clause, binding, body, line):
+                    disjoint_collect_fresh(body, fresh, dead)
+                if statement is Stmt.Match(scrutinee, arms, line):
+                    for arm in arms |fresh, dead|:
+                        disjoint_collect_fresh(arm.body, fresh, dead)
+
+
+        def disjoint_expr_proves_fresh(expression: Expr, function_name: sview, fresh: darray[sview]&, dead: darray[sview]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            if not disjoint_expr_proves(expression, function_name):
+                return false
+            if expression is Expr.Call(callee, arguments, argument_names, line):
+                for argument in arguments |fresh, dead|:
+                    root: sview = disjoint_addr_ident(argument)
+                    if root == "" or not disjoint_name_present(fresh, root) or disjoint_name_present(dead, root):
+                        return false
+                return true
+            return false
+
+
+        def disjoint_mask_has(mask: u64, index: u32) -> bool can[Abort.Panic]:
+            bit: mutable u64 = 1
+            for _ in 0..<index |bit|:
+                bit <- bit * 2
+            return mask >= bit and (mask / bit) % 2 == 1
+
+
+        def disjoint_param_index(name: sview, parameters: darray[Ast::ParamDecl]&) -> i64 can[Abort.Panic]:
+            index: mutable i64 = 0
+            for parameter in parameters |name, index|:
+                if parameter.name == name:
+                    return index
+                index <- index + 1
+            return -1
+
+
+        def disjoint_call_proven(expression: Expr, candidate_name: sview, candidate_mask: u64, enclosing_name: sview, enclosing_params: darray[Ast::ParamDecl]&, fresh: darray[sview]&, dead: darray[sview]&, structs: StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            if expression is Expr.Call(callee, arguments, argument_names, line):
+                if not (callee is Expr.Ident(callee_name, callee_line) and callee_name == candidate_name):
+                    return false
+                parameter_index: mutable u32 = 0
+                for _ in 0..<64 |parameter_index|:
+                    continue if not disjoint_mask_has(candidate_mask, parameter_index)
+                    if arguments.count <= parameter_index.usize():
+                        return false
+                    left_root: sview = disjoint_addr_ident(arguments[parameter_index.usize()])
+                    if left_root == "":
+                        return false
+                    left_param: i64 = disjoint_param_index(left_root, enclosing_params)
+                    left_fresh: bool = disjoint_name_present(fresh, left_root) and not disjoint_name_present(dead, left_root)
+                    pair_index: mutable u32 = parameter_index + 1
+                    for _ in (parameter_index + 1)..<64 |pair_index|:
+                        continue if not disjoint_mask_has(candidate_mask, pair_index)
+                        if arguments.count <= pair_index.usize():
+                            return false
+                        right_root: sview = disjoint_addr_ident(arguments[pair_index.usize()])
+                        if right_root == "" or right_root == left_root:
+                            return false
+                        right_param: i64 = disjoint_param_index(right_root, enclosing_params)
+                        right_fresh: bool = disjoint_name_present(fresh, right_root) and not disjoint_name_present(dead, right_root)
+                        base: bool = left_fresh and right_fresh
+                        depend: bool = left_param >= 0 and right_param >= 0 and disjoint_mask_has(disjoint_function_mask(enclosing_name, structs), left_param.u32()) and disjoint_mask_has(disjoint_function_mask(enclosing_name, structs), right_param.u32())
+                        if not base and not depend:
+                            return false
+                        pair_index <- pair_index + 1
+                    parameter_index <- parameter_index + 1
+                return true
+            return false
+
+
+        def disjoint_scan_expr(expression: Expr, candidate_name: sview, candidate_mask: u64, enclosing_name: sview, enclosing_params: darray[Ast::ParamDecl]&, fresh: darray[sview]&, dead: darray[sview]&, structs: StructTable&, seen: mutable bool&, bad: mutable bool&) -> void can[Abort.Panic, Memory.Allocate]:
+            if expression is Expr.Call(callee, arguments, argument_names, line):
+                if callee is Expr.Ident(callee_name, callee_line) and callee_name == candidate_name:
+                    seen <- true
+                    bad <- true if not disjoint_call_proven(expression, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs)
+                else:
+                    disjoint_scan_expr(callee, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                for argument in arguments |candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad|:
+                    disjoint_scan_expr(argument, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                return
+            if expression is Expr.Ident(name, line):
+                bad <- true if name == candidate_name
+                return
+            if expression is Expr.Binary(left, operator, right, line):
+                disjoint_scan_expr(left, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                disjoint_scan_expr(right, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+            if expression is Expr.Unary(operator, operand, line) or expression is Expr.Move(operand, line) or expression is Expr.Paren(operand, line):
+                disjoint_scan_expr(operand, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+            if expression is Expr.Field(object, field, line) or expression is Expr.Scope(object, field, line):
+                disjoint_scan_expr(object, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+            if expression is Expr.Index(object, index, line):
+                disjoint_scan_expr(object, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                disjoint_scan_expr(index, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+            if expression is Expr.IndexN(object, arguments, line):
+                disjoint_scan_expr(object, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                for argument in arguments |candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad|:
+                    disjoint_scan_expr(argument, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+            if expression is Expr.If(condition, then_expr, else_expr, line):
+                disjoint_scan_expr(condition, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                disjoint_scan_expr(then_expr, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                disjoint_scan_expr(else_expr, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+            if expression is Expr.Paren(inner, line):
+                disjoint_scan_expr(inner, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+
+
+        def disjoint_scan_statements(statements: darray[Stmt], candidate_name: sview, candidate_mask: u64, enclosing_name: sview, enclosing_params: darray[Ast::ParamDecl]&, fresh: darray[sview]&, dead: darray[sview]&, structs: StructTable&, seen: mutable bool&, bad: mutable bool&) -> void can[Abort.Panic, Memory.Allocate]:
+            for statement in statements |candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad|:
+                if statement is Stmt.Expr(expression, line):
+                    disjoint_scan_expr(expression, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.VarDecl(name, type_expression, value, line):
+                    disjoint_scan_expr(value, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.Assign(target, operator, value, line):
+                    disjoint_scan_expr(target, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                    disjoint_scan_expr(value, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.Return(value, line):
+                    if value is returned:
+                        disjoint_scan_expr(returned, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.If(condition, then_body, else_body, line):
+                    disjoint_scan_expr(condition, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                    disjoint_scan_statements(then_body, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                    disjoint_scan_statements(else_body, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.While(condition, body, line):
+                    disjoint_scan_expr(condition, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                    disjoint_scan_statements(body, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.For(bind, variables, iterable, body, line):
+                    disjoint_scan_expr(iterable, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                    disjoint_scan_statements(body, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.Block(kind, clause, binding, body, line):
+                    disjoint_scan_statements(body, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.Match(scrutinee, arms, line):
+                    disjoint_scan_expr(scrutinee, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                    for arm in arms |candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad|:
+                        disjoint_scan_statements(arm.body, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+                if statement is Stmt.Contract(kind, expression, line):
+                    disjoint_scan_expr(expression, candidate_name, candidate_mask, enclosing_name, enclosing_params, fresh, dead, structs, seen, bad)
+
+
+        def disjoint_scan_declarations(declarations: darray[Decl]&, candidate_name: sview, candidate_mask: u64, structs: StructTable&, seen: mutable bool&, bad: mutable bool&) -> void can[Abort.Panic, Memory.Allocate]:
+            for declaration in declarations |candidate_name, candidate_mask, structs, seen, bad|:
+                if declaration is Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                    fresh: mutable darray[sview] = []
+                    dead: mutable darray[sview] = []
+                    disjoint_collect_fresh(body, fresh, dead)
+                    disjoint_scan_statements(body, candidate_name, candidate_mask, function_name, parameters, fresh, dead, structs, seen, bad)
+                if declaration is Decl.Module(module_name, body, line):
+                    disjoint_scan_declarations(body, candidate_name, candidate_mask, structs, seen, bad)
+                if declaration is Decl.Scoped(body, line):
+                    disjoint_scan_declarations(body, candidate_name, candidate_mask, structs, seen, bad)
+
+
+        def disjoint_collect_candidates(declarations: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for declaration in declarations |structs|:
+                if declaration is Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                    eligible_count: mutable u32 = 0
+                    mask: mutable u64 = 0
+                    parameter_index: mutable u32 = 0
+                    for parameter in parameters |eligible_count, mask, parameter_index, structs|:
+                        if disjoint_numeric_darray_ref(parameter.type_expression, structs):
+                            eligible_count <- eligible_count + 1
+                            bit: mutable u64 = 1
+                            for _ in 0..<parameter_index |bit|:
+                                bit <- bit * 2
+                            mask <- mask + bit
+                        parameter_index <- parameter_index + 1
+                    if eligible_count >= 2:
+                        duplicate_index: mutable i64 = -1
+                        for existing in 0..<structs.disjoint_function_names.count |duplicate_index, function_name, structs|:
+                            if structs.disjoint_function_names[existing] == function_name:
+                                duplicate_index <- existing.i64()
+                        if duplicate_index >= 0:
+                            structs.disjoint_candidate_masks[duplicate_index.usize()] <- 0
+                            structs.disjoint_function_masks[duplicate_index.usize()] <- 0
+                        else:
+                            structs.disjoint_function_names <- structs.disjoint_function_names.push(function_name)
+                            structs.disjoint_candidate_masks <- structs.disjoint_candidate_masks.push(mask)
+                            structs.disjoint_function_masks <- structs.disjoint_function_masks.push(0)
+                if declaration is Decl.Module(module_name, body, line):
+                    disjoint_collect_candidates(body, structs)
+                if declaration is Decl.Scoped(body, line):
+                    disjoint_collect_candidates(body, structs)
+
+
+        def disjoint_finalize_facts(declarations: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            changed: mutable bool = true
+            rounds: mutable u32 = 0
+            while changed and rounds < structs.disjoint_function_names.count.u32() + 1 |changed, rounds, structs|:
+                changed <- false
+                for index in 0..<structs.disjoint_function_names.count |index, declarations, structs, changed|:
+                    seen: mutable bool = false
+                    bad: mutable bool = false
+                    candidate_mask: u64 = structs.disjoint_candidate_masks[index]
+                    disjoint_scan_declarations(declarations, structs.disjoint_function_names[index], candidate_mask, structs, seen, bad)
+                    desired: u64 = candidate_mask if seen and not bad else 0
+                    if structs.disjoint_function_masks[index] != desired:
+                        structs.disjoint_function_masks[index] <- desired
+                        changed <- true
+                rounds <- rounds + 1
+
+
+        def disjoint_statements_prove(statements: darray[Stmt], function_name: sview, fresh: darray[sview]&, dead: darray[sview]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            for statement in statements:
+                if statement is Stmt.Expr(expression, line):
+                    true return if disjoint_expr_proves_fresh(expression, function_name, fresh, dead)
+                if statement is Stmt.VarDecl(name, type_expression, value, line):
+                    true return if disjoint_expr_proves_fresh(value, function_name, fresh, dead)
+                if statement is Stmt.Assign(target, operator, value, line):
+                    true return if disjoint_expr_proves_fresh(value, function_name, fresh, dead)
+                if statement is Stmt.Return(value, line):
+                    true return if value is returned and disjoint_expr_proves_fresh(returned, function_name, fresh, dead)
+                if statement is Stmt.If(condition, then_body, else_body, line):
+                    true return if disjoint_statements_prove(then_body, function_name, fresh, dead)
+                    true return if disjoint_statements_prove(else_body, function_name, fresh, dead)
+                if statement is Stmt.While(condition, body, line):
+                    true return if disjoint_statements_prove(body, function_name, fresh, dead)
+                if statement is Stmt.For(bind, variables, iterable, body, line):
+                    true return if disjoint_statements_prove(body, function_name, fresh, dead)
+                if statement is Stmt.Block(kind, clause, binding, body, line):
+                    true return if disjoint_statements_prove(body, function_name, fresh, dead)
+                if statement is Stmt.Match(scrutinee, arms, line):
+                    for arm in arms |function_name|:
+                        true return if disjoint_statements_prove(arm.body, function_name, fresh, dead)
+            return false
+
+
+        def disjoint_declarations_prove(declarations: darray[Decl], function_name: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            for declaration in declarations:
+                if declaration is Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                    fresh: mutable darray[sview] = []
+                    dead: mutable darray[sview] = []
+                    disjoint_collect_fresh(body, fresh, dead)
+                    true return if disjoint_statements_prove(body, function_name, fresh, dead)
+                if declaration is Decl.Module(name, body, line):
+                    true return if disjoint_declarations_prove(body, function_name)
+                if declaration is Decl.Scoped(body, line):
+                    true return if disjoint_declarations_prove(body, function_name)
+            return false
+
+
+        def register_disjoint_facts(declarations: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            disjoint_collect_candidates(declarations, structs)
+            disjoint_finalize_facts(declarations, structs)
+
+
+        def disjoint_function_mask(function_name: sview, structs: StructTable&) -> u64 can[Abort.Panic]:
+            for index in 0..<structs.disjoint_function_names.count |function_name, structs|:
+                if structs.disjoint_function_names[index] == function_name:
+                    return structs.disjoint_function_masks[index]
+            return 0
+
+
+        def disjoint_scope_name(index: u32) -> sview:
+            if index == 0:
+                return "elt.p0"
+            if index == 1:
+                return "elt.p1"
+            if index == 2:
+                return "elt.p2"
+            if index == 3:
+                return "elt.p3"
+            if index == 4:
+                return "elt.p4"
+            if index == 5:
+                return "elt.p5"
+            if index == 6:
+                return "elt.p6"
+            if index == 7:
+                return "elt.p7"
+            if index == 8:
+                return "elt.p8"
+            if index == 9:
+                return "elt.p9"
+            if index == 10:
+                return "elt.p10"
+            if index == 11:
+                return "elt.p11"
+            if index == 12:
+                return "elt.p12"
+            if index == 13:
+                return "elt.p13"
+            if index == 14:
+                return "elt.p14"
+            if index == 15:
+                return "elt.p15"
+            return "elt.p0"
+
+
+        def disjoint_param_index_for_pointer(pointer: LLVMValueRef, runtime: Runtime&) -> i64 can[Abort.Panic]:
+            for index in 0..<runtime.disjoint_param_slots.count |runtime, pointer|:
+                slot: LLVMValueRef = runtime.disjoint_param_slots[index]
+                current: mutable LLVMValueRef = pointer
+                for _ in 0..<8 |current, slot|:
+                    if current == slot:
+                        return runtime.disjoint_param_indices[index].i64()
+                    if current == zeroed:
+                        break
+                    if LLVMGetNumOperands(current) == 0:
+                        break
+                    current <- LLVMGetOperand(current, 0)
+            return -1
+
+
+        def remember_disjoint_element_pointer(pointer: LLVMValueRef, runtime: mutable Runtime&, parameter_index: u32) -> void can[Abort.Panic, Memory.Allocate]:
+            runtime.disjoint_element_ptrs <- runtime.disjoint_element_ptrs.push(pointer)
+            runtime.disjoint_element_indices <- runtime.disjoint_element_indices.push(parameter_index)
+
+
+        def disjoint_element_index_for_pointer(pointer: LLVMValueRef, runtime: Runtime&) -> i64 can[Abort.Panic]:
+            for index in 0..<runtime.disjoint_element_ptrs.count |runtime, pointer|:
+                if runtime.disjoint_element_ptrs[index] == pointer:
+                    return runtime.disjoint_element_indices[index].i64()
+            return disjoint_param_index_for_pointer(pointer, runtime)
+
+
+        def set_metadata_list(inst: LLVMValueRef, kind_name: cstr, kind_length: u32, metadata: darray[LLVMMetadataRef], ctx: LLVMContextRef) -> void can[Abort.Panic, Unsafe.PointerCast]:
+            return if inst == zeroed or metadata.count == 0
+            pointer: void& = (&metadata[0]).cast[void&] can Unsafe.PointerCast
+            node: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, pointer, metadata.count)
+            LLVMSetMetadata(inst, LLVMGetMDKindIDInContext(ctx, kind_name, kind_length), LLVMMetadataAsValue(ctx, node))
+
+
+        # Combine the shared darray header/element domain with the per-function
+        # disjoint-parameter domain. LLVM permits only one attachment per metadata kind,
+        # so setting either domain separately would silently discard the other.
+        def tag_disjoint_darray_access(inst: LLVMValueRef, pointer: LLVMValueRef, runtime: Runtime&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not noalias_mutable_refs_enabled()
+            parameter_index: i64 = disjoint_element_index_for_pointer(pointer, runtime)
+            return if parameter_index < 0
+            return if runtime.disjoint_function_mask == 0
+            domain_storage: mutable darray[u8] = []
+            domain_storage.extend("elisa.disjoint.")
+            domain_storage.extend(runtime.disjoint_function_name)
+            domain_storage.extend(".aa")
+            domain_storage.push(0)
+            domain: cstr = (&domain_storage[0]).cast[cstr] can Unsafe.PointerCast
+            one: usize = 1
+            two: usize = 2
+            three: usize = 3
+            domain_length: usize = domain_storage.count - one
+            domain_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, domain, domain_length)
+            domain_ops: mutable darray[LLVMMetadataRef] = [domain_string]
+            domain_pointer: void& = (&domain_ops[0]).cast[void&] can Unsafe.PointerCast
+            domain_md: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, domain_pointer, one)
+            own_name: sview = disjoint_scope_name(parameter_index.u32())
+            own_storage: mutable darray[u8] = []
+            own_storage.extend(own_name)
+            own_storage.push(0)
+            own_length: usize = own_storage.count - one
+            own_cstr: cstr = (&own_storage[0]).cast[cstr] can Unsafe.PointerCast
+            own_md_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, own_cstr, own_length)
+            own_ops: mutable darray[LLVMMetadataRef] = [own_md_string, domain_md]
+            own_pointer: void& = (&own_ops[0]).cast[void&] can Unsafe.PointerCast
+            own_scope: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, own_pointer, two)
+            darray_domain_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "elisa.darray.aa", 15.usize())
+            darray_domain_ops: mutable darray[LLVMMetadataRef] = [darray_domain_string]
+            darray_domain_pointer: void& = (&darray_domain_ops[0]).cast[void&] can Unsafe.PointerCast
+            darray_domain: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, darray_domain_pointer, one)
+            darray_elt_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "elt", three)
+            darray_elt_ops: mutable darray[LLVMMetadataRef] = [darray_elt_string, darray_domain]
+            darray_elt_pointer: void& = (&darray_elt_ops[0]).cast[void&] can Unsafe.PointerCast
+            darray_elt_scope: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, darray_elt_pointer, two)
+            alias_scopes: mutable darray[LLVMMetadataRef] = [darray_elt_scope, own_scope]
+            noalias_scopes: mutable darray[LLVMMetadataRef] = []
+            darray_hdr_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "hdr", three)
+            darray_hdr_ops: mutable darray[LLVMMetadataRef] = [darray_hdr_string, darray_domain]
+            darray_hdr_pointer: void& = (&darray_hdr_ops[0]).cast[void&] can Unsafe.PointerCast
+            darray_hdr_scope: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, darray_hdr_pointer, two)
+            noalias_scopes <- noalias_scopes.push(darray_hdr_scope)
+            sibling_bit: mutable u64 = 1
+            for sibling in 0..<64 |runtime, parameter_index, noalias_scopes, domain_md, sibling_bit|:
+                if runtime.disjoint_function_mask >= sibling_bit and (runtime.disjoint_function_mask / sibling_bit) % 2 == 1 and sibling != parameter_index:
+                    sibling_name: sview = disjoint_scope_name(sibling.u32())
+                    sibling_storage: mutable darray[u8] = []
+                    sibling_storage.extend(sibling_name)
+                    sibling_storage.push(0)
+                    sibling_length: usize = sibling_storage.count - one
+                    sibling_cstr: cstr = (&sibling_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    sibling_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, sibling_cstr, sibling_length)
+                    sibling_ops: mutable darray[LLVMMetadataRef] = [sibling_string, domain_md]
+                    sibling_pointer: void& = (&sibling_ops[0]).cast[void&] can Unsafe.PointerCast
+                    sibling_scope: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, sibling_pointer, two)
+                    noalias_scopes <- noalias_scopes.push(sibling_scope)
+                sibling_bit <- sibling_bit * 2
+            set_metadata_list(inst, "alias.scope", 11, alias_scopes, ctx)
+            set_metadata_list(inst, "noalias", 7, noalias_scopes, ctx)
+
+
+        def tag_darray_header_access(inst: LLVMValueRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Unsafe.PointerCast]:
+            return if inst == zeroed
+            one: usize = 1
+            two: usize = 2
+            three: usize = 3
+            domain_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "elisa.darray.aa", 15.usize())
+            domain_ops: mutable darray[LLVMMetadataRef] = [domain_string]
+            domain_pointer: void& = (&domain_ops[0]).cast[void&] can Unsafe.PointerCast
+            domain: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, domain_pointer, one)
+            own_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "hdr", three)
+            own_ops: mutable darray[LLVMMetadataRef] = [own_string, domain]
+            own_pointer: void& = (&own_ops[0]).cast[void&] can Unsafe.PointerCast
+            own: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, own_pointer, two)
+            sibling_string: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "elt", three)
+            sibling_ops: mutable darray[LLVMMetadataRef] = [sibling_string, domain]
+            sibling_pointer: void& = (&sibling_ops[0]).cast[void&] can Unsafe.PointerCast
+            sibling: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, sibling_pointer, two)
+            alias_metadata: mutable darray[LLVMMetadataRef] = [own]
+            noalias_metadata: mutable darray[LLVMMetadataRef] = [sibling]
+            set_metadata_list(inst, "alias.scope", 11, alias_metadata, ctx)
+            set_metadata_list(inst, "noalias", 7, noalias_metadata, ctx)
+
+
+        def finish_float_instruction(value: LLVMValueRef, fast_math: bool) -> LLVMValueRef:
+            LLVMSetFastMathFlags(value, 127) if fast_math
+            return value
+
+
+        def add_function_string_attribute(fn: LLVMValueRef, key: sview, value: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if key == "" or value == ""
+            key_storage: mutable darray[u8] = []
+            value_storage: mutable darray[u8] = []
+            key_cstr: cstr = sview_to_cstr(key, key_storage)
+            value_cstr: cstr = sview_to_cstr(value, value_storage)
+            attribute: LLVMAttributeRef = LLVMCreateStringAttribute(ctx, key_cstr, sview_len(key).u32(), value_cstr, sview_len(value).u32())
+            LLVMAddAttributeAtIndex(fn, 4294967295, attribute)
+
+
+        def branch_hint_for(structs: StructTable&, line: u32) -> sview can[Abort.Panic]:
+            for index in 0..<structs.branch_hint_lines.count |structs, line|:
+                if structs.branch_hint_lines[index] == line:
+                    return structs.branch_hint_kinds[index]
+            return ""

@@ -1,0 +1,543 @@
+# Stage1 backend — DWARF debug info and module-level declaration selection.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    public:
+        # DWARF. Debug info is built DURING emission and only lands in the OBJECT file --
+        # stage0's own `-emit llvm -g` shows none of it -- so the oracle for this is dwarfdump
+        # on the emitted object, not an IR diff.
+        #
+        # Scope: a compile unit plus one DISubprogram per function, which is what makes lldb
+        # able to name a frame. Per-line locations and variable info (DILocalVariable,
+        # dbg.declare) are NOT emitted: they need a source position on every statement, which
+        # the emitter does not thread today. So a backtrace names functions but has no line
+        # numbers -- honest about what it gives rather than half-emitting a wrong line table.
+        #
+        # The DWARF base type for an annotation. A type the backend does not model as a
+        # scalar (a container, a struct, a ref) becomes a pointer-width unsigned word rather
+        # than being dropped: an approximate type keeps the parameter VISIBLE in the
+        # debugger, where a null metadata slot would silently delete it from the signature.
+        #
+        # DW_ATE codes: 2 boolean, 4 float, 5 signed, 7 unsigned.
+        def debug_basic_type(value_type: ValueType, dib: LLVMDIBuilderRef) -> LLVMMetadataRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if value_type.kind == TypeKind.Bool:
+                return LLVMDIBuilderCreateBasicType(dib, "bool", 4, 8, 2, 0)
+            if value_type.kind == TypeKind.Float:
+                float_bits: u64 = value_type.bits.u64() if value_type.bits > 0 else 64
+                return LLVMDIBuilderCreateBasicType(dib, "f64", 3, float_bits, 4, 0) if float_bits == 64 else LLVMDIBuilderCreateBasicType(dib, "f32", 3, float_bits, 4, 0)
+            if value_type.kind == TypeKind.Signed:
+                signed_bits: u64 = value_type.bits.u64() if value_type.bits > 0 else 64
+                return LLVMDIBuilderCreateBasicType(dib, "i64", 3, signed_bits, 5, 0)
+            if value_type.kind == TypeKind.Unsigned:
+                unsigned_bits: u64 = value_type.bits.u64() if value_type.bits > 0 else 64
+                return LLVMDIBuilderCreateBasicType(dib, "u64", 3, unsigned_bits, 7, 0)
+            return LLVMDIBuilderCreateBasicType(dib, "word", 4, 64, 7, 0)
+
+
+        # As above, from a type ANNOTATION. A missing annotation is `void`, which DWARF
+        # spells as a null type in slot 0 of the subroutine type -- but a null here would
+        # also drop a PARAMETER, so callers pass only real annotations for those.
+        def debug_type_of_annotation(annotation: Expr?, dib: LLVMDIBuilderRef, structs: mutable StructTable&) -> LLVMMetadataRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if annotation is declared:
+                return debug_basic_type(annotation_value_type(declared, structs), dib)
+            return LLVMDIBuilderCreateBasicType(dib, "void", 4, 0, 7, 0)
+
+
+        # Attach a DWARF variable to its storage. `arg_no` > 0 makes it a formal PARAMETER
+        # (DW_TAG_formal_parameter); 0 makes it a local (DW_TAG_variable). Without the
+        # DECLARE record the variable metadata is created and then dropped -- the DIE never
+        # reaches the object.
+        def declare_debug_variable(name: sview, slot: LLVMValueRef, value_type: ValueType, arg_no: u32, line: u32, fn: LLVMValueRef, runtime: Runtime&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not runtime.debug_active
+            subprogram: LLVMMetadataRef = LLVMGetSubprogram(fn)
+            variable_storage: mutable darray[u8] = []
+            variable_name: cstr = sview_to_cstr(name, variable_storage)
+            variable_type: LLVMMetadataRef = debug_basic_type(value_type, runtime.debug_builder)
+            variable: mutable LLVMMetadataRef = zeroed
+            if arg_no > 0:
+                variable <- LLVMDIBuilderCreateParameterVariable(runtime.debug_builder, subprogram, variable_name, sview_len(name), arg_no, runtime.debug_file, line, variable_type, 1, 0)
+            else:
+                variable <- LLVMDIBuilderCreateAutoVariable(runtime.debug_builder, subprogram, variable_name, sview_len(name), runtime.debug_file, line, variable_type, 1, 0, 0)
+            empty_expression: LLVMMetadataRef = LLVMDIBuilderCreateExpression(runtime.debug_builder, null, 0)
+            location: LLVMMetadataRef = LLVMDIBuilderCreateDebugLocation(ctx, line, 0, subprogram, null)
+            _ = LLVMDIBuilderInsertDeclareRecordAtEnd(runtime.debug_builder, slot, variable, empty_expression, location, LLVMGetInsertBlock(builder))
+
+
+        # `-g` off costs nothing: the builder is never created and no flags are set.
+        def emit_debug_info(file: Ast::File&, top: darray[Decl]&, m: LLVMModuleRef, fns: FnTable&, structs: mutable StructTable&, runtime: mutable Runtime&, source_name: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # LLVM emits NO DWARF unless these module flags are present -- and it does not
+            # warn if they are missing, it just silently drops the debug info.
+            # 1 = LLVMModuleFlagBehaviorWarning, matching stage0.
+            version_value: LLVMMetadataRef = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ctx), 3, 0))
+            LLVMAddModuleFlag(m, 1, "Debug Info Version", 18, version_value)
+            dwarf_value: LLVMMetadataRef = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ctx), 4, 0))
+            LLVMAddModuleFlag(m, 1, "Dwarf Version", 13, dwarf_value)
+
+            builder: LLVMDIBuilderRef = LLVMCreateDIBuilder(m)
+            name_storage: mutable darray[u8] = []
+            file_name: cstr = sview_to_cstr(source_name, name_storage)
+            di_file: LLVMMetadataRef = LLVMDIBuilderCreateFile(builder, file_name, sview_len(source_name), ".", 1)
+            # LLVMDWARFSourceLanguageC99 = **11**, LLVMDWARFEmissionFull = 1 — stage0's
+            # choices. Counted out of DebugInfo.h, not guessed: 12 is Ada95, and passing it
+            # produced a perfectly valid compile unit that claimed the language was Ada.
+            # Nothing errors on a wrong enum here; only dwarfdump shows it.
+            unit: LLVMMetadataRef = LLVMDIBuilderCreateCompileUnit(builder, 11, di_file, "elisacore", 9, 0, "", 0, 0, "", 0, 1, 0, 0, 0, "", 0, "", 0)
+
+            for declaration in top |builder, di_file, unit, fns, structs|:
+                if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                    handle_index: mutable i64 = function_index_of_arity(fns, "", function_name, params.count)
+                    handle_index <- function_index_of(fns, "", function_name) if handle_index < 0
+                    continue if handle_index < 0
+                    # The subroutine TYPE, index 0 being the return type and the rest the
+                    # parameters -- DWARF's own ordering. Emitting it means a debugger shows
+                    # `add(a: i64, b: i64) -> i64` instead of a signature-less symbol, and it
+                    # is what puts DW_TAG_base_type entries in the object at all.
+                    signature_types: mutable darray[LLVMMetadataRef] = []
+                    signature_types.push(debug_type_of_annotation(return_type_opt, builder, structs))
+                    for parameter in params |signature_types, builder, structs|:
+                        signature_types.push(debug_basic_type(parameter_value_type(parameter.type_expression, structs), builder))
+                    signature_pointer: void& = (&signature_types[0]).cast[void&] can Unsafe.PointerCast
+                    subroutine: LLVMMetadataRef = LLVMDIBuilderCreateSubroutineType(builder, di_file, signature_pointer, signature_types.count.u32(), 0)
+                    subprogram_storage: mutable darray[u8] = []
+                    subprogram_name: cstr = sview_to_cstr(function_name, subprogram_storage)
+                    # isLocalToUnit=0, isDefinition=1, scopeLine=line, flags=0, isOptimized=0.
+                    subprogram: LLVMMetadataRef = LLVMDIBuilderCreateFunction(builder, unit, subprogram_name, sview_len(function_name), subprogram_name, sview_len(function_name), di_file, line, subroutine, 0, 1, line, 0, 0)
+                    LLVMSetSubprogram(fns.handles[handle_index.usize()], subprogram)
+
+            # Handed to the emitter so each alloca can attach its variable. Finalize runs
+            # after the bodies, once those declares exist.
+            runtime.debug_builder <- builder
+            runtime.debug_file <- di_file
+            runtime.debug_active <- true
+
+
+        # Does this MDNode's operand 0 spell `name`?
+        def md_property_is(property: LLVMValueRef, name: sview) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # `is` binds when the value is PRESENT, so this reads "not an MDNode -> false".
+            # Writing `false return if ... is node` inverts it and rejects every real node --
+            # which is exactly the bug that made this verifier silently never warn.
+            false return if not (LLVMIsAMDNode(property) is md_node)
+            false return if LLVMGetMDNodeNumOperands(property) == 0
+            operands: mutable darray[LLVMValueRef] = [zeroed for _ in 0..<LLVMGetMDNodeNumOperands(property).usize()]
+            LLVMGetMDNodeOperands(property, (&operands[0]).cast[void&] can Unsafe.PointerCast)
+            length: mutable u32 = 0
+            if LLVMGetMDString(operands[0], (&length).cast[void&] can Unsafe.PointerCast) is text_pointer:
+                # The postfix `can` grant does not parse inside an argument list; bind first.
+                text: cstr = text_pointer.cast[cstr] can Unsafe.PointerCast
+                return cstr_matches(text, length.usize(), name)
+            return false
+
+
+        # Compare an MDString's (pointer, length) against an sview.
+        #
+        # Via the `sview(ptr, start, end)` constructor rather than hand-rolled pointer
+        # arithmetic: my first cut wrote `(&bytes)[index]` on a `u8&`, which takes the address
+        # of the LOCAL holding the reference and indexes THAT -- reading unrelated stack and
+        # segfaulting. A reference is not an array.
+        def cstr_matches(text: cstr, length: usize, name: sview) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            false return if length != sview_len(name)
+            bytes: u8&? = text.cast[u8&?] can Unsafe.PointerCast
+            return sview(bytes, 0, length.i64()) == name
+
+
+        # After the pass pipeline: report every loop marked `elisa.autovec.expected` that did
+        # NOT come out vectorized. This is `-Wperf`.
+        #
+        # It has to run AFTER the passes -- the judgement IS "the vectorizer saw this loop and
+        # declined". LLVM adds `llvm.loop.isvectorized` to the loop's metadata when it
+        # succeeds; our marker riding in the same node is what ties the verdict back to the
+        # comprehension that asked for it.
+        #
+        # Returns the number of unvectorized marked loops.
+        def verify_autovec_expectations(m: LLVMModuleRef, ctx: LLVMContextRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            kind: u32 = LLVMGetMDKindIDInContext(ctx, "llvm.loop", 9)
+            warnings: mutable i64 = 0
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(m)
+            while function_opt is function |warnings, kind, function_opt|:
+                block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_opt is block |warnings, kind, block_opt|:
+                    if LLVMGetBasicBlockTerminator(block) is terminator:
+                        if LLVMGetMetadata(terminator, kind) is loop_md:
+                            marked: mutable bool = false
+                            vectorized: mutable bool = false
+                            count: u32 = LLVMGetMDNodeNumOperands(loop_md)
+                            if count > 1:
+                                loop_ops: mutable darray[LLVMValueRef] = [zeroed for _ in 0..<count.usize()]
+                                LLVMGetMDNodeOperands(loop_md, (&loop_ops[0]).cast[void&] can Unsafe.PointerCast)
+                                # Operand 0 is the node's self-reference; the properties follow.
+                                for index in 1..<count.usize() |marked, vectorized, loop_ops|:
+                                    marked <- true if md_property_is(loop_ops[index], "elisa.autovec.expected")
+                                    vectorized <- true if md_property_is(loop_ops[index], "llvm.loop.isvectorized")
+                            warnings <- warnings + 1 if marked and not vectorized
+                    block_opt <- LLVMGetNextBasicBlock(block)
+                function_opt <- LLVMGetNextFunction(function)
+            return warnings
+
+
+
+        # Give the module its TARGET: triple + datalayout, taken from a real target machine.
+        #
+        # This is not decoration. Without a datalayout LLVM uses a default where i64 is
+        # 32-bit aligned, so every `store i64` is emitted `align 4` and the loop vectorizer
+        # refuses to touch it — silently costing alignment and vectorization on all emitted
+        # code while every exit code stayed correct. Nothing in a behavioural suite can see
+        # this; stage0's module header is what gives it away.
+        #
+        # Returns the machine so a caller that also emits objects can reuse it. Initializing
+        # the target is idempotent.
+        def configure_module_target_for(m: LLVMModuleRef, requested_triple: sview) -> LLVMTargetMachineRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            triple_storage: mutable darray[u8] = []
+            triple: cstr = LLVMGetDefaultTargetTriple() if requested_triple == "" else sview_to_cstr(requested_triple, triple_storage)
+            # LLVM exposes the per-target initializers, but its all-target helpers are
+            # static inline and therefore unavailable to a self-hosted LLVM-C client.
+            # Initialize the families stage0's target path commonly accepts explicitly.
+            if requested_triple == "" or sview_matches_prefix(requested_triple, "aarch64", 0, 7) or sview_matches_prefix(requested_triple, "arm64", 0, 5):
+                LLVMInitializeAArch64TargetInfo()
+                LLVMInitializeAArch64Target()
+                LLVMInitializeAArch64TargetMC()
+                LLVMInitializeAArch64AsmPrinter()
+            if requested_triple == "":
+                LLVMInitializeX86TargetInfo()
+                LLVMInitializeX86Target()
+                LLVMInitializeX86TargetMC()
+                LLVMInitializeX86AsmPrinter()
+                LLVMInitializeARMTargetInfo()
+                LLVMInitializeARMTarget()
+                LLVMInitializeARMTargetMC()
+                LLVMInitializeARMAsmPrinter()
+                LLVMInitializeRISCVTargetInfo()
+                LLVMInitializeRISCVTarget()
+                LLVMInitializeRISCVTargetMC()
+                LLVMInitializeRISCVAsmPrinter()
+                LLVMInitializeWebAssemblyTargetInfo()
+                LLVMInitializeWebAssemblyTarget()
+                LLVMInitializeWebAssemblyTargetMC()
+                LLVMInitializeWebAssemblyAsmPrinter()
+            if sview_matches_prefix(requested_triple, "arm", 0, 3) or sview_matches_prefix(requested_triple, "thumb", 0, 5):
+                LLVMInitializeARMTargetInfo()
+                LLVMInitializeARMTarget()
+                LLVMInitializeARMTargetMC()
+                LLVMInitializeARMAsmPrinter()
+            if sview_matches_prefix(requested_triple, "x86", 0, 3) or sview_matches_prefix(requested_triple, "i686", 0, 4):
+                LLVMInitializeX86TargetInfo()
+                LLVMInitializeX86Target()
+                LLVMInitializeX86TargetMC()
+                LLVMInitializeX86AsmPrinter()
+            if sview_matches_prefix(requested_triple, "riscv", 0, 5):
+                LLVMInitializeRISCVTargetInfo()
+                LLVMInitializeRISCVTarget()
+                LLVMInitializeRISCVTargetMC()
+                LLVMInitializeRISCVAsmPrinter()
+            if sview_matches_prefix(requested_triple, "wasm", 0, 4):
+                LLVMInitializeWebAssemblyTargetInfo()
+                LLVMInitializeWebAssemblyTarget()
+                LLVMInitializeWebAssemblyTargetMC()
+                LLVMInitializeWebAssemblyAsmPrinter()
+            LLVMSetTarget(m, triple)
+            target: mutable LLVMTargetRef = zeroed
+            error_message: mutable cstr = zeroed
+            target_pointer: void& = (&target).cast[void&] can Unsafe.PointerCast
+            error_pointer: void& = (&error_message).cast[void&] can Unsafe.PointerCast
+            _ = LLVMGetTargetFromTriple(triple, target_pointer, error_pointer)
+            machine: LLVMTargetMachineRef = LLVMCreateTargetMachine(target, triple, "generic", "", 0, 0, 0)
+            LLVMSetDataLayout(m, LLVMCopyStringRepOfTargetData(LLVMCreateTargetDataLayout(machine)))
+            return machine
+
+        def configure_module_target(m: LLVMModuleRef) -> LLVMTargetMachineRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return configure_module_target_for(m, "")
+
+
+        # Run LLVM's new pass manager on an already-emitted module. This is the stage1
+        # counterpart of stage0's GenerateLLVMIRWithOpt family; callers choose the exact
+        # pipeline string (for example, `default<O2>`), while the target machine supplies
+        # the module's target-specific legality and cost model. LLVM returns NULL on success.
+        def run_optimization(machine: LLVMTargetMachineRef, m: LLVMModuleRef, pipeline: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            pipeline_storage: mutable darray[u8] = []
+            options: LLVMPassBuilderOptionsRef = LLVMCreatePassBuilderOptions()
+            # Match stage0's pass-builder defaults. LLVM's C API otherwise leaves these
+            # policy switches at library defaults, which can silently disable the
+            # vectorizer/unroller even with the same `default<O*>` pipeline.
+            LLVMPassBuilderOptionsSetLoopInterleaving(options, 1)
+            LLVMPassBuilderOptionsSetLoopVectorization(options, 1)
+            LLVMPassBuilderOptionsSetSLPVectorization(options, 1)
+            LLVMPassBuilderOptionsSetLoopUnrolling(options, 1)
+            pass_error: void&? = LLVMRunPasses(m, sview_to_cstr(pipeline, pipeline_storage), machine, options)
+            LLVMDisposePassBuilderOptions(options)
+            if pass_error is real_error:
+                return false
+            return true
+
+
+        # Artifact writers matching stage0's backend entry points. The module must already
+        # have been configured and emitted; these functions deliberately report the C API's
+        # status instead of hiding a failed write behind a partially-created artifact.
+        def write_bitcode(m: LLVMModuleRef, path: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            path_storage: mutable darray[u8] = []
+            return LLVMWriteBitcodeToFile(m, sview_to_cstr(path, path_storage)) == 0
+
+
+        def emit_object(machine: LLVMTargetMachineRef, m: LLVMModuleRef, path: cstr) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # Take a NUL-terminated path (cstr), not sview: stage1 meta-compile does not
+            # lower the runtime `sview(u8&?,…)` constructor reliably, and the product
+            # driver already holds a terminated path buffer for gen2.
+            error_message: mutable cstr = zeroed
+            error_pointer: void& = (&error_message).cast[void&] can Unsafe.PointerCast
+            return LLVMTargetMachineEmitToFile(machine, m, path, 1, error_pointer) == 0
+
+
+
+        # Emit every declaration in `file`. Returns the number emitted, or -1 if ANY
+        # declaration was declined.
+        #
+        # All-or-nothing is the sound choice: a partially-emitted module is WORSE than no
+        # module. If `main` is unmodeled but a helper emits, a count-based "did we emit
+        # anything?" check reports success and hands back a module quietly missing the
+        # program. Declining the whole module keeps "emitted" honest.
+        #
+        # TWO PASSES: declare every function before emitting any body, so a call to a
+        # function defined LATER in the file still resolves. A one-pass emitter would
+        # silently decline forward references, which stage0 accepts.
+        #
+        # Takes `file` BY REFERENCE, mirroring `Semantic::check(file: Ast::File&)` — the
+        # AST is a large region-backed structure and there is no reason to copy it.
+        #
+        # `<-`, NOT `=`: inside a `for … |captures|:` loop a captured scalar must be
+        # threaded with `<-`; a plain `=` compiles clean and silently does nothing.
+        # `want_debug` emits DWARF (a compile unit + one DISubprogram per function). Kept as a
+        # parameter rather than a separate entry point so there is ONE emission path: a
+        # second path would drift from this one silently.
+        # Strip a half-emitted function back to a bare `declare`: delete every basic
+        # block. Used by the per-function tolerance pass — a failed body must not leave
+        # unterminated blocks in the module. An unreferenced declaration is linker-
+        # stripped; a referenced one fails the LINK loudly, never a silently-wrong binary.
+        def strip_function_body(handle: LLVMValueRef) -> void can[Abort.Panic]:
+            first_block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(handle)
+            while first_block_opt is first_block |handle, first_block_opt|:
+                LLVMDeleteBasicBlock(first_block)
+                first_block_opt <- LLVMGetFirstBasicBlock(handle)
+
+
+        # Name a declined function in `!elisa.declined`. Without this a decline is SILENT:
+        # the body is stripped to a bare `declare`, and the first symptom is a link error
+        # naming a mangled symbol with no indication of which function the backend gave up
+        # on. (Chasing four such symbols by hand through the real-std dict is what motivated
+        # this.) Recorded in the IR itself so `emit_native` output carries it.
+        # A function the C RUNTIME also provides. stage0 keeps these external only inside
+        # `native_runtime_support.elisa` (isDefaultNativeRuntimeSupportExport); an ORDINARY
+        # program that defines its own `arena_alloc` / `new_region` -- as the real std does --
+        # must not export them, or linking the program object together with the runtime
+        # object fails with "duplicate symbol _new_region".
+        #
+        # Internal linkage keeps the Elisa definition usable in-module while leaving the
+        # runtime's copy to satisfy everyone else. Every OTHER function keeps stage0's
+        # default external linkage: stage0 only internalizes wholesale at -O>0
+        # (preferPrivateLinkage), which is not this path.
+        def name_is_runtime_provided(name: sview) -> bool:
+            true return if name == "new_region" or name == "new_region_backend"
+            true return if name == "free_region" or name == "free_region_backend"
+            true return if name == "arena_alloc" or name == "arena_realloc"
+            true return if name == "arena_memcpy" or name == "arena_memeq"
+            true return if name == "arena_strdup" or name == "arena_memdup"
+            true return if name == "arena_snapshot" or name == "arena_reset"
+            true return if name == "arena_rewind" or name == "arena_free"
+            true return if name == "arena_adopt" or name == "arena_trim"
+            true return if name == "alloc_perm" or name == "alloc_scratch"
+            true return if name == "reset_scratch"
+            true return if name == "ctx_hash_cstr" or name == "ctx_hash_u64"
+            true return if name == "ctx_strlen" or name == "ctx_streq"
+            true return if name == "ctx_string_index" or name == "ctx_string_slice"
+            true return if name == "ctx_string_slice_eq" or name == "ctx_string_slices_eq"
+            true return if name == "ctx_string_view" or name == "ctx_string_view_len"
+            true return if name == "ctx_string_view_slice" or name == "ctx_string_view_index"
+            true return if name == "ctx_string_view_prefix" or name == "ctx_string_view_suffix"
+            true return if name == "ctx_string_view_eq" or name == "ctx_string_views_eq"
+            return false
+
+
+        # Some runtime functions are present in the source for standalone stage0 builds,
+        # but the linked runtime object is the authoritative implementation for stage1.
+        # Keep a declined source body from becoming a local panic stub that shadows it.
+        def runtime_external_only(name: sview) -> bool:
+            return name == "ctx_aos_store_record"
+
+
+        # 8 = LLVMInternalLinkage. `main` is the entry point crt0 calls from outside the
+        # module and always stays external.
+        def set_defined_function_linkage(name: sview, handle: LLVMValueRef) -> void can[Abort.Panic]:
+            return if name == "main"
+            # Every function this module DEFINES is internal: the product is a self-contained
+            # executable, so intra-module calls bind here and only `main` is reached from crt0.
+            # A hand-maintained "runtime-provided" whitelist cannot be kept complete — as more
+            # of the frontend became emittable, 289 std/runtime helpers were emitted with
+            # external linkage and collided with the same symbols in elisacore_runtime.o.
+            # Functions this module DECLINES are never defined here, so their calls still
+            # resolve to the runtime object exactly as before.
+            LLVMSetLinkage(handle, 8)
+
+
+        def record_declined_function(name: sview, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate]:
+            if dbg_decline_enabled():
+                dcl_msg: mutable darray[u8] = []
+                _ = dbg_push_sview(dcl_msg, "DROPPED ")
+                _ = dbg_push_sview(dcl_msg, name)
+                dcl_msg.push(0)
+                _ = puts((&dcl_msg[0]).cast[cstr] can Unsafe.PointerCast)
+            name_storage: mutable darray[u8] = []
+            declined_cstr: cstr = sview_to_cstr(name, name_storage)
+            declined_string: LLVMValueRef = LLVMMetadataAsValue(ctx, LLVMMDStringInContext2(ctx, declined_cstr, sview_len(name)))
+            LLVMAddNamedMetadataOperand(m, "elisa.declined", declined_string)
+
+
+        # Record a declined generic INSTANTIATION under the name LLVM knows it by (the
+        # mangled `base__K__T`), falling back to the template's base name if the handle has
+        # no name yet.
+        def record_declined_instantiation(handle: LLVMValueRef, base: sview, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            mangled_length: mutable usize = 0
+            mangled: cstr = LLVMGetValueName2(handle, &mangled_length)
+            if mangled_length == 0:
+                record_declined_function(base, m, ctx)
+                return
+            declined_instance: LLVMValueRef = LLVMMetadataAsValue(ctx, LLVMMDStringInContext2(ctx, mangled, mangled_length))
+            LLVMAddNamedMetadataOperand(m, "elisa.declined", declined_instance)
+
+
+        # Declare every ordinary function and extern before any body is emitted. Keeping this
+        # pass outside the module driver makes the self-hosted backend's main emission routine
+        # small enough for stage1's control-flow lowerer while preserving forward-call support.
+        def declare_module_functions(file: Ast::File&, top: darray[Decl], fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration_index in 0..<top.count |fns, structs, generics, m, ctx, file|:
+                declaration: Decl = top[declaration_index]
+                if declaration_is_module(declaration):
+                    module_name: sview = module_name_of(declaration)
+                    for nested_index in 0..<declaration_module_count(declaration) |fns, structs, generics, m, ctx, module_name, file, declaration|:
+                        nested: Decl = declaration_module_at(declaration, nested_index)
+                        continue if function_name_of(nested) == ""
+                        continue if generic_index_of(generics, function_name_of(nested)) >= 0
+                        nested_handle: LLVMValueRef? = declare_function(nested, module_name, file.error_set_func_lines, file.annotation_args, fns, structs, generics, m, ctx)
+                        if nested_handle is nested_ok:
+                            _ = nested_ok
+                        else:
+                            record_declined_function(function_name_of(nested), m, ctx)
+                    continue
+                if declaration_is_extern(declaration):
+                    _ = declare_extern(declaration, file.extern_params, file.annotation_args, file.enum_annotations, extern_return_is_pointer(file.enum_annotations, declaration_extern_name(declaration)), fns, structs, m, ctx)
+                    continue
+                continue if function_name_of(declaration) == ""
+                continue if generic_index_of(generics, function_name_of(declaration)) >= 0
+                declared_handle: LLVMValueRef? = declare_function(declaration, "", file.error_set_func_lines, file.annotation_args, fns, structs, generics, m, ctx)
+                if declared_handle is declared_ok:
+                    _ = declared_ok
+                else:
+                    record_declined_function(function_name_of(declaration), m, ctx) if function_name_of(declaration) != ""
+
+
+        # Emit all declared bodies and drain generic instantiations. The separate helper keeps
+        # the module setup routine focused on type/ABI registration and preserves the same
+        # all-or-nothing `main` check as the original inline pass.
+        def emit_module_bodies(file: Ast::File&, top: darray[Decl], fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: mutable Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, main_ok: mutable bool&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            emitted_count: mutable i64 = 0
+            for declaration_index in 0..<top.count |emitted_count, main_ok, fns, structs, m, ctx, builder, file, generics, runtime|:
+                declaration: Decl = top[declaration_index]
+                if declaration_is_module(declaration):
+                    module_name: sview = module_name_of(declaration)
+                    for nested_decl_index in 0..<declaration_module_count(declaration) |emitted_count, fns, structs, m, ctx, builder, module_name, file, generics, runtime, declaration|:
+                        nested: Decl = declaration_module_at(declaration, nested_decl_index)
+                        nested_name: sview = function_name_of(nested)
+                        continue if nested_name == ""
+                        continue if generic_index_of(generics, nested_name) >= 0
+                        nested_index: mutable i64 = function_index_of_line(fns, module_name, nested_name, function_line_of(nested))
+                        nested_index <- function_index_of_arity(fns, module_name, nested_name, function_param_count_of(nested)) if nested_index < 0
+                        nested_index <- function_index_of(fns, module_name, nested_name) if nested_index < 0
+                        continue if nested_index < 0
+                        if runtime_external_only(nested_name):
+                            strip_function_body(fns.handles[nested_index.usize()])
+                            continue
+                        nested_emitted: bool = emit_function_body(nested, module_name, fns.handles[nested_index.usize()], file.error_set_func_lines, fns, structs, generics, runtime, m, ctx, builder)
+                        emitted_count <- emitted_count + 1 if nested_emitted else emitted_count
+                        strip_function_body(fns.handles[nested_index.usize()]) if not nested_emitted
+                        record_declined_function(nested_name, m, ctx) if not nested_emitted
+                        set_defined_function_linkage(nested_name, fns.handles[nested_index.usize()]) if nested_emitted
+                    continue
+                if declaration_is_extern(declaration):
+                    export_name: sview = declaration_extern_name(declaration)
+                    export_target: sview = export_target_of(file.enum_annotations, export_name)
+                    if export_target != "":
+                        export_index: i64 = function_index_of(fns, "", export_name)
+                        if export_index >= 0:
+                            apply_export_target_decorators(top, export_target, file.annotation_args, fns.handles[export_index.usize()], ctx)
+                            exported: bool = emit_export_wrapper(export_name, export_target, fns.handles[export_index.usize()], fns, structs, m, ctx, builder)
+                            emitted_count <- emitted_count + 1 if exported else emitted_count
+                            strip_function_body(fns.handles[export_index.usize()]) if not exported
+                            record_declined_function(export_name, m, ctx) if not exported
+                    continue
+                declaration_name: sview = function_name_of(declaration)
+                continue if declaration_name == ""
+                continue if generic_index_of(generics, declaration_name) >= 0
+                handle_index: mutable i64 = function_index_of_line(fns, "", declaration_name, function_line_of(declaration))
+                handle_index <- function_index_of_arity(fns, "", declaration_name, function_param_count_of(declaration)) if handle_index < 0
+                handle_index <- function_index_of(fns, "", declaration_name) if handle_index < 0
+                continue if handle_index < 0
+                if runtime_external_only(declaration_name):
+                    strip_function_body(fns.handles[handle_index.usize()])
+                    continue
+                emitted: bool = emit_function_body(declaration, "", fns.handles[handle_index.usize()], file.error_set_func_lines, fns, structs, generics, runtime, m, ctx, builder)
+                emitted_count <- emitted_count + 1 if emitted else emitted_count
+                strip_function_body(fns.handles[handle_index.usize()]) if not emitted
+                record_declined_function(declaration_name, m, ctx) if not emitted
+                set_defined_function_linkage(declaration_name, fns.handles[handle_index.usize()]) if emitted
+                main_ok <- true if emitted and declaration_name == "main"
+            drained: mutable usize = 0
+            while drained < generics.pending_bases.count |drained, generics, fns, structs, runtime, m, ctx, builder, emitted_count|:
+                if emit_instantiation_body(drained, generics, fns, structs, runtime, m, ctx, builder):
+                    emitted_count <- emitted_count + 1
+                else:
+                    strip_function_body(generics.pending_handles[drained])
+                drained <- drained + 1
+            return emitted_count
+
+
+        def new_struct_table(ctx: LLVMContextRef) -> StructTable can[Abort.Panic, Memory.Allocate]:
+            table: mutable StructTable = StructTable{names: [], handles: [], alignments: [], field_names: [], field_types: [], field_start: [], field_count: [], tuple_label_lines: [], tuple_label_names: [], guest_layouts: [], overlay_field_names: [], overlay_field_offsets: [], overlay_field_widths: [], overlay_field_layouts: [], generic_struct_names: [], generic_struct_decls: [], generic_struct_param_names: [], generic_struct_param_start: [], generic_struct_param_count: [], generic_struct_inst_bases: [], generic_struct_inst_args: [], generic_struct_inst_arg_start: [], generic_struct_inst_arg_count: [], generic_struct_inst_index: [], generic_struct_inst_ready: [], generic_struct_inprogress: [], context: ctx, array_elements: [], array_extents: [], darray_elements: [], view_elements: [], ref_targets: [], ref_is_heap: [], optional_targets: [], enum_names: [], enum_backings: [], enum_variants: [], enum_variant_start: [], enum_variant_count: [], binding_names: [], binding_types: [], penum_names: [], penum_variants: [], penum_payloads: [], penum_has_payload: [], penum_field_names: [], penum_field_types: [], penum_field_flat_names: [], penum_field_type_start: [], penum_field_type_count: [], packed_names: [], packed_variants: [], packed_payloads: [], packed_has_payload: [], packed_field_names: [], packed_variant_start: [], packed_variant_count: [], packed_payload_words: [], packed_field_types: [], packed_field_flat_names: [], packed_field_type_start: [], packed_field_type_count: [], packed_common_counts: [], ast_refinement_names: [], penum_variant_start: [], penum_variant_count: [], penum_payload_words: [], alias_names: [], alias_types: [], const_names: [], const_types: [], const_values: [], const_resolved: [], const_float_text: [], const_globals: [], const_global_ok: [], extern_global_names: [], extern_global_types: [], extern_global_handles: [], mutable_global_names: [], mutable_global_types: [], mutable_global_handles: [], static_branch_lines: [], static_taken_lines: [], pending_ensures: [], narrowed_owners: [], narrowed_fields: [], fn_return_lines: [], fn_return_heads: [], fn_pool_returns: [], fn_param_lines: [], fn_param_heads: [], fn_pool_param_start: [], fn_pool_param_count: [], fn_pool_params: [], fn_type_param_lines: [], fn_type_param_exprs: [], branch_hint_lines: [], branch_hint_kinds: [], disjoint_function_names: [], disjoint_function_masks: []}
+            reserve_ast_packed_headers(table)
+            return table
+
+        def declaration_is_module(declaration: Decl) -> bool can[Abort.Panic]:
+            return match declaration:
+                Decl.Module(module_name, module_body, module_line): true
+                _: false
+
+
+        def declaration_module_count(declaration: Decl) -> usize can[Abort.Panic]:
+            return match declaration:
+                Decl.Module(module_name, module_body, module_line): module_body.count
+                _: 0
+
+
+        def module_name_of(declaration: Decl) -> sview can[Abort.Panic]:
+            return match declaration:
+                Decl.Module(module_name, module_body, module_line): module_name
+                _: ""
+
+
+        def declaration_is_extern(declaration: Decl) -> bool can[Abort.Panic]:
+            return match declaration:
+                Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type, decorators, line): true
+                _: false
+
+
+        def declaration_extern_name(declaration: Decl) -> sview can[Abort.Panic]:
+            return match declaration:
+                Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type, decorators, line): extern_name
+                _: ""
+
+
+        def declaration_is_struct(declaration: Decl) -> bool can[Abort.Panic]:
+            return match declaration:
+                Decl.Struct(struct_name, members, affinity, states, derive, invariants, line): true
+                _: false
+
+
+        def declaration_module_at(declaration: Decl, index: usize) -> Decl can[Abort.Panic]:
+            return match declaration:
+                Decl.Module(module_name, module_body, module_line): module_body[index]
+                _: (Decl.Invalid)

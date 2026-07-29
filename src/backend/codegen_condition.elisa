@@ -1,0 +1,523 @@
+# Stage1 backend — conditions, `assert`-narrowing bookkeeping, and the statement-list driver.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # Emit a branch condition: a modeled `bool` (i1). Elisa requires a bool condition,
+        # so this simply emits at bool type — no `!= 0` narrowing, because a comparison
+        # already yields i1 and a bool local is stored as i1.
+        def emit_condition(condition: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            bool_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+            condition_type: ValueType = resolve_type(condition, bool_type, local_scope, fns, structs, generics)
+            null return if condition_type.kind != TypeKind.Bool
+            return emit_expression(condition, bool_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+
+
+        # Branch to `dest` only when the just-emitted region left the block OPEN. An arm
+        # that already returned must not also get a branch — LLVM rejects a block with two
+        # terminators.
+        def branch_if_open(status: EmitStatus, builder: LLVMBuilderRef, dest: LLVMBasicBlockRef) -> void can[Abort.Panic]:
+            return if status != EmitStatus.Open
+            _ = LLVMBuildBr(builder, dest)
+
+
+        # The `owner` half of a narrowable path: `m.items` -> "m", `p` -> "p". "" = a shape
+        # too complex to track (a call result, an index, a nested path), which simply never
+        # narrows.
+        def narrow_ident_of(path: Expr) -> sview can[Abort.Panic]:
+            return match path:
+                Expr.Ident(narrow_ident_name, _): narrow_ident_name
+                _: ""
+
+
+        def narrow_owner_of(path: Expr) -> sview can[Abort.Panic]:
+            return match path:
+                Expr.Field(narrow_head, _, _): narrow_ident_of(narrow_head)
+                Expr.Ident(narrow_ident_name, _): narrow_ident_name
+                _: ""
+
+
+        # The `field` half: `m.items` -> "items", `p` -> "" (a bare local).
+        def narrow_field_of(path: Expr) -> sview can[Abort.Panic]:
+            return match path:
+                Expr.Field(_, narrow_f_name, _): narrow_f_name
+                _: ""
+
+
+        # Whether `path` has been proven non-null by an earlier `assert PATH != null`.
+        def path_is_narrowed(path: Expr, structs: StructTable&) -> bool can[Abort.Panic]:
+            narrow_owner: sview = narrow_owner_of(path)
+            false return if narrow_owner == ""
+            narrow_field: sview = narrow_field_of(path)
+            narrow_index: mutable usize = 0
+            while narrow_index < structs.narrowed_owners.count |narrow_index, narrow_owner, narrow_field, structs|:
+                true return if structs.narrowed_owners[narrow_index] == narrow_owner and structs.narrowed_fields[narrow_index] == narrow_field
+                narrow_index <- narrow_index + 1
+            return false
+
+
+        # Record `assert PATH != null`. Only a `!=` against the null literal narrows; `==
+        # null` proves the opposite and must NOT record.
+        def record_null_assert(predicate: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if predicate is Expr.Binary(assert_left, assert_operator, assert_right, assert_line):
+                return if assert_operator != TokenKind.BangEq
+                left_null: bool = is_null_literal(assert_left)
+                right_null: bool = is_null_literal(assert_right)
+                return if not (left_null or right_null)
+                asserted_path: Expr = assert_right if left_null else assert_left
+                asserted_owner: sview = narrow_owner_of(asserted_path)
+                return if asserted_owner == ""
+                structs.narrowed_owners <- structs.narrowed_owners.push(asserted_owner)
+                structs.narrowed_fields <- structs.narrowed_fields.push(narrow_field_of(asserted_path))
+
+
+        # Drop any narrowing proof about `path` -- an assignment replaces the value the
+        # proof was about, so a stale proof would unwrap a fresh null.
+        def invalidate_narrowing(path: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            invalid_owner: sview = narrow_owner_of(path)
+            return if invalid_owner == ""
+            # Assigning to `m` invalidates every proof about `m.FIELD` too: the whole struct
+            # was replaced. So an owner match alone is enough to drop the row.
+            # Collected into LOCALS, then the table is emptied and refilled by PUSH. Binding
+            # `structs.narrowed_owners <- kept_owners` instead would hand the caller's field
+            # a darray backed by this function's auto region, freed on return -- the
+            # callee-rebind use-after-free the region checker rejects outright.
+            kept_owners: mutable darray[sview] = []
+            kept_fields: mutable darray[sview] = []
+            keep_index: mutable usize = 0
+            while keep_index < structs.narrowed_owners.count |keep_index, kept_owners, kept_fields, invalid_owner, structs|:
+                if structs.narrowed_owners[keep_index] != invalid_owner:
+                    kept_owners.push(structs.narrowed_owners[keep_index])
+                    kept_fields.push(structs.narrowed_fields[keep_index])
+                keep_index <- keep_index + 1
+            clear_narrowings(structs)
+            refill_index: mutable usize = 0
+            while refill_index < kept_owners.count |refill_index, kept_owners, kept_fields, structs|:
+                structs.narrowed_owners <- structs.narrowed_owners.push(kept_owners[refill_index])
+                structs.narrowed_fields <- structs.narrowed_fields.push(kept_fields[refill_index])
+                refill_index <- refill_index + 1
+
+
+        # Record every `PATH != null` a guard CONDITION proves, walking `and` chains (the std
+        # dict writes `if old_items_opt != null and old_capacity > 0:`). Only `and` is walked:
+        # under `or` neither side is guaranteed, so nothing is proven.
+        def record_null_guards(condition: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if condition is Expr.Binary(guard_left, guard_operator, guard_right, guard_line):
+                if guard_operator == TokenKind.And:
+                    record_null_guards(guard_left, structs)
+                    record_null_guards(guard_right, structs)
+                    return
+            record_null_assert(condition, structs)
+
+
+        # Save the proof set so a branch's narrowings can be rolled back at the join: a proof
+        # that only holds inside the `then` arm must not leak past it.
+        def snapshot_narrowings(structs: StructTable&, saved_owners: mutable darray[sview]&, saved_fields: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            snapshot_index: mutable usize = 0
+            while snapshot_index < structs.narrowed_owners.count |snapshot_index, saved_owners, saved_fields, structs|:
+                saved_owners.push(structs.narrowed_owners[snapshot_index])
+                saved_fields.push(structs.narrowed_fields[snapshot_index])
+                snapshot_index <- snapshot_index + 1
+
+
+        def restore_narrowings(structs: mutable StructTable&, saved_owners: darray[sview]&, saved_fields: darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            clear_narrowings(structs)
+            restore_index: mutable usize = 0
+            while restore_index < saved_owners.count |restore_index, saved_owners, saved_fields, structs|:
+                structs.narrowed_owners <- structs.narrowed_owners.push(saved_owners[restore_index])
+                structs.narrowed_fields <- structs.narrowed_fields.push(saved_fields[restore_index])
+                restore_index <- restore_index + 1
+
+
+        # Drop every narrowing proof (per-function reset, and the first half of a rebuild).
+        def clear_narrowings(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            while structs.narrowed_owners.count > 0 |structs|:
+                _ = structs.narrowed_owners.pop()
+            while structs.narrowed_fields.count > 0 |structs|:
+                _ = structs.narrowed_fields.pop()
+
+
+        # Emit the LLVM trap intrinsic and terminate the failure block. This is shared by
+        # forced dereference guards and the dynamic index watchdog; unlike libc abort it
+        # remains a recognizable `llvm.trap` for both LLVM and stage0 parity checks.
+        def emit_trap_unreachable(m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Unsafe.PointerCast]:
+            trap_name: cstr = "llvm.trap"
+            trap_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+            trap_fn: LLVMValueRef = LLVMAddFunction(m, trap_name, trap_type)
+            _ = LLVMBuildCall2(builder, trap_type, trap_fn, null, 0, "")
+            _ = LLVMBuildUnreachable(builder)
+
+
+        # In forced bounds mode, reject null and near-null addresses before they are
+        # dereferenced. Runtime-derived pointers are compared directly; this deliberately
+        # stays conservative for stack/global addresses, which is safe and keeps the
+        # guard independent of LLVM's value-kind introspection API.
+        def emit_pointer_deref_guard(pointer: LLVMValueRef, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Unsafe.PointerCast]:
+            return if not runtime.force_bounds_check
+            return if pointer == zeroed
+            int_pointer: LLVMValueRef = LLVMBuildPtrToInt(builder, pointer, LLVMInt64TypeInContext(ctx), "pg.addr")
+            limit: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 65536, 0)
+            valid: LLVMValueRef = LLVMBuildICmp(builder, 35, int_pointer, limit, "pg.valid")
+            ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)), "pg.ok")
+            fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)), "pg.fail")
+            _ = LLVMBuildCondBr(builder, valid, ok_block, fail_block)
+            LLVMPositionBuilderAtEnd(builder, fail_block)
+            emit_trap_unreachable(m, ctx, builder)
+            LLVMPositionBuilderAtEnd(builder, ok_block)
+
+
+        # Dynamic container indices are checked when the opt-in flag is active. The
+        # semantic checker already handles `get ... else` and proven accesses; this
+        # backend guard covers unchecked reads/writes before their GEP is used.
+        def emit_index_bounds_guard(array_slot: LLVMValueRef, array_type: ValueType, index: LLVMValueRef, runtime: Runtime&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not runtime.force_bounds_check
+            emit_pointer_deref_guard(array_slot, runtime, m, ctx, builder)
+            count_pointer: mutable LLVMValueRef = zeroed
+            count_value: mutable LLVMValueRef = zeroed
+            if array_type.kind == TypeKind.DArray:
+                count_pointer <- LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), array_slot, 1, "bounds.count.ptr")
+                count_value <- LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), count_pointer, "bounds.count")
+            elif array_type.kind == TypeKind.Array:
+                count_value <- LLVMConstInt(LLVMInt64TypeInContext(ctx), structs.array_extents[array_type.bits.usize()].u64(), 0)
+            else:
+                return
+            valid: LLVMValueRef = LLVMBuildICmp(builder, 36, index, count_value, "wd.in_bounds")
+            parent: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "wd.ok")
+            fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "wd.fail")
+            _ = LLVMBuildCondBr(builder, valid, ok_block, fail_block)
+            LLVMPositionBuilderAtEnd(builder, fail_block)
+            emit_trap_unreachable(m, ctx, builder)
+            LLVMPositionBuilderAtEnd(builder, ok_block)
+
+
+        # Emit a runtime contract guard: branch on `condition`, abort on false, and leave
+        # the builder positioned on the success path. Shared by `requires`/`assert` (checked
+        # where they are written) and `ensure` (checked at every return).
+        def emit_contract_guard(condition: LLVMValueRef, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic]:
+            guard_fn: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            guard_ok: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, guard_fn, "contract.ok")
+            guard_fail: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, guard_fn, "contract.fail")
+            _ = LLVMBuildCondBr(builder, condition, guard_ok, guard_fail)
+            LLVMPositionBuilderAtEnd(builder, guard_fail)
+            guard_abort_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+            guard_abort_fn: LLVMValueRef = declare_or_get_abort(m, guard_abort_type)
+            _ = LLVMBuildCall2(builder, guard_abort_type, guard_abort_fn, null, 0, "")
+            _ = LLVMBuildUnreachable(builder)
+            LLVMPositionBuilderAtEnd(builder, guard_ok)
+
+
+        # Check the current function's `ensure` postconditions against the value it is about
+        # to return. Mirrors stage0's shape: bind the returned value as `result` (stage0
+        # allocates a `%result` slot and stores into it), then guard on each predicate.
+        # Called on the return path, BEFORE the regions are unwound -- a predicate may read a
+        # container the auto region still backs.
+        #
+        # False = DECLINE (a predicate the expression emitter cannot model). Never silently
+        # skips a check: a contract that is not emitted is a contract that is not enforced.
+        def emit_ensure_checks(return_value: LLVMValueRef, return_type: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            ensure_count: usize = structs.pending_ensures.count
+            true return if ensure_count == 0
+            false return if return_type.kind == TypeKind.Void
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(return_type, structs, ctx), "result")
+            _ = LLVMBuildStore(builder, return_value, result_slot)
+            # `result` is an ordinary local from here, so the predicate's `result >= a` needs
+            # no special case in the expression emitter.
+            declare_local(local_scope, "result", result_slot, return_type)
+            ensure_bool: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+            ensure_index: mutable usize = 0
+            while ensure_index < ensure_count |ensure_index, ensure_count, ensure_bool, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                # Copied OUT of the table: emit_expression takes `structs` mutably, so a
+                # borrow held across the call would conflict.
+                ensure_pred: Expr = structs.pending_ensures[ensure_index]
+                if emit_expression(ensure_pred, ensure_bool, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ensure_value:
+                    emit_contract_guard(ensure_value, m, ctx, builder)
+                else:
+                    return false
+                ensure_index <- ensure_index + 1
+            return true
+
+
+        # The source line carried by every statement kind that this backend can lower.
+        def trace_line(statement: Stmt) -> u32:
+            if statement is Stmt.Block(kind, clause, binding, body, line): return line
+            if statement is Stmt.Contract(kind, predicate, line): return line
+            if statement is Stmt.Expr(expression, line): return line
+            if statement is Stmt.Return(value, line): return line
+            if statement is Stmt.VarDecl(name, type_expression, value, line): return line
+            if statement is Stmt.Assign(target, operator, value, line): return line
+            if statement is Stmt.If(condition, then_body, else_body, line): return line
+            if statement is Stmt.While(condition, body, line): return line
+            if statement is Stmt.Break(label, line): return line
+            if statement is Stmt.Continue(label, line): return line
+            if statement is Stmt.Match(scrutinee, arms, line): return line
+            if statement is Stmt.For(bind, variables, iterable, body, line): return line
+            return 0
+
+        def emit_trace_step(statement: Stmt, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not runtime.trace_enabled
+            line: u32 = trace_line(statement)
+            arguments: mutable darray[LLVMValueRef] = [runtime.trace_name, LLVMConstInt(LLVMInt32TypeInContext(ctx), line.u64(), 0)]
+            arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            _ = LLVMBuildCall2(builder, runtime.trace_record_type, runtime.trace_record, arguments_pointer, 2, "")
+
+        # Record scalar local values using stage0's four-argument trace ABI. Aggregates and
+        # floating-point values intentionally fall back to the ordinary step record: the
+        # runtime value slot is an integer word and must never receive a guessed bitcast.
+        def emit_trace_value(name: sview, line: u32, value: LLVMValueRef, value_type: ValueType, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not runtime.trace_enabled or name == "_"
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            value64: mutable LLVMValueRef? = null
+            if value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.CStr:
+                value64 <- LLVMBuildPtrToInt(builder, value, int64_type, "trace.ptr")
+            if value_type.kind == TypeKind.Bool or value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned:
+                value64 <- value if value_type.bits == 64 else LLVMBuildSExt(builder, value, int64_type, "trace.sext") if value_type.kind == TypeKind.Signed else LLVMBuildZExt(builder, value, int64_type, "trace.zext")
+            if value64 is recorded_value:
+                name_storage: mutable darray[u8] = []
+                variable_name: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, sview_to_cstr(name, name_storage), "trace.variable")
+                arguments: mutable darray[LLVMValueRef] = [runtime.trace_name, LLVMConstInt(LLVMInt32TypeInContext(ctx), line.u64(), 0), variable_name, recorded_value]
+                arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+                _ = LLVMBuildCall2(builder, runtime.trace_record_value_type, runtime.trace_record_value, arguments_pointer, 4, "")
+
+        # Lower `for i in LOW ..< HIGH by par:` through the stage0 structured-parallel runtime.
+        # The runtime takes a zero-based index callback, so the callback reconstructs the
+        # source index by adding LOW. LOW/HIGH are saved in caller locals so the lambda's normal
+        # scalar-capture machinery carries non-zero ranges without inventing a new closure ABI.
+        # The runtime function is intentionally looked up in `fns`: a source that has not
+        # included the concurrency runtime must decline rather than emit an unresolved guess.
+        def emit_parallel_range_for(variables: darray[sview]&, iterable: Expr, body: darray[Stmt]&, line: u32, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            EmitStatus.Declined return if variables.count != 1
+            if iterable is Expr.Binary(range_low, range_operator, range_high, range_line):
+                EmitStatus.Declined return if range_operator != TokenKind.RangeLt and range_operator != TokenKind.RangeLe
+                usize_type: ValueType = ValueType{kind: TypeKind.Unsigned, bits: 64}
+                if emit_expression(range_low, usize_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is low_value:
+                    if emit_expression(range_high, usize_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is high_value:
+                        low_name: sview = "__parallel_low"
+                        high_name: sview = "__parallel_high"
+                        low_storage: mutable darray[u8] = []
+                        high_storage: mutable darray[u8] = []
+                        low_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(usize_type, structs, ctx), sview_to_cstr(low_name, low_storage))
+                        high_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(usize_type, structs, ctx), sview_to_cstr(high_name, high_storage))
+                        _ = LLVMBuildStore(builder, low_value, low_slot)
+                        _ = LLVMBuildStore(builder, high_value, high_slot)
+                        declare_local(local_scope, low_name, low_slot, usize_type)
+                        declare_local(local_scope, high_name, high_slot, usize_type)
+
+                        callback_name: sview = variables[0]
+                        callback_body: mutable darray[Stmt] = []
+                        callback_index: Expr = Expr.Ident("__parallel_index", line)
+                        reconstructed: Expr = Expr.Binary(Expr.Ident(low_name, line), TokenKind.Plus, callback_index, line)
+                        callback_body.push(Stmt.VarDecl(callback_name, Expr.Ident("usize", line), reconstructed, line))
+                        callback_body.extend(body)
+                        callback_body.push(Stmt.Return(Expr.IntLit(0), line))
+                        callback: Expr = Expr.Lambda(["__parallel_index"], callback_body, line)
+
+                        width: mutable Expr = Expr.Binary(Expr.Ident(high_name, line), TokenKind.Minus, Expr.Ident(low_name, line), line)
+                        if range_operator == TokenKind.RangeLe:
+                            width <- Expr.Binary(width, TokenKind.Plus, Expr.IntLit(1), line)
+                        arguments: mutable darray[Expr] = [width, callback, Expr.IntLit(0)]
+                        call: Expr = Expr.Ident("for_indices_par", line)
+                        if emit_call(call, arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) is parallel_result:
+                            _ = parallel_result
+                            return EmitStatus.Open
+            return EmitStatus.Declined
+
+
+        # Lower `parallel for band in slice:` through the generic `each` combinator. The
+        # semantic checker guarantees that the source is a thread-shareable band view and that
+        # the body does not mutate an outer binding; the callback therefore needs only its band
+        # parameter plus the ordinary scalar captures handled by emit_lambda_value.
+        def emit_parallel_band_for(variables: darray[sview]&, iterable: Expr, body: darray[Stmt]&, line: u32, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            EmitStatus.Declined return if variables.count != 1
+            callback_body: mutable darray[Stmt] = []
+            callback_body.extend(body)
+            callback_body.push(Stmt.Return(Expr.IntLit(0), line))
+            callback: Expr = Expr.Lambda([variables[0]], callback_body, line)
+            arguments: mutable darray[Expr] = [iterable, callback, Expr.IntLit(0)]
+            if emit_call(Expr.Ident("each", line), arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) is parallel_each_result:
+                _ = parallel_each_result
+                return EmitStatus.Open
+            return EmitStatus.Declined
+
+
+        # Emit a statement list. Declined if ANY statement declined; Terminated if the
+        # Emit one arm's body of a `x = match …` and STORE its yielded value into `result_slot`,
+        # then branch to `done_block`. Unlike a match-EXPRESSION arm (a single expression), a
+        # statement-position arm may be a BLOCK: leading statements (a `rebind`, a call) followed
+        # by a final yield expression. The leading statements are emitted in full statement
+        # context; the final `Stmt.Expr` becomes the stored value. A prefix that itself terminates
+        # (a `return` in the arm) yields no value and just closes the arm. Returns false to DECLINE.
+        def emit_arm_body_into_slot(body: darray[Stmt]&, result_type: ValueType, result_slot: LLVMValueRef, done_block: LLVMBasicBlockRef, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if body.count == 0
+            prefix_open: mutable bool = true
+            for prefix_index in 0..<body.count - 1 |prefix_open, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                continue if not prefix_open
+                pre_status: EmitStatus = emit_statement(body[prefix_index], return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                false return if pre_status == EmitStatus.Declined
+                prefix_open <- false if pre_status != EmitStatus.Open
+            # A prefix that already returned/broke leaves no open block to yield into.
+            true return if not prefix_open
+            final_stmt: Stmt = body[body.count - 1]
+            if final_stmt is Stmt.Expr(final_expr, final_line):
+                if emit_expression(final_expr, result_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is final_value:
+                    _ = LLVMBuildStore(builder, final_value, result_slot)
+                    _ = LLVMBuildBr(builder, done_block)
+                    return true
+                return false
+            # A non-expression final statement (`return X`, `raise`) must itself terminate.
+            fin_status: EmitStatus = emit_statement(final_stmt, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+            false return if fin_status == EmitStatus.Declined
+            return true
+
+        # `x: T = match SCRUT:` — a match in VALUE position whose arms may be BLOCKS (statements
+        # then a yield). emit_expression's Expr.Match handles only single-expression arms and
+        # lacks the statement context (loops/regions/return_type) a block arm needs; this runs
+        # at statement level and routes each arm through emit_arm_body_into_slot. Allocates and
+        # declares `var_name`. Mirrors the match-expr's scrutinee dispatch (int/cstr/sview/packed/
+        # penum) and its variant-payload binding. Returns Declined for unmodeled shapes.
+        def emit_match_into_slot(match_scrutinee: Expr, match_arms: darray[MatchArm]&, result_type: ValueType, var_name: sview, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            scrutinee_type: ValueType = resolve_type(match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
+            penum_scrutinee: bool = scrutinee_type.kind == TypeKind.PayloadEnum
+            packed_scrutinee: bool = scrutinee_type.kind == TypeKind.PackedEnum
+            cstr_scrutinee: bool = scrutinee_type.kind == TypeKind.CStr
+            sview_scrutinee: bool = scrutinee_type.kind == TypeKind.SView
+            EmitStatus.Declined return if result_type.kind == TypeKind.Unmodeled
+            EmitStatus.Declined return if packed_scrutinee and runtime.active_store_enum != packed_root_index_of(structs, scrutinee_type.bits.i64())
+            EmitStatus.Declined return if not is_integer_type(scrutinee_type) and not penum_scrutinee and not packed_scrutinee and not cstr_scrutinee and not sview_scrutinee
+            if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scrutinee_raw:
+                mis_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                mis_scrutinee: mutable LLVMValueRef = scrutinee_raw
+                mis_compare_type: mutable LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
+                if packed_scrutinee:
+                    mis_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "mis.state")
+                    mis_index: LLVMValueRef = LLVMBuildZExt(builder, scrutinee_raw, LLVMInt64TypeInContext(ctx), "mis.index")
+                    mis_tag_args: mutable darray[LLVMValueRef] = [mis_state, mis_index]
+                    mis_tag_pointer: void& = (&mis_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                    mis_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, mis_tag_pointer, 2, "mis.record")
+                    mis_row_type: LLVMTypeRef = packed_row_llvm_type(structs, scrutinee_type.bits.i64(), ctx)
+                    mis_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, 0, "mis.tag.ptr")
+                    mis_scrutinee <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), mis_tag_ptr, "mis.tag")
+                    mis_compare_type <- LLVMInt32TypeInContext(ctx)
+                if penum_scrutinee:
+                    mis_scrutinee <- LLVMBuildExtractValue(builder, scrutinee_raw, 0, "mis.penum.tag")
+                    mis_compare_type <- LLVMInt32TypeInContext(ctx)
+                mis_slot_storage: mutable darray[u8] = []
+                mis_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(result_type, structs, ctx), sview_to_cstr(var_name, mis_slot_storage))
+                mis_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.done")
+                mis_declined: mutable bool = false
+                mis_saw_default: mutable bool = false
+                for arm in match_arms |mis_declined, mis_saw_default, cstr_scrutinee, sview_scrutinee, packed_scrutinee, penum_scrutinee, mis_scrutinee, scrutinee_raw, scrutinee_type, mis_compare_type, result_type, mis_result_slot, mis_done, mis_function, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                    continue if mis_declined or mis_saw_default
+                    mis_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.arm")
+                    # Catch-all (`_` / binder): unconditional, closes the chain.
+                    if is_catch_all_pattern(arm.pattern):
+                        _ = LLVMBuildBr(builder, mis_arm_block)
+                        LLVMPositionBuilderAtEnd(builder, mis_arm_block)
+                        if arm.pattern is Pattern.Binding(mis_bind_name):
+                            mis_bind_storage: mutable darray[u8] = []
+                            mis_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(scrutinee_type, structs, ctx), sview_to_cstr(mis_bind_name, mis_bind_storage))
+                            _ = LLVMBuildStore(builder, scrutinee_raw, mis_bind_slot)
+                            declare_local(local_scope, mis_bind_name, mis_bind_slot, scrutinee_type)
+                        if emit_arm_body_into_slot(arm.body, result_type, mis_result_slot, mis_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder):
+                            mis_saw_default <- true
+                        else:
+                            mis_declined <- true
+                        continue
+                    # Compute the arm's hit test into `mis_hit` and (for variants) bind payload.
+                    mis_next: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.next")
+                    mis_hit: mutable LLVMValueRef = zeroed
+                    mis_have_hit: mutable bool = false
+                    if arm.pattern is Pattern.Literal(mis_lit_text):
+                        if cstr_scrutinee:
+                            mis_cstr_storage: mutable darray[u8] = []
+                            if string_pattern_content_cstr(mis_lit_text, mis_cstr_storage) is mis_cstr:
+                                mis_cstr_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, mis_cstr, "mis.strpat")
+                                mis_streq_args: mutable darray[LLVMValueRef] = [mis_scrutinee, mis_cstr_global]
+                                mis_streq_pointer: void& = (&mis_streq_args[0]).cast[void&] can Unsafe.PointerCast
+                                mis_streq_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.streq_type, runtime.streq, mis_streq_pointer, 2, "mis.streq")
+                                mis_hit <- LLVMBuildICmp(builder, 33, mis_streq_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "mis.streq.hit")
+                                mis_have_hit <- true
+                            else:
+                                mis_declined <- true
+                        elif sview_scrutinee:
+                            mis_sv_storage: mutable darray[u8] = []
+                            if string_pattern_content_cstr(mis_lit_text, mis_sv_storage) is mis_sv_cstr:
+                                mis_sv_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, mis_sv_cstr, "mis.svpat")
+                                mis_sv_lit_type: LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
+                                mis_sv_undef: LLVMValueRef = LLVMGetUndef(mis_sv_lit_type)
+                                mis_sv_with_ptr: LLVMValueRef = LLVMBuildInsertValue(builder, mis_sv_undef, mis_sv_global, 0, "mis.svpat.ptr")
+                                mis_sv_len: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), (mis_sv_storage.count - 1).u64(), 0)
+                                mis_sv_lit: LLVMValueRef = LLVMBuildInsertValue(builder, mis_sv_with_ptr, mis_sv_len, 1, "mis.svpat.len")
+                                mis_sv_args: mutable darray[LLVMValueRef] = [scrutinee_raw, mis_sv_lit]
+                                mis_sv_pointer: void& = (&mis_sv_args[0]).cast[void&] can Unsafe.PointerCast
+                                mis_sv_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, mis_sv_pointer, 2, "mis.sview.eq")
+                                mis_hit <- LLVMBuildICmp(builder, 33, mis_sv_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "mis.sview.hit")
+                                mis_have_hit <- true
+                            else:
+                                mis_declined <- true
+                        else:
+                            mis_lit_value: mutable i64 = 0
+                            if parse_pattern_scalar(mis_lit_text, mis_lit_value):
+                                mis_hit <- LLVMBuildICmp(builder, 32, mis_scrutinee, LLVMConstInt(llvm_type_of(scrutinee_type, structs, ctx), mis_lit_value.u64(), 1), "mis.int.hit")
+                                mis_have_hit <- true
+                            else:
+                                mis_declined <- true
+                    elif arm.pattern is Pattern.Variant(mis_variant_path, mis_variant_fields):
+                        mis_ordinal: mutable i64 = -1
+                        if packed_scrutinee:
+                            mis_ordinal <- packed_variant_index_of_path(mis_variant_path, structs)
+                        if penum_scrutinee:
+                            mis_ordinal <- penum_variant_index_of_path(mis_variant_path, structs)
+                        # A const-enum variant on an integer scrutinee (`TokenKind.With`) compares
+                        # against the variant's ORDINAL value, exactly like an integer literal.
+                        if not packed_scrutinee and not penum_scrutinee:
+                            mis_ordinal <- ordinal_of_dotted_path(mis_variant_path, structs)
+                        if mis_ordinal >= 0:
+                            mis_hit <- LLVMBuildICmp(builder, 32, mis_scrutinee, LLVMConstInt(mis_compare_type, mis_ordinal.u64(), 0), "mis.variant.hit")
+                            mis_have_hit <- true
+                        else:
+                            mis_declined <- true
+                    else:
+                        mis_declined <- true
+                    if mis_declined:
+                        LLVMPositionBuilderAtEnd(builder, mis_next)
+                        continue
+                    if mis_have_hit:
+                        _ = LLVMBuildCondBr(builder, mis_hit, mis_arm_block, mis_next)
+                        LLVMPositionBuilderAtEnd(builder, mis_arm_block)
+                        if arm_has_guard(arm.guard):
+                            if emit_condition(arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is mis_guard_bit:
+                                mis_guard_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.guard")
+                                _ = LLVMBuildCondBr(builder, mis_guard_bit, mis_guard_body, mis_next)
+                                LLVMPositionBuilderAtEnd(builder, mis_guard_body)
+                            else:
+                                mis_declined <- true
+                        if not mis_declined:
+                            if not emit_arm_body_into_slot(arm.body, result_type, mis_result_slot, mis_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder):
+                                mis_declined <- true
+                        LLVMPositionBuilderAtEnd(builder, mis_next)
+                EmitStatus.Declined return if mis_declined
+                if not mis_saw_default:
+                    _ = LLVMBuildUnreachable(builder)
+                LLVMPositionBuilderAtEnd(builder, mis_done)
+                declare_local(local_scope, var_name, mis_result_slot, result_type)
+                return EmitStatus.Open
+            return EmitStatus.Declined
+
+        # list ended the block.
+        #
+        # A statement AFTER a terminator is unreachable; the subset does not model dead
+        # code, so it declines rather than emitting into a closed block (which LLVM would
+        # reject anyway).
+        def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            status: mutable EmitStatus = EmitStatus.Open
+            for statement in body |status, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                # Stage0 accepts unreachable tails after a return/break/terminating nested
+                # block and emits no code for them. Preserve the already-terminated status;
+                # treating the dead tail as a backend decline incorrectly stripped otherwise
+                # valid functions such as packed-store AST helpers.
+                continue if status != EmitStatus.Open
+                status <- emit_statement(statement, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                if status == EmitStatus.Declined and dbg_decline_enabled():
+                    _ = dbg_decline(runtime.disjoint_function_name, statement)
+            return status

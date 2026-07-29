@@ -1,0 +1,526 @@
+# Stage1 backend — generic CALLS: instantiation dispatch, UFCS, lambda values, and the error-union carrier.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        def emit_generic_call(base: sview, type_args: darray[ValueType]&, arguments: darray[Expr]&, argument_names: darray[sview], local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # An ERROR-returning instantiation uses the out-param + i32-status ABI. A plain
+            # call hands the caller the STATUS where it expects a value, and the caller's
+            # `extractvalue` on that i32 crashes LLVM outright (a `try f(x) else null` over
+            # a generic error fn segfaulted the backend). Such calls must go through the
+            # error path (emit_error_union_call_value / emit_propagating_try*).
+            error_generic_slot: i64 = generic_index_of(generics, base)
+            if error_generic_slot >= 0:
+                null return if generics.is_error[error_generic_slot.usize()]
+            if instantiate_generic(base, type_args, generics, structs, m, ctx) is target:
+                argument_values: mutable darray[LLVMValueRef] = []
+                declined: mutable bool = false
+                argument_index: mutable usize = 0
+                named_call: mutable bool = false
+                for argument_name in argument_names |named_call|:
+                    named_call <- true if argument_name != ""
+                if named_call:
+                    generic_slot: i64 = generic_index_of(generics, base)
+                    null return if generic_slot < 0
+                    if generics.decls[generic_slot.usize()] is Decl.Func(generic_name, generic_params, generic_return, generic_body, generic_effects, generic_decorators, generic_line):
+                        named_position: mutable usize = 0
+                        while named_position < generic_params.count |argument_values, declined, named_position, argument_names, arguments, generic_params, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            source_index: i64 = generic_named_argument_index(argument_names, generic_params, named_position)
+                            null return if source_index < 0 or source_index.usize() >= arguments.count
+                            named_wanted: ValueType = instantiation_param_type(base, type_args, named_position, generics, structs)
+                            if emit_expression(arguments[source_index.usize()], named_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is named_argument_value:
+                                argument_values.push(named_argument_value)
+                            else:
+                                declined <- true
+                            named_position <- named_position + 1
+                    else:
+                        declined <- true
+                else:
+                    for argument in arguments |argument_values, declined, argument_index, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        # Each argument is emitted at its PARAMETER's type, resolved through the
+                        # instantiation's bindings — so a literal argument to `f[u8]` becomes a
+                        # u8, not an i64.
+                        wanted: ValueType = instantiation_param_type(base, type_args, argument_index, generics, structs)
+                        if emit_expression(argument, wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is emitted_argument:
+                            argument_values.push(emitted_argument)
+                        else:
+                            declined <- true
+                        argument_index <- argument_index + 1
+                null return if declined
+                # A container-growing/-returning instantiation trails an arena param (matching
+                # instantiate_generic's signature); hand over OUR arena so the darray it builds
+                # lives in a region that outlives the call.
+                argument_values.push(runtime.arena) if instantiation_wants_arena(base, type_args, generics, structs)
+                fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                # A VOID call must be unnamed: "instructions returning void cannot have a name".
+                gresult_name: cstr = call_result_name(generic_return_type(base, type_args, generics, structs))
+                LLVMBuildCall2(builder, fn_type, target, null, 0, gresult_name) return if argument_values.count == 0
+                args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildCall2(builder, fn_type, target, args_pointer, argument_values.count.u32(), gresult_name)
+            return null
+
+
+        # Add an already-emitted task to a nursery group. The task value cannot be emitted a
+        # second time (doing so would submit the work twice), so this small value-call variant
+        # mirrors emit_generic_call but accepts the second LLVM argument directly.
+        def emit_task_group_add_value(group_name: sview, task_value: LLVMValueRef, task_result_type: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            group_args: darray[ValueType] = [task_result_type]
+            if instantiate_generic("task_group_add", group_args, generics, structs, m, ctx) is target:
+                group_wanted: ValueType = instantiation_param_type("task_group_add", group_args, 0, generics, structs)
+                if emit_expression(Expr.Ident(group_name, 0), group_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is group_value:
+                    add_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                    add_args: mutable darray[LLVMValueRef] = [group_value, task_value]
+                    add_pointer: void& = (&add_args[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMBuildCall2(builder, add_type, target, add_pointer, 2, "")
+            return null
+
+
+        # Infer template SLOT's type arguments for a UFCS call `recv.f(a, b)` == `f(recv, a, b)`:
+        # parameter 0 unifies with the receiver, parameters 1+ with the explicit arguments. The
+        # receiver is threaded separately (a receiver-then-args darray[Expr] crashes stage0).
+        # Returns empty when any parameter stays unbound — which is how the WRONG overload for this
+        # receiver is rejected (its parameter-0 base will not match, leaving a type param free).
+        def infer_generic_args_ufcs(slot: usize, receiver: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            count: usize = generics.param_count[slot]
+            bindings: mutable darray[ValueType] = [unmodeled_type() for _slot_index in 0..<count]
+            bound_flags: mutable darray[bool] = [false for _flag_index in 0..<count]
+            no_args: darray[ValueType] = []
+            if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                no_args return if params.count == 0
+                receiver_actual: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+                unify_annotation(params[0].type_expression, receiver_actual, generics, slot, structs, bindings, bound_flags) if receiver_actual.kind != TypeKind.Unmodeled
+                arg_limit: usize = (params.count - 1.usize()) if (params.count - 1.usize()) < arguments.count else arguments.count
+                for position in 0..<arg_limit |bindings, bound_flags, params, arguments, local_scope, fns, structs, generics, slot|:
+                    actual: mutable ValueType = expression_type(arguments[position], local_scope, fns, structs, generics)
+                    actual <- ValueType{kind: TypeKind.Signed, bits: 64} if actual.kind == TypeKind.Unmodeled and is_int_literal_expr(arguments[position])
+                    continue if actual.kind == TypeKind.Unmodeled
+                    unify_annotation(params[position + 1.usize()].type_expression, actual, generics, slot, structs, bindings, bound_flags)
+            for flag_index in 0..<count |bound_flags, no_args, count|:
+                no_args return if not bound_flags[flag_index]
+            return bindings
+
+
+        # Emit a UFCS call to a GENERIC user function at a specific template SLOT: `recv.f(a)` as
+        # `f(recv, a)`, receiver as parameter 0. The slot-keyed analogue of emit_generic_call, used
+        # for overloaded std generics (Slice/Deque/…) that direct-name resolution cannot distinguish.
+        def emit_generic_ufcs_call(slot: usize, type_args: darray[ValueType]&, receiver: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instantiate_generic_at(slot, type_args, generics, structs, m, ctx) is target:
+                argument_values: mutable darray[LLVMValueRef] = []
+                declined: mutable bool = false
+                receiver_wanted: ValueType = instantiation_param_type_at(slot, type_args, 0.usize(), generics, structs)
+                if emit_expression(receiver, receiver_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is emitted_receiver:
+                    argument_values.push(emitted_receiver)
+                else:
+                    declined <- true
+                argument_index: mutable usize = 1.usize()
+                for argument in arguments |argument_values, declined, argument_index, slot, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    wanted: ValueType = instantiation_param_type_at(slot, type_args, argument_index, generics, structs)
+                    if emit_expression(argument, wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is emitted_argument:
+                        argument_values.push(emitted_argument)
+                    else:
+                        declined <- true
+                    argument_index <- argument_index + 1.usize()
+                null return if declined
+                argument_values.push(runtime.arena) if instantiation_wants_arena_at(slot, type_args, generics, structs)
+                ufcs_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                ufcs_result_name: cstr = call_result_name(generic_return_type_at(slot, type_args, generics, structs))
+                LLVMBuildCall2(builder, ufcs_fn_type, target, null, 0, ufcs_result_name) return if argument_values.count == 0
+                ufcs_args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildCall2(builder, ufcs_fn_type, target, ufcs_args_pointer, argument_values.count.u32(), ufcs_result_name)
+            return null
+
+
+        # Emit a synthesized dict-method call — stage0 lowers `d.get(k)` / `d.put(k, v)` to a
+        # call to a std generic (`arena_dict_get` / `arena_dict_put_or_panic`), NOT to a user
+        # `get`/`put` function. The RECEIVER is threaded separately (a `darray[Expr]` of
+        # receiver-then-args crashes stage0), and for a mutating helper the region leads the
+        # argument list (stage0: `arena_dict_put_or_panic(ptr %region, ptr %d, …)`).
+        # Emit a lambda VALUE `fn(params) => body` as a tagged closure, per stage0's ABI:
+        # malloc an env of the captured enclosing scalars, emit a LIFTED `@lambda(ptr env,
+        # params…)` whose body loads its captures from env, then malloc a `{code, env}` closure
+        # and `ptrtoint | 1`-tag it. `expected` (a Fn) supplies the param + return types. Sound
+        # subset: only SCALAR captures (int/bool/float) and a modeled return; anything else
+        # declines. Non-capturing lambdas pass a null env.
+        def emit_lambda_value(lambda_params: darray[sview], lambda_body: darray[Stmt], expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            null return if expected.kind != TypeKind.Fn
+            return_type: ValueType = fn_return_type_of(expected, structs)
+            null return if return_type.kind == TypeKind.Unmodeled
+            null return if expected.bits.usize() >= structs.fn_pool_param_start.count
+            param_span_start: usize = structs.fn_pool_param_start[expected.bits.usize()]
+            param_span_count: usize = structs.fn_pool_param_count[expected.bits.usize()]
+            null return if param_span_count != lambda_params.count
+            return_llvm: LLVMTypeRef = llvm_type_of(return_type, structs, ctx)
+            param_types: mutable darray[ValueType] = []
+            param_llvms: mutable darray[LLVMTypeRef] = []
+            param_declined: mutable bool = false
+            param_probe: mutable usize = 0
+            while param_probe < param_span_count |param_types, param_llvms, param_declined, param_probe, param_span_start, structs, ctx|:
+                one_param: ValueType = copied_type(structs.fn_pool_params[param_span_start + param_probe])
+                param_declined <- true if one_param.kind == TypeKind.Unmodeled
+                param_types.push(one_param)
+                param_llvms.push(llvm_type_of(one_param, structs, ctx))
+                param_probe <- param_probe + 1
+            null return if param_declined
+            # Capture every SCALAR local in scope, BY VALUE (load it now, in the caller block).
+            capture_names: mutable darray[sview] = []
+            capture_types: mutable darray[ValueType] = []
+            capture_llvms: mutable darray[LLVMTypeRef] = []
+            capture_values: mutable darray[LLVMValueRef] = []
+            capture_probe: mutable usize = 0
+            while capture_probe < local_scope.names.count |capture_names, capture_types, capture_llvms, capture_values, capture_probe, local_scope, structs, ctx, builder|:
+                capture_type: ValueType = copied_type(local_scope.types[capture_probe])
+                if is_integer_type(capture_type) or capture_type.kind == TypeKind.Bool or capture_type.kind == TypeKind.Float:
+                    capture_llvm: LLVMTypeRef = llvm_type_of(capture_type, structs, ctx)
+                    capture_names.push(local_scope.names[capture_probe])
+                    capture_types.push(capture_type)
+                    capture_llvms.push(capture_llvm)
+                    capture_values.push(LLVMBuildLoad2(builder, capture_llvm, local_scope.slots[capture_probe], "lambda.capture"))
+                capture_probe <- capture_probe + 1
+            # Build + fill the env (null when nothing is captured).
+            has_env: bool = capture_names.count > 0
+            env_struct_type: mutable LLVMTypeRef = zeroed
+            env_pointer: mutable LLVMValueRef = LLVMConstNull(pointer_type)
+            malloc_param_types: mutable darray[LLVMTypeRef] = [int64_type]
+            malloc_types_pointer: void& = (&malloc_param_types[0]).cast[void&] can Unsafe.PointerCast
+            malloc_type: LLVMTypeRef = LLVMFunctionType(pointer_type, malloc_types_pointer, 1, 0)
+            malloc_fn: LLVMValueRef = declare_or_get_named(m, "malloc", malloc_type)
+            if has_env:
+                env_fields_pointer: void& = (&capture_llvms[0]).cast[void&] can Unsafe.PointerCast
+                env_struct_type <- LLVMStructTypeInContext(ctx, env_fields_pointer, capture_names.count.u32(), 0)
+                env_malloc_args: mutable darray[LLVMValueRef] = [LLVMSizeOf(env_struct_type)]
+                env_malloc_pointer: void& = (&env_malloc_args[0]).cast[void&] can Unsafe.PointerCast
+                env_pointer <- LLVMBuildCall2(builder, malloc_type, malloc_fn, env_malloc_pointer, 1, "lambda.env")
+                store_probe: mutable usize = 0
+                while store_probe < capture_names.count |store_probe, env_struct_type, env_pointer, capture_values, builder|:
+                    store_field: LLVMValueRef = LLVMBuildStructGEP2(builder, env_struct_type, env_pointer, store_probe.u32(), "lambda.env.field")
+                    _ = LLVMBuildStore(builder, capture_values[store_probe], store_field)
+                    store_probe <- store_probe + 1
+            # The LIFTED function `@lambda(ptr env, params…)`. LLVM uniquifies the name.
+            lifted_llvm_types: mutable darray[LLVMTypeRef] = [pointer_type]
+            lifted_llvm_types.extend(param_llvms)
+            lifted_types_pointer: void& = (&lifted_llvm_types[0]).cast[void&] can Unsafe.PointerCast
+            lifted_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, lifted_types_pointer, (param_span_count + 1).u32(), 0)
+            lifted_fn: LLVMValueRef = LLVMAddFunction(m, "lambda", lifted_fn_type)
+            saved_block: LLVMBasicBlockRef = LLVMGetInsertBlock(builder)
+            lifted_entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lifted_fn, "entry")
+            LLVMPositionBuilderAtEnd(builder, lifted_entry)
+            lifted_scope: mutable Scope = Scope{names: [], slots: [], types: [], pool_names: [], group_names: [], deferred: []}
+            lifted_loops: mutable LoopStack = LoopStack{exits: [], continues: []}
+            lifted_regions: mutable RegionStack = RegionStack{arenas: []}
+            lifted_runtime: mutable Runtime = copied_runtime(runtime)
+            lifted_arena_type: LLVMTypeRef = arena_llvm_type(ctx)
+            lifted_arena_slot: LLVMValueRef = LLVMBuildAlloca(builder, lifted_arena_type, "auto.region")
+            _ = LLVMBuildStore(builder, LLVMConstNull(lifted_arena_type), lifted_arena_slot)
+            lifted_strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, lifted_arena_type, lifted_arena_slot, 3, "region.strategy")
+            _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), lifted_strategy_pointer)
+            lifted_runtime.arena <- lifted_arena_slot
+            lifted_runtime.owns_arena <- true
+            lifted_runtime.debug_active <- false
+            lifted_regions.arenas.push(lifted_arena_slot)
+            # Load each capture from the env param (param 0) into a fresh local.
+            env_param: LLVMValueRef = LLVMGetParam(lifted_fn, 0)
+            load_probe: mutable usize = 0
+            while load_probe < capture_names.count |load_probe, env_struct_type, env_param, capture_llvms, capture_names, capture_types, lifted_scope, builder|:
+                load_field: LLVMValueRef = LLVMBuildStructGEP2(builder, env_struct_type, env_param, load_probe.u32(), "lambda.cap.ptr")
+                loaded_capture: LLVMValueRef = LLVMBuildLoad2(builder, capture_llvms[load_probe], load_field, "lambda.cap")
+                capture_slot: LLVMValueRef = LLVMBuildAlloca(builder, capture_llvms[load_probe], "lambda.cap.slot")
+                _ = LLVMBuildStore(builder, loaded_capture, capture_slot)
+                declare_local(lifted_scope, capture_names[load_probe], capture_slot, capture_types[load_probe])
+                load_probe <- load_probe + 1
+            # Declare the lambda's own params (LLVM params 1..).
+            lifted_param_probe: mutable usize = 0
+            while lifted_param_probe < lambda_params.count |lifted_param_probe, lifted_fn, param_llvms, param_types, lambda_params, lifted_scope, builder|:
+                lifted_param_slot: LLVMValueRef = LLVMBuildAlloca(builder, param_llvms[lifted_param_probe], "lambda.param")
+                _ = LLVMBuildStore(builder, LLVMGetParam(lifted_fn, (lifted_param_probe + 1).u32()), lifted_param_slot)
+                declare_local(lifted_scope, lambda_params[lifted_param_probe], lifted_param_slot, param_types[lifted_param_probe])
+                lifted_param_probe <- lifted_param_probe + 1
+            lifted_status: EmitStatus = emit_statements(lambda_body, return_type, lifted_scope, lifted_loops, lifted_regions, fns, structs, generics, lifted_runtime, m, ctx, builder)
+            lifted_ok: mutable bool = lifted_status != EmitStatus.Declined
+            if lifted_status == EmitStatus.Open:
+                if return_type.kind == TypeKind.Void:
+                    emit_region_free(lifted_runtime, builder)
+                    _ = LLVMBuildRetVoid(builder)
+                else:
+                    lifted_ok <- false
+            LLVMPositionBuilderAtEnd(builder, saved_block)
+            if not lifted_ok:
+                strip_function_body(lifted_fn)
+                return null
+            # Build the `{code, env}` closure and tag it.
+            closure_fields: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type]
+            closure_fields_pointer: void& = (&closure_fields[0]).cast[void&] can Unsafe.PointerCast
+            closure_struct_type: LLVMTypeRef = LLVMStructTypeInContext(ctx, closure_fields_pointer, 2, 0)
+            closure_malloc_args: mutable darray[LLVMValueRef] = [LLVMSizeOf(closure_struct_type)]
+            closure_malloc_pointer: void& = (&closure_malloc_args[0]).cast[void&] can Unsafe.PointerCast
+            closure_pointer: LLVMValueRef = LLVMBuildCall2(builder, malloc_type, malloc_fn, closure_malloc_pointer, 1, "lambda.closure")
+            closure_code_field: LLVMValueRef = LLVMBuildStructGEP2(builder, closure_struct_type, closure_pointer, 0, "lambda.closure.code")
+            _ = LLVMBuildStore(builder, lifted_fn, closure_code_field)
+            closure_env_field: LLVMValueRef = LLVMBuildStructGEP2(builder, closure_struct_type, closure_pointer, 1, "lambda.closure.env")
+            _ = LLVMBuildStore(builder, env_pointer, closure_env_field)
+            closure_integer: LLVMValueRef = LLVMBuildPtrToInt(builder, closure_pointer, int64_type, "lambda.closure.int")
+            closure_tagged: LLVMValueRef = LLVMBuildOr(builder, closure_integer, LLVMConstInt(int64_type, 1, 0), "lambda.closure.tagged")
+            return LLVMBuildIntToPtr(builder, closure_tagged, pointer_type, "lambda.closure.value")
+
+
+        # Call THROUGH a `fn(…)` VALUE (a fn-typed local/param), e.g. `fn(value)` inside
+        # `apply(fn: fn(i64)->i64, …)`. The value is a low-bit-tagged ptr: bit0 clear → a raw
+        # function pointer (call directly); bit0 set → an `%ElisaCoreLambdaClosure = {ptr code,
+        # ptr env}` (unmask, load code+env, call `code(env, args…)`). The result type is the
+        # EXPECTED type (a `return f(x)` / `y: R = f(x)` supplies it). Branch results merge
+        # through an alloca (LLVMBuildPhi is not bound). Mirrors stage0's llvm call lowering.
+        def emit_fn_value_call(callee: Expr, arguments: darray[Expr]&, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            # The result type: the fn value's own DECLARED return type (from its Fn signature)
+            # is authoritative and works even in argument position (`f(f(x))`); fall back to the
+            # call site's EXPECTED type when the signature carries no return (older Fn{bits:0}).
+            declared_return: mutable ValueType = unmodeled_type()
+            if callee is Expr.Ident(callee_fn_name, callee_fn_name_line):
+                declared_return <- fn_return_type_of(lookup_type(local_scope, callee_fn_name), structs)
+            result_type: ValueType = declared_return if declared_return.kind != TypeKind.Unmodeled else expected
+            null return if result_type.kind == TypeKind.Void or result_type.kind == TypeKind.Unmodeled or result_type.kind == TypeKind.Fn
+            return_llvm: LLVMTypeRef = llvm_type_of(result_type, structs, ctx)
+            fn_pointer_opt: LLVMValueRef? = emit_expression(callee, ValueType{kind: TypeKind.Fn, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            fn_pointer: mutable LLVMValueRef = zeroed
+            got_fn_pointer: mutable bool = false
+            if fn_pointer_opt is fn_pointer_bound:
+                fn_pointer <- fn_pointer_bound
+                got_fn_pointer <- true
+            null return if not got_fn_pointer
+            # The fn value's declared PARAM types (from its Fn signature pool) so a LITERAL
+            # argument (`f(20)`) adopts the param type instead of failing expression_type.
+            callee_param_types: mutable darray[ValueType] = []
+            if callee is Expr.Ident(callee_param_name, callee_param_line):
+                callee_fn_type: ValueType = lookup_type(local_scope, callee_param_name)
+                if callee_fn_type.kind == TypeKind.Fn and callee_fn_type.bits.usize() < structs.fn_pool_param_start.count:
+                    callee_param_start: usize = structs.fn_pool_param_start[callee_fn_type.bits.usize()]
+                    callee_param_span: usize = structs.fn_pool_param_count[callee_fn_type.bits.usize()]
+                    callee_param_offset: mutable usize = 0
+                    while callee_param_offset < callee_param_span |callee_param_types, callee_param_offset, callee_param_start, structs|:
+                        callee_param_types.push(copied_type(structs.fn_pool_params[callee_param_start + callee_param_offset]))
+                        callee_param_offset <- callee_param_offset + 1
+            argument_values: mutable darray[LLVMValueRef] = []
+            argument_llvm_types: mutable darray[LLVMTypeRef] = []
+            arg_declined: mutable bool = false
+            arg_index: mutable usize = 0
+            for call_argument in arguments |argument_values, argument_llvm_types, arg_declined, arg_index, callee_param_types, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                continue if arg_declined
+                signature_arg_type: ValueType = copied_type(callee_param_types[arg_index]) if arg_index < callee_param_types.count else unmodeled_type()
+                inferred_arg_type: ValueType = expression_type(call_argument, local_scope, fns, structs, generics)
+                call_argument_type: ValueType = signature_arg_type if signature_arg_type.kind != TypeKind.Unmodeled else inferred_arg_type
+                if call_argument_type.kind == TypeKind.Unmodeled:
+                    arg_declined <- true
+                elif emit_expression(call_argument, call_argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is call_argument_value:
+                    argument_values.push(call_argument_value)
+                    argument_llvm_types.push(llvm_type_of(call_argument_type, structs, ctx))
+                else:
+                    arg_declined <- true
+                arg_index <- arg_index + 1
+            null return if arg_declined
+            argument_count: usize = argument_values.count
+            # A zero-argument function value (`f()`) is supported: LLVM ignores the args/types
+            # base pointers when the count is 0, but Elisa cannot index `[0]` on an EMPTY darray,
+            # so the RAW path below falls back to a 1-element dummy pointer (never read). The
+            # CLOSURE path is unaffected — it always prepends the env, so its arrays are non-empty.
+            raw_dummy_type: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+            raw_dummy_value: mutable darray[LLVMValueRef] = [fn_pointer]
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, return_llvm, "fnval.result")
+            fn_integer: LLVMValueRef = LLVMBuildPtrToInt(builder, fn_pointer, int64_type, "fnval.int")
+            fn_tag: LLVMValueRef = LLVMBuildAnd(builder, fn_integer, LLVMConstInt(int64_type, 1, 0), "fnval.tag")
+            is_closure: LLVMValueRef = LLVMBuildICmp(builder, 33, fn_tag, LLVMConstInt(int64_type, 0, 0), "fnval.is_closure")
+            enclosing: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            raw_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, enclosing, "fnval.raw")
+            closure_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, enclosing, "fnval.closure")
+            merge_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, enclosing, "fnval.merge")
+            _ = LLVMBuildCondBr(builder, is_closure, closure_block, raw_block)
+            # RAW: call the pointer as an ordinary `return_llvm (args…)` function.
+            LLVMPositionBuilderAtEnd(builder, raw_block)
+            raw_types_pointer: void& = (&argument_llvm_types[0]).cast[void&] can Unsafe.PointerCast if argument_count > 0 else (&raw_dummy_type[0]).cast[void&] can Unsafe.PointerCast
+            raw_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, raw_types_pointer, argument_count.u32(), 0)
+            raw_args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast if argument_count > 0 else (&raw_dummy_value[0]).cast[void&] can Unsafe.PointerCast
+            raw_result: LLVMValueRef = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, argument_count.u32(), "fnval.raw.call")
+            _ = LLVMBuildStore(builder, raw_result, result_slot)
+            _ = LLVMBuildBr(builder, merge_block)
+            # CLOSURE: unmask (bit0 is known set here, so `- 1` clears it), load {code, env},
+            # and call `code(env, args…)`.
+            LLVMPositionBuilderAtEnd(builder, closure_block)
+            closure_integer: LLVMValueRef = LLVMBuildSub(builder, fn_integer, LLVMConstInt(int64_type, 1, 0), "fnval.unmask")
+            closure_pointer: LLVMValueRef = LLVMBuildIntToPtr(builder, closure_integer, pointer_type, "fnval.cptr")
+            closure_fields: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type]
+            closure_fields_pointer: void& = (&closure_fields[0]).cast[void&] can Unsafe.PointerCast
+            closure_struct_type: LLVMTypeRef = LLVMStructTypeInContext(ctx, closure_fields_pointer, 2, 0)
+            code_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, closure_struct_type, closure_pointer, 0, "fnval.code.ptr")
+            env_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, closure_struct_type, closure_pointer, 1, "fnval.env.ptr")
+            code_pointer: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, code_field_pointer, "fnval.code")
+            env_pointer: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, env_field_pointer, "fnval.env")
+            closure_arg_types: mutable darray[LLVMTypeRef] = [pointer_type]
+            closure_arg_types.extend(argument_llvm_types)
+            closure_arg_values: mutable darray[LLVMValueRef] = [env_pointer]
+            closure_arg_values.extend(argument_values)
+            closure_types_pointer: void& = (&closure_arg_types[0]).cast[void&] can Unsafe.PointerCast
+            closure_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, closure_types_pointer, (argument_count + 1).u32(), 0)
+            closure_args_pointer: void& = (&closure_arg_values[0]).cast[void&] can Unsafe.PointerCast
+            closure_result: LLVMValueRef = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, (argument_count + 1).u32(), "fnval.closure.call")
+            _ = LLVMBuildStore(builder, closure_result, result_slot)
+            _ = LLVMBuildBr(builder, merge_block)
+            LLVMPositionBuilderAtEnd(builder, merge_block)
+            return LLVMBuildLoad2(builder, return_llvm, result_slot, "fnval.merged")
+
+
+        def emit_dict_method_call(base: sview, type_args: darray[ValueType]&, receiver: Expr, arguments: darray[Expr]&, arena_leading: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instantiate_generic(base, type_args, generics, structs, m, ctx) is target:
+                dict_arg_values: mutable darray[LLVMValueRef] = []
+                param_index: mutable usize = 0
+                # The leading region for a mutating helper — hand over OUR arena.
+                if arena_leading:
+                    dict_arg_values.push(runtime.arena)
+                    param_index <- 1
+                # The receiver, emitted at its `dict[K,T]&` parameter type (a bare dict local
+                # auto-borrows to its slot).
+                receiver_wanted: ValueType = instantiation_param_type(base, type_args, param_index, generics, structs)
+                if emit_expression(receiver, receiver_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is receiver_value:
+                    dict_arg_values.push(receiver_value)
+                    param_index <- param_index + 1
+                    method_declined: mutable bool = false
+                    for method_argument in arguments |dict_arg_values, method_declined, param_index, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        method_wanted: ValueType = instantiation_param_type(base, type_args, param_index, generics, structs)
+                        if emit_expression(method_argument, method_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is method_argument_value:
+                            dict_arg_values.push(method_argument_value)
+                        else:
+                            method_declined <- true
+                        param_index <- param_index + 1
+                    null return if method_declined
+                    dict_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                    dict_result_name: cstr = call_result_name(generic_return_type(base, type_args, generics, structs))
+                    dict_args_pointer: void& = (&dict_arg_values[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMBuildCall2(builder, dict_fn_type, target, dict_args_pointer, dict_arg_values.count.u32(), dict_result_name)
+                return null
+            return null
+
+
+        # If `receiver` has a `DynDict[K, T]` type, return its type-argument tuple (K, T);
+        # otherwise an empty darray. Used to lower `d.get`/`d.put` to the arena_dict_* helpers.
+        def dict_type_args_of(receiver: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            empty: darray[ValueType] = []
+            receiver_type: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+            empty return if receiver_type.kind != TypeKind.Struct
+            receiver_base: mutable sview = ""
+            receiver_arg_start: mutable usize = 0
+            receiver_arg_count: mutable usize = 0
+            has_instantiation: bool = generic_struct_instantiation_of(structs, receiver_type, receiver_base, receiver_arg_start, receiver_arg_count)
+            empty return if not has_instantiation
+            empty return if receiver_base != "DynDict"
+            collected: mutable darray[ValueType] = []
+            for offset in 0..<receiver_arg_count |collected, structs, receiver_arg_start|:
+                collected.push(copied_type(structs.generic_struct_inst_args[receiver_arg_start + offset]))
+            return collected
+
+
+        # The std helper a dict method lowers to — the FRICTIONLESS (panic-on-OOM, no `can`)
+        # surface, matching stage0's synthetic `dict.<method>` lowering. Empty = not a dict
+        # method (fall through to ordinary UFCS).
+        def dict_method_helper(method_name: sview) -> sview can[Abort.Panic]:
+            return when method_name:
+                "get" -> "arena_dict_get"
+                "get_mut" -> "arena_dict_get_mut"
+                "put" -> "arena_dict_put_or_panic"
+                "get_or_insert" -> "arena_dict_get_or_insert_or_panic"
+                "reserve" -> "arena_dict_reserve_or_panic"
+                "contains" -> "arena_dict_contains"
+                "remove" -> "arena_dict_remove"
+                "clear" -> "arena_dict_clear"
+                _ -> ""
+
+
+        # Whether a dict method mutates the map and therefore takes a LEADING region argument.
+        def dict_method_is_mutating(method_name: sview) -> bool can[Abort.Panic]:
+            return method_name == "put" or method_name == "get_or_insert" or method_name == "reserve"
+
+
+        # Emit a call `f(args…)`. Only a direct call to a named, already-declared function
+        # is modeled: the callee must exist in the module (emit_module declares every
+        # function before emitting any body, so definition order does not matter) and the
+        # arity must match.
+        # The LLVMAtomicRMWBinOp code for a std atomic read-modify-write op name, or -1.
+        # exchange=Xchg(0), fetch_add=Add(1), fetch_sub=Sub(2), fetch_and=And(3),
+        # fetch_or=Or(5), fetch_xor=Xor(6).
+        def atomic_rmw_op_of(name: sview) -> i64 can[Abort.Panic]:
+            0 return if name == "exchange"
+            1 return if name == "fetch_add"
+            2 return if name == "fetch_sub"
+            3 return if name == "fetch_and"
+            5 return if name == "fetch_or"
+            6 return if name == "fetch_xor"
+            return -1
+
+
+        # Whether an atomic cell's value type is a modeled INTEGER (known byte size) — the only
+        # shape LLVM atomic load/store/RMW handle here.
+        def atomic_value_is_integer(value_type: ValueType) -> bool can[Abort.Panic]:
+            return is_integer_type(value_type) and (value_type.bits == 8 or value_type.bits == 16 or value_type.bits == 32 or value_type.bits == 64)
+
+
+        # Recursive value cloning used by the darray clone path. Scalar values are already
+        # value-owned; fixed arrays, structs, optionals, and nested darrays need element/field
+        # reconstruction so an aggregate does not accidentally retain source-owned storage.
+        def emit_clone_error_union_value(source_value: LLVMValueRef, source_type: ValueType, target_type: ValueType, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if source_type.kind != TypeKind.ErrorUnion or target_type.kind != TypeKind.ErrorUnion
+            source_payload_type: ValueType = error_union_payload_of(source_type, structs)
+            target_payload_type: ValueType = error_union_payload_of(target_type, structs)
+            null return if source_payload_type.kind != target_payload_type.kind or source_payload_type.bits != target_payload_type.bits
+            source_code: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 0, "clone.error.code")
+            source_payload_ptr: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 1, "clone.error.payload")
+            zero_code: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)
+            is_success: LLVMValueRef = LLVMBuildICmp(builder, 32, source_code, zero_code, "clone.error.ok")
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            success_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.error.success")
+            failure_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.error.failure")
+            merge_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.error.merge")
+            union_llvm: LLVMTypeRef = llvm_type_of(target_type, structs, ctx)
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, union_llvm, "clone.error.slot")
+            _ = LLVMBuildCondBr(builder, is_success, success_block, failure_block)
+
+            LLVMPositionBuilderAtEnd(builder, success_block)
+            payload_llvm: LLVMTypeRef = llvm_type_of(source_payload_type, structs, ctx)
+            source_payload: LLVMValueRef = LLVMBuildLoad2(builder, payload_llvm, source_payload_ptr, "clone.error.payload.load")
+            if emit_clone_aggregate_value(source_payload, source_payload_type, target_payload_type, structs, runtime, m, ctx, builder) is cloned_payload:
+                payload_size: LLVMValueRef = LLVMSizeOf(payload_llvm)
+                alloc_args: mutable darray[LLVMValueRef] = [runtime.arena, payload_size]
+                alloc_pointer: void& = (&alloc_args[0]).cast[void&] can Unsafe.PointerCast
+                destination_payload_ptr: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "clone.error.alloc")
+                _ = LLVMBuildStore(builder, cloned_payload, destination_payload_ptr)
+                success_result: mutable LLVMValueRef = LLVMGetUndef(union_llvm)
+                success_result <- LLVMBuildInsertValue(builder, success_result, zero_code, 0, "clone.error.success.code")
+                success_result <- LLVMBuildInsertValue(builder, success_result, destination_payload_ptr, 1, "clone.error.success.payload")
+                _ = LLVMBuildStore(builder, success_result, result_slot)
+                _ = LLVMBuildBr(builder, merge_block)
+            else:
+                return null
+
+            LLVMPositionBuilderAtEnd(builder, failure_block)
+            failure_result: mutable LLVMValueRef = LLVMGetUndef(union_llvm)
+            failure_result <- LLVMBuildInsertValue(builder, failure_result, source_code, 0, "clone.error.failure.code")
+            failure_result <- LLVMBuildInsertValue(builder, failure_result, LLVMConstNull(LLVMPointerTypeInContext(ctx, 0)), 1, "clone.error.failure.payload")
+            _ = LLVMBuildStore(builder, failure_result, result_slot)
+            _ = LLVMBuildBr(builder, merge_block)
+
+            LLVMPositionBuilderAtEnd(builder, merge_block)
+            return LLVMBuildLoad2(builder, union_llvm, result_slot, "clone.error.result")
+
+
+        # Materialize the successful result of `try f(...)` into a first-class error-union
+        # local. Error-call lowering already produced the payload value; the union descriptor
+        # owns a fresh payload slot in the current arena and carries status code zero.
+        def build_error_union_success(payload_value: LLVMValueRef, payload_type: ValueType, union_type: ValueType, structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            payload_llvm: LLVMTypeRef = llvm_type_of(payload_type, structs, ctx)
+            payload_size: LLVMValueRef = LLVMSizeOf(payload_llvm)
+            alloc_args: mutable darray[LLVMValueRef] = [runtime.arena, payload_size]
+            alloc_pointer: void& = (&alloc_args[0]).cast[void&] can Unsafe.PointerCast
+            payload_slot: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "error.union.alloc")
+            _ = LLVMBuildStore(builder, payload_value, payload_slot)
+            result: mutable LLVMValueRef = LLVMGetUndef(llvm_type_of(union_type, structs, ctx))
+            result <- LLVMBuildInsertValue(builder, result, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), 0, "error.union.code")
+            result <- LLVMBuildInsertValue(builder, result, payload_slot, 1, "error.union.payload")
+            return result

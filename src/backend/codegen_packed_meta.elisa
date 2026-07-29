@@ -1,0 +1,514 @@
+# Stage1 backend — packed-enum METADATA queries: variant ordinals, payload slots, instantiation arena facts.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # Pattern literal/range bound: integer text OR char code.
+        # CharLit patterns are stored QUOTED (`'0'`) by the parser so they are distinct
+        # from integer `0`. Unquoted pure decimals stay integers.
+        def parse_pattern_scalar(text: sview, out_value: mutable i64&) -> bool can[Abort.Panic]:
+            # Quoted char (`'x'` / `'\n'`).
+            if sview_len(text) >= 2 and sview_at(text, 0) == 39:
+                return parse_char_literal_code(text, out_value)
+            # Escape interior without quotes (legacy).
+            if sview_len(text) >= 2 and sview_at(text, 0) == 92:
+                return parse_char_literal_code(text, out_value)
+            # Integer (including single-digit unquoted).
+            true return if parse_int_literal(text, out_value)
+            # Single-byte non-digit interior (e.g. `A` if a path still omits quotes).
+            return parse_char_literal_code(text, out_value)
+
+
+        # `Color.Red` -> its ordinal, or -1 if the path is not a const-enum member.
+        # Whether a LABELLED call is a payload-enum constructor whose label is the payload
+        # field's real name: `Shape.Circle(r: 42)` where the field is declared `r`. A label
+        # that names something else is a different program, so it must not be emitted as
+        # this constructor.
+        def penum_ctor_labels_match(callee: Expr, argument_names: darray[sview]&, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            false return if argument_names.count != 1
+            if callee is Expr.Field(label_head, label_variant, label_line):
+                if label_head is Expr.Ident(label_enum, label_enum_line):
+                    label_enum_index: i64 = penum_index_of(structs, label_enum)
+                    false return if label_enum_index < 0
+                    label_tag: i64 = penum_variant_index(structs, label_enum_index, label_variant)
+                    false return if label_tag < 0
+                    slot: usize = structs.penum_variant_start[label_enum_index.usize()] + label_tag.usize()
+                    false return if not structs.penum_has_payload[slot]
+                    return structs.penum_field_names[slot] == argument_names[0]
+            return false
+
+
+        def packed_variant_index_of_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            for enum_index in 0..<structs.packed_names.count |structs, path, dot|:
+                continue if not packed_path_matches_enum(path, structs.packed_names[enum_index], dot)
+                for offset in 0..<structs.packed_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    variant: sview = structs.packed_variants[structs.packed_variant_start[enum_index] + offset]
+                    packed_tag_base: mutable i64 = 0
+                    if packed_is_ast_refinement(structs, enum_index):
+                        for prior_enum in 0..<enum_index |packed_tag_base, structs|:
+                            packed_tag_base <- packed_tag_base + structs.packed_variant_count[prior_enum].i64() if packed_is_ast_refinement(structs, prior_enum.i64())
+                    (packed_tag_base + offset.i64()) return if sview_matches_prefix(path, variant, dot + 1, sview_len(path).i64())
+            return -1
+
+
+        # Source patterns may spell a refinement as `Ast::Expr.Variant` (or
+        # `Ast.Expr.Variant`), while the packed registry intentionally stores the
+        # leaf refinement name `Expr`. Accept both forms at the lookup boundary.
+        def packed_path_matches_enum(path: sview, enum_name: sview, dot: i64) -> bool can[Abort.Panic]:
+            true return if sview_matches_prefix(path, enum_name, 0, dot)
+            prefix_len: i64 = sview_len(enum_name).i64()
+            true return if dot == prefix_len + 5 and sview_matches_prefix(path, enum_name, 5, dot)
+            true return if dot == prefix_len + 4 and sview_matches_prefix(path, enum_name, 4, dot)
+            return false
+
+
+        def packed_variant_index_of_parts(enum_name: sview, variant_name: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            enum_index: i64 = packed_index_of(structs, enum_name)
+            -1 return if enum_index < 0
+            local_index: i64 = packed_variant_local_index(structs, enum_index, variant_name)
+            -1 return if local_index < 0
+            packed_tag_base: mutable i64 = 0
+            if packed_is_ast_refinement(structs, enum_index):
+                for prior_enum in 0..<enum_index |packed_tag_base, structs|:
+                    packed_tag_base <- packed_tag_base + structs.packed_variant_count[prior_enum.usize()].i64() if packed_is_ast_refinement(structs, prior_enum)
+            return packed_tag_base + local_index
+
+
+        def packed_payload_of_path(path: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            unmodeled_type() return if dot <= 0
+            for enum_index in 0..<structs.packed_names.count |structs, path, dot|:
+                continue if not packed_path_matches_enum(path, structs.packed_names[enum_index], dot)
+                for offset in 0..<structs.packed_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    slot: usize = structs.packed_variant_start[enum_index] + offset
+                    continue if not sview_matches_prefix(path, structs.packed_variants[slot], dot + 1, sview_len(path).i64())
+                    unmodeled_type() return if not structs.packed_has_payload[slot]
+                    return copied_type(structs.packed_payloads[slot])
+            return unmodeled_type()
+
+
+        # Return the packed payload pool slot for `Child.Variant`. The variant tag is
+        # hierarchy-global for AST refinements, but payload metadata remains local to the
+        # declaring refinement.
+        def packed_slot_of_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            for enum_index in 0..<structs.packed_names.count |structs, path, dot|:
+                continue if not packed_path_matches_enum(path, structs.packed_names[enum_index], dot)
+                for offset in 0..<structs.packed_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    slot: usize = structs.packed_variant_start[enum_index] + offset
+                    slot.i64() return if sview_matches_prefix(path, structs.packed_variants[slot], dot + 1, sview_len(path).i64())
+            return -1
+
+
+        # The packed twin of penum_ctor_labels_match: `new Node.Leaf(v: 42)` labels the
+        # payload field, and the label must be the field's real name.
+        def packed_ctor_labels_match(callee: Expr, argument_names: darray[sview]&, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            # With a `common:` block a constructor carries commons THEN the payload
+            # (`new Expr.Int(span: 1, value: 42)`), so more than one label is legitimate.
+            # Only the payload label is checked against its declared name here; the commons
+            # are positional-by-construction (the parser prepends them in order).
+            true return if argument_names.count > 1
+            false return if argument_names.count != 1
+            if callee is Expr.Field(packed_label_head, packed_label_variant, packed_label_line):
+                if packed_label_head is Expr.Ident(packed_label_enum, packed_label_enum_line):
+                    packed_label_index: i64 = packed_index_of(structs, packed_label_enum)
+                    false return if packed_label_index < 0
+                    packed_label_tag: i64 = packed_variant_index(structs, packed_label_index, packed_label_variant)
+                    false return if packed_label_tag < 0
+                    packed_label_slot: usize = structs.packed_variant_start[packed_label_index.usize()] + packed_variant_local_index(structs, packed_label_index, packed_label_variant).usize()
+                    false return if not structs.packed_has_payload[packed_label_slot]
+                    return structs.packed_field_names[packed_label_slot] == argument_names[0]
+            return false
+
+
+        # `Shape.Circle` -> the variant's TAG, or -1. Same byte-comparison approach as
+        # ordinal_of_dotted_path, against the payload-enum pools.
+        def penum_variant_index_of_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
+                for offset in 0..<structs.penum_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    variant: sview = structs.penum_variants[structs.penum_variant_start[enum_index] + offset]
+                    offset.i64() return if sview_matches_prefix(path, variant, dot + 1, sview_len(path).i64())
+            return -1
+
+
+        # `Shape.Circle` -> its payload's ValueType, or Unmodeled when the path names no
+        # payload-carrying variant.
+        def penum_payload_of_path(path: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            unmodeled_type() return if dot <= 0
+            for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
+                for offset in 0..<structs.penum_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    slot: usize = structs.penum_variant_start[enum_index] + offset
+                    continue if not sview_matches_prefix(path, structs.penum_variants[slot], dot + 1, sview_len(path).i64())
+                    unmodeled_type() return if not structs.penum_has_payload[slot]
+                    return copied_type(structs.penum_payloads[slot])
+            return unmodeled_type()
+
+        # The variant-slot for `Enum.Variant` (an index into the per-variant pools), or -1.
+        def penum_slot_of_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
+                for offset in 0..<structs.penum_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    slot: usize = structs.penum_variant_start[enum_index] + offset
+                    (structs.penum_variant_start[enum_index] + offset).i64() return if sview_matches_prefix(path, structs.penum_variants[slot], dot + 1, sview_len(path).i64())
+            return -1
+
+        # The `{T0, T1, …}` tuple LLVM type over a MULTI-FIELD variant-slot's fields — the
+        # value stored into (and loaded from) the `[N x i64]` payload blob. Only meaningful
+        # when `penum_field_type_count[slot] > 1`.
+        def penum_field_tuple_type(slot: usize, structs: mutable StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            field_count: usize = structs.penum_field_type_count[slot]
+            field_start: usize = structs.penum_field_type_start[slot]
+            field_llvm: mutable darray[LLVMTypeRef] = []
+            for field_index in 0..<field_count |field_llvm, field_start, structs, ctx|:
+                field_llvm.push(llvm_type_of(copied_type(structs.penum_field_types[field_start + field_index]), structs, ctx))
+            field_pointer: void& = (&field_llvm[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, field_pointer, field_count.u32(), 0)
+
+
+        # `Shape.Circle` -> the enclosing enum's ValueType, or Unmodeled.
+        def penum_type_of_path(path: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            unmodeled_type() return if dot <= 0
+            for enum_index in 0..<structs.penum_names.count |structs, path, dot|:
+                ValueType{kind: TypeKind.PayloadEnum, bits: enum_index.u32()} return if sview_matches_prefix(path, structs.penum_names[enum_index], 0, dot)
+            return unmodeled_type()
+
+
+        # `E.Variant` as an Expr.Field -> the variant's ordinal in its (payload-free) enum,
+        # or -1. Error sets parse as plain enums, so their ordinals live in the enum pools.
+        def ordinal_of_dotted_path_expr(expression: Expr, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            if expression is Expr.Field(enum_head, variant_name, field_line):
+                if enum_head is Expr.Ident(enum_name, enum_name_line):
+                    enum_index: i64 = penum_index_of(structs, enum_name)
+                    penum_variant_index(structs, enum_index, variant_name) return if enum_index >= 0
+                    plain_index: i64 = enum_index_of(structs, enum_name)
+                    enum_ordinal_of(structs, plain_index.usize(), variant_name) return if plain_index >= 0
+            return -1
+
+
+        # Pattern.Variant carries the path as one dotted STRING, so it is split here.
+        def ordinal_of_dotted_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            dot: mutable i64 = -1
+            for index in 0..<sview_len(path) |dot, path|:
+                dot <- index.i64() if sview_at(path, index) == 46
+            -1 return if dot <= 0
+            # Match by comparing BYTES against each registered enum/variant rather than
+            # slicing `path` into two sviews: `&path[0]` is a `char&`, not the `u8&?` that
+            # `sview(...)` wants, and a view-into-a-view buys nothing here.
+            for enum_index in 0..<structs.enum_names.count |structs, path, dot|:
+                continue if not sview_matches_prefix(path, structs.enum_names[enum_index], 0, dot)
+                for offset in 0..<structs.enum_variant_count[enum_index] |structs, path, dot, enum_index|:
+                    variant: sview = structs.enum_variants[structs.enum_variant_start[enum_index] + offset]
+                    offset.i64() return if sview_matches_prefix(path, variant, dot + 1, sview_len(path).i64())
+            return -1
+
+
+        # Whether `path[start..end)` equals `candidate`, byte for byte.
+        def sview_matches_prefix(path: sview, candidate: sview, start: i64, end: i64) -> bool can[Abort.Panic]:
+            false return if (end - start) != sview_len(candidate).i64()
+            matched: mutable bool = true
+            for index in 0..<sview_len(candidate) |matched, path, candidate, start|:
+                matched <- false if sview_at(path, (start + index.i64()).usize()) != sview_at(candidate, index)
+            return matched
+
+
+        # Whether a pattern matches anything. ONLY `_` does: a BINDING arm is not legal in
+        # an integer match — stage0 rejects `other: other + 2` with "top-level integer
+        # match arm must use an integer literal or _" (and then "undefined identifier
+        # other"). Treating a binding as a catch-all made stage1 emit code for a program
+        # the language rejects; caught by the stage0 differential.
+        #
+        # Written as a `match`, NOT `pattern is Pattern.Wildcard`: `is` on a PAYLOAD-LESS
+        # packed-enum variant crashes stage0's backend with "unsupported expression
+        # *ast.TypeExprExpr" (the bare `Pattern.Wildcard` parses as a type path). `is` WITH
+        # a payload and `match` both work — filed with a 12-line repro. Keep this a match
+        # until that lands.
+        def is_catch_all_pattern(pattern: Pattern) -> bool can[Abort.Panic]:
+            return match pattern:
+                Pattern.Wildcard: true
+                Pattern.Binding(_): true
+                _: false
+
+
+        # Whether an arm carries a guard (`0 if n > 1:`). Guards are emitted as a second
+        # condition after the pattern test; this helper keeps the branching paths explicit.
+        #
+        # A `match`, not `guard is Expr.Absent`, for the same payload-less-variant ICE.
+        def arm_has_guard(guard: Expr) -> bool can[Abort.Panic]:
+            return match guard:
+                Expr.Absent: false
+                _: true
+
+
+
+        # The single value an arm body yields, for a value `match`. Only a one-expression
+        # body is modeled (`0: 100`).
+        #
+        # Returns `Expr?` rather than filling a `mutable Expr&` out-param: an out-param
+        # needs a placeholder to initialize (`Expr.Invalid`), and CONSTRUCTING a
+        # packed-enum node requires an active `in Ast.Expr.Store:` scope the backend does
+        # not have — it only ever READS the AST. Returning the existing handle constructs
+        # nothing.
+        def arm_value_expression(body: darray[Stmt]&) -> Expr? can[Abort.Panic]:
+            null return if body.count != 1
+            if body[0] is Stmt.Expr(arm_expression, arm_expression_line):
+                return arm_expression
+            return null
+
+
+        # Close a `match` that has no `_` arm. Nothing matching means the frontend's
+        # exhaustiveness proof was wrong, so `unreachable` is the honest terminator —
+        # inventing a default value would hide the gap. A guard helper, not a ternary: a
+        # VOID ternary ICEs stage0 (`%termp = phi void`).
+        def terminate_if_no_default(saw_default: bool, builder: LLVMBuilderRef) -> void can[Abort.Panic]:
+            return if saw_default
+            _ = LLVMBuildUnreachable(builder)
+
+
+        # The binary operator a compound assignment applies (`+=` -> `+`), or `Eof` when
+        # the token is not a compound assignment. (TokenKind has no Invalid; `Eof` can
+        # never appear as a real operator, so it is the natural sentinel.) Keeps the
+        # lowering honest: `x op= v` is exactly `x <- x op v`, so it reuses emit_binary
+        # instead of re-deriving each operator.
+        def compound_operator_of(operator: TokenKind) -> TokenKind:
+            TokenKind.Plus return if operator == TokenKind.PlusEq
+            TokenKind.Minus return if operator == TokenKind.MinusEq
+            TokenKind.Star return if operator == TokenKind.StarEq
+            TokenKind.Slash return if operator == TokenKind.SlashEq
+            TokenKind.Percent return if operator == TokenKind.PercentEq
+            TokenKind.Ampersand return if operator == TokenKind.AmpEq
+            TokenKind.Pipe return if operator == TokenKind.PipeEq
+            TokenKind.Caret return if operator == TokenKind.CaretEq
+            TokenKind.LShift return if operator == TokenKind.LShiftEq
+            TokenKind.RShift return if operator == TokenKind.RShiftEq
+            return TokenKind.Eof
+
+
+        # `left and right` / `left or right`, SHORT-CIRCUITING. Yields a modeled `bool`
+        # (i1), like every other comparison.
+        #
+        # Lowered through a result SLOT rather than a phi: `right` may itself append
+        # blocks, so the join's predecessor is not necessarily `rhs_block` and a phi would
+        # need incoming-block bookkeeping. mem2reg restores the phi at -O2.
+        #
+        #   result = <short-circuit answer>   ; `and` -> false, `or` -> true
+        #   br left ? rhs : done              ; `or` swaps the targets
+        #   rhs:  result = right; br done
+        #   done: load result
+        def emit_short_circuit(left_expression: Expr, operator: TokenKind, right_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
+            is_and: bool = operator == TokenKind.And
+
+            # Entry-block, not here: this slot is emitted at the point of every short-circuit
+            # `and`/`or`, so inside a loop body it allocated ONE PER ITERATION. Stack from an
+            # alloca is not released until the function returns, so a flat loop over a large
+            # input walks straight into the guard page — `Parser.scan_legacy_error_syntax`
+            # (13 short-circuit slots in one loop, ~200k tokens for the flattened compiler)
+            # crashed gen2 with a stack-overflow write, only 4 frames deep. The slot is a pure
+            # temporary, always stored before it is read within the same evaluation, so
+            # hoisting is safe and costs one fixed slot instead of one per iteration.
+            result_slot: LLVMValueRef = build_entry_alloca(builder, bool_type, "sc.result")
+            if emit_condition(left_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is left_bit:
+                # `false and _` is false; `true or _` is true.
+                short_value: LLVMValueRef = LLVMConstInt(bool_type, 0, 0) if is_and else LLVMConstInt(bool_type, 1, 0)
+                _ = LLVMBuildStore(builder, short_value, result_slot)
+
+                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                rhs_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "sc.rhs")
+                done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "sc.done")
+                # `and` runs the right side only when the left is TRUE; `or` only when FALSE.
+                if is_and:
+                    _ = LLVMBuildCondBr(builder, left_bit, rhs_block, done_block)
+                else:
+                    _ = LLVMBuildCondBr(builder, left_bit, done_block, rhs_block)
+
+                LLVMPositionBuilderAtEnd(builder, rhs_block)
+                if emit_condition(right_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is right_bit:
+                    _ = LLVMBuildStore(builder, right_bit, result_slot)
+                    _ = LLVMBuildBr(builder, done_block)
+                    LLVMPositionBuilderAtEnd(builder, done_block)
+                    return LLVMBuildLoad2(builder, bool_type, result_slot, "sc")
+            return null
+
+
+        # Declare an instantiation of a generic template, and queue its body.
+        #
+        # The SIGNATURE is built here — cheap, needs no builder, and yields the handle the
+        # call site needs immediately. The BODY is queued because emitting it needs the
+        # builder, which is currently positioned inside the caller.
+        def instantiate_generic(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # Direct-name entry (the common case): resolve the FIRST template with this name. For a
+            # unique name that is the only template; an overloaded name is disambiguated only via
+            # instantiate_generic_at (the UFCS path), which selects the slot by receiver type.
+            index: i64 = generic_index_of(generics, base)
+            null return if index < 0
+            return instantiate_generic_at(index.usize(), type_args, generics, structs, m, ctx)
+
+
+        # Number of generic templates sharing `name` (1 for a unique name, >1 for an overload set).
+        def generic_slot_count(generics: GenericTable&, name: sview) -> usize can[Abort.Panic]:
+            count: mutable usize = 0.usize()
+            for index in 0..<generics.names.count |count, generics, name|:
+                count <- count + 1.usize() if generics.names[index] == name
+            return count
+
+
+        # The instantiation cached for (SLOT, args), or null. Keyed on slot rather than base name so
+        # two overloads of the same name with the same type args do not alias to one handle.
+        def instantiation_of_slot(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<generics.inst_slots.count |generics, slot, type_args|:
+                continue if generics.inst_slots[index] != slot
+                continue if generics.inst_arg_count[index] != type_args.count
+                astart: usize = generics.inst_arg_start[index]
+                matched: mutable bool = true
+                for k in 0..<type_args.count |generics, matched, astart, type_args|:
+                    stored: ValueType = generics.inst_args[astart + k]
+                    matched <- false if stored.kind != type_args[k].kind or stored.bits != type_args[k].bits
+                generics.inst_handles[index] return if matched
+            return null
+
+
+        # Instantiate template SLOT for `type_args` (declaring the signature + queuing the body).
+        # instantiate_generic delegates here after resolving the slot; the UFCS path calls it with an
+        # overload-selected slot. The mangled name gets a slot suffix ONLY for overloaded names, so a
+        # unique name's instantiation keeps its exact current symbol.
+        def instantiate_generic_at(slot: usize, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if slot >= generics.names.count
+            base: sview = generics.names[slot]
+            if instantiation_of_slot(generics, slot, type_args) is already_declared:
+                return already_declared
+            # The call must supply exactly one argument per type parameter.
+            null return if generics.param_count[slot] != type_args.count
+
+            if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                # Bind every K/T for the duration of resolving this signature.
+                bound: usize = push_type_bindings(generics, structs, slot, type_args)
+                # A MISSING return annotation is `void` (std helpers omit `-> void`).
+                return_value_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+                if return_type_opt is return_type:
+                    return_value_type <- annotation_value_type(return_type, structs)
+                llvm_params: mutable darray[LLVMTypeRef] = []
+                declined: mutable bool = false
+                for parameter in params |llvm_params, declined, structs, ctx|:
+                    parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
+                    if parameter_type.kind == TypeKind.Unmodeled:
+                        declined <- true
+                    else:
+                        llvm_params.push(llvm_type_of(parameter_type, structs, ctx))
+
+                # The arena/error ABI must match emit_function_body's param layout for the
+                # instantiation body: `[out-param if error], <declared params>, [arena if
+                # the signature grows a container]`, and an error fn returns i32.
+                instantiation_is_error: bool = generics.is_error[slot]
+                instantiation_needs_arena: bool = signature_needs_arena(params, return_value_type, structs)
+                pop_type_bindings(structs, bound)
+                null return if declined or return_value_type.kind == TypeKind.Unmodeled
+
+                name_storage: mutable darray[u8] = []
+                mangled_slot_suffix: i64 = slot.i64() if generic_slot_count(generics, base) > 1.usize() else -1
+                mangled: cstr = mangled_name_multi_into(base, type_args, mangled_slot_suffix, structs, name_storage)
+                llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
+                llvm_return <- LLVMInt32TypeInContext(ctx) if instantiation_is_error
+                full_params: mutable darray[LLVMTypeRef] = []
+                full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_is_error
+                for llvm_param in llvm_params |full_params|:
+                    full_params.push(llvm_param)
+                full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_needs_arena
+                fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
+                if full_params.count != 0:
+                    params_pointer: void& = (&full_params[0]).cast[void&] can Unsafe.PointerCast
+                    fn_type <- LLVMFunctionType(llvm_return, params_pointer, full_params.count.u32(), 0)
+                handle: LLVMValueRef = LLVMAddFunction(m, mangled, fn_type)
+
+                inst_arg_start: usize = generics.inst_args.count
+                for argument in type_args |generics|:
+                    generics.inst_args <- generics.inst_args.push(copied_type(argument))
+                generics.inst_bases <- generics.inst_bases.push(base)
+                generics.inst_arg_start <- generics.inst_arg_start.push(inst_arg_start)
+                generics.inst_arg_count <- generics.inst_arg_count.push(type_args.count)
+                generics.inst_handles <- generics.inst_handles.push(handle)
+                generics.inst_slots <- generics.inst_slots.push(slot)
+                pending_arg_start: usize = generics.pending_args.count
+                for argument in type_args |generics|:
+                    generics.pending_args <- generics.pending_args.push(copied_type(argument))
+                generics.pending_bases <- generics.pending_bases.push(base)
+                generics.pending_arg_start <- generics.pending_arg_start.push(pending_arg_start)
+                generics.pending_arg_count <- generics.pending_arg_count.push(type_args.count)
+                generics.pending_handles <- generics.pending_handles.push(handle)
+                generics.pending_slots <- generics.pending_slots.push(slot)
+                return handle
+            return null
+
+
+        # The declared type of instantiation (base, args)'s parameter `position`, resolved
+        # through the template's bindings.
+        def instantiation_param_type(base: sview, type_args: darray[ValueType]&, position: usize, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            index: i64 = generic_index_of(generics, base)
+            unmodeled_type() return if index < 0
+            return instantiation_param_type_at(index.usize(), type_args, position, generics, structs)
+
+
+        def instantiation_param_type_at(slot: usize, type_args: darray[ValueType]&, position: usize, generics: mutable GenericTable&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if slot >= generics.names.count
+            if generics.decls[slot] is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                unmodeled_type() return if position >= params.count
+                # POP is symmetric via pop_type_bindings — never `<- []`, which would rebind
+                # the caller's darray to callee-region memory AND wipe an outer instantiation's
+                # bindings (the historical nested-generic crash).
+                bound: usize = push_type_bindings(generics, structs, slot, type_args)
+                resolved: ValueType = parameter_value_type(params[position].type_expression, structs)
+                pop_type_bindings(structs, bound)
+                return resolved
+            return unmodeled_type()
+
+
+        # The IR name for a call's result. A VOID call must be UNNAMED — LLVM rejects
+        # "instructions returning void cannot have a name".
+        def call_result_name(return_type: ValueType) -> cstr:
+            return "" if return_type.kind == TypeKind.Void else "call"
+
+        # Emit a call to a generic function, instantiating on first use.
+        # Whether a generic INSTANTIATION threads an arena — the same predicate
+        # instantiate_generic uses to build the signature (so the call site matches). Computed
+        # under the type-arg bindings so `wrap[i64] -> darray[i64]` (grows a darray) is detected.
+        def instantiation_wants_arena(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            arena_index: i64 = generic_index_of(generics, base)
+            false return if arena_index < 0
+            return instantiation_wants_arena_at(arena_index.usize(), type_args, generics, structs)
+
+
+        def instantiation_wants_arena_at(arena_slot: usize, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            false return if arena_slot >= generics.names.count
+            if generics.decls[arena_slot] is Decl.Func(arena_fn_name, arena_params, arena_ret_opt, arena_body, arena_effects, arena_decs, arena_line):
+                arena_bound: usize = push_type_bindings(generics, structs, arena_slot, type_args)
+                arena_ret_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+                if arena_ret_opt is arena_ret:
+                    arena_ret_type <- annotation_value_type(arena_ret, structs)
+                arena_wanted: bool = signature_needs_arena(arena_params, arena_ret_type, structs)
+                pop_type_bindings(structs, arena_bound)
+                return arena_wanted
+            return false

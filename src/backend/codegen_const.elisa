@@ -1,0 +1,525 @@
+# Stage1 backend — constants and globals: folding, aggregate materialization, aliases, packed payload rows.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        def const_aggregate_value(value_expression: Expr, value_type: ValueType, top: darray[Decl]&, structs: mutable StructTable&, ctx: LLVMContextRef, ok: mutable bool&) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            aggregate_failure: LLVMValueRef = zeroed
+            # Enum members can arrive here as a field expression or as a dotted identifier
+            # depending on whether the initializer was parsed through the aggregate literal
+            # path. Resolve both spellings directly; relying only on the general scalar folder
+            # made `const C[2] = [C.R, C.B]` decline while numeric arrays succeeded.
+            if value_expression is Expr.Field(enum_value_head, enum_value_member, enum_value_line):
+                enum_value_ordinal: i64 = ordinal_of_dotted_path_expr(value_expression, structs)
+                if enum_value_ordinal >= 0 and (is_numeric_type(value_type) or value_type.kind == TypeKind.Bool):
+                    return LLVMConstInt(llvm_type_of(value_type, structs, ctx), enum_value_ordinal.u64(), 0)
+            if value_expression is Expr.Ident(enum_value_path, enum_value_path_line):
+                enum_value_ordinal: i64 = ordinal_of_dotted_path(enum_value_path, structs)
+                if enum_value_ordinal >= 0 and (is_numeric_type(value_type) or value_type.kind == TypeKind.Bool):
+                    return LLVMConstInt(llvm_type_of(value_type, structs, ctx), enum_value_ordinal.u64(), 0)
+            if value_expression is Expr.Ident(zeroed_name, zeroed_line):
+                LLVMConstNull(llvm_type_of(value_type, structs, ctx)) return if zeroed_name == "zeroed"
+                global_found: mutable bool = false
+                global_expression: Expr = const_global_expression(top, zeroed_name, global_found)
+                if global_found:
+                    return const_aggregate_value(global_expression, value_type, top, structs, ctx, ok)
+                ok <- false
+                return aggregate_failure
+            if value_type.kind == TypeKind.Array:
+                if value_expression is Expr.Array(aggregate_elements, aggregate_line):
+                    aggregate_element_type: ValueType = copied_type(structs.array_elements[value_type.bits.usize()])
+                    aggregate_extent: u32 = structs.array_extents[value_type.bits.usize()]
+                    if aggregate_elements.count.u32() != aggregate_extent:
+                        ok <- false
+                        return aggregate_failure
+                    aggregate_element_llvm: LLVMTypeRef = llvm_type_of(aggregate_element_type, structs, ctx)
+                    aggregate_values: mutable darray[LLVMValueRef] = []
+                    aggregate_all_ok: mutable bool = true
+                    for aggregate_element in aggregate_elements |aggregate_values, aggregate_all_ok, aggregate_element_type, structs, ctx|:
+                        aggregate_child_ok: mutable bool = true
+                        aggregate_child: LLVMValueRef = const_aggregate_value(aggregate_element, aggregate_element_type, top, structs, ctx, aggregate_child_ok)
+                        if aggregate_child_ok:
+                            aggregate_values.push(aggregate_child)
+                        else:
+                            aggregate_all_ok <- false
+                    if not aggregate_all_ok or aggregate_values.count == 0:
+                        ok <- false
+                        return aggregate_failure
+                    aggregate_values_pointer: void& = (&aggregate_values[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMConstArray2(aggregate_element_llvm, aggregate_values_pointer, aggregate_values.count.u64())
+                ok <- false
+                return aggregate_failure
+            if value_expression is Expr.Index(indexed_global, index_expression, index_line):
+                if indexed_global is Expr.Ident(indexed_name, indexed_name_line):
+                    source_found: mutable bool = false
+                    source_expression: Expr = const_global_expression(top, indexed_name, source_found)
+                    if source_found and source_expression is Expr.Array(source_elements, source_line):
+                        source_index_ok: mutable bool = true
+                        source_index: i64 = fold_const_expr(index_expression, structs, source_index_ok)
+                        if source_index_ok and source_index >= 0 and source_index.usize() < source_elements.count:
+                            source_index_const_index: i64 = const_index_of(structs, indexed_name)
+                            source_index_mutable_index: i64 = mutable_global_index_of(structs, indexed_name)
+                            source_index_type: ValueType = copied_type(structs.const_types[source_index_const_index.usize()]) if source_index_const_index >= 0 else copied_type(structs.mutable_global_types[source_index_mutable_index.usize()]) if source_index_mutable_index >= 0 else unmodeled_type()
+                            element_type: ValueType = array_element_of(source_index_type, structs)
+                            return const_aggregate_value(source_elements[source_index.usize()], element_type, top, structs, ctx, ok)
+                ok <- false
+                return aggregate_failure
+            if value_type.kind == TypeKind.Struct:
+                if value_expression is Expr.Construct(construct_type, construct_fields, construct_line):
+                    struct_index: usize = value_type.bits.usize()
+                    field_count: usize = structs.field_count[struct_index]
+                    field_values: mutable darray[LLVMValueRef] = []
+                    for field_offset in 0..<field_count |field_values, structs, ctx, struct_index|:
+                        field_values.push(LLVMConstNull(llvm_type_of(structs.field_types[structs.field_start[struct_index] + field_offset], structs, ctx)))
+                    fields_ok: mutable bool = true
+                    for field_offset in 0..<construct_fields.count |field_values, fields_ok, construct_fields, structs, ctx, struct_index, field_count|:
+                        field_position: mutable i64 = field_offset.i64()
+                        field_position <- field_index_of(structs, struct_index, construct_fields[field_offset].name) if construct_fields[field_offset].name != ""
+                        if field_position < 0 or field_position.usize() >= field_count:
+                            fields_ok <- false
+                        else:
+                            field_type: ValueType = copied_type(structs.field_types[structs.field_start[struct_index] + field_position.usize()])
+                            field_ok: mutable bool = true
+                            field_value: LLVMValueRef = const_aggregate_value(construct_fields[field_offset].value, field_type, top, structs, ctx, field_ok)
+                            fields_ok <- false if not field_ok
+                            field_values[field_position.usize()] <- field_value if field_ok
+                    if fields_ok:
+                        field_values_pointer: void& = (&field_values[0]).cast[void&] can Unsafe.PointerCast
+                        return LLVMConstNamedStruct(llvm_type_of(value_type, structs, ctx), field_values_pointer, field_count.u32())
+                ok <- false
+                return aggregate_failure
+            if value_expression is Expr.Field(field_object, field_name, field_line):
+                if field_object is Expr.Construct(field_construct_value_type, field_construct_value_fields, field_construct_value_line):
+                    field_construct_type: ValueType = annotation_value_type(field_construct_value_type, structs)
+                    if field_construct_type.kind == TypeKind.Struct:
+                        field_construct_slot: usize = field_construct_type.bits.usize()
+                        field_construct_position: i64 = field_index_of(structs, field_construct_slot, field_name)
+                        if field_construct_position >= 0:
+                            selected_field_value: mutable Expr = Expr.Invalid
+                            selected_field_found: mutable bool = false
+                            for field_construct_value_field in field_construct_value_fields |selected_field_value, field_name|:
+                                if field_construct_value_field.name == field_name:
+                                    selected_field_value <- field_construct_value_field.value
+                                    selected_field_found <- true
+                            if selected_field_found:
+                                field_construct_field_type: ValueType = copied_type(structs.field_types[structs.field_start[field_construct_slot] + field_construct_position.usize()])
+                                return const_aggregate_value(selected_field_value, field_construct_field_type, top, structs, ctx, ok)
+                if field_object is Expr.Index(indexed_field_global, indexed_field_index, indexed_field_line):
+                    if indexed_field_global is Expr.Ident(indexed_field_name, indexed_field_name_line):
+                        indexed_field_source_found: mutable bool = false
+                        indexed_field_source: Expr = const_global_expression(top, indexed_field_name, indexed_field_source_found)
+                        indexed_field_const_index: i64 = const_index_of(structs, indexed_field_name)
+                        indexed_field_mutable_index: i64 = mutable_global_index_of(structs, indexed_field_name)
+                        if indexed_field_source_found and indexed_field_source is Expr.Array(indexed_field_elements, indexed_field_source_line) and (indexed_field_const_index >= 0 or indexed_field_mutable_index >= 0):
+                            indexed_field_source_type: ValueType = copied_type(structs.const_types[indexed_field_const_index.usize()]) if indexed_field_const_index >= 0 else copied_type(structs.mutable_global_types[indexed_field_mutable_index.usize()])
+                            indexed_field_element_type: ValueType = array_element_of(indexed_field_source_type, structs)
+                            indexed_field_index_ok: mutable bool = true
+                            indexed_field_position: i64 = fold_const_expr(indexed_field_index, structs, indexed_field_index_ok)
+                            if indexed_field_index_ok and indexed_field_position >= 0 and indexed_field_position.usize() < indexed_field_elements.count and indexed_field_element_type.kind == TypeKind.Struct:
+                                indexed_field_struct_index: usize = indexed_field_element_type.bits.usize()
+                                indexed_field_position_in_struct: i64 = field_index_of(structs, indexed_field_struct_index, field_name)
+                                if indexed_field_position_in_struct >= 0:
+                                    indexed_field_field_type: ValueType = copied_type(structs.field_types[structs.field_start[indexed_field_struct_index] + indexed_field_position_in_struct.usize()])
+                                    return const_aggregate_value(Expr.Field(indexed_field_elements[indexed_field_position.usize()], field_name, field_line), indexed_field_field_type, top, structs, ctx, ok)
+                if field_object is Expr.Ident(field_global_name, field_global_line):
+                    source_found: mutable bool = false
+                    source_expression: Expr = const_global_expression(top, field_global_name, source_found)
+                    if source_found and source_expression is Expr.Construct(field_construct_type, field_construct_fields, field_construct_line):
+                        direct_field_found: mutable bool = false
+                        direct_field_value: mutable Expr = Expr.Invalid
+                        for direct_field in field_construct_fields |direct_field_found, direct_field_value, field_name|:
+                            if direct_field.name == field_name:
+                                direct_field_found <- true
+                                direct_field_value <- direct_field.value
+                        if direct_field_found:
+                            return const_aggregate_value(direct_field_value, value_type, top, structs, ctx, ok)
+                        source_const_index: i64 = const_index_of(structs, field_global_name)
+                        source_mutable_index: i64 = mutable_global_index_of(structs, field_global_name)
+                        source_type: ValueType = copied_type(structs.const_types[source_const_index.usize()]) if source_const_index >= 0 else copied_type(structs.mutable_global_types[source_mutable_index.usize()]) if source_mutable_index >= 0 else unmodeled_type()
+                        source_struct_index: usize = source_type.bits.usize()
+                        source_position: i64 = field_index_of(structs, source_struct_index, field_name)
+                        if source_position >= 0:
+                            source_field_offset: mutable i64 = -1
+                            for candidate_offset in 0..<field_construct_fields.count |field_construct_fields, source_field_offset, field_name|:
+                                candidate_name: sview = field_construct_fields[candidate_offset].name
+                                source_field_offset <- candidate_offset.i64() if candidate_name == field_name or (candidate_name == "" and candidate_offset.i64() == source_position)
+                            if source_field_offset >= 0:
+                                field_type: ValueType = copied_type(structs.field_types[structs.field_start[source_struct_index] + source_position.usize()])
+                                return const_aggregate_value(field_construct_fields[source_field_offset.usize()].value, field_type, top, structs, ctx, ok)
+                ok <- false
+                return aggregate_failure
+            if is_numeric_type(value_type) or value_type.kind == TypeKind.Bool:
+                scalar_folded_ok: mutable bool = true
+                scalar_folded: i64 = fold_const_expr(value_expression, structs, scalar_folded_ok)
+                if not scalar_folded_ok:
+                    ok <- false
+                    return aggregate_failure
+                return LLVMConstInt(llvm_type_of(value_type, structs, ctx), scalar_folded.u64(), 0)
+            ok <- false
+            return aggregate_failure
+
+
+        # Materialize a global const ARRAY as a real module global (`@xs = internal constant
+        # [N x i64] […]`), the way stage0 does. Scalar- AND nested-array elements are modeled
+        # (`i64[2][2]` -> `[2 x [2 x i64]]`) so long as the initializer is a fully-foldable
+        # literal of exactly the declared shape; anything else leaves const_global_ok false and
+        # the const stays declined at its use sites.
+        def materialize_const_aggregates(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration in top |structs, m, ctx|:
+                if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                    const_index: i64 = const_index_of(structs, const_name)
+                    continue if const_index < 0
+                    const_type: ValueType = copied_type(structs.const_types[const_index.usize()])
+                    continue if const_type.kind != TypeKind.Array and const_type.kind != TypeKind.Struct
+                    aggregate_ok: mutable bool = true
+                    const_aggregate: LLVMValueRef = const_aggregate_value(const_value, const_type, top, structs, ctx, aggregate_ok)
+                    continue if not aggregate_ok
+                    array_llvm: LLVMTypeRef = llvm_type_of(const_type, structs, ctx)
+                    const_name_storage: mutable darray[u8] = []
+                    const_global: LLVMValueRef = LLVMAddGlobal(m, array_llvm, sview_to_cstr(const_name, const_name_storage))
+                    LLVMSetInitializer(const_global, const_aggregate)
+                    aggregate_alignment: u32 = struct_alignment(const_type, structs)
+                    LLVMSetAlignment(const_global, aggregate_alignment) if aggregate_alignment != 0
+                    # LLVMInternalLinkage == 8; a `constant` global is immutable.
+                    LLVMSetLinkage(const_global, 8)
+                    LLVMSetGlobalConstant(const_global, 1)
+                    structs.const_globals[const_index.usize()] <- const_global
+                    structs.const_global_ok[const_index.usize()] <- true
+
+
+        # Materialize scalar `global` storage. Initializers follow stage0's constant
+        # initializer rule for this first slice; an omitted initializer is zeroed.
+        # Fold scalar projections from aggregate globals (a.x and table[i].x) before the
+        # ordinary scalar folder, which intentionally knows nothing about aggregate places.
+        def fold_global_scalar_expr(expression: Expr, top: darray[Decl]&, structs: mutable StructTable&, ok: mutable bool&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if expression is Expr.Field(field_object, field_name, field_line):
+                if field_object is Expr.Ident(field_global_name, field_global_line):
+                    source_found: mutable bool = false
+                    source_expression: Expr = const_global_expression(top, field_global_name, source_found)
+                    if source_found and source_expression is Expr.Construct(field_type_expression, field_fields, field_construct_line):
+                        for field_entry in field_fields |field_name, structs, ok|:
+                            if field_entry.name == field_name:
+                                return fold_global_scalar_expr(field_entry.value, top, structs, ok)
+                if field_object is Expr.Index(indexed_object, indexed_index, indexed_line):
+                    if indexed_object is Expr.Ident(indexed_name, indexed_name_line):
+                        source_found: mutable bool = false
+                        source_expression: Expr = const_global_expression(top, indexed_name, source_found)
+                        if source_found and source_expression is Expr.Array(source_elements, source_array_line):
+                            index_ok: mutable bool = true
+                            index_value: i64 = fold_const_expr(indexed_index, structs, index_ok)
+                            if index_ok and index_value >= 0 and index_value.usize() < source_elements.count:
+                                return fold_global_scalar_expr(Expr.Field(source_elements[index_value.usize()], field_name, field_line), top, structs, ok)
+                ok <- false
+                return 0
+            if expression is Expr.Ident(global_name, global_line):
+                source_found: mutable bool = false
+                source_expression: Expr = const_global_expression(top, global_name, source_found)
+                if source_found:
+                    return fold_global_scalar_expr(source_expression, top, structs, ok)
+            return fold_const_expr(expression, structs, ok)
+
+
+        def materialize_mutable_globals(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for declaration in top |structs, m, ctx|:
+                if declaration is Decl.Const(global_name, global_type_expression, global_value, global_is_mutable, global_line):
+                    continue if not global_is_mutable
+                    global_index: i64 = mutable_global_index_of(structs, global_name)
+                    continue if global_index < 0
+                    global_type: ValueType = copied_type(structs.mutable_global_types[global_index.usize()])
+                    global_llvm_type: LLVMTypeRef = llvm_type_of(global_type, structs, ctx)
+                    global_name_storage: mutable darray[u8] = []
+                    global_handle: LLVMValueRef = LLVMAddGlobal(m, global_llvm_type, sview_to_cstr(global_name, global_name_storage))
+                    initializer: mutable LLVMValueRef = LLVMConstNull(global_llvm_type)
+                    aggregate_initialized: mutable bool = false
+                    if (global_type.kind == TypeKind.Array or global_type.kind == TypeKind.Struct) and global_value is not Expr.Invalid:
+                        aggregate_ok: mutable bool = true
+                        aggregate_initializer: LLVMValueRef = const_aggregate_value(global_value, global_type, top, structs, ctx, aggregate_ok)
+                        if aggregate_ok:
+                            initializer <- aggregate_initializer
+                            aggregate_initialized <- true
+                    if global_value is Expr.FloatLit(global_float_text) and global_type.kind == TypeKind.Float:
+                        global_float_storage: mutable darray[u8] = []
+                        initializer <- LLVMConstRealOfString(global_llvm_type, sview_to_cstr(global_float_text, global_float_storage))
+                    if global_value is not Expr.Invalid and not aggregate_initialized and not (global_value is Expr.FloatLit(_)):
+                        initializer_ok: mutable bool = true
+                        initializer_value: i64 = fold_global_scalar_expr(global_value, top, structs, initializer_ok)
+                        if initializer_ok and (is_integer_type(global_type) or global_type.kind == TypeKind.Bool):
+                            initializer <- LLVMConstInt(global_llvm_type, initializer_value.u64(), 0)
+                    LLVMSetInitializer(global_handle, initializer)
+                    global_alignment: u32 = struct_alignment(global_type, structs)
+                    LLVMSetAlignment(global_handle, global_alignment) if global_alignment != 0
+                    # collections.elisa's namespace carriers are also present in the
+                    # runtime object. Keep the program-local copies internal, as in
+                    # stage0's optimized IR, so real std-collection links do not collide.
+                    LLVMSetLinkage(global_handle, 8) if global_name == "indexmap" or global_name == "inlinevec" or global_name == "flags"
+                    structs.mutable_global_handles[global_index.usize()] <- global_handle
+
+
+        # Register aliases from parser side tables; this avoids destructuring the recursive
+        # packed Decl hierarchy during the backend's type pass.
+        def register_aliases(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for alias_name in file.alias_names |structs|:
+                structs.alias_names <- structs.alias_names.push(alias_name)
+                structs.alias_types <- structs.alias_types.push(unmodeled_type())
+
+
+        # Resolve each alias to a concrete ValueType in DECLARATION ORDER, one pass.
+        #
+        # NOT a fixpoint: stage0 requires an alias's target to be already declared
+        # (`type A = B` before `type B = i64` is "unknown type B" — verified), unlike
+        # structs, which are order-free. Iterating to a fixpoint would resolve that forward
+        # reference and make stage1 accept a program the reference compiler REJECTS — a
+        # silent divergence, caught by a differential fixture that SKIPped.
+        #
+        # One in-order pass also subsumes the cycle guard: `type A = B` / `type B = A` never
+        # resolves, stays Unmodeled, and declines rather than recursing forever.
+        def resolve_aliases(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for alias_index in 0..<file.alias_names.count |structs, file|:
+                resolved: ValueType = resolve_type_head(file.alias_target_heads[alias_index], structs)
+                continue if resolved.kind == TypeKind.Unmodeled
+                structs.alias_types[alias_index] <- resolved
+
+
+        def alias_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.alias_names.count |index, structs, name|:
+                index.i64() return if structs.alias_names[index] == name
+                index <- index + 1
+            return -1
+
+
+        def packed_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.packed_names.count |index, structs, name|:
+                index.i64() return if structs.packed_names[index] == name
+                index <- index + 1
+            return -1
+
+        # Packed profile ABI: canonical uses the existing variant-sparse runtime; retained_reads
+        # uses the dense index/SOA runtime. build_heavy remains reserved for the AoS path below.
+        def packed_profile_mode(annotations: darray[Ast::EnumAnnotation]&) -> i32 can[Abort.Panic]:
+            for annotation in annotations:
+                2 return if annotation.name == "__aos" and annotation.line == 3900000042
+                if annotation.line == 3900000041:
+                    1 return if annotation.name == "retained_reads"
+                    2 return if annotation.name == "build_heavy"
+            return 0
+
+
+        def packed_is_ast_root(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            name: sview = structs.packed_names[enum_index.usize()]
+            return name == "Node" and structs.packed_variant_count[enum_index.usize()] == 0
+
+
+        def packed_root_index_of(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
+            enum_index return if not packed_is_ast_refinement(structs, enum_index)
+            return packed_index_of(structs, "Node")
+
+
+        # Two packed variant slots have the SAME payload FIELD layout — identical field count and
+        # each field's kind+bits. Structurally-identical payloads (`Pattern.Variant{sview,darray}`
+        # vs `Pattern.Struct{sview,darray}`) may intern to DIFFERENT aggregate payload slots, so an
+        # OR arm binding across them must compare field SPANS, not the aggregate ValueType.
+        def packed_slots_same_field_layout(a: i64, b: i64, structs: StructTable&) -> bool can[Abort.Panic]:
+            false return if a < 0 or b < 0
+            count_a: usize = structs.packed_field_type_count[a.usize()]
+            count_b: usize = structs.packed_field_type_count[b.usize()]
+            false return if count_a != count_b
+            start_a: usize = structs.packed_field_type_start[a.usize()]
+            start_b: usize = structs.packed_field_type_start[b.usize()]
+            same: mutable bool = true
+            for offset in 0..<count_a |same, start_a, start_b, structs|:
+                type_a: ValueType = structs.packed_field_types[start_a + offset]
+                type_b: ValueType = structs.packed_field_types[start_b + offset]
+                same <- false if type_a.kind != type_b.kind or type_a.bits != type_b.bits
+            return same
+
+
+        def packed_is_ast_refinement(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            name: sview = structs.packed_names[enum_index.usize()]
+            # `Pattern` is `enum Pattern is Node` too (docs/122) — a Node refinement sharing the
+            # Node store with hierarchy-global tags, like Expr/Stmt/Decl. Omitting it here (every
+            # OTHER refinement list already names it) made packed_root_index_of(Pattern) wrong, so
+            # every `match pattern:` / `p is Pattern.X` failed the Node-store-active check.
+            for refinement_name in structs.ast_refinement_names |name|:
+                true return if refinement_name == name
+            return false
+
+        def packed_constructor_enum_name(head: Expr) -> sview:
+            if head is Expr.Ident(name, line):
+                return name
+            if head is Expr.Scope(base, name, line):
+                if base is Expr.Ident(module_name, module_line):
+                    return name
+            return sview("", 0, 0)
+
+
+        def packed_variant_index(structs: StructTable&, enum_index: i64, variant_name: sview) -> i64 can[Abort.Panic]:
+            start: usize = structs.packed_variant_start[enum_index.usize()]
+            count: usize = structs.packed_variant_count[enum_index.usize()]
+            offset: mutable usize = 0
+            while offset < count |offset, structs, start, variant_name|:
+                packed_tag_base: mutable i64 = 0
+                if packed_is_ast_refinement(structs, enum_index):
+                    for prior_enum in 0..<enum_index.usize() |packed_tag_base, structs|:
+                        packed_tag_base <- packed_tag_base + structs.packed_variant_count[prior_enum].i64() if packed_is_ast_refinement(structs, prior_enum.i64())
+                (packed_tag_base + offset.i64()) return if structs.packed_variants[start + offset] == variant_name
+                offset <- offset + 1
+            return -1
+
+
+        # A variant's ordinal within its own refinement, used only to index the
+        # refinement-local payload pools. `packed_variant_index` deliberately returns the
+        # hierarchy-wide tag used in the shared AST row.
+        def packed_variant_local_index(structs: StructTable&, enum_index: i64, variant_name: sview) -> i64 can[Abort.Panic]:
+            start: usize = structs.packed_variant_start[enum_index.usize()]
+            count: usize = structs.packed_variant_count[enum_index.usize()]
+            offset: mutable usize = 0
+            while offset < count |offset, structs, start, variant_name|:
+                offset.i64() return if structs.packed_variants[start + offset] == variant_name
+                offset <- offset + 1
+            return -1
+
+
+        # The ROW LAYOUT `{i32 tag, [N x i64] payload}` — what a row contains, as distinct
+        # from the handle (an i32 index) that names it.
+        def packed_row_llvm_type(structs: mutable StructTable&, enum_index: i64, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if packed_is_ast_root(structs, packed_root_index_of(structs, enum_index)):
+                row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt32TypeInContext(ctx), 32)]
+                row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, row_pointer, 2, 0)
+            words: u32 = structs.packed_payload_words[enum_index.usize()]
+            commons: u32 = structs.packed_common_counts[enum_index.usize()]
+            # `{i32 tag, <commons x i64>, [N x i64] payload}` — commons sit BETWEEN the tag
+            # and the payload, which is why every payload index shifts by `commons`.
+            row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx)]
+            for _ in 0..<commons.usize() |row_fields, ctx|:
+                row_fields.push(LLVMInt64TypeInContext(ctx))
+            row_fields.push(LLVMArrayType(LLVMInt64TypeInContext(ctx), words))
+            row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, row_pointer, (2 + commons), 0)
+
+
+        # A store row's size in bytes: the `{i32, [N x i64]}` handle laid out at i64
+        # alignment, so the tag's 4 bytes pad to 8. stage0 passes 16 for a one-word payload
+        # (`state_new_variant_sparse(ptr %owner, i64 16)`), which this reproduces.
+        def packed_row_bytes(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
+            132 return if packed_is_ast_root(structs, packed_root_index_of(structs, enum_index))
+            # 8 (tag, padded to i64 alignment) + 8 per common + 8 per payload word. stage0
+            # passes 16 with no commons and 24 with one — both reproduced.
+            return 8 + 8 * structs.packed_common_counts[enum_index.usize()].i64() + 8 * structs.packed_payload_words[enum_index.usize()].i64()
+
+
+        def register_packed_payload_struct(enum_name: sview, variant_name: sview, fields: darray[ValueType]&, names: darray[sview]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # The registry index is sufficient to make this anonymous helper type unique;
+            # avoiding a second recursive sview concatenation path keeps this constructor
+            # lowerable by the self-hosted backend.
+            name_storage: mutable darray[u8] = [95, 95, 112, 97, 99, 107, 101, 100, 95, 112, 97, 121, 108, 111, 97, 100, 95]
+            append_usize_decimal(structs.names.count, name_storage)
+            name_storage.push(0)
+            handle: LLVMTypeRef = LLVMStructCreateNamed(structs.context, (&name_storage[0]).cast[cstr] can Unsafe.PointerCast)
+            index: usize = structs.names.count
+            structs.names <- structs.names.push(sview("__packed_payload", 0, 0))
+            structs.handles <- structs.handles.push(handle)
+            structs.alignments <- structs.alignments.push(0)
+            field_start: usize = structs.field_names.count
+            llvm_fields: mutable darray[LLVMTypeRef] = []
+            for field_index in 0..<fields.count |llvm_fields, fields, names, structs|:
+                llvm_fields.push(llvm_type_of(fields[field_index], structs, structs.context))
+                structs.field_names <- structs.field_names.push(names[field_index] if field_index < names.count else sview("", 0, 0))
+                structs.field_types <- structs.field_types.push(copied_type(fields[field_index]))
+            structs.field_start <- structs.field_start.push(field_start)
+            structs.field_count <- structs.field_count.push(fields.count)
+            llvm_fields_pointer: void& = (&llvm_fields[0]).cast[void&] can Unsafe.PointerCast
+            LLVMStructSetBody(handle, llvm_fields_pointer, llvm_fields.count.u32(), 0)
+            return ValueType{kind: TypeKind.Struct, bits: index.u32()}
+
+
+        # Allocations whose values cross a branch join must live in the function entry
+        # block. Keeping the builder in the current block would make a later load observe
+        # an alloca that is not dominated by every predecessor.
+        # Every LOCAL DECLARATION allocates through here, not through a bare LLVMBuildAlloca at
+        # the point of declaration. Hoisting to the entry block is what makes a declared slot
+        # DOMINATE every later block, which the multi-target rebind path relies on: it reuses an
+        # existing slot only when that slot's alloca is in the entry block or the current block
+        # (an equality stand-in for a real dominance query). With declarations allocating
+        # in-place, a local declared at function-body level satisfied NEITHER test, so
+        # `body, parser <- …` inside an if/else minted a FRESH slot and rebound the name to it —
+        # and on any path where that assign did not run, later reads saw uninitialized stack.
+        # That is the self-host blocker: `Parser.lambda_expression` built
+        # `Expr.Lambda(parameters, body, …)` from a garbage `body` darray header whenever the
+        # lambda was a fn TYPE (`fn(i64) -> i64`), so gen2 died in arena_alloc on a bogus size.
+        # Hoisting does NOT merge slots — each declaration still builds its own alloca, so
+        # shadowing is unchanged; only the instruction's position moves.
+        def build_entry_alloca(builder: LLVMBuilderRef, type: LLVMTypeRef, name: cstr) -> LLVMValueRef:
+            current_block: LLVMBasicBlockRef = LLVMGetInsertBlock(builder)
+            function: LLVMValueRef = LLVMGetBasicBlockParent(current_block)
+            entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+            first_instruction: LLVMValueRef? = LLVMGetFirstInstruction(entry)
+            if first_instruction is first:
+                LLVMPositionBuilderBefore(builder, first)
+            else:
+                LLVMPositionBuilderAtEnd(builder, entry)
+            slot: LLVMValueRef = LLVMBuildAlloca(builder, type, name)
+            LLVMPositionBuilderAtEnd(builder, current_block)
+            return slot
+
+
+        # Reserve all recursive AST handles before resolving any refinement body. The
+        # placeholders make darray[Expr]/darray[Stmt]/darray[Decl] resolve independent of
+        # source order; failed resolution resets a placeholder in place rather than popping
+        # a different (later-reserved) registry slot.
+        def reserve_ast_packed_header(ast_name: sview, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            return if packed_index_of(structs, ast_name) >= 0
+            structs.packed_names <- structs.packed_names.push(ast_name)
+            structs.packed_variant_start <- structs.packed_variant_start.push(structs.packed_variants.count)
+            structs.packed_variant_count <- structs.packed_variant_count.push(0)
+            structs.packed_payload_words <- structs.packed_payload_words.push(0)
+            structs.packed_common_counts <- structs.packed_common_counts.push(0)
+
+
+        def reserve_ast_packed_headers(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            reserve_ast_packed_header(sview("Node", 0, 4), structs)
+            reserve_ast_packed_header(sview("Expr", 0, 4), structs)
+            reserve_ast_packed_header(sview("Stmt", 0, 4), structs)
+            reserve_ast_packed_header(sview("Decl", 0, 4), structs)
+            reserve_ast_packed_header(sview("Pattern", 0, 7), structs)
+
+
+        def register_packed_variant_rows(enum_name: sview, variants: darray[Ast::EnumVariant]&, commons: u32, start: usize, packed_field_pool_start: usize, declined: mutable bool&, widest: mutable u32&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for variant in variants |structs, declined, widest, commons|:
+                # Commons come first. Preserve every payload field; recursive AST
+                # variants routinely carry multiple handles and darray side-tables.
+                declined <- true if variant.fields.count.u32() < commons
+                payload: mutable ValueType = unmodeled_type()
+                payload_fields: mutable darray[ValueType] = []
+                payload_names: mutable darray[sview] = []
+                for common_index in 0..<commons.usize() |structs, declined, variant|:
+                    continue if common_index >= variant.fields.count
+                    common_type: ValueType = annotation_value_type(variant.fields[common_index], structs)
+                    declined <- true if common_type.kind == TypeKind.Unmodeled
+                for payload_index in commons.usize()..<variant.fields.count |payload_fields, payload_names, structs, variant, declined|:
+                    payload_type: ValueType = annotation_value_type(variant.fields[payload_index], structs)
+                    declined <- true if payload_type.kind == TypeKind.Unmodeled
+                    payload_fields.push(payload_type)
+                    payload_names.push(variant.field_names[payload_index] if payload_index < variant.field_names.count else sview("", 0, 0))
+                if payload_fields.count == 1:
+                    payload <- copied_type(payload_fields[0])
+                    widest <- 1 if widest == 0
+                elif payload_fields.count > 1:
+                    payload <- register_packed_payload_struct(enum_name, variant.name, payload_fields, payload_names, structs)
+                    widest <- payload_fields.count.u32() if payload_fields.count.u32() > widest
+                field_name: mutable sview = ""
+                field_name <- payload_names[0] if payload_fields.count == 1
+                structs.packed_variants <- structs.packed_variants.push(variant.name)
+                structs.packed_payloads <- structs.packed_payloads.push(payload)
+                structs.packed_has_payload <- structs.packed_has_payload.push(payload_fields.count > 0)
+                structs.packed_field_names <- structs.packed_field_names.push(field_name)
+                packed_field_start: usize = structs.packed_field_types.count
+                for payload_index in 0..<payload_fields.count |structs, payload_fields, payload_names|:
+                    structs.packed_field_types <- structs.packed_field_types.push(copied_type(payload_fields[payload_index]))
+                    structs.packed_field_flat_names <- structs.packed_field_flat_names.push(payload_names[payload_index])
+                structs.packed_field_type_start <- structs.packed_field_type_start.push(packed_field_start)
+                structs.packed_field_type_count <- structs.packed_field_type_count.push(payload_fields.count)

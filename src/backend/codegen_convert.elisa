@@ -1,0 +1,519 @@
+# Stage1 backend — type resolution/conversion, index addressing, and the list comprehension emitter.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # The type a value will actually have: its own if known, else the context's.
+        # An integer literal has no intrinsic type, so `expected` is what makes
+        # `a: u8 = 200` a u8 rather than an i64 that is then truncated behind your back.
+        def resolve_type(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic]:
+            own: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+            own return if own.kind != TypeKind.Unmodeled
+            return expected
+
+
+        # Convert `value` from `from_type` to `to_type`. Widening sign-extends a signed
+        # source and zero-extends an unsigned one (that IS the difference between
+        # `u8 200 -> i64 200` and `i8 200 -> i64 -56`); narrowing truncates. Same width is
+        # a no-op — a signed/unsigned reinterpretation costs no instruction.
+        def emit_conversion(value: LLVMValueRef, from_type: ValueType, to_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            null return if from_type.kind == TypeKind.Unmodeled or to_type.kind == TypeKind.Unmodeled
+            target: LLVMTypeRef = llvm_type_of(to_type, structs, ctx)
+            # bool <-> int needs an explicit widening decision; only int<->int, float, and
+            # the identity are modeled.
+            if from_type.kind == TypeKind.Bool or to_type.kind == TypeKind.Bool:
+                value return if from_type.kind == to_type.kind
+                return null
+
+            # float -> int TRUNCATES toward zero (`7.5.i64()` is 7, and `(-7.5).i64()` is
+            # -7), which is what FPToSI does — verified against stage0.
+            if from_type.kind == TypeKind.Float and to_type.kind != TypeKind.Float:
+                return LLVMBuildFPToSI(builder, value, target, "fptosi") if to_type.kind == TypeKind.Signed else LLVMBuildFPToUI(builder, value, target, "fptoui")
+            # int -> float follows the SOURCE's signedness: u8 200 becomes 200.0, i8 -56
+            # becomes -56.0.
+            if to_type.kind == TypeKind.Float and from_type.kind != TypeKind.Float:
+                return LLVMBuildSIToFP(builder, value, target, "sitofp") if from_type.kind == TypeKind.Signed else LLVMBuildUIToFP(builder, value, target, "uitofp")
+            if from_type.kind == TypeKind.Float and to_type.kind == TypeKind.Float:
+                value return if from_type.bits == to_type.bits
+                return LLVMBuildFPTrunc(builder, value, target, "fptrunc") if to_type.bits < from_type.bits else LLVMBuildFPExt(builder, value, target, "fpext")
+
+            # POINTER <-> INTEGER is a distinct cast, not a width change: `zext ptr .. to i64`
+            # is invalid IR llc rejects. The std takes a pointer DIFFERENCE this way --
+            # arena_tail_offset_slots is `(ptr.cast[heap u8&].usize() - base.usize()) / stride`
+            # -- so every dict program went through here.
+            from_is_pointer: bool = from_type.kind == TypeKind.Ref or from_type.kind == TypeKind.CStr
+            to_is_pointer: bool = to_type.kind == TypeKind.Ref or to_type.kind == TypeKind.CStr
+            if from_is_pointer or to_is_pointer:
+                LLVMBuildPtrToInt(builder, value, target, "ptrtoint") return if from_is_pointer and is_integer_type(to_type)
+                LLVMBuildIntToPtr(builder, value, target, "inttoptr") return if to_is_pointer and is_integer_type(from_type)
+                # ptr -> ptr is a no-op under opaque pointers; anything else is unmodeled.
+                value return if from_is_pointer and to_is_pointer
+                return null
+
+            value return if from_type.bits == to_type.bits
+            LLVMBuildTrunc(builder, value, target, "trunc") return if to_type.bits < from_type.bits
+            return LLVMBuildSExt(builder, value, target, "sext") if from_type.kind == TypeKind.Signed else LLVMBuildZExt(builder, value, target, "zext")
+
+
+        # The ADDRESS of `xs[i]` for a DARRAY.
+        #
+        # ONE index, not two: `items` is already a `T*`, so there is no leading 0 to step
+        # over the way a fixed array's pointer-to-array needs.
+        def emit_darray_index_address(array_slot: LLVMValueRef, array_type: ValueType, index_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if array_type.kind != TypeKind.DArray
+            element_type: ValueType = darray_element_of(array_type, structs)
+            null return if element_type.kind == TypeKind.Unmodeled
+            index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+            if emit_expression(index_expression, index_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is index_value:
+                emit_index_bounds_guard(array_slot, array_type, index_value, runtime, structs, m, ctx, builder)
+                items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), array_slot, 0, "darray.items.ptr")
+                items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "darray.items")
+                tag_darray_header_access(items, ctx)
+                indices: mutable darray[LLVMValueRef] = [index_value]
+                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                element_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items, indices_pointer, 1, "darray.elem.ptr")
+                return element_pointer
+            return null
+
+
+        # The ADDRESS of `xs[i]`.
+        #
+        # A two-index GEP: the first index (always 0) steps over the array POINTER itself,
+        # the second selects the element — the classic C-array shape. StructGEP cannot be
+        # used because the index is dynamic.
+        #
+        # NO BOUNDS CHECK: the subset does not model one. That matches `-emit obj` without
+        # -fbounds-check, which is what the differential compares against; a checked build
+        # is a separate feature, not a silent default.
+        def emit_index_address(array_slot: LLVMValueRef, array_type: ValueType, index_expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if array_type.kind != TypeKind.Array
+            index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+            if emit_expression(index_expression, index_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is index_value:
+                emit_index_bounds_guard(array_slot, array_type, index_value, runtime, structs, m, ctx, builder)
+                indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), index_value]
+                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMBuildGEP2(builder, llvm_type_of(array_type, structs, ctx), array_slot, indices_pointer, 2, "elem.ptr")
+            return null
+
+
+        # Copy a Runtime out of a reference (same borrow rule as copied_type).
+        def copied_runtime(runtime: Runtime&) -> Runtime:
+            return Runtime{
+                owns_arena: runtime.owns_arena,
+                fast_math: runtime.fast_math,
+                force_bounds_check: runtime.force_bounds_check,
+                active_store: runtime.active_store,
+                active_store_enum: runtime.active_store_enum,
+                error_out: runtime.error_out,
+                in_error_fn: runtime.in_error_fn,
+                streq: runtime.streq,
+                streq_type: runtime.streq_type,
+                sview_eq: runtime.sview_eq,
+                sview_eq_type: runtime.sview_eq_type,
+                sview_index: runtime.sview_index,
+                sview_index_type: runtime.sview_index_type,
+                debug_builder: runtime.debug_builder,
+                debug_file: runtime.debug_file,
+                debug_active: runtime.debug_active,
+                trace_record: runtime.trace_record,
+                trace_record_type: runtime.trace_record_type,
+                trace_record_value: runtime.trace_record_value,
+                trace_record_value_type: runtime.trace_record_value_type,
+                trace_name: runtime.trace_name,
+                trace_enabled: runtime.trace_enabled,
+                trace_fault_install: runtime.trace_fault_install,
+                trace_fault_install_type: runtime.trace_fault_install_type,
+                disjoint_function_name: runtime.disjoint_function_name,
+                disjoint_function_mask: runtime.disjoint_function_mask,
+                disjoint_param_slots: runtime.disjoint_param_slots,
+                disjoint_param_indices: runtime.disjoint_param_indices,
+                disjoint_element_ptrs: runtime.disjoint_element_ptrs,
+                disjoint_element_indices: runtime.disjoint_element_indices,
+                packed_state_new: runtime.packed_state_new,
+                packed_state_new_type: runtime.packed_state_new_type,
+                packed_alloc: runtime.packed_alloc,
+                packed_alloc_type: runtime.packed_alloc_type,
+                packed_alloc_result_type: runtime.packed_alloc_result_type,
+                packed_read_tag: runtime.packed_read_tag,
+                packed_read_tag_type: runtime.packed_read_tag_type,
+                packed_read_word: runtime.packed_read_word,
+                packed_read_word_type: runtime.packed_read_word_type,
+                packed_record_prefix: runtime.packed_record_prefix,
+                packed_record_prefix_type: runtime.packed_record_prefix_type,
+                packed_mode: runtime.packed_mode,
+                new_region_backend: runtime.new_region_backend,
+                new_region_backend_type: runtime.new_region_backend_type,
+                arena_alloc: runtime.arena_alloc,
+                arena_realloc: runtime.arena_realloc,
+                arena_free: runtime.arena_free,
+                arena_alloc_type: runtime.arena_alloc_type,
+                arena_realloc_type: runtime.arena_realloc_type,
+                arena_free_type: runtime.arena_free_type,
+                arena: runtime.arena
+            }
+
+
+        # `arena_free(region)` — release the function's auto region. Idempotent in the
+        # runtime and a no-op for a region that never allocated (strategy 2 is lazy), so
+        # emitting it unconditionally on every return path is correct and cheap.
+        def emit_region_free(runtime: Runtime&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A BORROWED region (the caller's, threaded in) is not ours to free.
+            return if not runtime.owns_arena
+            arguments: mutable darray[LLVMValueRef] = [runtime.arena]
+            arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            _ = LLVMBuildCall2(builder, runtime.arena_free_type, runtime.arena_free, arguments_pointer, 1, "")
+
+
+        # `xs.push(v)` — grow-if-needed, store, bump count.
+        #
+        # Mirrors stage0's lowering, read out of its own `-emit llvm` output:
+        #
+        #   count = xs.count; needed = count + 1
+        #   if xs.capacity < needed:
+        #       new_cap = capacity == 0 ? 256 : max(capacity * 2, needed)
+        #       items = xs.items == null ? arena_alloc(arena, new_bytes)
+        #                                : arena_realloc(arena, items, old_bytes, new_bytes)
+        #       xs.items = items; xs.capacity = new_cap
+        #   xs.items[count] = v; xs.count = needed
+        #
+        # The 256 initial capacity is stage0's, not a guess. Overflow TRAPS are omitted:
+        # they only abort on a capacity that cannot occur in a modeled program, so their
+        # absence is unobservable in the differential — but it does mean this lowering is
+        # not a bit-for-bit clone, only a behavioural one.
+        # Tag a loop's LATCH branch `!llvm.loop !{ <self>, !{ "elisa.autovec.expected", pos,
+        # reason } }` — stage0's exact shape.
+        #
+        # The marker rides IN THE IR, which is the point: it survives inlining (a held
+        # function reference would not), so a post-optimization pass can still identify a
+        # comprehension build loop that was lowered to be vectorizable and then wasn't. That
+        # is the entire basis of `-Wperf`.
+        #
+        # LLVM requires a loop-ID node's operand 0 to be the node ITSELF, so it is built via
+        # a temporary that is then replaced by the finished node.
+        def tag_autovec_loop(branch: LLVMValueRef, position: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position_storage: mutable darray[u8] = []
+            position_text: cstr = sview_to_cstr(position, position_storage)
+            marker_name: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "elisa.autovec.expected", 22)
+            position_md: LLVMMetadataRef = LLVMMDStringInContext2(ctx, position_text, sview_len(position))
+            reason_md: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "", 0)
+            marker_ops: mutable darray[LLVMMetadataRef] = [marker_name, position_md, reason_md]
+            marker_pointer: void& = (&marker_ops[0]).cast[void&] can Unsafe.PointerCast
+            marker_node: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, marker_pointer, 3)
+
+            temporary: LLVMMetadataRef = LLVMTemporaryMDNode(ctx, null, 0)
+            loop_ops: mutable darray[LLVMMetadataRef] = [temporary, marker_node]
+            loop_pointer: void& = (&loop_ops[0]).cast[void&] can Unsafe.PointerCast
+            loop_id: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, loop_pointer, 2)
+            LLVMMetadataReplaceAllUsesWith(temporary, loop_id)
+
+            kind: u32 = LLVMGetMDKindIDInContext(ctx, "llvm.loop", 9)
+            LLVMSetMetadata(branch, kind, LLVMMetadataAsValue(ctx, loop_id))
+
+
+        # `[BODY for VAR in LOW..<HIGH]` — a list comprehension, lowered PRESIZE-AND-FILL the
+        # way stage0 does: compute the count, allocate the backing once, set count/capacity
+        # up front, then write each element BY INDEX.
+        #
+        # Not a push loop. A push loop is behaviourally identical and would pass every
+        # differential here, but it reallocates as it grows and defeats the vectorizer — and
+        # vectorization is the whole point of the construct (`-Wperf`'s autovec verifier tags
+        # exactly these loops and reports the ones that failed). Emitting the slow shape for
+        # a construct that exists to be fast would be a divergence the exit code cannot see.
+        #
+        # Constant filters preserve the presized lowering: `if true` is ordinary and
+        # `if false` produces an empty darray.
+        # `any VAR in ITER where COND` — bool quantifier (Comprehension with empty body).
+        # Models fixed array-literal iterables (the self-host `valid_suffix` shape) by
+        # unrolling: bind VAR to each element and short-circuit on first true COND.
+        def emit_any_quantifier(comprehension_var: sview, iterable: Expr, condition: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if iterable is Expr.Array(elements, array_line):
+                null return if elements.count == 0
+                bool_ty: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
+                result_slot: LLVMValueRef = LLVMBuildAlloca(builder, bool_ty, "any.result")
+                _ = LLVMBuildStore(builder, LLVMConstInt(bool_ty, 0, 0), result_slot)
+                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "any.done")
+                declined: mutable bool = false
+                for element in elements |declined, comprehension_var, condition, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    continue if declined
+                    elem_type: mutable ValueType = expression_type(element, local_scope, fns, structs, generics)
+                    if elem_type.kind == TypeKind.Unmodeled:
+                        elem_type <- ValueType{kind: TypeKind.CStr, bits: 0}
+                    if emit_expression(element, elem_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is elem_value:
+                        var_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(elem_type, structs, ctx), "any.var")
+                        _ = LLVMBuildStore(builder, elem_value, var_slot)
+                        declare_local(local_scope, comprehension_var, var_slot, elem_type)
+                        if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cond_bit:
+                            hit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "any.hit")
+                            next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "any.next")
+                            _ = LLVMBuildCondBr(builder, cond_bit, hit_block, next_block)
+                            LLVMPositionBuilderAtEnd(builder, hit_block)
+                            _ = LLVMBuildStore(builder, LLVMConstInt(bool_ty, 1, 0), result_slot)
+                            _ = LLVMBuildBr(builder, done_block)
+                            LLVMPositionBuilderAtEnd(builder, next_block)
+                        else:
+                            declined <- true
+                    else:
+                        declined <- true
+                null return if declined
+                _ = LLVMBuildBr(builder, done_block)
+                LLVMPositionBuilderAtEnd(builder, done_block)
+                return LLVMBuildLoad2(builder, bool_ty, result_slot, "any.load")
+            # `any VAR in XS where COND` over an existing DARRAY (the self-hosted machine helpers
+            # scan arm.payloads / arm.input_literals / a Stmt.Block body this way; the array-literal
+            # path above only took `any x in [a, b]`). Loop over XS, eval COND per element,
+            # short-circuit to TRUE on the first hit; default FALSE. Mirrors the comprehension walk.
+            aq_source_type: ValueType = darray_type_behind_expr(iterable, local_scope, structs)
+            if aq_source_type.kind == TypeKind.DArray:
+                if darray_address_of_expr(iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder) is aq_slot:
+                    aq_elem: ValueType = darray_element_of(aq_source_type, structs)
+                    null return if aq_elem.kind == TypeKind.Unmodeled
+                    null return if condition is Expr.Absent
+                    aq_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                    aq_bool: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
+                    aq_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                    aq_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, aq_bool, "any.d.result")
+                    _ = LLVMBuildStore(builder, LLVMConstInt(aq_bool, 0, 0), aq_result_slot)
+                    aq_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, aq_header, aq_slot, 1, "any.d.cnt.ptr")
+                    aq_count: LLVMValueRef = LLVMBuildLoad2(builder, aq_i64, aq_count_ptr, "any.d.cnt")
+                    aq_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, aq_i64, "any.d.i")
+                    _ = LLVMBuildStore(builder, LLVMConstInt(aq_i64, 0, 0), aq_index_slot)
+                    aq_var_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(aq_elem, structs, ctx), "any.d.var")
+                    declare_local(local_scope, comprehension_var, aq_var_slot, aq_elem)
+                    aq_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                    aq_cond_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, aq_function, "any.d.cond")
+                    aq_body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, aq_function, "any.d.body")
+                    aq_hit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, aq_function, "any.d.hit")
+                    aq_step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, aq_function, "any.d.step")
+                    aq_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, aq_function, "any.d.done")
+                    _ = LLVMBuildBr(builder, aq_cond_block)
+                    LLVMPositionBuilderAtEnd(builder, aq_cond_block)
+                    aq_cur: LLVMValueRef = LLVMBuildLoad2(builder, aq_i64, aq_index_slot, "any.d.cur")
+                    aq_more: LLVMValueRef = LLVMBuildICmp(builder, 40, aq_cur, aq_count, "any.d.more")
+                    _ = LLVMBuildCondBr(builder, aq_more, aq_body_block, aq_done_block)
+                    LLVMPositionBuilderAtEnd(builder, aq_body_block)
+                    aq_items_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, aq_header, aq_slot, 0, "any.d.items.ptr")
+                    aq_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), aq_items_ptr, "any.d.items")
+                    aq_elem_llvm: LLVMTypeRef = llvm_type_of(aq_elem, structs, ctx)
+                    aq_gep_indices: mutable darray[LLVMValueRef] = [aq_cur]
+                    aq_gep_pointer: void& = (&aq_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                    aq_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, aq_elem_llvm, aq_items, aq_gep_pointer, 1, "any.d.elem.ptr")
+                    aq_elem_value: LLVMValueRef = LLVMBuildLoad2(builder, aq_elem_llvm, aq_elem_ptr, "any.d.elem")
+                    _ = LLVMBuildStore(builder, aq_elem_value, aq_var_slot)
+                    if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is aq_pred:
+                        _ = LLVMBuildCondBr(builder, aq_pred, aq_hit_block, aq_step_block)
+                        LLVMPositionBuilderAtEnd(builder, aq_hit_block)
+                        _ = LLVMBuildStore(builder, LLVMConstInt(aq_bool, 1, 0), aq_result_slot)
+                        _ = LLVMBuildBr(builder, aq_done_block)
+                        LLVMPositionBuilderAtEnd(builder, aq_step_block)
+                        aq_next: LLVMValueRef = LLVMBuildAdd(builder, aq_cur, LLVMConstInt(aq_i64, 1, 0), "any.d.next")
+                        _ = LLVMBuildStore(builder, aq_next, aq_index_slot)
+                        _ = LLVMBuildBr(builder, aq_cond_block)
+                        LLVMPositionBuilderAtEnd(builder, aq_done_block)
+                        return LLVMBuildLoad2(builder, aq_bool, aq_result_slot, "any.d.load")
+                    return null
+            return null
+
+
+        def emit_comprehension(comprehension_var: sview, iterable: Expr, condition: Expr, body: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A container comprehension whose `expected` is a struct is either a DICT
+            # comprehension (`{k: v for …}`, a DynDict — the pair rides in `body` as a Tuple) or a
+            # SET comprehension (`{x for …}`, a DynSet — `body` is the element). Route by base;
+            # both are dispatched before the darray path.
+            if expected.kind == TypeKind.Struct:
+                comp_struct_base: mutable sview = ""
+                comp_struct_arg_start: mutable usize = 0
+                comp_struct_arg_count: mutable usize = 0
+                comp_struct_has: bool = generic_struct_instantiation_of(structs, expected, comp_struct_base, comp_struct_arg_start, comp_struct_arg_count)
+                null return if not comp_struct_has
+                if comp_struct_base == "DynSet":
+                    return emit_set_comprehension(comprehension_var, iterable, condition, body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                return emit_dict_comprehension(comprehension_var, iterable, condition, body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            # Quantifier `any|all VAR in ITER where COND` — Comprehension with empty body,
+            # expected bool. Stage0 lowers to a loop that short-circuits. Without an any/all
+            # marker on the node we treat these as `any` (self-host lexer uses `any` heavily;
+            # `all` is rarer and can be refined later via annotation).
+            if expected.kind == TypeKind.Bool and body is Expr.Absent:
+                return emit_any_quantifier(comprehension_var, iterable, condition, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            null return if expected.kind != TypeKind.DArray
+            # A quantifier (`any`/`all`) has no body; only the collection form is modeled.
+            null return if body is Expr.Absent
+            if condition is Expr.BoolLit(filter_value):
+                if not filter_value:
+                    return LLVMConstNull(darray_llvm_type(structs, ctx))
+            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            element_type: ValueType = darray_element_of(expected, structs)
+            null return if element_type.kind == TypeKind.Unmodeled
+
+            # Only an integer RANGE iterable is modeled: its length is known before the loop,
+            # which is what makes the presize possible at all.
+            if iterable is Expr.Binary(range_low, range_operator, range_high, range_line):
+                null return if range_operator != TokenKind.RangeLt and range_operator != TokenKind.RangeLe
+                inclusive: bool = range_operator == TokenKind.RangeLe
+                index_type: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                if emit_expression(range_low, index_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is low_value:
+                    if emit_expression(range_high, index_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is high_value:
+                        span: LLVMValueRef = LLVMBuildSub(builder, high_value, low_value, "comp.span")
+                        count: mutable LLVMValueRef = span
+                        count <- LLVMBuildAdd(builder, span, LLVMConstInt(int64_type, 1, 0), "comp.count") if inclusive
+                        # An empty or reversed range yields an empty darray, not a negative
+                        # allocation.
+                        positive: LLVMValueRef = LLVMBuildICmp(builder, 38, count, LLVMConstInt(int64_type, 0, 0), "comp.count.pos")
+                        count <- LLVMBuildSelect(builder, positive, count, LLVMConstInt(int64_type, 0, 0), "comp.count.clamped")
+
+                        header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                        result_slot: LLVMValueRef = LLVMBuildAlloca(builder, header, "list.comp.result")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(header), result_slot)
+                        stride: LLVMValueRef = element_stride(element_type, structs, ctx)
+                        bytes: LLVMValueRef = LLVMBuildMul(builder, count, stride, "comp.bytes")
+                        alloc_args: mutable darray[LLVMValueRef] = [runtime.arena, bytes]
+                        alloc_pointer: void& = (&alloc_args[0]).cast[void&] can Unsafe.PointerCast
+                        items: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "comp.alloc")
+                        items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, result_slot, 0, "comp.items.ptr")
+                        count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, result_slot, 1, "comp.count.ptr")
+                        capacity_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, result_slot, 2, "comp.cap.ptr")
+                        _ = LLVMBuildStore(builder, items, items_pointer)
+                        # Capacity is the range bound; count is the number of values that
+                        # actually pass a dynamic filter and starts at zero.
+                        filtered: mutable bool = true
+                        if condition is Expr.Absent:
+                            filtered <- false
+                        elif condition is Expr.BoolLit:
+                            filtered <- false
+                        if filtered:
+                            _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), count_pointer)
+                        else:
+                            _ = LLVMBuildStore(builder, count, count_pointer)
+                        output_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, "comp.out.i")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), output_index_slot)
+
+                        function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, "comp.i")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), index_slot)
+                        var_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(index_type, structs, ctx), "comp.var")
+                        declare_local(local_scope, comprehension_var, var_slot, index_type)
+
+                        condition_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.cond")
+                        body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.input")
+                        write_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.write")
+                        skip_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.skip")
+                        latch_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.latch")
+                        done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "comp.done")
+                        _ = LLVMBuildBr(builder, condition_block)
+                        LLVMPositionBuilderAtEnd(builder, condition_block)
+                        current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, index_slot, "comp.i.cur")
+                        more: LLVMValueRef = LLVMBuildICmp(builder, 40, current, count, "comp.more")
+                        _ = LLVMBuildCondBr(builder, more, body_block, done_block)
+
+                        LLVMPositionBuilderAtEnd(builder, body_block)
+                        _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, low_value, current, "comp.var.value"), var_slot)
+                        if filtered:
+                            if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is predicate:
+                                _ = LLVMBuildCondBr(builder, predicate, write_block, skip_block)
+                            else:
+                                LLVMPositionBuilderAtEnd(builder, done_block)
+                                return null
+                            LLVMPositionBuilderAtEnd(builder, write_block)
+                        if emit_expression(body, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_value:
+                            loaded_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "comp.items")
+                            # A darray indexes with a ONE-index GEP: `items` is already a T*.
+                            output_index: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, output_index_slot, "comp.out.i.cur") if filtered else current
+                            comp_indices: mutable darray[LLVMValueRef] = [output_index]
+                            comp_indices_pointer: void& = (&comp_indices[0]).cast[void&] can Unsafe.PointerCast
+                            slot_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), loaded_items, comp_indices_pointer, 1, "comp.slot")
+                            _ = LLVMBuildStore(builder, element_value, slot_pointer)
+                            if filtered:
+                                _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, output_index, LLVMConstInt(int64_type, 1, 0), "comp.out.i.next"), output_index_slot)
+                                _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, output_index, LLVMConstInt(int64_type, 1, 0), "comp.count.next"), count_pointer)
+                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, current, LLVMConstInt(int64_type, 1, 0), "comp.i.next"), index_slot)
+                            # The LATCH is what carries the marker: this branch is the loop's
+                            # back-edge, and `!llvm.loop` belongs on it.
+                            _ = LLVMBuildBr(builder, latch_block)
+                            LLVMPositionBuilderAtEnd(builder, skip_block)
+                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, current, LLVMConstInt(int64_type, 1, 0), "comp.i.skip"), index_slot)
+                            _ = LLVMBuildBr(builder, latch_block)
+                            LLVMPositionBuilderAtEnd(builder, latch_block)
+                            latch: LLVMValueRef = LLVMBuildBr(builder, condition_block)
+                            tag_autovec_loop(latch, "comprehension", ctx)
+                            if not filtered:
+                                LLVMPositionBuilderAtEnd(builder, write_block)
+                                _ = LLVMBuildUnreachable(builder)
+                                LLVMPositionBuilderAtEnd(builder, skip_block)
+                                _ = LLVMBuildUnreachable(builder)
+                            LLVMPositionBuilderAtEnd(builder, done_block)
+                            return LLVMBuildLoad2(builder, header, result_slot, "list.comp.value")
+                        LLVMPositionBuilderAtEnd(builder, done_block)
+                        return null
+            # `[BODY for VAR in XS (if COND)?]` over an existing DARRAY source (the most common
+            # comprehension form; the range path above needs a compile-time count and cannot take
+            # one). The source count is dynamic, so this builds the output by PUSH — behaviourally
+            # identical, exit-code-verified; it forgoes the range path's presize/vectorize, which
+            # a dynamic-length source could not use anyway.
+            lc_source_type: ValueType = darray_type_behind_expr(iterable, local_scope, structs)
+            if lc_source_type.kind == TypeKind.DArray:
+                if darray_address_of_expr(iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder) is lc_source_slot:
+                    lc_source_elem: ValueType = darray_element_of(lc_source_type, structs)
+                    null return if lc_source_elem.kind == TypeKind.Unmodeled
+                    lc_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                    lc_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                    lc_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, lc_header, "list.comp.d.out")
+                    _ = LLVMBuildStore(builder, LLVMConstNull(lc_header), lc_out_slot)
+                    lc_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, lc_header, lc_source_slot, 1, "list.comp.d.cnt.ptr")
+                    lc_count: LLVMValueRef = LLVMBuildLoad2(builder, lc_i64, lc_count_ptr, "list.comp.d.cnt")
+                    lc_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, lc_i64, "list.comp.d.i")
+                    _ = LLVMBuildStore(builder, LLVMConstInt(lc_i64, 0, 0), lc_index_slot)
+                    lc_var_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(lc_source_elem, structs, ctx), "list.comp.d.var")
+                    declare_local(local_scope, comprehension_var, lc_var_slot, lc_source_elem)
+                    lc_filtered: mutable bool = true
+                    if condition is Expr.Absent:
+                        lc_filtered <- false
+                    elif condition is Expr.BoolLit:
+                        lc_filtered <- false
+                    # A constant-false filter yields the empty darray.
+                    if condition is Expr.BoolLit(lc_filter_value):
+                        if not lc_filter_value:
+                            return LLVMBuildLoad2(builder, lc_header, lc_out_slot, "list.comp.d.empty")
+                    lc_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                    lc_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lc_function, "list.comp.d.cond")
+                    lc_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lc_function, "list.comp.d.body")
+                    lc_push_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lc_function, "list.comp.d.push")
+                    lc_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lc_function, "list.comp.d.step")
+                    lc_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lc_function, "list.comp.d.done")
+                    _ = LLVMBuildBr(builder, lc_cond)
+                    LLVMPositionBuilderAtEnd(builder, lc_cond)
+                    lc_cur: LLVMValueRef = LLVMBuildLoad2(builder, lc_i64, lc_index_slot, "list.comp.d.cur")
+                    lc_more: LLVMValueRef = LLVMBuildICmp(builder, 40, lc_cur, lc_count, "list.comp.d.more")
+                    _ = LLVMBuildCondBr(builder, lc_more, lc_bodyb, lc_done)
+                    LLVMPositionBuilderAtEnd(builder, lc_bodyb)
+                    # Bind VAR = source[cur]: load the source's items pointer (header field 0) and
+                    # GEP by the current counter at the element stride — the same shape the darray
+                    # for-loop uses to walk its backing.
+                    if true:
+                        lc_items_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, lc_header, lc_source_slot, 0, "list.comp.d.items.ptr")
+                        lc_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), lc_items_ptr, "list.comp.d.items")
+                        lc_elem_llvm: LLVMTypeRef = llvm_type_of(lc_source_elem, structs, ctx)
+                        lc_gep_indices: mutable darray[LLVMValueRef] = [lc_cur]
+                        lc_gep_pointer: void& = (&lc_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                        lc_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, lc_elem_llvm, lc_items, lc_gep_pointer, 1, "list.comp.d.elem.ptr")
+                        lc_elem_value: LLVMValueRef = LLVMBuildLoad2(builder, lc_elem_llvm, lc_elem_ptr, "list.comp.d.elem")
+                        _ = LLVMBuildStore(builder, lc_elem_value, lc_var_slot)
+                        lc_body_ok: mutable bool = true
+                        if lc_filtered:
+                            if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is lc_pred:
+                                _ = LLVMBuildCondBr(builder, lc_pred, lc_push_block, lc_step)
+                            else:
+                                lc_body_ok <- false
+                        else:
+                            _ = LLVMBuildBr(builder, lc_push_block)
+                        null return if not lc_body_ok
+                        LLVMPositionBuilderAtEnd(builder, lc_push_block)
+                        if emit_darray_push(lc_out_slot, expected, body, local_scope, fns, structs, generics, runtime, m, ctx, builder):
+                            _ = LLVMBuildBr(builder, lc_step)
+                            LLVMPositionBuilderAtEnd(builder, lc_step)
+                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, lc_cur, LLVMConstInt(lc_i64, 1, 0), "list.comp.d.next"), lc_index_slot)
+                            _ = LLVMBuildBr(builder, lc_cond)
+                            LLVMPositionBuilderAtEnd(builder, lc_done)
+                            return LLVMBuildLoad2(builder, lc_header, lc_out_slot, "list.comp.d.value")
+                        return null
+                    return null
+            return null

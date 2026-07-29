@@ -1,0 +1,548 @@
+# Stage1 backend — registering struct types: names, bodies, alignment, and generic struct instantiation.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        # Materialize `Base[type_args]` into a concrete registered struct and return its
+        # Struct ValueType. Memoized by (base, args) so a second mention is a lookup and a
+        # recursive/self mention terminates. Declines (Unmodeled) if the base is not a
+        # template, the arity is wrong, any argument or field type is unmodeled, or the
+        # template recurses by value.
+        def instantiate_generic_struct(base: sview, type_args: darray[ValueType]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # Memo: an already-built (base, args) tuple resolves straight to its entry.
+            for inst in 0..<structs.generic_struct_inst_bases.count |structs, base, type_args|:
+                continue if structs.generic_struct_inst_bases[inst] != base
+                continue if structs.generic_struct_inst_arg_count[inst] != type_args.count
+                astart: usize = structs.generic_struct_inst_arg_start[inst]
+                matched: mutable bool = true
+                for k in 0..<type_args.count |structs, matched, astart, type_args|:
+                    stored: ValueType = structs.generic_struct_inst_args[astart + k]
+                    matched <- false if stored.kind != type_args[k].kind or stored.bits != type_args[k].bits
+                if matched:
+                    if structs.generic_struct_inst_ready[inst]:
+                        return ValueType{kind: TypeKind.Struct, bits: structs.generic_struct_inst_index[inst].u32()}
+                    else:
+                        # An incomplete row is usable only for the recursive lookup made while
+                        # its own base is being resolved. Outside that window the prior attempt
+                        # declined, so do not leak its opaque handle into later code.
+                        for pending in structs.generic_struct_inprogress |structs, base|:
+                            ValueType{kind: TypeKind.Struct, bits: structs.generic_struct_inst_index[inst].u32()} return if pending == base
+                        return unmodeled_type()
+            template_index: i64 = generic_struct_index_of(structs, base)
+            unmodeled_type() return if template_index < 0
+            tslot: usize = template_index.usize()
+            unmodeled_type() return if structs.generic_struct_param_count[tslot] != type_args.count
+            for arg in type_args |structs|:
+                unmodeled_type() return if arg.kind == TypeKind.Unmodeled
+            # Conservative recursion guard: a base already mid-instantiation would loop unless
+            # the recursive lookup finds the placeholder registered below. The placeholder is
+            # what makes `Node[T]&?` representable; a direct `Node[T]` field is rejected below
+            # because it would still have infinite size.
+
+            if structs.generic_struct_decls[tslot] is Decl.Struct(sname, members, saffinity, shas_states, shas_derive, sinvariants, sline):
+                unmodeled_type() return if members.count == 0
+
+                # Register the opaque named LLVM struct and its memo row BEFORE resolving
+                # members. Recursive pointer/optional fields can then resolve the same
+                # (base,args) tuple to this placeholder instead of recursing forever.
+                name_storage: mutable darray[u8] = []
+                for index in 0..<sview_len(base) |name_storage, base|:
+                    name_storage.push(sview_at(base, index))
+                for arg in type_args |name_storage, structs|:
+                    name_storage.push(95)
+                    name_storage.push(95)
+                    push_generic_arg_name(arg, structs, name_storage)
+                name_storage.push(0)
+                mangled: cstr = (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                handle: LLVMTypeRef = LLVMStructCreateNamed(structs.context, mangled)
+                idx: usize = structs.names.count
+                structs.names <- structs.names.push(base)
+                structs.handles <- structs.handles.push(handle)
+                structs.alignments <- structs.alignments.push(0)
+                # Reserve the field-table row together with the named type. Nested generic
+                # fields can instantiate another generic while this body is being resolved;
+                # appending the outer row only at the end reverses the rows (Inner lands in
+                # Outer’s slot and vice versa), making every outer field lookup appear absent.
+                structs.field_start <- structs.field_start.push(0)
+                structs.field_count <- structs.field_count.push(0)
+                arg_start: usize = structs.generic_struct_inst_args.count
+                inst_row: usize = structs.generic_struct_inst_bases.count
+                for arg in type_args |structs|:
+                    structs.generic_struct_inst_args <- structs.generic_struct_inst_args.push(copied_type(arg))
+                structs.generic_struct_inst_bases <- structs.generic_struct_inst_bases.push(base)
+                structs.generic_struct_inst_arg_start <- structs.generic_struct_inst_arg_start.push(arg_start)
+                structs.generic_struct_inst_arg_count <- structs.generic_struct_inst_arg_count.push(type_args.count)
+                structs.generic_struct_inst_index <- structs.generic_struct_inst_index.push(idx)
+                structs.generic_struct_inst_ready <- structs.generic_struct_inst_ready.push(false)
+                structs.generic_struct_inprogress <- structs.generic_struct_inprogress.push(base)
+                pstart: usize = structs.generic_struct_param_start[tslot]
+                for k in 0..<type_args.count |structs, pstart, type_args|:
+                    structs.binding_names <- structs.binding_names.push(structs.generic_struct_param_names[pstart + k])
+                    structs.binding_types <- structs.binding_types.push(copied_type(type_args[k]))
+
+                element_types: mutable darray[LLVMTypeRef] = []
+                resolved_names: mutable darray[sview] = []
+                resolved_types: mutable darray[ValueType] = []
+                declined: mutable bool = false
+                for member in members |element_types, resolved_names, resolved_types, declined, structs|:
+                    member_type: mutable ValueType = annotation_value_type(member.type_expression, structs)
+                    field_error_family: sview = field_error_family_for(member.type_expression, structs)
+                    member_type <- intern_error_union_type(member_type, field_error_family, structs) if field_error_family != ""
+                    if member_type.kind == TypeKind.Unmodeled:
+                        declined <- true
+                    # The placeholder is valid behind a reference/optional wrapper, but a
+                    # direct self-value would make the struct infinitely large.
+                    elif member_type.kind == TypeKind.Struct and member_type.bits == idx.u32():
+                        declined <- true
+                    else:
+                        element_types.push(llvm_type_of(member_type, structs, structs.context))
+                        resolved_names.push(member.name)
+                        resolved_types.push(member_type)
+
+                for k in 0..<type_args.count |structs, type_args|:
+                    structs.binding_names <- structs.binding_names.truncate(structs.binding_names.count - 1)
+                    structs.binding_types <- structs.binding_types.truncate(structs.binding_types.count - 1)
+                structs.generic_struct_inprogress <- structs.generic_struct_inprogress.truncate(structs.generic_struct_inprogress.count - 1)
+                unmodeled_type() return if declined
+                field_start: usize = structs.field_names.count
+                for slot in 0..<resolved_names.count |structs, resolved_names, resolved_types|:
+                    structs.field_names <- structs.field_names.push(resolved_names[slot])
+                    structs.field_types <- structs.field_types.push(resolved_types[slot])
+                structs.field_start[idx] <- field_start
+                structs.field_count[idx] <- resolved_names.count
+                elements_pointer: void& = (&element_types[0]).cast[void&] can Unsafe.PointerCast
+                LLVMStructSetBody(handle, elements_pointer, element_types.count.u32(), 0)
+                structs.generic_struct_inst_ready[inst_row] <- true
+                return ValueType{kind: TypeKind.Struct, bits: idx.u32()}
+            return unmodeled_type()
+
+
+        def register_struct_names(file: Ast::File&, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for struct_name in file.struct_names |structs, ctx|:
+                # A generic template has no concrete type of its own; skip it here.
+                continue if generic_struct_index_of(structs, struct_name) >= 0
+                # Idempotent: extend modules re-declare types already registered.
+                continue if struct_index_of(structs, struct_name) >= 0
+                name_storage: mutable darray[u8] = []
+                handle: LLVMTypeRef = LLVMStructCreateNamed(ctx, sview_to_cstr(struct_name, name_storage))
+                structs.names <- structs.names.push(struct_name)
+                structs.handles <- structs.handles.push(handle)
+                structs.alignments <- structs.alignments.push(0)
+                structs.field_start <- structs.field_start.push(0)
+                structs.field_count <- structs.field_count.push(0)
+
+
+        # The `__tuple_label` field names recorded (in source order) for the tuple at `line`.
+        def tuple_labels_at(line: u32, structs: mutable StructTable&) -> darray[sview] can[Abort.Panic, Memory.Allocate]:
+            result: mutable darray[sview] = []
+            probe: mutable usize = 0
+            while probe < structs.tuple_label_lines.count |probe, line, result, structs|:
+                result.push(structs.tuple_label_names[probe]) if structs.tuple_label_lines[probe] == line
+                probe <- probe + 1
+            return result
+
+
+        # Apply struct-level alignment metadata after all named types have been
+        # registered. The parser stores `@align(N)` as `__align` with N in the
+        # annotation's value-bearing line slot.
+        def apply_struct_alignments(annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&) -> void can[Abort.Panic]:
+            for annotation in annotations |structs|:
+                continue if annotation.name != "__align"
+                index: i64 = struct_index_of(structs, annotation.owner)
+                if index >= 0 and index.usize() < structs.alignments.count:
+                    structs.alignments[index.usize()] <- annotation.line
+
+
+        def struct_alignment(value_type: ValueType, structs: StructTable&) -> u32 can[Abort.Panic]:
+            if value_type.kind != TypeKind.Struct or value_type.bits.usize() >= structs.alignments.count:
+                return 0
+            return structs.alignments[value_type.bits.usize()]
+
+
+        # The index of an already-registered anonymous tuple struct whose field NAMES and field
+        # TYPES match (structural memo — an empty struct name marks a synthesized tuple), or -1.
+        def tuple_struct_lookup(labels: darray[sview]&, element_types: darray[ValueType]&, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            si: mutable usize = 0
+            while si < structs.names.count |si, labels, element_types, structs|:
+                if structs.names[si] == "" and structs.field_count[si] == labels.count and labels.count > 0:
+                    start: usize = structs.field_start[si]
+                    matched: mutable bool = true
+                    k: mutable usize = 0
+                    while k < labels.count |k, matched, start, si, labels, element_types, structs|:
+                        if structs.field_names[start + k] != labels[k] or structs.field_types[start + k].kind != element_types[k].kind or structs.field_types[start + k].bits != element_types[k].bits:
+                            matched <- false
+                        k <- k + 1
+                    si.i64() return if matched
+                si <- si + 1
+            return -1
+
+
+        # Register ONE named-tuple type `(x: T, y: U)` as an anonymous (empty-named) struct, if
+        # not already registered. Its field labels come from the __tuple_label side-table; its
+        # element types resolve like any annotation. Structurally memoized so a tuple return
+        # type and a same-shape local resolve to the SAME struct.
+        def register_one_tuple_type(elements: darray[Ast::Expr], line: u32, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            labels: darray[sview] = tuple_labels_at(line, structs)
+            return if elements.count == 0 or labels.count != elements.count
+            element_types: mutable darray[ValueType] = []
+            declined: mutable bool = false
+            for element in elements |element_types, declined, structs|:
+                element_type: ValueType = annotation_value_type(element, structs)
+                declined <- true if element_type.kind == TypeKind.Unmodeled
+                element_types.push(element_type)
+            return if declined
+            return if tuple_struct_lookup(labels, element_types, structs) >= 0
+            name_storage: mutable darray[u8] = []
+            handle: LLVMTypeRef = LLVMStructCreateNamed(ctx, sview_to_cstr("tuple", name_storage))
+            llvm_fields: mutable darray[LLVMTypeRef] = []
+            for element_type_slot in element_types |llvm_fields, structs, ctx|:
+                llvm_fields.push(llvm_type_of(element_type_slot, structs, ctx))
+            llvm_fields_pointer: void& = (&llvm_fields[0]).cast[void&] can Unsafe.PointerCast
+            LLVMStructSetBody(handle, llvm_fields_pointer, element_types.count.u32(), 0)
+            field_start: usize = structs.field_names.count
+            fi: mutable usize = 0
+            while fi < labels.count |fi, labels, element_types, structs|:
+                structs.field_names <- structs.field_names.push(labels[fi])
+                structs.field_types <- structs.field_types.push(element_types[fi])
+                fi <- fi + 1
+            structs.names <- structs.names.push(sview("", 0, 0))
+            structs.handles <- structs.handles.push(handle)
+            structs.alignments <- structs.alignments.push(0)
+            structs.field_start <- structs.field_start.push(field_start)
+            structs.field_count <- structs.field_count.push(labels.count)
+
+
+        # If `type_expression` is a named-tuple TYPE, pre-register its anonymous struct.
+        # Pre-pass: register every named-tuple TYPE that appears in a function signature
+        # (params, return) or a local declaration, BEFORE any body is emitted — annotation_value_type
+        # then resolves a tuple annotation by structural lookup (it has no ctx to build a handle).
+        def register_tuple_types(elements: darray[Ast::Expr], starts: darray[usize], counts: darray[usize], lines: darray[u32], structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for tuple_index in 0..<starts.count |elements, starts, counts, lines, structs, ctx|:
+                tuple_elements: mutable darray[Ast::Expr] = []
+                element_start: usize = starts[tuple_index]
+                element_count: usize = counts[tuple_index]
+                for element_index in 0..<element_count |tuple_elements, elements, element_start|:
+                    tuple_elements.push(elements[element_start + element_index])
+                register_one_tuple_type(tuple_elements, lines[tuple_index], structs, ctx)
+
+
+        def const_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.const_names.count |index, structs, name|:
+                index.i64() return if structs.const_names[index] == name
+                index <- index + 1
+            return -1
+
+
+        def extern_global_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.extern_global_names.count |index, structs, name|:
+                index.i64() return if structs.extern_global_names[index] == name
+                index <- index + 1
+            return -1
+
+
+        def mutable_global_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.mutable_global_names.count |index, structs, name|:
+                index.i64() return if structs.mutable_global_names[index] == name
+                index <- index + 1
+            return -1
+
+
+        # Register a global const's NAME and declared type; fold_consts fills in the value.
+        # `const A: mutable i64 = 42` is accepted by stage0, so is_mutable is not a decline.
+        # The type of an UNANNOTATED `const NAME = VALUE`, taken from the initializer the way
+        # stage0 does. Only literal initializers infer; anything else stays Unmodeled and
+        # declines rather than being guessed at.
+        def infer_const_type(const_value: Expr) -> ValueType can[Abort.Panic]:
+            if const_value is Expr.IntLit(inferred_int_literal):
+                # stage0's default integer type is `int` -- signed 64-bit.
+                return ValueType{kind: TypeKind.Signed, bits: 64}
+            if const_value is Expr.BoolLit(inferred_bool_literal):
+                return ValueType{kind: TypeKind.Bool, bits: 1}
+            if const_value is Expr.FloatLit(inferred_float_literal):
+                return ValueType{kind: TypeKind.Float, bits: 64}
+            return ValueType{kind: TypeKind.Unmodeled, bits: 0}
+
+
+        def global_has_mutable_annotation(annotations: darray[Ast::EnumAnnotation]&, name: sview) -> bool can[Abort.Panic]:
+            for annotation in annotations |name|:
+                true return if annotation.owner == name and annotation.name == "__global_mutable"
+            return false
+
+
+        def register_const(declaration: Decl, annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                const_annotated: ValueType = annotation_value_type(const_type_expression, structs)
+                # `const A = 0x20` — the annotation is OPTIONAL, and stage0 takes the type
+                # from the initializer (an integer literal is `int`). Without this the const
+                # stays Unmodeled and every USE declines, which is how the arena's
+                # ELISA_ARENA_PROT_* / MAP_* flags -- all written unannotated -- silently
+                # took new_region_with_owner down with them.
+                #
+                # Only Expr.Absent infers: a PRESENT annotation that does not resolve is a
+                # type the backend does not model, and guessing i64 there would be wrong.
+                const_declared: mutable ValueType = const_annotated
+                if const_type_expression is Expr.Absent:
+                    const_declared <- infer_const_type(const_value)
+                if const_is_mutable:
+                    # `global` declarations use the same AST variant as consts, but
+                    # must remain addressable storage rather than entering the fold table.
+                    if const_declared.kind != TypeKind.Unmodeled:
+                        existing_mutable_global: i64 = mutable_global_index_of(structs, const_name)
+                        if existing_mutable_global >= 0:
+                            structs.mutable_global_types[existing_mutable_global.usize()] <- const_declared
+                            return
+                        structs.mutable_global_names <- structs.mutable_global_names.push(const_name)
+                        structs.mutable_global_types <- structs.mutable_global_types.push(const_declared)
+                        structs.mutable_global_handles <- structs.mutable_global_handles.push(zeroed)
+                    return
+                # IDEMPOTENT: static-if selection registers consts repeatedly as it iterates
+                # to a fixpoint (a branch condition may name a const declared in an earlier
+                # branch), and a second ROW for the same name would shadow the folded first.
+                #
+                # It re-resolves the TYPE rather than returning early, because selection runs
+                # BEFORE enums exist -- so a `const cs: C[2]` first registers with an
+                # unresolved element type, and skipping here would freeze that provisional
+                # answer even after `C` is known. (Caught by const_array_of_enum.)
+                existing_const: i64 = const_index_of(structs, const_name)
+                if existing_const >= 0:
+                    structs.const_types[existing_const.usize()] <- const_declared
+                    return
+                structs.const_names <- structs.const_names.push(const_name)
+                structs.const_types <- structs.const_types.push(const_declared)
+                structs.const_values <- structs.const_values.push(0)
+                # A FLOAT const with a float-literal initializer resolves here (its text is
+                # inlined at use); other consts fold in fold_consts.
+                const_reg_float_text: mutable sview = ""
+                if const_declared.kind == TypeKind.Float:
+                    if const_value is Expr.FloatLit(const_reg_float_lit):
+                        const_reg_float_text <- const_reg_float_lit
+                structs.const_resolved <- structs.const_resolved.push(const_reg_float_text != "")
+                structs.const_float_text <- structs.const_float_text.push(const_reg_float_text)
+                structs.const_globals <- structs.const_globals.push(zeroed)
+                structs.const_global_ok <- structs.const_global_ok.push(false)
+
+        # Constant-FOLD an initializer to an integer. Only the forms stage0 itself calls a
+        # "compile-time value" are modeled: literals, other consts, and integer arithmetic.
+        # `ok` is false for anything else (a call, an unresolved const), which propagates
+        # outward as a decline rather than a guessed value.
+        def fold_const_atom(expression: Expr, structs: mutable StructTable&, ok: mutable bool&, handled: mutable bool&) -> i64 can[Abort.Panic]:
+            handled <- false
+            if expression is Expr.IntLit(literal_value):
+                handled <- true
+                return literal_value
+            if expression is Expr.BoolLit(bool_literal_value):
+                handled <- true
+                return 1 if bool_literal_value else 0
+            if expression is Expr.Field(enum_head_expression, enum_member_name, enum_field_line):
+                handled <- true
+                enum_fold_ordinal: i64 = ordinal_of_dotted_path_expr(expression, structs)
+                if enum_fold_ordinal >= 0:
+                    return enum_fold_ordinal
+                ok <- false
+                return 0
+            if expression is Expr.Ident(ident_name, ident_line):
+                handled <- true
+                const_index: i64 = const_index_of(structs, ident_name)
+                if const_index >= 0 and structs.const_resolved[const_index.usize()]:
+                    return structs.const_values[const_index.usize()]
+                ok <- false
+                return 0
+            return 0
+
+        def fold_const_binary_values(left_value: i64, operator: TokenKind, right_value: i64, ok: mutable bool&) -> i64 can[Abort.Panic]:
+            if operator == TokenKind.EqEq:
+                return 1 if left_value == right_value else 0
+            if operator == TokenKind.BangEq:
+                return 1 if left_value != right_value else 0
+            if operator == TokenKind.Lt:
+                return 1 if left_value < right_value else 0
+            if operator == TokenKind.Gt:
+                return 1 if left_value > right_value else 0
+            if operator == TokenKind.LtEq:
+                return 1 if left_value <= right_value else 0
+            if operator == TokenKind.GtEq:
+                return 1 if left_value >= right_value else 0
+            if operator == TokenKind.And:
+                return 1 if left_value != 0 and right_value != 0 else 0
+            if operator == TokenKind.Or:
+                return 1 if left_value != 0 or right_value != 0 else 0
+            if operator == TokenKind.Plus:
+                return left_value + right_value
+            if operator == TokenKind.Minus:
+                return left_value - right_value
+            if operator == TokenKind.Star:
+                return left_value * right_value
+            if operator == TokenKind.Slash:
+                if right_value != 0:
+                    return left_value / right_value
+                ok <- false
+                return 0
+            ok <- false
+            return 0
+
+        def fold_const_expr(expression: Expr, structs: mutable StructTable&, ok: mutable bool&) -> i64 can[Abort.Panic]:
+            atom_handled: mutable bool = false
+            atom_value: i64 = fold_const_atom(expression, structs, ok, atom_handled)
+            if atom_handled:
+                return atom_value
+            if expression is Expr.Paren(paren_inner, paren_line):
+                return fold_const_expr(paren_inner, structs, ok)
+            if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
+                operand_value: i64 = fold_const_expr(unary_operand, structs, ok)
+                if unary_operator == TokenKind.Minus:
+                    return 0 - operand_value
+                ok <- false
+                return 0
+            if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
+                left_value: i64 = fold_const_expr(binary_left, structs, ok)
+                right_value: i64 = fold_const_expr(binary_right, structs, ok)
+                operands_ok: bool = ok
+                if not operands_ok:
+                    return 0
+                return fold_const_binary_values(left_value, binary_operator, right_value, ok)
+            ok <- false
+            return 0
+
+
+        # Seed the TARGET predefines a `static if` selects on. Mirrors stage0's
+        # populateTargetConstValues (semantic/target_consts.go); the host triple is the only
+        # one stage1 emits for, so these are fixed rather than derived from a -target flag.
+        # Registered as ordinary resolved consts so fold_const_expr reaches them by name.
+        def register_target_consts(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            bool_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+            names: darray[sview] = ["ELISA_TARGET_OS_MACOS", "ELISA_TARGET_OS_LINUX", "ELISA_TARGET_OS_WINDOWS", "ELISA_TARGET_OS_FREEBSD", "ELISA_TARGET_OS_POSIX", "ELISA_TARGET_ARCH_X86_64", "ELISA_TARGET_ARCH_ARM64", "PLATFORM_WINDOWS", "PLATFORM_APPLE", "PLATFORM_DARWIN", "PLATFORM_LINUX", "PLATFORM_FREEBSD", "ARCH_X86_64", "ARCH_ARM64"]
+            values: darray[i64] = [1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1]
+            for index in 0..<names.count |structs, names, values, bool_type|:
+                continue if const_index_of(structs, names[index]) >= 0
+                structs.const_names <- structs.const_names.push(names[index])
+                structs.const_types <- structs.const_types.push(bool_type)
+                structs.const_values <- structs.const_values.push(values[index])
+                structs.const_resolved <- structs.const_resolved.push(true)
+                structs.const_float_text <- structs.const_float_text.push("")
+                structs.const_globals <- structs.const_globals.push(zeroed)
+                structs.const_global_ok <- structs.const_global_ok.push(false)
+
+
+        # Which `static if` BRANCH bodies are live. The parser keeps every branch (a name
+        # declared in two branches is not a duplicate), so without this the backend sees a
+        # per-target `const ARENA_BACKEND` declared once per branch -- and everything reading
+        # one declines. Returns the head lines of the branches to KEEP.
+        #
+        # Rows are in source order and carry a kind: 0 opens a chain, 1 continues it, 2 is the
+        # fallback. A chain takes its FIRST true branch; `static else` is taken only when no
+        # earlier branch in the same chain was. A condition that will not fold is treated as
+        # FALSE rather than guessed -- the same decline-don't-invent rule fold_const_expr uses.
+        def selected_static_if_lines(file: Ast::File&, structs: mutable StructTable&) -> darray[u32] can[Abort.Panic, Memory.Allocate]:
+            taken: mutable darray[u32] = []
+            chain_satisfied: mutable bool = false
+            for row in 0..<file.static_if_lines.count |taken, chain_satisfied, file, structs|:
+                chain_satisfied <- false if file.static_if_kinds[row] == 0
+                continue if chain_satisfied
+                if file.static_if_kinds[row] == 2:
+                    taken.push(file.static_if_lines[row])
+                    chain_satisfied <- true
+                    continue
+                condition_ok: mutable bool = true
+                condition_value: i64 = fold_const_expr(file.static_if_conds[row], structs, condition_ok)
+                continue if not condition_ok or condition_value == 0
+                taken.push(file.static_if_lines[row])
+                chain_satisfied <- true
+            return taken
+
+
+        # The EFFECTIVE top-level declarations: `file.top_decls` with each `Decl.Scoped`
+        # (one `static if` branch body) replaced by its contents when the branch is taken,
+        # and dropped when it is not. Every later pass iterates this instead of
+        # `file.top_decls`, so branch selection is decided in ONE place rather than being
+        # re-derived (inconsistently) by each of the nine passes.
+        #
+        # Recursive: `static if` blocks nest (arena.elisa selects a backend, then selects
+        # again on the chosen backend's constant).
+        # `Decl.Scoped` is NOT exclusively a static-if branch -- an `impl` block produces one
+        # too (parser_decl.elisa:420). Dropping a Scoped merely because it is not in
+        # `taken_lines` would silently delete every impl in the program, so a Scoped whose
+        # line is not a static-if branch line at all is inlined UNCONDITIONALLY. Only a
+        # genuine branch (its line appears in `branch_lines`) is subject to selection.
+        def flatten_static_branches(decls: darray[Decl]&, branch_lines: darray[u32]&, taken_lines: darray[u32]&, out: mutable darray[Decl]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for declaration in decls |out, branch_lines, taken_lines|:
+                if declaration is Decl.Scoped(scoped_body, scoped_line):
+                    is_branch: bool = static_branch_is_taken(branch_lines, scoped_line)
+                    keep: bool = static_branch_is_taken(taken_lines, scoped_line) if is_branch else true
+                    flatten_static_branches(scoped_body, branch_lines, taken_lines, out) if keep
+                    continue
+                out.push(declaration)
+
+
+        def static_branch_is_taken(taken_lines: darray[u32]&, line: u32) -> bool can[Abort.Panic]:
+            for taken_line in taken_lines |line|:
+                true return if taken_line == line
+            return false
+
+
+        # Fold every global const to its value, iterating to a FIXPOINT so a const may
+        # reference one declared LATER (stage0 accepts that). Each pass must resolve at
+        # least one new const or nothing ever will, so `const_names.count` passes suffice.
+        def fold_one_const_decl(declaration: Decl, progressed: mutable bool&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            pending: mutable darray[Decl] = [declaration]
+            while pending.count > 0 |pending, progressed, structs|:
+                current_index: usize = pending.count - 1
+                current: Decl = pending[current_index]
+                pending.truncate(current_index)
+                if current is Decl.Module(module_name, module_body, module_line):
+                    for nested in module_body |pending|:
+                        pending.push(nested)
+                    continue
+                if current is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                    const_index: i64 = const_index_of(structs, const_name)
+                    continue if const_index < 0
+                    continue if structs.const_resolved[const_index.usize()]
+                    folded_ok: mutable bool = true
+                    folded: i64 = fold_const_expr(const_value, structs, folded_ok)
+                    continue if not folded_ok
+                    structs.const_values[const_index.usize()] <- folded
+                    structs.const_resolved[const_index.usize()] <- true
+                    progressed <- true
+
+        def fold_consts(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            pass_index: mutable usize = 0
+            while pass_index < structs.const_names.count |pass_index, file, structs|:
+                progressed: mutable bool = false
+                pending: mutable darray[Decl] = []
+                for declaration in top |pending|:
+                    pending.push(declaration)
+                while pending.count > 0 |pending, progressed, structs|:
+                    current_index: usize = pending.count - 1
+                    current: Decl = pending[current_index]
+                    pending.truncate(current_index)
+                    if current is Decl.Module(module_name, module_body, module_line):
+                        for nested in module_body |pending|:
+                            pending.push(nested)
+                        continue
+                    if current is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                        const_index: i64 = const_index_of(structs, const_name)
+                        continue if const_index < 0
+                        continue if structs.const_resolved[const_index.usize()]
+                        folded_ok: mutable bool = true
+                        folded: i64 = fold_const_expr(const_value, structs, folded_ok)
+                        continue if not folded_ok
+                        structs.const_values[const_index.usize()] <- folded
+                        structs.const_resolved[const_index.usize()] <- true
+                        progressed <- true
+                break if not progressed
+                pass_index <- pass_index + 1
+
+
+        # Build the LLVM constant for a const aggregate initializer, RECURSIVELY: a scalar
+        # element folds to a ConstInt, an array element (`[[1,2],[3,4]]`) builds a nested
+        # ConstArray. `ok` goes false on any non-foldable element, extent mismatch, or
+        # unmodeled element type — the caller then declines the whole global.
+        def const_global_expression(top: darray[Decl]&, name: sview, found: mutable bool&) -> Expr can[Abort.Panic]:
+            for declaration in top |name, found|:
+                if declaration is Decl.Const(global_name, global_type_expression, global_value, global_is_mutable, global_line):
+                    if global_name == name:
+                        found <- true
+                        return global_value
+            return Expr.Invalid

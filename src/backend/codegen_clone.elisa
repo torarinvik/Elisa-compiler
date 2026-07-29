@@ -1,0 +1,200 @@
+# Stage1 backend — deep-copying an aggregate into the caller's region before it escapes.
+# Part of `module Backend` (see codegen.elisa); split out to keep each file short.
+
+extend Backend:
+    private:
+        def emit_clone_aggregate_value(source_value: LLVMValueRef, source_type: ValueType, target_type: ValueType, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if source_type.kind != target_type.kind
+            # Optional type IDs are compiler-local intern slots. Equivalent annotations can
+            # receive different IDs while lowering a call, so compare their payload shapes
+            # instead of requiring the IDs themselves to match.
+            if source_type.kind == TypeKind.Optional:
+                source_payload_shape: ValueType = optional_payload_of(source_type, structs)
+                target_payload_shape: ValueType = optional_payload_of(target_type, structs)
+                null return if source_payload_shape.kind != target_payload_shape.kind or source_payload_shape.bits != target_payload_shape.bits
+            elif source_type.kind == TypeKind.ErrorUnion:
+                null return if error_union_family_of(source_type, structs) != error_union_family_of(target_type, structs)
+                return emit_clone_error_union_value(source_value, source_type, target_type, structs, runtime, m, ctx, builder)
+            else:
+                null return if source_type.bits != target_type.bits
+            if source_type.kind == TypeKind.Optional:
+                payload_type: ValueType = optional_payload_of(source_type, structs)
+                optional_type: LLVMTypeRef = llvm_type_of(target_type, structs, ctx)
+                # The payload is value-owned for scalar optionals; preserve the tagged
+                # aggregate directly when recursive reconstruction is unavailable.
+                if payload_type.kind == TypeKind.Signed or payload_type.kind == TypeKind.Unsigned or payload_type.kind == TypeKind.Float or payload_type.kind == TypeKind.Bool:
+                    return source_value
+                source_tag: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 0, "clone.optional.tag")
+                source_payload: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 1, "clone.optional.payload")
+                if emit_clone_aggregate_value(source_payload, payload_type, payload_type, structs, runtime, m, ctx, builder) is cloned_payload:
+                    result: mutable LLVMValueRef = LLVMGetUndef(optional_type)
+                    result <- LLVMBuildInsertValue(builder, result, source_tag, 0, "clone.optional.tag.out")
+                    result <- LLVMBuildInsertValue(builder, result, cloned_payload, 1, "clone.optional.payload.out")
+                    return result
+                return null
+            if source_type.kind == TypeKind.Array:
+                source_element: ValueType = array_element_of(source_type, structs)
+                target_element: ValueType = array_element_of(target_type, structs)
+                null return if structs.array_extents[source_type.bits.usize()] != structs.array_extents[target_type.bits.usize()]
+                array_type: LLVMTypeRef = llvm_type_of(target_type, structs, ctx)
+                result: mutable LLVMValueRef = LLVMGetUndef(array_type)
+                for index in 0..<structs.array_extents[target_type.bits.usize()] |result, source_value, source_element, target_element, structs, ctx, builder|:
+                    source_field: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, index.u32(), "clone.array.src")
+                    if emit_clone_aggregate_value(source_field, source_element, target_element, structs, runtime, m, ctx, builder) is cloned_field:
+                        result <- LLVMBuildInsertValue(builder, result, cloned_field, index.u32(), "clone.array.dst")
+                    else:
+                        return null
+                return result
+            if source_type.kind == TypeKind.Struct:
+                slot: usize = source_type.bits.usize()
+                null return if structs.field_count[slot] == 0
+                struct_type: LLVMTypeRef = llvm_type_of(target_type, structs, ctx)
+                result: mutable LLVMValueRef = LLVMGetUndef(struct_type)
+                for index in 0..<structs.field_count[slot] |result, source_value, structs, ctx, builder|:
+                    field_type: ValueType = copied_type(structs.field_types[structs.field_start[slot] + index])
+                    null return if field_type.kind == TypeKind.Unmodeled
+                    source_field: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, index.u32(), "clone.field.src")
+                    if emit_clone_aggregate_value(source_field, field_type, field_type, structs, runtime, m, ctx, builder) is cloned_field:
+                        result <- LLVMBuildInsertValue(builder, result, cloned_field, index.u32(), "clone.field.dst")
+                    else:
+                        return null
+                return result
+            if source_type.kind == TypeKind.DArray:
+                return emit_clone_nested_darray_value(source_value, source_type, target_type, structs, runtime, m, ctx, builder)
+            null return if source_type.kind == TypeKind.View
+            return source_value
+
+
+        # Clone a darray value when it appears inside another aggregate (for example a
+        # struct field or a darray element). The direct clone builtin has the same lowering,
+        # but this value-level form lets aggregate recursion deep-copy nested containers.
+        def emit_clone_nested_darray_value(source_value: LLVMValueRef, source_type: ValueType, target_type: ValueType, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if source_type.kind != TypeKind.DArray or target_type.kind != TypeKind.DArray
+            source_element: ValueType = darray_element_of(source_type, structs)
+            target_element: ValueType = darray_element_of(target_type, structs)
+            null return if source_element.kind == TypeKind.Unmodeled or target_element.kind == TypeKind.Unmodeled
+            null return if source_element.kind != target_element.kind or source_element.bits != target_element.bits
+            header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+            count_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            source_items: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 0, "clone.nested.src.items")
+            source_count: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 1, "clone.nested.src.count")
+            stride: LLVMValueRef = element_stride(target_element, structs, ctx)
+            byte_count: LLVMValueRef = LLVMBuildMul(builder, source_count, stride, "clone.nested.bytes")
+            alloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, byte_count]
+            alloc_pointer: void& = (&alloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+            destination_items: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "clone.nested.alloc")
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            index_slot: LLVMValueRef = LLVMBuildAlloca(builder, count_type, "clone.nested.index")
+            _ = LLVMBuildStore(builder, LLVMConstInt(count_type, 0, 0), index_slot)
+            loop_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.nested.loop")
+            body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.nested.body")
+            end_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.nested.end")
+            _ = LLVMBuildBr(builder, loop_block)
+            LLVMPositionBuilderAtEnd(builder, loop_block)
+            current_index: LLVMValueRef = LLVMBuildLoad2(builder, count_type, index_slot, "clone.nested.index.load")
+            more: LLVMValueRef = LLVMBuildICmp(builder, 36, current_index, source_count, "clone.nested.more")
+            _ = LLVMBuildCondBr(builder, more, body_block, end_block)
+            LLVMPositionBuilderAtEnd(builder, body_block)
+            indices: mutable darray[LLVMValueRef] = [current_index]
+            indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+            element_llvm: LLVMTypeRef = llvm_type_of(source_element, structs, ctx)
+            source_pointer: LLVMValueRef = LLVMBuildGEP2(builder, element_llvm, source_items, indices_pointer, 1, "clone.nested.src.ptr")
+            destination_pointer: LLVMValueRef = LLVMBuildGEP2(builder, element_llvm, destination_items, indices_pointer, 1, "clone.nested.dst.ptr")
+            source_element_value: LLVMValueRef = LLVMBuildLoad2(builder, element_llvm, source_pointer, "clone.nested.src.value")
+            if emit_clone_aggregate_value(source_element_value, source_element, target_element, structs, runtime, m, ctx, builder) is cloned_element:
+                _ = LLVMBuildStore(builder, cloned_element, destination_pointer)
+            else:
+                return null
+            next_index: LLVMValueRef = LLVMBuildAdd(builder, current_index, LLVMConstInt(count_type, 1, 0), "clone.nested.next")
+            _ = LLVMBuildStore(builder, next_index, index_slot)
+            _ = LLVMBuildBr(builder, loop_block)
+            LLVMPositionBuilderAtEnd(builder, end_block)
+            result: mutable LLVMValueRef = LLVMGetUndef(header)
+            result <- LLVMBuildInsertValue(builder, result, destination_items, 0, "clone.nested.items")
+            result <- LLVMBuildInsertValue(builder, result, source_count, 1, "clone.nested.count")
+            result <- LLVMBuildInsertValue(builder, result, source_count, 2, "clone.nested.capacity")
+            return result
+
+
+        def emit_clone_value_builtin(callee: Expr, arguments: darray[Expr]&, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            is_clone: mutable bool = false
+            if callee is Expr.Index(object, type_argument, line):
+                is_clone <- true if object is Expr.Ident(name, name_line) and name == "clone"
+            if callee is Expr.IndexN(object, type_arguments, line):
+                is_clone <- true if object is Expr.Ident(name, name_line) and name == "clone"
+            null return if not is_clone or arguments.count != 1 or expected.kind == TypeKind.DArray or expected.kind == TypeKind.Unmodeled
+            source_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            if emit_expression(arguments[0], source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is source_value:
+                return emit_clone_aggregate_value(source_value, source_type, expected, structs, runtime, m, ctx, builder)
+            return null
+
+
+        def emit_clone_darray_builtin(callee: Expr, arguments: darray[Expr]&, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            is_clone: mutable bool = false
+            if callee is Expr.Index(object, type_argument, line):
+                is_clone <- true if object is Expr.Ident(name, name_line) and name == "clone"
+            if callee is Expr.IndexN(object, type_arguments, line):
+                is_clone <- true if object is Expr.Ident(name, name_line) and name == "clone"
+            null return if not is_clone or arguments.count != 1 or expected.kind != TypeKind.DArray
+            source_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            null return if source_type.kind != TypeKind.DArray and source_type.kind != TypeKind.View and source_type.kind != TypeKind.SView and source_type.kind != TypeKind.Array
+            source_element: mutable ValueType = ValueType{kind: TypeKind.Unsigned, bits: 8}
+            source_element <- darray_element_of(source_type, structs) if source_type.kind == TypeKind.DArray
+            source_element <- view_element_of(source_type, structs) if source_type.kind == TypeKind.View
+            source_element <- array_element_of(source_type, structs) if source_type.kind == TypeKind.Array
+            target_element: ValueType = darray_element_of(expected, structs)
+            null return if source_element.kind == TypeKind.Unmodeled or target_element.kind == TypeKind.Unmodeled
+            null return if source_element.kind != target_element.kind or source_element.bits != target_element.bits
+            source_expression_type: ValueType = view_struct_type(source_type, structs) if source_type.kind == TypeKind.View else source_type
+            if emit_expression(arguments[0], source_expression_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is source_value:
+                header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                count_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                source_items: mutable LLVMValueRef = zeroed
+                source_count: mutable LLVMValueRef = zeroed
+                if source_type.kind == TypeKind.Array:
+                    source_array_llvm: LLVMTypeRef = llvm_type_of(source_type, structs, ctx)
+                    source_array_slot: LLVMValueRef = LLVMBuildAlloca(builder, source_array_llvm, "clone.src.array")
+                    _ = LLVMBuildStore(builder, source_value, source_array_slot)
+                    source_array_indices: mutable darray[LLVMValueRef] = [LLVMConstInt(count_type, 0, 0), LLVMConstInt(count_type, 0, 0)]
+                    source_array_indices_pointer: void& = (&source_array_indices[0]).cast[void&] can Unsafe.PointerCast
+                    source_items <- LLVMBuildGEP2(builder, source_array_llvm, source_array_slot, source_array_indices_pointer, 2, "clone.src.array.items")
+                    source_count <- LLVMConstInt(count_type, structs.array_extents[source_type.bits.usize()].u64(), 0)
+                else:
+                    source_items <- LLVMBuildExtractValue(builder, source_value, 0, "clone.src.items")
+                    source_count <- LLVMBuildExtractValue(builder, source_value, 1, "clone.src.count")
+                stride: LLVMValueRef = element_stride(target_element, structs, ctx)
+                byte_count: LLVMValueRef = LLVMBuildMul(builder, source_count, stride, "clone.bytes")
+                alloc_arguments: mutable darray[LLVMValueRef] = [runtime.arena, byte_count]
+                alloc_pointer: void& = (&alloc_arguments[0]).cast[void&] can Unsafe.PointerCast
+                destination_items: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "clone.alloc")
+                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                index_slot: LLVMValueRef = LLVMBuildAlloca(builder, count_type, "clone.index")
+                _ = LLVMBuildStore(builder, LLVMConstInt(count_type, 0, 0), index_slot)
+                loop_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.loop")
+                body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.body")
+                end_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "clone.end")
+                _ = LLVMBuildBr(builder, loop_block)
+                LLVMPositionBuilderAtEnd(builder, loop_block)
+                current_index: LLVMValueRef = LLVMBuildLoad2(builder, count_type, index_slot, "clone.index.load")
+                more: LLVMValueRef = LLVMBuildICmp(builder, 36, current_index, source_count, "clone.more")
+                _ = LLVMBuildCondBr(builder, more, body_block, end_block)
+                LLVMPositionBuilderAtEnd(builder, body_block)
+                indices: mutable darray[LLVMValueRef] = [current_index]
+                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                source_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(source_element, structs, ctx), source_items, indices_pointer, 1, "clone.src.ptr")
+                destination_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(target_element, structs, ctx), destination_items, indices_pointer, 1, "clone.dst.ptr")
+                source_element_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(source_element, structs, ctx), source_pointer, "clone.src.value")
+                if emit_clone_aggregate_value(source_element_value, source_element, target_element, structs, runtime, m, ctx, builder) is cloned_element:
+                    _ = LLVMBuildStore(builder, cloned_element, destination_pointer)
+                else:
+                    return null
+                next_index: LLVMValueRef = LLVMBuildAdd(builder, current_index, LLVMConstInt(count_type, 1, 0), "clone.next")
+                _ = LLVMBuildStore(builder, next_index, index_slot)
+                _ = LLVMBuildBr(builder, loop_block)
+                LLVMPositionBuilderAtEnd(builder, end_block)
+                result: mutable LLVMValueRef = LLVMGetUndef(header)
+                result <- LLVMBuildInsertValue(builder, result, destination_items, 0, "clone.items")
+                result <- LLVMBuildInsertValue(builder, result, source_count, 1, "clone.count")
+                result <- LLVMBuildInsertValue(builder, result, source_count, 2, "clone.capacity")
+                return result
+            return null
