@@ -476,6 +476,31 @@ def main() -> i64:
 EOF
 )" 10
 
+# 19. A STRING LITERAL passed to a `T&` extern parameter. declare_extern records every
+#     provenance-bearing extern param as `void&` — the `&` is known, the referent is not —
+#     and the literal path required a `u8` referent, so `snprintf(…, "%llu", …)` declined
+#     and took its caller with it. Asserts the formatted LENGTH, so a literal lowered to
+#     the wrong pointer gives the wrong count rather than passing silently.
+# 19. A STRING LITERAL passed to a `T&` extern parameter. declare_extern records every
+#     provenance-bearing extern param as `void&` — the `&` is known, the referent is not —
+#     and the literal path required a `u8` referent, so `snprintf(…, "%llu", …)` declined
+#     and took its caller down with it. Asserts the formatted LENGTH, so a literal lowered
+#     to the wrong pointer gives a wrong count rather than passing silently.
+differential string_literal_to_ref_extern_param "$(cat <<'EOF'
+extern snprintf(buf: mutable u8&?, bufsize: usize, fmt: u8&, ...) -> int can[Console.Format]
+
+
+def digits(value: u64) -> i64:
+    can Console.Format, Abort.Panic:
+        len: int = snprintf(null, 0.usize(), "%llu", value)
+        return len.i64()
+
+
+def main() -> i64:
+    return digits(12345.u64())
+EOF
+)" 5
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
