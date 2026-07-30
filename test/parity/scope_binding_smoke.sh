@@ -880,6 +880,95 @@ def main() -> i64:
 EOF
 )" 42
 
+# 33. `id[T]` TYPED HANDLES. Three gaps in one shape: `id[T]` did not resolve (it erases
+#     to a u32 backing, verified against stage0's `define i64 @to_index(i32 %0)`); a
+#     `type X = id[T]` ALIAS resolved to the REFERENT struct, because the alias head
+#     heuristic keeps the LAST Ident in the target span (`Slot`, not `id`); and `!x` was
+#     lowered as boolean NOT when stage0 makes it the ID-UNWRAP operator, rejecting it on
+#     anything else ("id unwrap operator requires id[T] operand, got i64"). Unwraps two
+#     distinct handles and sums them, so a bool-not lowering cannot land on 42.
+differential id_handle_unwrap_and_alias "$(cat <<'EOF'
+struct Slot:
+    v: mutable i64
+
+
+type MyId = id[Slot]
+
+
+def to_index(x: MyId) -> usize:
+    return (!x).usize() - 1
+
+
+def sum_two(a: MyId, b: MyId) -> i64:
+    can Abort.Panic:
+        return to_index(a).i64() + to_index(b).i64() + 1
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        raw_a: u32 = 7
+        raw_b: u32 = 36
+        trusted Unsafe.PointerCast:
+            return sum_two(raw_a.cast[MyId], raw_b.cast[MyId])
+EOF
+)" 42
+
+# 34. SHAPE-parameterized types (`cstr[shape_in]`, `darray[u8, shape_buf]`). A shape is a
+#     type-level refinement with NO representation — stage0 lowers both to a plain `ptr`,
+#     identical to the unshaped spelling. stage1 failed to resolve the annotation at all,
+#     which declined the function at DECLARATION level, with no statement trace to point
+#     at: 25 runtime functions went down on this one gap. Uses both spellings and reads
+#     real data through each, so an erasure that lost the element type would not answer 42.
+differential shape_parameterized_types "$(cat <<'EOF'
+def shaped_len(s: cstr[shape_in]) -> i64 can[Abort.Panic]:
+    return s.len
+
+
+def shaped_sum(xs: darray[u8, shape_buf]&) -> i64 can[Abort.Panic]:
+    total: mutable i64 = 0
+    for b in xs |total|:
+        total <- total + b.i64()
+    return total
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        bytes: mutable darray[u8] = [10, 20, 9]
+        return shaped_len("abc") + shaped_sum(&bytes)
+EOF
+)" 42
+
+# 35. A PHANTOM generic parameter: `Guard[Held]` where `Held` is declared NOWHERE and
+#     `struct Guard[S]` never mentions `S` in a field. stage0 instantiates it anyway
+#     (`%MutexGuard__Held`); stage1 rejected any unresolved type argument up front, which
+#     declined every guard-returning lock primitive. An argument the fields DO use still
+#     fails — substituting it leaves the field Unmodeled and the existing field check
+#     declines, one step later.
+differential phantom_generic_parameter "$(cat <<'EOF'
+struct Guard[S]:
+    handle: mutable void&?
+
+
+struct Lock:
+    handle: mutable void&?
+
+
+def take(mu: mutable Lock&) -> Guard[Held]:
+    g: Guard[Held] = zeroed
+    return g
+
+
+def release(g: Guard[Held]) -> i64:
+    return 42
+
+
+def main() -> i64:
+    can Abort.Panic:
+        l: mutable Lock = Lock{handle: null}
+        return release(take(&l))
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
