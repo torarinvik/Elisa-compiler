@@ -847,6 +847,39 @@ def main() -> i64:
 EOF
 )" 42
 
+# 32. `.items[i] <- v` where the ELEMENT is an OPTIONAL ref (`darray[heap Node&?]`, what
+#     stores_core's region table holds). Reverted once: stage1 then gave an optional ref a
+#     16-byte `{i1, ptr}` while the stage0-compiled runtime strides such a darray by 8, so
+#     the write corrupted memory — and this very fixture PASSED anyway, because stage1 did
+#     both the store and the load, making a wrong stride self-consistent. The stride is now
+#     the pointer's, so the case finally tests what it claims. Stores at NON-ADJACENT slots
+#     and reads both back.
+differential darray_items_write_optional_element "$(cat <<'EOF'
+struct Node:
+    tag: mutable i64
+
+
+def fill(xs: mutable darray[heap Node&?]&, at: usize, n: heap Node&?) -> void can[Abort.Panic]:
+    assert xs.items != null
+    xs.items[at] <- n
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        a: mutable Node = Node{tag: 7}
+        b: mutable Node = Node{tag: 35}
+        xs: mutable darray[heap Node&?] = [null, null, null]
+        fill(&xs, 0.usize(), (&a).cast[heap Node&])
+        fill(&xs, 2.usize(), (&b).cast[heap Node&])
+        total: mutable i64 = 0
+        if xs[0] is first:
+            total <- total + first.tag
+        if xs[2] is second:
+            total <- total + second.tag
+        return total
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
