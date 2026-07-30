@@ -1353,6 +1353,41 @@ def main() -> i64:
 ELISAEOF
 )" 42
 
+# `x in {A, B, C}` — membership over a BRACE SET. The OR-chain lowering existed but matched
+# only an ARRAY literal (Expr.Array); the brace form is Expr.SetLit, so every such test
+# declined. The semantic layer uses the brace form heavily
+# (`operator in {TokenKind.EqEq, TokenKind.BangEq, …}`). `by_or` is the control: the same
+# predicate spelled as an explicit or-chain, so the two must agree, and a member that is NOT
+# in the set must yield false.
+differential membership_over_brace_set "$(cat <<'ELISAEOF'
+enum Kind:
+    A
+    B
+    C
+    D
+
+
+def in_set(k: Kind) -> i64:
+    can Abort.Panic:
+        return 1 if k in {Kind.A, Kind.B, Kind.C} else 0
+
+
+def by_or(k: Kind) -> i64:
+    can Abort.Panic:
+        return 1 if k == Kind.A or k == Kind.B or k == Kind.C else 0
+
+
+def main() -> i64:
+    can Abort.Panic:
+        hits: mutable i64 = 0
+        hits <- hits + in_set(Kind.A) * 10
+        hits <- hits + in_set(Kind.D) * 100
+        hits <- hits + by_or(Kind.B) * 30
+        hits <- hits + in_set(Kind.C) * 2
+        return hits
+ELISAEOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
