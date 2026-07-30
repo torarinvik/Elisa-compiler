@@ -969,6 +969,98 @@ def main() -> i64:
 EOF
 )" 42
 
+# A REF return type followed by a trailing `can[...]` grant: `can` is a plain identifier
+# to the lexer, so the postfix `&` used to be reclassified as an infix bitwise AND and the
+# whole return annotation resolved to Unmodeled, dropping the function.
+differential ref_return_with_can_clause "$(cat <<'EOF'
+struct Cell:
+    v: mutable i64
+
+
+def pick(c: Cell&) -> Cell& can[Abort.Panic]:
+    return c
+
+
+def pick_i64(n: i64&) -> i64& can[Abort.Panic]:
+    return n
+
+
+def main() -> i64:
+    can Abort.Panic:
+        c: mutable Cell = Cell{v: 40}
+        k: mutable i64 = 2
+        r: Cell& = pick(&c)
+        n: i64& = pick_i64(&k)
+        return r.v + n
+EOF
+)" 42
+
+# `fn_name.cast[void&]` takes a FUNCTION's ADDRESS — how the runtime hands a C callback to
+# pthread_create/sigaction. A function name is not a value in scope, so the source type came
+# back Unmodeled and the enclosing statement declined.
+differential cast_function_name_to_pointer "$(cat <<'EOF'
+def worker(arg: mutable void&?) -> mutable void&?:
+    return arg
+
+
+def other(arg: mutable void&?) -> mutable void&?:
+    return null
+
+
+def install() -> i64 can[Abort.Panic]:
+    p: void& = worker.cast[void&]
+    q: void&? = other.cast[void&?]
+    same: void& = worker.cast[void&]
+    hit: i64 = 40 if p == same and p != null else 0
+    return hit + (2 if q != null else 0)
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return install()
+EOF
+)" 42
+
+# A PROPAGATING `try` (no `else`) on a generic error call with EXPLICIT type arguments. The
+# bracket makes the callee an Index/IndexN rather than an Ident, so the Ident-only dispatch
+# never fired and the inference-based helper had no argument to recover T from. Covers both
+# the statement form and the `return try …` value form, plus a void-success instantiation.
+differential propagating_try_explicit_generic "$(cat <<'EOF'
+error RuntimeError:
+    Boom
+
+
+def gen_id[T](x: T) -> T error[RuntimeError]:
+    return x
+
+
+def gen_void[T](x: T) -> void error[RuntimeError]:
+    return
+
+
+def gen_boom[T](x: T) -> T error[RuntimeError]:
+    raise RuntimeError.Boom
+
+
+def good(x: i64) -> i64 error[RuntimeError]:
+    can Abort.Panic:
+        try gen_void[i64](x)
+        return try gen_id[i64](x)
+
+
+def bad(x: i64) -> i64 error[RuntimeError]:
+    can Abort.Panic:
+        return try gen_boom[i64](x)
+
+
+def main() -> i64:
+    can Abort.Panic:
+        ok: i64 = try good(40) else 0
+        recovered: i64 = try bad(99) else 2
+        return ok + recovered
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
