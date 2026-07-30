@@ -304,6 +304,80 @@ extend Backend:
             return null
 
 
+        # The EXPLICIT type-argument list of a generic callee — `f[T]` (Index) or `f[K, V]`
+        # (IndexN) — plus its base name. `ok` is false when the callee is not that shape or a
+        # type argument does not resolve. Written as one out-param helper so the three `try`
+        # dispatch sites do not each re-open the Index/IndexN pair.
+        def generic_callee_type_args(callee: Expr, base: mutable sview&, ok: mutable bool&, structs: mutable StructTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            resolved: mutable darray[ValueType] = []
+            ok <- false
+            if callee is Expr.Index(single_callee, single_arg, single_line):
+                if single_callee is Expr.Ident(single_name, single_name_line):
+                    single_type: ValueType = annotation_value_type(single_arg, structs)
+                    if single_type.kind != TypeKind.Unmodeled:
+                        resolved.push(single_type)
+                        base <- single_name
+                        ok <- true
+            if callee is Expr.IndexN(multi_callee, multi_args, multi_line):
+                if multi_callee is Expr.Ident(multi_name, multi_name_line):
+                    multi_declined: mutable bool = false
+                    for multi_arg in multi_args |resolved, multi_declined, structs|:
+                        multi_type: ValueType = annotation_value_type(multi_arg, structs)
+                        multi_declined <- true if multi_type.kind == TypeKind.Unmodeled
+                        resolved.push(multi_type)
+                    if not multi_declined:
+                        base <- multi_name
+                        ok <- true
+            return resolved
+
+
+        # `try f[K, V](args)` with NO `else`, in an error-returning function — the PROPAGATING
+        # form of a generic error call with EXPLICIT type arguments. The plain propagating
+        # helpers take a bare name and recover the type args by INFERENCE from argument 0,
+        # which the std's `arena_dict_put[cstr[key_shape], i64](a, m, key, value)` cannot
+        # supply; without this the call fell through to the plain generic lowering, which
+        # declines every error-returning instantiation outright. `wants_value` selects whether
+        # the out-slot's success value is loaded (`return try …`) or discarded (statement form).
+        def emit_propagating_generic_try_value(base: sview, type_args: darray[ValueType]&, arguments: darray[Expr]&, wants_value: bool, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            gtry_slot: i64 = generic_index_of(generics, base)
+            null return if gtry_slot < 0
+            null return if not generics.is_error[gtry_slot.usize()]
+            gtry_type: ValueType = generic_return_type(base, type_args, generics, structs)
+            null return if gtry_type.kind == TypeKind.Unmodeled
+            null return if wants_value and gtry_type.kind == TypeKind.Void
+            if instantiate_generic(base, type_args, generics, structs, m, ctx) is gtry_target:
+                # A VOID-success instantiation still writes an i64 0 on `raise`, so the
+                # out-slot needs a real allocation even when nothing reads it.
+                gtry_out_llvm: LLVMTypeRef = LLVMInt64TypeInContext(ctx) if gtry_type.kind == TypeKind.Void else llvm_type_of(gtry_type, structs, ctx)
+                gtry_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, gtry_out_llvm, "try.out")
+                gtry_args: mutable darray[LLVMValueRef] = [gtry_out_slot]
+                gtry_declined: mutable bool = false
+                gtry_index: mutable usize = 0
+                for gtry_arg in arguments |gtry_args, gtry_declined, gtry_index, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    gtry_wanted: ValueType = instantiation_param_type(base, type_args, gtry_index, generics, structs)
+                    if emit_expression(gtry_arg, gtry_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is gtry_arg_value:
+                        gtry_args.push(gtry_arg_value)
+                    else:
+                        gtry_declined <- true
+                    gtry_index <- gtry_index + 1
+                null return if gtry_declined
+                gtry_args.push(runtime.arena) if instantiation_wants_arena(base, type_args, generics, structs)
+                gtry_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(gtry_target)
+                gtry_args_pointer: void& = (&gtry_args[0]).cast[void&] can Unsafe.PointerCast
+                gtry_status: LLVMValueRef = LLVMBuildCall2(builder, gtry_fn_type, gtry_target, gtry_args_pointer, gtry_args.count.u32(), "try.code")
+                gtry_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, gtry_status, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.ok")
+                gtry_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                gtry_cont_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gtry_function, "try.cont")
+                gtry_fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gtry_function, "try.propagate")
+                _ = LLVMBuildCondBr(builder, gtry_ok, gtry_cont_block, gtry_fail_block)
+                LLVMPositionBuilderAtEnd(builder, gtry_fail_block)
+                emit_region_unwind(regions, runtime, builder)
+                _ = LLVMBuildRet(builder, gtry_status)
+                LLVMPositionBuilderAtEnd(builder, gtry_cont_block)
+                return LLVMBuildLoad2(builder, gtry_out_llvm, gtry_out_slot, "try.value") if wants_value else gtry_out_slot
+            return null
+
+
         # The VALUE form of `try f(args)` — `v: T = try f(x)`: same propagate-on-error path as
         # the statement form, but on SUCCESS it LOADS and returns the out-slot's success value
         # (rather than discarding it). Null on decline.
