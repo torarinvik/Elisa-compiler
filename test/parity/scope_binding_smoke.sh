@@ -1504,6 +1504,32 @@ def main() -> i64:
 ELISAEOF
 )" 106   # 2 + 100 + 4
 
+# `match s: "": …` — an EMPTY-STRING pattern on an sview scrutinee. The pattern decoder
+# rejected a zero-length span as undecodable, so every function with such an arm was
+# dropped. Checks the empty case hits AND that a non-empty scrutinee falls to the default,
+# so a decoder that produced a match-anything pattern would fail too. The nested arm also
+# pins that an inner sview match inside another match arm works.
+differential empty_string_pattern "$(cat <<'ELISAEOF'
+def pick(a: sview, b: sview) -> i64 can[Memory.Allocate, Abort.Panic]:
+    n: mutable i64 = 0
+    match a:
+        "x":
+            match b:
+                "":
+                    n <- 1
+                _:
+                    n <- 2
+        _:
+            n <- 3
+    return n
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        return pick("x", "") * 100 + pick("x", "q") * 10 + pick("z", "")
+ELISAEOF
+)" 123
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
