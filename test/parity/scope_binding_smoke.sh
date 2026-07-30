@@ -779,6 +779,30 @@ def main() -> i64:
 EOF
 )" 42
 
+# 30. Building a `dstr` (which IS a `darray[u8]`) BY HAND, as ctx_fstr_alloc does: install
+#     a buffer with the `as &` reborrow spelling on a PLAIN pointer field (only the
+#     optional form was handled), then set and read back the two header fields. count and
+#     capacity are weighted differently so swapping header indices 1 and 2 answers 69, and
+#     the byte written through the INSTALLED buffer must land in the original storage, so
+#     a no-op install is caught too.
+differential darray_header_build_by_hand "$(cat <<'EOF'
+def build() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    out: mutable dstr = zeroed
+    storage: mutable u8[8] = zeroed
+    buf: mutable u8& = &storage[0]
+    out.items as & <- buf
+    out.count <- 5.usize()
+    out.capacity <- 32.usize()
+    out.items[0] <- 7.u8()
+    return out.count.i64() * 2 + out.capacity.i64() + storage[0].i64() - 7
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        return build()
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
