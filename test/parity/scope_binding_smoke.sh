@@ -1564,6 +1564,35 @@ def main() -> i64:
 ELISAEOF
 )" 109   # shadowed keeps 100, in_place accumulates 9
 
+# `a, b, c =` NEWLINE INDENT `for … |accs…| -> a, b, c:` — multi-target destructuring from an
+# accumulator loop. This nests TWO blocks: the indented body's tail statement is the loop's own
+# header block, so the outer block's statement list is empty and its value is another Block.
+# The tuple check used to see that Block and decline every such form in the semantic layer.
+#
+# Three accumulators of DIFFERENT types (bool, u32, i64) and each is read back, so a lowering
+# that bound them in the wrong order or dropped one changes the ANSWER rather than failing to
+# build. The loop also filters, so the accumulation has to actually run per element.
+differential multi_target_accumulator_destructuring "$(cat <<'ELISAEOF'
+def scan(xs: darray[i64]) -> i64 can[Memory.Allocate, Abort.Panic]:
+    found, count, total =
+        for x in xs |found = false, count: u32 = 0, total = 0| -> found, count, total:
+            if x > 2:
+                found <- true
+                count <- count + 1
+                total <- total + x
+    return (1000 if found else 0) + count.i64() * 100 + total
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[i64] = []
+        xs.push(1)
+        xs.push(3)
+        xs.push(5)
+        return scan(xs)
+ELISAEOF
+)" 184   # 1000 + 2*100 + 8 = 1208, truncated mod 256
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
