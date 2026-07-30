@@ -1388,6 +1388,89 @@ def main() -> i64:
 ELISAEOF
 )" 42
 
+# `[c for c in s]` — a list comprehension over an SVIEW (not a range, not a darray).
+# The semantic layer's sview_equal collects bytes this way. Checks the COUNT and the
+# byte VALUES, so a lowering that walked the wrong length or loaded the wrong stride
+# gives a different ANSWER rather than merely compiling.
+differential sview_comprehension "$(cat <<'ELISAEOF'
+def count_bytes(a: sview) -> i64 can[Memory.Allocate, Abort.Panic]:
+    bs: darray[u8] = [c for c in a]
+    return bs.count.i64()
+
+
+def sum_bytes(a: sview) -> i64 can[Memory.Allocate, Abort.Panic]:
+    bs: darray[u8] = [c for c in a]
+    t: mutable i64 = 0
+    i: mutable usize = 0
+    while i < bs.count:
+        t <- t + bs[i].i64()
+        i <- i + 1
+    return t
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        return count_bytes("hello") * 20 + sum_bytes("abc") - 194
+ELISAEOF
+)" 200
+
+# `name in {"i8", "u8", ...}` — set membership over STRING candidates, the shape the
+# semantic layer's type predicates (is_primitive_type, literal_fits_in_type) all use.
+# Checks hits AND misses, and a near-miss ("i3", a prefix of a member) so a length-blind
+# comparison fails.
+#
+# LIMIT, on purpose: every probe here is a literal, and identical literals may be merged to
+# one global, so this case can NOT distinguish a content comparison from a pointer one.
+# Building a pointer-distinct sview needs string_view_slice, which lives in std source these
+# self-contained fixtures do not include. The discriminating check is the parse_report
+# differential against stage0.
+differential sview_set_membership "$(cat <<'ELISAEOF'
+def is_prim(name: sview) -> bool:
+    can Abort.Panic:
+        return name in {"i8", "i16", "i32", "bool", "sview"}
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        hits: mutable i64 = 0
+        hits <- hits + 1 if is_prim("i8") else hits
+        hits <- hits + 10 if is_prim("i32") else hits
+        hits <- hits + 100 if is_prim("nope") else hits
+        hits <- hits + 1000 if is_prim("sview") else hits
+        hits <- hits + 10000 if is_prim("i3") else hits
+        return hits
+ELISAEOF
+)" 243   # 1011 truncated mod 256 by the exit code
+
+# `dst.extend([x for x in src])` — extend from a COMPREHENSION. The source is a value with
+# no address, and the extend loop re-emits its source once per element as `src[i]`, so a
+# lowering that passed the comprehension through unchanged would rebuild the list every
+# iteration. This case makes that visible as a WRONG ANSWER rather than just slow code: the
+# comprehension filters, so a per-iteration rebuild changes which elements land where.
+differential extend_from_comprehension "$(cat <<'ELISAEOF'
+def add_evens(dst: mutable darray[i64]&, src: darray[i64]) -> void can[Memory.Allocate, Abort.Panic]:
+    dst.extend([x for x in src if x % 2 == 0])
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        src: mutable darray[i64] = []
+        i: mutable i64 = 1
+        while i <= 6:
+            src.push(i)
+            i <- i + 1
+        out: mutable darray[i64] = []
+        out.push(99)
+        add_evens(out, src)
+        total: mutable i64 = 0
+        j: mutable usize = 0
+        while j < out.count:
+            total <- total + out[j]
+            j <- j + 1
+        return out.count.i64() * 10 + total
+ELISAEOF
+)" 151   # 4 elements (99,2,4,6): 4*10 + (99+2+4+6) = 151
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
