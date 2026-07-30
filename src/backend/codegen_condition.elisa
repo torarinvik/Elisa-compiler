@@ -422,13 +422,18 @@ extend Backend:
                 mis_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                 mis_scrutinee: mutable LLVMValueRef = scrutinee_raw
                 mis_compare_type: mutable LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
+                # Hoisted out of the `if packed_scrutinee` block below: the ARM loop needs the
+                # node's record and row type to bind payload fields, and a block-local would
+                # not be in scope there.
+                mis_record: mutable LLVMValueRef = zeroed
+                mis_row_type: mutable LLVMTypeRef = zeroed
                 if packed_scrutinee:
                     mis_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "mis.state")
                     mis_index: LLVMValueRef = LLVMBuildZExt(builder, scrutinee_raw, LLVMInt64TypeInContext(ctx), "mis.index")
                     mis_tag_args: mutable darray[LLVMValueRef] = [mis_state, mis_index]
                     mis_tag_pointer: void& = (&mis_tag_args[0]).cast[void&] can Unsafe.PointerCast
-                    mis_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, mis_tag_pointer, 2, "mis.record")
-                    mis_row_type: LLVMTypeRef = packed_row_llvm_type(structs, scrutinee_type.bits.i64(), ctx)
+                    mis_record <- LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, mis_tag_pointer, 2, "mis.record")
+                    mis_row_type <- packed_row_llvm_type(structs, scrutinee_type.bits.i64(), ctx)
                     mis_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, 0, "mis.tag.ptr")
                     mis_scrutinee <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), mis_tag_ptr, "mis.tag")
                     mis_compare_type <- LLVMInt32TypeInContext(ctx)
@@ -440,7 +445,35 @@ extend Backend:
                 mis_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.done")
                 mis_declined: mutable bool = false
                 mis_saw_default: mutable bool = false
-                for arm in match_arms |mis_declined, mis_saw_default, cstr_scrutinee, sview_scrutinee, packed_scrutinee, penum_scrutinee, mis_scrutinee, scrutinee_raw, scrutinee_type, mis_compare_type, result_type, mis_result_slot, mis_done, mis_function, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                # This emitter has no OR-arm test, so every `A | B:` arm declines. That was
+                # harmless while only `x: T = match …` routed here, but `return match …` does
+                # too now, and a returned OR-arm match is common — so expand one into N
+                # single-variant arms sharing the body. Arms are tested in order, so N
+                # sequential tests are equivalent to one OR'd test, and each alternative then
+                # binds through the per-variant path with its OWN field offsets (which is also
+                # why differing payload layouts are safe here, unlike a shared-test lowering).
+                mis_arms: mutable darray[MatchArm] = []
+                for mis_src_arm in match_arms |mis_arms, structs|:
+                    mis_expanded: mutable bool = false
+                    if mis_src_arm.pattern is Pattern.Or(mis_pre_opts):
+                        # Options may be VARIANTS (`Expr.Unary(..) | Expr.Paren(..)`) or plain
+                        # LITERALS (`"u8" | "i8" | "bool"` over an sview/cstr/int scrutinee) —
+                        # the per-arm paths below handle both, so both expand.
+                        mis_pre_ok: mutable bool = mis_pre_opts.count > 0
+                        for mis_pre_opt in mis_pre_opts |mis_pre_ok, structs|:
+                            if mis_pre_opt is Pattern.Variant(mis_pre_path, mis_pre_fields):
+                                mis_pre_ok <- false if packed_slot_of_path(mis_pre_path, structs) < 0
+                            elif mis_pre_opt is Pattern.Literal(mis_pre_lit):
+                                mis_pre_ok <- mis_pre_ok
+                            else:
+                                mis_pre_ok <- false
+                        if mis_pre_ok:
+                            for mis_pre_opt2 in mis_pre_opts |mis_arms, mis_src_arm|:
+                                mis_arms.push(MatchArm{pattern: mis_pre_opt2, body: mis_src_arm.body, guard: mis_src_arm.guard})
+                            mis_expanded <- true
+                    mis_arms.push(mis_src_arm) if not mis_expanded
+
+                for arm in mis_arms |mis_declined, mis_saw_default, cstr_scrutinee, sview_scrutinee, packed_scrutinee, penum_scrutinee, mis_scrutinee, mis_record, mis_row_type, scrutinee_raw, scrutinee_type, mis_compare_type, result_type, mis_result_slot, mis_done, mis_function, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
                     continue if mis_declined or mis_saw_default
                     mis_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.arm")
                     # Catch-all (`_` / binder): unconditional, closes the chain.
@@ -519,6 +552,47 @@ extend Backend:
                     if mis_have_hit:
                         _ = LLVMBuildCondBr(builder, mis_hit, mis_arm_block, mis_next)
                         LLVMPositionBuilderAtEnd(builder, mis_arm_block)
+                        # Bind the variant's PAYLOAD fields. Without this the arm's tag test was
+                        # emitted but its bound names were never declared, so any arm body that
+                        # referenced one failed to emit and took the whole function down —
+                        # `is_module_qualifier: bool = match base:` / `Expr.Ident(n, l): f(n)` is
+                        # the shape, and it is the single largest decline cluster in the semantic
+                        # layer. Mirrors the statement emitter's packed binding (codegen_stmt_match).
+                        if packed_scrutinee:
+                            if arm.pattern is Pattern.Variant(mis_bind_path, mis_bind_fields):
+                                mis_bind_slot_index: i64 = packed_slot_of_path(mis_bind_path, structs)
+                                # A NESTED constructor sub-pattern needs its own tag test. This
+                                # emitter has none, and simply not binding it would let the arm
+                                # match whatever the sub-node's tag is — a WRONG ANSWER, strictly
+                                # worse than the decline. So refuse the arm outright.
+                                for mis_nest_field in mis_bind_fields |mis_declined|:
+                                    if mis_nest_field is Pattern.Variant(mis_nest_p, mis_nest_f):
+                                        mis_declined <- true
+                                if mis_bind_slot_index >= 0 and mis_bind_fields.count > 0 and not mis_declined:
+                                    if structs.packed_has_payload[mis_bind_slot_index.usize()]:
+                                        mis_bind_payload: ValueType = copied_type(structs.packed_payloads[mis_bind_slot_index.usize()])
+                                        if mis_bind_payload.kind == TypeKind.Unmodeled:
+                                            mis_declined <- true
+                                        else:
+                                            mis_pay_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, 1, "mis.payload.ptr")
+                                            mis_pay_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(mis_bind_payload, structs, ctx), mis_pay_ptr, "mis.payload")
+                                            mis_field_start: usize = structs.packed_field_type_start[mis_bind_slot_index.usize()]
+                                            # One field: the payload IS the value, no ExtractValue.
+                                            if mis_bind_fields.count == 1:
+                                                if mis_bind_fields[0] is Pattern.Binding(mis_one_name):
+                                                    mis_one_storage: mutable darray[u8] = []
+                                                    mis_one_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(mis_bind_payload, structs, ctx), sview_to_cstr(mis_one_name, mis_one_storage))
+                                                    _ = LLVMBuildStore(builder, mis_pay_value, mis_one_slot)
+                                                    declare_local(local_scope, mis_one_name, mis_one_slot, mis_bind_payload)
+                                            if mis_bind_fields.count > 1:
+                                                for mis_bi in 0..<mis_bind_fields.count |mis_bind_fields, mis_field_start, mis_pay_value, structs, local_scope, ctx, builder|:
+                                                    if mis_bind_fields[mis_bi] is Pattern.Binding(mis_multi_name):
+                                                        mis_multi_type: ValueType = copied_type(structs.packed_field_types[mis_field_start + mis_bi])
+                                                        mis_multi_field: LLVMValueRef = LLVMBuildExtractValue(builder, mis_pay_value, mis_bi.u32(), "mis.field")
+                                                        mis_multi_storage: mutable darray[u8] = []
+                                                        mis_multi_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(mis_multi_type, structs, ctx), sview_to_cstr(mis_multi_name, mis_multi_storage))
+                                                        _ = LLVMBuildStore(builder, mis_multi_field, mis_multi_slot)
+                                                        declare_local(local_scope, mis_multi_name, mis_multi_slot, mis_multi_type)
                         if arm_has_guard(arm.guard):
                             if emit_condition(arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is mis_guard_bit:
                                 mis_guard_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.guard")
