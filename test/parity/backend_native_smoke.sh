@@ -534,10 +534,22 @@ stage1_ir_case module_datalayout 'def main() -> i64:\n    return 42\n' '^target 
 # For a HEAP pointer, null IS the absent case, so the optional's tag must be a real null
 # test. A hardcoded `true` tag reports a FAILED allocation as present and hands the program
 # a null it believes is real -- unobservable in any exit code that does not allocate.
-stage1_ir_case extern_optional_ptr_null_tag 'extern malloc(n: usize) -> mutable heap void&?\n\ndef main() -> i64:\n    p: mutable heap void&? = malloc(64)\n    if p is real:\n        return 7\n    return 3\n' 'icmp ne ptr %call, null'
+# An optional POINTER is NICHE-OPTIMIZED to a bare pointer — null IS absent — which is
+# what stage0 emits (`%p = alloca ptr`, presence via `icmp ne ptr %p1, null`). These two
+# cases previously asserted the `{i1, ptr}` TAGGED shape, which stage0 never produced:
+# they pinned a stage1 DIVERGENCE, and the difference is ABI-visible (a struct field after
+# an optional ref sat at offset 16 instead of 8). Assert the SHAPE, not the SSA names,
+# since those legitimately differ between the two compilers.
+stage1_ir_case extern_optional_ptr_niche_alloca 'extern malloc(n: usize) -> mutable heap void&?\n\ndef main() -> i64:\n    p: mutable heap void&? = malloc(64)\n    if p is real:\n        return 7\n    return 3\n' '%p = alloca ptr'
+stage1_ir_case extern_optional_ptr_null_tag 'extern malloc(n: usize) -> mutable heap void&?\n\ndef main() -> i64:\n    p: mutable heap void&? = malloc(64)\n    if p is real:\n        return 7\n    return 3\n' 'icmp ne ptr %[a-zA-Z0-9._]+, null'
+# The REGRESSION guard: no tagged optional aggregate may reappear for a pointer payload.
+stage1_ir_absent_case extern_optional_ptr_not_tagged 'extern malloc(n: usize) -> mutable heap void&?\n\ndef main() -> i64:\n    p: mutable heap void&? = malloc(64)\n    if p is real:\n        return 7\n    return 3\n' 'alloca \{ i1, ptr \}'
 # An ordinary (never-null) ref keeps the CONSTANT tag -- the null test is for heap pointers
 # only, and widening it to all refs would be a silent behavior change.
-stage1_ir_case optional_plain_ref_const_tag 'def main() -> i64:\n    v: i64 = 5\n    r: i64&? = &v\n    if r is real:\n        return 7\n    return 3\n' 'store i1 true'
+# A PLAIN `T&?` niches exactly like a heap one — stage0 gives `%r = alloca ptr` and a null
+# test, with no `store i1 true` anywhere. The old assertion demanded that constant tag.
+stage1_ir_case optional_plain_ref_niche_alloca 'def main() -> i64:\n    v: i64 = 5\n    r: i64&? = &v\n    if r is real:\n        return 7\n    return 3\n' '%r = alloca ptr'
+stage1_ir_absent_case optional_plain_ref_not_tagged 'def main() -> i64:\n    v: i64 = 5\n    r: i64&? = &v\n    if r is real:\n        return 7\n    return 3\n' 'store i1 true'
 stage1_ir_case module_triple 'def main() -> i64:\n    return 42\n' '^target triple = "arm64'
 stage1_ir_absent_case store_not_underaligned 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' 'store i64 %comp.var.value, ptr %comp.var, align 4'
 
