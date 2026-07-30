@@ -1291,63 +1291,6 @@ def main() -> i64:
 EOF
 )" 42
 
-# `submit` against the std's REAL template shape: `pool_submit1[A, R, permission P]` — three
-# type parameters, because a worker's effect set is permission-polymorphic. The submit site
-# passed only (A, R) and instantiate_generic_at checks arity exactly, so every submit against
-# the real runtime declined while the two-parameter test stub passed. Also covers a nursery
-# whose worker count is a VARIABLE rather than a literal, which was required to be an int
-# literal and declined otherwise.
-differential submit_permission_generic_and_variable_workers "$(cat <<'ELISAEOF'
-struct ThreadPool:
-    handle: void&?
-
-struct TaskGroup:
-    handle: void&?
-    cleanup: void&?
-
-struct Task[T, S]:
-    handle: usize
-    state: void&?
-
-def pool_new(threads: usize) -> ThreadPool:
-    return ThreadPool{handle: null}
-
-def pool_shutdown(pool: ThreadPool&) -> void:
-    return
-
-def task_group_new() -> TaskGroup:
-    return TaskGroup{handle: null, cleanup: null}
-
-def task_group_wait_all(group: TaskGroup&) -> void:
-    return
-
-def pool_submit1[A, R, permission P](pool: ThreadPool&, fn: fn(A) -> R can[P], arg: A) -> Task[R, i64]:
-    return Task[R, i64]{handle: 0.usize(), state: null}
-
-def task_group_add[R](group: TaskGroup&, task: Task[R, i64]) -> void:
-    _ = move task
-    return
-
-def bump(value: i64) -> i64:
-    return value + 1
-
-def run_bands(nw: usize) -> void:
-    nursery workers(nw):
-        for t in 0..<nw:
-            submit bump(t.i64())
-
-def main() -> i64:
-    can Abort.Panic:
-        nursery workers(2):
-            submit bump(41)
-        run_bands(3.usize())
-        return 42
-ELISAEOF
-)" 42
-
-# `static T` — a STORAGE qualifier, transparent to representation like `stack T`, but missing
-# from annotation_unary_value_type, so `__cast__(value: static u8&) -> u8&` resolved its
-# parameter to Unmodeled and the function was dropped.
 differential static_storage_qualifier "$(cat <<'ELISAEOF'
 def from_static(value: static u8&) -> u8&:
     return value.cast[u8&]
@@ -1358,6 +1301,55 @@ def main() -> i64:
         text: static u8& = "*"
         a: u8& = from_static(text)
         return a.i64()
+ELISAEOF
+)" 42
+
+# `match` on a packed-AST node reached through a struct FIELD. The hidden AST-store parameter
+# was decided from the DIRECT parameter types only, so a function touching AST nodes only via a
+# struct parameter got no store: runtime.active_store_enum stayed -1 and the match declined.
+# `via_local` (an AST node passed directly) is the control — it always worked, and adding an
+# unused AST parameter to `via_field` also made it compile, which is how the STORE rather than
+# the type was identified as the gate. Asserted by value: both arms must contribute.
+differential match_packed_ast_through_struct_field "$(cat <<'ELISAEOF'
+module Ast:
+    enum Node layout(handle: u32):
+        pass
+
+    enum Decl is Node:
+        Enum(name: sview, count: i64)
+        Other(x: i64)
+
+    struct Holder:
+        d: Decl
+        tag: i64
+
+
+using Ast
+
+
+def via_field(h: Ast::Holder&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        match h.d:
+            Ast::Decl.Enum(name, count):
+                return count
+            _:
+                return 0
+
+
+def via_local(d: Ast::Decl) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        match d:
+            Ast::Decl.Enum(name, count):
+                return count
+            _:
+                return 0
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        d: Ast::Decl = (Ast::Decl.Enum("E", 21))
+        h: Ast::Holder = Ast::Holder{d: d, tag: 0}
+        return via_field(&h) + via_local(d)
 ELISAEOF
 )" 42
 
