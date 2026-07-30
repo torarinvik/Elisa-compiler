@@ -740,6 +740,45 @@ def main() -> i64:
 EOF
 )" 42
 
+# 29. The two MEANINGS of `<-` on a `T&?` variable, in one fixture, because confusing them
+#     miscompiles silently in both directions. `out_value <- 30` writes THROUGH the payload
+#     pointer (an out-parameter); `r <- r.next` REBINDS the cursor and the list walk
+#     depends on it. stage0 disambiguates on the VALUE type: pointee-typed writes through,
+#     pointer-typed rebinds. Write-through contributes 30, the walk 12, the status 0 — a
+#     rebind treated as a write-through loses the walk, and the reverse loses the 30.
+differential optional_out_param_write_vs_rebind "$(cat <<'EOF'
+struct Node:
+    v: mutable i64
+    next: mutable heap Node&?
+
+
+def fill_out(out_value: mutable i64&?) -> int can[Abort.Panic]:
+    1 return if out_value == null
+    out_value <- 30
+    return 0
+
+
+def count_from(head: mutable heap Node&?) -> i64 can[Abort.Panic]:
+    n: mutable i64 = 0
+    r: mutable heap Node&? = head
+    trusted Unsafe.AssumeProgress:
+        while r != null:
+            n <- n + r.v
+            r <- r.next
+    return n
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        slot: mutable i64 = 0
+        rc: int = fill_out(&slot)
+        b: mutable Node = Node{v: 4, next: null}
+        a: mutable Node = Node{v: 8, next: (&b).cast[heap Node&]}
+        walked: i64 = count_from((&a).cast[heap Node&])
+        return slot + rc.i64() + walked
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
