@@ -1142,6 +1142,225 @@ def main() -> i64:
 EOF
 )" 42
 
+# Resolving a struct member can INSTANTIATE a generic struct, and that instantiation pushes
+# its own field rows onto the same table mid-loop. `field_start` was captured BEFORE the
+# member loop, so the FIRST struct to trigger a given instantiation had its field_start
+# pointing into the instantiation's rows (later structs hit the memo and looked fine, which
+# is why this read as a type-specific bug). Checks VALUES of the fields either side of the
+# generic one, since a wrong field_start can also resolve to a wrong index rather than decline.
+differential struct_field_start_across_generic_instantiation "$(cat <<'EOF'
+struct Cell[T]:
+    value: mutable T
+
+
+struct First:
+    a: mutable i64
+    slot: mutable Cell[i64]
+    b: mutable i64
+
+
+struct Second:
+    c: mutable i64
+    slot: mutable Cell[i64]
+
+
+def bump(s: mutable Cell[i64]&) -> i64:
+    return s.value
+
+
+def main() -> i64:
+    can Abort.Panic:
+        f: mutable First = zeroed
+        f.a <- 100
+        f.slot.value <- 7
+        f.b <- 200
+        s: mutable Second = zeroed
+        s.c <- 300
+        s.slot.value <- 3
+        hit: mutable i64 = 0
+        hit <- hit + 10 if f.a == 100 and f.b == 200 else hit
+        hit <- hit + 10 if s.c == 300 else hit
+        return hit + bump(&f.slot) * 2 + bump(&s.slot) * 2 + 2
+EOF
+)" 42
+
+# `sb.extend([0.u8()])` — a LITERAL source (no address to take, so both existing loop paths
+# declined on darray_address_of_expr) and `extend` in VALUE position (`return sb.extend(…)`,
+# which mutates in place and yields the target). Checks the appended BYTES and the resulting
+# count, so a push that drops or duplicates an element fails rather than merely compiling.
+differential extend_with_literal_source "$(cat <<'EOF'
+def add_two(sb: mutable darray[u8]&) -> void:
+    can Memory.Allocate, Abort.Panic:
+        sb.extend([7.u8(), 9.u8()])
+
+
+def add_via_arena(a: mutable Arena&, sb: mutable darray[u8, shape_in]&) -> mutable darray[u8, shape_out]&:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            return sb.extend([5.u8()])
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[u8] = [1.u8()]
+        add_two(&xs)
+        total: mutable i64 = 0
+        for b in xs |total|:
+            total <- total + b.i64()
+        return total + xs.count.i64() * 8 + 1
+EOF
+)" 42
+
+# A fn TYPE reached three ways that all previously failed, because looks_like_lambda only
+# treats `fn(A) -> R` (arrow, no `:`/`=>` body) as a TYPE inside a type annotation, and neither
+# a `type X = …` RHS nor a `[...]` reinterpret bracket marked itself as one — so both parsed as
+# a CALL to a function named `fn` plus a trailing binary `->`, and no Expr.Lambda ever reached
+# annotation_value_type. Covers the alias spelling, `cast` to a fn type, and `call_as`.
+# `call_as` is checked by RESULT, so a wrong indirect callee or arity fails rather than compiles.
+differential fn_type_alias_cast_and_call_as "$(cat <<'EOF'
+type Handler = fn(i64) -> i64
+
+
+def double(x: i64) -> i64:
+    return x * 2
+
+
+def add_one(x: i64) -> i64:
+    return x + 1
+
+
+def through_alias_param(f: Handler, n: i64) -> i64:
+    return f(n)
+
+
+def through_cast(p: void&, n: i64) -> i64 can[Abort.Panic, Unsafe.PointerCast]:
+    f: Handler = p.cast[Handler]
+    return f(n)
+
+
+def through_call_as(p: void&, n: i64) -> i64 can[Abort.Panic, Unsafe.PointerCast, Unsafe.IndirectCall]:
+    trusted Unsafe.IndirectCall:
+        return p.call_as[fn(i64) -> i64](n)
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast, Unsafe.IndirectCall:
+        a: i64 = through_alias_param(double, 10)
+        b: i64 = through_cast(double.cast[void&], 5)
+        c: i64 = through_call_as(add_one.cast[void&], 11)
+        return a + b + c
+EOF
+)" 42
+
+# Fn TYPES with REFERENCE params/returns, held in struct FIELDS and called through them.
+# Three separate gaps met here: lambda_signature_probe did not consume a bare parameter's
+# postfix `&` (so `fn(Cell&) -> Cell&` was not recognized as a fn type at all); the return
+# type was recorded as a head TOKEN, so `-> Cell&` resolved to the POINTEE — a wrong type
+# rather than a decline, which for an indirect call is an ABI mismatch; and a struct member's
+# annotation was not marked a type position, so a fn-typed field silently took the i64
+# placeholder. Asserted by VALUE precisely because the return-type bug is silent.
+differential fn_type_ref_params_in_struct_fields "$(cat <<'EOF'
+struct Cell:
+    v: mutable i64
+
+
+struct Work:
+    scale: i64
+    op: fn(i64) -> i64
+    pick: fn(Cell&) -> Cell&
+
+
+def triple(x: i64) -> i64:
+    return x * 3
+
+
+def identity(c: Cell&) -> Cell&:
+    return c
+
+
+def run(w: Work&, c: Cell&) -> i64 can[Abort.Panic]:
+    got: Cell& = w.pick(c)
+    return w.op(got.v) + w.scale
+
+
+def main() -> i64:
+    can Abort.Panic:
+        c: mutable Cell = Cell{v: 12}
+        w: Work = Work{scale: 6, op: triple, pick: identity}
+        return run(&w, &c)
+EOF
+)" 42
+
+# `submit` against the std's REAL template shape: `pool_submit1[A, R, permission P]` — three
+# type parameters, because a worker's effect set is permission-polymorphic. The submit site
+# passed only (A, R) and instantiate_generic_at checks arity exactly, so every submit against
+# the real runtime declined while the two-parameter test stub passed. Also covers a nursery
+# whose worker count is a VARIABLE rather than a literal, which was required to be an int
+# literal and declined otherwise.
+differential submit_permission_generic_and_variable_workers "$(cat <<'ELISAEOF'
+struct ThreadPool:
+    handle: void&?
+
+struct TaskGroup:
+    handle: void&?
+    cleanup: void&?
+
+struct Task[T, S]:
+    handle: usize
+    state: void&?
+
+def pool_new(threads: usize) -> ThreadPool:
+    return ThreadPool{handle: null}
+
+def pool_shutdown(pool: ThreadPool&) -> void:
+    return
+
+def task_group_new() -> TaskGroup:
+    return TaskGroup{handle: null, cleanup: null}
+
+def task_group_wait_all(group: TaskGroup&) -> void:
+    return
+
+def pool_submit1[A, R, permission P](pool: ThreadPool&, fn: fn(A) -> R can[P], arg: A) -> Task[R, i64]:
+    return Task[R, i64]{handle: 0.usize(), state: null}
+
+def task_group_add[R](group: TaskGroup&, task: Task[R, i64]) -> void:
+    _ = move task
+    return
+
+def bump(value: i64) -> i64:
+    return value + 1
+
+def run_bands(nw: usize) -> void:
+    nursery workers(nw):
+        for t in 0..<nw:
+            submit bump(t.i64())
+
+def main() -> i64:
+    can Abort.Panic:
+        nursery workers(2):
+            submit bump(41)
+        run_bands(3.usize())
+        return 42
+ELISAEOF
+)" 42
+
+# `static T` — a STORAGE qualifier, transparent to representation like `stack T`, but missing
+# from annotation_unary_value_type, so `__cast__(value: static u8&) -> u8&` resolved its
+# parameter to Unmodeled and the function was dropped.
+differential static_storage_qualifier "$(cat <<'ELISAEOF'
+def from_static(value: static u8&) -> u8&:
+    return value.cast[u8&]
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        text: static u8& = "*"
+        a: u8& = from_static(text)
+        return a.i64()
+ELISAEOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
