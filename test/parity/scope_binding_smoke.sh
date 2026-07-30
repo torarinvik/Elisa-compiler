@@ -1530,6 +1530,40 @@ def main() -> i64:
 ELISAEOF
 )" 123
 
+# `for x in xs |n = 0|:` — an INITIALIZED capture. stage0 gives it a SHADOWING loop-local,
+# so the OUTER `n` of the same name is untouched after the loop. This case exists because
+# getting it wrong is SILENT: emitting the accumulator decl into the enclosing scope makes
+# the loop mutate the caller's variable and the function returns the accumulated value
+# instead of the original. Measured before the fix: 4 where stage0 gives 100.
+#
+# The second half pins the OPPOSITE direction — an UNINITIALIZED capture (`|acc|`) names an
+# existing outer local and MUST mutate it in place, so over-scoping would break it too. A
+# lowering that scoped both, or neither, fails one half of this case.
+differential loop_accumulator_scoping "$(cat <<'ELISAEOF'
+def shadowed(xs: darray[i64]) -> i64 can[Memory.Allocate, Abort.Panic]:
+    n: mutable i64 = 100
+    for x in xs |n = 0|:
+        n <- n + x
+    return n
+
+
+def in_place(xs: darray[i64]) -> i64 can[Memory.Allocate, Abort.Panic]:
+    acc: mutable i64 = 0
+    for x in xs |acc| -> acc:
+        acc <- acc + x
+        acc
+    return acc
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[i64] = []
+        xs.push(4)
+        xs.push(5)
+        return shadowed(xs) + in_place(xs)
+ELISAEOF
+)" 109   # shadowed keeps 100, in_place accumulates 9
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
