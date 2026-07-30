@@ -59,7 +59,38 @@ extend Backend:
                     declined: mutable bool = false
                     saw_default: mutable bool = false
 
-                    for arm in match_arms |declined, saw_default, cstr_scrutinee, sview_scrutinee, scrutinee, scrutinee_type, penum_scrutinee, packed_scrutinee, scrutinee_raw, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    # An OR-arm whose alternatives have DIFFERING packed field layouts
+                    # cannot share one test: the binds below would read the FIRST
+                    # alternative's offsets for every variant — a silent wrong value.
+                    # Expand it into one single-variant arm per alternative, all sharing
+                    # the body; arms are tested in order, so N sequential tests are
+                    # equivalent to one OR'd test. Same-layout OR-arms are left alone.
+                    # This mirrors the statement emitter's spm_arms pre-pass.
+                    vpm_arms: mutable darray[MatchArm] = []
+                    for vpm_src_arm in match_arms |vpm_arms, structs|:
+                        vpm_expanded: mutable bool = false
+                        if vpm_src_arm.pattern is Pattern.Or(vpm_pre_opts):
+                            vpm_pre_ok: mutable bool = vpm_pre_opts.count > 0
+                            vpm_pre_differ: mutable bool = false
+                            vpm_pre_ref: mutable i64 = -1
+                            for vpm_pre_opt in vpm_pre_opts |vpm_pre_ok, vpm_pre_differ, vpm_pre_ref, structs|:
+                                if vpm_pre_opt is Pattern.Variant(vpm_pre_path, vpm_pre_fields):
+                                    vpm_pre_slot: i64 = packed_slot_of_path(vpm_pre_path, structs)
+                                    if vpm_pre_slot < 0:
+                                        vpm_pre_ok <- false
+                                    elif vpm_pre_ref < 0:
+                                        vpm_pre_ref <- vpm_pre_slot
+                                    else:
+                                        vpm_pre_differ <- true if not packed_slots_same_field_layout(vpm_pre_ref, vpm_pre_slot, structs)
+                                else:
+                                    vpm_pre_ok <- false
+                            if vpm_pre_ok and vpm_pre_differ:
+                                for vpm_pre_opt2 in vpm_pre_opts |vpm_arms, vpm_src_arm|:
+                                    vpm_arms.push(MatchArm{pattern: vpm_pre_opt2, body: vpm_src_arm.body, guard: vpm_src_arm.guard})
+                                vpm_expanded <- true
+                        vpm_arms.push(vpm_src_arm) if not vpm_expanded
+
+                    for arm in vpm_arms |declined, saw_default, cstr_scrutinee, sview_scrutinee, scrutinee, scrutinee_type, penum_scrutinee, packed_scrutinee, scrutinee_raw, penum_slot, compare_type, expected, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
                         # Once a catch-all is emitted the chain is closed.
                         continue if declined or saw_default
                         if arm_value_expression(arm.body) is arm_expression:
@@ -200,6 +231,11 @@ extend Backend:
                                                 payload_multi_bindings.push(packed_multi_bound)
                                             elif packed_multi_field is Pattern.Wildcard:
                                                 payload_multi_bindings.push("")
+                                            # A NESTED variant sub-pattern occupies its slot but
+                                            # binds no name here — it is tested and bound after the
+                                            # plain fields, below. "" keeps the positions aligned.
+                                            elif packed_multi_field is Pattern.Variant(packed_nest_path, packed_nest_sub):
+                                                payload_multi_bindings.push("")
                                             else:
                                                 payload_declined <- true
                                 if penum_scrutinee:
@@ -321,6 +357,44 @@ extend Backend:
                                             packed_multi_slot_ptr: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(packed_multi_type, structs, ctx), sview_to_cstr(payload_multi_bindings[packed_multi_index], packed_multi_storage))
                                             _ = LLVMBuildStore(builder, packed_multi_field, packed_multi_slot_ptr)
                                             declare_local(local_scope, payload_multi_bindings[packed_multi_index], packed_multi_slot_ptr, packed_multi_type)
+                                    # NESTED sub-patterns: read each sub-node's record, test its
+                                    # tag, and fall through to next_block on a mismatch so the arm
+                                    # only matches when every nested test holds, then bind that
+                                    # sub-pattern's own fields. Mirrors the statement emitter.
+                                    if arm.pattern is Pattern.Variant(vnest_outer_path, vnest_outer_fields):
+                                        for vnest_i in 0..<vnest_outer_fields.count |vnest_outer_fields, packed_multi_value, declined, function, next_block, structs, local_scope, runtime, ctx, builder|:
+                                            if vnest_outer_fields[vnest_i] is Pattern.Variant(vnest_path, vnest_fields):
+                                                vnest_slot: i64 = packed_slot_of_path(vnest_path, structs)
+                                                vnest_ord: i64 = packed_variant_index_of_path(vnest_path, structs)
+                                                vnest_payload: ValueType = packed_payload_of_path(vnest_path, structs)
+                                                if vnest_slot < 0 or vnest_ord < 0:
+                                                    declined <- true
+                                                else:
+                                                    vnest_handle: LLVMValueRef = LLVMBuildExtractValue(builder, packed_multi_value, vnest_i.u32(), "vnest.handle")
+                                                    vnest_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "vnest.state")
+                                                    vnest_idx: LLVMValueRef = LLVMBuildZExt(builder, vnest_handle, LLVMInt64TypeInContext(ctx), "vnest.index")
+                                                    vnest_args: mutable darray[LLVMValueRef] = [vnest_state, vnest_idx]
+                                                    vnest_args_ptr: void& = (&vnest_args[0]).cast[void&] can Unsafe.PointerCast
+                                                    vnest_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, vnest_args_ptr, 2, "vnest.record")
+                                                    vnest_row: LLVMTypeRef = packed_row_llvm_type(structs, vnest_slot, ctx)
+                                                    vnest_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, vnest_row, vnest_record, 0, "vnest.tag.ptr")
+                                                    vnest_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), vnest_tag_ptr, "vnest.tag")
+                                                    vnest_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, vnest_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), vnest_ord.u64(), 0), "vnest.cmp")
+                                                    vnest_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "vnest.cont")
+                                                    _ = LLVMBuildCondBr(builder, vnest_hit, vnest_cont, next_block)
+                                                    LLVMPositionBuilderAtEnd(builder, vnest_cont)
+                                                    if vnest_fields.count > 1 and vnest_payload.kind != TypeKind.Unmodeled:
+                                                        vnest_pay_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, vnest_row, vnest_record, 1, "vnest.payload.ptr")
+                                                        vnest_pay: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(vnest_payload, structs, ctx), vnest_pay_ptr, "vnest.payload")
+                                                        vnest_fstart: usize = structs.packed_field_type_start[vnest_slot.usize()]
+                                                        for vnest_b in 0..<vnest_fields.count |vnest_fields, vnest_fstart, vnest_pay, structs, local_scope, ctx, builder|:
+                                                            if vnest_fields[vnest_b] is Pattern.Binding(vnest_b_name):
+                                                                vnest_b_type: ValueType = copied_type(structs.packed_field_types[vnest_fstart + vnest_b])
+                                                                vnest_b_val: LLVMValueRef = LLVMBuildExtractValue(builder, vnest_pay, vnest_b.u32(), "vnest.field")
+                                                                vnest_b_store: mutable darray[u8] = []
+                                                                vnest_b_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(vnest_b_type, structs, ctx), sview_to_cstr(vnest_b_name, vnest_b_store))
+                                                                _ = LLVMBuildStore(builder, vnest_b_val, vnest_b_slot)
+                                                                declare_local(local_scope, vnest_b_name, vnest_b_slot, vnest_b_type)
                                 if penum_scrutinee and payload_binding != "":
                                     payload_type: ValueType = penum_payload_of_path(payload_path, structs)
                                     if payload_type.kind == TypeKind.Unmodeled:
