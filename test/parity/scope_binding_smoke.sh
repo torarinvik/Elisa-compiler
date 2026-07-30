@@ -1061,6 +1061,87 @@ def main() -> i64:
 EOF
 )" 42
 
+# An OPTIONAL pointer reinterpreted as a DIFFERENT optional pointer. Nullability is
+# preserved rather than discarded, so unlike the unwrapping cast this needs no narrowing
+# proof — but that only holds if ABSENCE SURVIVES the cast, which is what both arms check
+# (a re-tagged non-heap payload would pin `true` and turn null into a present-but-null ref).
+differential cast_optional_pointer_to_optional_pointer "$(cat <<'EOF'
+struct Node:
+    v: mutable i64
+
+
+struct Holder:
+    handle: mutable void&?
+
+
+def absent_stays_absent() -> i64 can[Abort.Panic]:
+    h: mutable Holder = Holder{handle: null}
+    n: mutable heap Node&? = h.handle.cast[heap Node&?]
+    return 0 if n != null else 20
+
+
+def present_round_trips(p: mutable void&) -> i64 can[Abort.Panic]:
+    h: mutable Holder = Holder{handle: p}
+    n: mutable heap Node&? = h.handle.cast[heap Node&?]
+    return 0 if n == null else 22
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        node: mutable Node = Node{v: 1}
+        return absent_stays_absent() + present_round_trips((&node).cast[void&])
+EOF
+)" 42
+
+# Generic-argument INFERENCE through a SHAPED container parameter (`darray[T, shape_in]&`),
+# the spelling the std uses on every in-place container helper. The shape argument makes the
+# annotation an IndexN, so the single-argument darray/view unify branches never matched and
+# T stayed unbound, failing inference for the whole call.
+differential infer_generic_through_shaped_container "$(cat <<'EOF'
+def shaped_first[T](da: darray[T, shape_in]&, fallback: T) -> T:
+    return da[0] if da.count > 0 else fallback
+
+
+def shaped_count[T](da: mutable darray[T, shape_in]&, bump: T) -> usize:
+    return da.count
+
+
+def main() -> i64:
+    can Abort.Panic, Memory.Allocate:
+        xs: mutable darray[i64] = [40]
+        got: i64 = shaped_first(&xs, 0)
+        return got + shaped_count(&xs, 0).i64() + 1
+EOF
+)" 42
+
+# `.MyId()` — a conversion to an INTEGER-BACKED HANDLE ALIAS (`type X = id[T]`) rather than
+# to a builtin scalar. scalar_type_of_name says nothing about it, so the call fell through to
+# UFCS, found no function of that name, and declined. The resolution is deliberately limited
+# to integer-backed aliases so a same-named function still wins UFCS for every other alias.
+differential convert_to_handle_alias "$(cat <<'EOF'
+struct Slot:
+    v: mutable i64
+
+
+type MyId = id[Slot]
+
+
+def __cast__(value: u32) -> MyId:
+    return value.cast[MyId]
+
+
+def make(index: usize) -> MyId:
+    return (index + 1).u32().MyId()
+
+
+def main() -> i64:
+    can Abort.Panic:
+        first: MyId = make(0.usize())
+        last: MyId = make(40.usize())
+        return first.u32().i64() + last.u32().i64()
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
