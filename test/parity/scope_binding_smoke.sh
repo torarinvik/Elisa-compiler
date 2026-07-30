@@ -803,6 +803,50 @@ def main() -> i64:
 EOF
 )" 42
 
+# 31. A TERNARY narrows its arms, exactly like a statement `if`. The concurrency pool
+#     pushes with `node.next <- null if state.workers == null else state.workers.cast[...]`;
+#     the else arm could not see that the `== null` test had FAILED, so the cast had no
+#     narrowing proof and declined. stage0 rejects that cast unguarded ("invalid cast from
+#     mutable void&? to heap Node&"), so the proof is genuinely required. The first push
+#     takes the THEN arm and the second the ELSE arm, which must link to the first node —
+#     a broken else arm loses 12 and answers 30.
+differential ternary_arm_narrowing "$(cat <<'EOF'
+struct Node:
+    v: mutable i64
+    next: mutable heap Node&?
+
+
+struct State:
+    workers: mutable void&?
+
+
+def push(state: mutable State&, node: mutable heap Node&) -> void can[Abort.Panic, Unsafe.PointerCast]:
+    trusted Unsafe.PointerCast:
+        node.next <- null if state.workers == null else state.workers.cast[heap Node&]
+        state.workers <- node.cast[void&]
+
+
+def total(state: State&) -> i64 can[Abort.Panic, Unsafe.PointerCast]:
+    sum: mutable i64 = 0
+    trusted Unsafe.PointerCast, Unsafe.AssumeProgress:
+        cursor: mutable heap Node&? = null if state.workers == null else state.workers.cast[heap Node&]
+        while cursor != null:
+            sum <- sum + cursor.v
+            cursor <- cursor.next
+    return sum
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        st: mutable State = State{workers: null}
+        a: mutable Node = Node{v: 12, next: null}
+        b: mutable Node = Node{v: 30, next: null}
+        push(&st, (&a).cast[heap Node&])
+        push(&st, (&b).cast[heap Node&])
+        return total(&st)
+EOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
