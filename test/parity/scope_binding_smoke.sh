@@ -1471,6 +1471,39 @@ def main() -> i64:
 ELISAEOF
 )" 151   # 4 elements (99,2,4,6): 4*10 + (99+2+4+6) = 151
 
+# `for x in xs |acc| -> acc:` — a capture-listed accumulator loop whose body ALSO restates
+# the accumulator as a bare-ident statement (and does so per match arm, which is how the
+# semantic layer's validate_struct_layouts_range threads its table). The capture mutates in
+# place, so both the loop's `-> acc` and the per-branch restatements are no-op annotations.
+#
+# The value is accumulated across iterations AND a branch is taken per element, so a lowering
+# that dropped the body, or ran it once, gives a different ANSWER rather than failing to
+# build. Note the sibling form `|n = 0| -> n + x` genuinely threads a value between
+# iterations and must keep DECLINING — stage0 gives it a shadowing loop-local, which stage1
+# does not model, so accepting it would be a silent wrong answer.
+differential accumulator_for_loop "$(cat <<'ELISAEOF'
+def score(xs: darray[i64]) -> i64 can[Memory.Allocate, Abort.Panic]:
+    acc: mutable i64 = 0
+    for x in xs |acc| -> acc:
+        if x % 2 == 0:
+            acc <- acc + x
+            acc
+        else:
+            acc <- acc + 100
+            acc
+    return acc
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[i64] = []
+        xs.push(2)
+        xs.push(3)
+        xs.push(4)
+        return score(xs)
+ELISAEOF
+)" 106   # 2 + 100 + 4
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
