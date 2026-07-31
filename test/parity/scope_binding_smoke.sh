@@ -1867,6 +1867,34 @@ def main() -> i64:
 ELISAEOF
 )" 42
 
+# TWO named-tuple parameters on ONE LINE. Tuple-type labels are keyed by LINE, so the lookup
+# returned both label sets concatenated (6 labels for a 3-element tuple), the count check
+# failed, the parameter type resolved Unmodeled and the whole SIGNATURE was dropped — with no
+# DECLINE trace, since it is a signature failure rather than a body failure. Splitting the
+# params across lines was previously the only way such a function compiled.
+differential named_tuple_params_one_line "$(cat <<'ELISAEOF'
+def place_of(n: i64) -> (kind: i64, base: sview, field: sview):
+    can Abort.Panic:
+        return (n, "b", "f") if n > 0 else (0, "", "")
+
+
+def same(a: (kind: i64, base: sview, field: sview), b: (kind: i64, base: sview, field: sview)) -> bool:
+    can Abort.Panic:
+        return a.kind == b.kind
+
+
+def use(n: i64) -> i64 can[Abort.Panic]:
+    p: (kind: i64, base: sview, field: sview) = place_of(n)
+    q: (kind: i64, base: sview, field: sview) = place_of(3)
+    return 5 if same(p, q) else 2
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return use(3) * 10 + use(0)
+ELISAEOF
+)" 52
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
