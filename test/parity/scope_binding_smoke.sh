@@ -2036,6 +2036,60 @@ def main() -> i64:
 ELISAEOF
 )" 25
 
+# A GENERIC FUNCTION REFERENCE used as a VALUE rather than called. The bare-Ident form already
+# passes its raw handle at a `fn` expectation, but with explicit type arguments the bracket
+# makes it an Index/IndexN, which fell to the indexing paths and declined. pool_submit1's body
+# opens with exactly this shape (`ctx_task_from_raw[R, Pending]`).
+differential generic_fn_reference_value "$(cat <<'ELISAEOF'
+def wrap[R](v: R) -> R:
+    return v
+
+
+def use(n: i64) -> i64:
+    f: fn(i64) -> i64 = wrap[i64]
+    return f(n) + 1
+
+
+def main() -> i64:
+    return use(41)
+ELISAEOF
+)" 42
+
+# The same reference with TWO type arguments, one of which is a PHANTOM type-state that is
+# never used in a field. Rejecting an unresolved type argument here would decline this; the
+# instantiation is what decides, exactly as instantiate_generic_struct does for `MutexGuard[Held]`.
+differential generic_fn_reference_phantom_arg "$(cat <<'ELISAEOF'
+struct Slot:
+    ignored: i64
+
+
+struct Box[T, S]:
+    handle: mutable uintptr
+    state: mutable void&?
+
+
+def box_from_raw[R, S](raw: Box[void&?, S]) -> Box[R, S]:
+    out: Box[R, S] = zeroed
+    out.handle <- raw.handle
+    out.state <- raw.state
+    return out
+
+
+def make[A, R](arg: A) -> Box[R, Slot]:
+    can Abort.Panic, Memory.Allocate:
+        from_raw: fn(Box[void&?, Slot]) -> Box[R, Slot] = box_from_raw[R, Slot]
+        raw: Box[void&?, Slot] = zeroed
+        raw.handle <- 7.uintptr()
+        return from_raw(raw)
+
+
+def main() -> i64:
+    can Abort.Panic, Memory.Allocate:
+        b: Box[i64, Slot] = make[i64, i64](3)
+        return b.handle.i64() + 35
+ELISAEOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
