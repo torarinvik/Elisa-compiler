@@ -1593,6 +1593,56 @@ def main() -> i64:
 ELISAEOF
 )" 184   # 1000 + 2*100 + 8 = 1208, truncated mod 256
 
+# `match e: M::EK.A: …` — a MODULE-QUALIFIED enum variant as a match pattern. Pattern.Variant
+# carries the path as one dotted string, and the ordinal lookup compared the WHOLE prefix
+# before the last dot ("M::EK") against the registered enum name ("EK"), so it never matched
+# and every such arm declined. The semantic layer writes all of its Ast enum patterns this way.
+# Distinct arm values per variant, so a lookup that resolved to the wrong ordinal changes the
+# ANSWER rather than failing to build.
+differential module_qualified_enum_pattern "$(cat <<'ELISAEOF'
+module M:
+    enum EK:
+        A
+        B
+        C
+
+
+def to_i(e: M::EK) -> i64:
+    can Abort.Panic:
+        return match e:
+            M::EK.A: 7
+            M::EK.B: 9
+            _:       11
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return to_i(M::EK.B) * 10 + to_i(M::EK.C)
+ELISAEOF
+)" 101
+
+# `e is M::EK.A` — a MODULE-QUALIFIED enum variant in an `is` test. The three `is` forms
+# (payload-enum, const-enum, packed) each matched the variant head only as an Expr.Ident, but a
+# qualified head parses as Expr.Scope, so all of them missed and the function declined.
+# Checks both the hit and the miss.
+differential module_qualified_enum_is "$(cat <<'ELISAEOF'
+module M:
+    enum EK:
+        A
+        B
+
+
+def kind_is_a(e: M::EK) -> i64:
+    can Abort.Panic:
+        return 5 if e is M::EK.A else 3
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return kind_is_a(M::EK.A) * 10 + kind_is_a(M::EK.B)
+ELISAEOF
+)" 53
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
