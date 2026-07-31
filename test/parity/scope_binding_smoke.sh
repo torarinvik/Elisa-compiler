@@ -2110,6 +2110,52 @@ def main() -> i64:
 ELISAEOF
 )" 42
 
+# `fn.cast[uintptr]` — a FN value reinterpreted as an address, how a callback is stashed in a
+# work record (ConcurrencyWorkStart1.fn_bits). A fn value is a pointer at the LLVM level, so it
+# is the same ptrtoint the pointer sources take; allowed at the cast site rather than by
+# widening type_is_pointer, which also decides the optional NICHE layout.
+differential fn_value_cast_to_uintptr "$(cat <<'ELISAEOF'
+def dbl(x: i64) -> i64:
+    return x * 2
+
+
+def bits_of[A, R](f: fn(A) -> R) -> uintptr:
+    can Unsafe.PointerCast:
+        return f.cast[uintptr]
+
+
+def main() -> i64:
+    can Unsafe.PointerCast:
+        return 42 if bits_of(dbl) != 0.uintptr() else 7
+ELISAEOF
+)" 42
+
+# A GENERIC function reference as a CAST SOURCE: `entry[A, R].cast[void&]`, how pool_submit_raw
+# is handed a monomorphized C entry point. The bare-Ident function-name source was already
+# handled; the bracket makes this an Index/IndexN, which that path cannot see. Instantiating at
+# the cast site also DECLARES the instantiation the callback reaches at runtime.
+differential generic_fn_reference_cast_source "$(cat <<'ELISAEOF'
+def entry[A, R](p: void&) -> i64:
+    can Unsafe.PointerCast:
+        return 1
+
+
+def take(p: void&) -> i64:
+    can Unsafe.PointerCast:
+        return 41 if p.cast[uintptr] != 0.uintptr() else 0
+
+
+def go[A, R]() -> i64:
+    can Unsafe.PointerCast:
+        return take(entry[A, R].cast[void&]) + 1
+
+
+def main() -> i64:
+    can Unsafe.PointerCast:
+        return go[i64, i64]()
+ELISAEOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
