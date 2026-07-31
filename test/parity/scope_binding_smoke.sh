@@ -1895,6 +1895,57 @@ def main() -> i64:
 ELISAEOF
 )" 52
 
+# A named-tuple PARAMETER and a named-tuple RETURN on the SAME LINE, with DIFFERENT labels
+# and different arities. The label side-table is keyed by line, so this signature yields 5
+# labels on one line; neither 3 nor 2 divides 5, so the identical-repeated-groups heuristic
+# could not disambiguate and BOTH tuple types resolved Unmodeled — dropping the signature
+# with no DECLINE trace. Each tuple now registers under its own label WINDOW (source order)
+# and the annotation lookup finds the unique window that names a registered tuple.
+differential named_tuple_param_and_return_one_line "$(cat <<'ELISAEOF'
+def place_of(n: i64) -> (kind: i64, base: sview, field: sview) can[Abort.Panic]:
+    return (n, "b", "f") if n > 0 else (0, "", "")
+
+
+def assign_delta(value: i64, place: (kind: i64, base: sview, field: sview)) -> (ok: bool, delta: i64) can[Abort.Panic]:
+    return (true, value + place.kind) if place.kind > 0 else (false, 0)
+
+
+def use(n: i64) -> i64 can[Abort.Panic]:
+    r: (ok: bool, delta: i64) = assign_delta(n, place_of(n))
+    return r.delta if r.ok else 7
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return use(4) * 10 + use(0)
+ELISAEOF
+)" 87
+
+# A NESTED named tuple. The parser pushes each label BEFORE parsing the element it names, so
+# `(ok: bool, place: (kind: i64, base: sview), op: i64)` writes ok, place, kind, base, op —
+# the inner labels sit INSIDE the outer ones. Reading a flat run of 3 labels gets
+# [ok, place, kind], so the outer type resolved Unmodeled and the signature was dropped with
+# no DECLINE trace. Label positions now skip each element's nested span.
+differential nested_named_tuple_type "$(cat <<'ELISAEOF'
+def place_of(n: i64) -> (kind: i64, base: sview):
+    return (n, "b") if n > 0 else (0, "")
+
+
+def match_goal(n: i64) -> (ok: bool, place: (kind: i64, base: sview), op: i64):
+    return (n > 0, place_of(n), n)
+
+
+def use(n: i64) -> i64 can[Abort.Panic]:
+    goal: (ok: bool, place: (kind: i64, base: sview), op: i64) = match_goal(n)
+    return goal.op + goal.place.kind if goal.ok else 3
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return use(4) * 10 + use(0)
+ELISAEOF
+)" 83
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
