@@ -1825,6 +1825,31 @@ def main() -> i64:
 ELISAEOF
 )" 71   # "x of ab" = 7, "x" = 1
 
+# `match s: "a" | "b":` — an ALTERNATION arm on an sview scrutinee in STATEMENT position. The
+# per-arm path tested a single literal, so an OR arm fell through to the decline. Expanded into
+# one single-literal arm per option, sharing the body.
+#
+# Every option of every arm is exercised plus a miss, weighted by position, so dropping an
+# option or reordering the arms changes the ANSWER.
+differential sview_alternation_statement "$(cat <<'ELISAEOF'
+def kind(s: sview) -> i64 can[Memory.Allocate, Abort.Panic]:
+    n: mutable i64 = 0
+    match s:
+        "a" | "b":
+            n <- 1
+        "c" | "d" | "e":
+            n <- 2
+        _:
+            n <- 3
+    return n
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        return kind("a") * 1000 + kind("b") * 100 + kind("d") * 10 + kind("z")
+ELISAEOF
+)" 99   # 1123 truncated mod 256
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
