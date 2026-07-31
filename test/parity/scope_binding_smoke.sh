@@ -1946,6 +1946,44 @@ def main() -> i64:
 ELISAEOF
 )" 83
 
+# `a, b, c = match X:` — ONE dispatch, SEVERAL outputs, each arm yielding a tuple. The
+# destructuring-assign path handled `Assign(Array(targets), =, Block(...))` (a loop with a tuple
+# yield) but not a MATCH on the right, so resolve_enums.elisa's check_unreachable_arms declined
+# and was dropped. emit_match_into_slot now carries N parallel slots; each arm's tuple element i
+# is stored into slot i. Element types come from the FIRST arm, with stage0's i64 default for a
+# bare integer literal (which has no intrinsic type of its own).
+differential destructure_match_scalar "$(cat <<'ELISAEOF'
+def classify(n: i64) -> i64 can[Abort.Panic]:
+    flag, key, weight = match n:
+        0: true, 1, 7
+        1: false, 2, 8
+        _: false, 3, 9
+    return key * 10 + weight + (100 if flag else 0)
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return classify(0) + classify(2)
+ELISAEOF
+)" 156
+
+# Same form over an SVIEW scrutinee — a different arm-test path (string compare, not an integer
+# switch) sharing the same N-slot arm-body emitter.
+differential destructure_match_sview "$(cat <<'ELISAEOF'
+def pick(name: sview) -> i64 can[Abort.Panic]:
+    ok, kind, weight = match name:
+        "add": true, 1, 4
+        "sub": true, 2, 5
+        _: false, 3, 6
+    return kind * 10 + weight + (100 if ok else 0)
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return pick("sub") + pick("zz")
+ELISAEOF
+)" 161
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
