@@ -1768,6 +1768,42 @@ def main() -> i64:
 ELISAEOF
 )" 24   # 2 evens of 4 elements
 
+# `x: T = match OPT: v: … / _: …` — an OPTIONAL scrutinee in VALUE position. A binding arm over
+# an optional is a CATCH-ALL: stage0 takes it even when the optional is ABSENT, and `_` is dead.
+# The slot emitter accepted only integer/penum/packed/cstr/sview scrutinees, so this declined.
+#
+# Both halves matter. `sel` never reads the payload, so it pins ARM SELECTION on the absent
+# path (a present/absent split would score 2 there, not 1). `val` reads the payload only where
+# the optional is PRESENT — deliberately, because the payload of an ABSENT optional is UNDEF in
+# stage0 (`v: v + 1` yields 0 there while `v: 5` yields 5), so reading it is undefined
+# behaviour and NOT a parity-testable path.
+differential optional_value_match "$(cat <<'ELISAEOF'
+def pick(n: i64) -> i64? can[Abort.Panic]:
+    return n * 2 if n > 0 else null
+
+
+def sel(n: i64) -> i64:
+    can Abort.Panic:
+        got: i64 = match pick(n):
+            v: 1
+            _: 2
+        return got
+
+
+def val(n: i64) -> i64:
+    can Abort.Panic:
+        got: i64 = match pick(n):
+            v: v
+            _: 9
+        return got
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return sel(0) * 100 + val(3) * 10 + val(5)
+ELISAEOF
+)" 170   # sel(0)=1 (binding arm taken when ABSENT), val(3)=6, val(5)=10
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
