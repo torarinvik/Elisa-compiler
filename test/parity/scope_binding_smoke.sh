@@ -2090,6 +2090,26 @@ def main() -> i64:
 ELISAEOF
 )" 42
 
+# Generic type-argument INFERENCE through a fn-typed parameter. `apply_once(dbl, 21)` binds A
+# from the second argument, but R appears ONLY inside `fn(A) -> R`, so it stayed unbound and the
+# whole call declined. unify_annotation takes a ValueType and a fn-type annotation cannot be
+# matched against one, so the actual's signature is resolved where the argument expression is
+# still in hand — from the interned Fn pools for a local of fn type, or from the FnTable for a
+# bare function name. `ctx_concurrency_work1_new(fn, arg)` infers R this way and no other.
+differential generic_infer_through_fn_param "$(cat <<'ELISAEOF'
+def apply_once[A, R](f: fn(A) -> R, arg: A) -> R:
+    return f(arg)
+
+
+def dbl(x: i64) -> i64:
+    return x * 2
+
+
+def main() -> i64:
+    return apply_once(dbl, 21)
+ELISAEOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
