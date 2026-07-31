@@ -1850,6 +1850,23 @@ def main() -> i64:
 ELISAEOF
 )" 99   # 1123 truncated mod 256
 
+# `f(a) if COND else g(b)` — a TERNARY in STATEMENT position whose arms are side-effecting
+# CALLS, not values. Emitting it as a value declines (the arms are void), so it is lowered as
+# an if/else running each arm as a statement. The branches append different lengths, so taking
+# the wrong one — or running both — changes the ANSWER.
+differential ternary_statement_calls "$(cat <<'ELISAEOF'
+def build(flag: bool) -> i64 can[Memory.Allocate, Abort.Panic]:
+    buffer: mutable darray[u8] = []
+    buffer.extend("abcd") if flag else buffer.extend("xy")
+    return buffer.count.i64()
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        return build(true) * 10 + build(false)
+ELISAEOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
