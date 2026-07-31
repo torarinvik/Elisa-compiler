@@ -6,6 +6,64 @@
 
 extend Backend:
     private:
+        # Test a NESTED packed sub-pattern against a sub-node HANDLE, and bind its fields.
+        #
+        # Reads the sub-node's record, compares its tag, and falls through to `next_block` on a
+        # mismatch — so the arm runs only when every nested test holds. Then binds each field: a
+        # Binding by name, a Wildcard not at all, and a nested Variant by RECURSING. The
+        # recursion is what makes DEPTH > 1 work, e.g.
+        # `Expr.Unary(op, Expr.Field(Expr.Ident(owner, l), field, fl), al)`, where hand-written
+        # one-level code left `owner` unbound and the arm body then failed to emit.
+        #
+        # Returns false to DECLINE. Every read here is guarded by the caller's outer tag test,
+        # so the handle is only dereferenced once the enclosing variant matched.
+        def emit_packed_subpattern_test(sub_path: sview, sub_fields: darray[Pattern]&, handle_value: LLVMValueRef, next_block: LLVMBasicBlockRef, function: LLVMValueRef, local_scope: mutable Scope&, structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            sub_slot: i64 = packed_slot_of_path(sub_path, structs)
+            sub_ord: i64 = packed_variant_index_of_path(sub_path, structs)
+            false return if sub_slot < 0 or sub_ord < 0 or runtime.packed_mode != 2
+            sub_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "sub.state")
+            sub_h64: LLVMValueRef = LLVMBuildZExt(builder, handle_value, LLVMInt64TypeInContext(ctx), "sub.h64")
+            sub_args: mutable darray[LLVMValueRef] = [sub_state, sub_h64]
+            sub_args_pointer: void& = (&sub_args[0]).cast[void&] can Unsafe.PointerCast
+            sub_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, sub_args_pointer, 2, "sub.record")
+            sub_row: LLVMTypeRef = packed_row_llvm_type(structs, sub_slot, ctx)
+            sub_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, sub_row, sub_record, 0, "sub.tag.ptr")
+            sub_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), sub_tag_ptr, "sub.tag")
+            sub_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, sub_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), sub_ord.u64(), 0), "sub.cmp")
+            sub_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "sub.cont")
+            _ = LLVMBuildCondBr(builder, sub_hit, sub_cont, next_block)
+            LLVMPositionBuilderAtEnd(builder, sub_cont)
+            true return if sub_fields.count == 0
+            sub_payload: ValueType = packed_payload_of_path(sub_path, structs)
+            true return if sub_payload.kind == TypeKind.Unmodeled
+            sub_pay_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, sub_row, sub_record, 1, "sub.payload.ptr")
+            sub_pay: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(sub_payload, structs, ctx), sub_pay_ptr, "sub.payload")
+            sub_field_start: usize = structs.packed_field_type_start[sub_slot.usize()]
+            sub_ok: mutable bool = true
+            # One field: the payload IS the value, so there is no ExtractValue.
+            if sub_fields.count == 1:
+                if sub_fields[0] is Pattern.Binding(sub_one_name):
+                    sub_one_storage: mutable darray[u8] = []
+                    sub_one_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(sub_payload, structs, ctx), sview_to_cstr(sub_one_name, sub_one_storage))
+                    _ = LLVMBuildStore(builder, sub_pay, sub_one_slot)
+                    declare_local(local_scope, sub_one_name, sub_one_slot, sub_payload)
+                elif sub_fields[0] is Pattern.Variant(sub_one_path, sub_one_fields):
+                    sub_ok <- emit_packed_subpattern_test(sub_one_path, sub_one_fields, sub_pay, next_block, function, local_scope, structs, runtime, ctx, builder)
+            if sub_fields.count > 1:
+                for sub_index in 0..<sub_fields.count |sub_ok, sub_fields, sub_field_start, sub_pay, next_block, function, local_scope, structs, runtime, ctx, builder|:
+                    continue if not sub_ok
+                    sub_field_type: ValueType = copied_type(structs.packed_field_types[sub_field_start + sub_index])
+                    sub_field_value: LLVMValueRef = LLVMBuildExtractValue(builder, sub_pay, sub_index.u32(), "sub.field")
+                    if sub_fields[sub_index] is Pattern.Binding(sub_bind_name):
+                        sub_bind_storage: mutable darray[u8] = []
+                        sub_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(sub_field_type, structs, ctx), sview_to_cstr(sub_bind_name, sub_bind_storage))
+                        _ = LLVMBuildStore(builder, sub_field_value, sub_bind_slot)
+                        declare_local(local_scope, sub_bind_name, sub_bind_slot, sub_field_type)
+                    elif sub_fields[sub_index] is Pattern.Variant(sub_nest_path, sub_nest_fields):
+                        sub_ok <- emit_packed_subpattern_test(sub_nest_path, sub_nest_fields, sub_field_value, next_block, function, local_scope, structs, runtime, ctx, builder)
+            return sub_ok
+
+
         def emit_statement_match(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             handled <- true
             # `for i in a..<b:` / `for i in a..=b:` over an integer range. Only the range
@@ -369,61 +427,31 @@ extend Backend:
                                                         else:
                                                             spm_declined <- true
                                                 if spm_fields[spm_nest_index] is Pattern.Variant(spm_nest_path, spm_nest_fields):
-                                                    spm_nest_slot: i64 = packed_slot_of_path(spm_nest_path, structs)
-                                                    spm_nest_ord: i64 = packed_variant_index_of_path(spm_nest_path, structs)
-                                                    spm_nest_payload: ValueType = packed_payload_of_path(spm_nest_path, structs)
-                                                    # A CONST-ENUM sub-pattern — `Expr.Unary(TokenKind.Minus,
-                                                    # Expr.IntLit(v), _)`. TokenKind is not a packed enum, so
-                                                    # the handle read above does not apply: the field is a plain
-                                                    # integer holding the variant's ordinal, and the test is an
-                                                    # integer equality, not a store read. Only the payloadless
-                                                    # form (no sub-fields) is a constant.
+                                                    # RECURSIVE: also handles a nested variant that
+                                                    # itself contains one. The previous inline code
+                                                    # bound only Pattern.Binding sub-fields and
+                                                    # silently SKIPPED a deeper Variant, leaving its
+                                                    # names unbound so the arm body then declined —
+                                                    # `Expr.Unary(op, Expr.Field(Expr.Ident(o, l), f, fl), al)`
+                                                    # is the shape that needs depth 2.
+                                                    spm_nest_handle: LLVMValueRef = LLVMBuildExtractValue(builder, spm_payload_value, spm_nest_index.u32(), "spm.nest.handle")
+                                                    # A CONST-ENUM sub-pattern (`Expr.Unary(TokenKind.Minus, …)`)
+                                                    # is NOT a packed node: the field holds the variant's ordinal
+                                                    # directly, so the test is an integer compare rather than a
+                                                    # store read. Payloadless only, and the field's registered
+                                                    # type must really be an integer.
                                                     spm_nest_const: i64 = ordinal_of_dotted_path(spm_nest_path, structs)
-                                                    if (spm_nest_slot < 0 or spm_nest_ord < 0) and spm_nest_const >= 0 and spm_nest_fields.count == 0:
+                                                    if packed_slot_of_path(spm_nest_path, structs) < 0 and spm_nest_const >= 0 and spm_nest_fields.count == 0:
                                                         spm_const_type: ValueType = copied_type(structs.packed_field_types[spm_field_start + spm_nest_index])
                                                         if not is_integer_type(spm_const_type):
                                                             spm_declined <- true
                                                         else:
-                                                            spm_const_field: LLVMValueRef = LLVMBuildExtractValue(builder, spm_payload_value, spm_nest_index.u32(), "spm.nest.const.field")
-                                                            spm_const_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, spm_const_field, LLVMConstInt(llvm_type_of(spm_const_type, structs, ctx), spm_nest_const.u64(), 0), "spm.nest.const.cmp")
+                                                            spm_const_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, spm_nest_handle, LLVMConstInt(llvm_type_of(spm_const_type, structs, ctx), spm_nest_const.u64(), 0), "spm.nest.const.cmp")
                                                             spm_const_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.nest.const.cont")
                                                             _ = LLVMBuildCondBr(builder, spm_const_hit, spm_const_cont, spm_next_block)
                                                             LLVMPositionBuilderAtEnd(builder, spm_const_cont)
-                                                    elif spm_nest_slot < 0 or spm_nest_ord < 0 or runtime.packed_mode != 2:
-                                                        spm_declined <- true
                                                     else:
-                                                        spm_nest_handle: LLVMValueRef = LLVMBuildExtractValue(builder, spm_payload_value, spm_nest_index.u32(), "spm.nest.handle")
-                                                        spm_nest_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "spm.nest.state")
-                                                        spm_nest_idx64: LLVMValueRef = LLVMBuildZExt(builder, spm_nest_handle, LLVMInt64TypeInContext(ctx), "spm.nest.index")
-                                                        spm_nest_args: mutable darray[LLVMValueRef] = [spm_nest_state, spm_nest_idx64]
-                                                        spm_nest_args_pointer: void& = (&spm_nest_args[0]).cast[void&] can Unsafe.PointerCast
-                                                        spm_nest_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_nest_args_pointer, 2, "spm.nest.record")
-                                                        spm_nest_row: LLVMTypeRef = packed_row_llvm_type(structs, spm_nest_slot, ctx)
-                                                        spm_nest_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_nest_row, spm_nest_record, 0, "spm.nest.tag.ptr")
-                                                        spm_nest_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), spm_nest_tag_ptr, "spm.nest.tag")
-                                                        spm_nest_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, spm_nest_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), spm_nest_ord.u64(), 0), "spm.nest.cmp")
-                                                        spm_nest_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.nest.cont")
-                                                        _ = LLVMBuildCondBr(builder, spm_nest_hit, spm_nest_cont, spm_next_block)
-                                                        LLVMPositionBuilderAtEnd(builder, spm_nest_cont)
-                                                        if spm_nest_fields.count > 0 and spm_nest_payload.kind != TypeKind.Unmodeled:
-                                                            spm_nest_pay_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_nest_row, spm_nest_record, 1, "spm.nest.payload.ptr")
-                                                            spm_nest_pay: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(spm_nest_payload, structs, ctx), spm_nest_pay_ptr, "spm.nest.payload")
-                                                            spm_nest_fstart: usize = structs.packed_field_type_start[spm_nest_slot.usize()]
-                                                            if spm_nest_fields.count == 1:
-                                                                if spm_nest_fields[0] is Pattern.Binding(spm_nest_one):
-                                                                    spm_nest_one_store: mutable darray[u8] = []
-                                                                    spm_nest_one_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_nest_payload, structs, ctx), sview_to_cstr(spm_nest_one, spm_nest_one_store))
-                                                                    _ = LLVMBuildStore(builder, spm_nest_pay, spm_nest_one_slot)
-                                                                    declare_local(local_scope, spm_nest_one, spm_nest_one_slot, spm_nest_payload)
-                                                            if spm_nest_fields.count > 1:
-                                                                for spm_nb in 0..<spm_nest_fields.count |spm_nest_fields, spm_nest_fstart, spm_nest_pay, structs, local_scope, ctx, builder|:
-                                                                    if spm_nest_fields[spm_nb] is Pattern.Binding(spm_nb_name):
-                                                                        spm_nb_type: ValueType = copied_type(structs.packed_field_types[spm_nest_fstart + spm_nb])
-                                                                        spm_nb_val: LLVMValueRef = LLVMBuildExtractValue(builder, spm_nest_pay, spm_nb.u32(), "spm.nest.field")
-                                                                        spm_nb_store: mutable darray[u8] = []
-                                                                        spm_nb_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_nb_type, structs, ctx), sview_to_cstr(spm_nb_name, spm_nb_store))
-                                                                        _ = LLVMBuildStore(builder, spm_nb_val, spm_nb_slot)
-                                                                        declare_local(local_scope, spm_nb_name, spm_nb_slot, spm_nb_type)
+                                                        spm_declined <- true if not emit_packed_subpattern_test(spm_nest_path, spm_nest_fields, spm_nest_handle, spm_next_block, spm_function, local_scope, structs, runtime, ctx, builder)
                                 if not spm_declined and arm_has_guard(spm_arm.guard):
                                     if emit_condition(spm_arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is spm_guard_bit:
                                         spm_guard_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.guard")
