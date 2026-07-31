@@ -1804,6 +1804,27 @@ def main() -> i64:
 ELISAEOF
 )" 170   # sel(0)=1 (binding arm taken when ABSENT), val(3)=6, val(5)=10
 
+# `phrase = EXPR` — an UNTYPED declaration by FIRST ASSIGNMENT, which stage0 accepts. stage1
+# parses it as Stmt.Assign and the handler rejected `=` outright, so it declined. Declares the
+# local from the value's inferred type.
+#
+# The initializer is a TERNARY of f-strings: a value-`if` is context-typed and has no standalone
+# type, so the then-arm supplies it. Both branches are exercised and their lengths differ, so
+# inferring from the wrong arm or dropping a branch changes the ANSWER.
+differential untyped_decl_first_assignment "$(cat <<'ELISAEOF'
+def msg(flag: bool, name: sview) -> i64 can[Memory.Allocate, Abort.Panic]:
+    phrase = f" of {name}" if flag else f""
+    buffer: mutable darray[u8] = []
+    buffer.extend(f"x{phrase}")
+    return buffer.count.i64()
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        return msg(true, "ab") * 10 + msg(false, "ab")
+ELISAEOF
+)" 71   # "x of ab" = 7, "x" = 1
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
