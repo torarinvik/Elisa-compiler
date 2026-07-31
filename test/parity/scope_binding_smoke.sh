@@ -1728,6 +1728,24 @@ def main() -> i64:
 ELISAEOF
 )" 25
 
+# DEFAULT PARAMETERS omitted at the call site. The parser parsed the default expression and
+# DISCARDED it, keeping only a has_default flag, so nothing downstream could fill an omitted
+# argument and the call declined on an LLVMCountParams mismatch.
+#
+# Each call omits a different number of trailing arguments and the three results differ, so a
+# lowering that filled the wrong value — or filled positionally out of order — changes the
+# ANSWER rather than failing to build.
+differential default_parameters "$(cat <<'ELISAEOF'
+def scaled(base: i64, factor: i64 = 3, offset: i64 = 5) -> i64:
+    return base * factor + offset
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return scaled(2) + scaled(2, 4) + scaled(2, 4, 6)
+ELISAEOF
+)" 38   # 11 + 13 + 14
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
