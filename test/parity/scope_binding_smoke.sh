@@ -1675,6 +1675,31 @@ def main() -> i64:
 ELISAEOF
 )" 76   # 21 + 34 + 21
 
+# `for x in xs |lo, hi| -> lo, hi:` — a loop header with a MULTI-name (tuple) yield in
+# STATEMENT position. The yield is a no-op annotation there (captures mutate in place), but the
+# guard only accepted a single capture Ident, so the tuple form declined outright — it is how
+# the semantic layer's multi-accumulator walkers are written.
+#
+# Both captures are mutated and both are read back, so dropping either half changes the answer.
+differential tuple_yield_loop_header "$(cat <<'ELISAEOF'
+def walk(xs: darray[i64]) -> i64 can[Memory.Allocate, Abort.Panic]:
+    lo: mutable i64 = 100
+    hi: mutable i64 = 0
+    for x in xs |lo, hi| -> lo, hi:
+        lo <- x if x < lo else lo
+        hi <- x if x > hi else hi
+    return lo * 100 + hi
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[i64] = []
+        xs.push(3)
+        xs.push(7)
+        return walk(xs)
+ELISAEOF
+)" 51   # lo=3, hi=7 -> 307 truncated mod 256
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
