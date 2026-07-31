@@ -1746,6 +1746,28 @@ def main() -> i64:
 ELISAEOF
 )" 38   # 11 + 13 + 14
 
+# `count VAR in XS where COND` — a fold to an integer. The parser DROPPED the query head
+# keyword from Expr.Comprehension, so the backend could not tell `count` from `sum`/`min`/`max`
+# and declined rather than guess. The head is now recorded in the line-keyed side table.
+#
+# The count and the container length differ, so a lowering that returned the length (or
+# short-circuited like `any` does) gives a different ANSWER.
+differential count_quantifier "$(cat <<'ELISAEOF'
+def evens(xs: darray[i64]) -> usize can[Memory.Allocate, Abort.Panic]:
+    return count x in xs where x % 2 == 0
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[i64] = []
+        xs.push(1)
+        xs.push(2)
+        xs.push(4)
+        xs.push(7)
+        return evens(xs).i64() * 10 + xs.count.i64()
+ELISAEOF
+)" 24   # 2 evens of 4 elements
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
