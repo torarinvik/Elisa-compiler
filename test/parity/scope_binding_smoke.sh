@@ -1700,6 +1700,34 @@ def main() -> i64:
 ELISAEOF
 )" 51   # lo=3, hi=7 -> 307 truncated mod 256
 
+# A MIXED capture header: a bare capture (`out`) plus a TYPED initialized accumulator
+# (`position: usize = 0`), yielded as a tuple. The bound-name check keyed on UNTYPED VarDecls
+# only, so the typed accumulator was not recognised as a name the block binds and the whole
+# loop declined.
+#
+# Note the header must capture `out`: stage0 rejects mutating an outer binding from inside a
+# value block (docs/119 E4), even through a call. The loop breaks early, so a lowering that
+# mishandled the accumulator would copy the wrong number of elements.
+differential typed_accumulator_capture "$(cat <<'ELISAEOF'
+def fill(out: mutable darray[i64]&, xs: darray[i64], limit: usize) -> void can[Memory.Allocate, Abort.Panic]:
+    for x in xs |out, position: usize = 0| -> out, position:
+        break if position >= limit
+        out.push(x)
+        position <- position + 1
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[i64] = []
+        xs.push(4)
+        xs.push(5)
+        xs.push(6)
+        o: mutable darray[i64] = []
+        fill(o, xs, 2)
+        return o.count.i64() * 10 + o[1]
+ELISAEOF
+)" 25
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
