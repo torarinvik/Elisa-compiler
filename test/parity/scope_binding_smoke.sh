@@ -1643,6 +1643,38 @@ def main() -> i64:
 ELISAEOF
 )" 53
 
+# `a, b <- b, a` — POSITIONAL parallel assignment, and the guarded form
+# `a, b <- b, a if COND`. Two separate defects: the backend had no lowering for an Array RHS
+# at all, and the trailing `if` parses as part of the LAST ELEMENT rather than guarding the
+# statement, so it arrived as `[b, If(COND, a, Absent)]` — an else-less conditional value with
+# no lowering, where stage0 accepts the statement.
+#
+# A SWAP is the case that catches evaluation order: every RHS value must be emitted before any
+# store, or `first` on the right reads the value it was just overwritten with. A lowering that
+# interleaved stores returns 22/44 here instead of 21/34.
+differential parallel_assignment_and_guard "$(cat <<'ELISAEOF'
+def order(a: i64, b: i64, do_swap: bool) -> i64:
+    can Abort.Panic:
+        first: mutable i64 = a
+        second: mutable i64 = b
+        first, second <- second, first if do_swap
+        return first * 10 + second
+
+
+def plain(a: i64, b: i64) -> i64:
+    can Abort.Panic:
+        first: mutable i64 = a
+        second: mutable i64 = b
+        first, second <- second, first
+        return first * 10 + second
+
+
+def main() -> i64:
+    can Abort.Panic:
+        return order(1, 2, true) + order(3, 4, false) + plain(1, 2)
+ELISAEOF
+)" 76   # 21 + 34 + 21
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
