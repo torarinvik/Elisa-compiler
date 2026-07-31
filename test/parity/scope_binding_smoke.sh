@@ -1984,6 +1984,58 @@ def main() -> i64:
 ELISAEOF
 )" 161
 
+# `machine over INPUT while COND:` — the parser already DESUGARS a machine into a hoisted
+# mode enum plus a while/if-chain, so no backend feature was missing. What was missing is that
+# the synthesized `Decl.Enum` went into pending_decls only: the backend registers enums from the
+# FILE METADATA pools (register_enums_from_metadata never looks at the Decl), so
+# `__MachineMode_0.Before` resolved Unmodeled and the untyped mode-var declaration declined —
+# dropping every function containing a machine, resolve.elisa's check_function among them.
+#
+# The arms may only mutate the driven resource, so the finding is reported through a helper
+# call, exactly as check_function does with `table.diagnostics`.
+differential machine_over_while "$(cat <<'ELISAEOF'
+def note(sink: mutable darray[i64]&, value: i64) -> void can[Abort.Panic, Memory.Allocate]:
+    sink.push(value)
+
+
+def count_after(flags: darray[bool], sink: mutable darray[i64]&) -> void can[Abort.Panic, Memory.Allocate]:
+    index: mutable usize = 0
+    machine over flags[index] while index < flags.count:
+        state Before
+        state After
+        start Before
+
+        Before, true:
+            index <- index + 1
+            -> After
+        Before, _:
+            index <- index + 1
+            -> Before
+        After, true:
+            index <- index + 1
+            -> After
+        After, _:
+            note(sink, index.i64())
+            index <- index + 1
+            -> After
+
+
+def main() -> i64:
+    can Abort.Panic, Memory.Allocate:
+        flags: mutable darray[bool] = []
+        flags.push(false)
+        flags.push(true)
+        flags.push(false)
+        flags.push(false)
+        sink: mutable darray[i64] = []
+        count_after(flags, sink)
+        total: mutable i64 = sink.count.i64() * 10
+        for s in sink |total|:
+            total <- total + s
+        return total
+ELISAEOF
+)" 25
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
