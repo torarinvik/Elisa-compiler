@@ -2156,6 +2156,78 @@ def main() -> i64:
 ELISAEOF
 )" 42
 
+# `c.at <- c.at.next` where `at` is a `heap Node&?` FIELD — a SILENT MISCOMPILE, not a decline.
+# The receiver type was unwrapped to the pointee struct, but struct_chain_address hands back the
+# address OF THE SLOT for a field receiver, and that slot holds a POINTER. GEPing it walked the
+# OUTER struct: at field position 0 the GEP is a no-op, so this compiled to `c.at <- c.at` and
+# the cursor never advanced; with a padding field first it silently read the NEIGHBOURING field
+# instead. That is what spun arena_alloc forever in the stage1-built runtime object.
+#
+# Both layouts are pinned, because the two failures look nothing alike: without `pad` stage1
+# returned 49 (loop ran to its bound), with `pad` it returned 40 (one bogus step).
+differential field_chain_through_ref_field "$(cat <<'ELISAEOF'
+struct Node:
+    next: mutable heap Node&?
+    value: mutable i64
+
+
+struct Cursor:
+    at: mutable heap Node&?
+    steps: mutable i64
+
+
+def advance(c: mutable Cursor&) -> i64:
+    can Abort.Panic:
+        trusted Unsafe.AssumeProgress:
+            while c.at != null and c.steps < 10:
+                c.at <- c.at.next
+                c.steps <- c.steps + 1
+        return c.steps
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        n3: mutable Node = Node{next: null, value: 3}
+        n2: mutable Node = Node{next: (&n3).cast[heap Node&], value: 2}
+        n1: mutable Node = Node{next: (&n2).cast[heap Node&], value: 1}
+        c: mutable Cursor = Cursor{at: (&n1).cast[heap Node&], steps: 0}
+        return advance(&c) + 39
+ELISAEOF
+)" 42
+
+# Same walk with the ref field at a NON-ZERO offset, where the bug read the neighbouring field
+# rather than degenerating into a no-op.
+differential field_chain_through_ref_field_offset "$(cat <<'ELISAEOF'
+struct Node:
+    pad: mutable i64
+    next: mutable heap Node&?
+    value: mutable i64
+
+
+struct Cursor:
+    at: mutable heap Node&?
+    steps: mutable i64
+
+
+def advance(c: mutable Cursor&) -> i64:
+    can Abort.Panic:
+        trusted Unsafe.AssumeProgress:
+            while c.at != null and c.steps < 10:
+                c.at <- c.at.next
+                c.steps <- c.steps + 1
+        return c.steps
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        n3: mutable Node = Node{pad: 0, next: null, value: 3}
+        n2: mutable Node = Node{pad: 0, next: (&n3).cast[heap Node&], value: 2}
+        n1: mutable Node = Node{pad: 0, next: (&n2).cast[heap Node&], value: 1}
+        c: mutable Cursor = Cursor{at: (&n1).cast[heap Node&], steps: 0}
+        return advance(&c) + 39
+ELISAEOF
+)" 42
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
