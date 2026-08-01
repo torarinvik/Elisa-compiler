@@ -101,16 +101,19 @@ done
 [[ -n "$out" && -n "$src" ]] || { echo "usage: $0 -o out.o source.elisa" >&2; exit 2; }
 [[ -f "$src" ]] || { echo "missing source: $src" >&2; exit 2; }
 
-# Trusted-stdlib marker: stage0 skips the user-code-only passes for elisacore_std's own
-# sources (and so accepts the compiler, which includes them). The driver cannot tell after
-# include flattening, so decide it here from the input PATH. See runtime_std_enabled().
-case "$src" in
-  *elisacore_std/*|*src/driver/elisac.elisa) export ELISA_STAGE1_RUNTIME_STD=1 ;;
-esac
-
 flat="$(mktemp)"
 trap 'rm -f "$flat"' EXIT
 flatten_includes "$src" >"$flat"
+# Trusted-stdlib marker: stage0 skips the user-code-only passes (raw-concurrency surface
+# removal, region-tied return) for elisacore_std's OWN sources, deciding per FILE. stage1
+# cannot — flattening concatenates without line directives, so a declaration's origin is gone
+# by the time the driver sees the source. Decide from the FLATTENED UNIT's CONTENT, not the
+# input path: a program that `include`s the std pulls the std's own definitions into the unit
+# and would otherwise be judged as if it had written them. Keying on the path missed exactly
+# that — every corpus program includes the std. See runtime_std_enabled().
+if grep -q 'def arena_alloc(' "$flat" 2>/dev/null; then
+  export ELISA_STAGE1_RUNTIME_STD=1
+fi
 # stdin protocol: output path line, then source
 if [[ "$noalias" == 1 && "$bounds_check" == 1 ]]; then
   { printf '%s\n' "$out"; cat "$flat"; } | ELISACORE_NOALIAS_MUTABLE_REFS=1 ELISACORE_FORCE_BOUNDS_CHECK=1 "$BIN"

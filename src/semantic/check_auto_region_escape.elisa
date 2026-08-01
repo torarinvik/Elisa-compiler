@@ -154,6 +154,25 @@ extend Semantic:
                         return sview("", 0, 0)
 
 
+        # Is the value DIRECTLY a locally-created container — a bare local, or a direct call
+        # to a container-returning fn — as opposed to one WRAPPED in a struct/variant/array
+        # literal? The wrapper has its own type, so with a single caller-owned ref param
+        # region inference unifies the fresh container's region with that param's and nothing
+        # escapes; see the 2x2 note on auto_escape_call.
+        def value_is_directly_local(value: Ast::Expr, local_containers: darray[sview]&, container_fns: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Ident(name, line):
+                        return any local_name in local_containers where local_name == name
+                    Expr.Call(callee, arguments, argument_names, line):
+                        callee_name: sview = ident_name_of(callee)
+                        return any fn_name in container_fns where fn_name == callee_name
+                    Expr.Paren(inner, paren_line):
+                        return value_is_directly_local(inner, local_containers, container_fns)
+                    _:
+                        return false
+
+
         # `dst.push(VALUE)` / `dst.put(KEY, VALUE)` where `dst` is caller-owned.
         def auto_escape_call(expression: Ast::Expr, line: u32, caller_params: darray[sview]&, local_containers: darray[sview]&, container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -167,7 +186,22 @@ extend Semantic:
                                 # `push`/`extend` take the stored value first; `put` second.
                                 stored_index: i64 = 0 if (method == "push" or method == "extend") and arguments.count == 1 else (1 if method == "put" and arguments.count == 2 else -1)
                                 return if stored_index < 0
-                                escaping: bool = value_is_locally_created(arguments[stored_index.usize()], local_containers, container_fns)
+                                # With exactly ONE caller-owned ref param, region inference
+                                # unifies a fresh container's region with that param's, so
+                                # only a DIRECT value escapes through a push. Measured against
+                                # stage0, one thing varied at a time:
+                                #
+                                #                        1 ref param   2 ref params
+                                #   field assign            reject        reject
+                                #   push WRAPPED literal    ACCEPT        reject
+                                #   push DIRECT call        reject          -
+                                #
+                                # (The field-assign row is the Stmt.Assign path above, which
+                                # is unchanged.) Making wrappers opaque UNCONDITIONALLY was
+                                # tried and broke the internal-suite oracle, whose case has
+                                # TWO ref params — that is the cell this count distinguishes.
+                                stored_value: Ast::Expr = arguments[stored_index.usize()]
+                                escaping: bool = value_is_directly_local(stored_value, local_containers, container_fns) if caller_params.count <= 1 else value_is_locally_created(stored_value, local_containers, container_fns)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", line: line, expected: "", actual: ""}) if escaping
                             _:
                                 pass
@@ -209,8 +243,18 @@ extend Semantic:
     public:
         def check_auto_region_escape(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
+                # Only REGION-BACKED enums count as container-returning.
+                # collect_enum_type_names returns EVERY enum, but a plain non-recursive one is
+                # a value — stage0 accepts pushing an enum-returning result into a caller
+                # container (fixture reg_g), since its type carries no region.
+                # packed_enum_names is exactly the region-backed set: explicitly
+                # `packed enum` plus the recursive ones record_recursive_enum auto-promotes
+                # into region-backed packed trees.
+                all_enum_names: mutable darray[sview] = []
+                collect_enum_type_names(declarations, all_enum_names)
                 enum_names: mutable darray[sview] = []
-                collect_enum_type_names(declarations, enum_names)
+                for candidate_enum in all_enum_names |enum_names|:
+                    enum_names.push(candidate_enum) if any packed_name in table.packed_enum_names where packed_name == candidate_enum
                 container_fns: mutable darray[sview] = []
                 collect_container_returning_fns(declarations, enum_names, container_fns)
                 table <- check_auto_region_escape_walk(declarations, container_fns, table)
