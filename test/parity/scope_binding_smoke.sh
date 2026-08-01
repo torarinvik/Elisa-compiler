@@ -2228,6 +2228,39 @@ def main() -> i64:
 ELISAEOF
 )" 42
 
+# The WRITE twin of field_chain_through_ref_field: `c.at.value <- v` stores THROUGH a ref
+# field. struct_chain_address hands back the address OF THE SLOT for a field receiver, so the
+# store landed in the OUTER struct. This is the one that made the stage1-built runtime object
+# corrupt its own Region bookkeeping (`a.end.count <- a.end.count + size` in arena_alloc), and
+# it took the gate against that runtime from 66/78 to 78/78 on its own.
+differential field_chain_write_through_ref_field "$(cat <<'ELISAEOF'
+struct Node:
+    next: mutable heap Node&?
+    value: mutable i64
+
+
+struct Holder:
+    at: mutable heap Node&?
+    seen: mutable i64
+
+
+def bump(h: mutable Holder&) -> i64:
+    can Abort.Panic:
+        assert h.at != null
+        h.at.value <- h.at.value + 5
+        h.seen <- h.seen + 1
+        return h.at.value * 10 + h.seen
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        n: mutable Node = Node{next: null, value: 3}
+        h: mutable Holder = Holder{at: (&n).cast[heap Node&], seen: 0}
+        r: i64 = bump(&h)
+        return r + n.value - 40
+ELISAEOF
+)" 49
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
