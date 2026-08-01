@@ -101,6 +101,13 @@ done
 [[ -n "$out" && -n "$src" ]] || { echo "usage: $0 -o out.o source.elisa" >&2; exit 2; }
 [[ -f "$src" ]] || { echo "missing source: $src" >&2; exit 2; }
 
+# Trusted-stdlib marker: stage0 skips the user-code-only passes for elisacore_std's own
+# sources (and so accepts the compiler, which includes them). The driver cannot tell after
+# include flattening, so decide it here from the input PATH. See runtime_std_enabled().
+case "$src" in
+  *"/elisacore_std/"*|*"/src/driver/elisac.elisa") export ELISA_STAGE1_RUNTIME_STD=1 ;;
+esac
+
 flat="$(mktemp)"
 trap 'rm -f "$flat"' EXIT
 flatten_includes "$src" >"$flat"
