@@ -33,10 +33,19 @@ clang -o prog out.o build/runtime/elisacore_runtime.o
 Host tools still required: `clang`, LLVM (`llvm-config` / libLLVM), optional `ar` /
 `llvm-mc` / Z3 for archive, template, and SMT surfaces.
 
-**Gen2 self-host** (stage1 compiling its own product sources into a second
-binary) is still incomplete: remaining backend declines in the full frontend
-corpus (`next_token` / machine forms, etc.). Track progress with
-`scripts/self_host_gen2.sh`. Optional stage0 remains a parity oracle only.
+**Gen2 self-host** (stage1 compiling its own product sources into a second binary) is
+CLOSED, and closed as a byte-identical fixpoint: `test/parity/self_host_gen3_smoke.sh`
+asserts gen2 compiles the compiler and `gen3.o == gen4.o`. stage1 also builds the standard
+library's runtime object, gated by `test/parity/self_host_runtime_smoke.sh` — the half the
+fixpoint cannot see, since every generation otherwise links the stage0-built runtime.
+Track with `scripts/self_host_gen2.sh`. Optional stage0 remains a parity oracle only.
+
+Still open, and the reason self-hosting is not yet complete: the product driver runs
+semantic analysis only under `ELISA_STAGE1_SEMANTIC_GATE=1`. With the gate off it emits
+code without analysing, so it accepts programs stage0 rejects. The gate cannot default to
+on until stage1's semantic layer stops OVER-reporting relative to stage0 on the compiler's
+own source (docs/119 E4 "through a call" over reference parameters is the remaining
+cluster). See `src/driver/elisac.elisa` for the current measurements.
 
 Built **frontend-first**: lexer → parser → name resolution → typecheck → LLVM
 backend.
