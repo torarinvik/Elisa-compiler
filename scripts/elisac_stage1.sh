@@ -105,7 +105,7 @@ done
 # sources (and so accepts the compiler, which includes them). The driver cannot tell after
 # include flattening, so decide it here from the input PATH. See runtime_std_enabled().
 case "$src" in
-  *"/elisacore_std/"*|*"/src/driver/elisac.elisa") export ELISA_STAGE1_RUNTIME_STD=1 ;;
+  *elisacore_std/*|*src/driver/elisac.elisa) export ELISA_STAGE1_RUNTIME_STD=1 ;;
 esac
 
 flat="$(mktemp)"
