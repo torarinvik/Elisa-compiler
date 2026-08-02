@@ -90,7 +90,16 @@ while [[ $# -gt 0 ]]; do
       noalias=1; shift ;;
     -fbounds-check)
       bounds_check=1; shift ;;
-    -O2|-O0|-O3|-permissive) shift ;;
+    # stage1 runs NO LLVM pass pipeline (see src/driver/elisac.elisa: `default<O2>` has
+    # trapped on large self-host modules). `-O0` is therefore the truth and is accepted.
+    # An optimisation level we cannot honour is REJECTED rather than silently ignored:
+    # accepting it made `-O0` and `-O3` produce byte-identical objects while the caller
+    # believed otherwise — a wrong answer to a question the user asked, not a missing
+    # feature. Optimise the emitted object with host `opt`/`clang` instead.
+    -O0|-permissive) shift ;;
+    -O1|-O2|-O3|-Os|-Oz)
+      echo "$1: stage1 emits unoptimised objects (no LLVM pass pipeline); use -O0, or run host opt/clang on the object" >&2
+      exit 2 ;;
     -*)
       echo "unknown flag: $1" >&2; exit 2 ;;
     *)

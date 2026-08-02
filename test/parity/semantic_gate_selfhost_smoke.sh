@@ -10,9 +10,30 @@
 #     stage0-built driver (bin/elisac-stage1, the seed)  -> exit 0   ACCEPTS
 #     stage1-built driver (gen2)                          -> exit 139 SIGSEGV
 #
-#   lldb puts the fault in `arena_dict_find_index__u64__unknown` — a dict probe whose
-#   generic instantiation carries an UNRESOLVED value type (`__unknown` where `sview`
-#   belongs). SymbolTable.name_primary is `mutable dict[u64, sview]`.
+#   lldb puts the fault in `arena_dict_find_index__u64__unknown` — a dict probe.
+#   SymbolTable.name_primary is `mutable dict[u64, sview]`. (`__unknown` in the symbol is
+#   only push_type_name's spelling for a non-scalar type arg; it is not itself the defect.)
+#
+# MEASURED at the fault (2026-08-02), superseding two earlier diagnoses:
+#
+#   stack       Semantic.seed_builtins -> index_name -> name_indexed
+#                 -> arena_dict_get__u64__unknown__ov124 -> arena_dict_find_index
+#   dict        items=0x1006fb878 count=34 used=33 capacity=64 arena=0x16fdfdb70
+#   fault       0x1006fc030 == items + 63*32 + 0x18   (the LAST bucket's `state` byte)
+#   mapping     the block holding `items` ENDS at 0x1006fc000 — 1928 bytes after `items`,
+#               where 64 buckets at the 32-byte stride need 2048
+#   arena       begin=0x1006d4000 end=0x1006e8000 strategy=0 (CHAINED); the region at
+#               a.end has count=5865 capacity=8192 slots, data 0x1006e8038..0x1006f8038
+#
+# So `items` lies OUTSIDE every region in its own arena's chain, and the bucket array is
+# ~120 bytes short of what capacity 64 requires. The stride is not wrong (size_of and the
+# GEP both use 32) and the bucket-symbol COLLISION that used to cause this is fixed
+# (429f95b) — arena_da_fill__DictBucket__u64__unknown and __unknown__i64 are now distinct
+# symbols with no LLVM `.N` rename. What remains is that the growth allocation came from
+# an arena that is not the one the dict recorded.
+#
+# Ruled out and fixed on the way: every `try`/`catch`/error-union call site dropped the
+# trailing arena parameter its generic callee declared (fe79c9c). Real bug, not this one.
 #
 # Everything the ANALYSIS needs is already done: with the gate on, the corpus is at
 # baseline (49 match / 0 mismatch / 3 declined), scope_binding_smoke is 79/79, and the
