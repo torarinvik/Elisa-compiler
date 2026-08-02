@@ -222,19 +222,33 @@ extend Backend:
         #
         # Constant filters preserve the presized lowering: `if true` is ordinary and
         # `if false` produces an empty darray.
-        # `any VAR in ITER where COND` — bool quantifier (Comprehension with empty body).
+        # `any|all VAR in ITER where COND` — bool quantifier (Comprehension with empty body).
         # Models fixed array-literal iterables (the self-host `valid_suffix` shape) by
-        # unrolling: bind VAR to each element and short-circuit on first true COND.
-        def emit_any_quantifier(comprehension_var: sview, iterable: Expr, condition: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # unrolling: bind VAR to each element and short-circuit on the first DECIDING COND.
+        #
+        # The two quantifiers are one loop with three things flipped, so they share it rather
+        # than duplicating ~80 lines of block plumbing:
+        #
+        #   universal=false (`any`)  seed FALSE, short-circuit to TRUE  on the first COND that HOLDS
+        #   universal=true  (`all`)  seed TRUE,  short-circuit to FALSE on the first COND that FAILS
+        #
+        # The seed is also the answer for an empty ITER, which is what makes `all` over an
+        # empty darray vacuously TRUE — the case that separates it from `any` even when every
+        # element would agree.
+        def emit_any_quantifier(comprehension_var: sview, iterable: Expr, condition: Expr, universal: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # The value the loop settles on if it never short-circuits, and the value it
+            # stores when it does. Always opposites.
+            seed_bit: u64 = 1 if universal else 0
+            decided_bit: u64 = 0 if universal else 1
             if iterable is Expr.Array(elements, array_line):
                 null return if elements.count == 0
                 bool_ty: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
                 result_slot: LLVMValueRef = LLVMBuildAlloca(builder, bool_ty, "any.result")
-                _ = LLVMBuildStore(builder, LLVMConstInt(bool_ty, 0, 0), result_slot)
+                _ = LLVMBuildStore(builder, LLVMConstInt(bool_ty, seed_bit, 0), result_slot)
                 function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                 done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "any.done")
                 declined: mutable bool = false
-                for element in elements |declined, comprehension_var, condition, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                for element in elements |declined, comprehension_var, condition, universal, decided_bit, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
                     continue if declined
                     elem_type: mutable ValueType = expression_type(element, local_scope, fns, structs, generics)
                     if elem_type.kind == TypeKind.Unmodeled:
@@ -246,9 +260,14 @@ extend Backend:
                         if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cond_bit:
                             hit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "any.hit")
                             next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "any.next")
-                            _ = LLVMBuildCondBr(builder, cond_bit, hit_block, next_block)
+                            # `all` decides on the FALSE edge, `any` on the true one — same two
+                            # blocks, opposite successors.
+                            if universal:
+                                _ = LLVMBuildCondBr(builder, cond_bit, next_block, hit_block)
+                            else:
+                                _ = LLVMBuildCondBr(builder, cond_bit, hit_block, next_block)
                             LLVMPositionBuilderAtEnd(builder, hit_block)
-                            _ = LLVMBuildStore(builder, LLVMConstInt(bool_ty, 1, 0), result_slot)
+                            _ = LLVMBuildStore(builder, LLVMConstInt(bool_ty, decided_bit, 0), result_slot)
                             _ = LLVMBuildBr(builder, done_block)
                             LLVMPositionBuilderAtEnd(builder, next_block)
                         else:
@@ -273,7 +292,7 @@ extend Backend:
                     aq_bool: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
                     aq_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
                     aq_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, aq_bool, "any.d.result")
-                    _ = LLVMBuildStore(builder, LLVMConstInt(aq_bool, 0, 0), aq_result_slot)
+                    _ = LLVMBuildStore(builder, LLVMConstInt(aq_bool, seed_bit, 0), aq_result_slot)
                     aq_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, aq_header, aq_slot, 1, "any.d.cnt.ptr")
                     aq_count: LLVMValueRef = LLVMBuildLoad2(builder, aq_i64, aq_count_ptr, "any.d.cnt")
                     aq_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, aq_i64, "any.d.i")
@@ -301,9 +320,12 @@ extend Backend:
                     aq_elem_value: LLVMValueRef = LLVMBuildLoad2(builder, aq_elem_llvm, aq_elem_ptr, "any.d.elem")
                     _ = LLVMBuildStore(builder, aq_elem_value, aq_var_slot)
                     if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is aq_pred:
-                        _ = LLVMBuildCondBr(builder, aq_pred, aq_hit_block, aq_step_block)
+                        if universal:
+                            _ = LLVMBuildCondBr(builder, aq_pred, aq_step_block, aq_hit_block)
+                        else:
+                            _ = LLVMBuildCondBr(builder, aq_pred, aq_hit_block, aq_step_block)
                         LLVMPositionBuilderAtEnd(builder, aq_hit_block)
-                        _ = LLVMBuildStore(builder, LLVMConstInt(aq_bool, 1, 0), aq_result_slot)
+                        _ = LLVMBuildStore(builder, LLVMConstInt(aq_bool, decided_bit, 0), aq_result_slot)
                         _ = LLVMBuildBr(builder, aq_done_block)
                         LLVMPositionBuilderAtEnd(builder, aq_step_block)
                         aq_next: LLVMValueRef = LLVMBuildAdd(builder, aq_cur, LLVMConstInt(aq_i64, 1, 0), "any.d.next")
@@ -386,11 +408,20 @@ extend Backend:
                     return emit_set_comprehension(comprehension_var, iterable, condition, body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 return emit_dict_comprehension(comprehension_var, iterable, condition, body, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             # Quantifier `any|all VAR in ITER where COND` — Comprehension with empty body,
-            # expected bool. Stage0 lowers to a loop that short-circuits. Without an any/all
-            # marker on the node we treat these as `any` (self-host lexer uses `any` heavily;
-            # `all` is rarer and can be refined later via annotation).
+            # expected bool. Stage0 lowers to a loop that short-circuits.
+            #
+            # WHICH quantifier comes from the line-keyed `__query` marker, exactly as `count`
+            # does below. It has to: Expr.Comprehension drops the head keyword, and treating
+            # every bool empty-body form as `any` made `all x in [1, 0] where x > 0` return
+            # TRUE — a wrong answer that compiled, linked and ran clean. An unrecognised head
+            # DECLINES rather than guessing; a decline is loud at link time, a wrong
+            # quantifier is silent forever.
             if expected.kind == TypeKind.Bool and body is Expr.Absent:
-                return emit_any_quantifier(comprehension_var, iterable, condition, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                quantifier_head: sview = fn_return_head_at(comprehension_line, structs)
+                universal_quantifier: bool = quantifier_head == "all" or quantifier_head == "forall"
+                existential_quantifier: bool = quantifier_head == "any" or quantifier_head == "exists"
+                null return if not universal_quantifier and not existential_quantifier
+                return emit_any_quantifier(comprehension_var, iterable, condition, universal_quantifier, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             # `count VAR in ITER where COND` — a FOLD to an integer, not a bool quantifier and
             # not a collection. The parser drops the query head from the node, so which fold
             # this is comes from the line-keyed marker recorded at parse time; without that
