@@ -45,7 +45,15 @@ COMPILE_TIMEOUT=60
 
 # Programs with a TRIAGED intermittent stage1 failure. Each must have a recorded
 # reproducer; see memory/stage1-intermittent-segfault.md. Empty is the goal.
-KNOWN_INTERMITTENT=(easm_lockstep_parse_smoke)
+#
+# EMPTY as of the `[@r]` arena-threading fix: `easm_lockstep_parse_smoke` was the only entry,
+# and it was a use-after-free of a munmap'd region (0/400 after the fix, 13/400 before).
+# Do not add an entry here without a REPRODUCER. The way that one was finally caught was to
+# make the failure deterministic rather than to run it more times: patch `free_region` in
+# elisacore_std/arena.elisa to `mprotect(addr, size, 0)` instead of `munmap`, rebuild the
+# runtime object, and every use-after-free faults on the spot with a usable lldb backtrace
+# (stage0 0/40, stage1 40/40). Worth reaching for first next time.
+KNOWN_INTERMITTENT=()
 
 match=0; mismatch=0; declined=0; skipped=0; intermittent=0
 : > "$WORK/mismatches.txt"
@@ -131,7 +139,9 @@ while IFS= read -r src <&3; do
         # DETERMINISTIC instead of failing on whichever ~3% run happens to crash. They are
         # printed every run, loudly, and counted separately — this is a to-do list, not an
         # exemption, and it should only ever shrink.
-        if [ "$s1_rc" != "$s1_rc2" ] && printf '%s\n' "${KNOWN_INTERMITTENT[@]}" | grep -qx "$name"; then
+        # `${a[@]+"${a[@]}"}`: bash 3.2 (macOS) treats an EMPTY array as unbound under `set -u`,
+        # so the plain expansion would abort the gate now that the list is empty.
+        if [ "$s1_rc" != "$s1_rc2" ] && printf '%s\n' ${KNOWN_INTERMITTENT[@]+"${KNOWN_INTERMITTENT[@]}"} | grep -qx "$name"; then
             intermittent=$((intermittent + 1))
             echo "$name (stage0 $s0_rc, stage1 $s1_rc/$s1_rc2)" >> "$WORK/intermittent.txt"
             continue
