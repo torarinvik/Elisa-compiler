@@ -32,8 +32,9 @@ and an SMT integration. stage1 implements `obj`. The rest are **not stage1 goals
   is the one the fixpoint and the corpus exercise. (`llvm` IS now implemented — it prints the
   same module the object path lowers, so it shares that parity rather than adding a surface.)
 * **Execution and tooling** — `interpret`, `serve`, `test`, `tests`, `test-runner`, `benches`,
-  `fixtures`, native link/run, the debugger, the REPL. These are a build system and a
-  developer environment, not a compiler.
+  `fixtures`, the debugger, the REPL. These are a build system and a developer environment,
+  not a compiler. (Native LINK is now `-emit exe` above; `run` stays out — it is `-emit exe`
+  plus executing the result, which the caller can do.)
 * **SMT / Z3.** stage1's proof-adjacent checks are the heuristic semantic rules and are
   described as such. There is no plan to embed a solver; a program that needs stage0's SMT
   should be checked by stage0.
@@ -58,6 +59,10 @@ rejected outright; honouring them closes that properly.
 `-emit llvm` prints the SAME module as textual IR instead of lowering it — the debugging
 surface every backend investigation in this repo kept borrowing from stage0. The smoke
 round-trips the IR through clang.
+
+`-emit exe` links the object against the runtime into a runnable binary — the exact
+compile-and-link every harness in this repo already performs by hand, promoted to a flag.
+Host clang does the link; the smoke builds and RUNS one.
 
 ## Bootstrap policy, unchanged
 

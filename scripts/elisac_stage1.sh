@@ -86,11 +86,15 @@ while [[ $# -gt 0 ]]; do
       out="${2:-}"; shift 2 ;;
     -emit)
       # `obj` (default) lowers to a native object; `llvm` prints the SAME module as
-      # textual IR — the debugging surface this repo kept borrowing from stage0.
+      # textual IR — the debugging surface this repo kept borrowing from stage0; `exe`
+      # links the object against the runtime into a runnable binary (host clang does the
+      # link — linking is host tooling, and every harness in this repo already links this
+      # exact way by hand).
       case "${2:-}" in
         obj)  emit_mode="obj" ;;
         llvm) emit_mode="llvm" ;;
-        *) echo "only -emit obj and -emit llvm are supported" >&2; exit 2 ;;
+        exe)  emit_mode="exe" ;;
+        *) echo "only -emit obj, -emit llvm and -emit exe are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -fnoalias)
@@ -132,6 +136,16 @@ flatten_includes "$src" >"$flat"
 if grep -q 'def arena_alloc(' "$flat" 2>/dev/null; then
   export ELISA_STAGE1_RUNTIME_STD=1
 fi
+# `-emit exe`: compile to a temporary object, then link with the runtime object.
+runtime_obj="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+link_out=""
+if [[ "$emit_mode" == "exe" ]]; then
+  [[ -f "$runtime_obj" ]] || { echo "-emit exe requires the runtime object at $runtime_obj (run scripts/build_runtime_object.sh)" >&2; exit 2; }
+  link_out="$out"
+  out="$(mktemp).o"
+  emit_mode="obj"
+fi
+
 # Optimisation level and emit mode reach the driver via env (the stdin protocol
 # carries only the output path and the source).
 driver_env=()
@@ -147,3 +161,10 @@ elif [[ "$bounds_check" == 1 ]]; then
 else
   { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" "$BIN"
 fi
+compile_rc=$?
+if [[ -n "$link_out" ]]; then
+  [[ "$compile_rc" == 0 && -f "$out" ]] || { rm -f "$out"; exit "${compile_rc:-1}"; }
+  clang -Wl,-dead_strip -o "$link_out" "$out" "$runtime_obj" || { rm -f "$out"; exit 1; }
+  rm -f "$out"
+fi
+exit "$compile_rc"

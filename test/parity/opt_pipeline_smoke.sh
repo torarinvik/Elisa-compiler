@@ -55,6 +55,20 @@ else
     failed=$((failed + 1))
 fi
 
+# -emit exe: compile+link one fixture end to end and RUN it; the exit code must match
+# the object-path build the loop above already validated.
+EXE_SRC="$ROOT/test/repro/region_statement_form.elisa"
+if bash "$ROOT/scripts/elisac_stage1.sh" -emit exe -o "$WORK/exe_probe" "$EXE_SRC" >/dev/null 2>&1; then
+    timeout 10 "$WORK/exe_probe" >/dev/null 2>&1 </dev/null; exe_rc=$?
+    if [ "$exe_rc" != 42 ]; then
+        echo "  FAIL -emit exe: exit $exe_rc, want 42"
+        failed=$((failed + 1))
+    fi
+else
+    echo "  FAIL -emit exe: build failed"
+    failed=$((failed + 1))
+fi
+
 if [ "$failed" -gt 0 ]; then
     echo "opt_pipeline FAILED: $failed failures over $checked fixtures"
     exit 1
