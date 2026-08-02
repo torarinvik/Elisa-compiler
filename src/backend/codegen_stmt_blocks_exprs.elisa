@@ -93,7 +93,15 @@ extend Backend:
                         in_runtime: mutable Runtime = copied_runtime(runtime)
                         in_runtime.arena <- in_slot
                         in_runtime.owns_arena <- false
+                        # Same frame bookkeeping as `region`: containers declared OUTSIDE the
+                        # block keep growing from their declaration arena.
+                        local_scope.region_frame_starts <- local_scope.region_frame_starts.push(local_scope.names.count)
+                        local_scope.region_frame_arenas <- local_scope.region_frame_arenas.push(in_slot)
+                        local_scope.region_frame_outers <- local_scope.region_frame_outers.push(runtime.arena)
                         in_status: EmitStatus = emit_statements(block_body, return_type, local_scope, loops, regions, fns, structs, generics, in_runtime, m, ctx, builder)
+                        local_scope.region_frame_starts <- local_scope.region_frame_starts.truncate(local_scope.region_frame_starts.count - 1)
+                        local_scope.region_frame_arenas <- local_scope.region_frame_arenas.truncate(local_scope.region_frame_arenas.count - 1)
+                        local_scope.region_frame_outers <- local_scope.region_frame_outers.truncate(local_scope.region_frame_outers.count - 1)
                         return in_status
                     return declined_status
                 # `trusted X:` / `can X:` — a trust/effect-grant wrapper. The grant is a
@@ -207,7 +215,16 @@ extend Backend:
                 # Live for the block's duration, so a `return` inside unwinds it along with
                 # every enclosing region -- innermost first, which is the order stage0 emits.
                 regions.arenas.push(scoped_slot)
+                # Record the frame so growth sites can tell a block-local container from one
+                # declared outside (see growth_arena_for): outside ones keep growing from
+                # the arena they were declared under, not from this region.
+                local_scope.region_frame_starts <- local_scope.region_frame_starts.push(local_scope.names.count)
+                local_scope.region_frame_arenas <- local_scope.region_frame_arenas.push(scoped_slot)
+                local_scope.region_frame_outers <- local_scope.region_frame_outers.push(runtime.arena)
                 scoped_status: EmitStatus = emit_statements(block_body, return_type, local_scope, loops, regions, fns, structs, generics, scoped_runtime, m, ctx, builder)
+                local_scope.region_frame_starts <- local_scope.region_frame_starts.truncate(local_scope.region_frame_starts.count - 1)
+                local_scope.region_frame_arenas <- local_scope.region_frame_arenas.truncate(local_scope.region_frame_arenas.count - 1)
+                local_scope.region_frame_outers <- local_scope.region_frame_outers.truncate(local_scope.region_frame_outers.count - 1)
                 _ = regions.arenas.pop()
                 declined_status return if scoped_status == EmitStatus.Declined
                 # A body that RETURNED already unwound this region on its way out; emitting
@@ -413,7 +430,8 @@ extend Backend:
                         push_type: ValueType = darray_type_behind_expr(push_object, local_scope, structs)
                         if push_type.kind == TypeKind.DArray and push_method == "push" and push_arguments.count == 1:
                             if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is push_slot:
-                                if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, generics, runtime, m, ctx, builder):
+                                push_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, generics, push_growth_runtime, m, ctx, builder):
                                     return EmitStatus.Open
                             return EmitStatus.Declined
                         # `xs.clear()` — logically empty the darray by zeroing its count (the
@@ -476,7 +494,8 @@ extend Backend:
                                     rz_more: LLVMValueRef = LLVMBuildICmp(builder, 36, rz_cur, rz_n, "resize.more")
                                     _ = LLVMBuildCondBr(builder, rz_more, rz_push_block, rz_after)
                                     LLVMPositionBuilderAtEnd(builder, rz_push_block)
-                                    if emit_darray_push(rz_slot, push_type, Expr.IntLit(0), local_scope, fns, structs, generics, runtime, m, ctx, builder):
+                                    rz_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                    if emit_darray_push(rz_slot, push_type, Expr.IntLit(0), local_scope, fns, structs, generics, rz_growth_runtime, m, ctx, builder):
                                         _ = LLVMBuildBr(builder, rz_cond)
                                         LLVMPositionBuilderAtEnd(builder, rz_after)
                                         # Final count is exactly n: a no-op after growth, the shrink
@@ -509,9 +528,10 @@ extend Backend:
                             # expression straight through emit_darray_push (which handles growth).
                             if push_arguments[0] is Expr.Array(ext_lit_elements, ext_lit_line):
                                 if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_lit_target_slot:
+                                    ext_lit_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
                                     ext_lit_declined: mutable bool = false
-                                    for ext_lit_element in ext_lit_elements |ext_lit_declined, ext_lit_target_slot, push_type, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
-                                        ext_lit_declined <- true if not emit_darray_push(ext_lit_target_slot, push_type, ext_lit_element, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                    for ext_lit_element in ext_lit_elements |ext_lit_declined, ext_lit_target_slot, push_type, local_scope, fns, structs, generics, ext_lit_growth_runtime, m, ctx, builder|:
+                                        ext_lit_declined <- true if not emit_darray_push(ext_lit_target_slot, push_type, ext_lit_element, local_scope, fns, structs, generics, ext_lit_growth_runtime, m, ctx, builder)
                                     EmitStatus.Declined return if ext_lit_declined
                                     return EmitStatus.Open
                                 return EmitStatus.Declined
@@ -520,6 +540,7 @@ extend Backend:
                                 EmitStatus.Declined return if ext_byte_element.kind != TypeKind.Unsigned or ext_byte_element.bits != 8
                                 ext_sview_source_type: ValueType = ValueType{kind: TypeKind.SView, bits: 0}
                                 if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_sview_target_slot:
+                                    ext_sview_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
                                     if emit_expression(push_arguments[0], ext_sview_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_sview_value:
                                         ext_sview_len: LLVMValueRef = LLVMBuildExtractValue(builder, ext_sview_value, 1, "extend.sview.len")
                                         ext_sview_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, LLVMInt64TypeInContext(ctx), "extend.sview.i")
@@ -536,7 +557,7 @@ extend Backend:
                                         _ = LLVMBuildCondBr(builder, ext_sview_more, ext_sview_body, ext_sview_done)
                                         LLVMPositionBuilderAtEnd(builder, ext_sview_body)
                                         ext_sview_index_expr: Expr = Expr.Index(push_arguments[0], Expr.Ident("__extend_sview_idx", push_call_line), push_call_line)
-                                        if emit_darray_push(ext_sview_target_slot, push_type, ext_sview_index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder):
+                                        if emit_darray_push(ext_sview_target_slot, push_type, ext_sview_index_expr, local_scope, fns, structs, generics, ext_sview_growth_runtime, m, ctx, builder):
                                             ext_sview_next: LLVMValueRef = LLVMBuildAdd(builder, ext_sview_index, LLVMConstInt(LLVMInt64TypeInContext(ctx), 1, 0), "extend.sview.next")
                                             _ = LLVMBuildStore(builder, ext_sview_next, ext_sview_index_slot)
                                             _ = LLVMBuildBr(builder, ext_sview_cond)
@@ -587,6 +608,7 @@ extend Backend:
                             EmitStatus.Declined return if ext_source_type.kind != TypeKind.DArray
                             if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_target_slot:
                                 if darray_address_of_expr(ext_src_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_source_slot:
+                                    ext_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
                                     ext_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
                                     ext_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
                                     # Snapshot the source count before the loop (a self-extend then
@@ -607,7 +629,7 @@ extend Backend:
                                     _ = LLVMBuildCondBr(builder, ext_more, ext_bodyb, ext_done)
                                     LLVMPositionBuilderAtEnd(builder, ext_bodyb)
                                     ext_index_expr: Expr = Expr.Index(ext_src_expr, Expr.Ident("__extend_idx", push_call_line), push_call_line)
-                                    if emit_darray_push(ext_target_slot, push_type, ext_index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder):
+                                    if emit_darray_push(ext_target_slot, push_type, ext_index_expr, local_scope, fns, structs, generics, ext_growth_runtime, m, ctx, builder):
                                         _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, ext_cur, LLVMConstInt(ext_i64, 1, 0), "extend.next"), ext_idx_slot)
                                         _ = LLVMBuildBr(builder, ext_cond)
                                         LLVMPositionBuilderAtEnd(builder, ext_done)
