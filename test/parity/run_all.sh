@@ -49,6 +49,7 @@ run_one "parser acceptance parity (stage1 == stage0)" "$REPO_ROOT/test/parity/pa
 run_one "semantic acceptance parity (stage1 == stage0)" "$REPO_ROOT/test/parity/semantic_acceptance_diff.sh"
 run_one "diagnostics message parity (stage1 covers stage0)" "$REPO_ROOT/test/parity/diagnostics_diff.sh"
 run_one "internal-suite differential (ratchet)" "$REPO_ROOT/test/parity/semantic_internal_diff.sh"
+run_one "optimisation pipeline answer parity" "$REPO_ROOT/test/parity/opt_pipeline_smoke.sh"
 # The only check that compares ANSWERS rather than acceptance: compile a corpus of real
 # programs with both compilers, RUN both, require the same exit code. Every other check
 # here would pass a stage1 that compiles everything and computes the wrong result — as it

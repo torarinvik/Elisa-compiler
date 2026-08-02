@@ -28,9 +28,9 @@ and an SMT integration. stage1 implements `obj`. The rest are **not stage1 goals
   `packed`, `progress`, `iface`, `deps`, `deps-json`, `doc`, `fmt`. These re-render data the
   compiler already has. Porting them adds no parity signal, and stage0 remains available to
   produce them.
-* **Alternate outputs** — `ir`, `llvm`, `bc`, `header`, `c-archive`, `c-bind-check`. The object
-  path is the one the fixpoint and the corpus exercise; a second output format would be a
-  second surface to keep in parity for no correctness gain.
+* **Alternate outputs** — `ir`, `bc`, `header`, `c-archive`, `c-bind-check`. The object path
+  is the one the fixpoint and the corpus exercise. (`llvm` IS now implemented — it prints the
+  same module the object path lowers, so it shares that parity rather than adding a surface.)
 * **Execution and tooling** — `interpret`, `serve`, `test`, `tests`, `test-runner`, `benches`,
   `fixtures`, native link/run, the debugger, the REPL. These are a build system and a
   developer environment, not a compiler.
@@ -41,17 +41,23 @@ and an SMT integration. stage1 implements `obj`. The rest are **not stage1 goals
 If one of these is ever wanted, it is a NEW feature with its own justification — not a parity
 debt.
 
-## The one thing that was a real defect: silent flags
+## Optimisation levels and `-emit llvm` — in scope and honoured (2026-08-03)
 
-`-O0`, `-O2` and `-O3` used to be **accepted and ignored** by `scripts/elisac_stage1.sh`, so
-`-O0` and `-O3` produced byte-identical objects while the caller believed otherwise. That is
-not a missing feature, it is a wrong answer to a question the user asked, and it is the one
-part of the CLI gap worth fixing. The wrapper now rejects an optimisation level it cannot
-honour rather than pretending to apply it.
+`-O1`, `-O2` and `-O3` run LLVM's `default<O{n}>` pass pipeline in the driver; `-O0`
+(the default) skips it, so the fixpoint and every unoptimised measurement are unchanged.
+The pipeline had been disabled while `default<O2>` trapped on large self-host modules —
+those traps were the opaque-handle `==` and arena-identity miscompiles in the SELF-HOSTED
+binary, not LLVM's; with them fixed the compiler builds its own 110k-line module at -O2
+(9.1 MB -> 5.4 MB object) and the resulting binary compiles correctly.
+`test/parity/opt_pipeline_smoke.sh` holds the invariant that matters: optimisation NEVER
+changes answers — every runnable repro fixture must exit identically at -O0 and -O2.
+`-Os`/`-Oz` remain rejected (no size-pipeline parity to hold them to). Before this, the
+levels were accepted-and-ignored — a wrong answer to a question the user asked — and then
+rejected outright; honouring them closes that properly.
 
-The LLVM pass pipeline itself stays disabled — `default<O2>` has trapped on large self-host
-modules (see the note in `src/driver/elisac.elisa`). Emitting unoptimised objects is a stated
-property, not an accident; host `opt`/`clang` can optimise afterwards.
+`-emit llvm` prints the SAME module as textual IR instead of lowering it — the debugging
+surface every backend investigation in this repo kept borrowing from stage0. The smoke
+round-trips the IR through clang.
 
 ## Bootstrap policy, unchanged
 

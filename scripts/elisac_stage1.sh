@@ -78,27 +78,36 @@ out=""
 src=""
 noalias=0
 bounds_check=0
+opt_level=0
+emit_mode="obj"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o)
       out="${2:-}"; shift 2 ;;
     -emit)
-      # accept -emit obj for familiarity; only obj is supported
-      [[ "${2:-}" == "obj" ]] || { echo "only -emit obj is supported" >&2; exit 2; }
+      # `obj` (default) lowers to a native object; `llvm` prints the SAME module as
+      # textual IR — the debugging surface this repo kept borrowing from stage0.
+      case "${2:-}" in
+        obj)  emit_mode="obj" ;;
+        llvm) emit_mode="llvm" ;;
+        *) echo "only -emit obj and -emit llvm are supported" >&2; exit 2 ;;
+      esac
       shift 2 ;;
     -fnoalias)
       noalias=1; shift ;;
     -fbounds-check)
       bounds_check=1; shift ;;
-    # stage1 runs NO LLVM pass pipeline (see src/driver/elisac.elisa: `default<O2>` has
-    # trapped on large self-host modules). `-O0` is therefore the truth and is accepted.
-    # An optimisation level we cannot honour is REJECTED rather than silently ignored:
-    # accepting it made `-O0` and `-O3` produce byte-identical objects while the caller
-    # believed otherwise — a wrong answer to a question the user asked, not a missing
-    # feature. Optimise the emitted object with host `opt`/`clang` instead.
     -O0|-permissive) shift ;;
-    -O1|-O2|-O3|-Os|-Oz)
-      echo "$1: stage1 emits unoptimised objects (no LLVM pass pipeline); use -O0, or run host opt/clang on the object" >&2
+    # -O1/-O2/-O3 now run LLVM's `default<O{n}>` pass pipeline in the driver
+    # (ELISA_STAGE1_OPT). The pipeline was disabled while `default<O2>` trapped on
+    # large self-host modules; those traps were the opaque-handle `==` and
+    # arena-identity miscompiles in the self-hosted binary, fixed 2026-08-02/03.
+    # -Os/-Oz remain unsupported: stage0 has no size-pipeline parity to hold them to.
+    -O1) opt_level=1; shift ;;
+    -O2) opt_level=2; shift ;;
+    -O3) opt_level=3; shift ;;
+    -Os|-Oz)
+      echo "$1: unsupported (no size-optimisation parity with stage0); use -O0..-O3" >&2
       exit 2 ;;
     -*)
       echo "unknown flag: $1" >&2; exit 2 ;;
@@ -123,13 +132,18 @@ flatten_includes "$src" >"$flat"
 if grep -q 'def arena_alloc(' "$flat" 2>/dev/null; then
   export ELISA_STAGE1_RUNTIME_STD=1
 fi
+# Optimisation level and emit mode reach the driver via env (the stdin protocol
+# carries only the output path and the source).
+driver_env=()
+[[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
+[[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
 # stdin protocol: output path line, then source
 if [[ "$noalias" == 1 && "$bounds_check" == 1 ]]; then
-  { printf '%s\n' "$out"; cat "$flat"; } | ELISACORE_NOALIAS_MUTABLE_REFS=1 ELISACORE_FORCE_BOUNDS_CHECK=1 "$BIN"
+  { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" ELISACORE_NOALIAS_MUTABLE_REFS=1 ELISACORE_FORCE_BOUNDS_CHECK=1 "$BIN"
 elif [[ "$noalias" == 1 ]]; then
-  { printf '%s\n' "$out"; cat "$flat"; } | ELISACORE_NOALIAS_MUTABLE_REFS=1 "$BIN"
+  { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" ELISACORE_NOALIAS_MUTABLE_REFS=1 "$BIN"
 elif [[ "$bounds_check" == 1 ]]; then
-  { printf '%s\n' "$out"; cat "$flat"; } | ELISACORE_FORCE_BOUNDS_CHECK=1 "$BIN"
+  { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" ELISACORE_FORCE_BOUNDS_CHECK=1 "$BIN"
 else
-  { printf '%s\n' "$out"; cat "$flat"; } | "$BIN"
+  { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" "$BIN"
 fi

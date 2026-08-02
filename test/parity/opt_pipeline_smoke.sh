@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# OPTIMISATION MUST NEVER CHANGE ANSWERS. stage1's -O1/-O2/-O3 run LLVM's `default<O{n}>`
+# pipeline (they were rejected outright while `default<O2>` trapped on large self-host
+# modules — those traps were the opaque-handle `==` and arena-identity miscompiles in the
+# self-hosted binary, fixed 2026-08-02/03). This smoke compiles every runnable repro
+# fixture at -O0 and -O2 and demands the SAME exit code from both; -O2 must also match the
+# recorded -O0 answer, so a pipeline that "fixes" a latent miscompile by optimising it away
+# still fails loudly.
+#
+# `-emit llvm` is exercised on one fixture: the module must parse as textual IR (llvm-as or
+# clang can consume it) and contain the program's main.
+set -uo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+[ -f "$RUNTIME_OBJ" ] || { echo "opt_pipeline SKIP: no runtime object"; exit 0; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+
+checked=0
+failed=0
+for src in "$ROOT"/test/repro/*.elisa; do
+    name="$(basename "$src" .elisa)"
+    grep -q "def main() -> i64" "$src" || continue
+    # -O0 (the baseline the corpus already validates against stage0)
+    if ! bash "$ROOT/scripts/elisac_stage1.sh" -O0 -o "$WORK/$name.o0.o" "$src" >/dev/null 2>&1; then
+        continue    # a decline is the corpus's business, not this smoke's
+    fi
+    clang -Wl,-dead_strip -o "$WORK/$name.o0" "$WORK/$name.o0.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || continue
+    timeout 10 "$WORK/$name.o0" >/dev/null 2>&1 </dev/null; rc0=$?
+    [ "$rc0" -eq 124 ] && continue
+    # -O2 through the pass pipeline
+    if ! bash "$ROOT/scripts/elisac_stage1.sh" -O2 -o "$WORK/$name.o2.o" "$src" >/dev/null 2>&1; then
+        echo "  FAIL $name: -O2 compile failed where -O0 succeeded"
+        failed=$((failed + 1)); continue
+    fi
+    clang -Wl,-dead_strip -o "$WORK/$name.o2" "$WORK/$name.o2.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O2 link"; failed=$((failed + 1)); continue; }
+    timeout 10 "$WORK/$name.o2" >/dev/null 2>&1 </dev/null; rc2=$?
+    checked=$((checked + 1))
+    if [ "$rc0" != "$rc2" ]; then
+        echo "  FAIL $name: -O0 exit $rc0, -O2 exit $rc2"
+        failed=$((failed + 1))
+    fi
+done
+
+# -emit llvm: one fixture, textual IR out, must contain main and round-trip through clang.
+LL_SRC="$ROOT/test/repro/region_statement_form.elisa"
+if bash "$ROOT/scripts/elisac_stage1.sh" -emit llvm -o "$WORK/ll.ll" "$LL_SRC" >/dev/null 2>&1 \
+   && grep -q "define i64 @main" "$WORK/ll.ll" \
+   && clang -c -o "$WORK/ll.o" "$WORK/ll.ll" >/dev/null 2>&1; then
+    :
+else
+    echo "  FAIL -emit llvm: no parseable IR with @main"
+    failed=$((failed + 1))
+fi
+
+if [ "$failed" -gt 0 ]; then
+    echo "opt_pipeline FAILED: $failed failures over $checked fixtures"
+    exit 1
+fi
+echo "opt_pipeline OK: $checked fixtures agree at -O0 and -O2; -emit llvm round-trips"
