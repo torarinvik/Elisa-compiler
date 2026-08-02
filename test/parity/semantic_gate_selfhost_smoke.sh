@@ -1,44 +1,36 @@
 #!/usr/bin/env bash
-# THE ONE BLOCKER to defaulting the semantic gate ON: a stage1-COMPILED semantic layer
-# miscompiles, and the resulting analyzer corrupts memory.
+# The stage1-COMPILED semantic layer must analyse IDENTICALLY to the stage0-compiled one.
 #
-# NOT wired into run_all.sh — it FAILS today by design. It is the executable form of the
-# bug so a future fix is verified rather than assumed, and so the regression cannot be
-# forgotten. Wire it into run_all.sh in the same commit that fixes the miscompile.
+# This was the one blocker to running the analyzer by default, and it is CLOSED: the gate is
+# now ON unless ELISA_STAGE1_NO_SEMANTIC_GATE=1. The check stays because the property it
+# guards is not self-evident — every generation of the bootstrap skips or runs the check
+# together, so a fixpoint cannot see a divergence in the checker itself. Only running the
+# SAME source through a stage0-built driver and a stage1-built one can.
 #
-#   ELISA_STAGE1_SEMANTIC_GATE=1, identical source through both drivers:
-#     stage0-built driver (bin/elisac-stage1, the seed)  -> exit 0   ACCEPTS
-#     stage1-built driver (gen2)                          -> exit 139 SIGSEGV
+#   identical source through both drivers, both with the gate active:
+#     stage0-built driver (bin/elisac-stage1, the seed)  -> exit 0
+#     stage1-built driver (gen2)                          -> exit 0
 #
-#   lldb puts the fault in `arena_dict_find_index__u64__unknown` — a dict probe.
-#   SymbolTable.name_primary is `mutable dict[u64, sview]`. (`__unknown` in the symbol is
-#   only push_type_name's spelling for a non-scalar type arg; it is not itself the defect.)
+# What it took to get here (each hid the next):
+#   * `d <- d.put(k, v)` stored the helper's RETURN VALUE over the dict header;
+#   * the deep packed pattern's probe ladder read the next level's handle without first
+#     branching on the current level's tag, so a direct call `f(x)` walked an Ident's payload
+#     as a node handle;
+#   * `for b in sview(literal, 0, -1)` compared the index UNSIGNED, so the std's
+#     NUL-terminated sentinel read as 2^64-1;
+#   * `scope` was an UNGUARDED contextual block keyword, so `scope.push(x)` parsed as a
+#     `scope:` block — Semantic.mark_mutable_locals' parameter is named `scope`, and that one
+#     bug produced 319 E10 false positives on the compiler's own source;
+#   * string literals reached LLVM with their escapes undecoded.
 #
-# MEASURED at the fault (2026-08-02), superseding two earlier diagnoses:
-#
-#   stack       Semantic.seed_builtins -> index_name -> name_indexed
-#                 -> arena_dict_get__u64__unknown__ov124 -> arena_dict_find_index
-#   dict        items=0x1006fb878 count=34 used=33 capacity=64 arena=0x16fdfdb70
-#   fault       0x1006fc030 == items + 63*32 + 0x18   (the LAST bucket's `state` byte)
-#   mapping     the block holding `items` ENDS at 0x1006fc000 — 1928 bytes after `items`,
-#               where 64 buckets at the 32-byte stride need 2048
-#   arena       begin=0x1006d4000 end=0x1006e8000 strategy=0 (CHAINED); the region at
-#               a.end has count=5865 capacity=8192 slots, data 0x1006e8038..0x1006f8038
-#
-# So `items` lies OUTSIDE every region in its own arena's chain, and the bucket array is
-# ~120 bytes short of what capacity 64 requires. The stride is not wrong (size_of and the
-# GEP both use 32) and the bucket-symbol COLLISION that used to cause this is fixed
-# (429f95b) — arena_da_fill__DictBucket__u64__unknown and __unknown__i64 are now distinct
-# symbols with no LLVM `.N` rename. What remains is that the growth allocation came from
-# an arena that is not the one the dict recorded.
-#
-# Ruled out and fixed on the way: every `try`/`catch`/error-union call site dropped the
-# trailing arena parameter its generic callee declared (fe79c9c). Real bug, not this one.
-#
-# Everything the ANALYSIS needs is already done: with the gate on, the corpus is at
-# baseline (49 match / 0 mismatch / 3 declined), scope_binding_smoke is 79/79, and the
-# compiler's own source has ZERO error-severity findings. Only this miscompile blocks the
-# default.
+# The FAST oracle for any future divergence is parse_report built by BOTH compilers, diffed
+# per file (<1s each, no gen2 needed) — it is what localised all of the above:
+#   REPO_ROOT=$PWD ELISACORE_BIN=~/.elisac/elisac bash test/parity/build_parse_report.sh
+#   bash scripts/elisac_stage1.sh -o /tmp/pr.o test/breadth/parse_report.elisa
+#   clang -Wl,-dead_strip -o /tmp/pr_s1 /tmp/pr.o build/runtime/elisacore_runtime.o
+#   ./build/parse_report < F.elisa ; /tmp/pr_s1 < F.elisa
+# Currently 505 of 507 sources agree; the two that differ are the same severity-2 warning
+# (a missed `pointer cast requires can[Unsafe]`), which does not gate acceptance.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -63,7 +55,7 @@ ELISAEOF
 
 run_driver() {
     { printf '%s\n' "$WORK/out.o"; cat "$WORK/prog.elisa"; } \
-        | ELISA_STAGE1_SEMANTIC_GATE=1 "$1" >/dev/null 2>&1
+        | "$1" >/dev/null 2>&1
     echo $?
 }
 
@@ -77,14 +69,12 @@ if [ "$seed_exit" -ne 0 ]; then
 fi
 
 if [ "$gen2_exit" -ne 0 ]; then
-    echo "semantic_gate_selfhost FAILED (EXPECTED TODAY): stage1-built gen2 gave $gen2_exit, stage0-built gave 0"
+    echo "semantic_gate_selfhost FAILED: stage1-built gen2 gave $gen2_exit, stage0-built gave 0"
     [ "$gen2_exit" -eq 139 ] && echo "  (139 = SIGSEGV — memory corruption, not a diagnostic)"
     [ "$gen2_exit" -eq 124 ] && echo "  (124 = TIMED OUT — a hang, not a wrong answer)"
-    echo "  the semantic layer computes differently when STAGE1 compiles it; see"
-    echo "  the memory note 'Semantic layer over-reporting' for the causal chain and dead ends"
+    echo "  the semantic layer computes differently when STAGE1 compiles it — a REGRESSION."
+    echo "  Localise it with the parse_report oracle in the header comment, not by bisecting gen2."
     exit 1
 fi
 
 echo "semantic_gate_selfhost OK: gen2 analyses identically to the stage0-built driver"
-echo "  -> the miscompile is FIXED; wire this into run_all.sh and default the gate ON"
-echo "     (src/driver/elisac.elisa: semantic_gate_enabled)"
