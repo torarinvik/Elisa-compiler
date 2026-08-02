@@ -1,0 +1,182 @@
+# `==`/`!=` on raw C-string pointers compares ADDRESSES, not contents — stage0 warns.
+#
+# The reflection descriptors (`for v in variants(E)`, `fields(S)`) expose `.name` as a raw
+# `u8&` C string, and static-reflection code naturally writes `field.name != "right"` or
+# binds `variant.name` through a `for first` yield and compares the result to a literal.
+# Both compile — to a pointer compare that is almost never what the author meant — so
+# stage0 reports severity-2 warnings pointing at streq()/sview instead
+# (static_reflection_variants_fields in the internal oracle: warnings at the `.name !=`
+# filter and at the `get … else "" ==` compare).
+#
+# This port is deliberately scoped to the reflection surface, where the operand's
+# raw-C-string type is knowable SYNTACTICALLY: a `.name` access on a variants()/fields()
+# binder, or a local whose initializer yields one (`x = v.name for first v in variants(E)
+# where …`), including through `get x else "…"`. A general cstr==cstr lint needs type
+# inference the analyzer does not carry; widening this check without it would false-positive
+# on sview compares, which ARE content compares.
+
+extend Semantic:
+    private:
+        # The bare callee name of `variants(...)`/`fields(...)`, or "".
+        def cpc_reflection_callee(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Refinement(cpc_refined, cpc_refine_cond, cpc_refine_line):
+                    return cpc_reflection_callee(cpc_refined)
+                if expression is Expr.Call(cpc_callee, cpc_args, cpc_arg_names, cpc_call_line):
+                    if cpc_callee is Expr.Ident(cpc_callee_name, cpc_callee_line):
+                        cpc_callee_name return if cpc_callee_name == "variants" or cpc_callee_name == "fields"
+                return sview("", 0, 0)
+
+
+        # Whether `expression` is a raw C-string VALUE: `B.name` for a reflection binder
+        # B, an Ident naming a reflection-yield local, or `get LOCAL else "…"` over one.
+        def cpc_is_raw_cstring(expression: Ast::Expr, binders: darray[sview]&, cstr_locals: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Paren(cpc_paren_inner, cpc_paren_line):
+                    return cpc_is_raw_cstring(cpc_paren_inner, binders, cstr_locals)
+                if expression is Expr.Field(cpc_field_object, cpc_field_name, cpc_field_line):
+                    false return if cpc_field_name != "name"
+                    if cpc_field_object is Expr.Ident(cpc_field_root, cpc_field_root_line):
+                        return any cpc_binder in binders where cpc_binder == cpc_field_root
+                    return false
+                if expression is Expr.Ident(cpc_ident_name, cpc_ident_line):
+                    return any cpc_local in cstr_locals where cpc_local == cpc_ident_name
+                if expression is Expr.GetElse(cpc_guarded, cpc_recovery, cpc_get_line):
+                    return cpc_is_raw_cstring(cpc_guarded, binders, cstr_locals)
+                return false
+
+
+        # Whether an INITIALIZER makes its local a raw-C-string value: a comprehension over
+        # variants()/fields() whose yield mentions `.name` — `v.name for first v in
+        # variants(E) where …` reaches here as an expression CONTAINING both pieces.
+        def cpc_init_yields_cstring(expression: Ast::Expr, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if depth > 12
+                if expression is Expr.Comprehension(cpc_c_var, cpc_c_iterable, cpc_c_cond, cpc_c_body, cpc_c_line):
+                    false return if cpc_reflection_callee(cpc_c_iterable) == ""
+                    binder_only: mutable darray[sview] = []
+                    binder_only.push(cpc_c_var)
+                    no_locals: darray[sview] = []
+                    true return if cpc_is_raw_cstring(cpc_c_body, binder_only, no_locals)
+                    return false
+                if expression is Expr.Binary(cpc_b_left, cpc_b_op, cpc_b_right, cpc_b_line):
+                    true return if cpc_init_yields_cstring(cpc_b_left, depth + 1)
+                    return cpc_init_yields_cstring(cpc_b_right, depth + 1)
+                if expression is Expr.Paren(cpc_p_inner, cpc_p_line):
+                    return cpc_init_yields_cstring(cpc_p_inner, depth + 1)
+                # The yield form `X for first B in IT where C` parses with X folded around
+                # the comprehension in a Block expression on some paths.
+                if expression is Expr.Block(cpc_blk_stmts, cpc_blk_value, cpc_blk_captures, cpc_blk_line):
+                    return cpc_init_yields_cstring(cpc_blk_value, depth + 1)
+                return false
+
+
+        def cpc_operator_text(operator: TokenKind) -> sview:
+            can Abort.Panic:
+                "==" return if operator == TokenKind.EqEq
+                return "!="
+
+
+        def cpc_expr_is_string_literal(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Paren(cpc_sl_inner, cpc_sl_line):
+                    return cpc_expr_is_string_literal(cpc_sl_inner)
+                if expression is Expr.StringLit(cpc_sl_text):
+                    return true
+                if expression is Expr.GetElse(cpc_sl_guarded, cpc_sl_recovery, cpc_sl_gline):
+                    return false
+                return false
+
+
+        # Walk an expression, reporting ==/!= where one side is a raw reflection C string
+        # and the other is a string literal (also a raw pointer) or another such value.
+        def cpc_walk_expr(expression: Ast::Expr, binders: mutable darray[sview]&, cstr_locals: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Binary(cpc_left, cpc_operator, cpc_right, cpc_line):
+                        if cpc_operator == TokenKind.EqEq or cpc_operator == TokenKind.BangEq:
+                            left_raw: bool = cpc_is_raw_cstring(cpc_left, binders, cstr_locals)
+                            right_raw: bool = cpc_is_raw_cstring(cpc_right, binders, cstr_locals)
+                            hits: bool = (left_raw and (right_raw or cpc_expr_is_string_literal(cpc_right))) or (right_raw and cpc_expr_is_string_literal(cpc_left))
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.CStrPointerCompare, name: cpc_operator_text(cpc_operator), line: cpc_line, expected: "", actual: ""}) if hits
+                        table <- cpc_walk_expr(cpc_left, binders, cstr_locals, table)
+                        table <- cpc_walk_expr(cpc_right, binders, cstr_locals, table)
+                    Expr.Paren(cpc_w_inner, cpc_w_line):
+                        table <- cpc_walk_expr(cpc_w_inner, binders, cstr_locals, table)
+                    Expr.Unary(cpc_w_op, cpc_w_operand, cpc_w_uline):
+                        table <- cpc_walk_expr(cpc_w_operand, binders, cstr_locals, table)
+                    Expr.Call(cpc_w_callee, cpc_w_args, cpc_w_names, cpc_w_cline):
+                        for cpc_w_arg in cpc_w_args |binders, cstr_locals, table| -> table:
+                            table <- cpc_walk_expr(cpc_w_arg, binders, cstr_locals, table)
+                    Expr.GetElse(cpc_w_guarded, cpc_w_recovery, cpc_w_gline):
+                        table <- cpc_walk_expr(cpc_w_guarded, binders, cstr_locals, table)
+                    Expr.Refinement(cpc_w_refined, cpc_w_cond, cpc_w_rline):
+                        table <- cpc_walk_expr(cpc_w_refined, binders, cstr_locals, table)
+                        table <- cpc_walk_expr(cpc_w_cond, binders, cstr_locals, table)
+                    Expr.Comprehension(cpc_w_var, cpc_w_iterable, cpc_w_ccond, cpc_w_cbody, cpc_w_compline):
+                        # A reflection comprehension binds its variable for the condition.
+                        comp_binders: mutable darray[sview] = []
+                        for cpc_existing in binders |comp_binders|:
+                            comp_binders.push(cpc_existing)
+                        comp_binders.push(cpc_w_var) if cpc_reflection_callee(cpc_w_iterable) != ""
+                        table <- cpc_walk_expr(cpc_w_iterable, comp_binders, cstr_locals, table)
+                        table <- cpc_walk_expr(cpc_w_ccond, comp_binders, cstr_locals, table)
+                        table <- cpc_walk_expr(cpc_w_cbody, comp_binders, cstr_locals, table)
+                    _:
+                        pass
+
+
+        def cpc_walk_statements(statements: darray[Ast::Stmt], binders: mutable darray[sview]&, cstr_locals: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |binders, cstr_locals, table| -> table, binders, cstr_locals:
+                    match statement:
+                        Stmt.VarDecl(cpc_s_name, cpc_s_type, cpc_s_value, cpc_s_line):
+                            cstr_locals.push(cpc_s_name) if cpc_init_yields_cstring(cpc_s_value, 0)
+                            table <- cpc_walk_expr(cpc_s_value, binders, cstr_locals, table)
+                        Stmt.Assign(cpc_s_target, cpc_s_assign_operator, cpc_s_assign_value, cpc_s_aline):
+                            table <- cpc_walk_expr(cpc_s_assign_value, binders, cstr_locals, table)
+                        Stmt.Expr(cpc_s_expr, cpc_s_eline):
+                            table <- cpc_walk_expr(cpc_s_expr, binders, cstr_locals, table)
+                        Stmt.Return(cpc_s_ret, cpc_s_rline):
+                            if cpc_s_ret is cpc_s_ret_value:
+                                table <- cpc_walk_expr(cpc_s_ret_value, binders, cstr_locals, table)
+                        Stmt.If(cpc_s_cond, cpc_s_then, cpc_s_else, cpc_s_iline):
+                            table <- cpc_walk_expr(cpc_s_cond, binders, cstr_locals, table)
+                            table <- cpc_walk_statements(cpc_s_then, binders, cstr_locals, table)
+                            table <- cpc_walk_statements(cpc_s_else, binders, cstr_locals, table)
+                        Stmt.While(cpc_s_wcond, cpc_s_wbody, cpc_s_wline):
+                            table <- cpc_walk_expr(cpc_s_wcond, binders, cstr_locals, table)
+                            table <- cpc_walk_statements(cpc_s_wbody, binders, cstr_locals, table)
+                        Stmt.For(cpc_s_bind, cpc_s_vars, cpc_s_iterable, cpc_s_fbody, cpc_s_fline):
+                            is_reflection: bool = cpc_reflection_callee(cpc_s_iterable) != ""
+                            binders.push(cpc_s_vars[0]) if is_reflection and cpc_s_vars.count > 0
+                            table <- cpc_walk_expr(cpc_s_iterable, binders, cstr_locals, table)
+                            table <- cpc_walk_statements(cpc_s_fbody, binders, cstr_locals, table)
+                        Stmt.Block(cpc_s_kind, cpc_s_clause, cpc_s_binding, cpc_s_bbody, cpc_s_bline):
+                            table <- cpc_walk_statements(cpc_s_bbody, binders, cstr_locals, table)
+                        Stmt.Match(cpc_s_scrutinee, cpc_s_arms, cpc_s_mline):
+                            for cpc_s_arm in cpc_s_arms |binders, cstr_locals, table| -> table:
+                                table <- cpc_walk_statements(cpc_s_arm.body, binders, cstr_locals, table)
+                        _:
+                            pass
+
+
+        def check_cstr_pointer_compare_decls(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(cpc_fn_name, cpc_fn_params, cpc_fn_return, cpc_fn_body, cpc_fn_effects, cpc_fn_decorators, cpc_fn_line):
+                            fn_binders: mutable darray[sview] = []
+                            fn_cstr_locals: mutable darray[sview] = []
+                            table <- cpc_walk_statements(cpc_fn_body, fn_binders, fn_cstr_locals, table)
+                        Decl.Module(cpc_mod_name, cpc_mod_body, cpc_mod_line):
+                            table <- check_cstr_pointer_compare_decls(cpc_mod_body, table)
+                        Decl.Scoped(cpc_scoped_body, cpc_scoped_line):
+                            table <- check_cstr_pointer_compare_decls(cpc_scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_cstr_pointer_compare(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- check_cstr_pointer_compare_decls(declarations, table)
