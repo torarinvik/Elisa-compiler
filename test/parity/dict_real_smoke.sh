@@ -224,6 +224,41 @@ dict_case contains_remove 'def main() -> i64:
         hit <- hit + 2
     return hit' 42
 
+# A dict whose VALUE is an AGGREGATE (a multi-word struct), not a scalar. Every case above
+# uses integer values, so the aggregate-valued bucket path was untested — and that is the
+# shape the compiler's own SymbolTable.name_primary (`dict[u64, sview]`, a {ptr,len} pair)
+# uses. A wrong bucket STRIDE only corrupts the heap when the value is wider than a word.
+dict_case aggregate_value_put_get 'struct Pair:
+    a: i64
+    b: i64
+
+def main() -> i64:
+    d: mutable dict[i64, Pair] = {}
+    d.put(1, Pair{a: 20, b: 1})
+    d.put(2, Pair{a: 20, b: 1})
+    total: mutable i64 = 0
+    if d.get(1) is p:
+        total <- total + p.a + p.b
+    if d.get(2) is q:
+        total <- total + q.a + q.b
+    return total' 42
+
+# Same aggregate value, but enough entries to force GROW + REHASH: the rehash COPIES every
+# bucket, so a stride error corrupts memory here even when a single put happens to survive.
+dict_case aggregate_value_grow 'struct Pair:
+    a: i64
+    b: i64
+
+def main() -> i64:
+    d: mutable dict[i64, Pair] = {}
+    for i in 0..<24 |d|:
+        d.put(i, Pair{a: i, b: 1})
+    total: mutable i64 = 0
+    for i in 0..<24 |total, d|:
+        if d.get(i) is p:
+            total <- total + p.b
+    return total + 18' 42
+
 if [ "$pass" -eq "$total" ]; then
     echo "dict_real_smoke OK: $pass/$total real-std collections.elisa dict programs compile+run correctly"
 else
