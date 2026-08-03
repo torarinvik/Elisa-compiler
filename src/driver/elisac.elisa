@@ -686,7 +686,7 @@ def emit_ast_token_needs_space(kind: Lexer::TokenKind) -> bool can[Abort.Panic]:
 
 # Render tokens [from, to) of the declaration line with stage0's type spacing.
 def emit_ast_render_tokens(buffer: mutable darray[u8]&, tokens: darray[Lexer::Token]&, source: u8&, from_index: usize, to_index: usize) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-    for render_index in from_index..<to_index |buffer, tokens, source, from_index|:
+    for render_index in from_index..<to_index |buffer, tokens, source, from_index, to_index|:
         render_token: Lexer::Token = tokens[render_index]
         render_text: sview = Lexer::text_or_empty(render_token, source)
         # An error-UNION return renders as `V error[...]` — one space before `error`.
@@ -694,7 +694,15 @@ def emit_ast_render_tokens(buffer: mutable darray[u8]&, tokens: darray[Lexer::To
         emit_tokens_push_sview(buffer, render_text)
         if render_token.kind == Lexer::TokenKind.Comma:
             buffer.push(32)
+        elif render_token.kind == Lexer::TokenKind.Colon:
+            # A value-generic's annotation (`[T, N: usize]`) keeps stage0's `: ` gap —
+            # measured identically on the ast, iface, and fmt surfaces.
+            buffer.push(32)
         elif emit_ast_token_needs_space(render_token.kind):
+            buffer.push(32)
+        elif render_token.kind == Lexer::TokenKind.Ident and render_text == "permission" and render_index + 1 < to_index and tokens[render_index + 1].kind == Lexer::TokenKind.Ident:
+            # A permission generic parameter (`[A, R, permission P]`) — `permission` is an
+            # ordinary identifier to the lexer, so its keyword gap is text-decided.
             buffer.push(32)
 
 
@@ -836,11 +844,65 @@ def emit_ast_body_declares_container(statements: darray[Ast::Stmt]&, annotations
     return false
 
 
+# A method call that can ALLOCATE into its receiver — the growth sites stage0's region
+# inference keys on.
+def emit_ast_is_growth_method(name: sview) -> bool:
+    return name == "push" or name == "put" or name == "extend" or name == "insert" or name == "reserve" or name == "resize" or name == "append"
+
+
+# stage0's region inference is a BODY dataflow pass, not a signature-shape test: a
+# reference parameter earns an inferred region only when the body actually GROWS it
+# through an implicit allocation (`p.push(..)`, `p.f <- p.f.put(..)`). The std's
+# `arena_*` helpers take a container ref of exactly the inferring SHAPE but allocate
+# through an explicit arena — either by forwarding to an `arena_*` callee or inside an
+# `in a:` block — so stage0 infers nothing for them. This approximates the pass with the
+# two signals visible in the token stream: a growth call on the parameter's own chain,
+# and the absence of a statement-leading `in` block (an explicit allocation target) in
+# the same body.
+def emit_ast_param_grown_in_body(tokens: darray[Lexer::Token]&, source: u8&, line: u32, name: sview) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    header_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
+    false return if not header_range.found
+    body_depth: mutable i64 = 0
+    body_entered: mutable bool = false
+    body_done: mutable bool = false
+    body_grown: mutable bool = false
+    body_explicit: mutable bool = false
+    for grow_probe in header_range.stop..<tokens.count |body_depth, body_entered, body_done, body_grown, body_explicit, tokens, source, name|:
+        continue if body_done
+        grow_kind: Lexer::TokenKind = tokens[grow_probe].kind
+        if grow_kind == Lexer::TokenKind.Indent:
+            body_depth <- body_depth + 1
+            body_entered <- true
+        elif grow_kind == Lexer::TokenKind.Dedent:
+            body_depth <- body_depth - 1
+            body_done <- true if body_entered and body_depth <= 0
+        elif grow_kind == Lexer::TokenKind.In and grow_probe > 0:
+            # `for x in xs` also spells `in`; only a STATEMENT-LEADING `in a:` names an
+            # explicit allocation target.
+            lead_kind: Lexer::TokenKind = tokens[grow_probe - 1].kind
+            body_explicit <- true if lead_kind == Lexer::TokenKind.Indent or lead_kind == Lexer::TokenKind.Newline or lead_kind == Lexer::TokenKind.Dedent
+        elif grow_kind == Lexer::TokenKind.Ident and Lexer::text_or_empty(tokens[grow_probe], source) == name:
+            chain_index: mutable usize = grow_probe + 1
+            chain_scanning: mutable bool = true
+            while chain_scanning and chain_index + 2 < tokens.count |chain_index, chain_scanning, body_grown, tokens, source|:
+                if tokens[chain_index].kind != Lexer::TokenKind.Dot or tokens[chain_index + 1].kind != Lexer::TokenKind.Ident:
+                    chain_scanning <- false
+                else:
+                    chain_method: sview = Lexer::text_or_empty(tokens[chain_index + 1], source)
+                    if tokens[chain_index + 2].kind == Lexer::TokenKind.LParen and emit_ast_is_growth_method(chain_method):
+                        body_grown <- true
+                        chain_scanning <- false
+                    else:
+                        chain_index <- chain_index + 2
+    return body_grown and not body_explicit
+
+
 # stage0 prints the region params its inference ADDS: a def with no explicit generic
 # bracket whose parameter list contains a growable REFERENCE (`darray[..]&`, `dict&`)
 # renders as `def f[@__rg_<param>](...)`. Decided from the signature tokens: within the
 # parameter parens, a comma-separated segment that contains a container head AND a
-# trailing `&` contributes `@__rg_` + its first identifier (the parameter name).
+# trailing `&` contributes `@__rg_` + its first identifier (the parameter name) — gated
+# on that parameter actually being grown by the body.
 def emit_ast_inferred_region_params(buffer: mutable darray[u8]&, tokens: darray[Lexer::Token]&, source: u8&, line: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     line_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
     return if not line_range.found
@@ -853,20 +915,28 @@ def emit_ast_inferred_region_params(buffer: mutable darray[u8]&, tokens: darray[
     segment_has_amp: mutable bool = false
     segment_name: mutable sview = ""
     segment_named: mutable bool = false
-    for param_index in line_range.start..<line_range.stop |paren_depth, segment_has_container, segment_has_amp, segment_name, segment_named, emitted_any, buffer, tokens, source|:
+    segment_darray: mutable bool = false
+    for param_index in line_range.start..<line_range.stop |paren_depth, segment_has_container, segment_has_amp, segment_name, segment_named, segment_darray, emitted_any, buffer, tokens, source, line|:
         param_token: Lexer::Token = tokens[param_index]
         if param_token.kind == Lexer::TokenKind.LParen or param_token.kind == Lexer::TokenKind.LBracket:
             paren_depth <- paren_depth + 1
         elif param_token.kind == Lexer::TokenKind.RParen or param_token.kind == Lexer::TokenKind.RBracket:
             paren_depth <- paren_depth - 1
-            if paren_depth == 0 and segment_has_container and segment_has_amp and segment_named:
+            if paren_depth == 0 and segment_has_container and segment_has_amp and segment_named and emit_ast_param_grown_in_body(tokens, source, line, segment_name):
                 emit_tokens_push_sview(buffer, "[" if not emitted_any else ", ")
                 emit_tokens_push_sview(buffer, "@__rg_")
                 emit_tokens_push_sview(buffer, segment_name)
                 emitted_any <- true
+            if paren_depth == 0:
+                # PAST the parameter list: without this reset the RETURN type's own
+                # closing bracket re-emitted the last segment (`[@__rg_sb, @__rg_sb]`).
+                segment_has_container <- false
+                segment_has_amp <- false
+                segment_named <- false
+                segment_darray <- false
         elif paren_depth >= 1:
             if param_token.kind == Lexer::TokenKind.Comma and paren_depth == 1:
-                if segment_has_container and segment_has_amp and segment_named:
+                if segment_has_container and segment_has_amp and segment_named and emit_ast_param_grown_in_body(tokens, source, line, segment_name):
                     emit_tokens_push_sview(buffer, "[" if not emitted_any else ", ")
                     emit_tokens_push_sview(buffer, "@__rg_")
                     emit_tokens_push_sview(buffer, segment_name)
@@ -874,12 +944,20 @@ def emit_ast_inferred_region_params(buffer: mutable darray[u8]&, tokens: darray[
                 segment_has_container <- false
                 segment_has_amp <- false
                 segment_named <- false
+                segment_darray <- false
+            elif param_token.kind == Lexer::TokenKind.Comma and paren_depth >= 2 and segment_darray:
+                # A comma INSIDE a darray's bracket is an explicit shape argument
+                # (`darray[u8, shape_in]`) — the region is already named; stage0
+                # infers nothing for this parameter.
+                segment_has_container <- false
             elif param_token.kind == Lexer::TokenKind.Ident:
                 param_text: sview = Lexer::text_or_empty(param_token, source)
                 if not segment_named:
                     segment_name <- param_text
                     segment_named <- true
-                segment_has_container <- true if param_text == "darray" or param_text == "dict" or param_text == "set" or param_text == "dstr"
+                if param_text == "darray" or param_text == "dict" or param_text == "set" or param_text == "dstr":
+                    segment_has_container <- true
+                    segment_darray <- param_text == "darray"
             elif param_token.kind == Lexer::TokenKind.Ampersand:
                 segment_has_amp <- true
     emit_tokens_push_sview(buffer, "]") if emitted_any
@@ -1267,7 +1345,9 @@ def emit_iface_param_segment(buffer: mutable darray[u8]&, tokens: darray[Lexer::
         elif seg_token.kind == Lexer::TokenKind.Ampersand:
             amp_index <- seg_probe
             amp_found <- true
-    weave: bool = has_container and amp_found and param_named and not explicit_generics
+    # Same body-growth gate as the signature-prefix weaver: the shape alone over-fires on
+    # the std's explicit-arena helpers.
+    weave: bool = has_container and amp_found and param_named and not explicit_generics and emit_ast_param_grown_in_body(tokens, source, tokens[from_index].line, param_name)
     if weave:
         emit_iface_render_tokens(buffer, tokens, source, from_index, amp_index)
         emit_tokens_push_sview(buffer, " @__rg_")
