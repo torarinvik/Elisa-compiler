@@ -42,6 +42,17 @@ global mutable fmt_map_delta_probe: i64
 # same clause a second time. 0: nothing claimed (source lines are 1-based).
 global mutable fmt_can_claimed_line: u32
 
+# stage0 desugars `nursery workers(N):` in its PARSER and unparses the RESULT: a
+# `pool __nursery_pool_K(N):` scope around a synthesized TaskGroup, with every `submit`
+# in it collected by `task_group_add`. stage1 lowers `nursery` in the BACKEND instead, so
+# the text is reconstructed here. `fmt_nursery_counter` reproduces stage0's parse-time
+# counter (nursery blocks in source order); `fmt_nursery_active` is the K of the nursery
+# currently being rendered, 0 outside one — it is what tells a `submit` statement which
+# group and pool to name.
+global mutable fmt_nursery_counter: i64
+
+global mutable fmt_nursery_active: i64
+
 module FmtUnparse:
     public:
         def fmt_expr(buffer: mutable darray[u8]&, expression: Ast::Expr, tokens: darray[Lexer::Token]&, source: u8&) -> void:
@@ -87,28 +98,15 @@ module FmtUnparse:
                         fmt_quote(buffer, fmt_str_text)
                     Expr.If(fmt_tern_cond, fmt_tern_then, fmt_tern_else, fmt_tern_line):
                         # `(THEN if COND else ELSE)` — stage0 parenthesizes the whole form.
-                        # A BINARY then-operand keeps one extra layer: its source parens
-                        # were grammatically REQUIRED (`(a + b) if c else d` — bare, the
-                        # `if` would bind inside the sum), so the parser absorbed them and
-                        # stage0's ParenExpr still prints them.
+                        # Any FURTHER layer comes from a real `Expr.Paren` in the operand,
+                        # never from a rule here: `(a + b) if c else d` keeps its required
+                        # source parens as a node, and `lo + band if … else n` has none.
                         buffer.push(40)
-                        fmt_tern_then_wrap: mutable bool = false
-                        if fmt_tern_then is Expr.Binary(fmt_tt_l, fmt_tt_o, fmt_tt_r, fmt_tt_ln):
-                            fmt_tern_then_wrap <- true
-                        buffer.push(40) if fmt_tern_then_wrap
                         fmt_expr(buffer, fmt_tern_then, tokens, source)
-                        buffer.push(41) if fmt_tern_then_wrap
                         fmt_push(buffer, " if ")
                         fmt_expr(buffer, fmt_tern_cond, tokens, source)
                         fmt_push(buffer, " else ")
-                        # A NESTED ternary in else position keeps one extra layer too
-                        # (measured: `else ((1 if (rep != 0) else 2))`).
-                        fmt_tern_else_wrap: mutable bool = false
-                        if fmt_tern_else is Expr.If(fmt_te_c, fmt_te_t, fmt_te_e, fmt_te_l):
-                            fmt_tern_else_wrap <- true
-                        buffer.push(40) if fmt_tern_else_wrap
                         fmt_expr(buffer, fmt_tern_else, tokens, source)
-                        buffer.push(41) if fmt_tern_else_wrap
                         buffer.push(41)
                     Expr.Block(fmt_vb_stmts, fmt_vb_value, fmt_vb_captures, fmt_vb_line):
                         # A VALUE BLOCK (the parser's lowering for `get X else Y` in value
@@ -282,6 +280,26 @@ module FmtUnparse:
                             fmt_arr_first <- false
                             fmt_expr(buffer, fmt_arr_element, tokens, source)
                         buffer.push(93)
+                    Expr.SetLit(fmt_set_elements, fmt_set_line):
+                        buffer.push(123)
+                        fmt_set_first: mutable bool = true
+                        for fmt_set_element in fmt_set_elements |buffer, fmt_set_first, tokens, source|:
+                            fmt_push(buffer, ", ") if not fmt_set_first
+                            fmt_set_first <- false
+                            fmt_expr(buffer, fmt_set_element, tokens, source)
+                        buffer.push(125)
+                    Expr.DictLit(fmt_dict_entries, fmt_dict_line):
+                        # MEASURED: stage0 stores a brace dict as a ListLitExpr whose Keys
+                        # side-table its unparser never reads — `{1: 10, 2: 20}` prints as
+                        # `{10, 20}`, the VALUES alone. Reproduced, quirk and all; the empty
+                        # `{}` initializer (the shape the corpus exercises) agrees either way.
+                        buffer.push(123)
+                        fmt_dict_first: mutable bool = true
+                        for fmt_dict_entry in fmt_dict_entries |buffer, fmt_dict_first, tokens, source|:
+                            fmt_push(buffer, ", ") if not fmt_dict_first
+                            fmt_dict_first <- false
+                            fmt_expr(buffer, fmt_dict_entry.value, tokens, source)
+                        buffer.push(125)
                     Expr.Slice(fmt_sl_obj, fmt_sl_low, fmt_sl_high, fmt_sl_line):
                         # `s[low:high]` — open bounds print empty, no interior spaces.
                         fmt_expr(buffer, fmt_sl_obj, tokens, source)
@@ -609,9 +627,40 @@ module FmtUnparse:
                         # desugar as `if true:` over the loop. Handled before the plain
                         # expression print so it renders as lines, not `<expr>`.
                         if fmt_es_expr is Expr.Block(fmt_es_stmts, fmt_es_value, fmt_es_caps, fmt_es_bl):
+                            if fmt_es_stmts.count > 0:
+                                # A RESULT-carrying capture list (`for … |t| -> t:`) is
+                                # stage0's ExprBlock and prints `do:` with the result on
+                                # its own line; the plain capture list is an if-true
+                                # statement. MEASURED both ways on a two-loop probe.
+                                fmt_es_has_value: bool = not (fmt_es_value is Expr.Absent) and not (fmt_es_value is Expr.Invalid)
+                                fmt_indent(buffer, indent)
+                                fmt_push(buffer, "do:\n" if fmt_es_has_value else "if true:\n")
+                                fmt_stmts(buffer, fmt_es_stmts, indent + 4, tokens, source)
+                                if fmt_es_has_value:
+                                    fmt_indent(buffer, indent + 4)
+                                    fmt_expr(buffer, fmt_es_value, tokens, source)
+                                    buffer.push(10)
+                                return
                             fmt_indent(buffer, indent)
+                            # `submit CALL(arg)` inside a nursery: stage0's parser turned
+                            # it into the group-collecting `task_group_add(…,
+                            # pool_submit1(…))`. stage1 keeps a bare value-Block, so the
+                            # call is rebuilt here. Only the IMPLICIT form is a nursery
+                            # submission — `submit[pool] …` names its own pool.
+                            if fmt_nursery_active > 0 and fmt_line_is_implicit_submit(tokens, source, fmt_es_line):
+                                fmt_push(buffer, "task_group_add(__nursery_grp_")
+                                fmt_push_decimal(buffer, fmt_nursery_active)
+                                fmt_push(buffer, ".ref[TaskGroup&], pool_submit1(__nursery_pool_")
+                                fmt_push_decimal(buffer, fmt_nursery_active)
+                                fmt_push(buffer, ".ref[ThreadPool&], ")
+                                if fmt_es_value is Expr.Call(fmt_su_callee, fmt_su_args, fmt_su_names, fmt_su_cl):
+                                    fmt_expr(buffer, fmt_su_callee, tokens, source)
+                                    fmt_push(buffer, ", ")
+                                    fmt_expr(buffer, fmt_su_args[0], tokens, source) if fmt_su_args.count > 0
+                                fmt_push(buffer, "))")
+                                buffer.push(10)
+                                return
                             fmt_push(buffer, "if true:\n")
-                            fmt_stmts(buffer, fmt_es_stmts, indent + 4, tokens, source)
                             return
                         fmt_indent(buffer, indent)
                         # `pass` lowers to Stmt.Expr(Expr.Invalid) — print the keyword.
@@ -941,6 +990,46 @@ module FmtUnparse:
                             fmt_push(buffer, ":")
                             buffer.push(10)
                             fmt_stmts(buffer, fmt_bl_body, indent + 4, tokens, source)
+                        elif (fmt_bl_kind == "nursery" or fmt_bl_kind == "pool") and fmt_bl_body.count > 0:
+                            # Both print stage0's `pool NAME(WORKERS):` header. A NURSERY's
+                            # name and worker count are synthesized (`__nursery_pool_K`,
+                            # `perf_cores()` when the source omits `workers(…)`), and its
+                            # body is bracketed by the TaskGroup declaration and wait that
+                            # stage0's parser splices in.
+                            fmt_nu_is_nursery: bool = fmt_bl_kind == "nursery"
+                            fmt_nu_saved: i64 = fmt_nursery_active
+                            if fmt_nu_is_nursery:
+                                fmt_nursery_counter <- fmt_nursery_counter + 1
+                                fmt_nursery_active <- fmt_nursery_counter
+                            fmt_indent(buffer, indent)
+                            fmt_push(buffer, "pool ")
+                            if fmt_nu_is_nursery:
+                                fmt_push(buffer, "__nursery_pool_")
+                                fmt_push_decimal(buffer, fmt_nursery_active)
+                            else:
+                                fmt_push(buffer, fmt_bl_clause[0]) if fmt_bl_clause.count > 0
+                            buffer.push(40)
+                            # The clause's capacity entry is the SOURCE SPAN of the worker
+                            # expression, as the region arm's is.
+                            fmt_push(buffer, fmt_bl_clause[1]) if fmt_bl_clause.count > 1
+                            fmt_push(buffer, "perf_cores()") if fmt_bl_clause.count < 2 and fmt_nu_is_nursery
+                            buffer.push(41)
+                            fmt_push(buffer, ":")
+                            buffer.push(10)
+                            if fmt_nu_is_nursery:
+                                fmt_indent(buffer, indent + 4)
+                                fmt_push(buffer, "__nursery_grp_")
+                                fmt_push_decimal(buffer, fmt_nursery_active)
+                                fmt_push(buffer, ": mutable TaskGroup = task_group_new()")
+                                buffer.push(10)
+                            fmt_stmts(buffer, fmt_bl_body, indent + 4, tokens, source)
+                            if fmt_nu_is_nursery:
+                                fmt_indent(buffer, indent + 4)
+                                fmt_push(buffer, "task_group_wait_all(__nursery_grp_")
+                                fmt_push_decimal(buffer, fmt_nursery_active)
+                                fmt_push(buffer, ".ref[TaskGroup&])")
+                                buffer.push(10)
+                            fmt_nursery_active <- fmt_nu_saved
                         else:
                             fmt_indent(buffer, indent)
                             fmt_push(buffer, "<fmt-block-todo>")
@@ -1294,16 +1383,22 @@ module FmtUnparse:
                         fmt_push(buffer, fmt_us_targets[fmt_us_next])
                         fmt_push(buffer, "\n")
                         fmt_us_next <- fmt_us_next + 1
-                    # A static if/elif/else CHAIN prints contiguously: no blank line
-                    # between consecutive Scoped branches (measured on string_escapes).
-                    # Only CHAIN branches — an `impl` body is the same node, and stage0
-                    # blank-lines between consecutive impls.
+                    # A static if/elif/else CHAIN is ONE decl in stage0, so its branches
+                    # print contiguously — but stage1's parser splits them into separate
+                    # top-level Scoped decls. Suppress the separator only for a CHAIN
+                    # CONTINUATION (`static elif` / `static else`): a fresh `static if`
+                    # right after another chain is a new decl and keeps its blank line, as
+                    # does an `impl` body, which is the same node kind.
                     fmt_cur_scoped: mutable bool = false
+                    fmt_cur_continues: mutable bool = false
                     if fmt_declaration is Decl.Scoped(fmt_ff_body, fmt_ff_line):
                         fmt_ff_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, fmt_ff_line)
                         if fmt_ff_range.found:
                             fmt_cur_scoped <- tokens[fmt_ff_range.start].kind == Lexer::TokenKind.Static
-                    fmt_push(buffer, "\n") if not fmt_first_decl and not (fmt_prev_scoped and fmt_cur_scoped)
+                            if fmt_cur_scoped and fmt_ff_range.start + 1 < tokens.count:
+                                fmt_ff_second: Lexer::TokenKind = tokens[fmt_ff_range.start + 1].kind
+                                fmt_cur_continues <- fmt_ff_second == Lexer::TokenKind.Elif or fmt_ff_second == Lexer::TokenKind.Else
+                    fmt_push(buffer, "\n") if not fmt_first_decl and not (fmt_prev_scoped and fmt_cur_continues)
                     fmt_first_decl <- false
                     fmt_prev_scoped <- fmt_cur_scoped
                     fmt_decl(buffer, fmt_declaration, tokens, source, 0)
@@ -1635,6 +1730,17 @@ module FmtUnparse:
                 fmt_push(buffer, " can ")
                 emit_iface_render_tokens(buffer, tokens, source, can_index + 1, range.stop)
                 return true
+
+        # Does LINE open with `submit` and NO `[pool]` selector? The parser consumes both
+        # the keyword and the selector, so only the tokens still tell a nursery submission
+        # (which stage0 collects into the enclosing group) from an explicitly pooled one.
+        def fmt_line_is_implicit_submit(tokens: darray[Lexer::Token]&, source: u8&, line: u32) -> bool:
+            can Abort.Panic, Memory.Allocate:
+                range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
+                false return if not range.found or range.start >= tokens.count
+                false return if tokens[range.start].kind != Lexer::TokenKind.Ident
+                false return if Lexer::text_or_empty(tokens[range.start], source) != "submit"
+                return range.start + 1 >= tokens.count or tokens[range.start + 1].kind != Lexer::TokenKind.LBracket
 
         # Does LINE open with the `catch` keyword? (A catch handler and a `match` build
         # the same node; only the source spelling separates them.)
