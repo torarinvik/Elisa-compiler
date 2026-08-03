@@ -23,6 +23,12 @@ global mutable fmt_cast_cursor: i64
 # literal's `0x…` source text) scans this line's tokens for a value match.
 global mutable fmt_stmt_line: u32
 
+# stage0 wraps a region-less container-allocating function body in a synthesized region and
+# PRINTS it: `with arena __auto_<N> as :`. `N` is `pos.Offset` of the function's `def` token
+# in a buffer based at the resolved absolute source path, so it is
+# `fmt_abs_path_length + 9 + def_token.start` (MEASURED, see emit_source_abs_path_length).
+global mutable fmt_abs_path_length: i64
+
 module FmtUnparse:
     public:
         def fmt_expr(buffer: mutable darray[u8]&, expression: Ast::Expr, tokens: darray[Lexer::Token]&, source: u8&) -> void:
@@ -100,6 +106,18 @@ module FmtUnparse:
                         fmt_push(buffer, fmt_char_text)
                         buffer.push(39)
                     Expr.Binary(fmt_left, fmt_operator, fmt_right, fmt_bin_line):
+                        # `X is name` with a bare lowercase non-builtin identifier is
+                        # stage0's OptionalBindExpr (docs/80, peekIsBareBindingTarget), and
+                        # its formatExpr arm prints `let name = X` — PAREN-FREE, in every
+                        # position (if headers, ternary conditions).
+                        if fmt_operator == Lexer::TokenKind.Is:
+                            if fmt_right is Expr.Ident(fmt_ob_name, fmt_ob_line):
+                                if fmt_is_bare_binding_name(fmt_ob_name):
+                                    fmt_push(buffer, "let ")
+                                    fmt_push(buffer, fmt_ob_name)
+                                    fmt_push(buffer, " = ")
+                                    fmt_expr(buffer, fmt_left, tokens, source)
+                                    return
                         # A RANGE is stage0's MembershipRangeExpr — paren-free, and the
                         # deprecated bare `..` re-spells as `..=` (rangeOpName).
                         fmt_bin_is_range: bool = fmt_operator == Lexer::TokenKind.Range or fmt_operator == Lexer::TokenKind.RangeLt or fmt_operator == Lexer::TokenKind.RangeGt or fmt_operator == Lexer::TokenKind.RangeLe
@@ -880,6 +898,82 @@ module FmtUnparse:
                 for fmt_body_statement in statements |buffer, indent, tokens, source|:
                     fmt_stmt(buffer, fmt_body_statement, indent, tokens, source)
 
+        # stage0's peekIsBareBindingTarget name test: lowercase first byte, and not one of
+        # the builtin bare type names (`x is u8` stays a TYPE TEST).
+        def fmt_is_bare_binding_name(name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if sview_len(name) == 0
+                fmt_bb_first: u8 = sview_at(name, 0)
+                false return if fmt_bb_first < 97 or fmt_bb_first > 122
+                false return if name == "void" or name == "bool" or name == "char" or name == "int"
+                false return if name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "isize"
+                false return if name == "u8" or name == "u16" or name == "u32" or name == "u64" or name == "usize" or name == "uintptr"
+                false return if name == "f32" or name == "f64" or name == "cstr" or name == "dstr"
+                return true
+
+        # stage0's `maybeWrapFunctionBodyInAutoRegion`: a function that receives an `Arena`
+        # manages allocation itself and is left alone; otherwise a body declaring a
+        # region-less container earns the synthesized region.
+        def fmt_body_needs_auto_region(statements: darray[Ast::Stmt], line: u32, tokens: darray[Lexer::Token]&, source: u8&) -> bool:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                false return if fmt_abs_path_length == 0
+                fmt_ar_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
+                false return if not fmt_ar_range.found
+                for fmt_ar_probe in fmt_ar_range.start..<fmt_ar_range.stop |tokens, source|:
+                    if tokens[fmt_ar_probe].kind == Lexer::TokenKind.Ident:
+                        false return if Lexer::text_or_empty(tokens[fmt_ar_probe], source) == "Arena"
+                return fmt_declares_regionless_container(statements, tokens)
+
+        # A body statement declaring a container local with no `@region` on its line. The
+        # region annotations live in a File side table the decl walker does not carry, and
+        # a global `darray` side channel for them bus-errors (a container value in a global
+        # is the arena-identity hazard); the `@` is on the declaration LINE either way.
+        def fmt_declares_regionless_container(statements: darray[Ast::Stmt], tokens: darray[Lexer::Token]&) -> bool:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                for fmt_rc_statement in statements |tokens|:
+                    if fmt_rc_statement is Stmt.VarDecl(fmt_rc_name, fmt_rc_type, fmt_rc_value, fmt_rc_line):
+                        if emit_ast_expr_head_is_container(fmt_rc_type):
+                            true return if not fmt_line_has_region_marker(tokens, fmt_rc_line)
+                    if fmt_rc_statement is Stmt.If(fmt_rc_cond, fmt_rc_then, fmt_rc_else, fmt_rc_if_line):
+                        true return if fmt_declares_regionless_container(fmt_rc_then, tokens)
+                        true return if fmt_declares_regionless_container(fmt_rc_else, tokens)
+                    if fmt_rc_statement is Stmt.While(fmt_rc_wcond, fmt_rc_wbody, fmt_rc_wline):
+                        true return if fmt_declares_regionless_container(fmt_rc_wbody, tokens)
+                    if fmt_rc_statement is Stmt.For(fmt_rc_bind, fmt_rc_vars, fmt_rc_iter, fmt_rc_fbody, fmt_rc_fline):
+                        true return if fmt_declares_regionless_container(fmt_rc_fbody, tokens)
+                    if fmt_rc_statement is Stmt.Block(fmt_rc_kind, fmt_rc_clause, fmt_rc_binding, fmt_rc_bbody, fmt_rc_bline):
+                        true return if fmt_declares_regionless_container(fmt_rc_bbody, tokens)
+                return false
+
+        def fmt_line_has_region_marker(tokens: darray[Lexer::Token]&, line: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                fmt_rm_found: mutable bool = false
+                for fmt_rm_probe in 0..<tokens.count |fmt_rm_found, tokens, line|:
+                    continue if tokens[fmt_rm_probe].line != line
+                    fmt_rm_found <- true if tokens[fmt_rm_probe].kind == Lexer::TokenKind.At
+                return fmt_rm_found
+
+        # `__auto_<N>` — see the note on `fmt_abs_path_length`.
+        def fmt_auto_region_number(line: u32, tokens: darray[Lexer::Token]&) -> i64:
+            can Memory.Allocate, Abort.Panic:
+                fmt_an_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
+                0 return if not fmt_an_range.found
+                return fmt_abs_path_length + 9 + tokens[fmt_an_range.start].start.i64()
+
+        def fmt_push_decimal(buffer: mutable darray[u8]&, value: i64) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if value <= 0:
+                    buffer.push(48)
+                    return
+                fmt_pd_digits: mutable darray[u8] = []
+                fmt_pd_rest: mutable i64 = value
+                for _fmt_pd_step in 0..<20 |fmt_pd_digits, fmt_pd_rest|:
+                    break if fmt_pd_rest == 0
+                    fmt_pd_digits.push((48 + (fmt_pd_rest % 10)).u8())
+                    fmt_pd_rest <- fmt_pd_rest / 10
+                for fmt_pd_index in 0..<fmt_pd_digits.count |buffer, fmt_pd_digits|:
+                    buffer.push(fmt_pd_digits[fmt_pd_digits.count - 1.usize() - fmt_pd_index])
+
         def fmt_indent(buffer: mutable darray[u8]&, indent: i64) -> void:
             can Memory.Allocate, Abort.Panic:
                 for fmt_indent_index in 0..<indent |buffer|:
@@ -896,6 +990,7 @@ module FmtUnparse:
                 # markers `__using` / `__using_alias_target`); stage0 keeps them as real
                 # decls and prints `using TARGET` in line order among the others. Collect
                 # (target, line) in parse order — ascending lines — and interleave.
+                fmt_abs_path_length <- emit_source_abs_path_length()
                 fmt_us_targets: mutable darray[sview] = []
                 fmt_us_lines: mutable darray[u32] = []
                 for fmt_us_annotation in file.enum_annotations |fmt_us_targets, fmt_us_lines, file|:
@@ -952,6 +1047,16 @@ module FmtUnparse:
                     # params into the header (`def fill[@__rg_out](out: ... @__rg_out&)`).
                     emit_signature_line(buffer, "def ", fmt_fd_name, fmt_fd_line, tokens, source, indent, true)
                     fmt_push(buffer, "\n")
+                    # stage0's inference-by-default: a body that allocates a region-less
+                    # container, in a function that does NOT thread an allocator itself,
+                    # is wrapped in a synthesized lazy region and PRINTED as one.
+                    if fmt_body_needs_auto_region(fmt_fd_body, fmt_fd_line, tokens, source):
+                        fmt_indent(buffer, indent + 4)
+                        fmt_push(buffer, "with arena __auto_")
+                        fmt_push_decimal(buffer, fmt_auto_region_number(fmt_fd_line, tokens))
+                        fmt_push(buffer, " as :\n")
+                        fmt_stmts(buffer, fmt_fd_body, indent + 8, tokens, source)
+                        return
                     fmt_stmts(buffer, fmt_fd_body, indent + 4, tokens, source)
                     return
                 if declaration is Decl.Struct(fmt_sd_name, fmt_sd_members, fmt_sd_aff, fmt_sd_states, fmt_sd_derive, fmt_sd_inv, fmt_sd_line):

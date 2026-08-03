@@ -197,7 +197,13 @@ driver_env=()
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
 if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" ]]; then
-  driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
+  # `-emit fmt` additionally needs the RESOLVED absolute path: stage0 names its
+  # synthesized auto-regions `__auto_<pos.Offset>`, and that offset is measured from a
+  # buffer whose base is the absolute path (measured: N = len(abs path) + 9 + the `def`
+  # token's byte offset). ELISA_STAGE1_SRC stays as given — the tokens report prints it
+  # verbatim and is byte-parity held.
+  src_abs="$(cd -- "$(dirname -- "$src")" && pwd)/$(basename -- "$src")"
+  driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src" "ELISA_STAGE1_SRC_ABS=$src_abs")
   exec > "$out"
 fi
 # stdin protocol: output path line, then source
