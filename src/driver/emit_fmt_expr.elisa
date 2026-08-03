@@ -25,9 +25,10 @@ global mutable fmt_stmt_line: u32
 
 # stage0 wraps a region-less container-allocating function body in a synthesized region and
 # PRINTS it: `with arena __auto_<N> as :`. `N` is `pos.Offset` of the function's `def` token
-# in a buffer based at the resolved absolute source path, so it is
-# `fmt_abs_path_length + 9 + def_token.start` (MEASURED, see emit_source_abs_path_length).
-global mutable fmt_abs_path_length: i64
+# in stage0's directive-bearing include expansion — recovered as
+# `def_token.start + offset-map delta` (see emit_fmt_offset_delta). -1: no map supplied,
+# wrap rendering stays off (a direct driver invocation without the wrapper).
+global mutable fmt_map_delta_probe: i64
 
 module FmtUnparse:
     public:
@@ -916,7 +917,7 @@ module FmtUnparse:
         # region-less container earns the synthesized region.
         def fmt_body_needs_auto_region(statements: darray[Ast::Stmt], line: u32, tokens: darray[Lexer::Token]&, source: u8&) -> bool:
             can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
-                false return if fmt_abs_path_length == 0
+                false return if fmt_map_delta_probe < 0
                 fmt_ar_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
                 false return if not fmt_ar_range.found
                 for fmt_ar_probe in fmt_ar_range.start..<fmt_ar_range.stop |tokens, source|:
@@ -924,20 +925,53 @@ module FmtUnparse:
                         false return if Lexer::text_or_empty(tokens[fmt_ar_probe], source) == "Arena"
                 return fmt_declares_regionless_container(statements, tokens)
 
-        # A body statement declaring a container local with no `@region` on its line. The
-        # region annotations live in a File side table the decl walker does not carry, and
-        # a global `darray` side channel for them bus-errors (a container value in a global
-        # is the arena-identity hazard); the `@` is on the declaration LINE either way.
+        # An initializer that actually ALLOCATES a backing buffer — stage0's
+        # isAllocatingLiteral: a list literal or a builder comprehension (a quantifier's
+        # `body` is Absent and does not allocate). Dict/set literals are deliberately NOT
+        # here, matching stage0.
+        def fmt_value_is_allocating_literal(value: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if value is Expr.Array(fmt_av_elements, fmt_av_line):
+                    return true
+                if value is Expr.Comprehension(fmt_av_var, fmt_av_iter, fmt_av_cond, fmt_av_body, fmt_av_cline):
+                    return not (fmt_av_body is Expr.Absent)
+                if value is Expr.Paren(fmt_av_inner, fmt_av_pline):
+                    return fmt_value_is_allocating_literal(fmt_av_inner)
+                return false
+
+        # stage0's structLiteralAllocatesContainerArg: a construct whose field argument is
+        # itself an allocating literal (`Index{primary: {}, overflow: []}` — the []).
+        def fmt_construct_allocates_arg(value: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if value is Expr.Construct(fmt_ca_type, fmt_ca_fields, fmt_ca_line):
+                    for fmt_ca_field in fmt_ca_fields:
+                        true return if fmt_value_is_allocating_literal(fmt_ca_field.value)
+                return false
+
+        # A body statement declaring a container local with no `@region` on its line —
+        # stage0's per-statement wrap triggers (functionBodyNeedsAutoRegion's VarDecl arm
+        # + bodyForwardsConstructedStructLocal). The region annotations live in a File
+        # side table the decl walker does not carry, and a global `darray` side channel
+        # for them bus-errors (a container value in a global is the arena-identity
+        # hazard); the `@` is on the declaration LINE either way.
         def fmt_declares_regionless_container(statements: darray[Ast::Stmt], tokens: darray[Lexer::Token]&) -> bool:
             can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
-                for fmt_rc_statement in statements |tokens|:
+                for fmt_rc_statement in statements |tokens, statements|:
                     if fmt_rc_statement is Stmt.VarDecl(fmt_rc_name, fmt_rc_type, fmt_rc_value, fmt_rc_line):
-                        if emit_ast_expr_head_is_container(fmt_rc_type):
+                        if emit_ast_expr_head_is_container(fmt_rc_type) and fmt_value_is_allocating_literal(fmt_rc_value):
                             # A container REFERENCE binding (`h: darray[u32]& = f(s)`)
                             # allocates nothing — stage0 does not wrap for it. The `&`
                             # lives in the line's type span, not the head expr.
                             if not fmt_line_type_is_reference(tokens, fmt_rc_line):
                                 true return if not fmt_line_has_region_marker(tokens, fmt_rc_line)
+                        # A construct with an allocating-literal field arg allocates that
+                        # field region-lessly (`t: mutable Index = Index{overflow: []}`).
+                        true return if fmt_construct_allocates_arg(fmt_rc_value)
+                        # A struct-CONSTRUCTED local later forwarded to a call has its
+                        # container fields grown interprocedurally — stage0's
+                        # bodyForwardsConstructedStructLocal (top-level approximation).
+                        if fmt_rc_value is Expr.Construct(fmt_rc_ct, fmt_rc_cf, fmt_rc_cl):
+                            true return if fmt_body_forwards_local(statements, fmt_rc_name)
                     if fmt_rc_statement is Stmt.If(fmt_rc_cond, fmt_rc_then, fmt_rc_else, fmt_rc_if_line):
                         true return if fmt_declares_regionless_container(fmt_rc_then, tokens)
                         true return if fmt_declares_regionless_container(fmt_rc_else, tokens)
@@ -947,6 +981,33 @@ module FmtUnparse:
                         true return if fmt_declares_regionless_container(fmt_rc_fbody, tokens)
                     if fmt_rc_statement is Stmt.Block(fmt_rc_kind, fmt_rc_clause, fmt_rc_binding, fmt_rc_bbody, fmt_rc_bline):
                         true return if fmt_declares_regionless_container(fmt_rc_bbody, tokens)
+                return false
+
+        # Does any statement in the list pass NAME (bare or by `&`) as a call argument?
+        def fmt_body_forwards_local(statements: darray[Ast::Stmt], name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for fmt_fw_statement in statements |name|:
+                    if fmt_fw_statement is Stmt.Expr(fmt_fw_expression, fmt_fw_line):
+                        true return if fmt_expr_forwards_name(fmt_fw_expression, name)
+                    if fmt_fw_statement is Stmt.Return(fmt_fw_value, fmt_fw_rline):
+                        if fmt_fw_value is fmt_fw_returned:
+                            true return if fmt_expr_forwards_name(fmt_fw_returned, name)
+                    if fmt_fw_statement is Stmt.VarDecl(fmt_fw_n, fmt_fw_t, fmt_fw_v, fmt_fw_vline):
+                        true return if fmt_expr_forwards_name(fmt_fw_v, name)
+                    if fmt_fw_statement is Stmt.Assign(fmt_fw_tg, fmt_fw_op, fmt_fw_av, fmt_fw_aline):
+                        true return if fmt_expr_forwards_name(fmt_fw_av, name)
+                return false
+
+        def fmt_expr_forwards_name(expression: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if expression is Expr.Call(fmt_fn_callee, fmt_fn_args, fmt_fn_argnames, fmt_fn_line):
+                    for fmt_fn_argument in fmt_fn_args |name|:
+                        fmt_fn_inner: mutable Ast::Expr = fmt_fn_argument
+                        if fmt_fn_argument is Expr.Unary(fmt_fn_op, fmt_fn_operand, fmt_fn_uline):
+                            if fmt_fn_op == Lexer::TokenKind.Ampersand:
+                                fmt_fn_inner <- fmt_fn_operand
+                        if fmt_fn_inner is Expr.Ident(fmt_fn_in, fmt_fn_iline):
+                            true return if fmt_fn_in == name
                 return false
 
         # The declaration line's TYPE span (first depth-0 `:` to the depth-0 `=`, or line
@@ -980,12 +1041,14 @@ module FmtUnparse:
                     fmt_rm_found <- true if tokens[fmt_rm_probe].kind == Lexer::TokenKind.At
                 return fmt_rm_found
 
-        # `__auto_<N>` — see the note on `fmt_abs_path_length`.
+        # `__auto_<N>` — see the note on `fmt_map_delta_probe`.
         def fmt_auto_region_number(line: u32, tokens: darray[Lexer::Token]&) -> i64:
-            can Memory.Allocate, Abort.Panic:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
                 fmt_an_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
                 0 return if not fmt_an_range.found
-                return fmt_abs_path_length + 9 + tokens[fmt_an_range.start].start.i64()
+                fmt_an_start: i64 = tokens[fmt_an_range.start].start.i64()
+                fmt_an_delta: i64 = emit_fmt_offset_delta(fmt_an_start)
+                return fmt_an_start + (fmt_an_delta if fmt_an_delta >= 0 else 0)
 
         def fmt_push_decimal(buffer: mutable darray[u8]&, value: i64) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -1017,7 +1080,7 @@ module FmtUnparse:
                 # markers `__using` / `__using_alias_target`); stage0 keeps them as real
                 # decls and prints `using TARGET` in line order among the others. Collect
                 # (target, line) in parse order — ascending lines — and interleave.
-                fmt_abs_path_length <- emit_source_abs_path_length()
+                fmt_map_delta_probe <- emit_fmt_offset_delta(0)
                 fmt_us_targets: mutable darray[sview] = []
                 fmt_us_lines: mutable darray[u32] = []
                 for fmt_us_annotation in file.enum_annotations |fmt_us_targets, fmt_us_lines, file|:

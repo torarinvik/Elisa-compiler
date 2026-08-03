@@ -16,11 +16,33 @@ LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 STAGE0_BIN="${ELISACORE_BIN:-${HOME}/.elisac/elisac}"
 
 flatten_includes() {
-  python3 - "$1" <<'PY'
+  # Writes the flattened source to stdout. When $2 is given, also writes an OFFSET MAP
+  # there: stage0 expands includes into a buffer with `#line <n> <abs path>` directives
+  # spliced in (writeSourceWithIncludesWithOptionsActive), and its synthesized auto-region
+  # names are `__auto_<offset in THAT buffer>`. The map records, at each flat-buffer
+  # offset where the two buffers diverge, the byte DELTA (stage0 offset - flat offset), as
+  # ascending `flatoff:delta` pairs — the driver's fmt adds the covering delta to a token
+  # offset to recover stage0's number. Indented include directives (stage0 re-indents the
+  # spliced lines) are not modeled; this repo's includes are all at column 0.
+  python3 - "$1" "${2:-}" <<'PY'
 import re, pathlib, sys
 path = pathlib.Path(sys.argv[1]).resolve()
+map_path = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
 include_re = re.compile(r'^[ \t]*(?:#\s*)?include[ \t]+"([^"]+)"[ \t]*$')
 seen = set()
+entries: list[tuple[int, int]] = []
+pos = {"flat": 0, "s0": 0}
+
+def directive_len(line_num: int, abs_path: str) -> int:
+    # "#line %d %s\n"
+    return 6 + len(str(line_num)) + 1 + len(abs_path) + 1
+
+def mark() -> None:
+    delta = pos["s0"] - pos["flat"]
+    if entries and entries[-1][0] == pos["flat"]:
+        entries[-1] = (pos["flat"], delta)
+    else:
+        entries.append((pos["flat"], delta))
 
 def flatten(p: pathlib.Path, out: list[str], stack: list[pathlib.Path]) -> None:
     ap = p.resolve()
@@ -32,6 +54,9 @@ def flatten(p: pathlib.Path, out: list[str], stack: list[pathlib.Path]) -> None:
     stack.append(ap)
     text = p.read_text(encoding="utf-8")
     base = p.parent
+    pos["s0"] += directive_len(1, str(ap))
+    mark()
+    cur_line = 1
     for line in text.splitlines(keepends=True):
         m = include_re.match(line.rstrip("\n"))
         if m:
@@ -39,14 +64,26 @@ def flatten(p: pathlib.Path, out: list[str], stack: list[pathlib.Path]) -> None:
             inc = pathlib.Path(rel) if pathlib.Path(rel).is_absolute() else (base / rel)
             if not inc.exists():
                 raise SystemExit(f"missing include {rel!r} from {p}")
+            s0_before = pos["s0"]
             flatten(inc, out, stack)
+            # stage0's newline guard: the spliced content must end with '\n'.
+            if pos["s0"] == s0_before or (out and not out[-1].endswith("\n")):
+                pos["s0"] += 1
+            pos["s0"] += directive_len(cur_line + 1, str(ap))
+            mark()
         else:
             out.append(line)
+            pos["flat"] += len(line)
+            pos["s0"] += len(line)
+        cur_line += 1
     stack.pop()
 
 out: list[str] = []
 flatten(path, out, [])
 sys.stdout.write("".join(out))
+if map_path:
+    with open(map_path, "w") as f:
+        f.write(",".join(f"{o}:{d}" for o, d in entries))
 PY
 }
 
@@ -130,8 +167,8 @@ done
 [[ -f "$src" ]] || { echo "missing source: $src" >&2; exit 2; }
 
 flat="$(mktemp)"
-trap 'rm -f "$flat"' EXIT
-flatten_includes "$src" >"$flat"
+trap 'rm -f "$flat" "$flat.map"' EXIT
+flatten_includes "$src" "$flat.map" >"$flat"
 # Trusted-stdlib marker: stage0 skips the user-code-only passes (raw-concurrency surface
 # removal, region-tied return) for elisacore_std's OWN sources, deciding per FILE. stage1
 # cannot — flattening concatenates without line directives, so a declaration's origin is gone
@@ -197,13 +234,14 @@ driver_env=()
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
 if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" ]]; then
-  # `-emit fmt` additionally needs the RESOLVED absolute path: stage0 names its
-  # synthesized auto-regions `__auto_<pos.Offset>`, and that offset is measured from a
-  # buffer whose base is the absolute path (measured: N = len(abs path) + 9 + the `def`
-  # token's byte offset). ELISA_STAGE1_SRC stays as given — the tokens report prints it
-  # verbatim and is byte-parity held.
-  src_abs="$(cd -- "$(dirname -- "$src")" && pwd)/$(basename -- "$src")"
-  driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src" "ELISA_STAGE1_SRC_ABS=$src_abs")
+  # `-emit fmt` additionally needs the OFFSET MAP (see flatten_includes): stage0 names
+  # its synthesized auto-regions `__auto_<pos.Offset>` with offsets measured over its
+  # directive-bearing expansion. ELISA_STAGE1_SRC stays as given — the tokens report
+  # prints it verbatim and is byte-parity held.
+  driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
+  if [[ "$emit_mode" == "fmt" && -s "$flat.map" ]]; then
+    driver_env+=("ELISA_STAGE1_OFFSET_MAP=$(cat "$flat.map")")
+  fi
   exec > "$out"
 fi
 # stdin protocol: output path line, then source
