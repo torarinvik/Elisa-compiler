@@ -95,7 +95,8 @@ while [[ $# -gt 0 ]]; do
         llvm)   emit_mode="llvm" ;;
         exe)    emit_mode="exe" ;;
         tokens) emit_mode="tokens" ;;
-        *) echo "only -emit obj, -emit llvm, -emit exe and -emit tokens are supported" >&2; exit 2 ;;
+        ast)    emit_mode="ast" ;;
+        *) echo "only -emit obj, -emit llvm, -emit exe, -emit tokens and -emit ast are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -fnoalias)
@@ -154,8 +155,8 @@ driver_env=()
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
-if [[ "$emit_mode" == "tokens" ]]; then
-  driver_env+=("ELISA_STAGE1_EMIT=tokens" "ELISA_STAGE1_SRC=$src")
+if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" ]]; then
+  driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
   exec > "$out"
 fi
 # stdin protocol: output path line, then source

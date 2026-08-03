@@ -24,12 +24,14 @@ computed is not.
 stage0's driver exposes roughly thirty `-emit` modes plus native link/run, a debugger, a REPL
 and an SMT integration. stage1 implements `obj`. The rest are **not stage1 goals**:
 
-* **Presentation of existing analysis** — `ast`, `lowered`, `semantic`, `facts`,
+* **Presentation of existing analysis** — `lowered`, `semantic`, `facts`,
   `packed`, `progress`, `iface`, `deps`, `deps-json`, `doc`, `fmt`. These re-render data the
   compiler already has. Porting them adds no parity signal, and stage0 remains available to
-  produce them. (`tokens` IS now implemented — it is the cross-repo LEXER ORACLE, not mere
-  presentation: byte-identical to stage0's report including the canonical kind checksum,
-  held by `emit_tokens_parity_smoke.sh` in the gate.)
+  produce them. (`tokens` and `ast` ARE now implemented — they are the cross-repo LEXER and
+  PARSER oracles, not mere presentation: byte-identical to stage0's reports, held by
+  `emit_tokens_parity_smoke.sh` / `emit_ast_parity_smoke.sh` in the gate. The ast summary
+  even reproduces stage0's region-inference artifacts — the wrapped stmt count and the
+  inferred `[@__rg_*]` params — so it doubles as a check on those.)
 * **Alternate outputs** — `ir`, `bc`, `header`, `c-archive`, `c-bind-check`. The object path
   is the one the fixpoint and the corpus exercise. (`llvm` IS now implemented — it prints the
   same module the object path lowers, so it shares that parity rather than adding a surface.)
