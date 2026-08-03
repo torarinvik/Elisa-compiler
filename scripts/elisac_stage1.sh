@@ -91,10 +91,11 @@ while [[ $# -gt 0 ]]; do
       # link — linking is host tooling, and every harness in this repo already links this
       # exact way by hand).
       case "${2:-}" in
-        obj)  emit_mode="obj" ;;
-        llvm) emit_mode="llvm" ;;
-        exe)  emit_mode="exe" ;;
-        *) echo "only -emit obj, -emit llvm and -emit exe are supported" >&2; exit 2 ;;
+        obj)    emit_mode="obj" ;;
+        llvm)   emit_mode="llvm" ;;
+        exe)    emit_mode="exe" ;;
+        tokens) emit_mode="tokens" ;;
+        *) echo "only -emit obj, -emit llvm, -emit exe and -emit tokens are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -fnoalias)
@@ -151,6 +152,12 @@ fi
 driver_env=()
 [[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
+# `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
+# report names the ORIGINAL source path, which only the wrapper knows.
+if [[ "$emit_mode" == "tokens" ]]; then
+  driver_env+=("ELISA_STAGE1_EMIT=tokens" "ELISA_STAGE1_SRC=$src")
+  exec > "$out"
+fi
 # stdin protocol: output path line, then source
 if [[ "$noalias" == 1 && "$bounds_check" == 1 ]]; then
   { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" ELISACORE_NOALIAS_MUTABLE_REFS=1 ELISACORE_FORCE_BOUNDS_CHECK=1 "$BIN"
