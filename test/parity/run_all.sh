@@ -52,6 +52,7 @@ run_one "internal-suite differential (ratchet)" "$REPO_ROOT/test/parity/semantic
 run_one "optimisation pipeline answer parity" "$REPO_ROOT/test/parity/opt_pipeline_smoke.sh"
 run_one "-emit tokens byte parity" "$REPO_ROOT/test/parity/emit_tokens_parity_smoke.sh"
 run_one "-emit ast byte parity" "$REPO_ROOT/test/parity/emit_ast_parity_smoke.sh"
+run_one "-emit deps byte parity" "$REPO_ROOT/test/parity/emit_deps_parity_smoke.sh"
 # The only check that compares ANSWERS rather than acceptance: compile a corpus of real
 # programs with both compilers, RUN both, require the same exit code. Every other check
 # here would pass a stage1 that compiles everything and computes the wrong result — as it
