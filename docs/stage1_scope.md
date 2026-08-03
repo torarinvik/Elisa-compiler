@@ -25,7 +25,9 @@ stage0's driver exposes roughly thirty `-emit` modes plus native link/run, a deb
 and an SMT integration. stage1 implements `obj`. The rest are **not stage1 goals**:
 
 * **Presentation of existing analysis** — `lowered`, `semantic`, `facts`,
-  `packed`, `progress`, `iface`, `doc`, `fmt`. (`deps`/`deps-json` are ALSO implemented —
+  `packed`, `progress`, `doc`, `fmt`. (`iface` is ALSO implemented — the public-interface
+  rendering, byte-identical including stage0's inferred-region weave, held by
+  `emit_iface_parity_smoke.sh`.) (`deps`/`deps-json` are ALSO implemented —
   the resolved include closure, byte-identical to stage0 including on the compiler's own
   111-file graph, held by `emit_deps_parity_smoke.sh`.) These re-render data the
   compiler already has. Porting them adds no parity signal, and stage0 remains available to

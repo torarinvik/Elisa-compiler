@@ -96,9 +96,10 @@ while [[ $# -gt 0 ]]; do
         exe)    emit_mode="exe" ;;
         tokens) emit_mode="tokens" ;;
         ast)    emit_mode="ast" ;;
+        iface)  emit_mode="iface" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit exe, -emit tokens, -emit ast, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit exe, -emit tokens, -emit ast, -emit iface, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -fnoalias)
@@ -194,7 +195,7 @@ driver_env=()
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
-if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" ]]; then
+if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" ]]; then
   driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
   exec > "$out"
 fi
