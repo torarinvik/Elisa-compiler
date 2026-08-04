@@ -43,6 +43,32 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 RUN() { timeout 10 "$@" >/dev/null 2>&1 </dev/null; }
 COMPILE_TIMEOUT=60
 
+# Link an object into a runnable program. THREE recipes, tried in order, because the plain
+# one silently cost this check SIX programs — counted as "stage0 could not arbitrate" when
+# the truth was that the LINK LINE was wrong, and among them `emit_obj` and `emit_native`,
+# the compiler-driver programs, i.e. the most valuable answers in the corpus to compare.
+#
+#   1. object + runtime — the ordinary program.
+#   2. object ALONE — a program that INCLUDES the std defines the runtime itself, so adding
+#      the object duplicates every symbol ("duplicate symbol '_perm_arena'"). This is how
+#      test/parity/build_parse_report.sh has always linked parse_report.
+#   3. object + runtime + libLLVM — a program that drives the backend calls LLVM-C directly
+#      (`_LLVMAddFunction`, `_LLVMArrayType`, …), exactly as scripts/self_host_gen2.sh links.
+#
+# Both compilers go through this same function, so whichever recipe wins is the same for
+# each and the comparison stays fair.
+LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_LIBDIR="$("$LLVM_CONFIG" --libdir 2>/dev/null || true)"
+link_program() {
+    local out="$1" obj="$2"
+    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" >/dev/null 2>&1 && return 0
+    clang -Wl,-dead_strip -o "$out" "$obj" >/dev/null 2>&1 && return 0
+    [ -n "$LLVM_LIBDIR" ] || return 1
+    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" \
+        -L"$LLVM_LIBDIR" -lLLVM -Wl,-rpath,"$LLVM_LIBDIR" >/dev/null 2>&1 && return 0
+    return 1
+}
+
 # Programs with a TRIAGED intermittent stage1 failure. Each must have a recorded
 # reproducer; see memory/stage1-intermittent-segfault.md. Empty is the goal.
 #
@@ -89,7 +115,7 @@ while IFS= read -r src <&3; do
     if ! timeout "$COMPILE_TIMEOUT" "$ELISACORE_BIN" -emit obj -o "$WORK/$name.s0.o" "$src" >/dev/null 2>&1 </dev/null; then
         skipped=$((skipped + 1)); continue
     fi
-    if ! clang -Wl,-dead_strip -o "$WORK/$name.s0" "$WORK/$name.s0.o" "$RUNTIME_OBJ" >/dev/null 2>&1; then
+    if ! link_program "$WORK/$name.s0" "$WORK/$name.s0.o"; then
         skipped=$((skipped + 1)); continue
     fi
     RUN "$WORK/$name.s0"; s0_rc=$?
@@ -102,7 +128,7 @@ while IFS= read -r src <&3; do
             -o "$WORK/$name.s1.o" "$src" >/dev/null 2>&1 </dev/null; then
         declined=$((declined + 1)); echo "$name (compile)" >> "$WORK/declines.txt"; continue
     fi
-    if ! clang -Wl,-dead_strip -o "$WORK/$name.s1" "$WORK/$name.s1.o" "$RUNTIME_OBJ" >/dev/null 2>&1; then
+    if ! link_program "$WORK/$name.s1" "$WORK/$name.s1.o"; then
         declined=$((declined + 1)); echo "$name (link: a declined function was dropped)" >> "$WORK/declines.txt"; continue
     fi
     RUN "$WORK/$name.s1"; s1_rc=$?
@@ -190,6 +216,19 @@ fi
 
 # Ratchet. MISMATCH must be 0 — a wrong answer is never acceptable. DECLINED rides a
 # baseline that should only ever fall.
+#
+# The baseline is 2, and BOTH entries are named so it cannot drift into a dumping ground:
+#   regular_enum_values — the DELIBERATE policy decline (stage0 lowers a bare `x = v` to a
+#     shadowing declaration and compiles `while i < 3: i = i + 1` into an infinite loop;
+#     stage1 refuses). Recorded in docs and in memory/stage1-parity-status.
+#   emit_obj_debug_ir — a REAL stage1 bug, found the moment the link recipes below made
+#     this program arbitrable at all: any program that calls the std's `print` leaves an
+#     undefined `_print__unknown`. Call resolution tries the GENERIC `print[T: Str]` BEFORE
+#     the non-generic overloads (codegen_call.elisa: `generic_index_of` is checked above
+#     `lookup_function`), so an exact `def print(value: cstr)` never wins; the generic is
+#     then instantiated at cstr, its `T.__cast__(value)` body DECLINES, and the symbol is
+#     dropped. Reproduces in three lines — `print("hi")` with the std included. Lower this
+#     back to 1 when that lands.
 allowed_declines=0
 [ -f "$BASELINE" ] && allowed_declines="$(tr -d '[:space:]' < "$BASELINE")"
 
