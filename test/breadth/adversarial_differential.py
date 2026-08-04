@@ -362,9 +362,112 @@ def main() -> i64:
 GENERATORS += [gen_structs_enums, gen_control_flow, gen_refs_optionals]
 
 
+
+def gen_casts_arith():
+    """Casts and arithmetic at width boundaries — where a wrong answer is silent."""
+    for a, b in [(7, 3), (-7, 3), (7, -3), (-7, -3)]:
+        yield (f"divmod_{a}_{b}".replace("-", "n"), f"""
+def main() -> i64:
+    a: i64 = {a}
+    b: i64 = {b}
+    return ((a / b) * 7 + (a % b)) + 100
+""")
+    for t, v in [("u8", 200), ("u16", 40000), ("i8", -100), ("i32", -70000)]:
+        yield (f"cast_roundtrip_{t}", f"""
+def main() -> i64:
+    x: {t} = {v}
+    y: i64 = x.i64()
+    z: {t} = y.{t}()
+    return (z.i64() - x.i64()) + 50
+""")
+    yield ("shift_widths", """
+def main() -> i64:
+    a: u8 = 1
+    b: u8 = (a.i64() << 7).u8()
+    c: i64 = 1
+    return (b.i64() % 131) + ((c << 40) % 97)
+""")
+    yield ("unsigned_compare", """
+def main() -> i64:
+    a: u64 = 18446744073709551615.u64()
+    b: u64 = 1.u64()
+    return 30 if a > b else 7
+""")
+    yield ("bitops", """
+def main() -> i64:
+    a: i64 = 0b1011
+    b: i64 = 0b0110
+    return (a & b) * 100 + (a | b) * 10 + (a ^ b)
+""")
+
+def gen_strings():
+    """sview/cstr operations — content vs pointer comparison is a classic silent divergence."""
+    yield ("sview_eq_content", f"""
+include "{STD}"
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        a: sview = sview("hello", 0, 5)
+        b: sview = sview("hello", 0, 5)
+        c: sview = sview("world", 0, 5)
+        return (10 if a == b else 0) + (3 if a == c else 1)
+""")
+    yield ("sview_index_len", f"""
+include "{STD}"
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        s: sview = sview("abcd", 0, 4)
+        return s.count.i64() * 10 + (s[1] - 96).i64()
+""")
+
+def gen_generics_multi():
+    """Multi-parameter generics and repeated instantiation at different types."""
+    yield ("generic_two_params", """
+def pair_first[A, B](a: A, b: B) -> A:
+    return a
+
+def main() -> i64:
+    x: i64 = pair_first[i64, bool](7, true)
+    y: i64 = pair_first[i64, i64](3, 9)
+    return x * 10 + y
+""")
+    yield ("generic_same_fn_two_types", """
+def idy[T](x: T) -> T:
+    return x
+
+def main() -> i64:
+    a: i64 = idy(5)
+    b: u8 = idy(3.u8())
+    return a * 10 + b.i64()
+""")
+
+def gen_match_exhaustive():
+    """Match arms, guards, and fallthrough order."""
+    yield ("match_guard_order", """
+def classify(n: i64) -> i64:
+    return match n:
+        0: 1
+        1: 2
+        _: 3
+
+def main() -> i64:
+    return classify(0) + classify(1) * 10 + classify(9) * 100
+""")
+    yield ("match_bool", """
+def main() -> i64:
+    b: bool = true
+    return match b:
+        true: 4
+        false: 9
+""")
+
+GENERATORS += [gen_casts_arith, gen_strings, gen_generics_multi, gen_match_exhaustive]
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
-    results = {"MATCH": [], "MISMATCH": [], "DECLINE": [], "SKIP": []}
+    results = {"MATCH": [], "MISMATCH": [], "DECLINE": [], "PERMISSIVE": [], "SKIP": []}
     work = tempfile.mkdtemp()
     progs = []
     for g in GENERATORS:
@@ -378,7 +481,14 @@ def main():
         open(path, "w").write(src.lstrip("\n"))
         ok0, rc0 = build_and_run(path, d, "s0")
         if not ok0:
-            results["SKIP"].append((name, None, None)); continue
+            # stage0 REFUSED it. If stage1 builds and runs the same program, stage1 is more
+            # PERMISSIVE than the reference compiler — a real divergence, and one no census
+            # here can otherwise see: the decline census counts what stage1 REFUSES, never
+            # what it wrongly ACCEPTS. Reported separately from SKIP so the two are not
+            # conflated; a genuinely malformed generator program lands in SKIP.
+            ok1p, _ = build_and_run(path, d, "s1")
+            results["PERMISSIVE" if ok1p else "SKIP"].append((name, None, None))
+            continue
         # A CRASHING oracle cannot arbitrate. differential_corpus skips a stage0 timeout for
         # the same reason; a negative code is a signal (observed: -11 SIGSEGV on a program
         # returning a ref from a value function). Counting it as a mismatch cries wolf, and a
@@ -392,7 +502,7 @@ def main():
             results["MISMATCH"].append((name, rc0, rc1))
         else:
             results["MATCH"].append((name, rc0, rc1))
-    for k in ("MISMATCH", "DECLINE", "SKIP", "MATCH"):
+    for k in ("MISMATCH", "DECLINE", "PERMISSIVE", "SKIP", "MATCH"):
         for name, rc0, rc1 in results[k]:
             if k == "MATCH":
                 continue
@@ -400,7 +510,9 @@ def main():
             print(f"  {k:9s} {name}{extra}")
     print(f"\nadversarial: {len(progs)} programs — "
           f"{len(results['MATCH'])} match, {len(results['MISMATCH'])} MISMATCH, "
-          f"{len(results['DECLINE'])} declined, {len(results['SKIP'])} skipped")
+          f"{len(results['DECLINE'])} declined, "
+          f"{len(results['PERMISSIVE'])} PERMISSIVE (stage0 rejects, stage1 builds), "
+          f"{len(results['SKIP'])} skipped")
     print(f"work dir: {work}")
     return 1 if results["MISMATCH"] else 0
 
