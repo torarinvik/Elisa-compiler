@@ -38,11 +38,22 @@ echo "$out" | grep -q "operator requires integral operands" || fail "float modul
 out=$(printf 'def f(value: i64) -> i64:\n    return value %% 2\n' | "$RPT")
 echo "$out" | grep -q "operator requires integral operands" && fail "false positive on integer modulo: $out"
 
-# 7. fixed arrays require integral indexes.
+# 7. positional containers require integral indexes.
+# "got f64", not "got float": this assertion used to pin the FAMILY name, which is what
+# stage1 printed and stage0 never did — the smoke was holding a divergence in place.
+# Verified against the oracle on this exact program: stage0 prints "index must be
+# integral, got f64".
 out=$(printf 'def f(values: i32[4], idx: f64) -> i32:\n    return values[idx]\n' | "$RPT")
-echo "$out" | grep -q "index must be integral, got float" || fail "float array index not flagged: $out"
+echo "$out" | grep -q "index must be integral, got f64" || fail "float array index not flagged: $out"
 out=$(printf 'def f(values: i32[4], idx: i64) -> i32:\n    return values[idx]\n' | "$RPT")
 echo "$out" | grep -q "index must be integral" && fail "false positive on integer array index: $out"
+# darray is positional too and was silent here until the index walls were unified.
+out=$(printf 'def f(values: darray[i32], idx: f64) -> i32:\n    return values[idx]\n' | "$RPT")
+echo "$out" | grep -q "index must be integral, got f64" || fail "float darray index not flagged: $out"
+out=$(printf 'def f(values: darray[i32], idx: sview) -> i32:\n    return values[idx]\n' | "$RPT")
+echo "$out" | grep -q "index must be numeric, got sview" || fail "sview darray index not flagged: $out"
+out=$(printf 'def f(values: darray[i32], idx: i64) -> i32:\n    return values[idx]\n' | "$RPT")
+echo "$out" | grep -qE "index must be (integral|numeric)" && fail "false positive on integer darray index: $out"
 
 # 8. literal-zero for-range strides are rejected, nonzero strides are valid.
 out=$(printf 'def f() -> void:\n    for i in 0..<10..0:\n        pass\n' | "$RPT")
