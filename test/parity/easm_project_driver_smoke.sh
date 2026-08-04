@@ -8,6 +8,20 @@ if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ]; then
     exit 0
 fi
 mkdir -p "$ROOT/build"
+# FRESHNESS GUARD. Twenty other easm smokes invoke this script just to GET the driver, and
+# it rebuilt + relinked unconditionally each time: 5.4s measured idle, ~1.8 min per gate
+# run recomputing identical bytes, on a fixed output path that also made the suite
+# unparallelisable. Rebuild only when an input is newer than the binary.
+_ed_stale=""
+if [ -x "$ROOT/build/easm_project_driver" ]; then
+    for _ed_src in "$ROOT/test/breadth/easm_project_driver.elisa" "$ELISACORE_BIN"; do
+        [ -e "$_ed_src" ] && [ "$_ed_src" -nt "$ROOT/build/easm_project_driver" ] && _ed_stale=1
+    done
+    [ -z "$_ed_stale" ] && [ -n "$(find "$ROOT/src" -name '*.elisa' -newer "$ROOT/build/easm_project_driver" -print -quit 2>/dev/null)" ] && _ed_stale=1
+else
+    _ed_stale=1
+fi
+if [ -n "$_ed_stale" ]; then
 if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_project_driver.o" "$ROOT/test/breadth/easm_project_driver.elisa" 2>"$ROOT/build/easm_project_driver.log"; then
     echo "easm_project_driver_smoke FAILED: project driver did not compile"
     sed -n '1,30p' "$ROOT/build/easm_project_driver.log"
@@ -16,6 +30,7 @@ fi
 if ! clang -o "$ROOT/build/easm_project_driver" "$ROOT/build/easm_project_driver.o" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
     echo "easm_project_driver_smoke FAILED: project driver did not link"
     exit 1
+fi
 fi
 fixture="$ROOT/build/easm_project_driver_fixture"
 rm -rf "$fixture"
