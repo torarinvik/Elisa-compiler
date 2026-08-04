@@ -11,8 +11,14 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "ternary-cond smoke FAIL: $1" >&2; exit 1; }
 
 # 1. non-bool (int) ternary condition MUST be flagged.
+# "got i64", not "got int": stage0 names a TYPED operand by its declared spelling and only
+# a bare LITERAL by its family. This assertion used to pin the family name, which stage1
+# printed and stage0 never did — the smoke was holding the divergence in place.
 out=$(printf 'def f(n: i64) -> i64:\n    x: i64 = 1 if n else 2\n    return x\n' | "$RPT")
-echo "$out" | grep -q "ternary condition must be bool, got int" || fail "non-bool ternary cond not flagged: $out"
+echo "$out" | grep -q "ternary condition must be bool, got i64" || fail "non-bool ternary cond not flagged: $out"
+# The literal form still reports the FAMILY, matching stage0.
+out=$(printf 'def f() -> i64:\n    x: i64 = 1 if 3 else 2\n    return x\n' | "$RPT")
+echo "$out" | grep -q "ternary condition must be bool, got int" || fail "literal ternary cond not flagged: $out"
 
 # 2. a bool condition must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    x: i64 = 1 if n > 0 else 2\n    return x\n' | "$RPT")

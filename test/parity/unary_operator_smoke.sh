@@ -16,11 +16,13 @@ echo "$out" | grep -q "not operator requires bool operand" || fail "not-on-int n
 
 # 2. unary `-` on a bool operand MUST be flagged.
 out=$(printf 'def f(b: bool) -> i64:\n    x: i64 = -b\n    return x\n' | "$RPT")
-echo "$out" | grep -q "operator requires numeric operands" || fail "minus-on-bool not flagged: $out"
+# stage0 says "unary operator requires numeric operand" — SINGULAR, and with "unary".
+# This used to assert the BINARY wording, which stage0 never prints for a unary operator.
+echo "$out" | grep -q "unary operator requires numeric operand" || fail "minus-on-bool not flagged: $out"
 
 # 3. unary `~` on a string operand MUST be flagged.
 out=$(printf 'def f(s: sview) -> i64:\n    x: i64 = ~s\n    return x\n' | "$RPT")
-echo "$out" | grep -q "operator requires numeric operands" || fail "tilde-on-string not flagged: $out"
+echo "$out" | grep -q "unary operator requires numeric operand" || fail "tilde-on-string not flagged: $out"
 
 # 4. `not` on bool operand must NOT be flagged.
 out=$(printf 'def f(b: bool) -> bool:\n    return not b\n' | "$RPT")

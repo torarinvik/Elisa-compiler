@@ -261,7 +261,7 @@ EXPECTS=(
     "match arm guard must be bool, got i64"
     "operator requires numeric operands"
     "shift count is out of range for every integer width (valid range 0..63)"
-    "range bounds must be integral, got float"
+    "for loop range requires integral bounds, got f64 and int"
     "redundant arithmetic: the literal operand makes this operation a no-op or a constant"
     "redundant comparison to a boolean literal; use the value (or its negation) directly"
     "redundant continue at end of loop body"

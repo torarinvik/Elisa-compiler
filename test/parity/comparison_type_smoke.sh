@@ -11,13 +11,29 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "comparison-type smoke FAIL: $1" >&2; exit 1; }
 
-# 1. int == string MUST be flagged.
+# 1. int == string LITERAL must NOT be flagged. This assertion used to REQUIRE a
+# diagnostic here, enshrining a false positive: stage0 ACCEPTS `n == "s"` all the way
+# through `-emit obj` (the bare literal adapts to a byte comparison). It is not a general
+# string/number exemption — rows 1b and 1c below pin the two shapes stage0 does reject.
 out=$(printf 'def f(n: i64) -> bool:\n    return n == "s"\n' | "$RPT")
-echo "$out" | grep -q "cannot compare int and string" || fail "int==string not flagged: $out"
+echo "$out" | grep -q "cannot compare" && fail "false positive on int==string literal: $out"
 
-# 2. bool == int MUST be flagged.
+# 1b. a cstr VARIABLE against a number IS rejected by stage0 ("cannot compare i64 and cstr").
+out=$(printf 'def f(n: i64, s: cstr) -> bool:\n    return n == s\n' | "$RPT")
+echo "$out" | grep -q "cannot compare i64 and cstr" || fail "int==cstr var not flagged: $out"
+
+# 1c. a string literal against a BOOL is rejected too — the adaptation is numeric-only.
+out=$(printf 'def f(b: bool) -> bool:\n    return b == "s"\n' | "$RPT")
+echo "$out" | grep -q "cannot compare bool and static u8" || fail "bool==string literal not flagged: $out"
+
+# 2. bool == int MUST be flagged. "i64", not "int": stage0 names a TYPED operand by its
+# declared spelling and only a bare literal by its family.
 out=$(printf 'def f(b: bool, n: i64) -> bool:\n    return b == n\n' | "$RPT")
-echo "$out" | grep -q "cannot compare bool and int" || fail "bool==int not flagged: $out"
+echo "$out" | grep -q "cannot compare bool and i64" || fail "bool==int not flagged: $out"
+
+# 2b. the LITERAL form still reports the family, matching stage0.
+out=$(printf 'def f(b: bool) -> bool:\n    return b == 1\n' | "$RPT")
+echo "$out" | grep -q "cannot compare bool and int" || fail "bool==int literal not flagged: $out"
 
 # 3. int == int must NOT be flagged.
 out=$(printf 'def f(n: i64, m: i64) -> bool:\n    return n == m\n' | "$RPT")
