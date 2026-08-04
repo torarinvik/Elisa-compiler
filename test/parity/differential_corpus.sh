@@ -217,18 +217,15 @@ fi
 # Ratchet. MISMATCH must be 0 — a wrong answer is never acceptable. DECLINED rides a
 # baseline that should only ever fall.
 #
-# The baseline is 2, and BOTH entries are named so it cannot drift into a dumping ground:
-#   regular_enum_values — the DELIBERATE policy decline (stage0 lowers a bare `x = v` to a
-#     shadowing declaration and compiles `while i < 3: i = i + 1` into an infinite loop;
-#     stage1 refuses). Recorded in docs and in memory/stage1-parity-status.
-#   emit_obj_debug_ir — a REAL stage1 bug, found the moment the link recipes below made
-#     this program arbitrable at all: any program that calls the std's `print` leaves an
-#     undefined `_print__unknown`. Call resolution tries the GENERIC `print[T: Str]` BEFORE
-#     the non-generic overloads (codegen_call.elisa: `generic_index_of` is checked above
-#     `lookup_function`), so an exact `def print(value: cstr)` never wins; the generic is
-#     then instantiated at cstr, its `T.__cast__(value)` body DECLINES, and the symbol is
-#     dropped. Reproduces in three lines — `print("hi")` with the std included. Lower this
-#     back to 1 when that lands.
+# The baseline is 1, and that entry is NAMED so it cannot drift into a dumping ground:
+#   regular_enum_values — the DELIBERATE policy decline. stage0 lowers a bare `x = v` to a
+#     shadowing declaration, so `while i < 3: i = i + 1` compiles into an INFINITE LOOP with
+#     no diagnostic; stage1 refuses. Modelling it faithfully would recover one corpus program
+#     and reproduce the infinite loop. Recorded in docs/ and memory/stage1-parity-status.
+#
+# emit_obj_debug_ir was the other entry and is CLOSED: it needed three separate fixes, each
+# hidden behind the last — the exact-overload wrong answer (160e4c1), the const-enum extern
+# parameter (418be1a), and two externs sharing one C symbol being LLVM-uniquified.
 allowed_declines=0
 [ -f "$BASELINE" ] && allowed_declines="$(tr -d '[:space:]' < "$BASELINE")"
 
