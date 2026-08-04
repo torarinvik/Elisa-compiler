@@ -76,6 +76,65 @@ fi
 # a check that is sensitive to load.
 GATE_JOBS="${ELISA_GATE_JOBS:-6}"
 
+# ---------------------------------------------------------------- PROFILES
+# The full gate is ~11 minutes. That is the right cost before a COMMIT and the wrong cost
+# for a one-line iteration, so `--profile NAME` runs a targeted subset. Every profile prints
+# what it does NOT cover: a partial gate that reads like a full one is how a regression gets
+# waved through, and the whole point of this suite is that it must not cry wolf OR go quiet.
+#
+# Timings are MEASURED (see the slowest-checks table each run prints), not estimated.
+#
+# All timings below are MEASURED on this machine, not estimated. `fast` was 4m on its first
+# definition because resolve_smoke (130s) and scope_binding_smoke (66s) had been swept into
+# it — a profile called "fast" that is not fast will simply be avoided, so it was retrimmed.
+#
+#   emit       19s / 5 checks   the byte-parity emit oracles (tokens, ast, iface, fmt, deps)
+#   parser     24s / 8 checks   lexer + parser acceptance, and the token/ast oracles
+#   fast       44s / 16 checks  the emit oracles plus the genuinely cheap smokes
+#   semantic  257s / 11 checks  analyzer diffs, diagnostics corpus, breadth baseline
+#   backend     -  / codegen smokes + the gen3 fixpoint
+#   answers     -  / the differential corpus + driver acceptance
+#   easm        -  / the easm group (its own serial lane)
+#   full      ~11m / 141 checks  everything. The ONLY profile a commit may rely on.
+#
+# `answers` deserves its name: those two checks are the only ones in the entire suite that
+# compare what the compiler COMPUTES rather than what it accepts. Every other profile can be
+# fully green while stage1 silently returns a different number — which is exactly how the
+# overload and const-enum wrong answers survived a 141-check gate and a byte-identical
+# fixpoint. Treat a green partial profile as "I have not broken the obvious things", never
+# as "this is correct".
+GATE_PROFILE="${ELISA_GATE_PROFILE:-full}"
+if [[ "${1:-}" == "--profile" ]]; then GATE_PROFILE="$2"; shift 2; fi
+
+# name-glob patterns per profile; a check runs when its NAME matches any pattern
+profile_patterns() {
+  case "$1" in
+    fast)     echo 'emit_*_parity_smoke.sh unreachable_smoke.sh when_smoke.sh
+                    match_*_smoke.sh struct_*_smoke.sh namespace_*_smoke.sh
+                    slice_*_smoke.sh assign_target_smoke.sh' ;;
+    answers)  echo 'behavioural* driver_acceptance_smoke.sh differential*' ;;
+    backend)  echo 'backend_*_smoke.sh self_host_gen3_smoke.sh opt_pipeline_smoke.sh
+                    array_*_smoke.sh slice_*_smoke.sh struct_*_smoke.sh' ;;
+    parser)   echo 'lexer* parser* emit_tokens_parity_smoke.sh emit_ast_parity_smoke.sh' ;;
+    semantic) echo 'semantic* diagnostics* sema_smoke.sh resolve_smoke.sh internal-suite*
+                    diagnostic* unreachable_smoke.sh flow_strict_census_smoke.sh' ;;
+    emit)     echo 'emit_*_parity_smoke.sh' ;;
+    easm)     echo 'easm_*' ;;
+    *)        echo '*' ;;
+  esac
+}
+
+# Does NAME belong to the active profile?
+in_profile() {
+  [[ "$GATE_PROFILE" == full ]] && return 0
+  local pat
+  for pat in $(profile_patterns "$GATE_PROFILE"); do
+    # shellcheck disable=SC2053
+    [[ "$1" == $pat ]] && return 0
+  done
+  return 1
+}
+
 pass=0
 fail=0
 failed_names=()
@@ -121,7 +180,7 @@ HEAVY_FIRST=(
 
 # The named checks keep their descriptive labels; the glob keeps basenames, exactly as before.
 declare -a JOB_NAMES JOB_CMDS
-push() { JOB_NAMES+=("$1"); shift; JOB_CMDS+=("$(printf '%s\037' "$@")"); }
+push() { in_profile "$1" || return 0; JOB_NAMES+=("$1"); shift; JOB_CMDS+=("$(printf '%s\037' "$@")"); }
 
 push "behavioural differential corpus (ratchet)" "$REPO_ROOT/test/parity/differential_corpus.sh"
 push "self-hostable (0 unresolved / 132 files)" "$REPO_ROOT/test/parity/check_self_hostable.sh"
@@ -154,11 +213,11 @@ for smoke in "$REPO_ROOT"/test/parity/*_smoke.sh; do
   # one sequential job rather than competing for the same output paths.
   case "$(basename "$smoke")" in
     # Shared easm project driver (fixed output paths).
-    easm_*) serial_lane+=("$smoke"); continue ;;
+    easm_*) in_profile "$(basename "$smoke")" && serial_lane+=("$smoke"); continue ;;
     # These run stage0's `go test` oracle: concurrent runs share Go's build cache and the
     # fixed ELISA_*_PARITY_OUT paths, which is a race whatever this suite does.
     parser_reference_inventory_smoke.sh|semantic_reference_inventory_smoke.sh)
-        serial_lane+=("$smoke"); continue ;;
+        in_profile "$(basename "$smoke")" && serial_lane+=("$smoke"); continue ;;
   esac
   push "$(basename "$smoke")" "$smoke"
 done
@@ -173,6 +232,7 @@ if [[ ${#oracle_lane[@]} -gt 0 ]]; then
   {
     printf '#!/usr/bin/env bash\n'
     for i in "${!oracle_lane[@]}"; do
+      in_profile "${oracle_names[$i]}" || continue
       printf 'bash %q --exec-one %q %q %q\n' "$REPO_ROOT/test/parity/run_all.sh" "$resultdir" "${oracle_names[$i]}" "${oracle_lane[$i]}"
     done
     printf 'exit 0\n'
@@ -194,7 +254,12 @@ fi
 
 # Count CHECKS, not pool jobs: the two serial lanes are one job each but many checks.
 total_checks=$(( ${#JOB_NAMES[@]} + ${#serial_lane[@]} + ${#oracle_lane[@]} ))
-echo "stage1 parity gate — ${total_checks} checks, ${GATE_JOBS} at a time (2 serial lanes):"
+TOTAL_AVAILABLE=$(( $(ls "$REPO_ROOT"/test/parity/*_smoke.sh | wc -l) + 9 ))
+if [[ "$GATE_PROFILE" == full ]]; then
+  echo "stage1 parity gate — ${total_checks} checks, ${GATE_JOBS} at a time (2 serial lanes):"
+else
+  echo "stage1 parity gate [PROFILE: $GATE_PROFILE] — ${total_checks} of ${TOTAL_AVAILABLE} checks, ${GATE_JOBS} at a time:"
+fi
 
 # One NUL-delimited record per check: resultdir, name, then the command words. Records are
 # separated by a DOUBLE NUL. Built with -0 throughout because the repo path contains spaces.
@@ -254,7 +319,23 @@ fi
 rm -f "$timings_file"
 echo "----------------------------------------"
 if [[ $fail -eq 0 ]]; then
-  echo "stage1 parity gate OK: $pass checks passed"
+  if [[ "$GATE_PROFILE" == full ]]; then
+    echo "stage1 parity gate OK: $pass checks passed"
+  else
+    echo "stage1 parity gate [$GATE_PROFILE] OK: $pass checks passed — PARTIAL, not a commit gate"
+    case "$GATE_PROFILE" in
+      fast|parser|semantic|emit|easm)
+        echo "  NOT covered by this profile: the differential corpus and driver acceptance" >&2
+        echo "  (the only checks that compare COMPUTED ANSWERS) and the gen3 fixpoint." >&2
+        echo "  Run --profile full before committing." >&2 ;;
+      backend)
+        echo "  NOT covered: the differential corpus, driver acceptance, semantic diffs." >&2
+        echo "  Run --profile full before committing." >&2 ;;
+      answers)
+        echo "  NOT covered: every acceptance and byte-parity oracle." >&2
+        echo "  Run --profile full before committing." >&2 ;;
+    esac
+  fi
   exit 0
 fi
 echo "stage1 parity gate FAILED: $fail of $((pass + fail)) checks failed:"
