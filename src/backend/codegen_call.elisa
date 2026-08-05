@@ -3,6 +3,68 @@
 
 extend Backend:
     private:
+        # Build the `{ptr, i64 len}` aggregate for `sview(base, start, end)` — the exact
+        # semantics of the std constructor stage0 CALLS
+        # (elisacore_std/elisacore_runtime_strings.elisa:203):
+        #
+        #   src = value if value != null else ""
+        #   len = strlen(src)
+        #   lo  = min(start, len) if start > 0  else 0
+        #   hi  = min(end,   len) if end  >= 0  else len
+        #   hi  = lo if hi < lo
+        #   {src + lo, hi - lo}
+        #
+        # Emitting `{base + start, end - start}` instead — no strlen, no clamp, no null
+        # check — is a WRONG ANSWER at every boundary, and `end < 0` is not a corner case:
+        # `__cast__(value: u8&?) -> sview` IS `sview(value, 0, -1)`, so every `x.sview()`
+        # produced a view of length -1. An out-of-range span produced a view running off
+        # the end of the string.
+        #
+        # The strlen is not optional and not an optimization loss: it is the bound every
+        # clamp is measured against, and stage0 pays exactly the same call.
+        def emit_sview_from_parts(base: LLVMValueRef, start: LLVMValueRef, end: LLVMValueRef, sview_llvm: LLVMTypeRef, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            sview_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            sview_ptr: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            sview_zero: LLVMValueRef = LLVMConstInt(sview_i64, 0, 0)
+            # A NULL base reads as the empty string — never a strlen of address 0.
+            sview_empty: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, "", "sview.empty")
+            sview_null: LLVMValueRef = LLVMBuildICmp(builder, 32, base, LLVMConstNull(sview_ptr), "sview.base.null")
+            sview_src: LLVMValueRef = LLVMBuildSelect(builder, sview_null, sview_empty, base, "sview.src")
+            sview_len_params: mutable darray[LLVMTypeRef] = [sview_ptr]
+            sview_len_params_pointer: void& = (&sview_len_params[0]).cast[void&] can Unsafe.PointerCast
+            sview_len_fn_type: LLVMTypeRef = LLVMFunctionType(sview_i64, sview_len_params_pointer, 1, 0)
+            # libc `strlen`, not the runtime's `ctx_strlen`: the std's runtime_strlen is a
+            # null-guard around this exact call (the guard is the select above), and LLVM
+            # KNOWS this one — it carries readonly/willreturn, so a repeated strlen of the
+            # same buffer folds. That matters here: the lexer builds a view per token off
+            # one source pointer, and an opaque call would leave a full scan in each.
+            sview_len_fn: LLVMValueRef = declare_or_get_named(m, "strlen", sview_len_fn_type)
+            sview_len_args: mutable darray[LLVMValueRef] = [sview_src]
+            sview_len_args_pointer: void& = (&sview_len_args[0]).cast[void&] can Unsafe.PointerCast
+            sview_source_len: LLVMValueRef = LLVMBuildCall2(builder, sview_len_fn_type, sview_len_fn, sview_len_args_pointer, 1, "sview.srclen")
+            # `start > 0` is a SIGNED test; the bound test that follows it is UNSIGNED,
+            # matching the std, where both sides are usize by then.
+            sview_start_positive: LLVMValueRef = LLVMBuildICmp(builder, 38, start, sview_zero, "sview.start.pos")
+            sview_start_over: LLVMValueRef = LLVMBuildICmp(builder, 34, start, sview_source_len, "sview.start.over")
+            sview_start_clamped: LLVMValueRef = LLVMBuildSelect(builder, sview_start_over, sview_source_len, start, "sview.start.clamped")
+            sview_lo: LLVMValueRef = LLVMBuildSelect(builder, sview_start_positive, sview_start_clamped, sview_zero, "sview.lo")
+            # A NEGATIVE end means "to the end of the string".
+            sview_end_bounded: LLVMValueRef = LLVMBuildICmp(builder, 39, end, sview_zero, "sview.end.bounded")
+            sview_end_over: LLVMValueRef = LLVMBuildICmp(builder, 34, end, sview_source_len, "sview.end.over")
+            sview_end_clamped: LLVMValueRef = LLVMBuildSelect(builder, sview_end_over, sview_source_len, end, "sview.end.clamped")
+            sview_hi_raw: LLVMValueRef = LLVMBuildSelect(builder, sview_end_bounded, sview_end_clamped, sview_source_len, "sview.hi.raw")
+            # An INVERTED span is empty, never a negative length.
+            sview_hi_under: LLVMValueRef = LLVMBuildICmp(builder, 36, sview_hi_raw, sview_lo, "sview.hi.under")
+            sview_hi: LLVMValueRef = LLVMBuildSelect(builder, sview_hi_under, sview_lo, sview_hi_raw, "sview.hi")
+            sview_gep_indices: mutable darray[LLVMValueRef] = [sview_lo]
+            sview_gep_pointer: void& = (&sview_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+            sview_data: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), sview_src, sview_gep_pointer, 1, "sview.data")
+            sview_agg: mutable LLVMValueRef = LLVMGetUndef(sview_llvm)
+            sview_agg <- LLVMBuildInsertValue(builder, sview_agg, sview_data, 0, "sview.ins0")
+            sview_agg <- LLVMBuildInsertValue(builder, sview_agg, LLVMBuildSub(builder, sview_hi, sview_lo, "sview.len"), 1, "sview.ins1")
+            return sview_agg
+
+
         def emit_call(callee: Expr, arguments: darray[Expr]&, argument_names: darray[sview], local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # `f[i64](x)` — an EXPLICIT type argument makes the callee an Index, not an
             # Ident; the bracket holds a TYPE, so it resolves as an annotation.
@@ -92,14 +154,7 @@ extend Backend:
                     if sview_base_ok:
                         if emit_expression(arguments[1], ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_start:
                             if emit_expression(arguments[2], ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_end:
-                                sview_len_val: LLVMValueRef = LLVMBuildSub(builder, sview_end, sview_start, "sview.len")
-                                sview_gep_indices: mutable darray[LLVMValueRef] = [sview_start]
-                                sview_gep_ptr: void& = (&sview_gep_indices[0]).cast[void&] can Unsafe.PointerCast
-                                sview_data: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), sview_base, sview_gep_ptr, 1, "sview.data")
-                                sview_agg: mutable LLVMValueRef = LLVMGetUndef(sview_llvm)
-                                sview_agg <- LLVMBuildInsertValue(builder, sview_agg, sview_data, 0, "sview.ins0")
-                                sview_agg <- LLVMBuildInsertValue(builder, sview_agg, sview_len_val, 1, "sview.ins1")
-                                return sview_agg
+                                return emit_sview_from_parts(sview_base, sview_start, sview_end, sview_llvm, m, ctx, builder)
                             return null
                         return null
                     return null
