@@ -3,7 +3,7 @@
 # pipeline (they were rejected outright while `default<O2>` trapped on large self-host
 # modules — those traps were the opaque-handle `==` and arena-identity miscompiles in the
 # self-hosted binary, fixed 2026-08-02/03). This smoke compiles every runnable repro
-# fixture at -O0 and -O2 and demands the SAME exit code from both; -O2 must also match the
+# fixture at -O0, -O2 AND -O3 and demands the SAME exit code from all three; -O2 must also match the
 # recorded -O0 answer, so a pipeline that "fixes" a latent miscompile by optimising it away
 # still fails loudly.
 #
@@ -42,6 +42,22 @@ for src in "$ROOT"/test/repro/*.elisa; do
         echo "  FAIL $name: -O0 exit $rc0, -O2 exit $rc2"
         failed=$((failed + 1))
     fi
+    # -O3 as well. It is NOT a duplicate of -O2: its CGSCC pipeline adds passes -O2 never
+    # runs (ArgumentPromotion among them), and one of those rewrites call arguments from the
+    # callee's REAL signature. A synthesized call built with the wrong ARITY is undefined
+    # rather than invalid under opaque pointers, so `opt -passes=verify` reads it as clean --
+    # the set membership helper was called with 2 arguments where its instantiation declared
+    # 3, and only -O3 ever noticed, by dying with SIGBUS.
+    if ! bash "$ROOT/scripts/elisac_stage1.sh" -O3 -o "$WORK/$name.o3.o" "$src" >/dev/null 2>&1; then
+        echo "  FAIL $name: -O3 compile failed where -O0 succeeded"
+        failed=$((failed + 1)); continue
+    fi
+    clang -Wl,-dead_strip -o "$WORK/$name.o3" "$WORK/$name.o3.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O3 link"; failed=$((failed + 1)); continue; }
+    timeout 10 "$WORK/$name.o3" >/dev/null 2>&1 </dev/null; rc3=$?
+    if [ "$rc0" != "$rc3" ]; then
+        echo "  FAIL $name: -O0 exit $rc0, -O3 exit $rc3"
+        failed=$((failed + 1))
+    fi
 done
 
 # -emit llvm: one fixture, textual IR out, must contain main and round-trip through clang.
@@ -73,4 +89,4 @@ if [ "$failed" -gt 0 ]; then
     echo "opt_pipeline FAILED: $failed failures over $checked fixtures"
     exit 1
 fi
-echo "opt_pipeline OK: $checked fixtures agree at -O0 and -O2; -emit llvm round-trips"
+echo "opt_pipeline OK: $checked fixtures agree at -O0, -O2 and -O3; -emit llvm round-trips"
