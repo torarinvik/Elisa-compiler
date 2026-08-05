@@ -272,6 +272,21 @@ extend Backend:
             return -1
 
 
+        # Which payload field types a tagged-union variant may carry. A scalar always;
+        # a STRUCT only as the SOLE field of its variant, because a single payload is
+        # stored and re-loaded AT ITS OWN LLVM TYPE (`store %S`, `load %S`) exactly as
+        # stage0 does, while a multi-field variant packs its fields into a tuple whose
+        # element extraction is modeled for scalars only.
+        #
+        # The blob EXTENT a struct payload needs is not known here — struct bodies are
+        # filled in a later pass — so registration records the provisional field-count
+        # extent and finalize_payload_enum_words below corrects it (and unregisters the
+        # enum if the payload turns out not to be sizeable).
+        def payload_variant_field_ok(field_type: ValueType, is_sole_field: bool) -> bool:
+            true return if is_numeric_type(field_type) or field_type.kind == TypeKind.Bool
+            return is_sole_field and field_type.kind == TypeKind.Struct
+
+
         def register_payload_variant_rows(variants: darray[Ast::EnumVariant]&, declined: mutable bool&, widest: mutable u32&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             for variant in variants |structs, declined, widest|:
                 # Each scalar field occupies one i64 slot of the `[N x i64]` blob, so the
@@ -280,16 +295,15 @@ extend Backend:
                 payload: mutable ValueType = unmodeled_type()
                 if variant.fields.count == 1:
                     payload <- annotation_value_type(variant.fields[0], structs)
-                    # Only a scalar payload: it must fit the `[N x i64]` slot and be read
-                    # back by a plain load at the payload pointer.
-                    declined <- true if not is_numeric_type(payload) and payload.kind != TypeKind.Bool
+                    declined <- true if not payload_variant_field_ok(payload, true)
                 field_name: mutable sview = ""
                 field_name <- variant.field_names[0] if variant.field_names.count == 1
                 # Flat per-field pools (used by the COUNT>1 tuple path; harmless for others).
                 field_span_start: usize = structs.penum_field_types.count
-                for field_index in 0..<variant.fields.count |structs, declined, variant|:
+                sole_field: bool = variant.fields.count == 1
+                for field_index in 0..<variant.fields.count |structs, declined, variant, sole_field|:
                     field_type: ValueType = annotation_value_type(variant.fields[field_index], structs)
-                    declined <- true if not is_numeric_type(field_type) and field_type.kind != TypeKind.Bool
+                    declined <- true if not payload_variant_field_ok(field_type, sole_field)
                     structs.penum_field_types <- structs.penum_field_types.push(field_type)
                     flat_name: mutable sview = ""
                     flat_name <- variant.field_names[field_index] if field_index < variant.field_names.count
@@ -311,13 +325,14 @@ extend Backend:
                 payload: mutable ValueType = unmodeled_type()
                 if field_count == 1:
                     payload <- annotation_value_type(variant_fields[field_start], structs)
-                    declined <- true if not is_numeric_type(payload) and payload.kind != TypeKind.Bool
+                    declined <- true if not payload_variant_field_ok(payload, true)
                 field_name: mutable sview = ""
                 field_name <- variant_field_names[field_start] if field_count == 1
                 field_span_start: usize = structs.penum_field_types.count
-                for field_index in 0..<field_count |structs, declined, variant_fields, variant_field_names, field_start|:
+                sole_field: bool = field_count == 1
+                for field_index in 0..<field_count |structs, declined, variant_fields, variant_field_names, field_start, sole_field|:
                     field_type: ValueType = annotation_value_type(variant_fields[field_start + field_index], structs)
-                    declined <- true if not is_numeric_type(field_type) and field_type.kind != TypeKind.Bool
+                    declined <- true if not payload_variant_field_ok(field_type, sole_field)
                     structs.penum_field_types <- structs.penum_field_types.push(field_type)
                     structs.penum_field_flat_names <- structs.penum_field_flat_names.push(variant_field_names[field_start + field_index])
                 structs.penum_field_type_start <- structs.penum_field_type_start.push(field_span_start)
@@ -415,6 +430,44 @@ extend Backend:
         def register_payload_enums_from_metadata(file: Ast::File&, packed_names: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             for enum_index in 0..<file.payload_enum_names.count |file, packed_names, structs|:
                 register_payload_enum_decl_flat(file.payload_enum_names[enum_index], file.payload_enum_variant_names, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.payload_enum_variant_field_counts, file.payload_enum_variant_starts[enum_index], file.payload_enum_variant_counts[enum_index], file.payload_enum_is_const[enum_index], packed_names, structs)
+
+
+        # Correct every payload enum's `[N x i64]` extent now that struct BODIES exist.
+        #
+        # Registration runs before set_struct_bodies_from_metadata (a struct field may name a
+        # payload enum, so the enums have to exist first), which means a STRUCT payload's size
+        # is unknowable at the point the enum is registered. Registration records the
+        # field-count extent as a placeholder; this pass replaces it with the real
+        # `ceil(sizeof(payload) / 8)`.
+        #
+        # The extent may only GROW here. The scalar paths were measured against stage0 and are
+        # already correct-or-generous, and shrinking one would push a tuple past the end of the
+        # blob. A struct payload that cannot be sized at all UNREGISTERS its enum: leaving it
+        # registered with the placeholder would store a 16-byte payload into an 8-byte slot.
+        def finalize_payload_enum_words(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for enum_slot in 0..<structs.penum_names.count |structs|:
+                variant_start: usize = structs.penum_variant_start[enum_slot]
+                variant_count: usize = structs.penum_variant_count[enum_slot]
+                widest: mutable u32 = structs.penum_payload_words[enum_slot]
+                unsizeable: mutable bool = false
+                for variant_offset in 0..<variant_count |structs, widest, unsizeable, variant_start|:
+                    variant_slot: usize = variant_start + variant_offset
+                    continue if not structs.penum_has_payload[variant_slot]
+                    payload_type: ValueType = copied_type(structs.penum_payloads[variant_slot])
+                    continue if payload_type.kind != TypeKind.Struct
+                    payload_words: u32 = payload_type_words(payload_type, structs)
+                    if payload_words == 0:
+                        unsizeable <- true
+                    elif payload_words > widest:
+                        widest <- payload_words
+                # Unregister by BLANKING the name rather than compacting the pools: every
+                # penum_* pool is index-parallel and three of them are indexed through
+                # penum_variant_start, so removing a row would have to renumber the variant
+                # spans too. penum_index_of matches by name and no enum is named "", so a
+                # blanked row is unreachable — and rewriting one field in place keeps this
+                # allocation-free (rebuilding the pools made them escape the inferred region).
+                structs.penum_names[enum_slot] <- "" if unsizeable
+                structs.penum_payload_words[enum_slot] <- widest if not unsizeable
 
 
         # Register fieldless enums from parser side tables. Payload-bearing enums are handled
