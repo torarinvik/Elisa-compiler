@@ -284,7 +284,7 @@ extend Backend:
         # enum if the payload turns out not to be sizeable).
         def payload_variant_field_ok(field_type: ValueType, is_sole_field: bool) -> bool:
             true return if is_numeric_type(field_type) or field_type.kind == TypeKind.Bool
-            return is_sole_field and field_type.kind == TypeKind.Struct
+            return is_sole_field and (field_type.kind == TypeKind.Struct or field_type.kind == TypeKind.PayloadEnum)
 
 
         def register_payload_variant_rows(variants: darray[Ast::EnumVariant]&, declined: mutable bool&, widest: mutable u32&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
@@ -427,9 +427,23 @@ extend Backend:
         # is the recursive AST itself, while the enum payload rows are ordinary side-table
         # data that the stage1 backend can traverse without requiring a recursive value
         # representation just to discover the layout.
+        # REPEATED while it makes progress. One enum's payload may BE another payload enum,
+        # and a single ordered pass only resolves that when the inner one is declared first:
+        # `Holder.Defers(inner: Late)` with `Late` declared below it left the field Unmodeled,
+        # which declined Holder outright. Each round registers whatever became resolvable in
+        # the previous one, so declaration order stops mattering. A chain is at most as long
+        # as the enum count, and the loop stops the first round that registers nothing.
         def register_payload_enums_from_metadata(file: Ast::File&, packed_names: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
-            for enum_index in 0..<file.payload_enum_names.count |file, packed_names, structs|:
-                register_payload_enum_decl_flat(file.payload_enum_names[enum_index], file.payload_enum_variant_names, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.payload_enum_variant_field_counts, file.payload_enum_variant_starts[enum_index], file.payload_enum_variant_counts[enum_index], file.payload_enum_is_const[enum_index], packed_names, structs)
+            round_index: mutable usize = 0
+            registered: mutable usize = 0
+            progressed: mutable bool = true
+            while progressed and round_index <= file.payload_enum_names.count |round_index, registered, progressed, file, packed_names, structs|:
+                round_index <- round_index + 1
+                for enum_index in 0..<file.payload_enum_names.count |file, packed_names, structs|:
+                    continue if penum_index_of(structs, file.payload_enum_names[enum_index]) >= 0
+                    register_payload_enum_decl_flat(file.payload_enum_names[enum_index], file.payload_enum_variant_names, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.payload_enum_variant_field_counts, file.payload_enum_variant_starts[enum_index], file.payload_enum_variant_counts[enum_index], file.payload_enum_is_const[enum_index], packed_names, structs)
+                progressed <- structs.penum_names.count > registered
+                registered <- structs.penum_names.count
 
 
         # Correct every payload enum's `[N x i64]` extent now that struct BODIES exist.
@@ -442,32 +456,53 @@ extend Backend:
         #
         # The extent may only GROW here. The scalar paths were measured against stage0 and are
         # already correct-or-generous, and shrinking one would push a tuple past the end of the
-        # blob. A struct payload that cannot be sized at all UNREGISTERS its enum: leaving it
+        # blob. A payload that cannot be sized at all UNREGISTERS its enum: leaving it
         # registered with the placeholder would store a 16-byte payload into an 8-byte slot.
+        #
+        # ITERATED to a fixpoint. A payload enum may carry ANOTHER payload enum, whose own
+        # extent this pass is what settles — `Outer.Wrap(i: Inner)` cannot be sized until
+        # Inner is, and declaration order does not guarantee Inner was visited first. A chain
+        # is at most as long as the enum count, so that bounds the rounds; the loop stops as
+        # soon as a round changes nothing, which is the usual single extra round.
         def finalize_payload_enum_words(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
-            for enum_slot in 0..<structs.penum_names.count |structs|:
-                variant_start: usize = structs.penum_variant_start[enum_slot]
-                variant_count: usize = structs.penum_variant_count[enum_slot]
-                widest: mutable u32 = structs.penum_payload_words[enum_slot]
-                unsizeable: mutable bool = false
-                for variant_offset in 0..<variant_count |structs, widest, unsizeable, variant_start|:
-                    variant_slot: usize = variant_start + variant_offset
-                    continue if not structs.penum_has_payload[variant_slot]
-                    payload_type: ValueType = copied_type(structs.penum_payloads[variant_slot])
-                    continue if payload_type.kind != TypeKind.Struct
-                    payload_words: u32 = payload_type_words(payload_type, structs)
-                    if payload_words == 0:
-                        unsizeable <- true
-                    elif payload_words > widest:
-                        widest <- payload_words
-                # Unregister by BLANKING the name rather than compacting the pools: every
-                # penum_* pool is index-parallel and three of them are indexed through
-                # penum_variant_start, so removing a row would have to renumber the variant
-                # spans too. penum_index_of matches by name and no enum is named "", so a
-                # blanked row is unreachable — and rewriting one field in place keeps this
-                # allocation-free (rebuilding the pools made them escape the inferred region).
-                structs.penum_names[enum_slot] <- "" if unsizeable
-                structs.penum_payload_words[enum_slot] <- widest if not unsizeable
+            round_index: mutable usize = 0
+            changed: mutable bool = true
+            while changed and round_index <= structs.penum_names.count |round_index, changed, structs|:
+                changed <- false
+                round_index <- round_index + 1
+                for enum_slot in 0..<structs.penum_names.count |structs, changed|:
+                    continue if structs.penum_names[enum_slot] == ""
+                    variant_start: usize = structs.penum_variant_start[enum_slot]
+                    variant_count: usize = structs.penum_variant_count[enum_slot]
+                    widest: mutable u32 = structs.penum_payload_words[enum_slot]
+                    unsizeable: mutable bool = false
+                    for variant_offset in 0..<variant_count |structs, widest, unsizeable, variant_start|:
+                        variant_slot: usize = variant_start + variant_offset
+                        continue if not structs.penum_has_payload[variant_slot]
+                        payload_type: ValueType = copied_type(structs.penum_payloads[variant_slot])
+                        continue if payload_type.kind != TypeKind.Struct and payload_type.kind != TypeKind.PayloadEnum
+                        # An inner enum this pass already gave up on is unusable as a payload:
+                        # its recorded extent is whatever it happened to settle at.
+                        if payload_type.kind == TypeKind.PayloadEnum and structs.penum_names[payload_type.bits.usize()] == "":
+                            unsizeable <- true
+                        else:
+                            payload_words: u32 = payload_type_words(payload_type, structs)
+                            if payload_words == 0:
+                                unsizeable <- true
+                            elif payload_words > widest:
+                                widest <- payload_words
+                    # Unregister by BLANKING the name rather than compacting the pools: every
+                    # penum_* pool is index-parallel and three of them are indexed through
+                    # penum_variant_start, so removing a row would have to renumber the variant
+                    # spans too. penum_index_of matches by name and no enum is named "", so a
+                    # blanked row is unreachable — and rewriting one field in place keeps this
+                    # allocation-free (rebuilding the pools made them escape the inferred region).
+                    if unsizeable:
+                        structs.penum_names[enum_slot] <- ""
+                        changed <- true
+                    elif widest != structs.penum_payload_words[enum_slot]:
+                        structs.penum_payload_words[enum_slot] <- widest
+                        changed <- true
 
 
         # Register fieldless enums from parser side tables. Payload-bearing enums are handled

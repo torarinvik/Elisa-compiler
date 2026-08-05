@@ -127,6 +127,114 @@ extend Backend:
             return unmodeled_type()
 
 
+        # Register a CONCRETE struct under a mangled `Base__Arg` LLVM name with the given
+        # fields — what instantiate_generic_struct does once it has resolved a template's
+        # members, but from types supplied directly, for a layout that has no source
+        # declaration to resolve from.
+        def register_synthesized_struct(base: sview, type_arg: ValueType, synth_field_names: darray[sview]&, synth_field_types: darray[ValueType]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            name_storage: mutable darray[u8] = []
+            for name_index in 0..<sview_len(base) |name_storage, base|:
+                name_storage.push(sview_at(base, name_index))
+            name_storage.push(95)
+            name_storage.push(95)
+            push_generic_arg_name(type_arg, structs, name_storage)
+            name_storage.push(0)
+            mangled: cstr = (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            handle: LLVMTypeRef = LLVMStructCreateNamed(structs.context, mangled)
+            slot: usize = structs.names.count
+            structs.names <- structs.names.push(base)
+            structs.handles <- structs.handles.push(handle)
+            structs.alignments <- structs.alignments.push(0)
+            structs.field_start <- structs.field_start.push(structs.field_names.count)
+            structs.field_count <- structs.field_count.push(synth_field_names.count)
+            element_types: mutable darray[LLVMTypeRef] = []
+            for field_index in 0..<synth_field_names.count |structs, element_types, synth_field_names, synth_field_types|:
+                field_type: ValueType = copied_type(synth_field_types[field_index])
+                structs.field_names <- structs.field_names.push(synth_field_names[field_index])
+                structs.field_types <- structs.field_types.push(copied_type(field_type))
+                element_types.push(llvm_type_of(field_type, structs, structs.context))
+            elements_pointer: void& = (&element_types[0]).cast[void&] can Unsafe.PointerCast
+            LLVMStructSetBody(handle, elements_pointer, element_types.count.u32(), 0)
+            return ValueType{kind: TypeKind.Struct, bits: slot.u32()}
+
+
+        # `set[T]` — stage0 has NO source declaration for the set layout. collections.elisa
+        # declares DictBucket/DynDict, but `DynSet`/`SetBucket` are stage0 BACKEND BUILTINS,
+        # so there was no template for instantiate_generic_struct to find and EVERY set
+        # program declined at its DECLARATION, with add / membership / count all unreachable
+        # behind it. (test/parity/set_real_smoke.sh compiles the real std set path by
+        # PREPENDING these two structs as source; this registers the same layout instead of
+        # requiring every program to declare it.)
+        #
+        # Field order and widths read from stage0's own `-emit llvm`:
+        #
+        #   %SetBucket__i64 = type { i64, i8 }
+        #   %DynSet__i64    = type { ptr, i64, i64, i64, ptr }
+        #
+        # i.e. DictBucket/DynDict minus the value column — SetBucket{key: T, state: u8} and
+        # DynSet{items: SetBucket[T]&?, count, used, capacity: usize, arena: Arena&?}, with
+        # both optional refs niche-collapsed to a bare pointer (the same collapse that already
+        # makes stage1's DynDict layout agree with stage0's).
+        #
+        # The OPERATIONS need nothing here: arena_set_add_or_panic / arena_set_contains and
+        # the rest are ordinary generics in collections.elisa, which the std's include
+        # closure already pulls in.
+        # The memo, over the same instantiation rows the template path uses, so a second
+        # `set[T]` in the unit resolves to the SAME struct rather than a fresh one. -1 = absent.
+        def synthesized_struct_index_of(base: sview, element_type: ValueType, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            for existing in 0..<structs.generic_struct_inst_bases.count |structs, base, element_type|:
+                continue if structs.generic_struct_inst_bases[existing] != base
+                continue if structs.generic_struct_inst_arg_count[existing] != 1.usize()
+                continue if not structs.generic_struct_inst_ready[existing]
+                stored: ValueType = copied_type(structs.generic_struct_inst_args[structs.generic_struct_inst_arg_start[existing]])
+                continue if stored.kind != element_type.kind or stored.bits != element_type.bits
+                return structs.generic_struct_inst_index[existing].i64()
+            return -1
+
+
+        def record_synthesized_instantiation(base: sview, element_type: ValueType, struct_type: ValueType, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            structs.generic_struct_inst_args <- structs.generic_struct_inst_args.push(copied_type(element_type))
+            structs.generic_struct_inst_bases <- structs.generic_struct_inst_bases.push(base)
+            structs.generic_struct_inst_arg_start <- structs.generic_struct_inst_arg_start.push(structs.generic_struct_inst_args.count - 1.usize())
+            structs.generic_struct_inst_arg_count <- structs.generic_struct_inst_arg_count.push(1.usize())
+            structs.generic_struct_inst_index <- structs.generic_struct_inst_index.push(struct_type.bits.usize())
+            structs.generic_struct_inst_ready <- structs.generic_struct_inst_ready.push(true)
+
+
+        def synthesize_set_struct(element_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            unmodeled_type() return if element_type.kind == TypeKind.Unmodeled
+            memoized: i64 = synthesized_struct_index_of("DynSet", element_type, structs)
+            ValueType{kind: TypeKind.Struct, bits: memoized.u32()} return if memoized >= 0
+            bucket_field_names: mutable darray[sview] = ["key", "state"]
+            bucket_field_types: mutable darray[ValueType] = [copied_type(element_type), ValueType{kind: TypeKind.Unsigned, bits: 8}]
+            bucket_type: ValueType = register_synthesized_struct("SetBucket", element_type, bucket_field_names, bucket_field_types, structs)
+            unmodeled_type() return if bucket_type.kind != TypeKind.Struct
+            # `SetBucket[T]` is named DIRECTLY in the std (`arena_set_find_index` walks an
+            # `items: SetBucket[T]&`), so it needs a memo row of its own — without one every
+            # helper body that mentions it declined, leaving `arena_set_add__T` declared but
+            # BODILESS while `arena_set_add_or_panic__T` still called it.
+            record_synthesized_instantiation("SetBucket", element_type, bucket_type, structs)
+            usize_type: ValueType = ValueType{kind: TypeKind.Unsigned, bits: 64}
+            items_type: ValueType = intern_optional_type(intern_ref_type(bucket_type, structs), structs)
+            arena_type: ValueType = intern_optional_type(intern_ref_type(ValueType{kind: TypeKind.Arena, bits: 0}, structs), structs)
+            unmodeled_type() return if items_type.kind == TypeKind.Unmodeled or arena_type.kind == TypeKind.Unmodeled
+            set_field_names: mutable darray[sview] = ["items", "count", "used", "capacity", "arena"]
+            set_field_types: mutable darray[ValueType] = [items_type, usize_type, usize_type, usize_type, arena_type]
+            set_type: ValueType = register_synthesized_struct("DynSet", element_type, set_field_names, set_field_types, structs)
+            unmodeled_type() return if set_type.kind != TypeKind.Struct
+            record_synthesized_instantiation("DynSet", element_type, set_type, structs)
+            return set_type
+
+
+        # `SetBucket[T]` — resolved through the pair above so the bucket a helper walks is
+        # the SAME registered struct the set header points at.
+        def synthesize_set_bucket(element_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            unmodeled_type() return if synthesize_set_struct(element_type, structs).kind != TypeKind.Struct
+            bucket_index: i64 = synthesized_struct_index_of("SetBucket", element_type, structs)
+            unmodeled_type() return if bucket_index < 0
+            return ValueType{kind: TypeKind.Struct, bits: bucket_index.u32()}
+
+
         def register_struct_names(file: Ast::File&, structs: mutable StructTable&, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             for struct_name in file.struct_names |structs, ctx|:
                 # A generic template has no concrete type of its own; skip it here.
