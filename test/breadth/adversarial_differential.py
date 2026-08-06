@@ -780,6 +780,47 @@ def use(x: i64) -> i64:
 def main() -> i64:
     return use(84) + use(-1)
 """)
+    # stage0 reads a `catch` arm as a MATCH EXPRESSION arm: it must end with an expression,
+    # and an arm ending in an ASSIGNMENT is rejected. stage1 used to accept this program —
+    # a PERMISSIVE divergence, the direction no decline census can see. Kept as a generator
+    # rather than a diagnostics fixture because stage0 follows the per-arm message with a
+    # second one ("catch expression arms are incompatible") that stage1 does not model; what
+    # matters, and what this pins, is that both compilers REJECT it.
+    yield ("catch_arm_ends_with_assignment", """
+error Bad:
+    Boom
+
+def g(x: i64) -> i64 error[Bad]:
+    return x
+
+def main() -> i64:
+    t: mutable i64 = 0
+    catch g(1):
+        v:
+            t <- v
+        error e:
+            t <- 9
+    return t
+""")
+    # The same shape with expression tails — accepted by both, so the rule above cannot be
+    # over-firing.
+    yield ("catch_arm_ends_with_expression", """
+error Bad:
+    Boom
+
+def g(x: i64) -> i64 error[Bad]:
+    return x
+
+def main() -> i64:
+    t: mutable i64 = 0
+    catch g(1):
+        v:
+            t <- v
+            0
+        error e:
+            0
+    return t
+""")
     yield ("error_try_propagates", """
 error Bad:
     Boom
