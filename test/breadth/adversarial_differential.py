@@ -1517,7 +1517,112 @@ def main() -> i64:
 """)
 
 
+def gen_signedness():
+    """Comparisons and division at the SIGNED/UNSIGNED boundary — the classic place a single
+    wrong LLVM predicate (slt vs ult, sdiv vs udiv, ashr vs lshr) is a wrong answer and not a
+    crash. Each case picks operands where the two predicates disagree."""
+    yield ("unsigned_compare_high_bit", """
+def main() -> i64:
+    a: u8 = 200
+    b: u8 = 100
+    hi: i64 = 1 if a > b else 0
+    lo: i64 = 1 if b < a else 0
+    return hi * 10 + lo
+""")
+    yield ("unsigned_divide_high_bit", """
+def main() -> i64:
+    a: u8 = 200
+    b: u8 = 4
+    return (a / b).i64()
+""")
+    yield ("signed_divide_negative", """
+def main() -> i64:
+    a: i64 = -200
+    b: i64 = 4
+    return (a / b) + 100
+""")
+    yield ("unsigned_shift_right_high_bit", """
+def main() -> i64:
+    a: u8 = 200
+    return (a >> 2.u8()).i64()
+""")
+    yield ("signed_shift_right_negative", """
+def main() -> i64:
+    a: i64 = -32
+    return (a >> 2) + 100
+""")
+    yield ("u32_compare_above_i32_max", """
+def main() -> i64:
+    a: u32 = 3000000000
+    b: u32 = 1
+    return (1 if a > b else 0) * 10 + (1 if b > a else 0)
+""")
+
+
+def gen_string_escapes():
+    """Escape sequences — the answer is a BYTE, so a mis-decoded escape is a wrong number."""
+    yield ("escape_bytes", f"""
+include "{STD}"
+
+def main() -> i64 can[Memory.Allocate, Abort.Panic]:
+    s: sview = sview("a\\tb\\nc", 0, 5)
+    return s[1].i64() * 100 + s[3].i64()
+""")
+    yield ("escape_backslash_and_quote", f"""
+include "{STD}"
+
+def main() -> i64 can[Memory.Allocate, Abort.Panic]:
+    s: sview = sview("x\\\\y", 0, 3)
+    return s.len.i64() * 100 + s[1].i64()
+""")
+    yield ("char_escape_codes", """
+def main() -> i64:
+    nl: char = '\\n'
+    tab: char = '\\t'
+    zero: char = '0'
+    return nl.i64() * 1000 + tab.i64() * 100 + zero.i64() % 100
+""")
+
+
+def gen_const_enum_values():
+    """Const enums with EXPLICIT values and gaps — the shape where compiling a member to its
+    ORDINAL instead of its value once passed every test in the repo."""
+    yield ("const_enum_gaps", """
+const enum Code of i64:
+    Lo = 1
+    Mid = 7
+    Hi = 9
+
+def main() -> i64:
+    return Code.Lo.i64() * 100 + Code.Mid.i64() * 10 + Code.Hi.i64()
+""")
+    yield ("const_enum_implicit_continuation", """
+const enum Step of i64:
+    A = 5
+    B
+    C
+
+def main() -> i64:
+    return Step.A.i64() * 100 + Step.B.i64() * 10 + Step.C.i64()
+""")
+    yield ("const_enum_in_when_columns", """
+const enum Code of i64:
+    Lo = 1
+    Hi = 9
+
+def pick(c: Code, n: i64) -> i64:
+    return when c, n:
+        Code.Lo, 0 -> 3
+        Code.Hi, 0 -> 4
+        _, _ -> 5
+
+def main() -> i64:
+    return pick(Code.Hi, 0) * 100 + pick(Code.Lo, 0) * 10 + pick(Code.Lo, 1)
+""")
+
+
 GENERATORS += [gen_aggregate_abi]
+GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values]
 
 
 def main():
