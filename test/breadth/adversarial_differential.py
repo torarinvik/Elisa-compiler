@@ -1517,6 +1517,55 @@ def main() -> i64:
 """)
 
 
+def gen_queries():
+    """Query expressions and comprehensions. The parser DISCARDS the head keyword — `count`,
+    `sum`, `any`, `all` all become one Comprehension node and are told apart only by a
+    line-keyed side table — so this family is worth pushing on. PERMISSIVE is the outcome
+    that found the two divergences here: stage0's query grammar is stricter than stage1's."""
+    yield ("query_count_and_sum", """
+def main() -> i64:
+    xs: darray[i64] = [1, 2, 3, 4, 5]
+    return (count x in xs where x > 2) * 10 + (sum y in xs where y > 2)
+""")
+    yield ("query_any_all", """
+def main() -> i64:
+    xs: darray[i64] = [1, 2, 3]
+    hit: bool = any x in xs where x > 2
+    every: bool = all y in xs where y > 0
+    none: bool = any z in xs where z > 9
+    return (1 if hit else 0) * 100 + (1 if every else 0) * 10 + (1 if none else 0)
+""")
+    yield ("query_empty_source", """
+def main() -> i64:
+    xs: darray[i64] = []
+    every: bool = all x in xs where x > 0
+    return (count y in xs where y > 0) + (1 if every else 0) + 40
+""")
+    # stage0 REQUIRES the filter on `count` — `sum`/`product` accept the bare form. Measured
+    # across the whole keyword family before the parser was tightened to match.
+    yield ("query_count_without_where", """
+def main() -> i64:
+    xs: darray[i64] = [1, 2]
+    return count x in xs
+""")
+    yield ("query_sum_without_where", """
+def main() -> i64:
+    xs: darray[i64] = [1, 2]
+    return sum x in xs
+""")
+    # A COMPREHENSION filter is `if`; `where` is the query form's and stage0 rejects it here.
+    yield ("comprehension_if_filter", """
+def main() -> i64:
+    xs: darray[i64] = [i for i in 0..<10 if i % 3 == 0]
+    return (count y in xs where y >= 0) * 10 + (sum z in xs where z >= 0)
+""")
+    yield ("comprehension_where_filter", """
+def main() -> i64:
+    xs: darray[i64] = [i for i in 0..<4 where i > 0]
+    return 0
+""")
+
+
 def gen_type_mismatches():
     """Return-type mismatches. PERMISSIVE is the outcome that matters — stage0 rejects these,
     so stage1 must too."""
@@ -1661,7 +1710,7 @@ def main() -> i64:
 
 GENERATORS += [gen_aggregate_abi]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
-               gen_type_mismatches]
+               gen_type_mismatches, gen_queries]
 
 
 def main():
