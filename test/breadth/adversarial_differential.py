@@ -1519,10 +1519,7 @@ def main() -> i64:
 
 def gen_type_mismatches():
     """Return-type mismatches. PERMISSIVE is the outcome that matters — stage0 rejects these,
-    so stage1 must too. A struct value returned as an i64 is still accepted (the checker keys
-    on the FAMILY of a returned identifier binding, and a struct literal is not an identifier
-    at all); that one is not here because it would fail the gate for a gap this suite is not
-    the right place to open."""
+    so stage1 must too."""
     yield ("fn_value_returned_as_scalar", """
 def apply(f: fn(i64) -> i64, n: i64) -> i64:
     return f
@@ -1530,6 +1527,21 @@ def apply(f: fn(i64) -> i64, n: i64) -> i64:
 def main() -> i64:
     return 0
 """)
+    yield ("struct_value_returned_as_scalar", """
+struct P:
+    x: i64
+
+def g() -> i64:
+    return P{x: 1}
+
+def main() -> i64:
+    return 0
+""")
+    # The case that broke the first attempt at the rule above — a struct returned where its
+    # own ALIAS is declared (`sview` IS `StringView`) — has no standalone spelling: declaring
+    # a local `StringView` collides with the builtin, and stage0 rejects the program for that
+    # instead. Its real coverage is the std, through self_host_gen3_smoke and the 574
+    # stage0 acceptance cases, both of which the narrowed rule was measured against.
     # The control: the same function returning the RIGHT thing still compiles and runs.
     yield ("fn_value_called_not_returned", """
 def apply(f: fn(i64) -> i64, n: i64) -> i64:
