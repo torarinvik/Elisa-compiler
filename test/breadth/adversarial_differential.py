@@ -1434,6 +1434,92 @@ GENERATORS += [gen_defaults_and_named_args, gen_multi_assign, gen_sview_slicing,
                gen_optional_containers]
 
 
+def gen_aggregate_abi():
+    """Aggregate ABI: structs returned and passed BY VALUE. A wrong sret/byval decision does
+    not crash — it reads a neighbouring field, so every field is read back and weighted."""
+    yield ("struct_return_many_fields", """
+struct Wide:
+    a: i64
+    b: i64
+    c: i64
+    d: i64
+    e: i64
+    f: i64
+
+def mk(base: i64) -> Wide:
+    return Wide{a: base, b: base + 1, c: base + 2, d: base + 3, e: base + 4, f: base + 5}
+
+def main() -> i64:
+    w: Wide = mk(1)
+    return (w.a * 1 + w.b * 2 + w.c * 3 + w.d * 4 + w.e * 5 + w.f * 6) % 251
+""")
+    yield ("struct_by_value_param", """
+struct Pair:
+    x: i64
+    y: u8
+
+def sum(p: Pair) -> i64:
+    return p.x * 10 + p.y.i64()
+
+def main() -> i64:
+    return sum(Pair{x: 4, y: 2.u8()})
+""")
+    yield ("struct_nested_by_value", """
+struct Inner:
+    v: i64
+    w: u8
+
+struct Outer:
+    left: Inner
+    right: Inner
+    tag: bool
+
+def fold(o: Outer) -> i64:
+    flag: i64 = 1 if o.tag else 0
+    return o.left.v * 1000 + o.left.w.i64() * 100 + o.right.v * 10 + o.right.w.i64() + flag
+
+def main() -> i64:
+    o: Outer = Outer{left: Inner{v: 1, w: 2.u8()}, right: Inner{v: 3, w: 4.u8()}, tag: true}
+    return fold(o) % 251
+""")
+    yield ("generic_struct_return", """
+struct Box[T]:
+    v: T
+    n: i64
+
+def wrap[T](value: T, n: i64) -> Box[T]:
+    return Box[T]{v: value, n: n}
+
+def main() -> i64:
+    a: Box[i64] = wrap(7, 2)
+    b: Box[u8] = wrap(3.u8(), 5)
+    return a.v * a.n + b.v.i64() * b.n
+""")
+    yield ("struct_through_optional_and_ref", """
+struct P:
+    x: mutable i64
+    y: i64
+
+def bump(p: mutable P&) -> void:
+    p.x <- p.x + 1
+
+def find(p: P&, want: bool) -> P&?:
+    return p if want else null
+
+def main() -> i64:
+    p: mutable P = P{x: 1, y: 9}
+    bump(p)
+    bump(p)
+    total: mutable i64 = 0
+    if find(&p, true) is r:
+        total <- r.x * 10 + r.y
+    return total
+""")
+
+
+GENERATORS += [gen_aggregate_abi]
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     results = {"MATCH": [], "MISMATCH": [], "O2_MISMATCH": [], "O2_DECLINE": [], "DECLINE": [], "PERMISSIVE": [], "SKIP": []}
