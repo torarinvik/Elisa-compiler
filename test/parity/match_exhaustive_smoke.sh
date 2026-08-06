@@ -52,20 +52,25 @@ echo "$out" | grep -q "non-exhaustive" && fail "false positive on exhaustive exp
 # 5d. OPEN-SCALAR totality (docs/125 R2): a value-producing match/when over an int/char/
 #     string/float domain with no `_` cannot yield a value for every input — MUST be flagged
 #     (applied to match AND when, stricter-but-sound vs stage0's match-only expr rule).
+#     The message is stage0's verbatim ("non-exhaustive integer match expression; add a final
+#     _ arm"). It used to be stage1's own phrasing, which THIS FILE pinned — a hand-written
+#     assertion holding a wording divergence in place, since no diagnostics fixture could
+#     carry the rule while the text disagreed with the oracle. There are fixtures now
+#     (when_scalar_total / when_tuple_total), so the text is oracle-checked.
 out=$(printf 'def f(n: i64) -> i64:\n    r: i64 = match n:\n        0: 1\n        1: 2\n    return r\n' | "$RPT")
-echo "$out" | grep -q "add a final '_' arm" || fail "open-scalar match without _ not flagged: $out"
+echo "$out" | grep -q "add a final _ arm" || fail "open-scalar match without _ not flagged: $out"
 out=$(printf 'def f(n: i64) -> i64:\n    r: i64 = when n:\n        0: 1\n        1: 2\n    return r\n' | "$RPT")
-echo "$out" | grep -q "add a final '_' arm" || fail "open-scalar when without _ not flagged: $out"
+echo "$out" | grep -q "add a final _ arm" || fail "open-scalar when without _ not flagged: $out"
 # 5e. a `_` arm makes it total; a bool (closed) domain needs no `_`.
 out=$(printf 'def f(n: i64) -> i64:\n    r: i64 = when n:\n        0: 1\n        _: 9\n    return r\n' | "$RPT")
-echo "$out" | grep -q "add a final '_' arm" && fail "false positive on open-scalar with _: $out"
+echo "$out" | grep -q "add a final _ arm" && fail "false positive on open-scalar with _: $out"
 out=$(printf 'def f(b: bool) -> i64:\n    r: i64 = when b:\n        true: 1\n        false: 2\n    return r\n' | "$RPT")
-echo "$out" | grep -q "add a final '_' arm" && fail "false positive on closed bool domain: $out"
+echo "$out" | grep -q "add a final _ arm" && fail "false positive on closed bool domain: $out"
 
 # 6. the whole frontend + stdlib must produce ZERO findings (all compile on stage0 → exhaustive).
 n=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "non-exhaustive match|add a final '_' arm" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "non-exhaustive match|add a final _ arm" || true)
   n=$((n + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$n" -eq 0 ] || fail "$n non-exhaustive false positives across frontend+stdlib"

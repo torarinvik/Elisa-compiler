@@ -465,6 +465,258 @@ def main() -> i64:
 GENERATORS += [gen_casts_arith, gen_strings, gen_generics_multi, gen_match_exhaustive]
 
 
+def gen_when_tables():
+    """`when` decision tables. The MULTI-COLUMN form had no backend lowering at all until
+    2026-08-06, so nothing here was ever differentially checked; the single-column form is
+    covered too because both share the arm machinery. Every row returns a distinct value, so
+    a row that hits the WRONG way is a wrong answer rather than a decline."""
+    yield ("when_two_columns", """
+def pick(a: i64, b: i64) -> i64:
+    return when a, b:
+        0, 0 -> 11
+        0, 1 -> 22
+        1, 0 -> 33
+        _, _ -> 44
+
+def main() -> i64:
+    return pick(0, 1) + pick(1, 0) + pick(9, 9)
+""")
+    # ORDER-INDEPENDENCE: the `_` row is written in the MIDDLE. A `when` is an unordered
+    # table, so the later specific row must still win — the parser moves the default last.
+    # Under plain `match` first-wins semantics this would answer 44.
+    yield ("when_default_in_middle", """
+def pick(a: i64, b: i64) -> i64:
+    return when a, b:
+        0, 0 -> 11
+        _, _ -> 44
+        1, 1 -> 33
+
+def main() -> i64:
+    return pick(1, 1)
+""")
+    yield ("when_or_and_range_columns", """
+def pick(a: i64, b: i64) -> i64:
+    return when a, b:
+        1 | 2, 0..<5 -> 7
+        3, _ -> 8
+        _, _ -> 9
+
+def main() -> i64:
+    return pick(2, 4) * 100 + pick(3, 99) * 10 + pick(8, 8)
+""")
+    # A `_` row is required even here, where the four combinations ARE spelled out: a tuple
+    # domain is the PRODUCT of its columns, and stage0 asks for the final row regardless.
+    yield ("when_bool_columns", """
+def pick(a: bool, b: bool) -> i64:
+    return when a, b:
+        true, true -> 1
+        true, false -> 2
+        false, true -> 3
+        _, _ -> 4
+
+def main() -> i64:
+    return pick(true, false) * 10 + pick(false, false)
+""")
+    # Columns must be DISJOINT (docs/125 R1): `'a', _` would overlap `'a', 'b'`, so the
+    # second row narrows on the other column instead.
+    yield ("when_char_columns", """
+def pick(a: char, b: char) -> i64:
+    return when a, b:
+        'a', 'b' -> 5
+        'q', 'q' -> 6
+        _, _ -> 7
+
+def main() -> i64:
+    return pick('a', 'b') * 100 + pick('q', 'q') * 10 + pick('z', 'z')
+""")
+    yield ("when_const_enum_columns", """
+const enum Side of u8:
+    Left
+    Right
+
+def pick(s: Side, n: i64) -> i64:
+    return when s, n:
+        Side.Left, 1 -> 3
+        Side.Right, 1 -> 4
+        _, _ -> 5
+
+def main() -> i64:
+    return pick(Side.Right, 1) * 10 + pick(Side.Left, 9)
+""")
+    yield ("when_in_local_and_nested", """
+def pick(a: i64, b: i64) -> i64:
+    inner: i64 = when a, b:
+        0, 0 -> 2
+        _, _ -> 3
+    outer: i64 = when inner, a:
+        2, 0 -> 40
+        _, _ -> 50
+    return outer
+
+def main() -> i64:
+    return pick(0, 0) + pick(1, 1)
+""")
+    yield ("when_single_column_range", """
+def classify(c: char) -> i64:
+    return when c:
+        '0'..='9' -> 1
+        'a'..='z' -> 2
+        _ -> 3
+
+def main() -> i64:
+    return classify('5') * 100 + classify('q') * 10 + classify('!')
+""")
+
+
+def gen_defer_region():
+    """`defer block:` ordering and region blocks — statement forms whose ORDER is the answer.
+    Deferred blocks run LIFO during unwind, so the trace digit order IS the property."""
+    yield ("defer_lifo_order", """
+global mutable trace: i64 = 0
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run() -> void:
+    defer block:
+        note(1)
+    defer block:
+        note(2)
+    note(3)
+
+def main() -> i64:
+    run()
+    return trace
+""")
+    yield ("defer_runs_on_early_return", """
+global mutable trace: i64 = 0
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run(early: bool) -> i64:
+    defer block:
+        note(1)
+    if early:
+        note(2)
+        return 5
+    note(3)
+    return 6
+
+def main() -> i64:
+    _ = run(true)
+    return trace
+""")
+    yield ("region_block_value_survives", """
+def build() -> i64:
+    total: mutable i64 = 0
+    region scratch:
+        xs: mutable darray[i64] = []
+        xs.push(4)
+        xs.push(5)
+        total <- (xs[0] can Unsafe.UncheckedIndex) + (xs[1] can Unsafe.UncheckedIndex)
+    return total
+
+def main() -> i64:
+    return build()
+""")
+
+
+def gen_error_unions():
+    """Error unions through the i32-status + out-param ABI, in each position. Every catch arm
+    ENDS WITH AN EXPRESSION — stage0 rejects an arm whose last statement is an assignment."""
+    yield ("error_catch_success_and_failure", """
+error Bad:
+    Boom
+
+def half(x: i64) -> i64 error[Bad]:
+    raise Bad.Boom if x < 0
+    return x / 2
+
+def use(x: i64) -> i64:
+    catch half(x):
+        v:
+            return v
+        error e:
+            return 100
+
+def main() -> i64:
+    return use(84) + use(-1)
+""")
+    yield ("error_try_propagates", """
+error Bad:
+    Boom
+
+def inner(x: i64) -> i64 error[Bad]:
+    raise Bad.Boom if x < 0
+    return x + 1
+
+def outer(x: i64) -> i64 error[Bad]:
+    v: i64 = try inner(x)
+    return v * 2
+
+def main() -> i64:
+    catch outer(20):
+        v:
+            return v
+        error e:
+            return 1
+""")
+
+
+def gen_struct_defaults():
+    """Struct field defaults — the `= default` initializer, whose value was PARSED and then
+    discarded until 2026-08-06 (fields silently zero-filled instead)."""
+    yield ("struct_default_omitted_field", """
+struct Config:
+    width: i64 = 7
+    height: i64 = 3
+
+def main() -> i64:
+    a: Config = Config{}
+    b: Config = Config{width: 10}
+    return a.width * a.height + b.width + b.height
+""")
+    yield ("struct_default_all_given", """
+struct Config:
+    width: i64 = 7
+    height: i64 = 3
+
+def main() -> i64:
+    c: Config = Config{width: 2, height: 5}
+    return c.width * c.height
+""")
+
+
+def gen_lambdas_closures():
+    """Closures capturing several values, and higher-order returns."""
+    yield ("closure_two_captures", """
+def apply(fn: fn(i64) -> i64, v: i64) -> i64:
+    return fn(v)
+
+def run() -> i64:
+    a: i64 = 3
+    b: i64 = 10
+    return apply(fn(x) => x * a + b, 4)
+
+def main() -> i64:
+    return run()
+""")
+    yield ("higher_order_two_levels", """
+def adder(n: i64) -> fn(i64) -> i64:
+    return fn(x) => x + n
+
+def main() -> i64:
+    f: fn(i64) -> i64 = adder(2)
+    g: fn(i64) -> i64 = adder(30)
+    return f(1) + g(1)
+""")
+
+
+GENERATORS += [gen_when_tables, gen_defer_region, gen_error_unions,
+               gen_struct_defaults, gen_lambdas_closures]
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     results = {"MATCH": [], "MISMATCH": [], "DECLINE": [], "PERMISSIVE": [], "SKIP": []}
