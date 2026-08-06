@@ -1518,13 +1518,18 @@ def main() -> i64:
 
 
 def gen_type_mismatches():
-    """Return-type mismatches. stage1 rejects a string, a bool and an int-for-bool return; it
-    does NOT reject a `fn` value or a struct value returned as an i64 — the checker keys on the
-    FAMILY of a returned identifier binding, and neither of those is recorded. That residual
-    gap is acceptance-only: the backend now declines the function rather than emitting the
-    `ret ptr` from an `-> i64` body that the verifier rejects, so nothing invalid is produced.
-    The invalid-IR half is pinned by name in test/parity/malformed_input_smoke.sh; a PERMISSIVE
-    entry here would just fail the gate for a gap this suite is not the right home for."""
+    """Return-type mismatches. PERMISSIVE is the outcome that matters — stage0 rejects these,
+    so stage1 must too. A struct value returned as an i64 is still accepted (the checker keys
+    on the FAMILY of a returned identifier binding, and a struct literal is not an identifier
+    at all); that one is not here because it would fail the gate for a gap this suite is not
+    the right place to open."""
+    yield ("fn_value_returned_as_scalar", """
+def apply(f: fn(i64) -> i64, n: i64) -> i64:
+    return f
+
+def main() -> i64:
+    return 0
+""")
     # The control: the same function returning the RIGHT thing still compiles and runs.
     yield ("fn_value_called_not_returned", """
 def apply(f: fn(i64) -> i64, n: i64) -> i64:
