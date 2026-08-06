@@ -1517,6 +1517,27 @@ def main() -> i64:
 """)
 
 
+def gen_type_mismatches():
+    """Return-type mismatches. stage1 rejects a string, a bool and an int-for-bool return; it
+    does NOT reject a `fn` value or a struct value returned as an i64 — the checker keys on the
+    FAMILY of a returned identifier binding, and neither of those is recorded. That residual
+    gap is acceptance-only: the backend now declines the function rather than emitting the
+    `ret ptr` from an `-> i64` body that the verifier rejects, so nothing invalid is produced.
+    The invalid-IR half is pinned by name in test/parity/malformed_input_smoke.sh; a PERMISSIVE
+    entry here would just fail the gate for a gap this suite is not the right home for."""
+    # The control: the same function returning the RIGHT thing still compiles and runs.
+    yield ("fn_value_called_not_returned", """
+def apply(f: fn(i64) -> i64, n: i64) -> i64:
+    return f(n)
+
+def dbl(x: i64) -> i64:
+    return x * 2
+
+def main() -> i64:
+    return apply(dbl, 21)
+""")
+
+
 def gen_signedness():
     """Comparisons and division at the SIGNED/UNSIGNED boundary — the classic place a single
     wrong LLVM predicate (slt vs ult, sdiv vs udiv, ashr vs lshr) is a wrong answer and not a
@@ -1622,7 +1643,8 @@ def main() -> i64:
 
 
 GENERATORS += [gen_aggregate_abi]
-GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values]
+GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
+               gen_type_mismatches]
 
 
 def main():

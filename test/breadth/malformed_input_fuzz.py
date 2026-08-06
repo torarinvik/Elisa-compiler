@@ -10,6 +10,13 @@ duplicate a span) with a FIXED seed, compile each with stage1, and require an or
 Exit codes 0..2 are all fine — 0 compiled, 1 diagnosed, 2 declined; a negative code (a signal)
 or anything above 2 is a crash. The mutants are not valid programs, so nothing here compares
 ANSWERS; that is the differential suite's job.
+
+A mutant that COMPILES gets a second look: its IR is emitted and run through `opt -passes=verify`.
+That is where the remaining defects of this class live — the frontend accepted the program, so
+the backend emitted something for a shape nobody wrote on purpose, and invalid IR that happens
+NOT to crash is otherwise invisible (the object path tolerates it; see llvm_verifier_smoke.sh).
+It found `ret ptr` from an `-> i64` function, from returning a `fn` value that stage0 rejects
+outright.
 """
 import os, random, subprocess, sys
 
@@ -25,13 +32,35 @@ REGRESSIONS = [
     ("void_call_into_return", "def compute()\n\ndef f() -> i64:\n    return compute()\n"),
     ("void_call_into_push", "def compute()\n\ndef f() -> void:\n    xs: mutable darray[i64] = []\n    xs.push(compute())\n"),
     ("malformed_signature_then_call", "def compute() -rn 5\n\ndef f() -> void:\n    x: i64 = compute()\n"),
+    # Not a crash — INVALID IR that the object path tolerated: `ret ptr` from an `-> i64`
+    # function. stage0 says "return type expects i64, got fn(i64) -> i64".
+    ("fn_value_returned_as_scalar", "def apply(f: fn(i64) -> i64, n: i64) -> i64:\n    return f\n"),
 ]
+
+OPT = os.path.join(os.path.dirname(os.environ.get("LLVM_CONFIG", "/opt/homebrew/opt/llvm/bin/llvm-config")), "opt")
 
 def compile_rc(path, work):
     r = subprocess.run(["bash", WRAP, "-o", os.path.join(work, "out.o"), path],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        stdin=subprocess.DEVNULL, timeout=120)
     return r.returncode
+
+def invalid_ir(path, work):
+    """None when the IR is valid or unavailable; the verifier's first line when it is not."""
+    if not os.path.exists(OPT):
+        return None
+    ll = os.path.join(work, "out.ll")
+    r = subprocess.run(["bash", WRAP, "-emit", "llvm", "-o", ll, path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       stdin=subprocess.DEVNULL, timeout=120)
+    if r.returncode != 0:
+        return None
+    v = subprocess.run([OPT, "-passes=verify", "-disable-output", ll],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+    if v.returncode == 0:
+        return None
+    lines = v.stderr.decode().splitlines()
+    return lines[0] if lines else "invalid IR"
 
 def abnormal(rc):
     return rc < 0 or rc > 2
@@ -63,6 +92,10 @@ def main():
         rc = compile_rc(src, work)
         if abnormal(rc):
             failures.append((name, rc))
+        elif rc == 0:
+            bad = invalid_ir(src, work)
+            if bad:
+                failures.append((f"{name} [invalid IR] {bad}", rc))
     seeds = []
     for d in ("test/repro", "test/fixtures/diagnostics"):
         p = os.path.join(ROOT, d)
@@ -80,9 +113,15 @@ def main():
                 crash = os.path.join(work, f"crash_{len(failures)}.elisa")
                 open(crash, "wb").write(open(src, "rb").read())
                 failures.append((f"{os.path.basename(seed)}#{k} -> {crash}", rc))
+            elif rc == 0:
+                bad = invalid_ir(src, work)
+                if bad:
+                    keep = os.path.join(work, f"invalid_{len(failures)}.elisa")
+                    open(keep, "wb").write(open(src, "rb").read())
+                    failures.append((f"{os.path.basename(seed)}#{k} [invalid IR] {bad} -> {keep}", rc))
     for name, rc in failures:
         print(f"  CRASH rc={rc}  {name}")
-    print(f"malformed input: {checked} programs, {len(failures)} abnormal exits")
+    print(f"malformed input: {checked} programs, {len(failures)} abnormal exits or invalid IR")
     return 1 if failures else 0
 
 if __name__ == "__main__":
