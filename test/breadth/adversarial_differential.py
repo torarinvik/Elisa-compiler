@@ -27,11 +27,17 @@ def run(cmd, **kw):
                           stdin=subprocess.DEVNULL, **kw)
 
 def build_and_run(src_path, work, tag):
-    """Compile+link+run with one compiler. Returns (ok, exit_code)."""
+    """Compile+link+run with one compiler. Returns (ok, exit_code).
+
+    `s1O2` is stage1 through the real `default<O2>` pass pipeline. Optimisation must never
+    change an answer, and a miscompile that only appears optimised is invisible to every
+    other check here — the module datalayout bug was exactly that shape."""
     obj = os.path.join(work, f"{tag}.o")
     exe = os.path.join(work, tag)
     if tag == "s0":
         r = run([S0, "-emit", "obj", "-o", obj, src_path], timeout=90)
+    elif tag == "s1O2":
+        r = run(["bash", WRAP, "-O2", "-o", obj, src_path], env=ENV, timeout=180)
     else:
         r = run(["bash", WRAP, "-o", obj, src_path], env=ENV, timeout=90)
     if r.returncode != 0:
@@ -1318,9 +1324,119 @@ def main() -> i64 can[Abort.Panic, Memory.Allocate]:
 GENERATORS += [gen_std_containers]
 
 
+def gen_defaults_and_named_args():
+    """Default parameter values and named arguments — resolution paths where picking the
+    wrong default is a wrong ANSWER, not a decline."""
+    yield ("default_arg_omitted_and_given", """
+def scale(v: i64, by: i64 = 3) -> i64:
+    return v * by
+
+def main() -> i64:
+    return scale(2) * 10 + scale(2, 4)
+""")
+    yield ("default_arg_two_defaults", """
+def mix(a: i64, b: i64 = 2, c: i64 = 5) -> i64:
+    return a * 100 + b * 10 + c
+
+def main() -> i64:
+    return mix(1) - mix(1, 3) + mix(1, 3, 4)
+""")
+    yield ("named_argument_order", """
+def sub(a: i64, b: i64) -> i64:
+    return a - b
+
+def main() -> i64:
+    return sub(b: 3, a: 10)
+""")
+
+
+def gen_multi_assign():
+    """Multi-target assignment and swap — the form where a fresh slot per target silently
+    reads uninitialised stack (fixed once; this holds it)."""
+    yield ("multi_assign_swap", """
+def main() -> i64:
+    a: mutable i64 = 3
+    b: mutable i64 = 7
+    a, b <- b, a
+    return a * 10 + b
+""")
+    yield ("multi_assign_from_calls", """
+def one() -> i64:
+    return 1
+
+def two() -> i64:
+    return 2
+
+def main() -> i64:
+    a: mutable i64 = 0
+    b: mutable i64 = 0
+    a, b <- one(), two()
+    return a * 10 + b
+""")
+
+
+def gen_sview_slicing():
+    """sview slicing and comparison — content vs pointer, and clamping at the bounds."""
+    yield ("sview_slice_and_compare", f"""
+include "{STD}"
+
+def main() -> i64 can[Memory.Allocate, Abort.Panic]:
+    s: sview = sview("abcdef", 0, 6)
+    head: sview = string_view_slice(s, 0, 3)
+    rest: sview = string_view_slice(s, 3, 6)
+    same: sview = sview("abc", 0, 3)
+    return (100 if head == same else 0) + (10 if head == rest else 0) + head.len.i64()
+""")
+    yield ("sview_slice_clamped", f"""
+include "{STD}"
+
+def main() -> i64 can[Memory.Allocate, Abort.Panic]:
+    s: sview = sview("abc", 0, 3)
+    over: sview = string_view_slice(s, 1, 99)
+    return over.len.i64() * 10 + (over[0] - 96).i64()
+""")
+
+
+def gen_optional_containers():
+    """Optionals of aggregates, and an optional stored in a container — layouts where the
+    niche and the payload can disagree."""
+    yield ("optional_struct_roundtrip", """
+struct P:
+    x: i64
+    y: i64
+
+def pick(hit: bool) -> P?:
+    return P{x: 4, y: 5} if hit else null
+
+def main() -> i64:
+    total: mutable i64 = 0
+    if pick(true) is p:
+        total <- p.x * 10 + p.y
+    if pick(false) is q:
+        total <- total + 100
+    return total
+""")
+    yield ("optional_in_darray", """
+def main() -> i64:
+    xs: mutable darray[i64?] = []
+    xs.push(7)
+    xs.push(null)
+    total: mutable i64 = 0
+    if (xs[0] can Unsafe.UncheckedIndex) is a:
+        total <- total + a
+    if (xs[1] can Unsafe.UncheckedIndex) is b:
+        total <- total + 100
+    return total * 10 + xs.count.i64()
+""")
+
+
+GENERATORS += [gen_defaults_and_named_args, gen_multi_assign, gen_sview_slicing,
+               gen_optional_containers]
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
-    results = {"MATCH": [], "MISMATCH": [], "DECLINE": [], "PERMISSIVE": [], "SKIP": []}
+    results = {"MATCH": [], "MISMATCH": [], "O2_MISMATCH": [], "O2_DECLINE": [], "DECLINE": [], "PERMISSIVE": [], "SKIP": []}
     work = tempfile.mkdtemp()
     progs = []
     for g in GENERATORS:
@@ -1353,9 +1469,17 @@ def main():
             results["DECLINE"].append((name, rc0, None)); continue
         if rc0 != rc1:
             results["MISMATCH"].append((name, rc0, rc1))
+            continue
+        # Optimisation must not change the answer. Only checked once the -O0 answer already
+        # agrees, so a row here always means "the pipeline changed a CORRECT answer".
+        ok2, rc2 = build_and_run(path, d, "s1O2")
+        if not ok2:
+            results["O2_DECLINE"].append((name, rc1, None))
+        elif rc2 != rc1:
+            results["O2_MISMATCH"].append((name, rc1, rc2))
         else:
             results["MATCH"].append((name, rc0, rc1))
-    for k in ("MISMATCH", "DECLINE", "PERMISSIVE", "SKIP", "MATCH"):
+    for k in ("MISMATCH", "O2_MISMATCH", "O2_DECLINE", "DECLINE", "PERMISSIVE", "SKIP", "MATCH"):
         for name, rc0, rc1 in results[k]:
             if k == "MATCH":
                 continue
@@ -1363,6 +1487,7 @@ def main():
             print(f"  {k:9s} {name}{extra}")
     print(f"\nadversarial: {len(progs)} programs — "
           f"{len(results['MATCH'])} match, {len(results['MISMATCH'])} MISMATCH, "
+          f"{len(results['O2_MISMATCH'])} O2_MISMATCH, {len(results['O2_DECLINE'])} O2_DECLINE, "
           f"{len(results['DECLINE'])} declined, "
           f"{len(results['PERMISSIVE'])} PERMISSIVE (stage0 rejects, stage1 builds), "
           f"{len(results['SKIP'])} skipped")
@@ -1374,7 +1499,7 @@ def main():
     # SKIP is not ratcheted: it means the ORACLE could not arbitrate (stage0 rejects the
     # program, or crashes on it), which says nothing about stage1. Keep those few honest by
     # fixing the generator program rather than by tolerating the skip.
-    return 1 if results["MISMATCH"] or results["DECLINE"] or results["PERMISSIVE"] else 0
+    return 1 if results["MISMATCH"] or results["O2_MISMATCH"] or results["O2_DECLINE"] or results["DECLINE"] or results["PERMISSIVE"] else 0
 
 if __name__ == "__main__":
     sys.exit(main())

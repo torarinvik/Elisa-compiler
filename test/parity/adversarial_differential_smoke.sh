@@ -9,7 +9,11 @@
 # wrong answers (a `when` default row that shadowed later rows; `defer` dropped when a `-> void`
 # function fell off the end).
 #
-# MISMATCH / DECLINE / PERMISSIVE are all ratcheted at zero by the tester itself.
+# MISMATCH / DECLINE / PERMISSIVE are all ratcheted at zero by the tester itself, and so are
+# O2_MISMATCH / O2_DECLINE: every program that agrees at -O0 is compiled again through the real
+# `default<O2>` pipeline and re-run, because optimisation must never change an answer and a
+# miscompile that only appears optimised is invisible to every other check here (the missing
+# module datalayout was exactly that shape). ~2m40s.
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "adversarial_differential SKIP: no stage1 binary"; exit 0; }
