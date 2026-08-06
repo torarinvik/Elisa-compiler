@@ -717,6 +717,211 @@ GENERATORS += [gen_when_tables, gen_defer_region, gen_error_unions,
                gen_struct_defaults, gen_lambdas_closures]
 
 
+def gen_loops_control():
+    """Loop control flow: `break`/`continue` interaction with accumulators, nested loops, and
+    the loop-variable's final value. Each body encodes the ITERATION PATH, not just a total."""
+    yield ("loop_break_in_nested", """
+def main() -> i64:
+    total: mutable i64 = 0
+    for i in 0..<4 |total|:
+        for j in 0..<4 |total, i|:
+            break if j == 2
+            total <- total * 10 + j
+    return total % 251
+""")
+    yield ("loop_continue_skips", """
+def main() -> i64:
+    total: mutable i64 = 0
+    for i in 0..<6 |total|:
+        continue if i % 2 == 0
+        total <- total * 10 + i
+    return total % 251
+""")
+    yield ("while_with_break", """
+def main() -> i64:
+    i: mutable i64 = 0
+    total: mutable i64 = 0
+    while i < 10 |i, total|:
+        i <- i + 1
+        break if i == 4
+        total <- total + i
+    return total * 10 + i
+""")
+    yield ("loop_inclusive_vs_exclusive", """
+def main() -> i64:
+    a: mutable i64 = 0
+    for i in 0..<3 |a|:
+        a <- a + 1
+    b: mutable i64 = 0
+    for i in 0..=3 |b|:
+        b <- b + 1
+    return a * 10 + b
+""")
+    yield ("loop_stepped_range", """
+def main() -> i64:
+    total: mutable i64 = 0
+    for i in 0..<10..3 |total|:
+        total <- total * 10 + i
+    return total % 251
+""")
+
+
+def gen_optionals_refs():
+    """Optionals and references — layout-sensitive shapes where a wrong niche reads as data."""
+    yield ("optional_absent_vs_zero", """
+def pick(n: i64) -> i64?:
+    return null if n == 0 else 0
+
+def main() -> i64:
+    a: i64 = 1 if pick(0) is v0 else 2
+    b: i64 = 3 if pick(5) is v1 else 4
+    return a * 10 + b
+""")
+    yield ("optional_ref_niche", """
+struct P:
+    x: i64
+
+def find(p: P&, want: bool) -> P&?:
+    return p if want else null
+
+def main() -> i64:
+    p: P = P{x: 7}
+    hit: i64 = 1 if find(&p, true) is r0 else 2
+    miss: i64 = 3 if find(&p, false) is r1 else 4
+    return hit * 10 + miss
+""")
+    yield ("ref_param_mutation", """
+def bump(n: mutable i64&) -> void:
+    n <- n + 5
+
+def main() -> i64:
+    x: mutable i64 = 3
+    bump(x)
+    bump(x)
+    return x
+""")
+    yield ("nested_optional_chain", """
+def outer(n: i64) -> i64?:
+    inner: i64? = null if n < 0 else n * 2
+    if inner is v:
+        return v + 1
+    return null
+
+def main() -> i64:
+    a: i64 = 0
+    if outer(3) is x:
+        a <- x
+    b: i64 = 0
+    if outer(-1) is y:
+        b <- y
+    return a * 10 + b
+""")
+
+
+def gen_ufcs_modules():
+    """UFCS method-call spelling and module-qualified names — resolution paths a plain call
+    never exercises."""
+    yield ("ufcs_vs_direct", """
+def twice(n: i64) -> i64:
+    return n * 2
+
+def main() -> i64:
+    return twice(3) * 10 + 3.twice()
+""")
+    yield ("module_qualified_call", """
+module M:
+    def f(n: i64) -> i64:
+        return n + 1
+
+def f(n: i64) -> i64:
+    return n + 100
+
+def main() -> i64:
+    return M::f(1) * 100 + f(1)
+""")
+    yield ("ufcs_chain", """
+def inc(n: i64) -> i64:
+    return n + 1
+
+def dbl(n: i64) -> i64:
+    return n * 2
+
+def main() -> i64:
+    return 3.inc().dbl()
+""")
+
+
+def gen_arrays_fixed():
+    """Fixed-size arrays: element addressing and 2D indexing, where a stride bug is silent."""
+    yield ("fixed_array_index", """
+def main() -> i64:
+    xs: i64[4] = [10, 20, 30, 40]
+    return (xs[0] can Unsafe.UncheckedIndex) + (xs[3] can Unsafe.UncheckedIndex) * 2
+""")
+    yield ("fixed_array_write_then_read", """
+def main() -> i64:
+    xs: mutable i64[3] = [1, 2, 3]
+    xs[1] <- 9
+    return (xs[0] can Unsafe.UncheckedIndex) * 100 + (xs[1] can Unsafe.UncheckedIndex) * 10 + (xs[2] can Unsafe.UncheckedIndex)
+""")
+    yield ("array_iteration_sum", """
+def main() -> i64:
+    xs: i64[4] = [1, 2, 3, 4]
+    total: mutable i64 = 0
+    for x in xs |total|:
+        total <- total * 10 + x
+    return total % 251
+""")
+
+
+def gen_struct_methods():
+    """Struct-typed values through calls and returns, plus a struct with mixed field widths —
+    layout is invisible to an exit code unless every field is READ BACK."""
+    yield ("struct_mixed_widths", """
+struct Mixed:
+    a: u8
+    b: i64
+    c: bool
+
+def mk() -> Mixed:
+    return Mixed{a: 7.u8(), b: 300, c: true}
+
+def main() -> i64:
+    m: Mixed = mk()
+    flag: i64 = 1 if m.c else 0
+    return m.a.i64() * 1000 + m.b + flag
+""")
+    yield ("struct_by_ref_mutation", """
+struct Counter:
+    n: i64
+
+def bump(c: mutable Counter&) -> void:
+    c.n <- c.n + 2
+
+def main() -> i64:
+    c: mutable Counter = Counter{n: 1}
+    bump(c)
+    bump(c)
+    return c.n
+""")
+    yield ("struct_nested_field", """
+struct Inner:
+    v: i64
+
+struct Outer:
+    left: Inner
+    right: Inner
+
+def main() -> i64:
+    o: Outer = Outer{left: Inner{v: 3}, right: Inner{v: 8}}
+    return o.left.v * 10 + o.right.v
+""")
+
+
+GENERATORS += [gen_loops_control, gen_optionals_refs, gen_ufcs_modules,
+               gen_arrays_fixed, gen_struct_methods]
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     results = {"MATCH": [], "MISMATCH": [], "DECLINE": [], "PERMISSIVE": [], "SKIP": []}
