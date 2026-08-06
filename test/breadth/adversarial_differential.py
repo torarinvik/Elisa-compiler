@@ -667,6 +667,62 @@ def main() -> i64:
             note(4)
     return trace
 """)
+    # `break` / `continue` jump past the end-of-iteration unwind and must run it themselves.
+    yield ("defer_with_break", """
+global mutable trace: i64 = 0
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run() -> void:
+    for i in 0..<4:
+        defer block:
+            note(1)
+        note(2)
+        break if i == 1
+
+def main() -> i64:
+    run()
+    return trace % 251
+""")
+    yield ("defer_with_continue", """
+global mutable trace: i64 = 0
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run() -> void:
+    for i in 0..<3:
+        defer block:
+            note(1)
+        continue if i == 1
+        note(2)
+
+def main() -> i64:
+    run()
+    return trace % 251
+""")
+    # Nested regions: the inner defer runs at the INNER end.
+    yield ("defer_nested_regions", """
+global mutable trace: i64 = 0
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run() -> void:
+    region outer:
+        defer block:
+            note(1)
+        region inner:
+            defer block:
+                note(2)
+            note(3)
+        note(4)
+
+def main() -> i64:
+    run()
+    return trace % 251
+""")
     yield ("region_block_value_survives", """
 def build() -> i64:
     total: mutable i64 = 0
