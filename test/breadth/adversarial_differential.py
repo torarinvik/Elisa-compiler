@@ -723,6 +723,27 @@ def main() -> i64:
     run()
     return trace % 251
 """)
+    # A match ARM body and an `if` BRANCH are statement lists too.
+    yield ("defer_in_match_arm", """
+global mutable trace: i64 = 0
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run(n: i64) -> void:
+    match n:
+        0:
+            defer block:
+                note(1)
+            note(2)
+        _:
+            note(3)
+    note(4)
+
+def main() -> i64:
+    run(0)
+    return trace
+""")
     yield ("region_block_value_survives", """
 def build() -> i64:
     total: mutable i64 = 0
