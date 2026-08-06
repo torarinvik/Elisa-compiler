@@ -607,6 +607,66 @@ def main() -> i64:
     _ = run(true)
     return trace
 """)
+    # SCOPE exits: a `defer block:` belongs to the scope that declared it, so it runs per
+    # loop ITERATION and at the end of a `region` body — not once at function exit.
+    yield ("defer_per_loop_iteration", """
+global mutable trace: i64 = 0
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run() -> void:
+    for i in 0..<2:
+        defer block:
+            note(1)
+        note(2)
+
+def main() -> i64:
+    run()
+    return trace % 251
+""")
+    yield ("defer_at_region_end", """
+global mutable trace: i64 = 0
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run() -> void:
+    region scratch:
+        defer block:
+            note(1)
+        note(2)
+    note(3)
+
+def main() -> i64:
+    run()
+    return trace
+""")
+    # A `raise` is a function exit and unwinds `defer` exactly as `return` does.
+    yield ("defer_on_raise_path", """
+global mutable trace: i64 = 0
+
+error Bad:
+    Boom
+
+def note(n: i64) -> void:
+    trace <- trace * 10 + n
+
+def run(x: i64) -> i64 error[Bad]:
+    defer block:
+        note(1)
+    raise Bad.Boom if x < 0
+    note(2)
+    return x
+
+def main() -> i64:
+    catch run(-1):
+        v:
+            note(3)
+        error e:
+            note(4)
+    return trace
+""")
     yield ("region_block_value_survives", """
 def build() -> i64:
     total: mutable i64 = 0
