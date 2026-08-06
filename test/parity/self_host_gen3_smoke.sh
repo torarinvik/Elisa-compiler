@@ -71,26 +71,15 @@ guard fn_type_generic \
 guard when_table \
   'def f(n: i64) -> i64:\n    return when n:\n        0 -> 10\n        _ -> 20\n\ndef main() -> i64:\n    return f(0)\n' \
   '05b3c03 — payload-free packed variant returned its ordinal as a handle'
-# MULTI-COLUMN `when` is NOT implemented in the stage1 backend — `when a, b:` declines its
-# whole enclosing body, at every spelling (return / local, all-literal / partly-wild). stage0
-# compiles it.
-#
-# This guard USED to be a `guard` like the three above and USED to pass, which is the reason
-# it is worth this comment: gen2 exited 0 while dropping `f`, and `main` still called it, so
-# the object it "successfully" produced could never link (`nm -u` showed `_f`; clang refuses
-# it). The check was reading a compile exit code that meant nothing. The driver now declines
-# a program that drops a body something still calls, which is what turned this from green
-# into the honest red it always should have been.
-#
-# So assert the CURRENT truth: this must fail to compile. Whoever implements multi-column
-# `when` will see this go red — promote it back to a `guard` then.
-xfail_gap() {
-    a_total=$((a_total + 1))
-    if run_gen2 "$1" "$2"; then echo "  FAIL gen2_$1: now COMPILES — $3"; else a_pass=$((a_pass + 1)); fi
-}
-xfail_gap when_or_columns \
+# MULTI-COLUMN `when`. This guard was green for a long time WITHOUT the backend having any
+# lowering for it: gen2 exited 0 while dropping `f`, and `main` still called it, so the object
+# it "successfully" produced could never link (`nm -u` showed `_f`; clang refuses it). It was
+# reading a compile exit code that, before the driver rejected a program dropping a called
+# body, meant nothing. Backed by the answer-checking fixture test/repro/when_multi_column.elisa
+# now that the table is actually emitted.
+guard when_or_columns \
   'def f(a: i64, b: i64) -> i64:\n    return when a, b:\n        0, 0 -> 10\n        _, _ -> 20\n\ndef main() -> i64:\n    return f(0, 0)\n' \
-  'multi-column `when` is implemented; make this a `guard` again'
+  'multi-column `when` — wildcard/or columns in a decision table'
 
 [ "$a_pass" -eq "$a_total" ] || fail "stage A regression: $a_pass/$a_total (a previously FIXED self-host blocker is back)"
 echo "self_host_gen3_smoke stage A OK: $a_pass/$a_total (fixed blockers still fixed)"
