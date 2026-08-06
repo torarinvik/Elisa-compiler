@@ -1201,6 +1201,61 @@ GENERATORS += [gen_comprehensions, gen_casts_widths, gen_payload_enums,
                gen_bit_operations, gen_generic_structs]
 
 
+def gen_std_containers():
+    """The STD's containers through their real API — dict/set/darray/f-string. These need the
+    std in the unit, which is a different acceptance path from the bare programs above."""
+    yield ("std_dict_put_get_overwrite", f"""
+include "{STD}"
+
+def main() -> i64 can[Abort.Panic, Memory.Allocate]:
+    m: mutable dict[i64, i64] = {{}}
+    m <- m.put(1, 10)
+    m <- m.put(2, 20)
+    m <- m.put(1, 30)
+    total: mutable i64 = m.count.i64() * 100
+    if m.get(1) is v:
+        total <- total + v
+    if m.get(9) is w:
+        total <- total + 1
+    return total % 251
+""")
+    yield ("std_set_dedup_and_membership", f"""
+include "{STD}"
+
+def main() -> i64 can[Abort.Panic, Memory.Allocate]:
+    s: mutable set[i64] = {{}}
+    _ = s.add(3)
+    _ = s.add(3)
+    _ = s.add(4)
+    a: i64 = 1 if 3 in s else 0
+    b: i64 = 1 if 9 in s else 0
+    return s.count.i64() * 100 + a * 10 + b
+""")
+    yield ("std_darray_push_pop", f"""
+include "{STD}"
+
+def main() -> i64 can[Abort.Panic, Memory.Allocate]:
+    xs: mutable darray[i64] = []
+    xs.push(1)
+    xs.push(2)
+    xs.push(3)
+    popped: i64 = xs.pop()
+    return xs.count.i64() * 100 + popped * 10 + (xs[0] can Unsafe.UncheckedIndex)
+""")
+    yield ("std_fstring_interpolation", f"""
+include "{STD}"
+
+def main() -> i64 can[Abort.Panic, Memory.Allocate]:
+    a: dstr = "ab"
+    b: dstr = "cde"
+    s: dstr = f"{{a}}-{{b}}!"
+    return s.count.i64() * 10 + (s[3] can Unsafe.UncheckedIndex).i64() % 10
+""")
+
+
+GENERATORS += [gen_std_containers]
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     results = {"MATCH": [], "MISMATCH": [], "DECLINE": [], "PERMISSIVE": [], "SKIP": []}
