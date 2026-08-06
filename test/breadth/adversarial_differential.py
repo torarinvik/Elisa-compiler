@@ -118,7 +118,7 @@ def main() -> i64:
     can Memory.Allocate, Abort.Panic:
         a: cstr = idy("ab")
         b: sview = idy(sview("cdef", 0, 4))
-        return runtime_strlen(a).i64() + b.count.i64()
+        return runtime_strlen(a).i64() + b.len.i64()
 """)
     yield ("mangle_two_dicts", f"""
 include "{STD}"
@@ -127,8 +127,8 @@ def main() -> i64:
     can Memory.Allocate, Abort.Panic:
         m: mutable dict[u64, i64] = {{}}
         m <- m.put(1.u64(), 3)
-        n: mutable dict[sview, i64] = {{}}
-        n <- n.put(sview("k", 0, 1), 4)
+        n: mutable dict[cstr, i64] = {{}}
+        n <- n.put("k", 4)
         return (m.count + n.count).i64()
 """)
 
@@ -329,11 +329,11 @@ def gen_refs_optionals():
     """References and optionals — the ABI shapes that produced past divergences."""
     yield ("optional_bind", """
 def find(n: i64) -> i64?:
-    return null if n < 0
+    null return if n < 0
     return n
 
 def main() -> i64:
-    a: i64 = 7
+    a: mutable i64 = 7
     if find(3) is v:
         a <- a + v
     if find(-1) is w:
@@ -395,8 +395,8 @@ def main() -> i64:
 """)
     yield ("bitops", """
 def main() -> i64:
-    a: i64 = 0b1011
-    b: i64 = 0b0110
+    a: i64 = 0xB
+    b: i64 = 0x6
     return (a & b) * 100 + (a | b) * 10 + (a ^ b)
 """)
 
@@ -418,7 +418,7 @@ include "{STD}"
 def main() -> i64:
     can Memory.Allocate, Abort.Panic:
         s: sview = sview("abcd", 0, 4)
-        return s.count.i64() * 10 + (s[1] - 96).i64()
+        return s.len.i64() * 10 + (s[1] - 96).i64()
 """)
 
 def gen_generics_multi():
@@ -808,10 +808,10 @@ def outer(n: i64) -> i64?:
     return null
 
 def main() -> i64:
-    a: i64 = 0
+    a: mutable i64 = 0
     if outer(3) is x:
         a <- x
-    b: i64 = 0
+    b: mutable i64 = 0
     if outer(-1) is y:
         b <- y
     return a * 10 + b
@@ -893,7 +893,7 @@ def main() -> i64:
 """)
     yield ("struct_by_ref_mutation", """
 struct Counter:
-    n: i64
+    n: mutable i64
 
 def bump(c: mutable Counter&) -> void:
     c.n <- c.n + 2
@@ -920,6 +920,169 @@ def main() -> i64:
 
 GENERATORS += [gen_loops_control, gen_optionals_refs, gen_ufcs_modules,
                gen_arrays_fixed, gen_struct_methods]
+
+
+def gen_comprehensions():
+    """Comprehensions and queries — the construct the language exists to vectorize, and one
+    whose result is a CONTAINER, so a wrong element order or a dropped filter is silent."""
+    yield ("comprehension_filtered", """
+def main() -> i64:
+    xs: darray[i64] = [i for i in 0..<8 if i % 3 == 1]
+    total: mutable i64 = 0
+    for x in xs |total|:
+        total <- total * 10 + x
+    return total
+""")
+    yield ("comprehension_mapped", """
+def main() -> i64:
+    xs: darray[i64] = [i * 2 + 1 for i in 0..<4]
+    total: mutable i64 = 0
+    for x in xs |total|:
+        total <- total + x
+    return total
+""")
+    yield ("comprehension_over_literal", """
+def main() -> i64:
+    xs: darray[i64] = [x * x for x in [1, 2, 3]]
+    return (xs[0] can Unsafe.UncheckedIndex) * 100 + (xs[1] can Unsafe.UncheckedIndex) * 10 + (xs[2] can Unsafe.UncheckedIndex)
+""")
+
+
+def gen_casts_widths():
+    """Width casts and sign extension — a wrong extension is invisible until the value is
+    read back at a different width."""
+    yield ("cast_narrow_then_widen", """
+def main() -> i64:
+    big: i64 = 300
+    narrowed: u8 = big.u8()
+    return narrowed.i64()
+""")
+    yield ("cast_sign_extension", """
+def main() -> i64:
+    small: i8 = -2
+    widened: i64 = small.i64()
+    return widened + 100
+""")
+    yield ("cast_unsigned_no_sign_extend", """
+def main() -> i64:
+    small: u8 = 254
+    widened: i64 = small.i64()
+    return widened % 251
+""")
+    yield ("cast_roundtrip_u32", """
+def main() -> i64:
+    a: i64 = 70000
+    b: u32 = a.u32()
+    c: u16 = b.u16()
+    return c.i64() % 251
+""")
+
+
+def gen_payload_enums():
+    """Payload enums: multi-field payloads and per-variant binding, where a wrong slot reads
+    a neighbouring field."""
+    yield ("penum_two_fields", """
+enum Shape:
+    Rect(i64, i64)
+    Dot
+
+def area(s: Shape) -> i64:
+    return match s:
+        Shape.Rect(w, h): w * 10 + h
+        Shape.Dot: 99
+
+def main() -> i64:
+    return area(Shape.Rect(3, 4)) + area(Shape.Dot)
+""")
+    yield ("penum_mixed_widths", """
+enum Msg:
+    Tag(u8, i64)
+    Empty
+
+def read(m: Msg) -> i64:
+    return match m:
+        Msg.Tag(a, b): a.i64() * 1000 + b
+        Msg.Empty: 7
+
+def main() -> i64:
+    return read(Msg.Tag(5.u8(), 42)) + read(Msg.Empty)
+""")
+    yield ("penum_variant_order", """
+enum E:
+    A(i64)
+    B(i64)
+    C(i64)
+
+def pick(e: E) -> i64:
+    return match e:
+        E.A(v): v + 100
+        E.B(v): v + 200
+        E.C(v): v + 300
+
+def main() -> i64:
+    return pick(E.B(1)) - pick(E.A(1))
+""")
+
+
+def gen_bit_operations():
+    """Shifts and masks at type boundaries — where an implicit width promotion changes the
+    answer without changing the program's shape."""
+    yield ("shift_u8_wraps", """
+def main() -> i64:
+    x: u8 = 200
+    y: u8 = (x << 1.u8())
+    return y.i64() % 251
+""")
+    yield ("mask_and_or_xor", """
+def main() -> i64:
+    a: i64 = 0xC
+    b: i64 = 0xA
+    return (a & b) * 100 + (a | b) * 10 + (a ^ b)
+""")
+    yield ("right_shift_signed", """
+def main() -> i64:
+    a: i64 = -16
+    return (a >> 2) + 100
+""")
+
+
+def gen_generic_structs():
+    """Generic STRUCTS instantiated at more than one argument — the mangling path that
+    collapsed two instantiations into one before."""
+    yield ("generic_struct_two_args", """
+struct Box[T]:
+    v: T
+
+def unbox[T](b: Box[T]) -> T:
+    return b.v
+
+def main() -> i64:
+    a: Box[i64] = Box[i64]{v: 40}
+    b: Box[u8] = Box[u8]{v: 2.u8()}
+    return unbox(a) + unbox(b).i64()
+""")
+    yield ("generic_nested_instantiation", """
+struct Box[T]:
+    v: T
+
+def main() -> i64:
+    inner: Box[i64] = Box[i64]{v: 7}
+    outer: Box[Box[i64]] = Box[Box[i64]]{v: inner}
+    return outer.v.v * 6
+""")
+    yield ("generic_fn_two_instantiations", """
+def pick[T](a: T, b: T, first: bool) -> T:
+    return a if first else b
+
+def main() -> i64:
+    n: i64 = pick(3, 9, true)
+    c: u8 = pick(1.u8(), 2.u8(), false)
+    return n * 10 + c.i64()
+""")
+
+
+GENERATORS += [gen_comprehensions, gen_casts_widths, gen_payload_enums,
+               gen_bit_operations, gen_generic_structs]
 
 
 def main():
@@ -971,7 +1134,14 @@ def main():
           f"{len(results['PERMISSIVE'])} PERMISSIVE (stage0 rejects, stage1 builds), "
           f"{len(results['SKIP'])} skipped")
     print(f"work dir: {work}")
-    return 1 if results["MISMATCH"] else 0
+    # RATCHET. All three of these are at zero and must stay there:
+    #   MISMATCH   a silent wrong answer — the worst outcome there is
+    #   DECLINE    stage0 built it, stage1 could not (an acceptance gap)
+    #   PERMISSIVE stage0 rejects it, stage1 builds it (the direction no census can see)
+    # SKIP is not ratcheted: it means the ORACLE could not arbitrate (stage0 rejects the
+    # program, or crashes on it), which says nothing about stage1. Keep those few honest by
+    # fixing the generator program rather than by tolerating the skip.
+    return 1 if results["MISMATCH"] or results["DECLINE"] or results["PERMISSIVE"] else 0
 
 if __name__ == "__main__":
     sys.exit(main())
