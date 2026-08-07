@@ -544,6 +544,70 @@ extend Backend:
                 for mwt_declare in 0..<result_types.count |local_scope, mwt_slots, result_types, var_names|:
                     declare_local(local_scope, var_names[mwt_declare], mwt_slots[mwt_declare], result_types[mwt_declare])
                 return EmitStatus.Open
+            # `x: T = match p: Point{x, y}: EXPR / _: EXPR` — a plain STRUCT destructure in
+            # VALUE position. Mirrors the statement emitter's struct-pattern arm
+            # (codegen_stmt_match.elisa) and the `is`-condition struct narrowing
+            # (codegen_expr_idents_binary.elisa): a struct pattern has no discriminant (the
+            # scrutinee's STATIC type already names the struct), so the struct arm is
+            # unconditionally taken. CONFIRMED against stage0's own `-emit llvm -O0` output:
+            # unconditional per-field extractvalue/store into the bound names, then the arm
+            # body; the fallback `_` arm's own block is emitted but is dead code ("No
+            # predecessors!") — it is only there because value-position match must be
+            # exhaustive (stage0 rejects a struct match with no trailing `_`). Since that arm
+            # never actually runs, this emitter does not bother replicating its dead block —
+            # only its PRESENCE is required, to keep the shape restricted to what was verified.
+            #
+            # SOUND SUBSET, same restriction as the two sibling fixes: exactly two arms
+            # (Struct then a catch-all), and only Binding/Wildcard inner field patterns —
+            # a literal or nested sub-pattern field declines, as does any extra arm between
+            # them (no example of either shape exists in the corpus to verify against).
+            if scrutinee_type.kind == TypeKind.Struct and match_arms.count == 2:
+                if match_arms[0].pattern is Pattern.Struct(mss_path, mss_fields):
+                    if not arm_has_guard(match_arms[0].guard) and is_catch_all_pattern(match_arms[1].pattern) and not arm_has_guard(match_arms[1].guard):
+                        mss_slot: i64 = struct_index_of(structs, mss_path)
+                        if mss_slot >= 0 and mss_slot.u32() == scrutinee_type.bits:
+                            mss_declined: mutable bool = false
+                            mss_positions: mutable darray[i64] = []
+                            mss_names: mutable darray[sview] = []
+                            for mss_field in mss_fields |mss_declined, mss_positions, mss_names, mss_slot, structs|:
+                                if mss_field is Pattern.Field(mss_selector, mss_inner):
+                                    # A Wildcard field is decided BEFORE any by-name lookup —
+                                    # its selector is the literal text "_", not a real field
+                                    # name (see the statement emitter's identical note).
+                                    if mss_inner.count == 1 and mss_inner[0] is Pattern.Wildcard:
+                                        pass
+                                    else:
+                                        mss_position: i64 = field_index_of(structs, mss_slot.usize(), mss_selector)
+                                        if mss_position < 0 or mss_inner.count != 1:
+                                            mss_declined <- true
+                                        elif mss_inner[0] is Pattern.Binding(mss_bind_name):
+                                            mss_positions.push(mss_position)
+                                            mss_names.push(mss_bind_name)
+                                        else:
+                                            mss_declined <- true
+                                else:
+                                    mss_declined <- true
+                            if not mss_declined:
+                                if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is mss_struct_value:
+                                    mss_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                    mss_storage: mutable darray[u8] = []
+                                    mss_slots: mutable darray[LLVMValueRef] = []
+                                    for mss_n in 0..<result_types.count |mss_slots, mss_storage, result_types, var_names, structs, ctx, builder|:
+                                        mss_slots.push(LLVMBuildAlloca(builder, llvm_type_of(result_types[mss_n], structs, ctx), sview_to_cstr(var_names[mss_n], mss_storage)))
+                                    for mss_bind_index in 0..<mss_positions.count |mss_positions, mss_names, mss_struct_value, mss_slot, structs, local_scope, ctx, builder|:
+                                        mss_field_type: ValueType = structs.field_types[structs.field_start[mss_slot.usize()] + mss_positions[mss_bind_index].usize()]
+                                        mss_field_value: LLVMValueRef = LLVMBuildExtractValue(builder, mss_struct_value, mss_positions[mss_bind_index].u32(), "mss.struct.field")
+                                        mss_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(mss_field_type, structs, ctx), "mss.struct.bind")
+                                        _ = LLVMBuildStore(builder, mss_field_value, mss_bind_slot)
+                                        declare_local(local_scope, mss_names[mss_bind_index], mss_bind_slot, mss_field_type)
+                                    mss_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mss_function, "mss.done")
+                                    EmitStatus.Declined return if not emit_arm_body_into_slot(match_arms[0].body, result_types, mss_slots, mss_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                    LLVMPositionBuilderAtEnd(builder, mss_done)
+                                    for mss_declare in 0..<result_types.count |local_scope, mss_slots, result_types, var_names|:
+                                        declare_local(local_scope, var_names[mss_declare], mss_slots[mss_declare], result_types[mss_declare])
+                                    return EmitStatus.Open
+                                return EmitStatus.Declined
+
             # `x: T = match OPT: v: EXPR / _: …` — an OPTIONAL scrutinee in VALUE position.
             #
             # A BINDING arm over an optional is a CATCH-ALL: stage0 takes it even when the
@@ -588,6 +652,59 @@ extend Backend:
                         declare_local(local_scope, var_names[mis_opt_d], mis_opt_slots[mis_opt_d], result_types[mis_opt_d])
                     return EmitStatus.Open
                 return EmitStatus.Declined
+            # `x: T = match p: Point{x, y}: … _: …` — a plain STRUCT destructure arm in VALUE
+            # position. Mirrors the statement-position fix in codegen_stmt_match.elisa: a struct
+            # pattern has no discriminant (the scrutinee's static type already proves the match),
+            # so the FIRST arm wins unconditionally and later arms (the required `_` fallback —
+            # stage0 rejects a struct match with no `_` arm as "non-exhaustive") are never
+            # reached. stage0's own `-emit llvm` output for this shape still EMITS the fallback's
+            # dead code (an unreachable block, since -O0 runs no DCE); skipping it here instead
+            # produces the same runtime answer with less code, matching how the statement-position
+            # fix already treats later arms as dead rather than replicating stage0's dead blocks.
+            #
+            # SOUND SUBSET, matching the statement-position fix exactly: only bare-Ident (fresh
+            # binding) or Wildcard (skip) fields are modeled; anything else falls through to the
+            # ordinary dispatch below, which declines it.
+            if match_arms.count >= 1 and match_arms[0].pattern is Pattern.Struct(mvs_path, mvs_fields) and not arm_has_guard(match_arms[0].guard):
+                mvs_slot: i64 = struct_index_of(structs, mvs_path)
+                if mvs_slot >= 0 and scrutinee_type.kind == TypeKind.Struct and scrutinee_type.bits == mvs_slot.u32():
+                    mvs_declined: mutable bool = false
+                    mvs_positions: mutable darray[i64] = []
+                    mvs_names: mutable darray[sview] = []
+                    for mvs_field in mvs_fields |mvs_declined, mvs_positions, mvs_names, mvs_slot, structs|:
+                        if mvs_field is Pattern.Field(mvs_selector, mvs_inner):
+                            if mvs_inner.count == 1 and mvs_inner[0] is Pattern.Wildcard:
+                                pass
+                            else:
+                                mvs_position: i64 = field_index_of(structs, mvs_slot.usize(), mvs_selector)
+                                if mvs_position < 0 or mvs_inner.count != 1:
+                                    mvs_declined <- true
+                                elif mvs_inner[0] is Pattern.Binding(mvs_bind_name):
+                                    mvs_positions.push(mvs_position)
+                                    mvs_names.push(mvs_bind_name)
+                                else:
+                                    mvs_declined <- true
+                        else:
+                            mvs_declined <- true
+                    if not mvs_declined:
+                        if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is mvs_struct_value:
+                            for mvs_bind_index in 0..<mvs_positions.count |mvs_positions, mvs_names, mvs_struct_value, mvs_slot, structs, local_scope, ctx, builder|:
+                                mvs_field_type: ValueType = structs.field_types[structs.field_start[mvs_slot.usize()] + mvs_positions[mvs_bind_index].usize()]
+                                mvs_field_value: LLVMValueRef = LLVMBuildExtractValue(builder, mvs_struct_value, mvs_positions[mvs_bind_index].u32(), "match.struct.field")
+                                mvs_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(mvs_field_type, structs, ctx), "match.struct.bind")
+                                _ = LLVMBuildStore(builder, mvs_field_value, mvs_bind_slot)
+                                declare_local(local_scope, mvs_names[mvs_bind_index], mvs_bind_slot, mvs_field_type)
+                            mvs_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            mvs_storage: mutable darray[u8] = []
+                            mvs_slots: mutable darray[LLVMValueRef] = []
+                            for mvs_slot_index in 0..<result_types.count |mvs_slots, mvs_storage, result_types, var_names, structs, ctx, builder|:
+                                mvs_slots.push(LLVMBuildAlloca(builder, llvm_type_of(result_types[mvs_slot_index], structs, ctx), sview_to_cstr(var_names[mvs_slot_index], mvs_storage)))
+                            mvs_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mvs_function, "match.struct.done")
+                            EmitStatus.Declined return if not emit_arm_body_into_slot(match_arms[0].body, result_types, mvs_slots, mvs_done, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                            LLVMPositionBuilderAtEnd(builder, mvs_done)
+                            for mvs_d in 0..<result_types.count |local_scope, mvs_slots, result_types, var_names|:
+                                declare_local(local_scope, var_names[mvs_d], mvs_slots[mvs_d], result_types[mvs_d])
+                            return EmitStatus.Open
             EmitStatus.Declined return if packed_scrutinee and runtime.active_store_enum != packed_root_index_of(structs, scrutinee_type.bits.i64())
             EmitStatus.Declined return if not is_integer_type(scrutinee_type) and not penum_scrutinee and not packed_scrutinee and not cstr_scrutinee and not sview_scrutinee
             if emit_expression(match_scrutinee, scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is scrutinee_raw:
