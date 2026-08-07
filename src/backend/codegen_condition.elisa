@@ -741,6 +741,14 @@ extend Backend:
                 # not be in scope there.
                 mis_record: mutable LLVMValueRef = zeroed
                 mis_row_type: mutable LLVMTypeRef = zeroed
+                # A payload enum's raw payload is a `[N x i64]` WORD ARRAY shared by every
+                # variant, not a per-variant struct — an in-register `extractvalue` cannot
+                # reinterpret those words as the variant's actual field types. Spilling the
+                # whole scrutinee to a slot once (like `packed_slot`'s single record read
+                # above) lets the field-bind block below GEP+load at the variant's real
+                # payload type, exactly as the statement emitter does
+                # (codegen_stmt_match_scalar.elisa's `sm_penum_slot`).
+                mis_penum_slot: mutable LLVMValueRef = zeroed
                 if packed_scrutinee:
                     mis_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "mis.state")
                     mis_index: LLVMValueRef = LLVMBuildZExt(builder, scrutinee_raw, LLVMInt64TypeInContext(ctx), "mis.index")
@@ -754,6 +762,8 @@ extend Backend:
                 if penum_scrutinee:
                     mis_scrutinee <- LLVMBuildExtractValue(builder, scrutinee_raw, 0, "mis.penum.tag")
                     mis_compare_type <- LLVMInt32TypeInContext(ctx)
+                    mis_penum_slot <- LLVMBuildAlloca(builder, llvm_type_of(scrutinee_type, structs, ctx), "mis.penum.slot")
+                    _ = LLVMBuildStore(builder, scrutinee_raw, mis_penum_slot)
                 mis_slot_storage: mutable darray[u8] = []
                 mis_result_slots: mutable darray[LLVMValueRef] = []
                 for mis_slot_n in 0..<result_types.count |mis_result_slots, mis_slot_storage, result_types, var_names, structs, ctx, builder|:
@@ -788,7 +798,7 @@ extend Backend:
                             mis_expanded <- true
                     mis_arms.push(mis_src_arm) if not mis_expanded
 
-                for arm in mis_arms |mis_declined, mis_saw_default, cstr_scrutinee, sview_scrutinee, packed_scrutinee, penum_scrutinee, mis_scrutinee, mis_record, mis_row_type, scrutinee_raw, scrutinee_type, mis_compare_type, result_types, mis_result_slots, mis_done, mis_function, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
+                for arm in mis_arms |mis_declined, mis_saw_default, cstr_scrutinee, sview_scrutinee, packed_scrutinee, penum_scrutinee, mis_scrutinee, mis_record, mis_row_type, mis_penum_slot, scrutinee_raw, scrutinee_type, mis_compare_type, result_types, mis_result_slots, mis_done, mis_function, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder|:
                     continue if mis_declined or mis_saw_default
                     mis_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.arm")
                     # Catch-all (`_` / binder): unconditional, closes the chain.
@@ -961,6 +971,47 @@ extend Backend:
                                                         mis_ni_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.nest.cont")
                                                         _ = LLVMBuildCondBr(builder, mis_ni_hit, mis_ni_cont, mis_next)
                                                         LLVMPositionBuilderAtEnd(builder, mis_ni_cont)
+                        # `Shape.Circle(r):` in VALUE position — bind the plain payload-enum's
+                        # field(s). This dispatcher previously bound fields for `packed_scrutinee`
+                        # only; a payload-enum arm's tag test was emitted but its names were never
+                        # declared, so any arm body referencing one failed to emit and the whole
+                        # value-position match declined (confirmed: the SAME fixture with the
+                        # binder names unused still declines, so this is not about `as`-binding —
+                        # a real, separate, pre-existing gap). Mirrors the statement emitter's
+                        # penum binding (codegen_stmt_match_scalar.elisa): the raw payload is a
+                        # shared `[N x i64]` word array, not a per-variant struct, so it must be
+                        # read back through the pre-spilled `mis_penum_slot` at the variant's own
+                        # payload type — an in-register ExtractValue cannot reinterpret it.
+                        if penum_scrutinee:
+                            if mis_pattern is Pattern.Variant(mis_pe_path, mis_pe_fields):
+                                if mis_pe_fields.count == 1:
+                                    mis_pe_payload: ValueType = penum_payload_of_path(mis_pe_path, structs)
+                                    if mis_pe_payload.kind == TypeKind.Unmodeled:
+                                        mis_declined <- true
+                                    elif mis_pe_fields[0] is Pattern.Binding(mis_pe_one_name):
+                                        mis_pe_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(scrutinee_type, structs, ctx), mis_penum_slot, 1, "mis.penum.payload.ptr")
+                                        mis_pe_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(mis_pe_payload, structs, ctx), mis_pe_ptr, "mis.penum.payload")
+                                        mis_pe_one_storage: mutable darray[u8] = []
+                                        mis_pe_one_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(mis_pe_payload, structs, ctx), sview_to_cstr(mis_pe_one_name, mis_pe_one_storage))
+                                        _ = LLVMBuildStore(builder, mis_pe_value, mis_pe_one_slot)
+                                        declare_local(local_scope, mis_pe_one_name, mis_pe_one_slot, mis_pe_payload)
+                                if mis_pe_fields.count > 1:
+                                    mis_pe_slot_index: i64 = penum_slot_of_path(mis_pe_path, structs)
+                                    if mis_pe_slot_index < 0 or mis_pe_fields.count != structs.penum_field_type_count[mis_pe_slot_index.usize()]:
+                                        mis_declined <- true
+                                    else:
+                                        mis_pe_tuple: LLVMTypeRef = penum_field_tuple_type(mis_pe_slot_index.usize(), structs, ctx)
+                                        mis_pe_multi_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(scrutinee_type, structs, ctx), mis_penum_slot, 1, "mis.penum.payload.ptr")
+                                        mis_pe_multi_value: LLVMValueRef = LLVMBuildLoad2(builder, mis_pe_tuple, mis_pe_multi_ptr, "mis.penum.payload")
+                                        mis_pe_start: usize = structs.penum_field_type_start[mis_pe_slot_index.usize()]
+                                        for mis_pe_i in 0..<mis_pe_fields.count |mis_pe_fields, mis_pe_start, mis_pe_multi_value, structs, local_scope, ctx, builder|:
+                                            if mis_pe_fields[mis_pe_i] is Pattern.Binding(mis_pe_multi_name):
+                                                mis_pe_field_type: ValueType = copied_type(structs.penum_field_types[mis_pe_start + mis_pe_i])
+                                                mis_pe_field_value: LLVMValueRef = LLVMBuildExtractValue(builder, mis_pe_multi_value, mis_pe_i.u32(), "mis.penum.field")
+                                                mis_pe_multi_storage: mutable darray[u8] = []
+                                                mis_pe_multi_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(mis_pe_field_type, structs, ctx), sview_to_cstr(mis_pe_multi_name, mis_pe_multi_storage))
+                                                _ = LLVMBuildStore(builder, mis_pe_field_value, mis_pe_multi_slot)
+                                                declare_local(local_scope, mis_pe_multi_name, mis_pe_multi_slot, mis_pe_field_type)
                         if arm_has_guard(arm.guard):
                             if emit_condition(arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is mis_guard_bit:
                                 mis_guard_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, mis_function, "mis.guard")
