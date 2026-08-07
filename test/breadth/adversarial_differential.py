@@ -1708,9 +1708,98 @@ def main() -> i64:
 """)
 
 
+def gen_as_bindings():
+    """`PATTERN as NAME:` — binds the whole matched value alongside its fields. Newly
+    implemented this session across struct/payload-enum/packed-enum x statement/value
+    position; zero usage anywhere in the compiler's own corpus, so self-hosting cannot
+    exercise it at all. Each program must ENCODE which arm ran AND use the `as`-bound
+    whole value distinctly from its unpacked fields, so a fix that binds the wrong thing
+    (or the field's value instead of the whole matched value) produces a wrong ANSWER,
+    not just a decline.
+    """
+    yield ("as_struct_statement_match", """
+struct Point:
+    x: i64
+    y: i64
+
+def describe(p: Point) -> i64:
+    match p:
+        Point{x, y} as whole:
+            return whole.x * 100 + whole.y * 10 + x + y
+    return 0
+
+def main() -> i64:
+    return describe(Point{x: 3, y: 4})
+""")
+    yield ("as_struct_value_match", """
+struct Point:
+    x: i64
+    y: i64
+
+def describe(p: Point) -> i64:
+    result: i64 = match p:
+        Point{x, y} as whole:
+            whole.x * 100 + whole.y * 10 + x + y
+        _:
+            0
+    return result
+
+def main() -> i64:
+    return describe(Point{x: 3, y: 4})
+""")
+    yield ("as_payload_enum_statement_match", """
+enum Shape:
+    Circle(r: i64)
+    Square(side: i64)
+
+def area_code(s: Shape) -> i64:
+    match s:
+        Shape.Circle(r) as whole:
+            return r * 1000
+        Shape.Square(side) as whole:
+            return side * 1
+    return 0
+
+def main() -> i64:
+    return area_code(Shape.Circle(3)) + area_code(Shape.Square(4))
+""")
+    yield ("as_payload_enum_bare_variant", """
+enum Signal:
+    Empty
+    Full(n: i64)
+
+def code(s: Signal) -> i64:
+    match s:
+        Signal.Empty as whole:
+            return 7
+        Signal.Full(n) as whole:
+            return n * 2
+    return 0
+
+def main() -> i64:
+    return code(Signal.Empty) * 100 + code(Signal.Full(5))
+""")
+    yield ("as_binding_two_arms_disjoint", """
+enum Op:
+    Add(a: i64, b: i64)
+    Neg(a: i64)
+
+def eval(o: Op) -> i64:
+    match o:
+        Op.Add(a, b) as whole:
+            return a + b
+        Op.Neg(a) as whole:
+            return -a
+    return 0
+
+def main() -> i64:
+    return eval(Op.Add(2, 3)) * 10 + eval(Op.Neg(9))
+""")
+
+
 GENERATORS += [gen_aggregate_abi]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
-               gen_type_mismatches, gen_queries]
+               gen_type_mismatches, gen_queries, gen_as_bindings]
 
 
 def main():
