@@ -1797,9 +1797,91 @@ def main() -> i64:
 """)
 
 
+def gen_struct_operator_protocols():
+    """`impl Add/Eq for MyStruct` dispatched through operator syntax (`+`, `==`, `!=`).
+    Landed this session by rewriting the operator to the equivalent explicit method call
+    (`left.__add__(right)`) and reusing the existing UFCS/impl-method call machinery — no
+    prior corpus usage anywhere (the compiler's own `impl` blocks are all for builtin
+    scalar types, never a struct), so self-hosting cannot exercise this at all.
+    """
+    yield ("struct_add_operator", """
+protocol Add:
+    def __add__(self: Self, other: Self) -> Self
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Add for Vec2:
+    def __add__(self: Vec2, other: Vec2) -> Vec2:
+        return Vec2{x: self.x + other.x, y: self.y + other.y}
+
+def main() -> i64:
+    a: Vec2 = Vec2{x: 1, y: 2}
+    b: Vec2 = Vec2{x: 3, y: 4}
+    c: Vec2 = a + b
+    return c.x * 1000 + c.y
+""")
+    yield ("struct_add_via_generic_bound", """
+protocol Add:
+    def __add__(self: Self, other: Self) -> Self
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Add for Vec2:
+    def __add__(self: Vec2, other: Vec2) -> Vec2:
+        return Vec2{x: self.x + other.x, y: self.y + other.y}
+
+def sum2[T: Add](a: T, b: T) -> T:
+    return a + b
+
+def main() -> i64:
+    a: Vec2 = Vec2{x: 1, y: 2}
+    b: Vec2 = Vec2{x: 3, y: 4}
+    d: Vec2 = sum2(a, b)
+    return d.x * 1000 + d.y
+""")
+    yield ("struct_eq_and_ne_operators", """
+protocol Eq:
+    def __eq__(self: Self, other: Self) -> bool
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Eq for Vec2:
+    def __eq__(self: Vec2, other: Vec2) -> bool:
+        return self.x == other.x and self.y == other.y
+
+def main() -> i64:
+    a: Vec2 = Vec2{x: 1, y: 2}
+    b: Vec2 = Vec2{x: 1, y: 2}
+    c: Vec2 = Vec2{x: 9, y: 9}
+    eq_same: i64 = 1 if a == b else 0
+    eq_diff: i64 = 1 if a == c else 0
+    ne_same: i64 = 1 if a != b else 0
+    ne_diff: i64 = 1 if a != c else 0
+    return eq_same * 1000 + eq_diff * 100 + ne_same * 10 + ne_diff
+""")
+    yield ("struct_no_impl_still_declines", """
+struct Vec2:
+    x: i64
+    y: i64
+
+def main() -> i64:
+    a: Vec2 = Vec2{x: 1, y: 2}
+    b: Vec2 = Vec2{x: 3, y: 4}
+    c: Vec2 = a + b
+    return c.x
+""")
+
+
 GENERATORS += [gen_aggregate_abi]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
-               gen_type_mismatches, gen_queries, gen_as_bindings]
+               gen_type_mismatches, gen_queries, gen_as_bindings,
+               gen_struct_operator_protocols]
 
 
 def main():
