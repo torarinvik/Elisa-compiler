@@ -1897,6 +1897,35 @@ def main() -> i64:
     ge: i64 = 1 if b >= a else 0
     return lt * 1000 + gt * 100 + le * 10 + ge
 """)
+    yield ("struct_eq_in_control_flow", """
+protocol Eq:
+    def __eq__(self: Self, other: Self) -> bool
+
+struct Point:
+    x: i64
+    y: i64
+
+impl Eq for Point:
+    def __eq__(self: Point, other: Point) -> bool:
+        return self.x == other.x and self.y == other.y
+
+def classify(p: Point, target: Point) -> i64:
+    if p == target:
+        return 1
+    return 0
+
+def main() -> i64:
+    a: Point = Point{x: 1, y: 2}
+    mutable_b: mutable Point = Point{x: 1, y: 2}
+    c: Point = Point{x: 9, y: 9}
+    guard_result: mutable i64 = 0
+    if a == mutable_b:
+        guard_result <- 1
+    while a == mutable_b:
+        guard_result <- guard_result + 10
+        mutable_b <- c
+    return classify(a, mutable_b) * 100 + guard_result
+""")
 
 
 GENERATORS += [gen_aggregate_abi]
