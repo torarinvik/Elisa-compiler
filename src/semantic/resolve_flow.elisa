@@ -56,18 +56,18 @@ extend Semantic:
                             pass
                 return false
 
-        def statement_terminates(statement: Ast::Stmt) -> bool:
-            can Abort.Panic:
+        def statement_terminates(statement: Ast::Stmt, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
                 return match statement:
                     Stmt.Return(_, _):           true
                     Stmt.Break(_, _):            true
                     Stmt.Continue(_, _):         true
-                    Stmt.Match(_, arms, _):      arms_all_terminate(arms)
+                    Stmt.Match(_, arms, _):      arms_all_terminate(arms, table)
                     Stmt.If(_, then_body, else_body, _):
                         # Both branches must terminate for the if to be a terminator
-                        statements_terminate(then_body) and statements_terminate(else_body)
+                        statements_terminate(then_body, table) and statements_terminate(else_body, table)
                     Stmt.Block(_, _, _, body, _):
-                        statements_terminate(body)
+                        statements_terminate(body, table)
                     Stmt.Expr(expression, _):             expression_aborts(expression)
                     Stmt.While(condition, body, _):
                         # `while true:` with no break escaping THIS loop never falls
@@ -112,19 +112,113 @@ extend Semantic:
                 return false
 
 
-        # Whether all arms of a match terminate.
-        def arms_all_terminate(arms: darray[Ast::MatchArm]) -> bool:
-            can Abort.Panic:
+        # Whether all arms of a match terminate AND the match is exhaustive — parity with
+        # stage0, which only treats a `match` as a terminator when every reachable case is
+        # covered (see `match_arms_exhaustive`). A match whose arms all return but that
+        # still has an uncovered case can fall through at runtime, so stage0 rejects the
+        # enclosing function with "may fall through without returning a value".
+        def arms_all_terminate(arms: darray[Ast::MatchArm], table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
                 false return if arms.count == 0
-                return all arm in arms where statements_terminate(arm.body)
+                false return if not (all arm in arms where statements_terminate(arm.body, table))
+                return match_arms_exhaustive(arms, table)
+
+
+        # Whether `arms` provably covers every value the scrutinee can take, mirroring
+        # stage0's codegen-level exhaustiveness test (docs/122): an unguarded catch-all
+        # (`_`/bare binding, or an all-wildcard tuple row) makes any match total; failing
+        # that, an enum/hierarchy match is total only when every variant is individually
+        # named across the (unguarded) arms. SOUND SUBSET, same philosophy as
+        # `check_match_exhaustive`: any arm that is not a pure variant/or-of-variants cover
+        # (a literal, struct, range, …) makes the whole match unprovable, so it's treated
+        # as non-exhaustive — never a false claim of totality. Stage0 never treats literal
+        # coverage (e.g. both `true:`/`false:` of a bool, or every value of a small int) as
+        # exhaustive, so this deliberately does not attempt that either.
+        def match_arms_exhaustive(arms: darray[Ast::MatchArm], table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                true return if match_has_catch_all(arms)
+                # A struct scrutinee has exactly one shape, so an unguarded struct-destructure
+                # arm (`Row{...}:`) is irrefutable — stage0's emitStructMatch treats it as
+                # exhaustive with no `_` arm needed (oracle: TestAnalyzeBraceStructErgonomics).
+                true return if any arm in arms where match_arm_is_unguarded_struct(arm)
+                covered: mutable darray[sview] = []
+                for arm in arms:
+                    guarded: bool = match arm.guard:
+                        Expr.Invalid: false
+                        Expr.Absent:  false
+                        _:            true
+                    continue if guarded
+                    false return if not collect_arm_variant_paths(arm.pattern, covered)
+                false return if covered.count == 0
+                anchor_owner: sview = enum_owner_of_path(covered[0], table)
+                false return if anchor_owner == ""
+                hierarchy_root: sview = enum_hierarchy_root_of(anchor_owner, table)
+                if hierarchy_root != "":
+                    return hierarchy_variants_all_covered(hierarchy_root, covered, table)
+                return flat_enum_variants_all_covered(anchor_owner, covered, table)
+
+
+        # Whether ARM is an unguarded struct-destructure pattern (`Row{...}:`).
+        def match_arm_is_unguarded_struct(arm: Ast::MatchArm) -> bool:
+            can Abort.Panic:
+                guarded: bool = match arm.guard:
+                    Expr.Invalid: false
+                    Expr.Absent:  false
+                    _:            true
+                false return if guarded
+                return match arm.pattern:
+                    Pattern.Struct(struct_path, struct_fields): true
+                    _:                                          false
+
+
+        # The enum name that owns the qualified variant path (`"TokenKind.IntLit"` ->
+        # `"TokenKind"`), or "" when `path` isn't qualified by any known enum (e.g. the
+        # `.Ready` leading-dot shorthand, which stores an unqualified path).
+        def enum_owner_of_path(path: sview, table: SymbolTable&) -> sview:
+            can Abort.Panic:
+                for owner_index in 0..<table.enum_variant_owner.count:
+                    candidate: sview = table.enum_variant_owner[owner_index]
+                    candidate return if path_names_enum(path, candidate)
+                return ""
+
+
+        # The hierarchy root that `enum_name` is a registered child of, or "" when
+        # `enum_name` isn't a hierarchy child (a plain flat enum).
+        def enum_hierarchy_root_of(enum_name: sview, table: SymbolTable&) -> sview:
+            can Abort.Panic:
+                for child_index in 0..<table.enum_hierarchy_child.count:
+                    table.enum_hierarchy_parent[child_index] return if table.enum_hierarchy_child[child_index] == enum_name
+                return ""
+
+
+        # Whether every variant of every child enum in the hierarchy rooted at `root` is
+        # named among `covered` (mirrors `check_hierarchy_exhaustive`'s coverage test).
+        def hierarchy_variants_all_covered(root: sview, covered: darray[sview]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for variant_index in 0..<table.enum_variant_owner.count:
+                    child: sview = table.enum_variant_owner[variant_index]
+                    if enum_in_hierarchy(child, root, table):
+                        false return if not paths_cover_variant(covered, table.enum_variant_name[variant_index])
+                return true
+
+
+        # Whether every declared variant of the flat enum `enum_name` is named among
+        # `covered` (mirrors `check_match_exhaustive`'s coverage test).
+        def flat_enum_variants_all_covered(enum_name: sview, covered: darray[sview]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                false return if not enum_is_known(enum_name, table)
+                for variant_index in 0..<table.enum_variant_owner.count:
+                    if table.enum_variant_owner[variant_index] == enum_name:
+                        false return if not paths_cover_variant(covered, table.enum_variant_name[variant_index])
+                return true
 
 
         # Whether a statement list necessarily terminates (every path leads to return/break/continue).
         # A list terminates if it's non-empty and the last statement terminates.
-        def statements_terminate(statements: darray[Ast::Stmt]) -> bool:
-            can Abort.Panic:
+        def statements_terminate(statements: darray[Ast::Stmt], table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
                 false return if statements.count == 0
-                return statement_terminates(statements[statements.count - 1])
+                return statement_terminates(statements[statements.count - 1], table)
 
 
         # Check that a non-void function body guarantees a return on all paths.
@@ -138,7 +232,7 @@ extend Semantic:
                     # Empty non-void body is missing a return
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MissingReturnValue, name: function_name, line: line, expected: "", actual: ""})
                     return
-                if not statements_terminate(body):
+                if not statements_terminate(body, table):
                     # Body doesn't guarantee a return; flag the last statement
                     last_line: mutable u32 = statement_line(body[body.count - 1])
                     last_line <- line if last_line == 0
