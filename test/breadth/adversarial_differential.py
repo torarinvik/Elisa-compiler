@@ -1876,6 +1876,27 @@ def main() -> i64:
     c: Vec2 = a + b
     return c.x
 """)
+    yield ("struct_ord_operators", """
+protocol Ord:
+    def __cmp__(self: Self, other: Self) -> i64
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Ord for Vec2:
+    def __cmp__(self: Vec2, other: Vec2) -> i64:
+        return self.x - other.x
+
+def main() -> i64:
+    a: Vec2 = Vec2{x: 3, y: 0}
+    b: Vec2 = Vec2{x: 5, y: 0}
+    lt: i64 = 1 if a < b else 0
+    gt: i64 = 1 if a > b else 0
+    le: i64 = 1 if a <= a else 0
+    ge: i64 = 1 if b >= a else 0
+    return lt * 1000 + gt * 100 + le * 10 + ge
+""")
 
 
 GENERATORS += [gen_aggregate_abi]
