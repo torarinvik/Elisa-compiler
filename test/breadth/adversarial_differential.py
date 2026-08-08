@@ -2037,6 +2037,48 @@ def main() -> i64:
     a += b
     return a.x * 1000 + a.y
 """)
+    yield ("struct_field_compound_assign_numeric", """
+struct Counter:
+    n: mutable i64
+
+def main() -> i64:
+    c: mutable Counter = Counter{n: 5}
+    c.n += 10
+    return c.n
+""")
+    yield ("struct_field_compound_assign_through_ref_param", """
+struct Counter:
+    n: mutable i64
+
+def bump(c: mutable Counter&) -> void:
+    c.n += 7
+
+def main() -> i64:
+    c: mutable Counter = Counter{n: 5}
+    bump(&c)
+    return c.n
+""")
+    yield ("struct_field_compound_assign_struct_typed_field_declines", """
+protocol Add:
+    def __add__(self: Self, other: Self) -> Self
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Add for Vec2:
+    def __add__(self: Vec2, other: Vec2) -> Vec2:
+        return Vec2{x: self.x + other.x, y: self.y + other.y}
+
+struct Holder:
+    v: mutable Vec2
+
+def main() -> i64:
+    h: mutable Holder = Holder{v: Vec2{x: 1, y: 2}}
+    b: Vec2 = Vec2{x: 3, y: 4}
+    h.v += b
+    return h.v.x * 1000 + h.v.y
+""")
 
 
 def gen_named_tuples():
