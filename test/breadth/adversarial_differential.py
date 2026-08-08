@@ -2135,6 +2135,43 @@ def main() -> i64:
 """)
 
 
+def gen_pin_and_range_match_arms():
+    """A scalar statement-match over an integer scrutinee with a `^pin` arm (compare
+    against an existing binding's VALUE rather than a constant) or a range arm. The
+    parser has built Pattern.Pin since parser_stmt_pattern.elisa:279 and three semantic
+    passes handled it, but scalar_match_pattern_valid's `_: false` tail rejected both
+    shapes outright ("top-level integer match arm must use an integer literal or _"),
+    so neither ever reached codegen -- which had no Pattern.Pin case either. Recovered
+    from uncommitted work in the sweet-zhukovsky-34d525 worktree.
+    """
+    yield ("scalar_match_pin_arm", """
+def classify(v: i64, target: i64) -> i64:
+    match v:
+        ^target:
+            return 100
+        0:
+            return 1
+        _:
+            return 2
+
+def main() -> i64:
+    return classify(7, 7) + classify(0, 9) + classify(5, 9)
+""")
+    yield ("scalar_match_range_arm", """
+def bucket(v: i64) -> i64:
+    match v:
+        0..<10:
+            return 1
+        10..<20:
+            return 2
+        _:
+            return 3
+
+def main() -> i64:
+    return bucket(5) * 100 + bucket(15) * 10 + bucket(99)
+""")
+
+
 def gen_darray_of_fixed_array():
     """`darray[T[N]]` -- a darray whose ELEMENT is itself a fixed-size array -- declined
     unconditionally at the type-annotation level (`annotation_index_named_value_type`'s
@@ -2283,7 +2320,8 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
                gen_ref_returning_call_deref, gen_struct_compound_assign_declines,
-               gen_index_compound_assign, gen_darray_of_fixed_array]
+               gen_index_compound_assign, gen_darray_of_fixed_array,
+               gen_pin_and_range_match_arms]
 
 
 def main():
