@@ -174,6 +174,53 @@ def main() -> i64 can[Memory.Allocate, Thread.Spawn, Thread.Join, Sync.Lock, Syn
         _ = pthread_join(handles[t], null)
     return s.counter + 42 - 4000' 42 8
 
+# A pthread_cond_t (48 bytes) wait/signal HANDSHAKE, both opaques struct-embedded: main locks,
+# waits on the cond until the worker sets `ready` under the lock and signals. Returns 42 only if
+# the full protocol works; a mis-sized cond corrupts cond_wait into a deadlock (124) or crash,
+# and a lost wakeup would hang — 8 stable 42s prove pthread_cond_t is sized and driven correctly.
+thread_case cond_handshake 'extern pthread_mutex_init(mutex: mutable PthreadMutexT&, attr: void&?) -> int can[Memory.Allocate]
+extern pthread_mutex_lock(mutex: void&) -> int can[Sync.Lock]
+extern pthread_mutex_unlock(mutex: void&) -> int can[Sync.Unlock]
+extern pthread_cond_init(cond: mutable PthreadCondT&, attr: void&?) -> int can[Memory.Allocate]
+extern pthread_cond_wait(cond: void&, mutex: void&) -> int can[Sync.Wait]
+extern pthread_cond_signal(cond: void&) -> int can[Sync.Notify]
+@c_opaque(pthread.h, pthread_mutex_t)
+extern PthreadMutexT
+@c_opaque(pthread.h, pthread_cond_t)
+extern PthreadCondT
+struct Sync:
+    lock: mutable PthreadMutexT
+    cond: mutable PthreadCondT
+    ready: mutable i64
+    result: mutable i64
+def worker(arg: void&?) -> void&? can[Sync.Lock, Sync.Unlock, Sync.Notify, Unsafe.PointerCast]:
+    if arg is present:
+        s: mutable Sync& = present.cast[mutable Sync&] can Unsafe.PointerCast
+        lk: void& = (&s.lock).cast[void&] can Unsafe.PointerCast
+        cv: void& = (&s.cond).cast[void&] can Unsafe.PointerCast
+        _ = pthread_mutex_lock(lk)
+        s.result <- 42
+        s.ready <- 1
+        _ = pthread_cond_signal(cv)
+        _ = pthread_mutex_unlock(lk)
+    return null
+def main() -> i64 can[Memory.Allocate, Thread.Spawn, Thread.Join, Sync.Lock, Sync.Unlock, Sync.Wait, Unsafe.PointerCast]:
+    s: mutable Sync = zeroed
+    _ = pthread_mutex_init(&s.lock, null)
+    _ = pthread_cond_init(&s.cond, null)
+    handle: mutable uintptr = 0.uintptr()
+    entry: void& = worker.cast[void&] can Unsafe.PointerCast
+    _ = pthread_create(&handle, null, entry, (&s).cast[void&?] can Unsafe.PointerCast)
+    lk: void& = (&s.lock).cast[void&] can Unsafe.PointerCast
+    cv: void& = (&s.cond).cast[void&] can Unsafe.PointerCast
+    _ = pthread_mutex_lock(lk)
+    while s.ready == 0:
+        _ = pthread_cond_wait(cv, lk)
+    r: i64 = s.result
+    _ = pthread_mutex_unlock(lk)
+    _ = pthread_join(handle, null)
+    return r' 42 8
+
 if [ "$pass" -eq "$total" ]; then
     echo "thread_real_smoke OK: $pass/$total real-thread spawn+join programs compile+run correctly"
 else
