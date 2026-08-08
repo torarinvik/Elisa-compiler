@@ -3087,8 +3087,33 @@ def main() -> i64:
 
 
 GENERATORS += [gen_aggregate_abi]
+def gen_copy_array_builtin():
+    """`copy[array[T, N]](src)` -- a value copy into a fixed-size array. The backend had
+    NO handling of `copy` whatsoever, so every use declined.
+
+    A fixed array is an LLVM first-class aggregate VALUE, so the copy is just the value:
+    no buffer to duplicate, nothing to alias. The dangerous shape (a runtime-length
+    source, where a shallow copy WOULD alias) cannot reach codegen -- check_copy_builtin
+    rejects a darray source and any non-array[T, N] target first.
+
+    The fixture MUTATES the duplicate and reads BOTH back, so aliasing would change the
+    answer rather than merely compiling: a true copy gives 1*100 + 99, an aliased one
+    would give 99*100 + 99.
+    """
+    yield ("copy_array_builtin_is_value_copy", """
+def dup(src: array[u8, 4]) -> array[u8, 4]:
+	return copy[array[u8, 4]](src)
+
+def main() -> i64:
+	original: mutable array[u8, 4] = [1, 2, 3, 4]
+	duplicate: mutable array[u8, 4] = dup(original)
+	duplicate[0] <- 99
+	return original[0].i64() * 100 + duplicate[0].i64()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
-               gen_void_return_call]
+               gen_void_return_call, gen_copy_array_builtin]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
