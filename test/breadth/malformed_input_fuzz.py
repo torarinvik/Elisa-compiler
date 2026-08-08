@@ -35,15 +35,42 @@ REGRESSIONS = [
     # Not a crash — INVALID IR that the object path tolerated: `ret ptr` from an `-> i64`
     # function. stage0 says "return type expects i64, got fn(i64) -> i64".
     ("fn_value_returned_as_scalar", "def apply(f: fn(i64) -> i64, n: i64) -> i64:\n    return f\n"),
+    # A left-nested `1 + 1 + 1 + ...` chain (adversarial, not anything real code writes) SIGSEGV'd
+    # the backend: `expression_type` (codegen_scope.elisa) re-walked the whole remaining left
+    # spine from scratch at EVERY one of the N levels of the emitter's own recursion into
+    # `binary_left` — O(N^2) time, and the combined recursion depth also exceeded the default
+    # ~8MB native stack. stage0 (and gen0 unoptimized) compile this instantly. Fixed by capping
+    # `expression_type`'s own recursion depth (falls back to Unmodeled, the same answer a bare
+    # literal already gives, past 200 levels — far deeper than any genuine expression) and by
+    # linking the product binary with a 512MB stack (scripts/elisac_stage1.sh, build_drivers.sh,
+    # self_host_gen2.sh). 5000 is comfortably past the depth that used to crash (~15000-20000)
+    # while keeping this regression's own runtime short.
+    ("deep_left_binary_chain", "def main() -> i64:\n    return " + "1" + " + 1" * 5000 + "\n"),
+    # A chain of just 30 nested `not`s hung the compiler indefinitely (confirmed exponential:
+    # n=25 took 0.7s, n=30 did not finish in 15s). Root cause: check_double_negation.elisa's
+    # `walk_double_negation_expression` called itself on the SAME `operand` TWICE in the
+    # `Expr.Unary` case — once before its own diagnostic checks, once again after — so a chain
+    # of N nested unaries cost T(n) = 2*T(n-1) + O(1) = O(2^n). stage0 accepts arbitrarily deep
+    # `not` chains instantly. Fixed by deleting the redundant second walk. 100 is comfortably
+    # past the point that used to hang (n=30) while keeping this regression's own runtime short.
+    ("deep_not_chain", "def main() -> i64:\n    b: bool = " + "not " * 100 + "true\n    return 0 if b else 1\n"),
 ]
 
 OPT = os.path.join(os.path.dirname(os.environ.get("LLVM_CONFIG", "/opt/homebrew/opt/llvm/bin/llvm-config")), "opt")
 
 def compile_rc(path, work):
-    r = subprocess.run(["bash", WRAP, "-o", os.path.join(work, "out.o"), path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       stdin=subprocess.DEVNULL, timeout=120)
-    return r.returncode
+    # A genuine HANG must come back as an ordinary (abnormal) return code, not an uncaught
+    # TimeoutExpired — an uncaught exception here crashes this script instead of reporting the
+    # hang as a failure, which is worse than useless for a harness whose whole job is "never
+    # let a hang go undetected" (see the module docstring). -9 mimics a killed-by-signal exit
+    # so `abnormal()` (rc < 0 or rc > 2) flags it exactly like a crash would.
+    try:
+        r = subprocess.run(["bash", WRAP, "-o", os.path.join(work, "out.o"), path],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           stdin=subprocess.DEVNULL, timeout=120)
+        return r.returncode
+    except subprocess.TimeoutExpired:
+        return -9
 
 def invalid_ir(path, work):
     """None when the IR is valid or unavailable; the verifier's first line when it is not."""

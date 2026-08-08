@@ -21,7 +21,9 @@ export PATH="/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin"
 echo "gen1=$BIN"
 file "$BIN"
 bash "$ROOT/scripts/elisac_stage1.sh" -o "$OUT_DIR/elisac_stage1_gen2.o" "$ROOT/src/driver/elisac.elisa"
-clang -Wl,-dead_strip -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
+# -stack_size 512MB (arm64 ld64 max) — same rationale as scripts/elisac_stage1.sh's
+# seed_build: emit_expression recurses once per AST level, and this is the product binary.
+clang -Wl,-dead_strip -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000
 echo "wrote $OUT_DIR/elisac-stage1-gen2"
 # Fixture parity with gen2
 printf 'def main() -> i64:\n    return 42\n' >"$OUT_DIR/fix.elisa"
