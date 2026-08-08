@@ -2109,6 +2109,15 @@ def main() -> i64:
     bump(&xs)
     return xs[1]
 """)
+    yield ("borrowed_fixed_array_index_compound_assign", """
+def bump(xs: mutable i64[3]&) -> void:
+    xs[2] += 100
+
+def main() -> i64:
+    xs: mutable i64[3] = [1, 2, 3]
+    bump(&xs)
+    return xs[2]
+""")
 
 
 def gen_named_tuples():
