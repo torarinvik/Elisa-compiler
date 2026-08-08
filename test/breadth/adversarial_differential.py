@@ -2172,6 +2172,52 @@ def main() -> i64:
 """)
 
 
+def gen_range_match_value_slot():
+    """A range-pattern arm (`0..<5:`) in a VALUE-position match whose arms are BLOCKS, not
+    single expressions (`x: T = match ...` / `return match ...`) -- emit_match_into_slot
+    (codegen_condition.elisa), the emitter for exactly that shape. Its sibling emitters
+    already supported a range arm -- the statement-position matcher
+    (codegen_stmt_match_scalar.elisa) and the single-EXPRESSION-arm value-position matcher
+    (codegen_expr_match_aggregates.elisa) -- but emit_match_into_slot's own pattern dispatch
+    only classified Pattern.Literal and Pattern.Variant, so a range arm fell through its
+    catch-all `mis_declined <- true` and the whole assignment/return declined, even though
+    stage0 accepts it and the identical range arm already worked in the OTHER two match
+    positions. Each arm below does real per-branch work (not a bare literal return) so a
+    wrong bucket, not just a wrong bound, would show up as a mismatch.
+    """
+    yield ("range_match_value_slot_vardecl", """
+def classify(x: i64) -> i64:
+    result: i64 = match x:
+        0..<5:
+            y: i64 = x * 10
+            y + 1
+        5..=10:
+            z: i64 = x * 100
+            z + 2
+        _:
+            -1
+    return result
+
+def main() -> i64:
+    return classify(2) + classify(7) + classify(99)
+""")
+    yield ("range_match_value_slot_return", """
+def classify(x: i64) -> i64:
+    return match x:
+        0..<5:
+            y: i64 = x * 10
+            y + 1
+        5..=10:
+            z: i64 = x * 100
+            z + 2
+        _:
+            -1
+
+def main() -> i64:
+    return classify(0) + classify(10) + classify(4)
+""")
+
+
 def gen_darray_of_fixed_array():
     """`darray[T[N]]` -- a darray whose ELEMENT is itself a fixed-size array -- declined
     unconditionally at the type-annotation level (`annotation_index_named_value_type`'s
@@ -2321,7 +2367,7 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_struct_operator_protocols, gen_named_tuples,
                gen_ref_returning_call_deref, gen_struct_compound_assign_declines,
                gen_index_compound_assign, gen_darray_of_fixed_array,
-               gen_pin_and_range_match_arms]
+               gen_pin_and_range_match_arms, gen_range_match_value_slot]
 
 
 def main():
