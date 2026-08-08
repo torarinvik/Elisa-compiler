@@ -2682,6 +2682,66 @@ def main() -> i64:
 """)
 
 
+def gen_generic_operator_no_bound():
+    """A binary operator applied to a value of a COMPLETELY UNBOUND generic type
+    parameter (`def bump[T](a: T, b: T): a + b`, no `[T: Interface]` clause). stage0
+    checks a generic function's body once, against only what its declared bound
+    guarantees -- an unbound T supports nothing, so this is rejected at DECLARATION
+    time regardless of any call site. stage1 had no such check and accepted it,
+    deferring entirely to per-instantiation codegen -- a genuine PERMISSIVE divergence
+    (stage1 was a strict superset of valid programs, never a wrong answer). See
+    generic-operator-bound-checking-gap.md for the full writeup, including a real false
+    positive found and fixed during staging: a REF parameter (`items: T&`, a C-buffer
+    pointer) used in pointer arithmetic (`items + index`) is unrelated to whatever T's
+    bound provides and must never be flagged -- the deque/collections
+    `*_void_from_items_at` helpers in elisacore_std use exactly this shape.
+    """
+    yield ("generic_operator_no_bound_rejected", """
+def bump[T](a: mutable T&, b: T) -> void:
+    a <- a + b
+
+def main() -> i64:
+    x: mutable i64 = 5
+    bump(&x, 10)
+    return x
+""")
+    yield ("generic_operator_bound_satisfied_accepted", """
+protocol Add:
+    def __add__(self: Self, other: Self) -> Self
+
+struct P:
+    x: i64
+
+impl Add for P:
+    def __add__(self: P, other: P) -> P:
+        return P{x: self.x + other.x}
+
+def combine[T: Add](a: T, b: T) -> T:
+    return a + b
+
+def main() -> i64:
+    p: P = combine(P{x: 1}, P{x: 2})
+    return p.x
+""")
+    yield ("generic_no_operator_still_accepted", """
+def identity[T](a: T) -> T:
+    return a
+
+def main() -> i64:
+    return identity(42)
+""")
+    yield ("generic_ref_param_pointer_arithmetic_not_flagged", """
+def buf_offset[T](items: mutable T&, index: usize) -> mutable void& can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+    trusted [Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+        return (items + index).cast[mutable void&]
+
+def main() -> i64:
+    x: mutable i64[3] = [10, 20, 30]
+    p: mutable void& = buf_offset(&x[0], 1)
+    return 5
+""")
+
+
 def gen_mutable_ref_local_rebind():
     """`r: mutable T& = v; r <- v2` -- the LOCAL BINDING itself was declared `mutable`,
     which stage0 treats as REBINDING the reference (assigning a new T&-typed value to
@@ -2942,7 +3002,7 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_flags_const_enum_sview, gen_char_literal_never_fits_sview,
                gen_clone_builtin_move_wrapped_source, gen_range_match_value_slot,
                gen_i16_u16_widths, gen_shifts_bitwise_and_size_types,
-               gen_mutable_ref_local_rebind]
+               gen_mutable_ref_local_rebind, gen_generic_operator_no_bound]
 
 
 def main():
