@@ -3112,8 +3112,38 @@ def main() -> i64:
 """)
 
 
+def gen_discarded_darray_growth_methods():
+    """`_ = xs.resize(n)` / `.truncate(n)` / `.clear()`. These return the receiver for
+    chaining, so they are DISCARDED via `_ =` rather than written as bare statements.
+
+    The STATEMENT emitter lowers all three, but emit_expression models none of them, so
+    the discarded spelling declined while the bare-statement spelling compiled --
+    `reserve` was the only one with a dedicated discard path. Fixed by delegating the
+    discard to the statement emitter (a discarded call IS a statement expression).
+
+    Note the discard of a METHOD call folds to Stmt.Assign, not Stmt.VarDecl: an
+    equivalent guard added to the VarDecl discard path turned out to be dead code and was
+    dropped. Both discard sites exist, so check which one a given spelling reaches.
+
+    Each case returns the resulting COUNT, so a lowering that compiled but resized wrongly
+    would still fail.
+    """
+    for method, expected in (("resize(5.usize())", 5), ("truncate(1.usize())", 1), ("clear()", 0)):
+        label = method.split("(")[0]
+        yield (f"discarded_darray_{label}", f"""
+def main() -> i64:
+	xs: mutable darray[i64] = []
+	xs.push(7)
+	xs.push(8)
+	xs.push(9)
+	_ = xs.{method}
+	return xs.count.i64()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
-               gen_void_return_call, gen_copy_array_builtin]
+               gen_void_return_call, gen_copy_array_builtin,
+               gen_discarded_darray_growth_methods]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
