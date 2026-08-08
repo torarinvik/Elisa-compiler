@@ -1997,6 +1997,48 @@ def main() -> i64:
 """)
 
 
+def gen_struct_compound_assign_declines():
+    """`x op= v` (`+=`, `-=`, ...) on a STRUCT target. stage0 categorically rejects this
+    ("augmented assignment requires numeric operands") even when the struct has a
+    matching `impl Add` -- there is no operator-protocol dispatch for the compound-assign
+    form, only for the plain binary operator. stage1 used to SEGFAULT here: the compound-
+    assign codegen path called the low-level `emit_binary` directly on a struct-typed
+    aggregate value without going through the protocol-rewrite that the plain `+` path
+    uses, and `emit_binary`'s signed-overflow-checked-arithmetic branch misused the LLVM
+    overflow intrinsic on a non-integer type. Fixed by declining early (matching stage0)
+    when the compound-assign target type is a Struct, before reaching emit_binary.
+    """
+    yield ("struct_compound_assign_with_impl_still_declines", """
+protocol Add:
+    def __add__(self: Self, other: Self) -> Self
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Add for Vec2:
+    def __add__(self: Vec2, other: Vec2) -> Vec2:
+        return Vec2{x: self.x + other.x, y: self.y + other.y}
+
+def main() -> i64:
+    a: mutable Vec2 = Vec2{x: 1, y: 2}
+    b: Vec2 = Vec2{x: 3, y: 4}
+    a += b
+    return a.x * 1000 + a.y
+""")
+    yield ("struct_compound_assign_no_impl_declines", """
+struct Vec2:
+    x: i64
+    y: i64
+
+def main() -> i64:
+    a: mutable Vec2 = Vec2{x: 1, y: 2}
+    b: Vec2 = Vec2{x: 3, y: 4}
+    a += b
+    return a.x * 1000 + a.y
+""")
+
+
 def gen_named_tuples():
     """Named-tuple return types (`-> (label: T, ...)`), multi-value `return a, b` (bare
     comma, NOT parenthesized `(label: a, ...)` — that shape is a DIFFERENT grammar the
@@ -2109,7 +2151,7 @@ GENERATORS += [gen_aggregate_abi]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
-               gen_ref_returning_call_deref]
+               gen_ref_returning_call_deref, gen_struct_compound_assign_declines]
 
 
 def main():
