@@ -2478,6 +2478,60 @@ def main() -> i64:
 """)
 
 
+def gen_i16_u16_widths():
+    """`i16`/`u16` had ZERO corpus coverage before this generator — the same signature as
+    the f32/f64 gap found earlier in this session (i8, i32, i64 all had cases; i16 was
+    simply skipped), and mixed-width arithmetic is the exact class that produced two
+    separate silent wrong answers today (the borrowed `T[N]&` read and the float widen).
+    Probed for those shapes specifically and found stage1 already CORRECT on all of them
+    — recorded here so the area stops being untested rather than because it was broken.
+    Each case gives distinct positions distinct values so a wrong width or a wrong
+    truncation cannot pass vacuously.
+    """
+    yield ("i16_narrow_arithmetic", """
+def main() -> i64:
+    a: i16 = 300
+    b: i16 = 40
+    c: i16 = a + b
+    d: i64 = c.i64()
+    return d
+""")
+    yield ("i16_mixed_width_and_array_compound", """
+def main() -> i64:
+    a: i16 = 300
+    b: i64 = 7
+    c: i64 = a.i64() + b
+    xs: mutable i16[3] = [10, 20, 30]
+    xs[1] += 5
+    return c + xs[1].i64()
+""")
+    yield ("i16_u16_borrowed_arrays_and_darray", """
+def bump(xs: mutable i16[3]&, ys: mutable u16[3]&) -> i64:
+    xs[0] += 100
+    ys[0] += 7
+    return xs[0].i64() + ys[0].i64()
+
+def main() -> i64:
+    xs: mutable i16[3] = [1, 2, 3]
+    ys: mutable u16[3] = [10, 20, 30]
+    r: i64 = bump(&xs, &ys)
+    m: mutable darray[i16] = [5, 6]
+    m[1] *= 3
+    neg: i16 = -300
+    return r + m[1].i64() + neg.i64()
+""")
+    yield ("i16_u16_boundary_division_truncation", """
+def main() -> i64:
+    a: i16 = 32767
+    b: i16 = a / 3
+    c: u16 = 65535
+    d: u16 = c / 5
+    e: i16 = -32768
+    f: i16 = e / 7
+    return b.i64() + d.i64() + f.i64()
+""")
+
+
 def gen_darray_of_fixed_array():
     """`darray[T[N]]` -- a darray whose ELEMENT is itself a fixed-size array -- declined
     unconditionally at the type-annotation level (`annotation_index_named_value_type`'s
@@ -2751,7 +2805,8 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_borrowed_fixed_array_chain, gen_borrowed_fixed_array_mixed_width_read,
                gen_floats, gen_lmut_place_required,
                gen_flags_const_enum_sview, gen_char_literal_never_fits_sview,
-               gen_clone_builtin_move_wrapped_source, gen_range_match_value_slot]
+               gen_clone_builtin_move_wrapped_source, gen_range_match_value_slot,
+               gen_i16_u16_widths]
 
 
 def main():
