@@ -21,7 +21,11 @@ for driver in emit_native emit_obj; do
         grep -v "warning:" "$log" | head -10 | sed 's/^/    /'
         status=1; continue
     fi
-    if ! clang -o "$BUILD/$driver" "$BUILD/$driver.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>>"$log"; then
+    # -stack_size 512MB (the arm64 ld64 max): these embed src/backend, whose emit_expression
+    # recurses once per AST level — see the depth guard in codegen_scope.elisa's
+    # expression_type and scripts/elisac_stage1.sh's seed_build for the same flag on the
+    # product binary.
+    if ! clang -o "$BUILD/$driver" "$BUILD/$driver.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000 2>>"$log"; then
         echo "build_drivers FAILED: could not link $driver"; status=1; continue
     fi
     echo "build_drivers ok: $driver"

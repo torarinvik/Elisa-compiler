@@ -97,7 +97,12 @@ seed_build() {
   fi
   echo "seed: building product with stage0 $STAGE0_BIN" >&2
   "$STAGE0_BIN" -emit obj -O2 -o "$ROOT/build/elisac_stage1.o" "$ROOT/src/driver/elisac.elisa"
-  clang -o "$BIN" "$ROOT/build/elisac_stage1.o" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir"
+  # -stack_size: a deeply left-nested expression (adversarial input, see
+  # malformed_input_fuzz.py / the depth guard in codegen_scope.elisa's expression_type)
+  # recurses once per AST level through emit_expression. 0x20000000 (512MB) is the max
+  # ld64 allows on arm64 and gives the compiler's own main thread far more headroom than
+  # the default ~8MB before a pathological input can overflow the native stack.
+  clang -o "$BIN" "$ROOT/build/elisac_stage1.o" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
   echo "seed: wrote $BIN" >&2
 }
 
