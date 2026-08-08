@@ -3166,6 +3166,30 @@ def main() -> i64:
 		total <- total * 2 + (1 if keep(probe) else 0)
 	return total
 """)
+    # Leading-dot shorthand CANDIDATES (`kind in {.IF, .LET}`). Same OR-chain, but
+    # emit_expression knows only the qualified `Enum.Variant` spelling, so each
+    # shorthand candidate declined. Resolved through the same helper the `is` path
+    # uses. Expected 6 (0b110): IF and LET are members, IDENT is not.
+    #
+    # NOT pinned: `kind in {.IF..=IDENT}` -- a range whose UPPER bound is a BARE
+    # unqualified enum member rather than a shorthand. That needs bare-ident-in-enum
+    # -context resolution, which is a separate gap and still declines.
+    yield ("brace_membership_shorthand_members", """
+const enum TokenKind of u32:
+	IF
+	LET
+	IDENT
+
+def keep(kind: TokenKind) -> bool:
+	return kind in {.IF, .LET}
+
+def main() -> i64:
+	total: mutable i64 = 0
+	total <- total * 2 + (1 if keep(TokenKind.IF) else 0)
+	total <- total * 2 + (1 if keep(TokenKind.LET) else 0)
+	total <- total * 2 + (1 if keep(TokenKind.IDENT) else 0)
+	return total
+""")
 
 
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
