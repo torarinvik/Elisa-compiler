@@ -2990,7 +2990,47 @@ def main() -> i64:
 """)
 
 
+def gen_shorthand_member_is():
+    """`x is .Variant` -- the leading-dot enum shorthand, whose enum comes from the
+    expected type. The parser gives it its own node (Expr.ShorthandMember) while every
+    `is` variant-test path in the backend matches Expr.Field, so the shorthand fell
+    through all of them and DECLINED: the form was simply unimplemented in codegen
+    (`grep ShorthandMember src/backend` found nothing).
+
+    stage0 permits the shorthand for CONST enums only -- on a payload enum it errors
+    `shorthand member ".Circle" requires an expected const enum type`. Both spellings
+    are pinned here, including `is not` (which the parser desugars to
+    Unary(Not, <is>)), and a const enum whose VALUES differ from its ordinals, since
+    the compare is against the member's value.
+
+    See shorthand-member-const-enum-only.md -- notably that stage0's `-emit obj`
+    ACCEPTS the payload-enum form its `-emit llvm` rejects, so obj-exit-0 alone is not
+    proof a form is legal.
+    """
+    yield ("shorthand_member_is_const_enum", """
+const enum Tok of i32:
+	IDENT = 7
+	NUMBER = 9
+
+def classify(kind: Tok) -> i64:
+	return 1 if kind is .IDENT else 0
+
+def negate(kind: Tok) -> i64:
+	return 10 if kind is not .IDENT else 20
+
+def main() -> i64:
+	return classify(Tok.IDENT) + classify(Tok.NUMBER) * 2 + negate(Tok.NUMBER) + negate(Tok.IDENT)
+""")
+    # NOT pinned here: the QUALIFIED spelling `kind is Tok.NUMBER` on a const enum.
+    # stage0 REJECTS it while stage1 accepts and runs it -- a live PERMISSIVE divergence
+    # that predates the shorthand work (stage1's const-enum `is` path at
+    # codegen_expr_idents_binary.elisa handles the qualified form unconditionally). The
+    # PERMISSIVE bucket is ratcheted at zero, so adding it would fail the gate outright
+    # without fixing anything. Documented in shorthand-member-const-enum-only.md instead.
+
+
 GENERATORS += [gen_aggregate_abi]
+GENERATORS += [gen_shorthand_member_is]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
