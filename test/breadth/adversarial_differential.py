@@ -1926,6 +1926,33 @@ def main() -> i64:
         mutable_b <- c
     return classify(a, mutable_b) * 100 + guard_result
 """)
+    yield ("struct_neg_operator", """
+protocol Neg:
+    def __neg__(self: Self) -> Self
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Neg for Vec2:
+    def __neg__(self: Vec2) -> Vec2:
+        return Vec2{x: -self.x, y: -self.y}
+
+def main() -> i64:
+    a: Vec2 = Vec2{x: 3, y: -4}
+    b: Vec2 = -a
+    return b.x * 1000 + b.y
+""")
+    yield ("struct_neg_no_impl_still_declines", """
+struct Vec2:
+    x: i64
+    y: i64
+
+def main() -> i64:
+    a: Vec2 = Vec2{x: 3, y: -4}
+    b: Vec2 = -a
+    return b.x
+""")
 
 
 GENERATORS += [gen_aggregate_abi]
