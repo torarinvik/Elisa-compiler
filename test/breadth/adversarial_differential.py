@@ -2082,6 +2082,27 @@ def main() -> i64:
     v: Pair = get_ref()
     return v.a
 """)
+    yield ("ref_returning_call_as_argument", """
+global mutable g: i64 = 42
+
+def get_ref() -> i64&:
+    return &g
+
+def show(v: i64) -> i64:
+    return v * 2
+
+def main() -> i64:
+    return show(get_ref())
+""")
+    yield ("ref_returning_call_in_arithmetic", """
+global mutable g: i64 = 42
+
+def get_ref() -> i64&:
+    return &g
+
+def main() -> i64:
+    return get_ref() + 1
+""")
 
 
 GENERATORS += [gen_aggregate_abi]
