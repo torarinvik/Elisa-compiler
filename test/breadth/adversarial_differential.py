@@ -12,6 +12,24 @@ tree: build each program with BOTH compilers, link, run, compare exit codes.
 Every bug found in this session lived in a shape the compiler's own source never uses, so
 the generators below deliberately target those: overload resolution, generic instantiation
 naming, extern declarations, container literals in value position, const enums.
+
+WHAT THIS HARNESS STRUCTURALLY CANNOT COVER (checked 2026-08-08, don't re-derive it):
+every program here is BARE MODE -- standalone source with no std include, linked against
+elisacore_runtime.o. So any construct whose operands are STD TYPES is unreachable from
+here no matter how the generator is written:
+
+  * `parallel for` / `nursery` / `pool`. stage0 requires the iterable to be a mutable
+    Slice[T], a frozen packed store, or a readonly dense view -- a plain darray is
+    rejected outright ("not structurally shareable across threads"), and `Slice` is a std
+    type (elisacore_std/elisacore_runtime_slice.elisa), so bare mode cannot even name it.
+    These are NOT untested overall: test/parity/parallel_for_grant_smoke.sh covers the
+    effect-grant and outer-mutation rules, and the std itself uses them, so the self-host
+    exercises the codegen. They are simply out of scope for THIS corpus.
+  * Anything else requiring a std container/protocol (Slice, MemoryPool, dict/set
+    internals) for the same reason.
+
+A zero mention-count for one of those in this file is therefore expected, not a gap to
+close here. Prefer the parity smokes for them.
 """
 import itertools, os, subprocess, sys, tempfile, hashlib
 
