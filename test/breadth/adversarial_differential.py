@@ -2118,6 +2118,12 @@ def main() -> i64:
     bump(&xs)
     return xs[2]
 """)
+    yield ("nested_darray_index_compound_assign", """
+def main() -> i64:
+    m: mutable darray[darray[i64]] = [[1, 2], [3, 4]]
+    m[0][1] += 100
+    return m[0][1]
+""")
 
 
 def gen_named_tuples():
