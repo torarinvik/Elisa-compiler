@@ -3141,9 +3141,36 @@ def main() -> i64:
 """)
 
 
+def gen_brace_membership_ranges():
+    """`x in {1..=3, 5..<7}` -- a brace membership set containing RANGE candidates.
+
+    Membership lowers to an OR-chain of ICmp EQ over the candidates. A range is not a
+    scalar, so emit_expression declined it and killed the ENTIRE chain: every membership
+    set containing a range declined, while the all-scalar form (`x in {1, 2, 3}`)
+    compiled. Ranges now lower as `x >= lo and x <(=) hi`, synthesized as expressions and
+    routed back through emit_expression so the signed-vs-unsigned compare choice is not
+    duplicated.
+
+    The fixture folds membership over probes 0..=7 into a BITMASK, so inclusive-vs-
+    exclusive boundary errors change the answer rather than merely compiling: `..=`
+    must include 3 and `..<` must exclude 7. Expected 118 (0b01110110), which fits in a
+    byte so exit-status truncation cannot mask a mismatch.
+    """
+    yield ("brace_membership_ranges", """
+def keep(value: i64) -> bool:
+	return value in {1..=3, 5..<7}
+
+def main() -> i64:
+	total: mutable i64 = 0
+	for probe in 0..=7:
+		total <- total * 2 + (1 if keep(probe) else 0)
+	return total
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
-               gen_discarded_darray_growth_methods]
+               gen_discarded_darray_growth_methods, gen_brace_membership_ranges]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
