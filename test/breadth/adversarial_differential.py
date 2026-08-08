@@ -1953,6 +1953,28 @@ def main() -> i64:
     b: Vec2 = -a
     return b.x
 """)
+    yield ("struct_add_via_nested_field_access", """
+protocol Add:
+    def __add__(self: Self, other: Self) -> Self
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Add for Vec2:
+    def __add__(self: Vec2, other: Vec2) -> Vec2:
+        return Vec2{x: self.x + other.x, y: self.y + other.y}
+
+struct Line:
+    start: Vec2
+    end: Vec2
+
+def main() -> i64:
+    l1: Line = Line{start: Vec2{x: 1, y: 1}, end: Vec2{x: 2, y: 2}}
+    l2: Line = Line{start: Vec2{x: 10, y: 10}, end: Vec2{x: 20, y: 20}}
+    combined: Vec2 = l1.start + l2.end
+    return combined.x * 1000 + combined.y
+""")
 
 
 GENERATORS += [gen_aggregate_abi]
