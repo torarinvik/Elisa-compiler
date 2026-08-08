@@ -2068,6 +2068,20 @@ def main() -> i64:
     v: i64 = r
     return v
 """)
+    yield ("ref_returning_call_struct_pointee_still_declines", """
+struct Pair:
+    a: i64
+    b: i64
+
+global mutable g: Pair = Pair{a: 10, b: 20}
+
+def get_ref() -> Pair&:
+    return &g
+
+def main() -> i64:
+    v: Pair = get_ref()
+    return v.a
+""")
 
 
 GENERATORS += [gen_aggregate_abi]
