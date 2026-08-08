@@ -1975,6 +1975,26 @@ def main() -> i64:
     combined: Vec2 = l1.start + l2.end
     return combined.x * 1000 + combined.y
 """)
+    yield ("struct_add_inside_closure", """
+protocol Add:
+    def __add__(self: Self, other: Self) -> Self
+
+struct Vec2:
+    x: i64
+    y: i64
+
+impl Add for Vec2:
+    def __add__(self: Vec2, other: Vec2) -> Vec2:
+        return Vec2{x: self.x + other.x, y: self.y + other.y}
+
+def apply(fn: fn(Vec2) -> Vec2, v: Vec2) -> Vec2:
+    return fn(v)
+
+def main() -> i64:
+    base: Vec2 = Vec2{x: 100, y: 200}
+    result: Vec2 = apply(fn(x) => x + base, Vec2{x: 1, y: 2})
+    return result.x * 1000 + result.y
+""")
 
 
 GENERATORS += [gen_aggregate_abi]
