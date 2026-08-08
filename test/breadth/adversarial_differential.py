@@ -3057,8 +3057,38 @@ def main() -> i64:
 """)
 
 
+def gen_void_return_call():
+    """`return helper()` where helper is `-> void`, from a `-> void` function --
+    returning a VOID-typed call rather than falling off the end.
+
+    stage1 CRASHED on this (SIGTRAP, no diagnostic). The operand is void-typed, so
+    LLVMBuildRet emitted `ret void <badref>` -- malformed IR that slipped past the
+    return-type identity check (void == void, so the types "match") and then trapped
+    LLVM during object emission. The bare-`return` path was always correct; only the
+    return-WITH-VALUE path was wrong.
+
+    Pinned through a mutable ref so the relayed call's SIDE EFFECT is observed twice,
+    not merely that the program compiles.
+    """
+    yield ("void_return_call_relay", """
+def bump(slot: mutable i64&) -> void:
+	slot <- slot + 7
+	return
+
+def relay(slot: mutable i64&) -> void:
+	return bump(slot)
+
+def main() -> i64:
+	total: mutable i64 = 0
+	relay(&total)
+	relay(&total)
+	return total
+""")
+
+
 GENERATORS += [gen_aggregate_abi]
-GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name]
+GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
+               gen_void_return_call]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
