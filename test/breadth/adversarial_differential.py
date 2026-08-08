@@ -2682,6 +2682,56 @@ def main() -> i64:
 """)
 
 
+def gen_mutable_ref_local_rebind():
+    """`r: mutable T& = v; r <- v2` -- the LOCAL BINDING itself was declared `mutable`,
+    which stage0 treats as REBINDING the reference (assigning a new T&-typed value to
+    the binding) rather than writing through it -- a plain non-Ref value on the RHS is
+    rejected ("cannot assign int to mutable i64&"). stage1's codegen had no way to tell
+    a mutable-declared local from a non-mutable one (Scope tracked name/slot/type only,
+    no mutability bit at all) and performed write-through unconditionally for ANY
+    Ref-typed `<-` target -- a genuine PERMISSIVE divergence (stage1 silently ACCEPTED
+    and ran `ref <- 5` on a `mutable i64&` local, writing 5 through instead of
+    rejecting), confirmed to predate this entire session via a throwaway worktree.
+
+    Fixed by adding Scope.local_is_mutable, a bit set ONLY at the one VarDecl shape that
+    can spell `mutable` on a Ref-typed annotation at all (type_contains_token already
+    existed in the backend for exactly this check); every other local stays at the
+    pushed default `false`, so the pre-existing write-through behavior for a
+    non-mutable-declared Ref local (the overwhelmingly common case) is unchanged by
+    construction. See defer-function-cleanup-scope-gap and mutable-ref-local-rebind-gap
+    in the memory notes for how this was found (interaction-axis testing) and the
+    corrected-vs-original write-through-ref-gap record.
+    """
+    yield ("mutable_ref_local_rebind_rejects_plain_value", """
+global mutable g: mutable i64 = 100
+
+def main() -> i64:
+    ref: mutable i64& = &g
+    ref <- 5
+    return g
+""")
+    yield ("mutable_ref_local_rebind_via_call_result_rejects_plain_value", """
+global mutable g: i64 = 42
+
+def get_ref() -> mutable i64&:
+    return &g
+
+def main() -> i64:
+    r: mutable i64& = get_ref()
+    r <- 99
+    return g
+""")
+    yield ("mutable_ref_local_rebind_accepts_new_reference", """
+global mutable g1: mutable i64 = 1
+global mutable g2: mutable i64 = 2
+
+def main() -> i64:
+    r: mutable i64& = &g1
+    r <- &g2
+    return g1 + g2
+""")
+
+
 def gen_ref_returning_call_deref():
     """A function declared `-> T&` whose call result lands in a VALUE context (`x: T =
     f()`, not `x: T& = f()`) must be DEREFERENCED — storing the raw pointer's bit pattern
@@ -2891,7 +2941,8 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_floats, gen_lmut_place_required,
                gen_flags_const_enum_sview, gen_char_literal_never_fits_sview,
                gen_clone_builtin_move_wrapped_source, gen_range_match_value_slot,
-               gen_i16_u16_widths, gen_shifts_bitwise_and_size_types]
+               gen_i16_u16_widths, gen_shifts_bitwise_and_size_types,
+               gen_mutable_ref_local_rebind]
 
 
 def main():
