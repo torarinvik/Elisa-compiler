@@ -98,6 +98,82 @@ def main() -> i64 can[Thread.Spawn, Thread.Join, Unsafe.PointerCast]:
     _ = pthread_join(h2, null)
     return a + b' 42
 
+# An INLINE-storage `@c_opaque` type (pthread_mutex_t) must be sized as its real C `sizeof`, not
+# an 8-byte handle — else pthread_mutex_init overruns the alloca and (embedded in a struct)
+# silently races. This CROSS-CHECKS stage1's emitted `[N x i8]` blob against C's own sizeof (a
+# passing lock/unlock alone can't prove the size — clobbered bytes may be padding), AND runs it.
+mutex_case() {
+    local name="$1" ctype="$2" body="$3" want="$4"; total=$((total + 1))
+    local src="$BUILD/threadreal_$name.elisa" ll="$BUILD/threadreal_$name.ll" obj="$BUILD/threadreal_$name.o" exe="$BUILD/threadreal_$name"
+    printf '%s\n%s\n' "$PRELUDE" "$body" > "$src"
+    if ! "$ELISACORE_BIN" -emit llvm -o /dev/null "$src" 2>/dev/null; then echo "  FAIL $name: stage0 rejects"; return; fi
+    if ! "$EMIT" < "$src" > "$ll" 2>/dev/null || grep -q UNSUPPORTED "$ll"; then echo "  FAIL $name: stage1 declined"; return; fi
+    printf '#include <pthread.h>\n#include <stdio.h>\nint main(void){printf("%%zu", sizeof(%s));return 0;}\n' "$ctype" > "$BUILD/sz_$name.c"
+    if ! clang -o "$BUILD/sz_$name" "$BUILD/sz_$name.c" 2>/dev/null; then echo "  FAIL $name: C sizeof probe won't build"; return; fi
+    local csize; csize="$("$BUILD/sz_$name")"
+    local emitted; emitted="$(grep -oE 'alloca \[[0-9]+ x i8\]' "$ll" | grep -oE '[0-9]+' | head -1)"
+    if [ -z "$emitted" ]; then echo "  FAIL $name: no [N x i8] opaque blob emitted (still a ptr handle?)"; return; fi
+    if [ "$emitted" != "$csize" ]; then echo "  FAIL $name: stage1 sized $ctype as $emitted bytes, C sizeof is $csize (would corrupt)"; return; fi
+    if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then echo "  FAIL $name: llc rejected the IR"; return; fi
+    if ! clang -Wl,-dead_strip -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then echo "  FAIL $name: link failed"; return; fi
+    local r
+    for r in 1 2 3 4 5; do
+        RUN "$exe"; local got=$?
+        if [ "$got" -eq 124 ]; then echo "  FAIL $name: TIMED OUT (deadlock?)"; return; fi
+        if [ "$got" -ne "$want" ]; then echo "  FAIL $name: run $r exit $got, want $want"; return; fi
+    done
+    pass=$((pass + 1))
+}
+
+# A local pthread_mutex_t: init, 42x lock/increment/unlock, destroy — with the C-sizeof
+# cross-check that stage1 sized the opaque as 64 bytes (macOS-arm64), not an 8-byte handle.
+mutex_case mutex_count pthread_mutex_t 'extern pthread_mutex_init(mutex: mutable PthreadMutexT&, attr: void&?) -> int can[Memory.Allocate]
+extern pthread_mutex_lock(mutex: void&) -> int can[Sync.Lock]
+extern pthread_mutex_unlock(mutex: void&) -> int can[Sync.Unlock]
+extern pthread_mutex_destroy(mutex: mutable PthreadMutexT&) -> int can[Memory.Release]
+@c_opaque(pthread.h, pthread_mutex_t)
+extern PthreadMutexT
+def main() -> i64 can[Memory.Allocate, Memory.Release, Sync.Lock, Sync.Unlock, Unsafe.PointerCast]:
+    m: mutable PthreadMutexT = zeroed
+    _ = pthread_mutex_init(&m, null)
+    counter: mutable i64 = 0
+    for i in 0..<42:
+        _ = pthread_mutex_lock((&m).cast[void&] can Unsafe.PointerCast)
+        counter <- counter + 1
+        _ = pthread_mutex_unlock((&m).cast[void&] can Unsafe.PointerCast)
+    _ = pthread_mutex_destroy(&m)
+    return counter' 42
+# The REAL pattern: a STRUCT-EMBEDDED mutex (as the std wraps it). 4 threads each do 1000
+# mutex-protected increments of ONE shared counter → 4000 ONLY if the mutex actually serializes
+# the racing increments; a struct-embedded mutex sized as 8 bytes (the pre-fix bug) LOSES updates
+# and varies run-to-run. Run 8x, all must be 42 — determinism IS the mutual-exclusion proof.
+thread_case mutex_shared 'extern pthread_mutex_init(mutex: mutable PthreadMutexT&, attr: void&?) -> int can[Memory.Allocate]
+extern pthread_mutex_lock(mutex: void&) -> int can[Sync.Lock]
+extern pthread_mutex_unlock(mutex: void&) -> int can[Sync.Unlock]
+@c_opaque(pthread.h, pthread_mutex_t)
+extern PthreadMutexT
+struct Shared:
+    lock: mutable PthreadMutexT
+    counter: mutable i64
+def worker(arg: void&?) -> void&? can[Sync.Lock, Sync.Unlock, Unsafe.PointerCast]:
+    if arg is present:
+        s: mutable Shared& = present.cast[mutable Shared&] can Unsafe.PointerCast
+        for i in 0..<1000:
+            _ = pthread_mutex_lock((&s.lock).cast[void&] can Unsafe.PointerCast)
+            s.counter <- s.counter + 1
+            _ = pthread_mutex_unlock((&s.lock).cast[void&] can Unsafe.PointerCast)
+    return null
+def main() -> i64 can[Memory.Allocate, Thread.Spawn, Thread.Join, Sync.Lock, Sync.Unlock, Unsafe.PointerCast]:
+    s: mutable Shared = zeroed
+    _ = pthread_mutex_init(&s.lock, null)
+    handles: mutable uintptr[4] = zeroed
+    entry: void& = worker.cast[void&] can Unsafe.PointerCast
+    for t in 0..<4:
+        _ = pthread_create(&handles[t], null, entry, (&s).cast[void&?] can Unsafe.PointerCast)
+    for t in 0..<4:
+        _ = pthread_join(handles[t], null)
+    return s.counter + 42 - 4000' 42 8
+
 if [ "$pass" -eq "$total" ]; then
     echo "thread_real_smoke OK: $pass/$total real-thread spawn+join programs compile+run correctly"
 else
