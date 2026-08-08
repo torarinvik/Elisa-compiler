@@ -1,0 +1,174 @@
+# A binary operator (`+ - * / % ^ | & << >> < <= > >=`) applied directly to a PARAMETER
+# whose declared type IS the function's own COMPLETELY UNBOUND generic type parameter
+# (`def bump[T](a: T, b: T) -> void: a <- a + b`, no `[T: Interface]` clause at all).
+# stage0 checks a generic function's body once, against only what the declared bound
+# guarantees -- an unbound T supports nothing, so this is rejected at DECLARATION time
+# regardless of any call site. stage1 has no such check and accepts it, deferring entirely
+# to per-instantiation codegen (which still correctly declines a genuinely unsupported
+# instantiation, e.g. a struct with no matching impl -- see
+# generic-operator-bound-checking-gap.md). This is therefore a PERMISSIVE divergence:
+# stage1 accepts a strict superset of valid programs, never a wrong answer or a crash.
+#
+# Deliberately narrow in two ways:
+# - Only a COMPLETELY unbound parameter is flagged (zero bound clauses); never an attempt
+#   to judge whether a DECLARED bound actually grants the operator used -- that would need
+#   to model what each interface provides, which this does not attempt.
+# - Only PARAMETERS whose type IS the bare type parameter (`a: T`, `a: mutable T&`, ...,
+#   stripped via bare_type_name_through_ref exactly like check_field_immutable_assign.elisa
+#   does) are tracked -- a local VarDecl's inferred type is not modeled here, so
+#   `x: T = a; x + b` is not caught. Under-catching, never over-catching: this only adds
+#   diagnostics for a shape it is certain about.
+#
+# Restricted to a SINGLE generic type parameter per function, mirroring
+# check_generic_interface_bounds.elisa's check_interface_specialization: with multiple type
+# params the existing generic_param_lines/names side table's bound rows are keyed by the
+# function's line, not disambiguated per parameter name, so a multi-param function cannot
+# be resolved this way without a different (unaudited) query path.
+extend Semantic:
+    private:
+        def gonb_operator_requires_bound(operator: TokenKind) -> bool:
+            can Abort.Panic:
+                return operator == TokenKind.Plus or operator == TokenKind.Minus or operator == TokenKind.Star or operator == TokenKind.Slash or operator == TokenKind.Percent or operator == TokenKind.Caret or operator == TokenKind.Pipe or operator == TokenKind.Ampersand or operator == TokenKind.LShift or operator == TokenKind.RShift or operator == TokenKind.Lt or operator == TokenKind.LtEq or operator == TokenKind.Gt or operator == TokenKind.GtEq
+
+
+        # The function's SOLE generic type parameter name, or "" if it has zero or more
+        # than one (the multi-param case is out of scope -- see file header).
+        def gonb_sole_param_name(table: SymbolTable&, line: u32) -> sview:
+            can Abort.Panic:
+                result: mutable sview = ""
+                count: mutable usize = 0
+                index: mutable usize = 0
+                while index < table.generic_param_lines.count |index, result, count, table, line|:
+                    if table.generic_param_lines[index] == line:
+                        result <- table.generic_param_names[index]
+                        count <- count + 1
+                    index <- index + 1
+                return result if count == 1 else ""
+
+
+        # Whether PARAM_NAME (the sole type parameter of the function at LINE) has ANY
+        # bound clause at all (`[T: Interface]`) -- bound rows are keyed at
+        # `line + 2^31`, distinct from the plain param-name rows at `line`.
+        def gonb_param_has_any_bound(table: SymbolTable&, line: u32) -> bool:
+            can Abort.Panic:
+                encoded: u32 = line + 2147483648
+                return any bound_line in table.generic_param_lines where bound_line == encoded
+
+
+        # Whether EXPRESSION is exactly the bare type parameter used as a VALUE type --
+        # `T` or `mutable T` -- stripping ONLY Mutable/Lmut. Deliberately distinct from
+        # bare_type_name_through_ref, which also strips Ampersand: a REF parameter
+        # (`items: T&`) is a C-buffer pointer, and `items + index` on it is POINTER
+        # ARITHMETIC -- a completely different, always-legal operation unrelated to
+        # whatever T's own bound provides (confirmed via the self-hosting audit this
+        # over-fired on: elisacore_std/deque.elisa's and collections.elisa's
+        # `*_void_from_items_at[T](items: T&, index: usize) -> void&: (items +
+        # index).cast[void&]` helpers). A `&`-wrapped parameter must NEVER match here.
+        def gonb_is_bare_value_type(expression: Ast::Expr, type_param_name: sview) -> bool:
+            can Abort.Panic:
+                if expression is Expr.Unary(operator, operand, unary_line):
+                    return gonb_is_bare_value_type(operand, type_param_name) if operator == TokenKind.Mutable or operator == TokenKind.Lmut else false
+                if expression is Expr.Ident(ident_name, ident_line):
+                    return ident_name == type_param_name
+                return false
+
+
+        # Names of function PARAMETERS whose declared type is the bare type parameter
+        # used AS A VALUE (see gonb_is_bare_value_type) -- never a reference to it.
+        # Out-parameter style (not a returned fresh darray) to avoid the
+        # region-polymorphic call-context requirement.
+        def gonb_bare_param_names(params: darray[Ast::ParamDecl], type_param_name: sview, bare_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                bare_names.extend([p.name for p in params if gonb_is_bare_value_type(p.type_expression, type_param_name)])
+
+
+        def gonb_expr_uses_bare_param(expression: Ast::Expr, bare_names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                return match expression:
+                    Expr.Ident(name, ident_line): any bare_name in bare_names where bare_name == name
+                    Expr.Paren(inner, paren_line): gonb_expr_uses_bare_param(inner, bare_names)
+                    _: false
+
+
+        def gonb_walk_expr(expression: Ast::Expr, bare_names: darray[sview]&, line: mutable u32&, found: mutable bool&) -> void:
+            can Abort.Panic:
+                match expression:
+                    Expr.Binary(left, operator, right, binary_line):
+                        if gonb_operator_requires_bound(operator) and (gonb_expr_uses_bare_param(left, bare_names) or gonb_expr_uses_bare_param(right, bare_names)):
+                            found <- true
+                            line <- binary_line
+                        gonb_walk_expr(left, bare_names, line, found)
+                        gonb_walk_expr(right, bare_names, line, found)
+                    Expr.Paren(inner, paren_line):
+                        gonb_walk_expr(inner, bare_names, line, found)
+                    Expr.Unary(operator, operand, unary_line):
+                        gonb_walk_expr(operand, bare_names, line, found)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        gonb_walk_expr(callee, bare_names, line, found)
+                        for argument in arguments |bare_names, line, found|:
+                            gonb_walk_expr(argument, bare_names, line, found)
+                    Expr.Field(object, field, field_line):
+                        gonb_walk_expr(object, bare_names, line, found)
+                    Expr.Index(object, index, index_line):
+                        gonb_walk_expr(object, bare_names, line, found)
+                        gonb_walk_expr(index, bare_names, line, found)
+                    _:
+                        pass
+
+
+        def gonb_walk_stmts(statements: darray[Ast::Stmt], bare_names: darray[sview]&, line: mutable u32&, found: mutable bool&) -> void:
+            can Abort.Panic:
+                for statement in statements |bare_names, line, found|:
+                    match statement:
+                        Stmt.Expr(expression, stmt_line):
+                            gonb_walk_expr(expression, bare_names, line, found)
+                        Stmt.VarDecl(name, type_expression, value, stmt_line):
+                            gonb_walk_expr(value, bare_names, line, found)
+                        Stmt.Assign(target, operator, value, stmt_line):
+                            gonb_walk_expr(target, bare_names, line, found)
+                            gonb_walk_expr(value, bare_names, line, found)
+                        Stmt.Return(value, stmt_line):
+                            gonb_walk_expr(return_value, bare_names, line, found) if value is return_value
+                        Stmt.If(condition, then_body, else_body, stmt_line):
+                            gonb_walk_expr(condition, bare_names, line, found)
+                            gonb_walk_stmts(then_body, bare_names, line, found)
+                            gonb_walk_stmts(else_body, bare_names, line, found)
+                        Stmt.While(condition, body, stmt_line):
+                            gonb_walk_expr(condition, bare_names, line, found)
+                            gonb_walk_stmts(body, bare_names, line, found)
+                        Stmt.For(bind, variables, iterable, body, stmt_line):
+                            gonb_walk_expr(iterable, bare_names, line, found)
+                            gonb_walk_stmts(body, bare_names, line, found)
+                        Stmt.Block(kind, clause, binding, body, stmt_line):
+                            gonb_walk_stmts(body, bare_names, line, found)
+                        Stmt.Match(scrutinee, arms, stmt_line):
+                            gonb_walk_expr(scrutinee, bare_names, line, found)
+                            for arm in arms |bare_names, line, found|:
+                                gonb_walk_stmts(arm.body, bare_names, line, found)
+                        _:
+                            pass
+
+
+        def gonb_walk_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, decl_line):
+                            type_param_name: sview = gonb_sole_param_name(table, decl_line)
+                            if type_param_name != "" and not gonb_param_has_any_bound(table, decl_line):
+                                bare_names: mutable darray[sview] = []
+                                gonb_bare_param_names(params, type_param_name, bare_names)
+                                if bare_names.count > 0:
+                                    found_line: mutable u32 = decl_line
+                                    found: mutable bool = false
+                                    gonb_walk_stmts(body, bare_names, found_line, found)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.GenericOperatorNoBound, name: type_param_name, line: found_line, expected: "binary", actual: name}) if found
+                        Decl.Module(name, body, decl_line) | Decl.Scoped(body, decl_line):
+                            table <- gonb_walk_declarations(body, table)
+                        _:
+                            pass
+
+    public:
+        def check_generic_operator_no_bound(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- gonb_walk_declarations(file.top_decls, table)
