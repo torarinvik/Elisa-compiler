@@ -1997,10 +1997,40 @@ def main() -> i64:
 """)
 
 
+def gen_named_tuples():
+    """Named-tuple return types (`-> (label: T, ...)`), multi-value `return a, b` (bare
+    comma, NOT parenthesized `(label: a, ...)` — that shape is a DIFFERENT grammar the
+    return-statement parser does not accept), and field access by label. Untested all
+    session; zero corpus usage (the compiler's own source doesn't use named tuples).
+    """
+    yield ("named_tuple_struct_elements", """
+struct Point:
+    x: i64
+    y: i64
+
+def make(a: Point, b: Point) -> (first: Point, second: Point):
+    return b, a
+
+def main() -> i64:
+    p1: Point = Point{x: 1, y: 2}
+    p2: Point = Point{x: 3, y: 4}
+    result: (first: Point, second: Point) = make(p1, p2)
+    return result.first.x * 1000 + result.second.x
+""")
+    yield ("named_tuple_scalar_elements", """
+def divmod(a: i64, b: i64) -> (quotient: i64, remainder: i64):
+    return a / b, a % b
+
+def main() -> i64:
+    r: (quotient: i64, remainder: i64) = divmod(17, 5)
+    return r.quotient * 100 + r.remainder
+""")
+
+
 GENERATORS += [gen_aggregate_abi]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
-               gen_struct_operator_protocols]
+               gen_struct_operator_protocols, gen_named_tuples]
 
 
 def main():
