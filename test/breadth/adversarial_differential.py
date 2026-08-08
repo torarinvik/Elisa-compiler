@@ -2478,6 +2478,73 @@ def main() -> i64:
 """)
 
 
+def gen_shifts_bitwise_and_size_types():
+    """Two thin spots found by auditing corpus density: shift operators (`<<` 4 mentions,
+    `>>` 3, `^` 7 — far below comparable features) and `usize`/`isize` (2 each). Both are
+    classic divergence territory: a right shift must be ARITHMETIC on a signed operand
+    and LOGICAL on an unsigned one, and getting that backwards is a silent wrong answer,
+    not a crash. Probed deliberately; stage1 matches stage0 on all of it, so this lands
+    as coverage rather than a fix.
+
+    Deliberately stays inside WELL-DEFINED shift ranges (never >= the operand width) —
+    an oversized shift is undefined behaviour, and a fixture built on UB proves nothing
+    about either compiler (see the poisoned-fixture lesson in the memory notes).
+    """
+    yield ("shift_arithmetic_vs_logical_right", """
+def main() -> i64:
+    a: i64 = -16
+    r1: i64 = a >> 2
+    b: u64 = 18446744073709551600
+    r2: u64 = b >> 2
+    c: i32 = -16
+    r3: i32 = c >> 2
+    d: u32 = 4294967280
+    r4: u32 = d >> 2
+    return (r1 + 4) + (r2 % 100).i64() + (r3 + 4).i64() + (r4 % 100).i64()
+""")
+    yield ("shift_left_and_bitwise_ops", """
+def main() -> i64:
+    a: i64 = 1
+    l1: i64 = a << 40
+    b: u8 = 3
+    l2: u8 = b << 5
+    c: i16 = -1
+    r3: i16 = c >> 3
+    m: i64 = 255
+    x: i64 = (m ^ 15) | 256
+    y: i64 = m & 240
+    return (l1 >> 36) + l2.i64() + (r3.i64() + 1) + (x % 1000) + y
+""")
+    yield ("usize_isize_in_containers_and_loops", """
+def take(n: usize, s: isize) -> i64:
+    return n.i64() + s.i64()
+
+def main() -> i64:
+    xs: mutable darray[i64] = [10, 20, 30]
+    n: usize = xs.count
+    s: isize = -5
+    idx: usize = 1
+    v: i64 = xs[idx]
+    sum: mutable usize = 0
+    for i in 0..<n |sum|:
+        sum <- sum + i
+    return take(n, s) + v + sum.i64()
+""")
+    yield ("usize_isize_division_truncation_and_max", """
+def main() -> i64:
+    a: usize = 10
+    b: usize = 3
+    q: usize = a / b
+    r: usize = a % b
+    s: isize = -10
+    t: isize = s / 3
+    u: isize = s % 3
+    big: usize = 18446744073709551615
+    w: usize = big / 1000000000000000000
+    return q.i64() * 100 + r.i64() * 10 + (t.i64() + 10) + (u.i64() + 10) + w.i64()
+""")
+
+
 def gen_i16_u16_widths():
     """`i16`/`u16` had ZERO corpus coverage before this generator — the same signature as
     the f32/f64 gap found earlier in this session (i8, i32, i64 all had cases; i16 was
@@ -2806,7 +2873,7 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_floats, gen_lmut_place_required,
                gen_flags_const_enum_sview, gen_char_literal_never_fits_sview,
                gen_clone_builtin_move_wrapped_source, gen_range_match_value_slot,
-               gen_i16_u16_widths]
+               gen_i16_u16_widths, gen_shifts_bitwise_and_size_types]
 
 
 def main():
