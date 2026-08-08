@@ -2027,10 +2027,54 @@ def main() -> i64:
 """)
 
 
+def gen_ref_returning_call_deref():
+    """A function declared `-> T&` whose call result lands in a VALUE context (`x: T =
+    f()`, not `x: T& = f()`) must be DEREFERENCED — storing the raw pointer's bit pattern
+    into a T-typed slot is a silent WRONG ANSWER, not a decline, and was invisible to
+    self-hosting (the compiler's own source apparently never triggers this exact shape).
+    """
+    yield ("ref_returning_call_deref_global", """
+global mutable g: i64 = 42
+
+def get_ref() -> i64&:
+    return &g
+
+def main() -> i64:
+    v1: i64 = get_ref()
+    return v1
+""")
+    yield ("ref_returning_call_deref_struct_field", """
+struct Pair:
+    a: i64
+    b: i64
+
+def store_get(s: Pair&, h: bool) -> i64&:
+    return &s.a if h else &s.b
+
+def main() -> i64:
+    p: Pair = Pair{a: 10, b: 20}
+    v1: i64 = store_get(p, true)
+    v2: i64 = store_get(p, false)
+    return v1 * 1000 + v2
+""")
+    yield ("ref_returning_call_still_works_as_ref", """
+global mutable g: i64 = 42
+
+def get_ref() -> i64&:
+    return &g
+
+def main() -> i64:
+    r: i64& = get_ref()
+    v: i64 = r
+    return v
+""")
+
+
 GENERATORS += [gen_aggregate_abi]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
-               gen_struct_operator_protocols, gen_named_tuples]
+               gen_struct_operator_protocols, gen_named_tuples,
+               gen_ref_returning_call_deref]
 
 
 def main():
