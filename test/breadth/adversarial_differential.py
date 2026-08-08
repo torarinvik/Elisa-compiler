@@ -2135,6 +2135,41 @@ def main() -> i64:
 """)
 
 
+def gen_darray_of_fixed_array():
+    """`darray[T[N]]` -- a darray whose ELEMENT is itself a fixed-size array -- declined
+    unconditionally at the type-annotation level (`annotation_index_named_value_type`'s
+    "darray" case had an explicit `unmodeled_type() return if darray_element.kind ==
+    TypeKind.Array` guard, predating any commit in this session's history), even for a
+    bare uninitialized `m: darray[i64[2]]` with no literal at all. The darray backing
+    store's push/index/growth paths are element-type-agnostic (they size and GEP through
+    llvm_type_of generically), so once the guard was removed the feature worked with no
+    other changes. Found by following up on a flagged-but-deferred lead from the same
+    session's borrowed-darray-of-darray chain-type fix.
+    """
+    yield ("darray_of_fixed_array_uninitialized", """
+def main() -> i64:
+    m: darray[i64[2]]
+    return 0
+""")
+    yield ("darray_of_fixed_array_literal", """
+def main() -> i64:
+    m: mutable darray[i64[2]] = [[1, 2], [3, 4]]
+    return m[0][1]
+""")
+    yield ("darray_of_fixed_array_push", """
+def main() -> i64:
+    m: mutable darray[i64[2]] = []
+    m.push([1, 2])
+    return m[0][1]
+""")
+    yield ("darray_of_fixed_array_index_compound_assign", """
+def main() -> i64:
+    m: mutable darray[i64[2]] = [[1, 2], [3, 4]]
+    m[0][1] += 100
+    return m[0][1] + m[1][0]
+""")
+
+
 def gen_named_tuples():
     """Named-tuple return types (`-> (label: T, ...)`), multi-value `return a, b` (bare
     comma, NOT parenthesized `(label: a, ...)` — that shape is a DIFFERENT grammar the
@@ -2248,7 +2283,7 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
                gen_ref_returning_call_deref, gen_struct_compound_assign_declines,
-               gen_index_compound_assign]
+               gen_index_compound_assign, gen_darray_of_fixed_array]
 
 
 def main():
