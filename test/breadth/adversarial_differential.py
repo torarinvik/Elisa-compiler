@@ -2135,6 +2135,101 @@ def main() -> i64:
 """)
 
 
+def gen_floats():
+    """f32/f64 arithmetic, comparisons, and numeric-cast METHOD CALLS whose RECEIVER is a
+    bare (or unary-negated) float LITERAL rather than a typed variable — zero corpus usage
+    (`grep f32\\|f64` over this file was empty before this generator existed), and the
+    receiver-is-a-literal shape is exactly the one `codegen_expr_calls.elisa`'s cast path
+    used to special-case AWAY: a comment there read "`1.5.i64()` is not a form the subset
+    needs to model", defaulting an untyped literal receiver's source type to i64 regardless
+    of the literal's own kind. `3.9.i64()` then resolved its FloatLit receiver AT i64,
+    which cannot be emitted, and the decline took the whole enclosing function with it
+    (DECLINE VarDecl, DROPPED main) — stage0 accepts and truncates it (exit 3). Fixed by
+    defaulting a float-literal receiver (bare OR unary +/- negated, `(-3.9).i32()` is a
+    one-layer-deeper case of the same gap) to f64 instead of i64.
+
+    A SECOND, independent bug turned up validating the FIRST fix's own boundary (variables,
+    not literals, this time): `emit_expression_binary_tail`'s mixed-width numeric check
+    assumed `operand_type` always equals the LEFT operand's exact kind/bits — true for the
+    INTEGER narrow-to-left rule it was written for, false the moment either operand is a
+    FLOAT of a different width/kind than the other. `f32 + f64` and `f64 + i64` (either
+    order) both declined outright, though stage0 accepts both and WIDENS to the wider/float
+    side (`fpext`/`sitofp`, confirmed via `-emit llvm` — the opposite direction from the
+    integer rule, which narrows). Fixed by special-casing both mixed shapes to pick the
+    float side as `operand_type` before the general check runs.
+    """
+    yield ("float_literal_cast_truncates", """
+def main() -> i64:
+    return 3.9.i64() * 10 + 7.2.i64()
+""")
+    yield ("float_literal_cast_negative_and_narrow", """
+def main() -> i64:
+    a: i32 = (-3.9).i32()
+    b: u8 = 9.9.u8()
+    return a.i64() * 10 + b.i64()
+""")
+    yield ("float_mixed_f32_f64_arithmetic", """
+def main() -> i64:
+    a: f32 = 1.5.f32()
+    b: f64 = 2.5
+    c: f64 = a + b
+    return c.i64()
+""")
+    # A separate DECLINE found while boundary-checking the f32/f64 widen fix: an INTEGER
+    # operand against a FLOAT operand (either order) hits the same "operand_type must equal
+    # left_own's exact kind/bits" decline check, even though stage0 accepts and promotes to
+    # the float side (`sitofp` on the int, confirmed via `-emit llvm`) exactly as it does
+    # for float/float mixed width.
+    yield ("float_int_mixed_arithmetic_both_orders", """
+def main() -> i64:
+    a: i64 = 3
+    b: f64 = 2.5
+    c: f64 = a - b
+    d: bool = a.f64() < b
+    e: bool = b < a.f64()
+    r: mutable i64 = c.i64()
+    r <- r + 100 if d
+    r <- r + 1000 if e
+    return r
+""")
+    yield ("float_comparison_branches", """
+def main() -> i64:
+    a: f64 = 5.5
+    b: f64 = 5.5
+    c: f64 = 5.6
+    r: mutable i64 = 0
+    r <- r + 1 if a == b
+    r <- r + 10 if a < c
+    r <- r + 100 if c > a
+    return r
+""")
+    yield ("float_negative_division_truncates", """
+def main() -> i64:
+    a: f64 = -7.5
+    b: f64 = 2.0
+    c: f64 = a / b
+    return c.i64()
+""")
+    yield ("float_f32_arithmetic_and_cast", """
+def main() -> i64:
+    a: f32 = 10.5.f32()
+    b: f32 = 3.25.f32()
+    c: f32 = a - b
+    return c.i64()
+""")
+    yield ("float_mixed_width_comparisons", """
+def main() -> i64:
+    a: f32 = 2.5.f32()
+    b: f64 = 2.5
+    c: f64 = 2.6
+    r: mutable i64 = 0
+    r <- r + 1 if a == b
+    r <- r + 10 if a < c
+    r <- r + 100 if c > a
+    return r
+""")
+
+
 def gen_pin_and_range_match_arms():
     """A scalar statement-match over an integer scrutinee with a `^pin` arm (compare
     against an existing binding's VALUE rather than a constant) or a range arm. The
@@ -2487,7 +2582,8 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_ref_returning_call_deref, gen_struct_compound_assign_declines,
                gen_index_compound_assign, gen_darray_of_fixed_array,
                gen_pin_and_range_match_arms, gen_value_match_pin_and_range,
-               gen_borrowed_fixed_array_chain, gen_borrowed_fixed_array_mixed_width_read]
+               gen_borrowed_fixed_array_chain, gen_borrowed_fixed_array_mixed_width_read,
+               gen_floats]
 
 
 def main():
