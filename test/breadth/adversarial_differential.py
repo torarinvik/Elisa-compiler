@@ -3029,8 +3029,36 @@ def main() -> i64:
     # without fixing anything. Documented in shorthand-member-const-enum-only.md instead.
 
 
+def gen_builtin_view_type_name():
+    """`size_of(view[i32])` -- the builtin container type name `view` used where the
+    resolver walks a TYPE as a value expression. seed_builtins registered `darray`,
+    `dict`, `set` and `array` but not `view`, so it alone reported `undefined
+    identifier 'view'` while its siblings resolved.
+
+    Pinned alongside a struct `size_of` so the numeric answers (not just acceptance)
+    are compared. Note the argument is strictly a TYPE: stage0 rejects both
+    `size_of(NoSuchType)` ("unknown type") and `size_of(x)` for a value `x`, so this
+    could NOT be fixed by skipping the argument the way offset_of's field selector is
+    skipped -- that would have accepted an undefined type name and gone PERMISSIVE.
+    """
+    yield ("builtin_view_type_name_size_of", """
+struct Padded:
+	tag: i8
+	value: i32
+
+def padded_size() -> usize:
+	return size_of(Padded)
+
+def view_size() -> usize:
+	return size_of(view[i32])
+
+def main() -> i64:
+	return padded_size().i64() * 100 + view_size().i64()
+""")
+
+
 GENERATORS += [gen_aggregate_abi]
-GENERATORS += [gen_shorthand_member_is]
+GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
