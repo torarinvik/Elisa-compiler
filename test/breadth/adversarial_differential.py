@@ -2100,6 +2100,15 @@ def main() -> i64:
     xs[2] *= 5
     return xs[2]
 """)
+    yield ("borrowed_darray_index_compound_assign", """
+def bump(xs: mutable darray[i64]&) -> void:
+    xs[1] += 100
+
+def main() -> i64:
+    xs: mutable darray[i64] = [1, 2, 3]
+    bump(&xs)
+    return xs[1]
+""")
 
 
 def gen_named_tuples():
