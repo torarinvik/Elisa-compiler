@@ -364,6 +364,29 @@ extend Backend:
         # thread an `expected` type downward — `a: u8 = 200` must make 200 a u8, not an
         # i64 that is then silently truncated.
         def expression_type(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic]:
+            can Abort.Panic:
+                return expression_type_depth(expression, local_scope, fns, structs, generics, 0)
+
+        # The recursive body of `expression_type`, with an explicit DEPTH so a pathologically
+        # left-nested expression (`1 + 1 + 1 + … ` thousands deep — adversarial input, not
+        # anything a real program writes) cannot blow up. Every caller OUTSIDE this function
+        # goes through the depth=0 wrapper above; every self-recursive call below increments
+        # depth by one. Without the cap, a chain of N binary operators cost O(N^2): this
+        # function is called once per level of the emitter's own recursion into `binary_left`
+        # (see emit_expression_binary_tail), and at EACH of those N levels this function walks
+        # the (still O(N)-long) remaining left spine again. Measured: an N=20000 chain took
+        # 44s and one nearly 3x deeper N=50000 chain still had not finished after 120s wall
+        # time (all CPU, not I/O) — a hang, not a slow-but-bounded compile. A depth-only cap
+        # bounds the STACK but not the total WORK: with the cap at 1000, N=300000+ chains still
+        # took >90s (still effectively O(N * cap)). 200 keeps the worst case cheap while
+        # remaining an order of magnitude past any nesting a hand-written or generated
+        # expression plausibly reaches — self-hosting this compiler is the check that it
+        # never fires on real code. Past the cap this answers Unmodeled, the same "give up,
+        # let the caller fall back to its own context/expected type" answer literals already
+        # give — safe because no genuine expression nests anywhere near this deep; only an
+        # adversarial one does.
+        def expression_type_depth(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, depth: i64) -> ValueType can[Abort.Panic]:
+            unmodeled_type() return if depth > 200
             if expression is Expr.Ident(ident_name, ident_line):
                 # A LOCAL shadows a global const, so the scope is consulted first.
                 local_type: ValueType = lookup_type(local_scope, ident_name)
@@ -378,10 +401,10 @@ extend Backend:
                 copied_type(structs.const_types[const_index.usize()]) return if const_index >= 0 and structs.const_global_ok[const_index.usize()]
                 return unmodeled_type()
             if expression is Expr.Paren(paren_inner, paren_line):
-                return expression_type(paren_inner, local_scope, fns, structs, generics)
+                return expression_type_depth(paren_inner, local_scope, fns, structs, generics, depth + 1)
             # A move has the moved value's type: it transfers ownership, not representation.
             if expression is Expr.Move(moved_value, move_line):
-                return expression_type(moved_value, local_scope, fns, structs, generics)
+                return expression_type_depth(moved_value, local_scope, fns, structs, generics, depth + 1)
             if expression is Expr.BoolLit(bool_value):
                 return ValueType{kind: TypeKind.Bool, bits: 1}
             if expression is Expr.CharLit(char_text):
@@ -399,13 +422,13 @@ extend Backend:
                 # `not x` is a bool whatever `x` is; `-x` / `~x` keep the operand's type.
                 ValueType{kind: TypeKind.Bool, bits: 1} return if unary_operator == TokenKind.Not
                 # `!id` yields the handle's BACKING integer, not a bool (see the emit site).
-                expression_type(unary_operand, local_scope, fns, structs, generics) return if unary_operator == TokenKind.Bang
+                expression_type_depth(unary_operand, local_scope, fns, structs, generics, depth + 1) return if unary_operator == TokenKind.Bang
                 # `&place` is a reference to the place's type.
                 if unary_operator == TokenKind.Ampersand:
-                    place_type: ValueType = expression_type(unary_operand, local_scope, fns, structs, generics)
+                    place_type: ValueType = expression_type_depth(unary_operand, local_scope, fns, structs, generics, depth + 1)
                     unmodeled_type() return if place_type.kind == TypeKind.Unmodeled
                     return intern_ref_type(place_type, structs)
-                return expression_type(unary_operand, local_scope, fns, structs, generics)
+                return expression_type_depth(unary_operand, local_scope, fns, structs, generics, depth + 1)
             if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
                 # A comparison, logical, `is` narrowing, or `in` membership yields bool
                 # regardless of operands.
@@ -415,9 +438,9 @@ extend Backend:
                 ValueType{kind: TypeKind.Bool, bits: 1} return if binary_operator == TokenKind.And or binary_operator == TokenKind.Or
                 # Arithmetic keeps the operands' type: take whichever side is known, since
                 # a literal contributes nothing.
-                left_type: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                left_type: ValueType = expression_type_depth(binary_left, local_scope, fns, structs, generics, depth + 1)
                 left_type return if left_type.kind != TypeKind.Unmodeled
-                return expression_type(binary_right, local_scope, fns, structs, generics)
+                return expression_type_depth(binary_right, local_scope, fns, structs, generics, depth + 1)
             # `x.cast[T]` — a reinterpret cast has the target type.
             if expression is Expr.Index(cast_type_head, cast_type_arg, cast_type_line):
                 if cast_type_head is Expr.Field(cast_type_source, cast_type_method, cast_type_method_line):
@@ -435,7 +458,7 @@ extend Backend:
             # `xs[i]` — an index READ yields the element type of an array, a darray, OR a
             # `Struct&` used as a C-style pointer base (`items[i]` on a `DictBucket[K,T]&`).
             if expression is Expr.Index(indexed_object, index_expression, index_line):
-                indexed_type: ValueType = expression_type(indexed_object, local_scope, fns, structs, generics)
+                indexed_type: ValueType = expression_type_depth(indexed_object, local_scope, fns, structs, generics, depth + 1)
                 # A byte read from a string (cstr / view[u8]) is an i64 (the runtime index
                 # helpers return i64), matching stage0.
                 ValueType{kind: TypeKind.Signed, bits: 64} return if indexed_type.kind == TypeKind.CStr or indexed_type.kind == TypeKind.SView
@@ -476,7 +499,7 @@ extend Backend:
             if expression is Expr.Field(field_object, field_name, field_line):
                 # Bitset flag names type as bool (`token.flags.has_suffix`).
                 ValueType{kind: TypeKind.Bool, bits: 1} return if field_name == "has_suffix" or field_name == "has_prefix"
-                object_type: mutable ValueType = expression_type(field_object, local_scope, fns, structs, generics)
+                object_type: mutable ValueType = expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
                 # AUTO-DEREF: `p.x` where `p: P&` reads P's field. A reference is
                 # transparent for member access — the frontend has already decided the
                 # access is legal, so the backend just looks through it. An optional HEAP
@@ -535,7 +558,7 @@ extend Backend:
             # `get OPT else FALLBACK` UNWRAPS and answers the payload. Backwards, and the
             # optional is silently dropped.
             if expression is Expr.Refinement(try_type_fallback, try_type_guarded, try_type_line):
-                try_type_guarded_type: ValueType = expression_type(try_type_guarded, local_scope, fns, structs, generics)
+                try_type_guarded_type: ValueType = expression_type_depth(try_type_guarded, local_scope, fns, structs, generics, depth + 1)
                 unmodeled_type() return if try_type_guarded_type.kind == TypeKind.Unmodeled
                 # A first-class error-union VALUE carries its payload in the descriptor.
                 error_union_payload_of(try_type_guarded_type, structs) return if try_type_guarded_type.kind == TypeKind.ErrorUnion
