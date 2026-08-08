@@ -2274,6 +2274,69 @@ def main() -> i64:
 """)
 
 
+def gen_borrowed_fixed_array_mixed_width_read():
+    """A SILENT WRONG ANSWER (MISMATCH), not a decline: `xs[i]` where `xs: T[N]&` is a
+    borrowed reference to a single fixed-size array. Two independent gaps compounded:
+
+    1. `expression_type`'s Expr.Index/Ref case (codegen_scope.elisa) had no
+       TypeKind.Array branch, so it fell through to the catch-all
+       `array_element_of(indexed_type, ...)` called on the raw Ref (not its Array
+       target) -- which safely declines a non-Array input, so `pts[i]` silently typed
+       as Unmodeled. This alone made a type-dependent use of the read (an explicit
+       `.i64()` cast) decline outright.
+
+    2. The matching CODEGEN read (emit_expression_index_fields's own
+       `array_type.kind == Ref, target == Array` branch, codegen_expr_index_fields.elisa)
+       loaded the element at its NATURAL width with no conversion tail at all -- the
+       exact "new read path forgets its conversion tail" shape documented for the
+       view[T] index arm earlier this session, just in a sibling branch that never got
+       the same fix.
+
+    Together, in a function whose return expression skips the `.i64()` decline path
+    (an implicit-width binary add rather than an explicit cast), stage1 built an LLVM
+    module with a WIDTH-MISMATCHED `llvm.sadd.with.overflow.i64(i64, i8)` call --
+    LLVM accepted it and answered 200 where stage0 answers 202. Confirmed via
+    `-emit llvm`: `%arr.ref.elem3 = load i8, ...` fed directly into the i64 overflow
+    intrinsic with no zext/sext in between. Fixed both gaps: added TypeKind.Array to
+    expression_type's Ref-Index branch (mirroring the DArray-behind-Ref case already
+    there), and added the same emit_conversion tail its scalar-ref/opt-ref/view
+    sibling branches already have.
+    """
+    yield ("borrowed_fixed_array_mixed_width_read", """
+def combine(ys: mutable i64[3]&, zs: mutable u8[3]&) -> i64:
+    return ys[1] + zs[1].i64()
+
+def main() -> i64:
+    ys: mutable i64[3] = [100, 200, 300]
+    zs: mutable u8[3] = [1, 2, 3]
+    return combine(&ys, &zs)
+""")
+    yield ("borrowed_fixed_array_explicit_cast_isolated", """
+def only_u8(zs: mutable u8[3]&) -> i64:
+    return zs[1].i64()
+
+def only_i64(ys: mutable i64[3]&) -> i64:
+    return ys[1]
+
+def main() -> i64:
+    ys: mutable i64[3] = [100, 200, 300]
+    zs: mutable u8[3] = [1, 2, 3]
+    return only_u8(&zs) * 10 + only_i64(&ys)
+""")
+    yield ("borrowed_fixed_array_struct_element_read", """
+struct Point:
+    x: i64
+    y: i64
+
+def sum_struct(pts: Point[3]&) -> i64:
+    return pts[1].x + pts[2].y
+
+def main() -> i64:
+    ps: Point[3] = [Point{x:1,y:2}, Point{x:3,y:4}, Point{x:5,y:6}]
+    return sum_struct(&ps)
+""")
+
+
 def gen_darray_of_fixed_array():
     """`darray[T[N]]` -- a darray whose ELEMENT is itself a fixed-size array -- declined
     unconditionally at the type-annotation level (`annotation_index_named_value_type`'s
@@ -2424,7 +2487,7 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_ref_returning_call_deref, gen_struct_compound_assign_declines,
                gen_index_compound_assign, gen_darray_of_fixed_array,
                gen_pin_and_range_match_arms, gen_value_match_pin_and_range,
-               gen_borrowed_fixed_array_chain]
+               gen_borrowed_fixed_array_chain, gen_borrowed_fixed_array_mixed_width_read]
 
 
 def main():
