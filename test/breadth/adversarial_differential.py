@@ -2081,6 +2081,27 @@ def main() -> i64:
 """)
 
 
+def gen_index_compound_assign():
+    """`xs[i] op= v` -- element address computed once and reused for both the load and
+    the store, unlike `xs[i] <- v` which only ever stores. Untested all session, and
+    stage1's own comment on the plain-store path called this out as "a separate
+    lowering" not yet implemented; fixed alongside the struct-field compound-assign
+    gap in the same session by reusing emit_darray_index_address/emit_index_address.
+    """
+    yield ("darray_index_compound_assign", """
+def main() -> i64:
+    xs: mutable darray[i64] = [1, 2, 3]
+    xs[1] += 10
+    return xs[1]
+""")
+    yield ("fixed_array_index_compound_assign", """
+def main() -> i64:
+    xs: mutable i64[3] = [1, 2, 3]
+    xs[2] *= 5
+    return xs[2]
+""")
+
+
 def gen_named_tuples():
     """Named-tuple return types (`-> (label: T, ...)`), multi-value `return a, b` (bare
     comma, NOT parenthesized `(label: a, ...)` — that shape is a DIFFERENT grammar the
@@ -2193,7 +2214,8 @@ GENERATORS += [gen_aggregate_abi]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
-               gen_ref_returning_call_deref, gen_struct_compound_assign_declines]
+               gen_ref_returning_call_deref, gen_struct_compound_assign_declines,
+               gen_index_compound_assign]
 
 
 def main():
