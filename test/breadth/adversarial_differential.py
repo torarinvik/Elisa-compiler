@@ -2575,6 +2575,126 @@ def main() -> i64:
 """)
 
 
+def gen_lmut_place_required():
+    """`lmut T` parameters need a mutable PLACE, not a value — stage0 enforces this
+    (docs/120 §10) and stage1 was silently missing two shapes of it, both PERMISSIVE gaps
+    (stage0 rejects, stage1 built clean). Every program below must FAIL to build under BOTH
+    compilers; a stage1 accept here is exactly the bug.
+
+    1. `DiagnosticKind.LmutMutationNotReassignment` (check_lmut_mutation_reassignment.elisa)
+       carried severity 0 in semantic_api_severity.elisa. The driver only exits 1 on
+       severity-1 findings (`continue if Semantic::diagnostic_severity(diagnostic) != 1`,
+       src/driver/elisac.elisa), so this diagnostic — though computed correctly — never
+       blocked a build. A bare statement call that threads an `lmut` struct parameter
+       without a reassignment (`bump(c)` instead of `c <- bump(c)`) compiled clean.
+    2. check_lmut_value_arg.elisa's place-tracking reused the shared `is_primitive_type_name`
+       helper, which folds `sview`/`cstr`/`dstr` in with the true scalars — correct for ITS
+       OTHER callers (e.g. `.sview()`/`.cstr()` are real builtin conversion method names) but
+       wrong here: those three spellings are STRUCTS, and stage0 requires a mutable place for
+       an `lmut sview`/`lmut cstr`/`lmut dstr` parameter exactly like any user struct
+       ("argument 1 to f expects mutable sview&, got sview"). A by-value sview/cstr/dstr
+       local passed to such a parameter was never flagged.
+    """
+    yield ("lmut_mutation_bare_call_not_reassignment", """
+struct Counter:
+    n: i64
+
+def bump(c: lmut Counter) -> void:
+    pass
+
+def main() -> i64:
+    c: mutable Counter = Counter{n: 1}
+    bump(c)
+    return c.n
+""")
+    yield ("lmut_value_arg_sview_needs_place", """
+def bump(s: lmut sview) -> void:
+    pass
+
+def main() -> i64:
+    x: sview = "hi"
+    bump(x)
+    return 0
+""")
+    yield ("lmut_value_arg_cstr_needs_place", """
+def bump(s: lmut cstr) -> void:
+    pass
+
+def main() -> i64:
+    x: cstr = "hi"
+    bump(x)
+    return 0
+""")
+    yield ("lmut_value_arg_dstr_needs_place", """
+def bump(s: lmut dstr) -> void:
+    pass
+
+def main() -> i64:
+    x: dstr = "hi"
+    bump(x)
+    return 0
+""")
+
+
+def gen_flags_const_enum_sview():
+    """`Flags[T]` requires T to be a const enum (check_flags_const_enum.elisa). Its own
+    `flags_is_primitive` helper lists every definitely-not-a-const-enum spelling to reject
+    (`Flags[i64]`, `Flags[bool]`, ...) and explicitly includes `cstr`/`dstr` — but not
+    `sview`, even though sview is exactly the same kind of builtin non-const-enum type.
+    stage0 rejects `Flags[sview]` with "Flags[T] expects a const enum type argument, got
+    sview"; stage1 silently accepted it (a PERMISSIVE gap) until sview was added alongside
+    cstr/dstr in the primitive list.
+    """
+    yield ("flags_const_enum_sview_rejected", f"""
+include "{ROOT}/elisacore_std/collections.elisa"
+
+def f(x: Flags[sview]&) -> bool:
+    return true
+
+def main() -> i64:
+    return 0
+""")
+
+
+def gen_char_literal_never_fits_sview():
+    """`literal_never_fits` (resolve_types.elisa) is the oracle-verified impossible-pair
+    matrix deciding whether a literal can NEVER initialize a declared primitive type. Its
+    "string"/"int"/"bool" branches all route the string family through the shared
+    `is_string_type_name` helper (cstr/dstr/sview together), but the "char" branch
+    hand-enumerated only `cstr`/`dstr` and dropped `sview` — even though a char literal
+    can no more initialize an sview than a cstr/dstr. stage0 rejects `x: sview = 'a'`
+    ("variable x expects sview, got char"); stage1 silently accepted it (PERMISSIVE gap)
+    until the char branch was switched to `is_string_type_name` like its siblings.
+    """
+    yield ("char_literal_into_sview_rejected", """
+def main() -> i64:
+    x: sview = 'a'
+    return 0
+""")
+
+
+def gen_clone_builtin_move_wrapped_source():
+    """`clone[darray[T]](src)` where `src` is an `sview` parameter and T != u8 cannot widen
+    a byte view into a T-element container (check_clone_builtin.elisa's CloneElemMismatch).
+    The check's own source-argument matcher only recognised a BARE `Expr.Ident` — a
+    `move src`-wrapped argument (a very ordinary way to pass an owned/linear-tracked
+    parameter) skipped the match entirely. In a `return`-position call the separate
+    CloneOwnerRequired check happens to also fire and mask this (both compilers still
+    reject), but bound to a plain local — the shape here — nothing else catches it: stage0
+    rejects ("clone cannot clone sview into darray[u32] in v1"), stage1 silently accepted
+    the `move`-wrapped form (a PERMISSIVE gap) until the source-argument matcher unwrapped
+    `Paren`/`Move` first.
+    """
+    yield ("clone_move_wrapped_sview_into_darray_u32", """
+def f(src: sview) -> i64:
+    x: darray[u32] = clone[darray[u32]](move src)
+    return 0
+
+def main() -> i64:
+    return 0
+""")
+
+
 GENERATORS += [gen_aggregate_abi]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
@@ -2583,7 +2703,9 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_index_compound_assign, gen_darray_of_fixed_array,
                gen_pin_and_range_match_arms, gen_value_match_pin_and_range,
                gen_borrowed_fixed_array_chain, gen_borrowed_fixed_array_mixed_width_read,
-               gen_floats]
+               gen_floats, gen_lmut_place_required,
+               gen_flags_const_enum_sview, gen_char_literal_never_fits_sview,
+               gen_clone_builtin_move_wrapped_source]
 
 
 def main():
