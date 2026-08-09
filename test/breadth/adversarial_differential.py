@@ -4212,6 +4212,37 @@ def main() -> i64:
 """)
 
 
+def gen_function_value_erasure_cast():
+    """`inc.cast[uintptr]` -- a bare FUNCTION NAME's address as an integer, then called back
+    through `bits.cast[fn(i64) -> i64]`.
+
+    The reverse direction (integer to fn) and the same cast through a fn-typed LOCAL both
+    worked; only the bare name declined, because expression_type answers Unmodeled for a
+    function name used as a VALUE (it types locals, not the FnTable) so the Fn branch of the
+    cast never fired.
+
+    TWO different functions are round-tripped and their results weighted differently
+    (42*10 + 43 - 400 = 63), so a cast that lost track of which function it addressed --
+    the failure mode that matters here -- changes the answer.
+    """
+    yield ("function_value_erasure_cast", """
+def inc(value: i64) -> i64:
+	return value + 1
+
+def dec(value: i64) -> i64:
+	return value - 1
+
+def call_bits(bits: uintptr, value: i64) -> i64:
+	f: fn(i64) -> i64 = bits.cast[fn(i64) -> i64]
+	return f(value)
+
+def main() -> i64:
+	up: uintptr = inc.cast[uintptr]
+	down: uintptr = dec.cast[uintptr]
+	return call_bits(up, 41) * 10 + call_bits(down, 44) - 400
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4230,7 +4261,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_shadowing_assignment_declaration, gen_proof_block_erasure,
                gen_first_query, gen_refined_type_alias,
                gen_builtin_string_surface, gen_fixed_array_slice_to_view,
-               gen_view_iteration]
+               gen_view_iteration, gen_function_value_erasure_cast]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
