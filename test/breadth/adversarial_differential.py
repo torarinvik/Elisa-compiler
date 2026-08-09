@@ -4900,6 +4900,51 @@ def main() -> i64:
 """)
 
 
+def gen_wide_payload_enum():
+    """`enum Wide: First(items: array[i64, 4])` -- a payload enum whose sole payload is an
+    ARRAY, i.e. wider than one blob word.
+
+    stage0 sizes `{i32, [N x i64]}` by the payload's WORD COUNT; stage1 sized it by the
+    variant's FIELD COUNT, so an array payload would have got `[1 x i64]`. The acceptance
+    guard that rejected array payloads was therefore LOAD-BEARING: relaxing it alone made
+    this program compile and SEGFAULT.
+
+    Layout first, acceptance second. The width is taken only for an i64-element array, the
+    one case checked against stage0's own IR; anything else still declines rather than risk
+    an undersized blob.
+
+    Every slot of the array is read -- including the LAST (`items[3]`), which is exactly what
+    an undersized blob corrupts -- through both a match arm and an `is` binding, folded to 41.
+    """
+    yield ("wide_payload_enum", """
+enum Wide:
+	First(items: array[i64, 4])
+	Second(items: array[i64, 4])
+	Empty
+
+def inspect(value: Wide) -> i64:
+	match value:
+		Wide.First(items):
+			return items[0] * 10 + items[3]
+		Wide.Second(items):
+			return items[1] * 10 + items[2]
+		Wide.Empty:
+			return 5
+	return 9
+
+def narrow(value: Wide) -> i64:
+	if value is Wide.First(items):
+		return items[2]
+	return 0
+
+def main() -> i64:
+	a: Wide = Wide.First([1, 2, 3, 4])
+	b: Wide = Wide.Second([1, 2, 3, 4])
+	c: Wide = Wide.Empty
+	return inspect(a) + inspect(b) - inspect(c) + narrow(a) * 3
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4927,7 +4972,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds]
+               gen_membership_range_enum_bounds, gen_wide_payload_enum]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
