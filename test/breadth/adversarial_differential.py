@@ -4771,6 +4771,48 @@ def main() -> i64:
 """)
 
 
+def gen_nested_variant_match_arm():
+    """`Outer.Wrap(Inner.A(inner)):` -- a match arm whose nested variant CARRIES a payload
+    and binds it.
+
+    Payloadless nesting (`Expr.Leaf(Token.Ident)`) already worked: there the outer payload
+    word IS the nested tag. A payload-carrying nested enum keeps its tag inside its own
+    aggregate, so the old path would have compared the wrong bytes and deliberately declined.
+    The tag is now read from field 0 of the nested aggregate and the binder from field 1.
+
+    Restricted to a SINGLE nested path: an alternation over payload-carrying variants would
+    bind different payload types per option, which one binder cannot express.
+
+    All three arms are exercised at distinct weights (3*16 + 5*4 + 7 = 75), deliberately
+    sized to fit in a byte, so a mis-tested tag or a mis-bound payload moves the total.
+    """
+    yield ("nested_variant_match_arm", """
+enum Inner:
+	A(i64)
+	B
+
+enum Outer:
+	Wrap(Inner)
+	Empty
+
+def nested_value(value: Outer) -> i64:
+	match value:
+		Outer.Wrap(Inner.A(inner)):
+			return inner
+		Outer.Wrap(Inner.B):
+			return 5
+		Outer.Empty:
+			return 7
+	return 9
+
+def main() -> i64:
+	a: Outer = Outer.Wrap(Inner.A(3))
+	b: Outer = Outer.Wrap(Inner.B)
+	c: Outer = Outer.Empty
+	return nested_value(a) * 16 + nested_value(b) * 4 + nested_value(c)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4796,7 +4838,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_loop_pattern_filter_guard, gen_catch_per_variant_arms,
                gen_each_collection_query, gen_first_projection_query,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
-               gen_projection_query_bare_pattern, gen_optional_match_null_arm]
+               gen_projection_query_bare_pattern, gen_optional_match_null_arm,
+               gen_nested_variant_match_arm]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
