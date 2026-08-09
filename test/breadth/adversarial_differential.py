@@ -3192,9 +3192,36 @@ def main() -> i64:
 """)
 
 
+def gen_checked_index_else():
+    """`get xs[i] else FALLBACK` -- a BOUNDS-CHECKED darray index.
+
+    This is NOT the Refinement node the other `get ... else` forms use: the SUBSCRIPT
+    postfix consumes the `else` itself (accept_subscript_else), producing
+    `Binary(Index(xs, i), TokenKind.Else, FALLBACK)`, which `get` then wraps in a GetElse
+    with an EMPTY recovery list. `grep TokenKind.Else src/backend` found nothing at all --
+    the checked-index operator was simply unimplemented in codegen.
+
+    The fixture reads two IN-RANGE indices and one PAST THE END, weighting them by powers
+    of 3 so every position contributes distinctly: 1*27 + 2*9 + 7 = 52, small enough that
+    exit-status truncation cannot mask a mismatch. A lowering that ignored the bounds test
+    would read past the end instead of yielding 7.
+    """
+    yield ("checked_index_else_darray", """
+def at(xs: darray[i64]&, i: usize) -> i64:
+	return get xs[i] else 7
+
+def main() -> i64:
+	xs: mutable darray[i64] = []
+	xs.push(1)
+	xs.push(2)
+	return at(xs, 0.usize()) * 27 + at(xs, 1.usize()) * 9 + at(xs, 2.usize())
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
-               gen_discarded_darray_growth_methods, gen_brace_membership_ranges]
+               gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
+               gen_checked_index_else]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,

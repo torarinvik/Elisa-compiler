@@ -126,6 +126,67 @@ extend Backend:
                 return emit_expression(block_value, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             if expression is Expr.Comprehension(comp_var, comp_iterable, comp_condition, comp_body, comp_line):
                 return emit_comprehension(comp_var, comp_iterable, comp_condition, comp_body, comp_line, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            # `get xs[i] else FALLBACK` — a BOUNDS-CHECKED index. NOT a Refinement: the
+            # SUBSCRIPT postfix consumes the `else` itself (parser_expr_ops's
+            # accept_subscript_else), producing `Binary(Index(xs, i), TokenKind.Else,
+            # FALLBACK)`, which `get` then wraps in a GetElse with an EMPTY recovery list.
+            # `grep TokenKind.Else src/backend` found nothing at all — the checked-index
+            # operator was simply unimplemented in codegen.
+            #
+            # A GetElse whose recovery is empty carries no control flow of its own, so it is
+            # value-transparent: emit the guarded expression. (A NON-empty recovery is a
+            # `return`/`break` branch and keeps declining here — the statement paths own it.)
+            if expression is Expr.GetElse(ge_guarded, ge_recovery, ge_line):
+                null return if ge_recovery.count != 0
+                return emit_expression(ge_guarded, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            # stage0 lowers the checked index exactly as this does, read from its own -emit
+            # llvm: compare the index against the header's count, load the element when in
+            # range, take the fallback otherwise, and merge.
+            #
+            # Restricted to a DARRAY receiver — the shape with a runtime count to test. A
+            # fixed array's bounds are static and a view/sview carries its length
+            # differently; both keep declining rather than guessing at a count field.
+            if expression is Expr.Binary(gi_indexed, gi_operator, gi_fallback, gi_line):
+                if gi_operator == TokenKind.Else:
+                    if gi_indexed is Expr.Index(gi_receiver, gi_index, gi_index_line):
+                        gi_container_type: ValueType = iterable_darray_type(gi_receiver, local_scope, fns, structs, generics)
+                        null return if gi_container_type.kind != TypeKind.DArray
+                        gi_element_type: ValueType = darray_element_of(gi_container_type, structs)
+                        null return if gi_element_type.kind == TypeKind.Unmodeled
+                        if darray_read_slot(gi_receiver, gi_container_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is gi_slot:
+                            gi_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                            gi_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                            gi_element_llvm: LLVMTypeRef = llvm_type_of(gi_element_type, structs, ctx)
+                            if emit_expression(gi_index, ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is gi_index_value:
+                                gi_count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, gi_header, gi_slot, 1, "safe.index.count.ptr")
+                                gi_count: LLVMValueRef = LLVMBuildLoad2(builder, gi_i64, gi_count_pointer, "safe.index.count")
+                                # 36 = unsigned <. The index is a usize and the count is
+                                # non-negative, so an unsigned compare also rejects a
+                                # wrapped-negative index — matching stage0's `icmp ult`.
+                                gi_in_range: LLVMValueRef = LLVMBuildICmp(builder, 36, gi_index_value, gi_count, "safe.index.in.range")
+                                gi_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                gi_in_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gi_function, "safe.index.in_range")
+                                gi_fallback_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gi_function, "safe.index.fallback")
+                                gi_end_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gi_function, "safe.index.end")
+                                gi_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, gi_element_llvm, "safe.index.result")
+                                _ = LLVMBuildCondBr(builder, gi_in_range, gi_in_block, gi_fallback_block)
+                                LLVMPositionBuilderAtEnd(builder, gi_in_block)
+                                gi_items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, gi_header, gi_slot, 0, "safe.index.items.ptr")
+                                gi_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), gi_items_pointer, "safe.index.items")
+                                gi_indices: mutable darray[LLVMValueRef] = [gi_index_value]
+                                gi_indices_pointer: void& = (&gi_indices[0]).cast[void&] can Unsafe.PointerCast
+                                gi_element_pointer: LLVMValueRef = LLVMBuildGEP2(builder, gi_element_llvm, gi_items, gi_indices_pointer, 1, "safe.index.elem.ptr")
+                                _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, gi_element_llvm, gi_element_pointer, "safe.index.value"), gi_result_slot)
+                                _ = LLVMBuildBr(builder, gi_end_block)
+                                LLVMPositionBuilderAtEnd(builder, gi_fallback_block)
+                                if emit_expression(gi_fallback, gi_element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is gi_fallback_value:
+                                    _ = LLVMBuildStore(builder, gi_fallback_value, gi_result_slot)
+                                    _ = LLVMBuildBr(builder, gi_end_block)
+                                    LLVMPositionBuilderAtEnd(builder, gi_end_block)
+                                    return LLVMBuildLoad2(builder, gi_element_llvm, gi_result_slot, "safe.index.result.load")
+                                return null
+                            return null
+                        return null
             # `try CALL else FALLBACK` -> Expr.Refinement(fallback, guarded). Modeled only
             # when the guarded is a call to an ERROR-returning function: call it with a fresh
             # out-slot, and if the returned i32 code is 0 use the out-value, else the
