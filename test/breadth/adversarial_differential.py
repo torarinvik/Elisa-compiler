@@ -3773,6 +3773,11 @@ def gen_is_bracketed_alternation():
     The fixture probes all four members of the alternation AND one outside it, folded
     into a bitmask, so an alternation that matched too much or too little changes the
     answer: 0b11110 = 30.
+
+    The GROUPED spelling `is (A | B | C)` means the same thing and is pinned separately:
+    it arrives as a Paren (sometimes nested) around the Pipe chain rather than as an
+    Array, so handling only the bracketed form left the grouped one declining -- and the
+    corpus uses both in ONE file.
     """
     yield ("is_bracketed_alternation", """
 const enum Tok of i32:
@@ -3796,6 +3801,38 @@ def main() -> i64:
 """)
 
 
+def gen_is_grouped_alternation():
+    """`value is (A | B | C)` -- the GROUPED spelling of an alternation, equivalent to the
+    bracketed one. Pinned alongside the bracketed form because the corpus file uses both
+    and they take different AST shapes (Paren-around-Pipe vs Array).
+    """
+    yield ("is_grouped_alternation", """
+enum Expr:
+	Int
+	Bool
+	Char
+	Missing
+
+def grouped(value: Expr) -> bool:
+	return value is (
+		Expr.Int
+		| Expr.Bool
+		| Expr.Char
+	)
+
+def bracketed(value: Expr) -> bool:
+	return value is [Expr.Int | Expr.Bool | Expr.Char]
+
+def main() -> i64:
+	total: mutable i64 = 0
+	total <- total * 2 + (1 if grouped(Expr.Int) else 0)
+	total <- total * 2 + (1 if grouped(Expr.Missing) else 0)
+	total <- total * 2 + (1 if bracketed(Expr.Char) else 0)
+	total <- total * 2 + (1 if bracketed(Expr.Missing) else 0)
+	return total
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3807,7 +3844,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_do_block_declaration, gen_flat_container_literal_declaration,
                gen_extend_darray_from_view, gen_resize_non_scalar_element,
                gen_literal_payload_is_test, gen_static_compile_time_call,
-               gen_darray_as_cstr, gen_is_bracketed_alternation]
+               gen_darray_as_cstr, gen_is_bracketed_alternation,
+               gen_is_grouped_alternation]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
