@@ -4645,6 +4645,49 @@ def main() -> i64:
 """)
 
 
+def gen_each_guarded_pattern_filter():
+    """`each item in items where item is Expr.Int(value): value > 0` -- the COLLECTION query
+    with a pattern filter AND a guard.
+
+    The body slot of a leading-keyword query means two different things: a GUARD here, and a
+    PROJECTION in `EXPR for each x in xs`. The backend cannot tell them apart from the node,
+    and collecting the guard would push a BOOL as the element -- so the guarded case is
+    marked by the parser (`__query_guard`) and the two roles split on that marker: the
+    element is the binder, and the guard joins the filter.
+
+    Before the marker this shape declined rather than mis-answering (the bool did not type
+    as the element), but the hazard was real and is what the marker removes.
+
+    The survivors are folded POSITIONALLY (34), so collecting the wrong elements, or losing
+    the guard and keeping the negative, changes the answer.
+    """
+    yield ("each_guarded_pattern_filter", """
+enum Expr:
+	Int(value: i64)
+	Missing
+
+def score(node: Expr) -> i64:
+	match node:
+		Expr.Int(v):
+			return v
+		Expr.Missing:
+			return 0
+
+def ints(items: darray[Expr]) -> darray[Expr]:
+	return each item in items where item is Expr.Int(value): value > 0
+
+def fold(xs: darray[Expr]) -> i64:
+	total: mutable i64 = 0
+	for x in xs |total|:
+		total <- total * 10 + score(x)
+	return total
+
+def main() -> i64:
+	src: darray[Expr] = [Expr.Int(3), Expr.Int(-1), Expr.Missing, Expr.Int(4)]
+	return fold(ints(src))
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4669,7 +4712,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_enum_variant_view_after_is, gen_bare_variant_loop_filter,
                gen_loop_pattern_filter_guard, gen_catch_per_variant_arms,
                gen_each_collection_query, gen_first_projection_query,
-               gen_query_guarded_pattern_filter]
+               gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
