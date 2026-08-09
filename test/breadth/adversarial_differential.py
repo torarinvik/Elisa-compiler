@@ -4573,6 +4573,41 @@ def main() -> i64:
 """)
 
 
+def gen_first_projection_query():
+    """`entry.name for first entry in entries where entry.enabled` -- the PROJECTION form of
+    the `first` query, whose result is an Optional of the PROJECTED type, not the element's.
+
+    Two defects on one path. The parser's projection suffix never recorded the `__query`
+    HEAD marker (only the leading-keyword form did), so `query_head_for` answered "" and
+    `first` was not recognised as producing its own Optional: emit_expression re-emitted the
+    node at the payload type and the comprehension emitter took the integer-fold path, where
+    an unknown head declines. And the first-quantifier had no projection support -- it
+    required the element and the result to be the same type, which a projection breaks.
+
+    Probed on a hit (the SECOND matching entry must not win -- 5, not 7) and a miss, folded
+    to 59.
+    """
+    yield ("first_projection_query", """
+struct Entry:
+	name: i64
+	enabled: bool
+
+def first_enabled(entries: darray[Entry]) -> i64?:
+	return entry.name for first entry in entries where entry.enabled
+
+def probe(entries: darray[Entry]) -> i64:
+	f: i64? = first_enabled(entries)
+	if f is hit:
+		return hit
+	return 9
+
+def main() -> i64:
+	hit: darray[Entry] = [Entry{name: 3, enabled: false}, Entry{name: 5, enabled: true}, Entry{name: 7, enabled: true}]
+	miss: darray[Entry] = [Entry{name: 3, enabled: false}]
+	return probe(hit) * 10 + probe(miss)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4596,7 +4631,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_region_qualifier_pin, gen_arena_local_region_pin,
                gen_enum_variant_view_after_is, gen_bare_variant_loop_filter,
                gen_loop_pattern_filter_guard, gen_catch_per_variant_arms,
-               gen_each_collection_query]
+               gen_each_collection_query, gen_first_projection_query]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
