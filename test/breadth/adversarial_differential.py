@@ -4306,6 +4306,50 @@ def main() -> i64:
 """)
 
 
+def gen_region_qualifier_pin():
+    """`zs: darray[i64] @host = [...]` -- an explicit REGION PIN on a local declaration.
+
+    stage1's codegen dropped the qualifier entirely and allocated from whatever arena was
+    ambient. That is not a wrong number, it is a USE-AFTER-FREE: a container pinned to a
+    longer-lived region landed in a shorter-lived one and its data was freed underneath the
+    program. stage0 answers 60 here; stage1 segfaulted.
+
+    Both fixtures declare inside `region tmp:` while pinning to the OUTER `host`, and read
+    the data AFTER tmp has ended -- the only shape that can catch this, since every
+    same-scope read finds the wrong arena still alive. The second also PUSHES twice, so the
+    pin has to survive into the growth path (reallocation) and not just the initial
+    allocation.
+    """
+    yield ("region_qualifier_pin", """
+def main() -> i64:
+	region host(4096)
+	total: mutable i64 = 0
+	ys: mutable darray[i64] = []
+	region tmp(4096):
+		zs: darray[i64] @host = [10, 20, 30]
+		ys <- zs
+	for y in ys |total|:
+		total <- total + y
+	destroy host
+	return total
+""")
+    yield ("region_qualifier_pin_growth", """
+def main() -> i64:
+	region host(4096)
+	total: mutable i64 = 0
+	ys: mutable darray[i64] = []
+	region tmp(4096):
+		zs: mutable darray[i64] @host = [10, 20]
+		zs.push(30)
+		zs.push(40)
+		ys <- zs
+	for y in ys |total|:
+		total <- total + y
+	destroy host
+	return total
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4325,7 +4369,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_first_query, gen_refined_type_alias,
                gen_builtin_string_surface, gen_fixed_array_slice_to_view,
                gen_view_iteration, gen_function_value_erasure_cast,
-               gen_fixed_array_slice_shapes, gen_rev_iteration]
+               gen_fixed_array_slice_shapes, gen_rev_iteration,
+               gen_region_qualifier_pin]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
