@@ -4724,6 +4724,53 @@ def main() -> i64:
 """)
 
 
+def gen_optional_match_null_arm():
+    """`match OPT:` with a literal `null` arm PLUS payload arms -- both the statement and the
+    expression spelling.
+
+    The optional-scrutinee branch handled exactly TWO arms and required one of them to be a
+    plain BINDING, so three-arm forms (`null:` / `Expr.Int(value):` / `_:`) declined. The
+    payload is now bound to a synthetic local and the REMAINING arms are re-entered as an
+    ordinary match on it, so every payload pattern the match emitter already models works
+    here unchanged. The `return match` spelling routes through the same path by rewriting
+    each arm's value into a `return`.
+
+    Three optionals -- a payload variant, a payload-free variant, and null -- run through
+    BOTH spellings at distinct weights (192), so a missed arm or a swapped branch moves the
+    total, and the two spellings check each other.
+    """
+    yield ("optional_match_null_arm", """
+enum Expr:
+	Int(value: i64)
+	Missing
+
+def score_stmt(maybe: Expr?) -> i64:
+	match maybe:
+		null:
+			return 0
+		Expr.Int(value):
+			return value
+		_:
+			return 2
+	return 3
+
+def score_expr(maybe: Expr?) -> i64:
+	return match maybe:
+		null:
+			0
+		Expr.Int(value):
+			value
+		_:
+			2
+
+def main() -> i64:
+	a: Expr? = Expr.Int(7)
+	b: Expr? = Expr.Missing
+	c: Expr? = null
+	return (score_stmt(a) * 8 + score_stmt(b) * 4 + score_stmt(c)) * 2 + (score_expr(a) * 8 + score_expr(b) * 4 + score_expr(c))
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4749,7 +4796,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_loop_pattern_filter_guard, gen_catch_per_variant_arms,
                gen_each_collection_query, gen_first_projection_query,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
-               gen_projection_query_bare_pattern]
+               gen_projection_query_bare_pattern, gen_optional_match_null_arm]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
