@@ -3622,6 +3622,34 @@ def main() -> i64:
 """)
 
 
+def gen_resize_non_scalar_element():
+    """`darray[view[u8]].resize(n)` -- resizing a container whose ELEMENT is not a scalar.
+
+    The growth loop was always element-type agnostic; only the FILL was not. It pushed an
+    `IntLit(0)`, so the method was restricted to scalar elements and a container element
+    declined. A non-scalar element now fills with `zeroed`, the language's own zero value.
+
+    Pins BOTH element kinds in one fixture, so generalising the fill cannot regress the
+    scalar path it replaced: 8*10 + 3 = 83. The scalar case also starts non-empty, so a
+    resize that ignored the existing count would report the wrong number.
+    """
+    yield ("resize_non_scalar_element", """
+def kernel() -> usize:
+	xs: mutable darray[view[u8]] = []
+	_ = xs.resize(8.usize())
+	return xs.count
+
+def scalar_still_works() -> usize:
+	ys: mutable darray[i64] = []
+	ys.push(7)
+	_ = ys.resize(3.usize())
+	return ys.count
+
+def main() -> i64:
+	return kernel().i64() * 10 + scalar_still_works().i64()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3631,7 +3659,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_loop_where_filter, gen_loop_bare_pattern_filter,
                gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding,
                gen_do_block_declaration, gen_flat_container_literal_declaration,
-               gen_extend_darray_from_view]
+               gen_extend_darray_from_view, gen_resize_non_scalar_element]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
