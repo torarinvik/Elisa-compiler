@@ -3431,13 +3431,50 @@ def main() -> i64:
 """)
 
 
+def gen_loop_bare_pattern_filter():
+    """`for item in items where Expr.Int(value):` -- a BARE PATTERN filter, no `item is`
+    in front. It BINDS the payload as well as testing the tag, so it is not a boolean
+    condition and could not go through the plain `where` desugaring.
+
+    It is exactly what `LOOPVAR is Enum.Variant(binders)` already means, and that form was
+    fully lowered, so the loop rewrites to it rather than growing a second
+    pattern-matching path. (The semantic half -- putting the binders in scope -- landed
+    separately in 7d4b49c3 / 0f03de4a.)
+
+    The fixture interleaves a NON-matching variant between two matching ones, so a filter
+    that failed to skip would add garbage and a binding that read the wrong field would
+    change the sum: 4 + 9 = 13.
+
+    Multi-binder loops (`for k, v in d where ...`) still decline -- there is no single
+    subject for the `is` test.
+    """
+    yield ("loop_bare_pattern_filter", """
+enum Expr:
+	Int(value: i64)
+	Missing
+
+def total(items: darray[Expr]&) -> i64:
+	sum: mutable i64 = 0
+	for item in items where Expr.Int(value):
+		sum <- sum + value
+	return sum
+
+def main() -> i64:
+	xs: mutable darray[Expr] = []
+	xs.push(Expr.Int(4))
+	xs.push(Expr.Missing)
+	xs.push(Expr.Int(9))
+	return total(xs)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
                gen_checked_index_else, gen_record_update, gen_move_as_destructure,
                gen_float_pointer_cast, gen_named_call_argument_order,
                gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern,
-               gen_loop_where_filter]
+               gen_loop_where_filter, gen_loop_bare_pattern_filter]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
