@@ -4527,6 +4527,38 @@ def main() -> i64:
 """)
 
 
+def gen_each_collection_query():
+    """`each item in items where c` -- the COLLECTION query, which returns a darray.
+
+    It carries no projection body (the element IS the binder), so it means exactly
+    `[item for item in items if c]`. The collection branch already lowered that, but bailed
+    on a body-less node -- and, once the identity body was supplied, the darray-source path
+    pushed the ORIGINAL `body` at a second emit site the first patch never touched. Both
+    sites now use the substituted body.
+
+    `each` and the equivalent comprehension run over the same list and are weighted apart
+    (2*34 - 34 = 34), so an `each` that collected nothing, or collected the wrong elements,
+    changes the answer while the comprehension acts as the control.
+    """
+    yield ("each_collection_query", """
+def positives(items: darray[i64]) -> darray[i64]:
+	return each item in items where item > 0
+
+def comp(items: darray[i64]) -> darray[i64]:
+	return [item for item in items if item > 0]
+
+def fold(xs: darray[i64]) -> i64:
+	total: mutable i64 = 0
+	for x in xs |total|:
+		total <- total * 10 + x
+	return total
+
+def main() -> i64:
+	src: darray[i64] = [3, -1, 4]
+	return fold(positives(src)) * 2 - fold(comp(src))
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4549,7 +4581,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_fixed_array_slice_shapes, gen_rev_iteration,
                gen_region_qualifier_pin, gen_arena_local_region_pin,
                gen_enum_variant_view_after_is, gen_bare_variant_loop_filter,
-               gen_loop_pattern_filter_guard, gen_catch_per_variant_arms]
+               gen_loop_pattern_filter_guard, gen_catch_per_variant_arms,
+               gen_each_collection_query]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
