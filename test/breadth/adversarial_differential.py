@@ -4156,6 +4156,29 @@ def main() -> i64:
 """)
 
 
+def gen_fixed_array_slice_to_view():
+    """`text[1:3]` on a `u8[4]` -- slicing a FIXED ARRAY into a `view[T]`.
+
+    The fat-view slice path handled only darray sources; an array source fell through to a
+    guard that declines every container (that guard is load-bearing -- the cstr byte-slice
+    path below it byte-GEPs the container header and miscompiles). Unlike a darray there is
+    no items pointer to extract: the array IS the storage, so the view points into the
+    array's own slot, which is stage0's lowering too.
+
+    The two slice elements are read back with DISTINCT weights (23), so an off-by-one in
+    the start offset or a length computed from the wrong end changes the answer.
+    """
+    yield ("fixed_array_slice_to_view", """
+def probe(text: u8[4]) -> i64:
+	part: view[u8] = text[1:3]
+	return part[0].i64() * 10 + part[1].i64()
+
+def main() -> i64:
+	buf: array[u8, 4] = [1.u8(), 2.u8(), 3.u8(), 4.u8()]
+	return probe(buf)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4173,7 +4196,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias,
                gen_shadowing_assignment_declaration, gen_proof_block_erasure,
                gen_first_query, gen_refined_type_alias,
-               gen_builtin_string_surface]
+               gen_builtin_string_surface, gen_fixed_array_slice_to_view]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
