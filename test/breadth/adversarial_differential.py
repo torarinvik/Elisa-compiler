@@ -4856,6 +4856,50 @@ def main() -> i64:
 """)
 
 
+def gen_membership_range_enum_bounds():
+    """`kind in {.IF..=IDENT, .NUMBER..<STRING}` -- brace-set membership whose RANGE bounds
+    are enum members, the second written UNQUALIFIED.
+
+    The leading-dot shorthand already resolved; the bare second bound did not, and it is the
+    spelling stage0 accepts, so every set containing such a range declined. A bare name is
+    rewritten to `Enum.MEMBER` only when it is NOT a local in scope and exactly ONE const
+    enum declares it -- otherwise `probe in {lo..=hi}` over VARIABLES would be rewritten into
+    nonsense.
+
+    That variable-bound form is exercised in the same fixture as a control, on both sides of
+    its range, and all five enum members are probed, folded into a bitmask (122) so a wrong
+    inclusive/exclusive edge or a mis-resolved bound moves it.
+    """
+    yield ("membership_range_enum_bounds", """
+const enum TokenKind of u32:
+	IF
+	LET
+	IDENT
+	NUMBER
+	STRING
+
+def keep(kind: TokenKind) -> bool:
+	return kind in {.IF..=IDENT, .NUMBER..<STRING}
+
+def bounds(lo: u32, hi: u32, probe: u32) -> bool:
+	return probe in {lo..=hi}
+
+def bit(b: bool) -> i64:
+	return 1 if b else 0
+
+def main() -> i64:
+	mask: mutable i64 = 0
+	mask <- mask * 2 + bit(keep(TokenKind.IF))
+	mask <- mask * 2 + bit(keep(TokenKind.LET))
+	mask <- mask * 2 + bit(keep(TokenKind.IDENT))
+	mask <- mask * 2 + bit(keep(TokenKind.NUMBER))
+	mask <- mask * 2 + bit(keep(TokenKind.STRING))
+	mask <- mask * 2 + bit(bounds(2.u32(), 4.u32(), 3.u32()))
+	mask <- mask * 2 + bit(bounds(2.u32(), 4.u32(), 5.u32()))
+	return mask
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4882,7 +4926,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_each_collection_query, gen_first_projection_query,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
-               gen_nested_variant_match_arm, gen_labelled_payload_match_arm]
+               gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
+               gen_membership_range_enum_bounds]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
