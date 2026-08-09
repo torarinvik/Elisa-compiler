@@ -4062,6 +4062,35 @@ def main() -> i64:
 """)
 
 
+def gen_first_query():
+    """`first VAR in ITER where COND` -- the query whose result is an Optional.
+
+    Two things were missing. The lowering itself (min/max were the only Optional-producing
+    folds), and -- the reason a correct lowering still declined -- `first` was absent from
+    comprehension_is_extremum, so emit_expression re-emitted it at the PAYLOAD type and the
+    comprehension emitter saw `expected` = i64 instead of i64?.
+
+    The probe list is [-3, 7, 5, -1]: `first` answers 7 where any extremal fold answers 5,
+    so a min/max-shaped lowering yields 53 instead of 73. The second list has no match, so
+    the absent path is exercised too.
+    """
+    yield ("first_query", """
+def first_positive(items: darray[i64]) -> i64?:
+	return first item in items where item > 0
+
+def probe(items: darray[i64]) -> i64:
+	f: i64? = first_positive(items)
+	if f is hit:
+		return hit
+	return 3
+
+def main() -> i64:
+	a: darray[i64] = [-3, 7, 5, -1]
+	b: darray[i64] = [-3, -5]
+	return probe(a) * 10 + probe(b)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4077,7 +4106,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_is_grouped_alternation, gen_extern_error_return_not_an_export,
                gen_unified_else_recovery, gen_get_else_raise,
                gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias,
-               gen_shadowing_assignment_declaration, gen_proof_block_erasure]
+               gen_shadowing_assignment_declaration, gen_proof_block_erasure,
+               gen_first_query]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
