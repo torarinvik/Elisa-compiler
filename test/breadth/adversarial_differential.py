@@ -4022,6 +4022,46 @@ def main() -> i64:
 """)
 
 
+def gen_proof_block_erasure():
+    """`assert C by:` and `proof C:` -- proof blocks whose BODY is compile-time only.
+
+    Both parse to the same node, with the GOAL riding as body[0] and the proof steps after
+    it. stage0 lowers the goal as an ordinary runtime contract check and emits nothing for
+    the body; stage1 declined the whole block because the kind was unhandled.
+
+    Three distinct spellings (assert-by, proof, `ensure ... by scoped:`) with different
+    return arithmetic, summed to 46, so a block whose goal was dropped or whose body leaked
+    into the emitted code changes the answer.
+    """
+    yield ("proof_block_erasure", """
+lemma weaken(x: i64):
+	requires x >= 10
+	ensure x >= 5
+	pass
+
+def use(n: i64) -> i64:
+	assert n >= 5 by:
+		assert(n >= 10)
+		weaken(n)
+	return n
+
+def proven(n: i64) -> i64:
+	proof n >= 5:
+		assert(n >= 10)
+		weaken(n)
+	return n + 1
+
+def scoped_ensure(n: i64) -> i64:
+	ensure result >= 5 by scoped:
+		assert(result >= 10)
+		weaken(result)
+	return n + 10
+
+def main() -> i64:
+	return use(12) + proven(20) + scoped_ensure(3)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4037,7 +4077,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_is_grouped_alternation, gen_extern_error_return_not_an_export,
                gen_unified_else_recovery, gen_get_else_raise,
                gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias,
-               gen_shadowing_assignment_declaration]
+               gen_shadowing_assignment_declaration, gen_proof_block_erasure]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
