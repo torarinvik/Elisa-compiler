@@ -3860,6 +3860,47 @@ def main() -> i64:
 """)
 
 
+def gen_unified_else_recovery():
+    """The two `else`-recovery shapes that both parse to `Expr.GetElse` in RETURN position.
+
+    `return get OPT else return V` -- emit_expression has no GetElse case, so the return
+    path declined until it routed through the local-declaration emitter.
+
+    `return try f(x) else err: BLOCK` -- the SAME node, but the guarded expression is an
+    error-returning call, so the recovery runs on a nonzero status code rather than on an
+    absent payload; the value emitter only knew how to PROPAGATE.
+
+    Each is probed on both branches and folded into one number, so a recovery arm that runs
+    when it shouldn't (or never runs) changes the answer: 7*10+11 = 81 and 7*10+13 = 83.
+    """
+    yield ("unified_else_recovery", """
+error FileError:
+	NotFound
+
+def maybe_value(flag: bool) -> i64?:
+	if flag:
+		return 7
+	return null
+
+def read_value(flag: bool) -> i64 error[FileError]:
+	if flag:
+		return 7
+	raise FileError.NotFound
+
+def optional_return(flag: bool) -> i64:
+	return get maybe_value(flag) else return 11
+
+def try_error_binding(flag: bool) -> i64:
+	return try read_value(flag) else err:
+		return 13
+
+def main() -> i64:
+	got: i64 = optional_return(true) * 10 + optional_return(false)
+	caught: i64 = try_error_binding(true) * 10 + try_error_binding(false)
+	return got + caught - 100
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3872,7 +3913,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_extend_darray_from_view, gen_resize_non_scalar_element,
                gen_literal_payload_is_test, gen_static_compile_time_call,
                gen_darray_as_cstr, gen_is_bracketed_alternation,
-               gen_is_grouped_alternation, gen_extern_error_return_not_an_export]
+               gen_is_grouped_alternation, gen_extern_error_return_not_an_export,
+               gen_unified_else_recovery]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
