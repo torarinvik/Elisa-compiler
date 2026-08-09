@@ -3695,6 +3695,37 @@ def main() -> i64:
 """)
 
 
+def gen_static_compile_time_call():
+    """`static answer(2)` / `static: answer(2)` where `answer` is a `static def`.
+
+    A call to a static def is COMPILE-TIME only -- stage0 evaluates it during static
+    execution and emits nothing (`keep()` lowers to an empty body, with no `@answer` in
+    the module). select_module_declarations already drops `static def` declarations, so
+    the callee has no FnTable entry, the call could not be emitted, and it took the whole
+    enclosing function down with it.
+
+    The fixture deliberately ALSO contains a `static if` whose taken branch mutates a
+    local, because that is the reason a static block emits inline at all: dropping the
+    whole block instead of just the compile-time calls would lose it. 5 + 3 = 8.
+    """
+    yield ("static_compile_time_call", """
+static def answer(step: i64) -> i64:
+	return step + 40
+
+def keep() -> i64:
+	static answer(2)
+	static:
+		answer(2)
+	total: mutable i64 = 5
+	static if true:
+		total <- total + 3
+	return total
+
+def main() -> i64:
+	return keep()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3705,7 +3736,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding,
                gen_do_block_declaration, gen_flat_container_literal_declaration,
                gen_extend_darray_from_view, gen_resize_non_scalar_element,
-               gen_literal_payload_is_test]
+               gen_literal_payload_is_test, gen_static_compile_time_call]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
