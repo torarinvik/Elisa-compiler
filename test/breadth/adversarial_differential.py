@@ -3761,6 +3761,41 @@ def main() -> i64:
 """)
 
 
+def gen_is_bracketed_alternation():
+    """`k is [.LT | .LTEQ | .GT | .GTEQ]` -- a BRACKETED ALTERNATION in an `is` test.
+
+    It means "matches any of these", so each alternative is re-entered as its own `is`
+    and the results are OR-ed. Reusing the per-leaf lowering is what makes the
+    const-enum, leading-dot shorthand and payload-enum forms all work here without
+    restating any of them. `|` parses as an ordinary binary operator inside the brackets,
+    so the element list is flattened through Pipe/Or first.
+
+    The fixture probes all four members of the alternation AND one outside it, folded
+    into a bitmask, so an alternation that matched too much or too little changes the
+    answer: 0b11110 = 30.
+    """
+    yield ("is_bracketed_alternation", """
+const enum Tok of i32:
+	LT = 1
+	LTEQ = 2
+	GT = 3
+	GTEQ = 4
+	PLUS = 5
+
+def is_rel(kind: Tok) -> bool:
+	return kind is [.LT | .LTEQ | .GT | .GTEQ]
+
+def main() -> i64:
+	total: mutable i64 = 0
+	total <- total * 2 + (1 if is_rel(Tok.LT) else 0)
+	total <- total * 2 + (1 if is_rel(Tok.LTEQ) else 0)
+	total <- total * 2 + (1 if is_rel(Tok.GT) else 0)
+	total <- total * 2 + (1 if is_rel(Tok.GTEQ) else 0)
+	total <- total * 2 + (1 if is_rel(Tok.PLUS) else 0)
+	return total
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3772,7 +3807,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_do_block_declaration, gen_flat_container_literal_declaration,
                gen_extend_darray_from_view, gen_resize_non_scalar_element,
                gen_literal_payload_is_test, gen_static_compile_time_call,
-               gen_darray_as_cstr]
+               gen_darray_as_cstr, gen_is_bracketed_alternation]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
