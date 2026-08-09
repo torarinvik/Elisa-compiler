@@ -3650,6 +3650,51 @@ def main() -> i64:
 """)
 
 
+def gen_literal_payload_is_test():
+    """`node is Expr.Float(3.14)` -- a LITERAL payload sub-pattern in an `is` test.
+
+    A binder ident NARROWS (binds the payload); a literal is a VALUE TEST -- it matches
+    only when the tag agrees AND the payload equals the literal. Only binders were
+    modelled, so every literal payload declined. Handled for the SINGLE-field variant;
+    a multi-field variant with literals mixed in keeps declining rather than testing some
+    fields and silently ignoring others.
+
+    Each fixture probes three cases -- matching payload, NON-matching payload, and a
+    different variant -- so both halves of the conjunction have to work: 100 when correct,
+    110 if the payload test were dropped, 101 if the tag test were.
+
+    The float case is pinned separately because it must compare with FCmp, not ICmp.
+    """
+    yield ("literal_payload_is_test_int", """
+enum E:
+	A(v: int)
+	B
+
+def is_seven(node: E) -> bool:
+	return node is E.A(7)
+
+def main() -> i64:
+	hit: i64 = 1 if is_seven(E.A(7)) else 0
+	miss: i64 = 1 if is_seven(E.A(9)) else 0
+	other: i64 = 1 if is_seven(E.B) else 0
+	return hit * 100 + miss * 10 + other
+""")
+    yield ("literal_payload_is_test_float", """
+enum Expr:
+	Float(PI: f64)
+	Int(value: int)
+
+def is_pi(node: Expr) -> bool:
+	return node is Expr.Float(3.14)
+
+def main() -> i64:
+	hit: i64 = 1 if is_pi(Expr.Float(3.14)) else 0
+	miss: i64 = 1 if is_pi(Expr.Float(2.71)) else 0
+	other: i64 = 1 if is_pi(Expr.Int(3)) else 0
+	return hit * 100 + miss * 10 + other
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3659,7 +3704,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_loop_where_filter, gen_loop_bare_pattern_filter,
                gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding,
                gen_do_block_declaration, gen_flat_container_literal_declaration,
-               gen_extend_darray_from_view, gen_resize_non_scalar_element]
+               gen_extend_darray_from_view, gen_resize_non_scalar_element,
+               gen_literal_payload_is_test]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
