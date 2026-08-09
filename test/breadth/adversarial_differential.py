@@ -3973,6 +3973,33 @@ def main() -> i64:
 """)
 
 
+def gen_labelled_call_through_fn_alias():
+    """`runner(y: 7, x: <do-block>)` where `runner: fn(i64,i64)->i64 = add`.
+
+    A `fn(...)` TYPE carries parameter types but no parameter NAMES, so there was nothing to
+    reorder labels against and the call declined (it had earlier passed them POSITIONALLY,
+    a silent wrong answer). The local now remembers which function it aliases, and the
+    labels resolve against that function's parameter names.
+
+    `add` SUBTRACTS and the labels are given in reverse order, so a lowering that ignores
+    the labels yields 7-30 = -23 instead of 30-7 = 23.
+    """
+    yield ("labelled_call_through_fn_alias", """
+def add(x: i64, y: i64) -> i64:
+	return x - y
+
+def build() -> i64:
+	runner: fn(i64, i64) -> i64 = add
+	return runner(y: 7, x: do:
+		seed = 30
+		seed
+	)
+
+def main() -> i64:
+	return build()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3987,7 +4014,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_darray_as_cstr, gen_is_bracketed_alternation,
                gen_is_grouped_alternation, gen_extern_error_return_not_an_export,
                gen_unified_else_recovery, gen_get_else_raise,
-               gen_nullable_extern_ref_get]
+               gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
