@@ -3218,10 +3218,37 @@ def main() -> i64:
 """)
 
 
+def gen_record_update():
+    """`base{field = v}` -- a RECORD UPDATE: the base value with named fields overridden
+    and every other field COPIED. `grep RecordUpdate src/backend` found nothing, so the
+    form was unimplemented in codegen (and the typer had no case either, so an annotated
+    destination could not infer it).
+
+    The fixture updates the MIDDLE field of three and reads all three back, so the
+    copy-the-rest half is what the answer depends on: 1*100 + 9*10 + 3 = 193. A lowering
+    that zeroed untouched fields instead of copying them would give 90. Fits in a byte,
+    so exit-status truncation cannot mask a mismatch.
+    """
+    yield ("record_update_copies_untouched_fields", """
+struct Acc:
+	first: i64
+	second: i64
+	third: i64
+
+def bump(base: Acc, v: i64) -> Acc:
+	return base{second = v}
+
+def main() -> i64:
+	start: Acc = Acc{first: 1, second: 2, third: 3}
+	updated: Acc = bump(start, 9)
+	return updated.first * 100 + updated.second * 10 + updated.third
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
-               gen_checked_index_else]
+               gen_checked_index_else, gen_record_update]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
