@@ -3560,6 +3560,34 @@ def main() -> i64:
 """)
 
 
+def gen_flat_container_literal_declaration():
+    """`values = [1, 2, 3, 4]` -- an un-annotated declaration from a CONTAINER LITERAL.
+
+    expression_type answers Unmodeled for a literal by design (a literal DEFERS to its
+    expected type), so the declaration declined even though the annotated form works.
+    literal_container_type derives the shape from the elements; it is used only at the
+    declaration site, never taught to expression_type, because a global change there
+    previously produced a WRONG ANSWER for nested literals.
+
+    FLAT only, matching stage0: it infers this but REJECTS `m = [[1, 2], [3, 4]]`
+    ("cannot infer element type for empty darray builder"). Taking the nested shape too
+    made stage1 run a program stage0 refuses -- PERMISSIVE, which the gate ratchets at
+    zero. The nested form still declines, so both compilers refuse it.
+
+    The fixture slices the inferred darray and indexes the view, so the element type has
+    to be right, not merely present.
+    """
+    yield ("flat_container_literal_declaration", """
+def head_of_middle() -> int:
+	values = [1, 2, 3, 4]
+	part: view[int] = values[1:3]
+	return part[0]
+
+def main() -> i64:
+	return head_of_middle().i64()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3568,7 +3596,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern,
                gen_loop_where_filter, gen_loop_bare_pattern_filter,
                gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding,
-               gen_do_block_declaration]
+               gen_do_block_declaration, gen_flat_container_literal_declaration]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
