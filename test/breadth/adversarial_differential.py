@@ -3271,10 +3271,49 @@ def main() -> i64:
 """)
 
 
+def gen_float_pointer_cast():
+    """`v.cast[heap u8&]` from an f64 -- a FLOAT source reinterpreted as a pointer.
+
+    There is no direct opcode and `inttoptr double` is invalid IR, so the integer step
+    has to be spelled out: stage0 emits `fptoui` then `inttoptr`. stage1's reinterpret
+    gate admitted only pointer, integer and narrowed-optional-pointer sources, so a float
+    fell through and declined.
+
+    Round-tripped back through `.uintptr()` so the VALUE is checked (42), not just that
+    the program builds.
+    """
+    yield ("float_to_pointer_cast_roundtrip", """
+def cast_ptr(v: f64) -> heap u8& can[Unsafe.PointerCast]:
+	return v.cast[heap u8&]
+
+def main() -> i64 can[Unsafe.PointerCast]:
+	p: heap u8& = cast_ptr(42.0)
+	return p.uintptr().i64()
+""")
+
+
+def gen_named_call_argument_order():
+    """Labelled call arguments supplied OUT OF ORDER (`combine(y: 7, x: 3)`).
+
+    No bug was found here -- this pins an invariant whose failure mode is a SILENT WRONG
+    ANSWER rather than a decline: a backend that ignored the labels and bound positionally
+    would compile happily and return 73 instead of 37. Worth a fixture precisely because
+    nothing currently fails it.
+    """
+    yield ("named_call_arguments_out_of_order", """
+def combine(x: i64, y: i64) -> i64:
+	return x * 10 + y
+
+def main() -> i64:
+	return combine(y: 7, x: 3)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
-               gen_checked_index_else, gen_record_update, gen_move_as_destructure]
+               gen_checked_index_else, gen_record_update, gen_move_as_destructure,
+               gen_float_pointer_cast, gen_named_call_argument_order]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
