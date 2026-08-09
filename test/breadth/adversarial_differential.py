@@ -4813,6 +4813,49 @@ def main() -> i64:
 """)
 
 
+def gen_labelled_payload_match_arm():
+    """`PairOrInt.Pair(right: r, left: l):` -- payload patterns written with FIELD LABELS,
+    in an order that does not match the declaration.
+
+    Labelled fields arrive as `Pattern.Field(label, [Binding])`, which the arm gatherer did
+    not model at all, and the bind loop indexes binders by DECLARED position -- so accepting
+    them without reordering would have bound `left` from `right`. Each label now resolves to
+    its declared index and fills that slot; unlabelled fields fill positionally, so the plain
+    spelling is untouched.
+
+    The labelled arm is deliberately written REVERSED (`right:` before `left:`) and its
+    result is asymmetric (l*10 + r), so a lowering that ignored the labels would answer 32
+    where the correct value is 23. The positional spelling runs the same inputs as a control,
+    and the two are subtracted -- so both must be right, not merely equal.
+    """
+    yield ("labelled_payload_match_arm", """
+enum PairOrInt:
+	Just(value: i64)
+	Pair(left: i64, right: i64)
+
+def labelled(value: PairOrInt) -> i64:
+	match value:
+		PairOrInt.Just(value: inner):
+			return inner
+		PairOrInt.Pair(right: r, left: l):
+			return l * 10 + r
+	return 0
+
+def positional(value: PairOrInt) -> i64:
+	match value:
+		PairOrInt.Just(inner):
+			return inner
+		PairOrInt.Pair(l, r):
+			return l * 10 + r
+	return 0
+
+def main() -> i64:
+	a: PairOrInt = PairOrInt.Just(7)
+	b: PairOrInt = PairOrInt.Pair(2, 3)
+	return (labelled(a) + labelled(b)) - (positional(a) + positional(b)) + labelled(b)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4839,7 +4882,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_each_collection_query, gen_first_projection_query,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
-               gen_nested_variant_match_arm]
+               gen_nested_variant_match_arm, gen_labelled_payload_match_arm]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
