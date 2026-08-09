@@ -3588,6 +3588,40 @@ def main() -> i64:
 """)
 
 
+def gen_extend_darray_from_view():
+    """`xs.extend(v)` where v is a `view[T]` -- appending a view's elements to a darray.
+
+    `extend` was modelled for a darray source, an sview BYTE source, an array literal and
+    a comprehension, but not for a typed view, so the whole function declined. Lowered on
+    the same shape as the sview path (loop the length, push `src[i]`, reusing the existing
+    view indexing) but element-typed, with the source and target element types required to
+    agree.
+
+    The fixture extends from a SLICE of the middle (`src[1:4]`), sums the result and
+    reports the count, so both WHICH elements were copied and HOW MANY have to be right:
+    9*10 + 3 = 93. Copying the whole source instead would give 153.
+    """
+    yield ("extend_darray_from_view", """
+def copy_span(src: darray[i64]) -> i64:
+	xs: mutable darray[i64] = []
+	v: view[i64] = src[1:4]
+	xs.extend(v)
+	total: mutable i64 = 0
+	for x in xs:
+		total <- total + x
+	return total * 10 + xs.count.i64()
+
+def main() -> i64:
+	s: mutable darray[i64] = []
+	s.push(1)
+	s.push(2)
+	s.push(3)
+	s.push(4)
+	s.push(5)
+	return copy_span(s)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3596,7 +3630,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern,
                gen_loop_where_filter, gen_loop_bare_pattern_filter,
                gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding,
-               gen_do_block_declaration, gen_flat_container_literal_declaration]
+               gen_do_block_declaration, gen_flat_container_literal_declaration,
+               gen_extend_darray_from_view]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
