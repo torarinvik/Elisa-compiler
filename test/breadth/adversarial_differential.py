@@ -3935,6 +3935,44 @@ def main() -> i64:
 """)
 
 
+def gen_nullable_extern_ref_get():
+    """`p: T& = get memchr(...) else raise E.Tag` over a NULLABLE-REFERENCE extern.
+
+    stage0 represents `-> heap T&?` as a bare ptr with null meaning absent, so the extern
+    registers as a plain Ref and the `get` path -- which tests for an Optional -- declined.
+    Ref-ness alone is not enough to accept: stage0 REJECTS `get` on a non-nullable `T&`, so
+    the marker for `?` is carried from the parser through FnTable.returns_nullable.
+
+    memchr is the nullable source rather than a failing malloc: a huge malloc DOES return
+    null at -O0 but the optimizer assumes success at -O2, which made an earlier version of
+    this fixture report a spurious MISMATCH. memchr's answer is decided by the data.
+
+    Both branches are real -- 'b' is in "abc", 'z' is not -- folded to 5*10+3 = 53, so a
+    present-check with the wrong polarity changes the answer.
+    """
+    yield ("nullable_extern_ref_get", """
+error MemoryError:
+\tNotThere
+
+extern memchr(s: cstr, c: i32, n: usize) -> heap void&?
+
+def find_byte(c: i32) -> i64 error[MemoryError]:
+\thit: heap void& = get memchr("abc", c, 3.usize()) else raise MemoryError.NotThere
+\t_ = hit
+\treturn 5
+
+def attempt(c: i32) -> i64:
+\treturn catch find_byte(c):
+\t\tok:
+\t\t\tok
+\t\terror e:
+\t\t\t3
+
+def main() -> i64:
+\treturn attempt(98) * 10 + attempt(122)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3948,7 +3986,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_literal_payload_is_test, gen_static_compile_time_call,
                gen_darray_as_cstr, gen_is_bracketed_alternation,
                gen_is_grouped_alternation, gen_extern_error_return_not_an_export,
-               gen_unified_else_recovery, gen_get_else_raise]
+               gen_unified_else_recovery, gen_get_else_raise,
+               gen_nullable_extern_ref_get]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
