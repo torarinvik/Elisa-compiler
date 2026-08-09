@@ -3901,6 +3901,40 @@ def main() -> i64:
 """)
 
 
+def gen_get_else_raise():
+    """`x: T = get OPT else raise E.Tag` -- a `raise` recovery on a monadic unwrap.
+
+    `raise` TERMINATES, but the recovery parser only treated return/break/continue that
+    way; everything else was parsed as a value FALLBACK and folded into a Refinement node,
+    which types the recovered expression by a value the branch never produces. The branch
+    that makes unwrapping the optional sound was lost.
+
+    Probed on both the present and absent path through a `catch`, so a recovery that does
+    not actually raise changes the answer: 30 + 7 = 37.
+    """
+    yield ("get_else_raise", """
+error MemoryError:
+	OutOfMemory
+
+def helper(n: i64) -> i64?:
+	return 3 if n > 0 else null
+
+def checked(n: i64) -> i64 error[MemoryError]:
+	v: i64 = get helper(n) else raise MemoryError.OutOfMemory
+	return v * 10
+
+def run(n: i64) -> i64:
+	return catch checked(n):
+		ok:
+			ok
+		error e:
+			7
+
+def main() -> i64:
+	return run(1) + run(-1)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3914,7 +3948,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_literal_payload_is_test, gen_static_compile_time_call,
                gen_darray_as_cstr, gen_is_bracketed_alternation,
                gen_is_grouped_alternation, gen_extern_error_return_not_an_export,
-               gen_unified_else_recovery]
+               gen_unified_else_recovery, gen_get_else_raise]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
