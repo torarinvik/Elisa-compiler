@@ -3726,6 +3726,37 @@ def main() -> i64:
 """)
 
 
+def gen_darray_as_cstr():
+    """`xs.as_cstr()` -- borrow a `darray[u8]` as a NUL-terminated C string.
+
+    `grep '"as_cstr"' src/backend` found nothing: unimplemented in codegen, so every use
+    dropped its function. Lowered as stage0 does -- make room for one more byte through
+    the same grow/realloc path a push uses, write the NUL at index `count`, hand back the
+    items pointer -- and the COUNT is deliberately left alone, since the terminator is not
+    an element.
+
+    The fixture checks BOTH halves of that: `strlen` reads the terminator (2) while
+    `xs.count` must still be 2, so 2*10 + 2 = 22. Incrementing the count would give 23,
+    and omitting the NUL would make strlen run off the end.
+    """
+    yield ("darray_as_cstr", """
+extern strlen(s: cstr) -> usize
+
+def main() -> i64:
+	can Abort.Panic, Memory.Allocate:
+		region r(256)
+		in r:
+			xs: mutable darray[u8] = []
+			xs.push(72)
+			xs.push(105)
+			s: cstr = xs.as_cstr()
+			total: usize = strlen(s) * 10 + xs.count
+			destroy r
+			return total.i64()
+	return 0
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3736,7 +3767,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding,
                gen_do_block_declaration, gen_flat_container_literal_declaration,
                gen_extend_darray_from_view, gen_resize_non_scalar_element,
-               gen_literal_payload_is_test, gen_static_compile_time_call]
+               gen_literal_payload_is_test, gen_static_compile_time_call,
+               gen_darray_as_cstr]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
