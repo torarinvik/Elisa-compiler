@@ -3833,6 +3833,33 @@ def main() -> i64:
 """)
 
 
+def gen_extern_error_return_not_an_export():
+    """An `extern f(...) -> T error[E]` carries an internal `__error_return` annotation on
+    `f`. The export-target lookup used to return the FIRST non-`__export_fn` annotation on
+    an owner, so that internal marker read as an export target name: the export path fired
+    on a plain extern, failed to build a wrapper for a target called "__error_return", and
+    recorded `f` as DECLINED even though its declaration had lowered correctly.
+
+    The fixture pairs a real `export fn` with such an extern so BOTH halves are pinned --
+    the export must still emit, and the extern must stop declining. The harness ratchets
+    declines at zero, which is what makes this fixture able to fail.
+    """
+    yield ("extern_error_return_not_an_export", """
+error IoError:
+	NotFound
+
+extern read_file(path: u8&) -> cstr[file_text] error[IoError]
+
+def add_impl(a: i64, b: i64) -> i64:
+	return a + b
+
+export fn add_two(a: i64, b: i64) -> i64 = add_impl
+
+def main() -> i64:
+	return add_impl(17, 25)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3845,7 +3872,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_extend_darray_from_view, gen_resize_non_scalar_element,
                gen_literal_payload_is_test, gen_static_compile_time_call,
                gen_darray_as_cstr, gen_is_bracketed_alternation,
-               gen_is_grouped_alternation]
+               gen_is_grouped_alternation, gen_extern_error_return_not_an_export]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
