@@ -4350,6 +4350,37 @@ def main() -> i64:
 """)
 
 
+def gen_arena_local_region_pin():
+    """`@alloc` where `alloc` is an `Arena&`-typed LOCAL, not a `region R:` block or a
+    `[@r]` region parameter.
+
+    stage1 rejected it outright -- "unknown region qualifier" -- because the scope check
+    knew only those two forms. An `Arena&` local owns a region too.
+
+    Two lifetimes again: the comprehension is built inside `region tmp:` but pinned to
+    `host` through the alias, and read after tmp ends. A pin that resolved to the wrong
+    arena, or was dropped, loses the data rather than answering 6 + 8 = 14.
+    """
+    yield ("arena_local_region_pin", """
+def build(owner: Arena, rest: darray[i64]) -> darray[i64]:
+	alloc: mutable Arena& = (&owner).cast[mutable Arena&]
+	xs: darray[i64] @alloc = [item + 1 for item in rest if item > 0]
+	return xs
+
+def main() -> i64:
+	region host(4096)
+	total: mutable i64 = 0
+	ys: mutable darray[i64] = []
+	region tmp(4096):
+		rest: darray[i64] = [5, -2, 7]
+		ys <- build(host, rest)
+	for y in ys |total|:
+		total <- total + y
+	destroy host
+	return total
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4370,7 +4401,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_builtin_string_surface, gen_fixed_array_slice_to_view,
                gen_view_iteration, gen_function_value_erasure_cast,
                gen_fixed_array_slice_shapes, gen_rev_iteration,
-               gen_region_qualifier_pin]
+               gen_region_qualifier_pin, gen_arena_local_region_pin]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
