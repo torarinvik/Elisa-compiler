@@ -4091,6 +4091,39 @@ def main() -> i64:
 """)
 
 
+def gen_refined_type_alias():
+    """`type Lane4 = u32 is InRange[0, 3]` and `type Pct = i64 where ...` -- REFINED aliases.
+
+    Both erase at runtime (stage0 lowers a `Lane4` parameter as a plain i32 and emits no
+    check), but neither target is a type EXPRESSION: the `is` form is a Binary, and the
+    fallback head heuristic keeps the last Ident in the span, which is the LAW's name. The
+    alias stayed Unmodeled, so every function mentioning it declined -- including ones that
+    only did arithmetic on the value.
+
+    Both spellings are exercised, one as an ARRAY INDEX (30) and one in arithmetic (23),
+    summing to 53 -- so an alias resolved to the wrong width or a dropped index changes it.
+    """
+    yield ("refined_type_alias", """
+law InRange(self: u32, lo: u32, hi: u32) = self >= lo and self <= hi
+
+type Lane4 = u32 is InRange[0, 3]
+type Pct = i64 where 0 <= self and self <= 100
+
+struct Vec4:
+	lanes: mutable array[u32, 4]
+
+def read_lane(v: Vec4&, lane: Lane4) -> u32:
+	return v.lanes[lane]
+
+def scale(p: Pct) -> i64:
+	return p * 2 + 1
+
+def main() -> i64:
+	v: Vec4 = Vec4{lanes: [10, 20, 30, 40]}
+	return read_lane(&v, 2.u32()).i64() + scale(11)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4107,7 +4140,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_unified_else_recovery, gen_get_else_raise,
                gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias,
                gen_shadowing_assignment_declaration, gen_proof_block_erasure,
-               gen_first_query]
+               gen_first_query, gen_refined_type_alias]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
