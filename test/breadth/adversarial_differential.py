@@ -4124,6 +4124,38 @@ def main() -> i64:
 """)
 
 
+def gen_builtin_string_surface():
+    """Two independent gaps on the byte-array / string-view surface.
+
+    `text[1]` on a `u8[4]` returned the raw i8 without converting to the EXPECTED type, so
+    a `-> char` (or plain `-> i64`) context failed the return path's type-identity guard and
+    the function declined -- while the same expression with an explicit `.i64()` compiled.
+    The sibling optional-ref read one branch above already did the conversion.
+
+    `sview[LO, HI]` is a LENGTH-BOUNDED view whose bounds are a type-level refinement with
+    no representation (stage0 lowers it to a plain %StringView), but the annotation resolver
+    had no case for it, so it stayed Unmodeled and the unbounded spelling was the only one
+    that worked.
+
+    Distinct indices and a subtraction, so a wrong element or a wrong width changes the
+    answer: 66 - 67 + 120 - 100 = 19.
+    """
+    yield ("builtin_string_surface", """
+def first_char(text: u8[4]) -> char:
+	return text[1]
+
+def wide(text: u8[4]) -> i64:
+	return text[2]
+
+def view_char(text: sview[0, 4]) -> char:
+	return text[1]
+
+def main() -> i64:
+	buf: array[u8, 4] = [65.u8(), 66.u8(), 67.u8(), 68.u8()]
+	return first_char(buf).i64() - wide(buf) + view_char("wxyz").i64() - 100
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4140,7 +4172,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_unified_else_recovery, gen_get_else_raise,
                gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias,
                gen_shadowing_assignment_declaration, gen_proof_block_erasure,
-               gen_first_query, gen_refined_type_alias]
+               gen_first_query, gen_refined_type_alias,
+               gen_builtin_string_surface]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
