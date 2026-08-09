@@ -4688,6 +4688,42 @@ def main() -> i64:
 """)
 
 
+def gen_projection_query_bare_pattern():
+    """`value for each item in items where Expr.Int(value)` -- a PROJECTION query whose
+    filter is a BARE PATTERN that binds the value the projection then uses.
+
+    A bare pattern is not a predicate: it must BIND the payload as well as test the tag. It
+    means exactly `BINDER is PATTERN`, which is fully lowered, so the shared query-filter
+    helper now rewrites to that -- the same rewrite the `for`-loop filter already did.
+
+    Folded positionally over a list containing a non-matching variant (58 after truncation),
+    so collecting the wrong elements changes the answer.
+
+    The GUARDED spelling of this form is deliberately NOT covered: the projection node has
+    no slot for a guard (its body holds the projection), and emitting the filter without the
+    guard collected the excluded elements -- stage1 answered 38 where stage0 answers 34.
+    That shape now declines, via a parser marker recording that the guard was dropped.
+    """
+    yield ("projection_query_bare_pattern", """
+enum Expr:
+	Int(value: i64)
+	Missing
+
+def plain(items: darray[Expr]) -> darray[i64]:
+	return value for each item in items where Expr.Int(value)
+
+def fold(xs: darray[i64]) -> i64:
+	total: mutable i64 = 0
+	for x in xs |total|:
+		total <- total * 10 + x
+	return total
+
+def main() -> i64:
+	src: darray[Expr] = [Expr.Int(3), Expr.Missing, Expr.Int(1), Expr.Int(4)]
+	return fold(plain(src))
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4712,7 +4748,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_enum_variant_view_after_is, gen_bare_variant_loop_filter,
                gen_loop_pattern_filter_guard, gen_catch_per_variant_arms,
                gen_each_collection_query, gen_first_projection_query,
-               gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter]
+               gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
+               gen_projection_query_bare_pattern]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
