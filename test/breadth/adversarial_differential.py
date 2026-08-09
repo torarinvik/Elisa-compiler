@@ -3536,6 +3536,30 @@ def main() -> i64:
 # the target's parameter names can be resolved.
 
 
+def gen_do_block_declaration():
+    """`x = do: <stmts> <tail>` -- an un-annotated declaration from a VALUE BLOCK.
+
+    Its type is the TAIL's, but the tail routinely names locals the block itself declares
+    (`do: base = 5 / base + 7`), so it cannot be typed before those statements run:
+    expression_type answered Unmodeled and the declaration declined. The statements are
+    now emitted FIRST, then the tail is typed and emitted with the block's locals in
+    scope.
+
+    The fixture's tail DEPENDS on a block-local, which is the whole difficulty -- a
+    version whose tail used only outer scope would pass without the fix.
+    """
+    yield ("do_block_declaration", """
+def build() -> i64:
+	value = do:
+		base = 5
+		base + 7
+	return value
+
+def main() -> i64:
+	return build()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3543,7 +3567,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_float_pointer_cast, gen_named_call_argument_order,
                gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern,
                gen_loop_where_filter, gen_loop_bare_pattern_filter,
-               gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding]
+               gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding,
+               gen_do_block_declaration]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
