@@ -3309,11 +3309,44 @@ def main() -> i64:
 """)
 
 
+def gen_user_enum_named_like_ast_node():
+    """A user enum named `Expr` (or Node/Stmt/Decl/Pattern) -- the compiler's own AST
+    node names.
+
+    These five were effectively RESERVED in stage1: `new_struct_table` reserved AST
+    packed-store headers for them in EVERY program, so an ordinary `enum Expr:` found a
+    packed slot already present, was registered as a packed AoS enum instead of a payload
+    enum, and its constructor declined. Renaming the enum to `Shape` compiled the
+    byte-identical program -- the bug was reachable by NAME ALONE.
+
+    One case per reserved name so a partial fix cannot pass, and each RUNS (payload bound
+    from one variant, constant from the other) rather than merely compiling: 3*10 + 5 = 35.
+    """
+    for name in ("Expr", "Node", "Stmt", "Decl", "Pattern"):
+        yield (f"user_enum_named_{name.lower()}", f"""
+enum {name}:
+	Leaf(v: i64)
+	Missing
+
+def score(e: {name}) -> i64:
+	match e:
+		{name}.Leaf(k):
+			return k
+		{name}.Missing:
+			return 5
+	return 9
+
+def main() -> i64:
+	return score({name}.Leaf(3)) * 10 + score({name}.Missing)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
                gen_checked_index_else, gen_record_update, gen_move_as_destructure,
-               gen_float_pointer_cast, gen_named_call_argument_order]
+               gen_float_pointer_cast, gen_named_call_argument_order,
+               gen_user_enum_named_like_ast_node]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
