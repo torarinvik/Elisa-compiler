@@ -3245,10 +3245,36 @@ def main() -> i64:
 """)
 
 
+def gen_move_as_destructure():
+    """`move pair as Pair(left, right)` -- a DESTRUCTURING move.
+
+    The parser lowers it to Block("move", ...) wrapping a Match whose arms have EMPTY
+    bodies plus one uninitialized VarDecl per binder. The backend handled no "move" block
+    kind at all, so every use declined. stage0 lowers it as a plain per-field extract into
+    fresh locals -- the arms carry no runtime test because the scrutinee's STATIC type
+    already names the struct.
+
+    The fixture uses ASYMMETRIC field values so a position mix-up changes the answer
+    rather than merely compiling: 3*10 + 5 = 35, where swapped binders would give 53.
+    """
+    yield ("move_as_destructure_positions", """
+struct Pair:
+	left: mutable i64
+	right: mutable i64
+
+def split(pair: Pair) -> i64:
+	move pair as Pair(left, right)
+	return left * 10 + right
+
+def main() -> i64:
+	return split(Pair{left: 3, right: 5})
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
-               gen_checked_index_else, gen_record_update]
+               gen_checked_index_else, gen_record_update, gen_move_as_destructure]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
