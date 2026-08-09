@@ -3468,13 +3468,54 @@ def main() -> i64:
 """)
 
 
+def gen_struct_pattern_tests_and_nesting():
+    """Struct patterns with LITERAL/shorthand field tests and one level of NESTING --
+    `tok is Token(kind: .INTEGER, span: Span(start: start), value: value)`.
+
+    Three separate gaps met here. The `is` struct path modelled only bare-Ident fields
+    (all bindings, result a constant true), so a field tested against a constant declined.
+    The PARENTHESISED spelling parses as a labelled CALL, not Expr.Construct, so it was
+    never seen at all -- and the NESTED pattern inside it is a labelled call too, which is
+    why normalising only the outer level left the function still declined.
+
+    The fixture feeds one MATCHING and one NON-matching token, so a pattern that ignored
+    the `.INTEGER` test would take the arm for both: 70 when correct (7*10 + 0), 76 if the
+    test were dropped.
+    """
+    yield ("struct_pattern_tests_and_nesting", """
+const enum Tok of i32:
+	INTEGER = 1
+	FLOAT = 2
+
+struct Span:
+	start: i64
+	finish: i64
+
+struct Token:
+	kind: Tok
+	span: Span
+	value: i64
+
+def score(tok: Token) -> i64:
+	if tok is Token(kind: .INTEGER, span: Span(start: start), value: value):
+		return start + value
+	return 0
+
+def main() -> i64:
+	hit: Token = Token{kind: Tok.INTEGER, span: Span{start: 3, finish: 9}, value: 4}
+	miss: Token = Token{kind: Tok.FLOAT, span: Span{start: 5, finish: 9}, value: 6}
+	return score(hit) * 10 + score(miss)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
                gen_checked_index_else, gen_record_update, gen_move_as_destructure,
                gen_float_pointer_cast, gen_named_call_argument_order,
                gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern,
-               gen_loop_where_filter, gen_loop_bare_pattern_filter]
+               gen_loop_where_filter, gen_loop_bare_pattern_filter,
+               gen_struct_pattern_tests_and_nesting]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,

@@ -297,6 +297,15 @@ extend Backend:
                     # A field with a literal or a nested sub-pattern (`Pair{left: 1, right: v}`)
                     # declines rather than risk silently dropping the comparison — the corpus has
                     # no example of either shape to verify against.
+                    # `tok is Token(kind: .INTEGER, value: value)` — the PARENTHESISED struct
+                    # pattern parses as a labelled CALL, not Expr.Construct, so the path below
+                    # never saw it. Normalise and re-enter so one implementation serves both
+                    # spellings. NESTED field patterns are normalised too (see below): inside a
+                    # paren pattern the nested `Span(start: start)` is ALSO a call.
+                    if is_right is Expr.Call(sp_probe_callee, sp_probe_arguments, sp_probe_names, sp_probe_line):
+                        sp_normalized: Expr = normalized_struct_pattern(is_right, structs)
+                        if sp_normalized is Expr.Construct(sp_norm_type, sp_norm_fields, sp_norm_line):
+                            return emit_expression((Expr.Binary(is_left, TokenKind.Is, sp_normalized, is_line)), expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                     if is_right is Expr.Construct(sc_type_expr, sc_fields, sc_construct_line):
                         sc_struct_type: ValueType = annotation_value_type(sc_type_expr, structs)
                         null return if sc_struct_type.kind != TypeKind.Struct
@@ -306,8 +315,23 @@ extend Backend:
                         sc_declined: mutable bool = false
                         sc_positions: mutable darray[i64] = []
                         sc_names: mutable darray[sview] = []
+                        # A field whose pattern value is a LITERAL or a const-enum shorthand
+                        # (`Token(kind: .INTEGER)`) is a TEST, not a binding: the arm only
+                        # matches when the field equals it. Previously every non-Ident field
+                        # declined, so the whole named-field form was unusable.
+                        sc_test_positions: mutable darray[i64] = []
+                        sc_test_values: mutable darray[Expr] = []
+                        # ONE level of nesting (`span: Span(start: start)`): the nested
+                        # pattern's own fields must all be bare Idents, which is the shape the
+                        # corpus uses. Deeper nesting, or a nested pattern that itself TESTS,
+                        # declines rather than matching without checking it.
+                        sc_nest_outer: mutable darray[i64] = []
+                        sc_nest_inner: mutable darray[i64] = []
+                        sc_nest_names: mutable darray[sview] = []
                         sc_field_order: mutable u32 = 0
-                        for sc_field in sc_fields |sc_declined, sc_positions, sc_names, sc_field_order, sc_slot, structs|:
+                        for sc_raw_field in sc_fields |sc_declined, sc_positions, sc_names, sc_test_positions, sc_test_values, sc_nest_outer, sc_nest_inner, sc_nest_names, sc_field_order, sc_slot, structs|:
+                            # A nested pattern may itself be the paren spelling.
+                            sc_field: Ast::FieldInit = Ast::FieldInit{name: sc_raw_field.name, value: normalized_struct_pattern(sc_raw_field.value, structs)}
                             sc_position: mutable i64 = field_index_of(structs, sc_slot, sc_field.name)
                             sc_position <- sc_field_order.i64() if sc_field.name == ""
                             sc_field_order <- sc_field_order + 1
@@ -316,8 +340,25 @@ extend Backend:
                             elif sc_field.value is Expr.Ident(sc_bind_name, sc_bind_line):
                                 sc_positions.push(sc_position)
                                 sc_names.push(sc_bind_name)
+                            elif sc_field.value is Expr.Construct(sc_nest_type_expr, sc_nest_fields, sc_nest_line):
+                                sc_nest_type: ValueType = copied_type(structs.field_types[structs.field_start[sc_slot] + sc_position.usize()])
+                                if sc_nest_type.kind != TypeKind.Struct:
+                                    sc_declined <- true
+                                else:
+                                    sc_nest_slot: usize = sc_nest_type.bits.usize()
+                                    for sc_nest_field in sc_nest_fields |sc_declined, sc_nest_outer, sc_nest_inner, sc_nest_names, sc_position, sc_nest_slot, structs|:
+                                        sc_inner_position: i64 = field_index_of(structs, sc_nest_slot, sc_nest_field.name)
+                                        if sc_inner_position < 0:
+                                            sc_declined <- true
+                                        elif sc_nest_field.value is Expr.Ident(sc_inner_name, sc_inner_line):
+                                            sc_nest_outer.push(sc_position)
+                                            sc_nest_inner.push(sc_inner_position)
+                                            sc_nest_names.push(sc_inner_name)
+                                        else:
+                                            sc_declined <- true
                             else:
-                                sc_declined <- true
+                                sc_test_positions.push(sc_position)
+                                sc_test_values.push(resolved_shorthand_member(sc_field.value, structs))
                         null return if sc_declined
                         if emit_expression(is_left, sc_scrut_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sc_struct_value:
                             for sc_bind_index in 0..<sc_positions.count |sc_positions, sc_names, sc_struct_value, sc_slot, structs, local_scope, ctx, builder|:
@@ -325,7 +366,30 @@ extend Backend:
                                 sc_field_value: LLVMValueRef = LLVMBuildExtractValue(builder, sc_struct_value, sc_positions[sc_bind_index].u32(), "is.struct.field")
                                 sc_bind_slot: LLVMValueRef = bind_is_slot(local_scope, structs, sc_names[sc_bind_index], sc_field_type, llvm_type_of(sc_field_type, structs, ctx), builder)
                                 _ = LLVMBuildStore(builder, sc_field_value, sc_bind_slot)
-                            return LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0)
+                            for sc_nest_index in 0..<sc_nest_outer.count |sc_nest_outer, sc_nest_inner, sc_nest_names, sc_struct_value, sc_slot, structs, local_scope, ctx, builder|:
+                                sc_outer_type: ValueType = copied_type(structs.field_types[structs.field_start[sc_slot] + sc_nest_outer[sc_nest_index].usize()])
+                                sc_outer_value: LLVMValueRef = LLVMBuildExtractValue(builder, sc_struct_value, sc_nest_outer[sc_nest_index].u32(), "is.struct.nest")
+                                sc_inner_type: ValueType = copied_type(structs.field_types[structs.field_start[sc_outer_type.bits.usize()] + sc_nest_inner[sc_nest_index].usize()])
+                                sc_inner_value: LLVMValueRef = LLVMBuildExtractValue(builder, sc_outer_value, sc_nest_inner[sc_nest_index].u32(), "is.struct.nest.field")
+                                sc_inner_slot: LLVMValueRef = bind_is_slot(local_scope, structs, sc_nest_names[sc_nest_index], sc_inner_type, llvm_type_of(sc_inner_type, structs, ctx), builder)
+                                _ = LLVMBuildStore(builder, sc_inner_value, sc_inner_slot)
+                            # No TESTS means the pattern only destructures, and the scrutinee's
+                            # static type already proves the match — a constant true, as before.
+                            sc_hit: mutable LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0)
+                            sc_test_declined: mutable bool = false
+                            for sc_test_index in 0..<sc_test_positions.count |sc_hit, sc_test_declined, sc_test_positions, sc_test_values, sc_struct_value, sc_slot, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                sc_test_type: ValueType = copied_type(structs.field_types[structs.field_start[sc_slot] + sc_test_positions[sc_test_index].usize()])
+                                if not is_numeric_type(sc_test_type) and sc_test_type.kind != TypeKind.Bool:
+                                    sc_test_declined <- true
+                                else:
+                                    sc_test_field: LLVMValueRef = LLVMBuildExtractValue(builder, sc_struct_value, sc_test_positions[sc_test_index].u32(), "is.struct.test.field")
+                                    if emit_expression(sc_test_values[sc_test_index], sc_test_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sc_test_value:
+                                        sc_test_cmp: LLVMValueRef = LLVMBuildICmp(builder, 32, sc_test_field, sc_test_value, "is.struct.test.eq")
+                                        sc_hit <- LLVMBuildAnd(builder, sc_hit, sc_test_cmp, "is.struct.test.and")
+                                    else:
+                                        sc_test_declined <- true
+                            null return if sc_test_declined
+                            return sc_hit
                         return null
                     # `e is Ast::Expr.Invalid` / `is Ast::Expr.Absent` — a PAYLOADLESS PACKED
                     # variant test. The packed narrowing below only matches the CALL form
