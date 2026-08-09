@@ -4276,6 +4276,36 @@ def main() -> i64:
 """)
 
 
+def gen_rev_iteration():
+    """`for value in rev(xs):` -- the reversed-iteration builtin.
+
+    stage1 did not know the name at all: the resolver reported "undefined identifier 'rev'",
+    a FALSE REJECTION of a program stage0 compiles, not a decline. `rev` is not a real call
+    (nothing declares it) -- it wraps the iterable and flips the traversal order, so the loop
+    reads the same container with only the element index mirrored.
+
+    The fixture folds positionally in BOTH directions over [1, 2, 3] and subtracts, so a
+    `rev` that quietly iterated forward yields 0 instead of 321 - 123 = 198.
+    """
+    yield ("rev_iteration", """
+def build(items: darray[i64]) -> i64:
+	total: mutable i64 = 0
+	for value in rev(items):
+		total <- total * 10 + value
+	return total
+
+def forward(items: darray[i64]) -> i64:
+	total: mutable i64 = 0
+	for value in items |total|:
+		total <- total * 10 + value
+	return total
+
+def main() -> i64:
+	xs: darray[i64] = [1, 2, 3]
+	return build(xs) - forward(xs)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4295,7 +4325,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_first_query, gen_refined_type_alias,
                gen_builtin_string_surface, gen_fixed_array_slice_to_view,
                gen_view_iteration, gen_function_value_erasure_cast,
-               gen_fixed_array_slice_shapes]
+               gen_fixed_array_slice_shapes, gen_rev_iteration]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
