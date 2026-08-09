@@ -4000,6 +4000,28 @@ def main() -> i64:
 """)
 
 
+def gen_shadowing_assignment_declaration():
+    """`acc = acc + 4` inside a nested block, where `acc` is already bound outside.
+
+    stage1 declined this, treating an already-bound name as "not a declaration". stage0's
+    rule is that `=` NEVER mutates -- `<-` is the mutation operator -- so the inner form
+    reads the outer binding and declares a NEW one that dies with the block.
+
+    The fixture makes the two readings differ: probe(true)*10 + probe(false) is 11 under
+    shadowing and 51 if the assignment mutated the outer binding.
+    """
+    yield ("shadowing_assignment_declaration", """
+def probe(flag: bool) -> i64:
+	acc: mutable i64 = 1
+	if flag:
+		acc = acc + 4
+	return acc
+
+def main() -> i64:
+	return probe(true) * 10 + probe(false)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4014,7 +4036,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_darray_as_cstr, gen_is_bracketed_alternation,
                gen_is_grouped_alternation, gen_extern_error_return_not_an_export,
                gen_unified_else_recovery, gen_get_else_raise,
-               gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias]
+               gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias,
+               gen_shadowing_assignment_declaration]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
