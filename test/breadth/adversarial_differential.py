@@ -3399,12 +3399,45 @@ def main() -> i64:
 """)
 
 
+def gen_loop_where_filter():
+    """`for x in xs where COND:` -- a boolean filter on a container loop.
+
+    The parser wraps the iterable as Expr.Refinement(base, condition) and NOTHING in the
+    loop emitter matched Refinement, so the whole loop declined -- a plain boolean filter,
+    not just the pattern-filter forms. Desugared to `for x in base: if COND: body`, which
+    reaches every iteration path (darray, fixed array, dict, enumerate) untouched.
+
+    The fixture keeps one element BELOW the threshold so a dropped filter changes the
+    answer: 5 + 3 = 8, versus 9 if the filter were ignored.
+
+    NOT covered, deliberately: a RANGE base (`for i in 0..<10 where c:`). stage0's PARSER
+    rejects that outright ("expected :, got where") while stage1's parser accepts it, so
+    emitting it would run a program stage0 refuses -- the PERMISSIVE direction. The
+    backend declines that shape so both compilers keep refusing it.
+    """
+    yield ("loop_where_filter_container", """
+def total(xs: darray[i64]&) -> i64:
+	sum: mutable i64 = 0
+	for x in xs where x > 2:
+		sum <- sum + x
+	return sum
+
+def main() -> i64:
+	xs: mutable darray[i64] = []
+	xs.push(1)
+	xs.push(5)
+	xs.push(3)
+	return total(xs)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
                gen_checked_index_else, gen_record_update, gen_move_as_destructure,
                gen_float_pointer_cast, gen_named_call_argument_order,
-               gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern]
+               gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern,
+               gen_loop_where_filter]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
