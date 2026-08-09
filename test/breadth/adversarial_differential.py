@@ -3508,6 +3508,34 @@ def main() -> i64:
 """)
 
 
+def gen_untyped_literal_binding():
+    """`seed = 3` -- an UNTYPED local declared by first assignment from an integer
+    literal.
+
+    A bare `x = v` folds to Stmt.Assign, NOT Stmt.VarDecl, so the VarDecl site's
+    "integer literal defaults to signed 64" rule never reached it: an int literal has no
+    intrinsic type, inference left it Unmodeled, and the declaration declined. (Third
+    time this session a fix landed on the VarDecl path when the spelling reaches Assign.)
+    """
+    yield ("untyped_literal_binding", """
+def main() -> i64:
+	seed = 3
+	other = 5
+	return seed * 10 + other
+""")
+
+
+# NOT a generator: labelled arguments through a `fn`-typed local
+# (`runner(y: 7, x: 3)`) are a KNOWN PARITY GAP. stage1 used to answer 73 where stage0
+# answers 37 -- a SILENT WRONG ANSWER, because the indirect call path takes no argument
+# names and passed them POSITIONALLY. stage1 now DECLINES that form, which makes the case
+# a DECLINE outcome, and DECLINE is ratcheted at ZERO by adversarial_differential_smoke --
+# adding it would fail the gate without fixing anything. Documented in
+# stage0-backend-corpus-gap instead. The DIRECT labelled call
+# (gen_named_call_argument_order) stays a MATCH and proves labels are honoured wherever
+# the target's parameter names can be resolved.
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -3515,7 +3543,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_float_pointer_cast, gen_named_call_argument_order,
                gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern,
                gen_loop_where_filter, gen_loop_bare_pattern_filter,
-               gen_struct_pattern_tests_and_nesting]
+               gen_struct_pattern_tests_and_nesting, gen_untyped_literal_binding]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
