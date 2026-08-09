@@ -4486,6 +4486,47 @@ def main() -> i64:
 """)
 
 
+def gen_catch_per_variant_arms():
+    """`catch f(x):` with per-VARIANT error arms (`NotFound:` / `Busy:`) rather than a
+    single `error e:` catch-all.
+
+    Two things were wrong, and the first hid the second. A bare undotted name in pattern
+    position is `Pattern.Binding`, NOT `Pattern.Variant` (parse_pattern_primary returns a
+    Variant only for a dotted path), so the arm matched none of the shapes the error-arm
+    loop handles. And the ordinal lookup scanned only PAYLOAD enums -- an `error E:` with no
+    payload variants registers as a CONST enum, so even after the rewrite the name resolved
+    to nothing.
+
+    Each variant returns a different value and the three branches are weighted apart
+    (7*100 + 1*10 + 2 = 712), so dispatching to the wrong arm changes the answer. A name
+    two error sets share still declines rather than picking one.
+    """
+    yield ("catch_per_variant_arms", """
+error FileError:
+	NotFound
+	Busy
+
+def read_value(flag: i64) -> i64 error[FileError]:
+	if flag == 1:
+		raise FileError.NotFound
+	if flag == 2:
+		raise FileError.Busy
+	return 7
+
+def load(flag: i64) -> i64:
+	return catch read_value(flag):
+		value:
+			value
+		NotFound:
+			1
+		Busy:
+			2
+
+def main() -> i64:
+	return load(0) * 100 + load(1) * 10 + load(2)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4508,7 +4549,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_fixed_array_slice_shapes, gen_rev_iteration,
                gen_region_qualifier_pin, gen_arena_local_region_pin,
                gen_enum_variant_view_after_is, gen_bare_variant_loop_filter,
-               gen_loop_pattern_filter_guard]
+               gen_loop_pattern_filter_guard, gen_catch_per_variant_arms]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
