@@ -3341,12 +3341,70 @@ def main() -> i64:
 """)
 
 
+def gen_nested_variant_subpattern():
+    """A NESTED variant sub-pattern in a single-field payload --
+    `Expr.Leaf(Token.Ident)`, and the alternation `Expr.Leaf(Token.Ident | Token.Keyword)`.
+
+    The match emitter accepted only a Binding or Wildcard as a single-field sub-pattern,
+    so both declined. stage0 loads the payload at ITS OWN type and compares against the
+    nested variant's ordinal, falling through on a mismatch; this now does the same, with
+    the alternation OR-ing the comparisons.
+
+    Both fixtures probe EVERY variant and weight the results, so an arm that matched
+    without testing the nested pattern changes the answer rather than merely compiling:
+    the single form gives 100 (110 if untested), the alternation 110 (111 if untested).
+
+    A nested variant that itself BINDS still declines -- its sub-fields would have to be
+    read too, and matching without testing them is a wrong answer, not a drop.
+    """
+    yield ("nested_variant_subpattern_single", """
+enum Token:
+	Ident
+	Keyword
+	Other
+
+enum Expr:
+	Leaf(kind: Token)
+	Missing
+
+def score(expr: Expr) -> i64:
+	match expr:
+		Expr.Leaf(Token.Ident):
+			return 1
+		_:
+			return 0
+
+def main() -> i64:
+	return score(Expr.Leaf(Token.Ident)) * 100 + score(Expr.Leaf(Token.Keyword)) * 10 + score(Expr.Missing)
+""")
+    yield ("nested_variant_subpattern_or", """
+enum Token:
+	Ident
+	Keyword
+	Other
+
+enum Expr:
+	Leaf(kind: Token)
+	Missing
+
+def score(expr: Expr) -> i64:
+	match expr:
+		Expr.Leaf(Token.Ident | Token.Keyword):
+			return 1
+		_:
+			return 0
+
+def main() -> i64:
+	return score(Expr.Leaf(Token.Ident)) * 100 + score(Expr.Leaf(Token.Keyword)) * 10 + score(Expr.Leaf(Token.Other))
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
                gen_checked_index_else, gen_record_update, gen_move_as_destructure,
                gen_float_pointer_cast, gen_named_call_argument_order,
-               gen_user_enum_named_like_ast_node]
+               gen_user_enum_named_like_ast_node, gen_nested_variant_subpattern]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
