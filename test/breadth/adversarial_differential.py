@@ -4945,6 +4945,39 @@ def main() -> i64:
 """)
 
 
+def gen_unannotated_comprehension_decl():
+    """`xs = [item + 1 for item in items if item > 0]` -- a comprehension declared with NO
+    type annotation, over both a darray and a RANGE source.
+
+    expression_type answers Unmodeled for a comprehension (its type comes from context, and a
+    bare `=` supplies none), and the literal-shape fallback reads only Array literals, so the
+    declaration declined while the annotated form worked. The element type is the
+    PROJECTION's, evaluated with the binder temporarily bound to the source's element type.
+
+    Both results are folded POSITIONALLY (45 and 123, summed to 168), so a wrong element
+    type, a dropped filter, or a reversed traversal changes the answer.
+    """
+    yield ("unannotated_comprehension_decl", """
+def build(items: darray[i64]) -> i64:
+	xs = [item + 1 for item in items if item > 0]
+	total: mutable i64 = 0
+	for x in xs |total|:
+		total <- total * 10 + x
+	return total
+
+def counted(n: usize) -> i64:
+	ys = [index for index in 1..<n]
+	total: mutable i64 = 0
+	for y in ys |total|:
+		total <- total * 10 + y.i64()
+	return total
+
+def main() -> i64:
+	src: darray[i64] = [3, -1, 4]
+	return build(src) + counted(4.usize())
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4972,7 +5005,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum]
+               gen_membership_range_enum_bounds, gen_wide_payload_enum,
+               gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
