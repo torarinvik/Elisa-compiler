@@ -4450,6 +4450,42 @@ def main() -> i64:
 """)
 
 
+def gen_loop_pattern_filter_guard():
+    """`for item in items where item is Expr.Int(value): value > 2:` -- a pattern filter
+    with a GUARD.
+
+    The parser parsed the guard and threw it away. That was not a decline: stage1 compiled
+    the loop and ran it over every Int, so `where … : value > 2` silently summed values the
+    guard excludes. The guard is now retained as a second Refinement layer, and the flow
+    resolver walks it in the PATTERN's scope so it can see the payload bindings.
+
+    Guarded and unguarded forms run over the same list in one program and are folded
+    positionally with different weights, so dropping the guard (or applying it to the wrong
+    form) changes the answer: 34*2 + 314 - 600 = 38.
+    """
+    yield ("loop_pattern_filter_guard", """
+enum Expr:
+	Int(value: i64)
+	Missing
+
+def guarded(items: array[Expr, 4]) -> i64:
+	acc: mutable i64 = 0
+	for item in items where item is Expr.Int(value): value > 2:
+		acc <- acc * 10 + value
+	return acc
+
+def unguarded(items: array[Expr, 4]) -> i64:
+	acc: mutable i64 = 0
+	for item in items where item is Expr.Int(value):
+		acc <- acc * 10 + value
+	return acc
+
+def main() -> i64:
+	xs: array[Expr, 4] = [Expr.Int(3), Expr.Missing, Expr.Int(1), Expr.Int(4)]
+	return guarded(xs) * 2 + unguarded(xs) - 600
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4471,7 +4507,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_view_iteration, gen_function_value_erasure_cast,
                gen_fixed_array_slice_shapes, gen_rev_iteration,
                gen_region_qualifier_pin, gen_arena_local_region_pin,
-               gen_enum_variant_view_after_is, gen_bare_variant_loop_filter]
+               gen_enum_variant_view_after_is, gen_bare_variant_loop_filter,
+               gen_loop_pattern_filter_guard]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
