@@ -4381,6 +4381,35 @@ def main() -> i64:
 """)
 
 
+def gen_enum_variant_view_after_is():
+    """`node.left` after `if node is Expr.Pair:` -- reading a payload field through the
+    NARROWED variant view, with no binding pattern to introduce the name.
+
+    stage0 lowers it as a plain payload GEP + extract in the proven branch; stage1 had no
+    case for a payload-enum receiver in field position at all.
+
+    The variant is selected by FIELD NAME and only when exactly one variant declares it --
+    with two variants sharing a name the offsets can differ and only the branch knows which
+    is right, so that declines instead of guessing.
+
+    Asymmetric payload values (3, 4) and a non-matching variant probe, folded to 70, so
+    reading the wrong field or the wrong offset changes the answer.
+    """
+    yield ("enum_variant_view_after_is", """
+enum Expr:
+	Pair(left: i64, right: i64)
+	Int(value: i64)
+
+def score(node: Expr) -> i64:
+	if node is Expr.Pair:
+		return node.left + node.right
+	return 0
+
+def main() -> i64:
+	return score(Expr.Pair(3, 4)) * 10 + score(Expr.Int(9))
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4401,7 +4430,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_builtin_string_surface, gen_fixed_array_slice_to_view,
                gen_view_iteration, gen_function_value_erasure_cast,
                gen_fixed_array_slice_shapes, gen_rev_iteration,
-               gen_region_qualifier_pin, gen_arena_local_region_pin]
+               gen_region_qualifier_pin, gen_arena_local_region_pin,
+               gen_enum_variant_view_after_is]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
