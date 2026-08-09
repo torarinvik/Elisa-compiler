@@ -4179,6 +4179,39 @@ def main() -> i64:
 """)
 
 
+def gen_view_iteration():
+    """`for x in v:` over a `view[T]`, from both a darray slice and a fixed-array slice.
+
+    A view is a `{ptr data, i64 len}` VALUE, not a header in memory like a darray, so the
+    loop emitter's darray branch could not take it and nothing else did. View INDEXING
+    worked all along, which is how the gap stayed hidden -- it only shows up when the same
+    view is iterated.
+
+    Each loop folds its elements positionally (total*10 + x), so a reversed traversal, an
+    off-by-one length, or a dropped element changes the answer: 23 and 23.
+    """
+    yield ("view_iteration", """
+def from_darray(xs: darray[i64]) -> i64:
+	part: view[i64] = xs[1:3]
+	total: mutable i64 = 0
+	for b in part |total|:
+		total <- total * 10 + b
+	return total
+
+def from_array(text: u8[4]) -> i64:
+	part: view[u8] = text[1:3]
+	total: mutable i64 = 0
+	for b in part |total|:
+		total <- total * 10 + b.i64()
+	return total
+
+def main() -> i64:
+	xs: darray[i64] = [1, 2, 3, 4]
+	buf: array[u8, 4] = [1.u8(), 2.u8(), 3.u8(), 4.u8()]
+	return from_darray(xs) + from_array(buf)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4196,7 +4229,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_nullable_extern_ref_get, gen_labelled_call_through_fn_alias,
                gen_shadowing_assignment_declaration, gen_proof_block_erasure,
                gen_first_query, gen_refined_type_alias,
-               gen_builtin_string_surface, gen_fixed_array_slice_to_view]
+               gen_builtin_string_surface, gen_fixed_array_slice_to_view,
+               gen_view_iteration]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
