@@ -254,7 +254,34 @@ extend Backend:
         # The seed is also the answer for an empty ITER, which is what makes `all` over an
         # empty darray vacuously TRUE — the case that separates it from `any` even when every
         # element would agree.
-        def emit_any_quantifier(comprehension_var: sview, iterable: Expr, condition: Expr, universal: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # A query filter's effective predicate: the `where` CONDITION, and -- when the query
+        # carries the `where PATTERN: GUARD` form -- the guard evaluated only on the matched
+        # side, where the pattern's payload bindings are live.
+        #
+        # It cannot be folded into `condition and guard`: stage0 REJECTS that spelling in a
+        # query filter ("undefined identifier" for the payload binder), so emitting it would
+        # be permissive. Nesting is also what the `for`-loop form does with the same shape.
+        def emit_filter_predicate(condition: Expr, guard: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            gp_bool: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
+            if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is gp_condition_bit:
+                gp_condition_bit return if guard is Expr.Absent
+                gp_slot: LLVMValueRef = LLVMBuildAlloca(builder, gp_bool, "filter.pred")
+                _ = LLVMBuildStore(builder, LLVMConstInt(gp_bool, 0, 0), gp_slot)
+                gp_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                gp_guard_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gp_function, "filter.guard")
+                gp_merge_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, gp_function, "filter.merge")
+                _ = LLVMBuildCondBr(builder, gp_condition_bit, gp_guard_block, gp_merge_block)
+                LLVMPositionBuilderAtEnd(builder, gp_guard_block)
+                if emit_condition(guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is gp_guard_bit:
+                    _ = LLVMBuildStore(builder, gp_guard_bit, gp_slot)
+                    _ = LLVMBuildBr(builder, gp_merge_block)
+                    LLVMPositionBuilderAtEnd(builder, gp_merge_block)
+                    return LLVMBuildLoad2(builder, gp_bool, gp_slot, "filter.pred.value")
+                return null
+            return null
+
+
+        def emit_any_quantifier(comprehension_var: sview, iterable: Expr, condition: Expr, guard: Expr, universal: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # The value the loop settles on if it never short-circuits, and the value it
             # stores when it does. Always opposites.
             seed_bit: u64 = 1 if universal else 0
@@ -283,7 +310,7 @@ extend Backend:
                         var_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(elem_type, structs, ctx), "any.var")
                         _ = LLVMBuildStore(builder, elem_value, var_slot)
                         declare_local(local_scope, comprehension_var, var_slot, elem_type)
-                        if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cond_bit:
+                        if emit_filter_predicate(condition, guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cond_bit:
                             hit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "any.hit")
                             next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "any.next")
                             # `all` decides on the FALSE edge, `any` on the true one — same two
@@ -345,7 +372,7 @@ extend Backend:
                     aq_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, aq_elem_llvm, aq_items, aq_gep_pointer, 1, "any.d.elem.ptr")
                     aq_elem_value: LLVMValueRef = LLVMBuildLoad2(builder, aq_elem_llvm, aq_elem_ptr, "any.d.elem")
                     _ = LLVMBuildStore(builder, aq_elem_value, aq_var_slot)
-                    if emit_condition(condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is aq_pred:
+                    if emit_filter_predicate(condition, guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is aq_pred:
                         if universal:
                             _ = LLVMBuildCondBr(builder, aq_pred, aq_step_block, aq_hit_block)
                         else:
@@ -659,12 +686,15 @@ extend Backend:
             # TRUE — a wrong answer that compiled, linked and ran clean. An unrecognised head
             # DECLINES rather than guessing; a decline is loud at link time, a wrong
             # quantifier is silent forever.
-            if expected.kind == TypeKind.Bool and body is Expr.Absent:
+            # A quantifier's `body` slot carries the GUARD of a `where PATTERN: GUARD` filter
+            # (the parser has no separate slot for it), so a non-empty body no longer excludes
+            # this branch -- it selects the guarded form.
+            if expected.kind == TypeKind.Bool:
                 quantifier_head: sview = query_head_for(comprehension_line, comprehension_var, structs)
                 universal_quantifier: bool = quantifier_head == "all" or quantifier_head == "forall"
                 existential_quantifier: bool = quantifier_head == "any" or quantifier_head == "exists"
                 null return if not universal_quantifier and not existential_quantifier
-                return emit_any_quantifier(comprehension_var, iterable, condition, universal_quantifier, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                return emit_any_quantifier(comprehension_var, iterable, condition, body, universal_quantifier, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             # `count|sum|product VAR in ITER [where COND]` — a FOLD to an integer, not a bool
             # quantifier and not a collection. The parser drops the query head from the node,
             # so which fold this is comes from the line-keyed marker recorded at parse time;

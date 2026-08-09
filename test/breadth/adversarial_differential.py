@@ -4608,6 +4608,43 @@ def main() -> i64:
 """)
 
 
+def gen_query_guarded_pattern_filter():
+    """`all|any item in items where item is Expr.Int(value): value > 0` -- a query filter
+    with a PATTERN and a GUARD.
+
+    The parser has no separate slot for the guard, so it rides in the quantifier's BODY --
+    and the quantifier branch excluded any node with a body, on the assumption that a body
+    meant a projection. The guard is now evaluated on the MATCHED side of the pattern test,
+    where the payload bindings are live.
+
+    It cannot be folded to `condition and guard`: stage0 REJECTS that spelling in a query
+    filter ("undefined identifier" for the binder), so emitting it would be permissive.
+
+    Six independent bits at distinct weights (52 = 0b110100) -- both quantifiers over an
+    all-pass, a mixed and an all-fail list -- so any single wrong answer moves the total.
+    """
+    yield ("query_guarded_pattern_filter", """
+enum Expr:
+	Int(value: i64)
+	Missing
+
+def all_pos(items: array[Expr, 3]) -> bool:
+	return all item in items where item is Expr.Int(value): value > 0
+
+def any_pos(items: array[Expr, 3]) -> bool:
+	return any item in items where item is Expr.Int(value): value > 0
+
+def bit(b: bool) -> i64:
+	return 1 if b else 0
+
+def main() -> i64:
+	pos: array[Expr, 3] = [Expr.Int(1), Expr.Int(2), Expr.Int(3)]
+	mixed: array[Expr, 3] = [Expr.Int(1), Expr.Int(-2), Expr.Int(3)]
+	none: array[Expr, 3] = [Expr.Int(-1), Expr.Missing, Expr.Int(-3)]
+	return bit(all_pos(pos)) * 32 + bit(any_pos(pos)) * 16 + bit(all_pos(mixed)) * 8 + bit(any_pos(mixed)) * 4 + bit(all_pos(none)) * 2 + bit(any_pos(none))
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4631,7 +4668,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_region_qualifier_pin, gen_arena_local_region_pin,
                gen_enum_variant_view_after_is, gen_bare_variant_loop_filter,
                gen_loop_pattern_filter_guard, gen_catch_per_variant_arms,
-               gen_each_collection_query, gen_first_projection_query]
+               gen_each_collection_query, gen_first_projection_query,
+               gen_query_guarded_pattern_filter]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
