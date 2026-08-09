@@ -4243,6 +4243,39 @@ def main() -> i64:
 """)
 
 
+def gen_fixed_array_slice_shapes():
+    """The remaining fixed-array slice shapes: a REF receiver, and indexing a slice DIRECTLY.
+
+    `values[1:3]` where `values: i32[4]&` -- the value in hand is already the array's
+    address, so no temp is needed, but the by-value branch could not take it.
+
+    `values[1:3][0]` -- every slice path keys off an EXPECTED view type, and here the
+    expected type is the ELEMENT's, so nothing produced the view and the chain resolver
+    declined. The slice is now emitted at the view type its receiver implies, then read
+    through.
+
+    Three readings at distinct powers of two (8, 4, 1) over [1, 2, 3, 4], each picking a
+    DIFFERENT element, so any one wrong offset changes the total: 3*8 + 2*4 + 4 = 36.
+    Deliberately sized to fit in a byte -- an earlier version returned 324 and "agreed"
+    only after exit-status truncation.
+    """
+    yield ("fixed_array_slice_shapes", """
+def by_value(values: i32[4]) -> i32:
+	return values[1:3][1]
+
+def by_ref(values: i32[4]&) -> i32:
+	return values[1:3][0]
+
+def ref_view(values: i32[4]&) -> i32:
+	part: view[i32] = values[2:4]
+	return part[1]
+
+def main() -> i64:
+	buf: array[i32, 4] = [1, 2, 3, 4]
+	return by_value(buf).i64() * 8 + by_ref(&buf).i64() * 4 + ref_view(&buf).i64()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4261,7 +4294,8 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_shadowing_assignment_declaration, gen_proof_block_erasure,
                gen_first_query, gen_refined_type_alias,
                gen_builtin_string_surface, gen_fixed_array_slice_to_view,
-               gen_view_iteration, gen_function_value_erasure_cast]
+               gen_view_iteration, gen_function_value_erasure_cast,
+               gen_fixed_array_slice_shapes]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
