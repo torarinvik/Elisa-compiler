@@ -4410,6 +4410,46 @@ def main() -> i64:
 """)
 
 
+def gen_bare_variant_loop_filter():
+    """`for item in items where Expr.Int:` -- a payload-FREE variant pattern as a loop filter.
+
+    The existing bare-pattern rewrite required a CALL (`where Expr.Int(value)`), so the
+    spelling with no binder list parsed as a plain Field, was treated as a boolean
+    condition, and declined -- an enum variant is not a bool.
+
+    It is resolved against the enum TABLES rather than by shape, because `where e.enabled`
+    is the same Field node; the fixture exercises BOTH in one program, so a rewrite that
+    caught the ordinary boolean filter too would change the answer. Matches fold
+    positionally (11) and the boolean filter sums a single enabled row (4).
+    """
+    yield ("bare_variant_loop_filter", """
+enum Expr:
+	Int(value: i64)
+	Missing
+
+struct Entry:
+	name: i64
+	enabled: bool
+
+def count_ints(items: array[Expr, 3]) -> i64:
+	total: mutable i64 = 0
+	for item in items where Expr.Int:
+		total <- total * 10 + 1
+	return total
+
+def sum_enabled(items: darray[Entry]) -> i64:
+	total: mutable i64 = 0
+	for e in items where e.enabled:
+		total <- total + e.name
+	return total
+
+def main() -> i64:
+	xs: array[Expr, 3] = [Expr.Int(1), Expr.Missing, Expr.Int(2)]
+	es: darray[Entry] = [Entry{name: 4, enabled: true}, Entry{name: 8, enabled: false}]
+	return count_ints(xs) + sum_enabled(es)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -4431,7 +4471,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_view_iteration, gen_function_value_erasure_cast,
                gen_fixed_array_slice_shapes, gen_rev_iteration,
                gen_region_qualifier_pin, gen_arena_local_region_pin,
-               gen_enum_variant_view_after_is]
+               gen_enum_variant_view_after_is, gen_bare_variant_loop_filter]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
                gen_struct_operator_protocols, gen_named_tuples,
