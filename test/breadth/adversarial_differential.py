@@ -4557,6 +4557,20 @@ def main() -> i64:
 	src: darray[i64] = [3, -1, 4]
 	return fold(positives(src)) * 2 - fold(comp(src))
 """)
+    # The SVIEW source has its own emit site, which needed the same substitution.
+    yield ("each_collection_query_sview", """
+def picks(text: sview) -> darray[u8]:
+	return each c in text where c > 97.u8()
+
+def fold(xs: darray[u8]) -> i64:
+	total: mutable i64 = 0
+	for x in xs |total|:
+		total <- total * 10 + (x.i64() - 96)
+	return total
+
+def main() -> i64:
+	return fold(picks("abcd"))
+""")
 
 
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
