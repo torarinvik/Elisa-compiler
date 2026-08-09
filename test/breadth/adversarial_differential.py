@@ -3735,9 +3735,13 @@ def gen_darray_as_cstr():
     items pointer -- and the COUNT is deliberately left alone, since the terminator is not
     an element.
 
-    The fixture checks BOTH halves of that: `strlen` reads the terminator (2) while
-    `xs.count` must still be 2, so 2*10 + 2 = 22. Incrementing the count would give 23,
+    The fixture checks BOTH halves of that: `strlen` reads the terminator (3) while
+    `xs.count` must still be 3, so 3*10 + 3 = 33. Incrementing the count would give 34,
     and omitting the NUL would make strlen run off the end.
+
+    It also pins `xs.push([72, 105])` -- an ARRAY-LITERAL argument pushes EVERY element,
+    which stage0 lowers as a bulk extend rather than a single push. Mixing the literal and
+    scalar forms means a lowering that handled only one of them changes the length.
     """
     yield ("darray_as_cstr", """
 extern strlen(s: cstr) -> usize
@@ -3747,8 +3751,8 @@ def main() -> i64:
 		region r(256)
 		in r:
 			xs: mutable darray[u8] = []
-			xs.push(72)
-			xs.push(105)
+			xs.push([72, 105])
+			xs.push(33)
 			s: cstr = xs.as_cstr()
 			total: usize = strlen(s) * 10 + xs.count
 			destroy r
