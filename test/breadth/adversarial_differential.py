@@ -5381,6 +5381,33 @@ def main() -> i64:
 """)
 
 
+def gen_enum_variant_alias_after_is():
+    """`if node is Expr.Pair as pair:` -- the variant-test ALIAS binder.
+
+    The parser modelled `is TARGET as NAME` by REPLACING the is-RHS with the alias ident,
+    which is right for a refinement target but DROPPED the variant outright: the condition
+    became `if let pair = node`, with no test at all. Only a Field-shaped target now keeps
+    its target as the RHS and records the alias under its own marker; the refinement-alias
+    form (an Ident target) is untouched.
+
+    Both variants are exercised and weighted (`Pair` -> 34, `Int` -> 7, combined 3407), so a
+    condition that dropped the test — taking the Pair arm for an Int — cannot pass.
+    """
+    yield ("enum_variant_alias_after_is", """
+enum Expr:
+	Pair(left: i64, right: i64)
+	Int(value: i64)
+
+def score(node: Expr) -> i64:
+	if node is Expr.Pair as pair:
+		return pair.left * 10 + pair.right
+	return 7
+
+def main() -> i64:
+	return score(Expr.Pair(3, 4)) * 100 + score(Expr.Int(9))
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5448,7 +5475,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
