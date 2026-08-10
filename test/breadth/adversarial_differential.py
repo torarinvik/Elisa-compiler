@@ -6006,6 +6006,41 @@ def main() -> i64:
 """)
 
 
+def gen_proof_carrying_view_helpers():
+    """`split_at` and `chunks_exact` -- the proof-carrying view helpers.
+
+    stage0's layouts, read off its IR rather than invented:
+    `%SplitView__T = { %DynArrayView, %DynArrayView }` and
+    `%ChunksExactView__T = { %DynArrayView, i64 chunk, i64 count }`. Both are built INLINE --
+    the halves and the chunks are ordinary view slices, so there is no runtime helper to call.
+
+    `readonly(x)` also had to TYPE as its operand, not just emit as it: `chunks_exact(readonly(v), n)`
+    read its argument's type to find the element, and an Unmodeled answer declined the call.
+
+    Every read is positional and the chunk size (3) differs from the split point (2), so a
+    chunk stride in bytes rather than elements, a split that kept the wrong half, or an
+    off-by-one count all change the answer.
+    """
+    yield ("proof_carrying_view_helpers", """
+def run(values: darray[i64, 6]) -> i64:
+	base: view[i64] = values[0:6]
+	halves: SplitView[i64] = split_at(base, 2)
+	left: view[i64] = halves.left
+	right: view[i64] = halves.right
+	chunks: ChunksExactView[i64] = chunks_exact(readonly(base), 3)
+	first: view[i64] = chunks[0]
+	total: mutable i64 = left[0] * 100 + left[1] * 10 + right[0]
+	total <- total * 10 + first[2]
+	for chunk in chunks:
+		total <- total * 10 + chunk[0] + chunk[2]
+	return total
+
+def main() -> i64:
+	ys: mutable darray[i64, 6] = [1, 2, 3, 4, 5, 6]
+	return run(ys) % 251
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -6073,7 +6108,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_with_arena_scoped_allocator, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_with_arena_scoped_allocator, gen_proof_carrying_view_helpers, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
