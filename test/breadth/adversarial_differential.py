@@ -4978,6 +4978,47 @@ def main() -> i64:
 """)
 
 
+def gen_struct_pattern_match_arm():
+    """`match tok: Token(kind: .INTEGER, span: Span(start: start), value: value): … / _: …`
+    -- a struct-pattern arm that TESTS a field and destructures, with a tail arm.
+
+    The struct-pattern match path emitted arm 0 UNCONDITIONALLY, which is correct only for a
+    destructure with nothing to test and nothing after it -- so the tested form declined. The
+    `is` spelling of the same pattern was already fully lowered (field tests, nested struct
+    fields, bindings), so the arm is REBUILT as an `is` expression and becomes
+    `if SCRUT is PATTERN: body else: <rest>`. No second struct-matching engine.
+
+    Both arms are exercised (a matching and a non-matching kind) at distinct weights (77), so
+    a test that always passes -- the previous behaviour -- answers 7*10+7 instead.
+    """
+    yield ("struct_pattern_match_arm", """
+const enum Tok of i32:
+	INTEGER = 1
+	FLOAT = 2
+
+struct Span:
+	start: i64
+	finish: i64
+
+struct Token:
+	kind: Tok
+	span: Span
+	value: i64
+
+def score(tok: Token) -> i64:
+	match tok:
+		Token(kind: .INTEGER, span: Span(start: start), value: value):
+			return start + value
+		_:
+			return 7
+
+def main() -> i64:
+	a: Token = Token{kind: Tok.INTEGER, span: Span{start: 3, finish: 9}, value: 4}
+	b: Token = Token{kind: Tok.FLOAT, span: Span{start: 3, finish: 9}, value: 4}
+	return score(a) * 10 + score(b)
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -5005,7 +5046,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
