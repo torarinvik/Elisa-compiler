@@ -5524,6 +5524,44 @@ def main() -> i64:
 """)
 
 
+def gen_soa_row_handles():
+    """`RowId[S]`, `s.valid(row)`, `s[row].field` read and write — the SoA ROW HANDLE API.
+
+    A RowId is an i32: stage0 narrows the column count to i32 on push (`%row = alloca i32`).
+    `valid` is a plain `row < rowCount`, and `s[row].field` resolves through the ONE lvalue
+    chain resolver, so the read and the write share an address computation.
+
+    Two rows are pushed, the SECOND is mutated, and BOTH are read back alongside the row
+    count and an out-of-range `valid` probe — so a row index off by one, a crossed column, or
+    a write that missed cannot produce the same answer.
+    """
+    yield ("soa_row_handles", """
+struct SymbolRows layout(soa):
+	name_id: i64
+	flags: i64
+
+def build(owner: Arena) -> i64:
+	alloc: mutable Arena& = (&owner).cast[mutable Arena&]
+	in alloc:
+		symbols: mutable SymbolRows = zeroed
+		symbols.reserve(4)
+		first: RowId[SymbolRows] = symbols.push(12, 3)
+		row: RowId[SymbolRows] = symbols.push(20, 4)
+		if not symbols.valid(row):
+			return 0
+		if symbols.valid(9):
+			return 1
+		symbols[row].flags <- 5
+		return symbols[first].name_id * 10000 + symbols[row].name_id * 100 + symbols[row].flags * 10 + symbols.count
+
+def main() -> i64:
+	region scratch(4096)
+	out: i64 = build(scratch)
+	destroy scratch
+	return out % 251
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5591,7 +5629,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
