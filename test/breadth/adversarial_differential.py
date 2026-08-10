@@ -5938,6 +5938,44 @@ def main() -> i64:
 """)
 
 
+def gen_view_slice_offsets():
+    """Slicing a `view[T]` at a NON-ZERO start, then iterating and indexing it.
+
+    The slice emitter had no case for a view receiver, so it fell through to the CSTR path:
+    the whole `{data, len}` AGGREGATE went to GEP, producing
+    `getelementptr i8, %DynArrayView %load, i64 0` -- malformed IR. It survived at -O0 and
+    became TWO -O2 defects, both fixed by extracting the data field first:
+
+      * `whole[0]..whole[3]` off a darray slice returned 255 at -O2 where -O0 and stage0 both
+        say 230 -- an optimisation-only WRONG ANSWER;
+      * `for x in v` CRASHED the compiler at -O2 inside the pass pipeline.
+
+    The offset is also in ELEMENTS, not bytes, which is why the slice here starts at 4: a
+    byte-addressed walk lands mid-element and cannot produce 64. The view is iterated AND
+    indexed, and cross-checked against the same element read through the unsliced view.
+
+    No view program was in this corpus before, which is how both -O2 defects stayed hidden:
+    the backend corpus has view shapes but never RUNS them, and this one runs everything but
+    had no view.
+    """
+    yield ("view_slice_offsets", """
+def kernel(buf: view[i64]) -> i64:
+	whole: view[i64] = buf[0:8]
+	hi: view[i64] = readonly(whole[4:8])
+	total: mutable i64 = 0
+	for x in hi:
+		total <- total * 10 + x
+	return total * 10 + hi[0] + whole[4]
+
+def main() -> i64:
+	xs: mutable darray[i64] = []
+	for n in 1..=8:
+		xs.push(n)
+	v: view[i64] = xs[0:8]
+	return kernel(v) % 251
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -6005,7 +6043,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
