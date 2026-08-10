@@ -5408,6 +5408,46 @@ def main() -> i64:
 """)
 
 
+def gen_projection_query_explicit_owner():
+    """`entry.name for each entry in entries with alloc` -- an EXPLICIT allocation owner.
+
+    The projection parser had no case for the trailing `with OWNER`, so the iterable stopped
+    at `entries` and the clause was left for the STATEMENT parser, which turned the whole
+    `return` into a recovery `pass`. The function then had no return at all and the semantic
+    layer rejected it with "'names' must return a value" -- a parse gap that surfaced as a
+    type error two layers away.
+
+    Two separate results are produced and read back AFTER both calls, so a result whose
+    storage was freed and reused by the second call cannot give the right answer.
+    """
+    yield ("projection_query_explicit_owner", """
+struct Entry:
+	name: i64
+
+def names(owner: Arena, entries: darray[Entry]) -> darray[i64]:
+	alloc: mutable Arena& = (&owner).cast[mutable Arena&]
+	return entry.name for each entry in entries with alloc
+
+def main() -> i64:
+	region scratch(8192)
+	a: mutable darray[Entry] = []
+	a.push(Entry{name: 1})
+	a.push(Entry{name: 2})
+	b: mutable darray[Entry] = []
+	b.push(Entry{name: 7})
+	b.push(Entry{name: 8})
+	first: darray[i64] = names(scratch, a)
+	second: darray[i64] = names(scratch, b)
+	out: mutable i64 = 0
+	for n in first:
+		out <- out * 10 + n
+	for n in second:
+		out <- out * 10 + n
+	destroy scratch
+	return out
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5475,7 +5515,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
