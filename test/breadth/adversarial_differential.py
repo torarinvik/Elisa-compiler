@@ -5277,6 +5277,51 @@ def main() -> i64:
 """ % (second, ctor))
 
 
+def gen_packed_recursive_eval():
+    """stage0's own `packed_enum_common.elisa` shape: a recursive packed AST, walked.
+
+    `Expr.Add(left: left, right: right)` is a LABELLED MULTI-field arm whose fields are
+    themselves packed handles, under the AoS profile the recursion forces. Two gaps met:
+    the AoS binder loop resolved only Pattern.Binding, so a labelled arm bound NOTHING; and
+    a payload field that is itself a node is an i32 handle in an i64 row word, which
+    emit_conversion declines outright rather than narrowing.
+
+    The tree is built with distinct spans and values (1/3, 2/4, root 3) so the answer 13
+    encodes that every common AND every payload word was read from its own slot -- swapping
+    any two of them changes it.
+    """
+    yield ("packed_recursive_eval", """
+packed enum Expr:
+	common:
+		span: i64
+	Int(value: i64)
+	Add(left: Expr, right: Expr)
+
+def eval(node: Expr, store: Expr.Store[Local]) -> i64:
+	in store:
+		match node:
+			Expr.Int(value: value):
+				return value + node.span
+			Expr.Add(left: left, right: right):
+				return node.span + eval(left, store) + eval(right, store)
+
+def demo() -> i64:
+	region scratch(4096)
+	store: Expr.Store[Local] = Expr.Store(scratch)
+	root: mutable Expr = zeroed
+	in store:
+		left: Expr = new Expr.Int(span: 1, value: 3)
+		right: Expr = new Expr.Int(span: 2, value: 4)
+		root <- new Expr.Add(span: 3, left: left, right: right)
+	out: i64 = eval(root, store)
+	destroy scratch
+	return out
+
+def main() -> i64:
+	return demo()
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5344,7 +5389,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
