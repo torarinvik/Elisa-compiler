@@ -5164,6 +5164,39 @@ def main() -> i64:
 """)
 
 
+def gen_packed_common_field_read():
+    """`node.span` -- reading a packed enum's COMMON field.
+
+    There was no packed common-field read path at all. The common is read INLINE at word
+    `1 + commonIndex` (word 0 is the tag), which is exactly where stage1's own constructor
+    WRITES it. stage0 instead keeps commons in a SIDE TABLE and builds the store with
+    `..._variant_sparse_with_side_words` -- a different layout, but not an observable one,
+    since stores never cross compilers. A first attempt read with stage0's convention against
+    stage1's writer and the compiled program segfaulted on an uninitialised side table.
+
+    The common is read TWICE and weighted (7*10 + 7 = 77) so a zero or garbage read cannot
+    coincide with the right answer.
+    """
+    yield ("packed_common_field_read", """
+packed enum Expr:
+	common:
+		span: i64
+	Lit(value: i64)
+
+def fold_common() -> i64:
+	region scratch(256)
+	store: Expr.Store[Local] = Expr.Store(scratch)
+	in store:
+		node: Expr = new Expr.Lit(span: 7, value: 5)
+		out: i64 = node.span * 10 + node.span
+		destroy scratch
+		return out
+
+def main() -> i64:
+	return fold_common()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -5191,7 +5224,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
