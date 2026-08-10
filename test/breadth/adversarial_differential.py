@@ -5086,6 +5086,47 @@ def main() -> i64:
 """)
 
 
+def gen_packed_match_in_store_clause():
+    """`match node in store:` -- the packed IN-STORE clause on a match header.
+
+    `in` is a binary operator, so the parser hands the header over as
+    `Binary(NODE, In, STORE)` and the scrutinee reads as a boolean membership test. It is
+    unwrapped in the match emitter -- NOT in the parser: a parser-side split stops the
+    resolver walking the store expression, and stage0 reports BOTH an undefined store name
+    and the store-type error, so splitting there loses a diagnostic.
+
+    Both variants are exercised through the clause, with the payload VALUE read back and the
+    two results weighted apart (5*10 + 3 = 53).
+    """
+    yield ("packed_match_in_store_clause", """
+packed enum Expr:
+	Lit(value: i64)
+	End
+
+def fold(node: Expr, frozen: Expr.Store[Local]) -> i64:
+	match node in frozen:
+		Expr.Lit(value):
+			return value * 10
+		Expr.End:
+			return 3
+	return 9
+
+def build() -> i64:
+	region scratch(256)
+	store: Expr.Store[Local] = Expr.Store(scratch)
+	total: mutable i64 = 0
+	in store:
+		a: Expr = new Expr.Lit(value: 5)
+		b: Expr = new Expr.End
+		total <- fold(a, store) + fold(b, store)
+	destroy scratch
+	return total
+
+def main() -> i64:
+	return build()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -5113,7 +5154,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
