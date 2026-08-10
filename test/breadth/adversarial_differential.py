@@ -5846,6 +5846,44 @@ def main() -> i64:
 """)
 
 
+def gen_packed_guarded_store_stays_active():
+    """`if node in STORE is Expr.Wrap(child): child.span` -- the store must stay ACTIVE for
+    the GUARDED BODY.
+
+    The condition activates the store only for its own emission, so a common read in the body
+    (`child.span`) had no store to read from and the whole function declined. The then-branch
+    now runs under a runtime carrying that store.
+
+    The child and the node have DIFFERENT spans (5 and 9) and both are read, so a body that
+    resolved the wrong row — or read the outer node where the child was meant — cannot give
+    59.
+    """
+    yield ("packed_guarded_store_stays_active", """
+packed enum Expr:
+	common:
+		@storage(inline)
+		span: i64
+	Int(value: i64)
+	Wrap(child: Expr)
+
+def fold_child_common_frozen() -> i64:
+	region scratch(256)
+	store: Expr.Store[Local] = Expr.Store(scratch)
+	child: Expr = new[store] Expr.Int(span: 5, value: 7)
+	node: Expr = new[store] Expr.Wrap(span: 9, child: child)
+	frozen: Expr.Store[Frozen] = freeze(move store)
+	if node in frozen is Expr.Wrap(child: child_alias):
+		out: i64 = child_alias.span * 10 + node.span
+		destroy scratch
+		return out
+	destroy scratch
+	return 0
+
+def main() -> i64:
+	return fold_child_common_frozen()
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5913,7 +5951,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
