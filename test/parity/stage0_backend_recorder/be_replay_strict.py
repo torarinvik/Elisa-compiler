@@ -26,6 +26,7 @@ for line in open(ORACLE):
 print(f"strict replay over {len(rows)} stage0-lowered sources", file=sys.stderr)
 res = collections.Counter()
 dropped = []
+failed = []
 work = tempfile.mkdtemp()
 for i, ((opt, src), fname) in enumerate(sorted(rows.items(), key=lambda kv: kv[1])):
     f = os.path.join(work, "case.elisa")
@@ -35,9 +36,9 @@ for i, ((opt, src), fname) in enumerate(sorted(rows.items(), key=lambda kv: kv[1
         p = subprocess.run(["bash", "scripts/elisac_stage1.sh", "-emit", "llvm", "-o", out, f],
                            cwd=REPO, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
-        res["gap"] += 1; continue
+        res["gap"] += 1; failed.append(fname); continue
     if p.returncode != 0:
-        res["gap"] += 1; continue
+        res["gap"] += 1; failed.append(fname); continue
     ir = pathlib.Path(out).read_text() if os.path.exists(out) else ""
     names = re.findall(r'!\d+ = !\{!"([^"]+)"\}', ir)
     if "!elisa.declined" in ir:
@@ -53,5 +54,5 @@ print(f"\n=== STRICT: {len(rows)} sources — covered={res['covered']} "
 for f, n in dropped[:40]:
     print(f"  DROPPED {f}: {n}")
 json.dump({"covered": res["covered"], "dropped": res["dropped"], "gap": res["gap"],
-           "dropped_files": [f for f, _ in dropped]},
+           "dropped_files": [f for f, _ in dropped], "failed_files": failed},
           open(os.path.join(S, "strict_result.json"), "w"), indent=1)
