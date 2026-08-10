@@ -6017,6 +6017,61 @@ def main() -> i64:
 """)
 
 
+def gen_multi_binder_enumerate_query():
+	"""`any|all|count|first|each index, item in xs.enumerate() where PAT: GUARD` — a
+	MULTI-BINDER query. The Comprehension node carries only the first binder, so the
+	element binder and the `.enumerate()` receiver both have to be recovered.
+
+	All five query heads appear, each folded into one exit code with a different weight,
+	and the guard compares the payload AGAINST the index — so an index bound to the wrong
+	value, an unbound index, or a dropped guard changes the answer rather than declining.
+	Elements straddle every boundary: 5 passes, 0 fails the guard, `Missing` fails the
+	pattern, 9 passes.
+	"""
+	yield ("multi_binder_enumerate_query", """
+enum Expr:
+	Int(value: i64)
+	Missing
+
+def any_after(items: darray[Expr]) -> bool:
+	return any index, item in items.enumerate() where item is Expr.Int(value): value > index
+
+def all_after(items: darray[Expr]) -> bool:
+	return all index, item in items.enumerate() where item is Expr.Int(value): value > index
+
+def count_after(items: darray[Expr]) -> usize:
+	return count index, item in items.enumerate() where item is Expr.Int(value): value > index
+
+def first_after(items: darray[Expr]) -> i64?:
+	return value for first index, item in items.enumerate() where item is Expr.Int(value): value > index
+
+def each_after(owner: Arena, items: darray[Expr]) -> i64:
+	alloc: mutable Arena& = (&owner).cast[mutable Arena&]
+	in alloc:
+		picked: darray[i64] = value for each index, item in items.enumerate() where item is Expr.Int(value): value > index
+		total: mutable i64 = 0
+		for p in picked:
+			total <- total * 10 + p
+		return total
+
+def main() -> i64:
+	region r:
+		xs: mutable darray[Expr] = []
+		xs.push((Expr.Int(5)))
+		xs.push((Expr.Int(0)))
+		xs.push((Expr.Missing))
+		xs.push((Expr.Int(9)))
+		acc: mutable i64 = 0
+		acc <- acc * 2 + 1 if any_after(xs)
+		acc <- acc * 2 + 1 if all_after(xs)
+		acc <- acc * 10 + count_after(xs).i64()
+		got: i64? = first_after(xs)
+		acc <- acc * 10 + (get got else 7)
+		acc <- acc * 100 + each_after(r, xs)
+		return acc % 251
+""")
+
+
 def gen_view_slice_offsets():
     """Slicing a `view[T]` at a NON-ZERO start, then iterating and indexing it.
 
@@ -6377,7 +6432,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_with_arena_scoped_allocator, gen_proof_carrying_view_helpers, gen_derived_state_is_test, gen_reduce_sum_over_view, gen_zip_map_over_views, gen_bitset_named_flags, gen_bitfield_member_widths, gen_bitfield_pack_width, gen_packed_new_store_selector, gen_renamed_struct_destructure, gen_guarded_projection_query,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_with_arena_scoped_allocator, gen_proof_carrying_view_helpers, gen_derived_state_is_test, gen_reduce_sum_over_view, gen_zip_map_over_views, gen_bitset_named_flags, gen_bitfield_member_widths, gen_bitfield_pack_width, gen_packed_new_store_selector, gen_renamed_struct_destructure, gen_guarded_projection_query, gen_multi_binder_enumerate_query,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
