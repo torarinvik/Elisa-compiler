@@ -404,20 +404,35 @@ extend Backend:
                 # bodies. Handles `T.Variant(binders):` and `T.A(b)|T.B(b):` (OR, same payload layout)
                 # and `_`; binders may be Binding or Wildcard; guards supported; AST-root only.
                 spm_type: ValueType = resolve_type(stmt_match_scrutinee, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics)
-                if spm_type.kind == TypeKind.PackedEnum and runtime.packed_mode == 2:
+                # The AoS profile (`packed_mode == 2`) reads a ROW POINTER and GEPs the tag out
+                # of it; the DEFAULT variant-sparse profile (mode 0, what a user `packed enum`
+                # gets without a `@profile`) reads the tag through
+                # `ctx_packed_store_read_variant_sparse_tag` and each payload word through
+                # `ctx_packed_store_read_variant_sparse_word`. Both runtime entry points are
+                # already declared, and the match EXPRESSION emitter already uses them -- only
+                # this STATEMENT path was mode-2 only, which is why a default-profile packed
+                # match declined while the same store and `new` compiled.
+                if spm_type.kind == TypeKind.PackedEnum and (runtime.packed_mode == 2 or runtime.packed_mode == 0):
                     spm_root: i64 = packed_root_index_of(structs, spm_type.bits.i64())
                     EmitStatus.Declined return if runtime.active_store_enum != spm_root
                     EmitStatus.Declined return if not packed_is_ast_root(structs, spm_root)
                     if emit_expression(stmt_match_scrutinee, spm_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is spm_index_value:
                         spm_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                         spm_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "spm.state")
-                        spm_index64: LLVMValueRef = LLVMBuildZExt(builder, spm_index_value, LLVMInt64TypeInContext(ctx), "spm.index")
-                        spm_record_args: mutable darray[LLVMValueRef] = [spm_state, spm_index64]
-                        spm_record_pointer: void& = (&spm_record_args[0]).cast[void&] can Unsafe.PointerCast
-                        spm_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_record_pointer, 2, "spm.record")
                         spm_row_type: LLVMTypeRef = packed_row_llvm_type(structs, spm_type.bits.i64(), ctx)
-                        spm_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_row_type, spm_record, 0, "spm.tag.ptr")
-                        spm_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), spm_tag_pointer, "spm.tag")
+                        spm_record: mutable LLVMValueRef = zeroed
+                        spm_tag: mutable LLVMValueRef = zeroed
+                        if runtime.packed_mode == 2:
+                            spm_index64: LLVMValueRef = LLVMBuildZExt(builder, spm_index_value, LLVMInt64TypeInContext(ctx), "spm.index")
+                            spm_record_args: mutable darray[LLVMValueRef] = [spm_state, spm_index64]
+                            spm_record_pointer: void& = (&spm_record_args[0]).cast[void&] can Unsafe.PointerCast
+                            spm_record <- LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_record_pointer, 2, "spm.record")
+                            spm_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_row_type, spm_record, 0, "spm.tag.ptr")
+                            spm_tag <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), spm_tag_pointer, "spm.tag")
+                        else:
+                            spm_tag_args: mutable darray[LLVMValueRef] = [spm_state, spm_index_value]
+                            spm_tag_call_pointer: void& = (&spm_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                            spm_tag <- LLVMBuildCall2(builder, runtime.packed_read_tag_type, runtime.packed_read_tag, spm_tag_call_pointer, 2, "packed.tag.store")
                         spm_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.done")
                         spm_declined: mutable bool = false
                         spm_saw_default: mutable bool = false
@@ -565,8 +580,23 @@ extend Backend:
                                     if spm_payload.kind == TypeKind.Unmodeled:
                                         spm_declined <- true
                                     else:
-                                        spm_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_row_type, spm_record, 1, "spm.payload.ptr")
-                                        spm_payload_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(spm_payload, structs, ctx), spm_payload_pointer, "spm.payload")
+                                        spm_payload_value: mutable LLVMValueRef = zeroed
+                                        if runtime.packed_mode == 2:
+                                            spm_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_row_type, spm_record, 1, "spm.payload.ptr")
+                                            spm_payload_value <- LLVMBuildLoad2(builder, llvm_type_of(spm_payload, structs, ctx), spm_payload_pointer, "spm.payload")
+                                        else:
+                                            # Word 0 is the tag and words 1..commons are the
+                                            # common fields, so the first payload word is
+                                            # `1 + commons` -- the same index the expression
+                                            # emitter uses.
+                                            spm_commons: u32 = structs.packed_common_counts[spm_type.bits.usize()]
+                                            spm_word_args: mutable darray[LLVMValueRef] = [spm_index_value, spm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + spm_commons).u64(), 0)]
+                                            spm_word_pointer: void& = (&spm_word_args[0]).cast[void&] can Unsafe.PointerCast
+                                            spm_payload_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_word_pointer, 3, "packed.word")
+                                            if emit_conversion(spm_payload_word, ValueType{kind: TypeKind.Signed, bits: 64}, spm_payload, structs, ctx, builder) is spm_payload_converted:
+                                                spm_payload_value <- spm_payload_converted
+                                            else:
+                                                spm_declined <- true
                                         spm_field_start: usize = structs.packed_field_type_start[spm_slot.usize()]
                                         if spm_fields.count == 1:
                                             if spm_fields[0] is Pattern.Binding(spm_single_name):

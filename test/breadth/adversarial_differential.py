@@ -5052,6 +5052,40 @@ def main() -> i64:
 """)
 
 
+def gen_packed_match_default_profile():
+    """A DEFAULT-profile `packed enum` store, `new`, and a `match` over the stored node.
+
+    A user packed enum gets the variant-sparse profile (mode 0); the match STATEMENT emitter
+    implemented only the AoS profile (mode 2), so the store and `new` compiled while the
+    match declined. Mode 0 reads the tag through
+    `ctx_packed_store_read_variant_sparse_tag` and each payload word through
+    `ctx_packed_store_read_variant_sparse_word` -- both already declared, and already used by
+    the match EXPRESSION emitter.
+
+    The payload VALUE is read back (5, not just a tag test), which is what catches a store
+    created with the wrong row stride: an earlier version of this change had the user enum
+    reporting the AST root's 132-byte row and every payload read back as 0.
+    """
+    yield ("packed_match_default_profile", """
+packed enum Expr:
+	Lit(value: i64)
+
+def fold() -> i64:
+	region scratch(256)
+	store: Expr.Store[Local] = Expr.Store(scratch)
+	in store:
+		node: Expr = new Expr.Lit(value: 5)
+		match node:
+			Expr.Lit(value):
+				out: i64 = value
+				destroy scratch
+				return out
+
+def main() -> i64:
+	return fold()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -5079,7 +5113,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
