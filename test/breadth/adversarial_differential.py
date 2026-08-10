@@ -5230,6 +5230,53 @@ def main() -> i64:
 """)
 
 
+def gen_packed_labelled_single_payload_match():
+    """`Expr.Int(value: value)` -- a LABELLED single payload field, plus the AoS payload offset.
+
+    Two defects met here, and each hid behind the other:
+
+    * A single payload field written LABELLED arrives as Pattern.Field, which only the
+      MULTI-field loop resolved. The binder was never declared, so the arm body declined on
+      an unknown name -- and since `main` was the declining function, the driver exited 2
+      with no `!elisa.declined` record at all.
+    * Under the AoS profile (which a RECURSIVE payload forces) the payload was GEPed at row
+      field 1. The row is `{i32 tag, <commons x i64>, [N x i64] payload}`, so with a common
+      declared, field 1 IS the common: `value` read back the SPAN. That is a silent wrong
+      answer -- 77 where stage0 says 37 -- and it only became visible once the labelled bind
+      above stopped declining.
+
+    Both variants are covered: `Add` forces AoS, `Neg` keeps the default variant-sparse
+    profile. The payload is weighted against the common (`value * 10 + span`) so reading
+    either slot in place of the other cannot produce the right answer.
+    """
+    for tag, second, ctor in (("aos", "Add(left: Expr, right: Expr)", "Expr.Add(left: left, right: right)"),
+                              ("sparse", "Neg(inner: i64)", "Expr.Neg(inner: inner)")):
+        yield (f"packed_labelled_single_payload_match_{tag}", """
+packed enum Expr:
+	common:
+		span: i64
+	Int(value: i64)
+	%s
+
+def demo() -> i64:
+	region scratch(4096)
+	store: Expr.Store[Local] = Expr.Store(scratch)
+	out: mutable i64 = 0
+	in store:
+		leaf: Expr = new Expr.Int(span: 7, value: 3)
+		match leaf:
+			Expr.Int(value: value):
+				out <- value * 10 + leaf.span
+			%s:
+				out <- 99
+	destroy scratch
+	return out
+
+def main() -> i64:
+	return demo()
+""" % (second, ctor))
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5297,7 +5344,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
