@@ -5909,6 +5909,35 @@ def main() -> i64:
 """)
 
 
+def gen_destructured_struct_loop_head():
+    """`for {index, item} in entries:` -- DESTRUCTURED struct elements in a loop head.
+
+    The brace head parses as a plain multi-binder loop, so N binders over a container of
+    STRUCTS means one local per named FIELD -- bound BY NAME, not by position. Works over
+    both a darray and a fixed array (the latter through the same synthetic header the plain
+    walk uses).
+
+    The two fields carry DIFFERENT weights in the fold (`item * 2 + index`) and the elements
+    are all distinct, so binders wired to the wrong field, or bound by position instead of
+    name, change the answer.
+    """
+    yield ("destructured_struct_loop_head", """
+struct Entry:
+	index: i64
+	item: i64
+
+def sum(entries: array[Entry, 3]) -> i64:
+	total: mutable i64 = 0
+	for {index, item} in entries:
+		total <- total * 10 + item * 2 + index
+	return total
+
+def main() -> i64:
+	xs: array[Entry, 3] = [Entry{index: 1, item: 2}, Entry{index: 3, item: 4}, Entry{index: 5, item: 6}]
+	return sum(xs) % 251
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5976,7 +6005,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
