@@ -5127,6 +5127,43 @@ def main() -> i64:
 """)
 
 
+def gen_packed_multi_field_payload():
+    """`Pair.Both(left: left, right: right)` -- a packed variant with a MULTI-FIELD payload,
+    destructured with LABELLED binders.
+
+    Two blockers, one behind the other. The arm gatherer accepted only bare `Binding` or
+    `Wildcard` sub-patterns, so a labelled binder (a `Field` wrapping a `Binding`) declined
+    before any payload code ran. And under the variant-sparse profile each payload field is
+    its OWN word at `1 + commons + i`, not one aggregate load -- the single-word read tried
+    to convert one i64 into the whole payload STRUCT.
+
+    Labels resolve to their DECLARED index, so the word read matches the binder; the result
+    is asymmetric (left*10 + right = 23), which a swapped pair would report as 32.
+    """
+    yield ("packed_multi_field_payload", """
+packed enum Pair:
+	Both(left: i64, right: i64)
+	End
+
+def sum_pair() -> i64:
+	region scratch(256)
+	store: Pair.Store[Local] = Pair.Store(scratch)
+	in store:
+		node: Pair = new Pair.Both(left: 2, right: 3)
+		match node:
+			Pair.Both(left: left, right: right):
+				out: i64 = left * 10 + right
+				destroy scratch
+				return out
+			Pair.End:
+				destroy scratch
+				return 0
+
+def main() -> i64:
+	return sum_pair()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -5154,7 +5191,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
