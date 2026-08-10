@@ -5637,6 +5637,51 @@ def main() -> i64:
 """)
 
 
+def gen_soa_row_view_binding():
+    """`view = s[row]` -- a ROW VIEW bound to a name, then read AND written through.
+
+    Two things this pins, both found the hard way:
+
+    * An unannotated `=` to a name that is not yet a local arrives as a `Stmt.Assign`, NOT a
+      `Stmt.VarDecl` — the declaration emitter never sees this shape, so the binder is
+      recorded from the assignment path.
+    * A `RowId[S]` is an i32, and every row emitter wants an i64 offset. Storing the i32
+      straight into the index slot is a mismatch LLVM does not diagnose, and it SEGFAULTED
+      unoptimised while -O2 folded the bad value away and produced stage0's answer. The index
+      is widened explicitly now.
+
+    The fixture indexes with a real RowId (not a literal), mutates through the view, and reads
+    back through BOTH the view and a fresh row walk, so an index that lost its high bits or a
+    write that landed in the wrong column changes the answer. `s1O2` alone would not have
+    caught the crash — the unoptimised build is the one that failed.
+    """
+    yield ("soa_row_view_binding", """
+struct SymbolRows layout(soa):
+	name_id: i64
+	flags: i64
+
+def build(owner: Arena) -> i64:
+	alloc: mutable Arena& = (&owner).cast[mutable Arena&]
+	in alloc:
+		symbols: mutable SymbolRows = zeroed
+		symbols.push(11, 2)
+		row: RowId[SymbolRows] = symbols.push(12, 3)
+		view = symbols[row]
+		view.flags <- 5
+		symbols[row].name_id <- 20
+		total: mutable i64 = view.name_id * 100 + view.flags * 10 + symbols.count
+		for iter_row in symbols.rows:
+			total <- total * 100 + iter_row.name_id
+		return total
+
+def main() -> i64:
+	region scratch(4096)
+	out: i64 = build(scratch)
+	destroy scratch
+	return out % 251
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5704,7 +5749,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
