@@ -204,6 +204,66 @@ extend Backend:
                         for_filter_test <- (Expr.Binary((Expr.Ident(for_variables[0], for_filter_line)), TokenKind.Is, for_filter_condition, for_filter_line))
                     for_filtered_body: mutable darray[Stmt] = [(Stmt.If(for_filter_test, for_body, [], for_filter_line))]
                     return emit_statement((Stmt.For(for_bind, for_variables, for_filter_base, for_filtered_body, for_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                # `for row in s.rows():` — ROW ITERATION over a `layout(soa)` aggregate. The
+                # binder is a row VIEW; rather than materialise stage0's `{ptr, i64}` pair, the
+                # aggregate's address and the loop index are recorded as a binder and
+                # `row.field` resolves straight to the element address (the same GEP the
+                # explicit `s[i].field` form produces).
+                #
+                # `rows` is accepted both called (`s.rows()`) and bare (`s.rows`) — stage0's own
+                # corpus writes it both ways.
+                if for_variables.count == 1:
+                    soa_iter_source: mutable Expr = Expr.Absent
+                    if for_iterable is Expr.Call(soa_it_callee, soa_it_args, soa_it_names, soa_it_line):
+                        if soa_it_callee is Expr.Field(soa_it_object, soa_it_method, soa_it_method_line):
+                            soa_iter_source <- soa_it_object if soa_it_method == "rows" and soa_it_args.count == 0
+                    if for_iterable is Expr.Field(soa_bare_object, soa_bare_method, soa_bare_line):
+                        soa_iter_source <- soa_bare_object if soa_bare_method == "rows"
+                    if not (soa_iter_source is Expr.Absent):
+                        soa_iter_type: ValueType = expression_type(soa_iter_source, local_scope, fns, structs, generics)
+                        if soa_iter_type.kind == TypeKind.Struct and struct_declares_soa_layout(structs, structs.names[soa_iter_type.bits.usize()]) and structs.field_count[soa_iter_type.bits.usize()] > 0.usize():
+                            if struct_chain_address(soa_iter_source, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_iter_base:
+                                soa_iter_llvm: LLVMTypeRef = llvm_type_of(soa_iter_type, structs, ctx)
+                                soa_iter_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                soa_iter_index: LLVMValueRef = LLVMBuildAlloca(builder, soa_iter_i64, "soa.iter.i")
+                                _ = LLVMBuildStore(builder, LLVMConstInt(soa_iter_i64, 0, 0), soa_iter_index)
+                                soa_iter_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                soa_iter_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.cond")
+                                soa_iter_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.body")
+                                soa_iter_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.step")
+                                soa_iter_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.done")
+                                _ = LLVMBuildBr(builder, soa_iter_cond)
+                                LLVMPositionBuilderAtEnd(builder, soa_iter_cond)
+                                soa_iter_col0: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_iter_llvm, soa_iter_base, 0, "soa.iter.col0")
+                                soa_iter_count: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_iter_col0, 1, "soa.iter.count.ptr"), "soa.iter.count")
+                                soa_iter_at: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.iter.at")
+                                # 40 = SLT.
+                                _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 40, soa_iter_at, soa_iter_count, "soa.iter.more"), soa_iter_body, soa_iter_done)
+                                LLVMPositionBuilderAtEnd(builder, soa_iter_body)
+                                structs.soa_row_binder_names <- structs.soa_row_binder_names.push(for_variables[0])
+                                structs.soa_row_binder_slots <- structs.soa_row_binder_slots.push(soa_iter_type.bits)
+                                structs.soa_row_binder_bases <- structs.soa_row_binder_bases.push(soa_iter_base)
+                                structs.soa_row_binder_indexes <- structs.soa_row_binder_indexes.push(soa_iter_index)
+                                loops.exits <- loops.exits.push(soa_iter_done)
+                                loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                                loops.continues <- loops.continues.push(soa_iter_step)
+                                soa_iter_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                _ = loops.exits.pop()
+                                _ = loops.defer_marks.pop()
+                                _ = loops.continues.pop()
+                                structs.soa_row_binder_names <- structs.soa_row_binder_names.truncate(structs.soa_row_binder_names.count - 1)
+                                structs.soa_row_binder_slots <- structs.soa_row_binder_slots.truncate(structs.soa_row_binder_slots.count - 1)
+                                structs.soa_row_binder_bases <- structs.soa_row_binder_bases.truncate(structs.soa_row_binder_bases.count - 1)
+                                structs.soa_row_binder_indexes <- structs.soa_row_binder_indexes.truncate(structs.soa_row_binder_indexes.count - 1)
+                                EmitStatus.Declined return if soa_iter_status == EmitStatus.Declined
+                                branch_if_open(soa_iter_status, builder, soa_iter_step)
+                                LLVMPositionBuilderAtEnd(builder, soa_iter_step)
+                                soa_iter_next: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.iter.at.next")
+                                _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, soa_iter_next, LLVMConstInt(soa_iter_i64, 1, 0), "soa.iter.inc"), soa_iter_index)
+                                _ = LLVMBuildBr(builder, soa_iter_cond)
+                                LLVMPositionBuilderAtEnd(builder, soa_iter_done)
+                                return EmitStatus.Open
+                            return EmitStatus.Declined
                 # `for k, v in d` — DICT ITERATION over the std DynDict (a LIBRARY type; its
                 # layout is `items: DictBucket&? , count, used, capacity, arena`, with
                 # DictBucket = `key, value, state:u8` (state 1 == occupied)). Walk the raw
