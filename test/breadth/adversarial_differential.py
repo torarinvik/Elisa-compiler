@@ -6104,6 +6104,33 @@ def main() -> i64:
 """)
 
 
+def gen_zip_map_over_views():
+    """`zip_map(dst, a, b, f)` -- elementwise `dst[i] = f(a[i], b[i])`.
+
+    The bound is the DESTINATION's length, which is what stage0 uses (`zip_map.total` comes
+    off the dst view). Same counted-loop shape as reduce_sum, storing instead of accumulating.
+
+    `f` is ASYMMETRIC (`left * 10 + right`), so swapping the two source views changes the
+    answer, and the check reads an element JUST PAST the destination slice as well — a write
+    that ran one element long would corrupt it.
+    """
+    yield ("zip_map_over_views", """
+def add(left: i64, right: i64) -> i64:
+	return left * 10 + right
+
+def kernel(buf: view[i64]) -> void:
+	whole: view[i64] = buf[0:6]
+	ro: view[i64] = readonly(whole)
+	zip_map(whole[0:2], ro[2:4], ro[4:6], add)
+
+def main() -> i64:
+	xs: mutable darray[i64, 6] = [0, 0, 3, 4, 5, 6]
+	v: view[i64] = xs[0:6]
+	kernel(v)
+	return xs[0] * 2 + xs[1] + xs[2]
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -6171,7 +6198,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_with_arena_scoped_allocator, gen_proof_carrying_view_helpers, gen_derived_state_is_test, gen_reduce_sum_over_view, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_with_arena_scoped_allocator, gen_proof_carrying_view_helpers, gen_derived_state_is_test, gen_reduce_sum_over_view, gen_zip_map_over_views, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
