@@ -5448,6 +5448,49 @@ def main() -> i64:
 """)
 
 
+def gen_soa_layout_columns():
+    """`struct Rows layout(soa)` -- the COLUMN representation.
+
+    stage0 lowers a column-major struct to a plain struct whose every field is a darray of
+    the declared type (`%SymbolRows = type { %DynArray__usize, %DynArray__u32 }`), so the
+    whole column API is the ordinary darray machinery once the fields register that way.
+
+    THREE layers, and all three are load-bearing: the backend wraps each member type in both
+    registration paths (the Decl-shaped one AND the metadata-driven flat one the self-hosted
+    backend actually takes -- patching only the first left the ValueTypes saying darray while
+    the LLVM body stayed {i64, i64}), and the semantic field table types a column as a mutable
+    darray or every `.push` trips the immutable-receiver wall.
+
+    Two columns are grown to DIFFERENT lengths and both are read back, so a layout that
+    aliased them or mixed up a count cannot give the right answer.
+    """
+    yield ("soa_layout_columns", """
+struct Rows layout(soa):
+	key: i64
+	depth: i64
+
+def build(owner: Arena) -> i64:
+	alloc: mutable Arena& = (&owner).cast[mutable Arena&]
+	in alloc:
+		pending: mutable Rows = zeroed
+		pending.key.reserve(4)
+		pending.key.push(1)
+		pending.key.push(2)
+		pending.depth.push(7)
+		total: mutable i64 = 0
+		for k in pending.key:
+			total <- total * 10 + k
+		total <- total * 10 + pending.depth[0]
+		return total * 10 + pending.key.count + pending.depth.count
+
+def main() -> i64:
+	region scratch(4096)
+	out: i64 = build(scratch)
+	destroy scratch
+	return out
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5515,7 +5558,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
