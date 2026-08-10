@@ -5197,6 +5197,39 @@ def main() -> i64:
 """)
 
 
+def gen_packed_common_field_read_aos():
+    """`leaf.span` on an AoS-profile packed enum -- one a RECURSIVE payload forces.
+
+    A recursive payload (`Add(left: Expr, right: Expr)`) switches the enum to packed mode 2,
+    where there IS no word reader: `packed_read_word` is bound to `ctx_aos_store_record`,
+    which takes (state, handle) and returns the ROW POINTER. The variant-sparse read called
+    it with the word reader's three arguments and used the result as the value, producing a
+    `ptr` where an i64 was wanted. A BARE `return leaf.span` then declined on the return
+    path's type-identity check, while `leaf.span + 0` silently accepted the POINTER as an
+    arithmetic operand -- a wrong answer with no diagnostic. The common is read out of the
+    row instead, at field `1 + commonIndex`.
+
+    The span is returned on its own, so a pointer-shaped read cannot pass as the value.
+    """
+    yield ("packed_common_field_read_aos", """
+packed enum Expr:
+	common:
+		span: i64
+	Int(value: i64)
+	Add(left: Expr, right: Expr)
+
+def main() -> i64:
+	region scratch(4096)
+	store: Expr.Store[Local] = Expr.Store(scratch)
+	out: mutable i64 = 0
+	in store:
+		leaf: Expr = new Expr.Int(span: 7, value: 3)
+		out <- leaf.span
+	destroy scratch
+	return out
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5264,7 +5297,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
