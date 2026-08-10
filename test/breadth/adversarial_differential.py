@@ -5351,6 +5351,36 @@ def main() -> i64:
 """)
 
 
+def gen_darray_literal_spread():
+    """`[first, ...rest, 9]` -- a SPREAD element inside a darray literal.
+
+    The `...` arrives as a unary Ellipsis; the literal's element loop pushed it as if it
+    were a single value, so the whole literal declined. Lowered as a copy loop that reuses
+    emit_darray_push per item, so growth and element conversion are the ordinary path.
+
+    The result is folded positionally (`total * 10 + x`), so a spread that dropped an item,
+    duplicated one, or emitted them out of order changes the answer.
+    """
+    yield ("darray_literal_spread", """
+def build(owner: Arena, first: i64, rest: darray[i64]) -> i64:
+	alloc: mutable Arena& = (&owner).cast[mutable Arena&]
+	xs: darray[i64] @alloc = [first, ...rest, 9]
+	total: mutable i64 = 0
+	for x in xs:
+		total <- total * 10 + x
+	return total
+
+def main() -> i64:
+	region scratch(4096)
+	src: mutable darray[i64] = []
+	src.push(2)
+	src.push(3)
+	out: i64 = build(scratch, 1, src)
+	destroy scratch
+	return out
+""")
+
+
 def gen_packed_new_store_selector():
     """`new[store] E.V(...)` -- an EXPLICIT allocation target, outside any `in store:` block,
     with the store later handed on by `freeze(move store)`.
@@ -5418,7 +5448,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_packed_new_store_selector,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_packed_new_store_selector,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
