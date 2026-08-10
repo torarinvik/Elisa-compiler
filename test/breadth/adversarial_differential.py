@@ -5019,6 +5019,39 @@ def main() -> i64:
 """)
 
 
+def gen_user_packed_enum_store():
+    """A USER `packed enum` with its own store -- `new[store] Node.Empty(zeroed)`.
+
+    The AoS store subsystem was gated on `packed_is_ast_root`, historically
+    `name == "Node" and variant_count == 0`: the compiler's own AST-root PLACEHOLDER row.
+    That was believed to be what blocked every user packed enum. Measured, it blocks exactly
+    ONE of the 21 packed corpus files -- this shape -- and the other 20 decline for their own
+    reasons.
+
+    This pins the shape that does work, so the relaxation cannot silently regress.
+    """
+    yield ("user_packed_enum_store", """
+struct Payload:
+	data: mutable u8&?
+	len: mutable i32
+
+packed enum Node:
+	Empty(Payload)
+	Byte(u8)
+
+def build() -> i64:
+	region scratch(256)
+	store: Node.Store[Local] = Node.Store(scratch)
+	n: Node = new[store] Node.Empty(zeroed)
+	_ = n
+	destroy scratch
+	return 7
+
+def main() -> i64:
+	return build()
+""")
+
+
 GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_void_return_call, gen_copy_array_builtin,
                gen_discarded_darray_growth_methods, gen_brace_membership_ranges,
@@ -5046,7 +5079,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,
