@@ -7170,10 +7170,6 @@ def main():
     # fixing the generator program rather than by tolerating the skip.
     return 1 if results["MISMATCH"] or results["O2_MISMATCH"] or results["O2_DECLINE"] or results["DECLINE"] or results["PERMISSIVE"] else 0
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 def gen_packed_forward_declared_payload_enum():
     """A packed enum whose payload field names a packed enum declared LATER in the file.
 
@@ -7222,3 +7218,59 @@ packed enum Expr:
 
 
 GENERATORS += [gen_packed_forward_declared_payload_enum]
+
+
+def gen_packed_index_profile_commons():
+    """`@packed_profile(retained_reads)` on an enum that declares COMMON fields.
+
+    This declined for two generations of wrong diagnosis. The visible symptom was a
+    SEGFAULT (139 where stage0 answers 28), and it was attributed to stage0 keeping commons
+    in a side table while stage1 stores them inline -- so the gate stayed, waiting on the
+    side-word runtime entry points.
+
+    That layout difference is real but NOT observable: a store never crosses compilers, and
+    stage1's writer, row LLVM type and row STRIDE already agree on the inline arrangement.
+    The actual bug was ARITY -- the common-field read emitted the variant-sparse reader's
+    three-argument call against this profile's four-parameter
+    `ctx_packed_store_read_index_word(arena, index, state, word)`.
+
+    Both a WIDE multi-field variant and a single-field one are read back, and the commons are
+    summed alongside the payload, so a common read at the wrong word cannot pass.
+    """
+    yield ("packed_index_profile_commons", """
+@packed_profile(retained_reads)
+packed enum Expr:
+	common:
+		span: int
+		cost: int
+	Leaf(value: int)
+	Wide(first: int, second: int, third: int)
+	End
+
+def fold(node: Expr, frozen: Expr.Store[Frozen]) -> int:
+	match node in frozen:
+		Expr.Wide(first: first, second: second, third: third):
+			return node.span + node.cost + first + second + third
+		Expr.Leaf(value: value):
+			return node.span + node.cost + value
+		Expr.End:
+			return 0
+
+def main() -> int:
+	region scratch(256)
+	store: Expr.Store[Local] = Expr.Store(scratch)
+	wide: Expr = new[store] Expr.Wide(span: 7, cost: 11, first: 2, second: 3, third: 5)
+	leaf: Expr = new[store] Expr.Leaf(span: 1, cost: 2, value: 40)
+	frozen: Expr.Store[Frozen] = freeze(move store)
+	out: int = fold(wide, frozen) + fold(leaf, frozen)
+	destroy scratch
+	return out
+""")
+
+
+GENERATORS += [gen_packed_index_profile_commons]
+
+
+
+if __name__ == "__main__":
+    sys.exit(main())
