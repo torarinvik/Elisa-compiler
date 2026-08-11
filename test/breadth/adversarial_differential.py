@@ -7272,5 +7272,44 @@ GENERATORS += [gen_packed_index_profile_commons]
 
 
 
+
+def gen_named_args_through_fn_field_alias():
+    """`box.run(y: 7, x: 30)` where `run: fn(i64, i64) -> i64` was set from a named function.
+
+    A `fn(i64, i64)` type carries no parameter NAMES, so the labels cannot be resolved from the
+    field's type alone. stage0 recovers them by resolving the alias back to its target: it
+    answers 23 for `sub` called as `(y: 7, x: 30)` — i.e. 30 - 7, reordered, not 7 - 30.
+
+    stage1 handled this for a fn-typed LOCAL and declined for a fn-typed FIELD. Declining was
+    the honest default: passing the labelled arguments positionally instead is a SILENT WRONG
+    ANSWER, not a crash, which is exactly what this fixture is shaped to catch — `sub` is
+    non-commutative, and the two orders give 23 and -23.
+
+    The positional call is generated alongside so a reorder that fires when it must not is
+    caught too.
+    """
+    yield ("named_args_through_fn_field_alias", """
+struct CallbackBox:
+	run: fn(i64, i64) -> i64
+
+def sub(x: i64, y: i64) -> i64:
+	return x - y
+
+def labelled() -> i64:
+	box: CallbackBox = CallbackBox{run: sub}
+	return box.run(y: 7, x: 30)
+
+def positional() -> i64:
+	box: CallbackBox = CallbackBox{run: sub}
+	return box.run(30, 7)
+
+def main() -> i64:
+	return labelled() * 100 + positional()
+""")
+
+
+GENERATORS += [gen_named_args_through_fn_field_alias]
+
+
 if __name__ == "__main__":
     sys.exit(main())
