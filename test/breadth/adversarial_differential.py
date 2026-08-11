@@ -7172,3 +7172,53 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def gen_packed_forward_declared_payload_enum():
+    """A packed enum whose payload field names a packed enum declared LATER in the file.
+
+    Registration walks declarations in SOURCE order, so `Expr` was still unregistered when
+    `Clause.Terminal(body: Expr)` was registered: the field resolved to Unmodeled, which
+    DECLINED the whole `Clause` enum -- and with it every match and every construction over
+    it. stage0 has no such order dependence; swapping the two declarations compiled the
+    byte-identical program, which is what made the asymmetry visible.
+
+    Both orders are generated, and each reads a payload back THROUGH the handle (9 + 1), so a
+    Clause whose row is laid out wrongly cannot pass by accident.
+    """
+    body = """
+def score_clause(node: Clause, clauses: Clause.Store[Frozen], exprs: Expr.Store[Frozen]) -> i64:
+	match node in clauses:
+		Clause.Terminal(body: body):
+			return score_expr(body, exprs) + 1
+
+def score_expr(node: Expr, exprs: Expr.Store[Frozen]) -> i64:
+	match node in exprs:
+		Expr.Literal(value: value):
+			return value
+
+def main() -> i64:
+	region scratch(512)
+	exprs: Expr.Store[Local] = Expr.Store(scratch)
+	clauses: Clause.Store[Local] = Clause.Store(scratch)
+	lit: Expr = new[exprs] Expr.Literal(value: 9)
+	clause: Clause = new[clauses] Clause.Terminal(body: lit)
+	frozen_exprs: Expr.Store[Frozen] = freeze(move exprs)
+	frozen_clauses: Clause.Store[Frozen] = freeze(move clauses)
+	out: i64 = score_clause(clause, frozen_clauses, frozen_exprs)
+	destroy scratch
+	return out
+"""
+    clause_decl = """@packed_profile(retained_reads)
+packed enum Clause:
+	Terminal(body: Expr)
+"""
+    expr_decl = """@packed_profile(retained_reads)
+packed enum Expr:
+	Literal(value: i64)
+"""
+    yield ("packed_forward_declared_payload_enum", clause_decl + "\n" + expr_decl + body)
+    yield ("packed_backward_declared_payload_enum", expr_decl + "\n" + clause_decl + body)
+
+
+GENERATORS += [gen_packed_forward_declared_payload_enum]
