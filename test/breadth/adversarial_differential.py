@@ -6667,6 +6667,27 @@ def main() -> i64:
 """)
 
 
+def gen_const_dict_table():
+	"""`const NUMBERS: dict[cstr, u8] = {…}` — a COMPILE-TIME dict, laid out statically.
+
+	stage0 builds the whole table at compile time and this reproduces its algorithm
+	exactly (read from its source, not guessed from its IR): capacity 8 doubling while
+	`count*4 > capacity*3`, FNV-1a 64 over the key bytes, `slot = hash & (capacity-1)`
+	with linear probing, buckets of `{key, value, i8 state}` and a header whose fields 1
+	AND 2 are both the entry count.
+
+	The seven-entry dict is the one that matters: it forces the capacity to GROW to 16, so
+	a wrong load-factor rule changes every slot. Both counts are folded into the exit code.
+	"""
+	yield ("const_dict_table", """
+const NUMBERS: dict[cstr, u8] = {"one": 1, "two": 2, "three": 3}
+const WIDE: dict[cstr, u8] = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7}
+
+def main() -> i64:
+	return (NUMBERS.count * 100 + WIDE.count).i64()
+""")
+
+
 def gen_view_slice_offsets():
     """Slicing a `view[T]` at a NON-ZERO start, then iterating and indexing it.
 
@@ -7027,7 +7048,7 @@ GENERATORS += [gen_shorthand_member_is, gen_builtin_view_type_name,
                gen_query_guarded_pattern_filter, gen_each_guarded_pattern_filter,
                gen_projection_query_bare_pattern, gen_optional_match_null_arm,
                gen_nested_variant_match_arm, gen_labelled_payload_match_arm,
-               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_with_arena_scoped_allocator, gen_proof_carrying_view_helpers, gen_derived_state_is_test, gen_reduce_sum_over_view, gen_zip_map_over_views, gen_bitset_named_flags, gen_bitfield_member_widths, gen_bitfield_pack_width, gen_packed_new_store_selector, gen_renamed_struct_destructure, gen_guarded_projection_query, gen_multi_binder_enumerate_query, gen_expect_statement, gen_expect_struct_shape, gen_expect_list_rest_shape, gen_struct_payload_beside_scalar, gen_array_payload_field, gen_expect_variant_payload_shape, gen_packed_nested_payload_decode, gen_static_protocol_dispatch, gen_index_profile_statement_match, gen_return_type_generic_inference, gen_shorthand_member_argument, gen_flags_bit_test_index, gen_index_returned_darray, gen_view_over_borrowed_darray, gen_slice_of_temporary, gen_view_field_element_read, gen_try_as_binary_operand,
+               gen_membership_range_enum_bounds, gen_wide_payload_enum, gen_struct_pattern_match_arm, gen_user_packed_enum_store, gen_packed_match_default_profile, gen_packed_match_in_store_clause, gen_packed_multi_field_payload, gen_packed_common_field_read, gen_packed_common_field_read_aos, gen_packed_labelled_single_payload_match, gen_packed_recursive_eval, gen_typestate_struct_qualifier, gen_darray_literal_spread, gen_enum_variant_alias_after_is, gen_projection_query_explicit_owner, gen_soa_layout_columns, gen_soa_row_api, gen_soa_row_handles, gen_soa_row_iteration, gen_soa_row_iteration_wrappers, gen_soa_row_view_binding, gen_soa_row_destructured_loop, gen_soa_row_let_destructure, gen_packed_in_store_is_test, gen_packed_is_payload_handle, gen_packed_guarded_store_stays_active, gen_enumerate_over_fixed_array, gen_destructured_struct_loop_head, gen_view_slice_offsets, gen_with_arena_scoped_allocator, gen_proof_carrying_view_helpers, gen_derived_state_is_test, gen_reduce_sum_over_view, gen_zip_map_over_views, gen_bitset_named_flags, gen_bitfield_member_widths, gen_bitfield_pack_width, gen_packed_new_store_selector, gen_renamed_struct_destructure, gen_guarded_projection_query, gen_multi_binder_enumerate_query, gen_expect_statement, gen_expect_struct_shape, gen_expect_list_rest_shape, gen_struct_payload_beside_scalar, gen_array_payload_field, gen_expect_variant_payload_shape, gen_packed_nested_payload_decode, gen_static_protocol_dispatch, gen_index_profile_statement_match, gen_return_type_generic_inference, gen_shorthand_member_argument, gen_flags_bit_test_index, gen_index_returned_darray, gen_view_over_borrowed_darray, gen_slice_of_temporary, gen_view_field_element_read, gen_try_as_binary_operand, gen_const_dict_table,
                gen_unannotated_comprehension_decl]
 GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_type_mismatches, gen_queries, gen_as_bindings,

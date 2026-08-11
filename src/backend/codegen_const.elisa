@@ -3,6 +3,144 @@
 
 extend Backend:
     private:
+        # FNV-1a 64 over a decoded key's bytes. stage0's `staticDictHashCStr`, constant for
+        # constant (`compiler/src/backend/llvm_const_dict.go`): the placement of every entry in
+        # a const dict depends on reproducing it EXACTLY, and a divergence here is a silently
+        # wrong table rather than a decline.
+        def const_dict_hash_cstr(bytes: darray[u8]&) -> u64 can[Abort.Panic]:
+            hash: mutable u64 = 14695981039346656037.u64()
+            for byte in bytes |hash|:
+                hash <- hash ^ byte.u64()
+                hash <- hash * 1099511628211.u64()
+            return hash
+
+
+        # stage0's `staticDictCapacity`: start at 8, double while the load factor would exceed
+        # three quarters.
+        def const_dict_capacity(count: usize) -> usize can[Abort.Panic]:
+            0.usize() return if count == 0.usize()
+            capacity: mutable usize = 8.usize()
+            while count * 4.usize() > capacity * 3.usize() |capacity|:
+                capacity <- capacity * 2.usize()
+            return capacity
+
+
+        # `const NUMBERS: dict[cstr, u8] = {"one": 1, …}` — a COMPILE-TIME dict. stage0 lays the
+        # whole table out statically (`llvm_const_dict.go`) and this reproduces it exactly:
+        # capacity from const_dict_capacity, `slot = hash & (capacity - 1)` with LINEAR probing,
+        # buckets of `{key, value, i8 state}` where state 1 = occupied and an empty bucket
+        # carries a null key and a zero value, and a header of
+        # `{buckets, count, count, capacity, null}` — fields 1 AND 2 are both the entry count.
+        #
+        # Only cstr keys: the integer-key hash is a different function (splitmix64's finalizer)
+        # and is left to decline rather than share this path approximately.
+        def const_dict_global_value(entries: darray[Ast::DictEntry]&, dict_type: ValueType, top: darray[Decl]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, dict_ok: mutable bool&) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            failure: LLVMValueRef = zeroed
+            dict_ok <- false
+            failure return if dict_type.kind != TypeKind.Struct
+            dict_base: mutable sview = ""
+            dict_arg_start: mutable usize = 0
+            dict_arg_count: mutable usize = 0
+            failure return if not generic_struct_instantiation_of(structs, dict_type, dict_base, dict_arg_start, dict_arg_count)
+            failure return if dict_base != "DynDict" or dict_arg_count != 2.usize()
+            dict_key_type: ValueType = copied_type(structs.generic_struct_inst_args[dict_arg_start])
+            dict_value_type: ValueType = copied_type(structs.generic_struct_inst_args[dict_arg_start + 1.usize()])
+            failure return if dict_key_type.kind != TypeKind.CStr
+            failure return if not is_numeric_type(dict_value_type) and dict_value_type.kind != TypeKind.Bool
+            pointer_llvm: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            value_llvm: LLVMTypeRef = llvm_type_of(dict_value_type, structs, ctx)
+            state_llvm: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+            bucket_fields: mutable darray[LLVMTypeRef] = [pointer_llvm, value_llvm, state_llvm]
+            bucket_fields_pointer: void& = (&bucket_fields[0]).cast[void&] can Unsafe.PointerCast
+            bucket_llvm: LLVMTypeRef = LLVMStructTypeInContext(ctx, bucket_fields_pointer, 3, 0)
+            capacity: usize = const_dict_capacity(entries.count)
+            i64_llvm: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            header_fields: mutable darray[LLVMValueRef] = []
+            if capacity == 0.usize():
+                header_fields.push(LLVMConstNull(pointer_llvm))
+                header_fields.push(LLVMConstInt(i64_llvm, 0, 0))
+                header_fields.push(LLVMConstInt(i64_llvm, 0, 0))
+                header_fields.push(LLVMConstInt(i64_llvm, 0, 0))
+                header_fields.push(LLVMConstNull(pointer_llvm))
+                header_pointer0: void& = (&header_fields[0]).cast[void&] can Unsafe.PointerCast
+                dict_ok <- true
+                return LLVMConstNamedStruct(llvm_type_of(dict_type, structs, ctx), header_pointer0, 5)
+            # Placement. `taken` mirrors stage0's `occupied` flag; the key/value indices are
+            # kept per slot so the bucket array can be built in slot order afterwards.
+            mask: usize = capacity - 1.usize()
+            taken: mutable darray[bool] = [false for _slot in 0..<capacity]
+            slot_entry: mutable darray[usize] = [0.usize() for _entry_slot in 0..<capacity]
+            placement_ok: mutable bool = true
+            for entry_index in 0..<entries.count |taken, slot_entry, placement_ok, entries, mask, capacity, structs|:
+                continue if not placement_ok
+                key_bytes: mutable darray[u8] = []
+                if entries[entry_index].key is Expr.StringLit(key_text):
+                    escapes_known: mutable bool = true
+                    decode_string_escapes(key_text, key_bytes, escapes_known)
+                    placement_ok <- false if not escapes_known
+                else:
+                    placement_ok <- false
+                continue if not placement_ok
+                slot: mutable usize = (const_dict_hash_cstr(key_bytes) & mask.u64()).usize()
+                probes: mutable usize = 0
+                while taken[slot] and probes < capacity |slot, probes, taken, mask|:
+                    slot <- (slot + 1.usize()) & mask
+                    probes <- probes + 1.usize()
+                if taken[slot]:
+                    placement_ok <- false
+                else:
+                    taken[slot] <- true
+                    slot_entry[slot] <- entry_index
+            failure return if not placement_ok
+            # The bucket table.
+            buckets: mutable darray[LLVMValueRef] = []
+            bucket_ok: mutable bool = true
+            for slot_index in 0..<capacity |buckets, bucket_ok, taken, slot_entry, entries, dict_value_type, bucket_llvm, pointer_llvm, value_llvm, state_llvm, top, structs, m, ctx|:
+                continue if not bucket_ok
+                bucket_key: mutable LLVMValueRef = LLVMConstNull(pointer_llvm)
+                bucket_value: mutable LLVMValueRef = LLVMConstInt(value_llvm, 0, 0)
+                bucket_state: mutable LLVMValueRef = LLVMConstInt(state_llvm, 0, 0)
+                if taken[slot_index]:
+                    entry: Ast::DictEntry = entries[slot_entry[slot_index]]
+                    key_storage: mutable darray[u8] = []
+                    if entry.key is Expr.StringLit(bucket_key_text):
+                        key_cstr: cstr = decoded_literal_cstr(bucket_key_text, key_storage)
+                        key_array: LLVMValueRef = LLVMConstStringInContext(ctx, key_cstr, (key_storage.count - 1.usize()).u32(), 0)
+                        key_global: LLVMValueRef = LLVMAddGlobal(m, LLVMTypeOf(key_array), ".const.dict.key")
+                        LLVMSetInitializer(key_global, key_array)
+                        LLVMSetLinkage(key_global, 9)
+                        LLVMSetGlobalConstant(key_global, 1)
+                        bucket_key <- key_global
+                    else:
+                        bucket_ok <- false
+                    entry_value_ok: mutable bool = true
+                    entry_value: LLVMValueRef = const_aggregate_value(entry.value, dict_value_type, top, structs, ctx, entry_value_ok)
+                    if entry_value_ok:
+                        bucket_value <- entry_value
+                    else:
+                        bucket_ok <- false
+                    bucket_state <- LLVMConstInt(state_llvm, 1, 0)
+                continue if not bucket_ok
+                slot_fields: mutable darray[LLVMValueRef] = [bucket_key, bucket_value, bucket_state]
+                slot_fields_pointer: void& = (&slot_fields[0]).cast[void&] can Unsafe.PointerCast
+                buckets.push(LLVMConstNamedStruct(bucket_llvm, slot_fields_pointer, 3))
+            failure return if not bucket_ok
+            buckets_pointer: void& = (&buckets[0]).cast[void&] can Unsafe.PointerCast
+            buckets_array: LLVMValueRef = LLVMConstArray2(bucket_llvm, buckets_pointer, capacity.u64())
+            buckets_global: LLVMValueRef = LLVMAddGlobal(m, LLVMArrayType(bucket_llvm, capacity.u32()), ".const.dict.buckets")
+            LLVMSetInitializer(buckets_global, buckets_array)
+            LLVMSetLinkage(buckets_global, 9)
+            LLVMSetGlobalConstant(buckets_global, 1)
+            header_fields.push(buckets_global)
+            header_fields.push(LLVMConstInt(i64_llvm, entries.count.u64(), 0))
+            header_fields.push(LLVMConstInt(i64_llvm, entries.count.u64(), 0))
+            header_fields.push(LLVMConstInt(i64_llvm, capacity.u64(), 0))
+            header_fields.push(LLVMConstNull(pointer_llvm))
+            header_pointer: void& = (&header_fields[0]).cast[void&] can Unsafe.PointerCast
+            dict_ok <- true
+            return LLVMConstNamedStruct(llvm_type_of(dict_type, structs, ctx), header_pointer, 5)
+
+
         def const_aggregate_value(value_expression: Expr, value_type: ValueType, top: darray[Decl]&, structs: mutable StructTable&, ctx: LLVMContextRef, ok: mutable bool&) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             aggregate_failure: LLVMValueRef = zeroed
             # Enum members can arrive here as a field expression or as a dotted identifier
@@ -172,7 +310,20 @@ extend Backend:
                     const_type: ValueType = copied_type(structs.const_types[const_index.usize()])
                     continue if const_type.kind != TypeKind.Array and const_type.kind != TypeKind.Struct
                     aggregate_ok: mutable bool = true
-                    const_aggregate: LLVMValueRef = const_aggregate_value(const_value, const_type, top, structs, ctx, aggregate_ok)
+                    const_aggregate: mutable LLVMValueRef = zeroed
+                    # A compile-time DICT is laid out whole, not folded element by element, and
+                    # needs the module to hang its bucket table and key strings off.
+                    dict_literal_handled: mutable bool = false
+                    if const_value is Expr.DictLit(const_dict_entries, const_dict_line):
+                        dict_built_ok: mutable bool = false
+                        dict_constant: LLVMValueRef = const_dict_global_value(const_dict_entries, const_type, top, structs, m, ctx, dict_built_ok)
+                        if dict_built_ok:
+                            const_aggregate <- dict_constant
+                            dict_literal_handled <- true
+                        else:
+                            aggregate_ok <- false
+                    if not dict_literal_handled:
+                        const_aggregate <- const_aggregate_value(const_value, const_type, top, structs, ctx, aggregate_ok)
                     continue if not aggregate_ok
                     array_llvm: LLVMTypeRef = llvm_type_of(const_type, structs, ctx)
                     const_name_storage: mutable darray[u8] = []
