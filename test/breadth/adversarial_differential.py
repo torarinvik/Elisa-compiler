@@ -7680,5 +7680,41 @@ def main() -> i64:
 GENERATORS += [gen_dict_entry_api]
 
 
+def gen_payload_enum_labelled_fields():
+    """`Shape.Rect(h: 5, w: 2)` — a multi-field payload-enum constructor with LABELS.
+
+    stage1 read the arguments POSITIONALLY and ignored the labels, so out-of-order fields
+    were stored swapped. That is a SILENT WRONG ANSWER, not a decline: the constructor
+    still emitted, and the program simply computed something else (stage0 59, stage1 47).
+    Found by probing the payload-enum analogue of a packed-constructor question, not by the
+    corpus -- a wrong answer is invisible to a decline census by construction.
+
+    Fixed by routing the fields through `named_argument_index`, the same reorder the
+    fn-typed call paths already do, over the variant's own field names.
+
+    The fixture keeps a DECLARATION-ORDER call beside the reordered one so a fix that
+    always permutes is caught too, and weights the four fields by distinct powers of two so
+    any single swap moves the total.
+    """
+    yield ("payload_enum_labelled_fields", """
+enum Shape:
+	Circle(r: i32)
+	Rect(w: i32, h: i32)
+
+def main() -> i64:
+	a: Shape = Shape.Rect(w: 3, h: 4)
+	b: Shape = Shape.Rect(h: 5, w: 2)
+	t: mutable i64 = 0
+	if a is Shape.Rect(aw, ah):
+		t <- t + aw.i64() * 1 + ah.i64() * 2
+	if b is Shape.Rect(bw, bh):
+		t <- t + bw.i64() * 4 + bh.i64() * 8
+	return t
+""")
+
+
+GENERATORS += [gen_payload_enum_labelled_fields]
+
+
 if __name__ == "__main__":
     sys.exit(main())
