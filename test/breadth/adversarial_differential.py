@@ -7820,5 +7820,54 @@ def main() -> i64:
 GENERATORS += [gen_packed_multi_field_word_packing]
 
 
+def gen_packed_store_ordinal_index():
+    """`frozen[2]` — indexing a FROZEN packed store by allocation ORDINAL.
+
+    stage0 lowers it to `ctx_packed_store_index_at(state, i64 ordinal)`, mapping an
+    ordinal to the node HANDLE at that position. The helper reads `state.indices` off a
+    PackedStoreState, so it serves the variant-sparse and index profiles; the AoS store is
+    a different struct with no such helper, and that profile declines.
+
+    Worth recording how this was found, because two attempts failed on it: the emitter and
+    the `expression_type` case were both CORRECT from the first try, but were inserted late
+    in `emit_expression_index_fields`, after four other branches that also match
+    `Expr.Index` — one of which claims a PackedStore receiver and returns null. A decline
+    marker placed at the same point was silent, which was misread as "the emitter is never
+    reached" rather than "not reached HERE". Placing the branch first made it work
+    unchanged.
+
+    Two nodes are read back with different spans and weighted 10 and 1, so an off-by-one in
+    the ordinal, or both reads resolving to the same node, moves the answer.
+    """
+    yield ("packed_store_ordinal_index", """
+packed enum Expr:
+	common:
+		span: i32
+	Lit(value: i32)
+	Sym(id: i32)
+
+def inspect(owner: Arena) -> i32:
+	store: Expr.Store[Local] = Expr.Store(owner)
+	in store:
+		a: Expr = new Expr.Lit(span: 4, value: 3)
+		b: Expr = new Expr.Sym(span: 7, id: 5)
+		_ = a
+		_ = b
+	frozen: Expr.Store[Frozen] = freeze(move store)
+	in frozen:
+		n0: Expr = frozen[0]
+		n1: Expr = frozen[1]
+		return n0.span * 10 + n1.span
+	return 0
+
+def main() -> i64:
+	owner: Arena = zeroed
+	return inspect(owner).i64()
+""")
+
+
+GENERATORS += [gen_packed_store_ordinal_index]
+
+
 if __name__ == "__main__":
     sys.exit(main())
