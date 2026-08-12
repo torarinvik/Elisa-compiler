@@ -7766,5 +7766,59 @@ def main() -> i64:
 GENERATORS += [gen_packed_is_variant_sparse_profile]
 
 
+def gen_packed_multi_field_word_packing():
+    """A MULTI-FIELD packed payload read under the variant-sparse profile.
+
+    The payload is stored as ONE AGGREGATE at word `1 + commons` --
+    `%__packed_payload_N = type { i32, i32 }`, i.e. BOTH fields inside a single 64-bit
+    word. The mode-0 match read field `i` from word `1 + commons + i`, which got field 0
+    right (it aliases the aggregate's low half) and read field 1 out of a word nothing
+    ever wrote.
+
+    For a payload of node HANDLES that was a silent wrong answer rather than a crash: the
+    second handle came back 0, which is a valid node index (the first one allocated), so
+    `right.span` quietly returned the wrong node's span -- stage0 13, stage1 11.
+
+    Field `i` now reads word `1 + commons + i/2` and shifts down 32 bits on odd positions.
+    A payload whose fields are not all 32-bit still declines: there is no size/offset
+    helper in this backend, and guessing the layout would be another silent wrong answer.
+
+    Both variants are matched, and the fields are weighted unequally (1 and 4), so reading
+    one field twice -- the exact old behaviour for the low half -- moves the total.
+    """
+    yield ("packed_multi_field_word_packing", """
+packed enum Tok:
+	common:
+		span: i32
+	Pair(a: i32, b: i32)
+	One(v: i32)
+
+def go(owner: Arena) -> i32:
+	total: mutable i32 = 0
+	store: Tok.Store[Local] = Tok.Store(owner)
+	in store:
+		p: Tok = new Tok.Pair(span: 9, a: 3, b: 5)
+		q: Tok = new Tok.One(span: 1, v: 7)
+		match p:
+			Tok.Pair(a: a, b: b):
+				total <- total + a * 1 + b * 4
+			Tok.One(v: v):
+				total <- total + 100
+		match q:
+			Tok.Pair(a: a2, b: b2):
+				total <- total + 200
+			Tok.One(v: v2):
+				total <- total + v2 * 16
+	return total
+
+def main() -> i64:
+	owner: Arena = zeroed
+	return go(owner).i64()
+""")
+
+
+GENERATORS += [gen_packed_multi_field_word_packing]
+
+
 if __name__ == "__main__":
     sys.exit(main())
