@@ -7399,5 +7399,93 @@ def main() -> i64:
 GENERATORS += [gen_payload_carrying_error_set]
 
 
+
+def gen_try_as_right_binary_operand():
+    """`return value + (try f(x))` — a propagating `try` as the RIGHT operand of a binary.
+
+    stage1 already hoisted a try that was the LEFT operand, and a try that WAS the whole
+    returned expression, but declined it on the right — which is where stage0's own corpus
+    puts it (`value + (try recursive_pair_node_sum(next))`).
+
+    The hoist evaluates the call BEFORE the left operand, so it is allowed only when the
+    operator does not short-circuit and the left operand is side-effect-free (an ident or an
+    int literal). The `and`/`or` case is generated here too: hoisting out of a short-circuit
+    would call the function where the source says it must not, and that program must keep
+    answering what stage0 answers either way.
+
+    BOTH paths are exercised — the success path (35) and the propagating error path (1) —
+    because a hoist that loses the error branch still returns the right number on success.
+    """
+    yield ("try_as_right_binary_operand", """
+error DiskError:
+	Missing
+
+def inner(v: i64) -> i64 error[DiskError]:
+	if v == 0:
+		raise DiskError.Missing
+	return v * 10
+
+def outer(v: i64) -> i64 error[DiskError]:
+	return 5 + (try inner(v))
+
+def run(v: i64) -> i64:
+	return catch outer(v):
+		lowered:
+			lowered
+		error e:
+			1
+
+def main() -> i64:
+	return run(3) + run(0)
+""")
+    yield ("try_operand_short_circuit", """
+error DiskError:
+	Missing
+
+def flag(v: i64) -> bool error[DiskError]:
+	if v == 0:
+		raise DiskError.Missing
+	return v > 1
+
+def both(v: i64) -> bool error[DiskError]:
+	return v > 100 and (try flag(v))
+
+def either(v: i64) -> bool error[DiskError]:
+	return v > 100 or (try flag(v))
+
+def check_and(v: i64) -> i64 error[DiskError]:
+	ok: bool = try both(v)
+	if ok:
+		return 7
+	return 3
+
+def check_or(v: i64) -> i64 error[DiskError]:
+	ok: bool = try either(v)
+	if ok:
+		return 7
+	return 3
+
+def run_and(v: i64) -> i64:
+	return catch check_and(v):
+		lowered:
+			lowered
+		error e:
+			1
+
+def run_or(v: i64) -> i64:
+	return catch check_or(v):
+		lowered:
+			lowered
+		error e:
+			1
+
+def main() -> i64:
+	return run_and(0) * 1000 + run_and(200) * 100 + run_or(200) * 10 + run_or(0)
+""")
+
+
+GENERATORS += [gen_try_as_right_binary_operand]
+
+
 if __name__ == "__main__":
     sys.exit(main())
