@@ -7621,5 +7621,64 @@ def main() -> i64:
 GENERATORS += [gen_catch_arm_that_returns]
 
 
+def gen_dict_entry_api():
+    """`d.entry(k)` and its four members — the dict ENTRY api.
+
+    stage0 materialises a three-word `{dict, key, cached}` aggregate (cached being
+    `arena_dict_get_mut__T(d, k)`) and extracts from it at the very next instruction, at
+    every use. stage1 recognises the CHAIN instead: `.found` is `icmp ne cached, null`,
+    `.value` IS cached, and `.insert(v)` / `.get_or_insert(v)` branch on cached and call
+    `arena_dict_put__T` / `arena_dict_get_or_insert__T` only on the miss side.
+
+    The program declares its OWN cut-down dict surface, which is the second half of what
+    made this decline: those helpers are `[T]` with the key fixed, one type parameter, while
+    the dict's type-argument tuple is `(K, T)` — and instantiation requires exactly one
+    argument per parameter. They also carry no `_or_panic` wrapper, so the frictionless name
+    stage1 prefers resolves to nothing. Both fall back here, matching stage0's mangling
+    (`arena_dict_get_or_insert__i64`, the value type alone).
+
+    The helpers are stubs returning null, so every `.found` is false and every `.insert`
+    takes the miss branch — which is exactly what makes the arithmetic below discriminating:
+    a `.found` that read the wrong word, an insert branch inverted, or a `.value` that failed
+    to narrow all move the total.
+    """
+    yield ("dict_entry_api", """
+def arena_dict_get[T](m: dict[cstr[key_shape], T]&, key: cstr[key_shape]) -> T&?:
+	return null
+
+def arena_dict_get_mut[T](m: mutable dict[cstr[key_shape], T]&, key: cstr[key_shape]) -> mutable T&?:
+	return null
+
+def arena_dict_put[T](a: mutable Arena&, m: mutable dict[cstr[key_shape], T]&, key: cstr[key_shape], value: T) -> mutable T&?:
+	return null
+
+def arena_dict_get_or_insert[T](a: mutable Arena&, m: mutable dict[cstr[key_shape], T]&, key: cstr[key_shape], value: T) -> mutable T&?:
+	return null
+
+def build(owner: Arena) -> i64:
+	alloc: mutable Arena& = (&owner).cast[mutable Arena&]
+	total: mutable i64 = 0
+	in alloc:
+		values: mutable dict[cstr[key_shape], i64] = zeroed
+		total <- total + 1 if values.entry("a").found
+		total <- total + 2 if not values.entry("b").found
+		_ = values.entry("c").insert(7)
+		_ = values.entry("d").get_or_insert(9)
+		total <- total + 4 if values.entry("e").value is present
+		total <- total + 8 if values.get_or_insert("f", 11) is inserted
+		slot = values.entry("g").get_or_insert(13)
+		total <- total + 16 if slot is bound
+		return total
+	return total
+
+def main() -> i64:
+	owner: Arena = zeroed
+	return build(owner)
+""")
+
+
+GENERATORS += [gen_dict_entry_api]
+
+
 if __name__ == "__main__":
     sys.exit(main())
