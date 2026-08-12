@@ -7311,5 +7311,93 @@ def main() -> i64:
 GENERATORS += [gen_named_args_through_fn_field_alias]
 
 
+
+def gen_payload_carrying_error_set():
+    """`error E:` with a PAYLOAD-carrying variant — stage0 returns a STRUCT, not an i32 code.
+
+    Measured from stage0's IR: a FIELDLESS set returns a bare `i32` (what stage1 always
+    emitted), and a set with any payload variant returns
+    `%ErrSet__E = { i32 tag, <every variant's fields concatenated> }` — slots are NOT
+    overlapped, tags are 1-based (0 = success), and other variants' slots are `undef`.
+
+    Three paths are exercised because they are three DIFFERENT emitters and the first attempt
+    got only one of them right:
+      - the payload raise (insertvalue tag + each field at `1 + preceding field counts + i`),
+      - a FIELDLESS raise in the same set, which must still build the struct (the ABI is per
+        SET, not per variant),
+      - the SUCCESS return, which kept emitting `ret i32 0` from a function whose signature
+        now says struct. LLVM did not reject that: it ran correctly at -O0 and MISCOMPILED at
+        -O2, reading the success value back as 0 instead of 3.
+
+    The fieldless set is generated alongside so a change that switches ABI unconditionally is
+    caught too.
+    """
+    yield ("payload_carrying_error_set", """
+error BackendError:
+	UnsupportedType(span: i64, code: i32)
+	Other
+
+def fail(span: i64) -> i64 error[BackendError]:
+	raise BackendError.UnsupportedType(span, 7)
+
+def fail_bare() -> i64 error[BackendError]:
+	raise BackendError.Other
+
+def ok(v: i64) -> i64 error[BackendError]:
+	return v
+
+def recover(span: i64) -> i64:
+	return catch fail(span):
+		lowered:
+			lowered
+		error e:
+			9
+
+def recover_bare() -> i64:
+	return catch fail_bare():
+		lowered:
+			lowered
+		error e:
+			40
+
+def recover_ok() -> i64:
+	return catch ok(3):
+		lowered:
+			lowered
+		error e:
+			99
+
+def main() -> i64:
+	return recover(5) * 100 + recover_bare() + recover_ok()
+""")
+    yield ("fieldless_error_set_keeps_i32", """
+error PlainError:
+	Missing
+	Other
+
+def fail_plain() -> i64 error[PlainError]:
+	raise PlainError.Missing
+
+def ok_plain(v: i64) -> i64 error[PlainError]:
+	return v
+
+def main() -> i64:
+	a: i64 = catch fail_plain():
+		lowered:
+			lowered
+		error e:
+			6
+	b: i64 = catch ok_plain(11):
+		lowered:
+			lowered
+		error e:
+			99
+	return a * 100 + b
+""")
+
+
+GENERATORS += [gen_payload_carrying_error_set]
+
+
 if __name__ == "__main__":
     sys.exit(main())

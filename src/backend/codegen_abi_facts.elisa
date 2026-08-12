@@ -72,6 +72,107 @@ extend Backend:
             return false
 
 
+        # Whether an error SET declares at least one PAYLOAD-carrying variant. That is the
+        # whole ABI switch: stage0 returns a plain `i32` for a fieldless set (which is what
+        # stage1 has always emitted) and a `%ErrSet__E` STRUCT for one with payloads. Gating on
+        # this keeps every fieldless program — including the compiler's own source, whose error
+        # sets are fieldless throughout — on exactly the code path it already used.
+        def error_set_has_payload(structs: StructTable&, set_name: sview) -> bool can[Abort.Panic]:
+            false return if set_name == ""
+            # The name must have been DECLARED `error Name:`. The clause alone is not proof:
+            # this compiler's own source writes `error[E]`/`error[R]` for GENERIC PARAMETERS
+            # and `error[Ident]` for an unrelated name, and matching those against the
+            # payload-enum pool switched the ABI on functions that must return i32 — which
+            # broke self-hosting outright (the driver emitted nothing, exit 2).
+            declared: mutable bool = false
+            for declared_name in structs.error_set_decl_names |declared, set_name|:
+                declared <- true if declared_name == set_name
+            false return if not declared
+            set_index: i64 = penum_index_of(structs, set_name)
+            false return if set_index < 0
+            variant_start: usize = structs.penum_variant_start[set_index.usize()]
+            variant_span: usize = structs.penum_variant_count[set_index.usize()]
+            carries: mutable bool = false
+            for offset in 0..<variant_span |carries, variant_start, structs|:
+                carries <- true if structs.penum_field_type_count[variant_start + offset] > 0.usize()
+            return carries
+
+
+        # The index of an error set variant's FIRST payload slot in the `%ErrSet__E` struct.
+        # Measured from stage0's IR: field 0 is the i32 tag, then every variant's fields
+        # CONCATENATED in declaration order — the slots are NOT overlapped, so a variant's
+        # field i sits at `1 + (sum of the preceding variants' field counts) + i`, and slots
+        # belonging to other variants are left `undef`.
+        def error_set_variant_field_base(structs: StructTable&, set_index: i64, variant_offset: usize) -> usize can[Abort.Panic]:
+            variant_start: usize = structs.penum_variant_start[set_index.usize()]
+            base: mutable usize = 1
+            for offset in 0..<variant_offset |base, variant_start, structs|:
+                base <- base + structs.penum_field_type_count[variant_start + offset]
+            return base
+
+
+        # `%ErrSet__E = type { i32, <every variant's fields, concatenated> }`.
+        def error_set_llvm_type(structs: mutable StructTable&, set_name: sview, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            set_index: i64 = penum_index_of(structs, set_name)
+            variant_start: usize = structs.penum_variant_start[set_index.usize()]
+            variant_span: usize = structs.penum_variant_count[set_index.usize()]
+            set_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx)]
+            for offset in 0..<variant_span |set_fields, variant_start, structs, ctx|:
+                field_start: usize = structs.penum_field_type_start[variant_start + offset]
+                field_span: usize = structs.penum_field_type_count[variant_start + offset]
+                for field_offset in 0..<field_span |set_fields, field_start, structs, ctx|:
+                    set_fields.push(llvm_type_of(copied_type(structs.penum_field_types[field_start + field_offset]), structs, ctx))
+            set_pointer: void& = (&set_fields[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMStructTypeInContext(ctx, set_pointer, set_fields.count.u32(), 0)
+
+
+        # The value an error function returns on SUCCESS: a bare `i32 0` for a fieldless set,
+        # and `{ i32 0, undef... }` for a payload-carrying one, whose signature declares the
+        # `%ErrSet__E` struct.
+        #
+        # This existed as an inline `LLVMConstInt(i32, 0)` at seven return sites. When the
+        # struct ABI landed, all seven kept emitting `ret i32 0` from a function declared to
+        # return the struct — malformed IR that LLVM did NOT reject: it ran correctly at -O0
+        # and MISCOMPILED at -O2 (the success value read back as 0 instead of 3). One helper,
+        # so a future ABI change cannot leave six of seven sites behind.
+        def error_success_return_value(structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            success_code: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)
+            success_set: sview = line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, runtime.error_fn_line)
+            success_code return if not error_set_has_payload(structs, success_set)
+            # A zeroinitializer rather than insertvalue-into-undef: field 0 is the tag and 0 IS
+            # success, and the catch path reads no other field on the success branch. It also
+            # needs no builder, so every return site can call this.
+            return LLVMConstNull(error_set_llvm_type(structs, success_set, ctx))
+
+
+        # Whether the named function returns a PAYLOAD-carrying error set, i.e. whether its
+        # LLVM return value is the `%ErrSet__E` struct rather than a bare i32 code. Every catch
+        # site asks this to decide whether the code needs an `extractvalue` first.
+        #
+        # Resolved through the function's LINE rather than by introspecting the LLVM type,
+        # because LLVMGetTypeKind is not bound here — and a magic type-kind ordinal would be a
+        # silent breakage the day the enum shifts.
+        def function_returns_error_struct(fns: FnTable&, structs: StructTable&, owner: sview, name: sview) -> bool can[Abort.Panic]:
+            index: i64 = function_index_of(fns, owner, name)
+            false return if index < 0
+            false return if not fns.is_error[index.usize()]
+            return error_set_has_payload(structs, line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, fns.lines[index.usize()]))
+
+
+        # The error SET NAME declared at `line` (`-> i64 error[BackendError]` -> "BackendError"),
+        # or "" when the line declares none or the clause was not the plain `error[Ident]` form.
+        # Index-parallel with error_lines; a shorter names pool (an older serialized File) reads
+        # as "", which keeps the i32 error ABI — the conservative answer.
+        def line_error_set_name(error_lines: darray[u32]&, error_names: darray[sview]&, line: u32) -> sview can[Abort.Panic]:
+            scan: mutable usize = 0
+            while scan < error_lines.count |scan, error_lines, error_names, line|:
+                if error_lines[scan] == line:
+                    "" return if scan >= error_names.count
+                    return error_names[scan]
+                scan <- scan + 1
+            return ""
+
+
         # Whether a struct holds a darray anywhere in its (recursive) fields — such a struct
         # returned by value carries a darray whose BUFFER must outlive the callee, so the
         # function must thread the caller's arena (build the darray there, not in the callee's
@@ -1019,6 +1120,9 @@ extend Backend:
             fast_math: mutable bool
             force_bounds_check: bool
             in_error_fn: mutable bool
+            # The enclosing error function's declaration LINE, so `raise` can look up WHICH
+            # error set it must build. Meaningful only while in_error_fn.
+            error_fn_line: mutable u32 = 0
             debug_active: mutable bool
             trace_enabled: mutable bool
 
