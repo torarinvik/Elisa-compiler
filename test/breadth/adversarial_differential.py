@@ -7487,5 +7487,50 @@ def main() -> i64:
 GENERATORS += [gen_try_as_right_binary_operand]
 
 
+
+def gen_linear_consume_marker_is_a_pointer():
+    """`x as ! <- (free(x))` — the linear-consume assignment, and the `T!` return it consumes.
+
+    Two bugs, one shape:
+
+    - `extern_return_is_pointer` scanned the return type for `&` only, so
+      `-> heap u8!` was declared returning `i8` where stage0 declares `ptr` (both
+      `-> heap u8!` and a bare `-> u8!` lower to `ptr`). The caller then emitted
+      `store i8 %call, ptr %buffer` — ONE BYTE written over a pointer slot. That compiles
+      clean and corrupts the pointer, which is why this fixture round-trips a real
+      `malloc`/`free` rather than a stub: a mangled pointer reaches the allocator.
+
+    - `PLACE as ! <- v` resolved its place through struct_chain_address, which wants a field
+      chain, so a bare LOCAL declined and took the enclosing `defer block:` and the whole
+      function with it. stage0 lowers the form to a plain store into the local's slot — the
+      `as !` is a linear-typing annotation with no codegen of its own.
+    """
+    yield ("linear_consume_marker_is_a_pointer", """
+extern malloc(size: usize) -> mutable heap u8&? can[Memory.Allocate]
+@link_name(free)
+extern sfree_bytes(ptr: heap u8&) -> heap u8! can[Memory.Release]
+
+def alloc_and_free(n: i64) -> i64:
+	can Memory.Allocate, Memory.Release:
+		buffer: mutable heap u8&? = null
+		defer block:
+			if buffer != null:
+				buffer as ! <- (sfree_bytes(buffer))
+
+		raw: heap u8&? = malloc(32)
+		buffer <- raw
+		if buffer == null:
+			return -1
+		return n + 5
+
+def main() -> i64:
+	can Memory.Allocate, Memory.Release:
+		return alloc_and_free(30)
+""")
+
+
+GENERATORS += [gen_linear_consume_marker_is_a_pointer]
+
+
 if __name__ == "__main__":
     sys.exit(main())
