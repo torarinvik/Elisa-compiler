@@ -7532,5 +7532,94 @@ def main() -> i64:
 GENERATORS += [gen_linear_consume_marker_is_a_pointer]
 
 
+
+def gen_catch_arm_that_returns():
+    """A `catch` arm that TERMINATES instead of yielding: `error e: return 1`.
+
+    `arm_value_expression` models an arm body as a single `Stmt.Expr`, so a `return` arm
+    answered null and the whole catch declined — in DECLARATION position, where "on error,
+    leave the function" is the natural spelling. stage0 accepts it.
+
+    Such an arm stores nothing and never branches to catch.done; the `ret` is the arm block's
+    terminator. The returned value is emitted at the enclosing function's return type, which
+    the body emitter now records on Runtime because the expression emitters have no statement
+    context of their own.
+
+    Two cases, because they take different branches: the enclosing function may be ORDINARY
+    (plain `ret`) or itself ERROR-returning (store through the out-param, then return the
+    success code). Both success and error paths of the inner call are exercised, and the bool
+    case is included because it was the shape that first surfaced this.
+    """
+    yield ("catch_arm_that_returns", """
+error DiskError:
+	Missing
+
+def num(v: i64) -> i64 error[DiskError]:
+	if v == 0:
+		raise DiskError.Missing
+	return v * 2
+
+def flag(v: i64) -> bool error[DiskError]:
+	if v == 0:
+		raise DiskError.Missing
+	return v > 1
+
+def run_num(v: i64) -> i64:
+	r: i64 = catch num(v):
+		lowered:
+			lowered
+		error e:
+			return 1
+	return r + 5
+
+def run_flag(v: i64) -> i64:
+	r: bool = catch flag(v):
+		lowered:
+			lowered
+		error e:
+			return 1
+	return 7 if r else 3
+
+def main() -> i64:
+	return run_num(3) * 1000 + run_num(0) * 100 + run_flag(5) * 10 + run_flag(0)
+""")
+    yield ("catch_arm_that_returns_inside_error_fn", """
+error DiskError:
+	Missing
+
+error OuterError:
+	Failed
+
+def num(v: i64) -> i64 error[DiskError]:
+	if v == 0:
+		raise DiskError.Missing
+	return v * 2
+
+def wrap(v: i64) -> i64 error[OuterError]:
+	r: i64 = catch num(v):
+		lowered:
+			lowered
+		error e:
+			return 41
+	return r + 5
+
+def main() -> i64:
+	a: i64 = catch wrap(3):
+		lowered:
+			lowered
+		error e:
+			90
+	b: i64 = catch wrap(0):
+		lowered:
+			lowered
+		error e:
+			91
+	return a * 100 + b
+""")
+
+
+GENERATORS += [gen_catch_arm_that_returns]
+
+
 if __name__ == "__main__":
     sys.exit(main())
