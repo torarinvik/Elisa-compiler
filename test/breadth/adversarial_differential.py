@@ -7716,5 +7716,55 @@ def main() -> i64:
 GENERATORS += [gen_payload_enum_labelled_fields]
 
 
+def gen_packed_is_variant_sparse_profile():
+    """`if tok is Tok.Ident(id):` on a NON-RECURSIVE packed enum.
+
+    Only a RECURSIVE packed enum gets the `__aos` annotation, so a plain one selects the
+    variant-sparse profile (mode 0) -- and the `is` payload path was gated to mode 2
+    outright. The `match` spelling of the identical test compiled all along; the `is`
+    spelling declined, which is the same lag between those two paths this backend has hit
+    before.
+
+    Extended to the variant-sparse and index profiles by reading the tag and the payload
+    WORD through the runtime helpers, the way the statement-match path already did.
+
+    Note the two helpers disagree on argument order --
+    `..._read_variant_sparse_tag(state, index)` but `..._read_variant_sparse_word(index,
+    state, word)` -- and passing the word reader's order to the tag reader SEGFAULTED
+    (exit 139) while still compiling cleanly. The commons are exercised too, since word 0
+    is the tag and words 1..commons precede the payload, so an off-by-commons here reads a
+    common as the binder.
+    """
+    yield ("packed_is_variant_sparse_profile", """
+packed enum Tok:
+	common:
+		span: i32
+		kind: i32
+	Ident(id: i32)
+	Num(n: i32)
+
+def go(owner: Arena) -> i32:
+	total: mutable i32 = 0
+	store: Tok.Store[Local] = Tok.Store(owner)
+	in store:
+		a: Tok = new Tok.Ident(span: 5, kind: 1, id: 2)
+		b: Tok = new Tok.Num(span: 3, kind: 2, n: 7)
+		total <- total + a.span * 1 + a.kind * 2
+		total <- total + b.span * 4 + b.kind * 8
+		if a is Tok.Ident(aid):
+			total <- total + aid * 16
+		if b is Tok.Ident(nope):
+			total <- total + nope * 1000
+	return total
+
+def main() -> i64:
+	owner: Arena = zeroed
+	return go(owner).i64()
+""")
+
+
+GENERATORS += [gen_packed_is_variant_sparse_profile]
+
+
 if __name__ == "__main__":
     sys.exit(main())

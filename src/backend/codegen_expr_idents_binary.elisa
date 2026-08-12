@@ -536,7 +536,7 @@ extend Backend:
                                 # bind each field). AST-root layout + plain binder idents only.
                                 pk_scrut: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
                                 pk_enum_idx: i64 = packed_index_of(structs, pe_enum_name)
-                                if pk_scrut.kind == TypeKind.PackedEnum and runtime.packed_mode == 2 and pk_enum_idx >= 0:
+                                if pk_scrut.kind == TypeKind.PackedEnum and pk_enum_idx >= 0:
                                     pk_ordinal: i64 = packed_variant_index_of_parts(pe_enum_name, pe_variant, structs)
                                     null return if pk_ordinal < 0
                                     pk_root: i64 = packed_root_index_of(structs, pk_scrut.bits.i64())
@@ -591,25 +591,63 @@ extend Backend:
                                     null return if not pk_args_ok
                                     if emit_expression(is_left, pk_scrut, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pk_index_value:
                                         pk_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "is.pk.state")
+                                        # Only the AoS profile hands back a ROW POINTER to GEP into.
+                                        # The variant-sparse (0) and index (1) profiles read one WORD
+                                        # at a time — the shape the STATEMENT-MATCH path has always
+                                        # used. This branch was gated to mode 2 outright, so
+                                        # `if tok is Tok.Ident(id):` on any NON-RECURSIVE packed enum
+                                        # (which selects mode 0) declined, while the `match` spelling
+                                        # of the same test compiled. Same lag between the two paths
+                                        # this file has hit before.
+                                        pk_is_aos: bool = runtime.packed_mode == 2
                                         pk_index64: LLVMValueRef = LLVMBuildZExt(builder, pk_index_value, LLVMInt64TypeInContext(ctx), "is.pk.index")
-                                        pk_record_args: mutable darray[LLVMValueRef] = [pk_state, pk_index64]
-                                        pk_record_pointer: void& = (&pk_record_args[0]).cast[void&] can Unsafe.PointerCast
-                                        pk_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, pk_record_pointer, 2, "is.pk.record")
-                                        pk_row_type: LLVMTypeRef = packed_row_llvm_type(structs, pk_scrut.bits.i64(), ctx)
+                                        pk_record: mutable LLVMValueRef = zeroed
+                                        pk_row_type: mutable LLVMTypeRef = zeroed
+                                        if pk_is_aos:
+                                            pk_record_args: mutable darray[LLVMValueRef] = [pk_state, pk_index64]
+                                            pk_record_pointer: void& = (&pk_record_args[0]).cast[void&] can Unsafe.PointerCast
+                                            pk_record <- LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, pk_record_pointer, 2, "is.pk.record")
+                                            pk_row_type <- packed_row_llvm_type(structs, pk_scrut.bits.i64(), ctx)
+                                        # A NESTED sub-pattern reads a second row through the pointer
+                                        # below; without one there is nothing to read, so decline
+                                        # rather than emit against an absent record.
+                                        null return if pk_has_nested and not pk_is_aos
+                                        pk_commons: u32 = structs.packed_common_counts[pk_scrut.bits.usize()]
                                         pk_payload_hoisted: mutable LLVMValueRef = zeroed
                                         if pe_args.count > 0 and structs.packed_has_payload[pk_slot]:
                                             pk_payload: ValueType = copied_type(structs.packed_payloads[pk_slot])
                                             null return if pk_payload.kind == TypeKind.Unmodeled
-                                            # The AoS row is `{i32 tag, <commons x i64>, payload}`, so the
-                                            # payload sits at `1 + commons` — index 1 IS the common when
-                                            # one is declared, which made a binder read the SPAN. Same
-                                            # off-by-commons the statement match had.
-                                            pk_commons: u32 = structs.packed_common_counts[pk_scrut.bits.usize()]
-                                            pk_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pk_row_type, pk_record, (1 + pk_commons), "is.pk.payload.ptr")
-                                            # A payload that is ITSELF a node is an i32 handle in an i64
-                                            # row word: load the word and narrow, rather than loading i32
-                                            # straight out of an i64 slot.
-                                            pk_payload_value: LLVMValueRef = LLVMBuildTrunc(builder, LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), pk_payload_pointer, "is.pk.payload.word"), LLVMInt32TypeInContext(ctx), "is.pk.handle") if pk_payload.kind == TypeKind.PackedEnum else LLVMBuildLoad2(builder, llvm_type_of(pk_payload, structs, ctx), pk_payload_pointer, "is.pk.payload")
+                                            # A MULTI-field payload is an aggregate the word readers
+                                            # cannot produce (the match path declines it for the same
+                                            # reason); keep that shape on the AoS path only.
+                                            null return if pe_args.count > 1 and not pk_is_aos
+                                            pk_payload_value: mutable LLVMValueRef = zeroed
+                                            if pk_is_aos:
+                                                # The AoS row is `{i32 tag, <commons x i64>, payload}`, so the
+                                                # payload sits at `1 + commons` — index 1 IS the common when
+                                                # one is declared, which made a binder read the SPAN. Same
+                                                # off-by-commons the statement match had.
+                                                pk_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pk_row_type, pk_record, (1 + pk_commons), "is.pk.payload.ptr")
+                                                # A payload that is ITSELF a node is an i32 handle in an i64
+                                                # row word: load the word and narrow, rather than loading i32
+                                                # straight out of an i64 slot.
+                                                pk_payload_value <- LLVMBuildTrunc(builder, LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), pk_payload_pointer, "is.pk.payload.word"), LLVMInt32TypeInContext(ctx), "is.pk.handle") if pk_payload.kind == TypeKind.PackedEnum else LLVMBuildLoad2(builder, llvm_type_of(pk_payload, structs, ctx), pk_payload_pointer, "is.pk.payload")
+                                            else:
+                                                # Word 0 is the tag and words 1..commons are the commons,
+                                                # so the first payload word is `1 + commons`. The INDEX
+                                                # profile's reader leads with the ARENA.
+                                                pk_word_args: mutable darray[LLVMValueRef] = [pk_index_value, pk_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + pk_commons).u64(), 0)]
+                                                if runtime.packed_mode == 1:
+                                                    pk_word_arena: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 0, "is.pk.arena")
+                                                    pk_word_args <- [pk_word_arena, pk_index_value, pk_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + pk_commons).u64(), 0)]
+                                                pk_word_pointer: void& = (&pk_word_args[0]).cast[void&] can Unsafe.PointerCast
+                                                pk_payload_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, pk_word_pointer, pk_word_args.count.u32(), "is.pk.payload.word")
+                                                if pk_payload.kind == TypeKind.PackedEnum:
+                                                    pk_payload_value <- LLVMBuildTrunc(builder, pk_payload_word, LLVMInt32TypeInContext(ctx), "is.pk.handle")
+                                                elif emit_conversion(pk_payload_word, ValueType{kind: TypeKind.Signed, bits: 64}, pk_payload, structs, ctx, builder) is pk_payload_converted:
+                                                    pk_payload_value <- pk_payload_converted
+                                                else:
+                                                    return null
                                             pk_payload_hoisted <- pk_payload_value
                                             pk_field_start: usize = structs.packed_field_type_start[pk_slot]
                                             if pe_args.count == 1:
@@ -623,8 +661,18 @@ extend Backend:
                                                         pk_multi_field: LLVMValueRef = LLVMBuildExtractValue(builder, pk_payload_value, pk_bind_index.u32(), "is.pk.field")
                                                         pk_multi_slot: LLVMValueRef = bind_is_slot(local_scope, structs, pk_multi_name, pk_multi_type, llvm_type_of(pk_multi_type, structs, ctx), builder)
                                                         _ = LLVMBuildStore(builder, pk_multi_field, pk_multi_slot)
-                                        pk_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pk_row_type, pk_record, 0, "is.pk.tag.ptr")
-                                        pk_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), pk_tag_pointer, "is.pk.tag")
+                                        pk_tag: mutable LLVMValueRef = zeroed
+                                        if pk_is_aos:
+                                            pk_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pk_row_type, pk_record, 0, "is.pk.tag.ptr")
+                                            pk_tag <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), pk_tag_pointer, "is.pk.tag")
+                                        else:
+                                            # The tag reader takes (STATE, index) while the word
+                                            # reader takes (index, state, word) — the two runtime
+                                            # helpers disagree on argument order, and passing the
+                                            # word reader's order to the tag reader segfaulted.
+                                            pk_tag_args: mutable darray[LLVMValueRef] = [pk_state, pk_index_value]
+                                            pk_tag_pointer_args: void& = (&pk_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                                            pk_tag <- LLVMBuildCall2(builder, runtime.packed_read_tag_type, runtime.packed_read_tag, pk_tag_pointer_args, 2, "is.pk.tag")
                                         pk_outer_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, pk_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), pk_ordinal.u64(), 0), "is.pk.eq")
                                         pk_no_nested: bool = not pk_has_nested
                                         pk_outer_hit return if pk_no_nested
