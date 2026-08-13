@@ -7869,5 +7869,53 @@ def main() -> i64:
 GENERATORS += [gen_packed_store_ordinal_index]
 
 
+def gen_region_new_allocation():
+    """`new[region] EXPR` — region allocation, both the scalar and the constructor form.
+
+    This construct was ERASED by the parser until 2026-08-13: `new[r] …` returned its bare
+    operand, so `v: i32& = new[scratch] x` degraded into an int-to-pointer cast of the
+    VALUE and faulted on the first dereference (SIGSEGV for the scalar form, SIGBUS for the
+    constructor form). Nothing caught it — the strict backend census counts a file covered
+    when stage1 declines no function, and these files decline nothing while emitting a
+    crashing binary.
+
+    Two traps this fixture pins deliberately:
+
+    - `new` binds LOOSER than the arithmetic operators. stage0 allocates the whole of
+      `new[scratch] seed + 1` (its IR adds first, then allocates and stores the sum).
+      Parsing only the postfix operand builds `RegionNew(seed) + 1` — pointer arithmetic —
+      which does not crash but silently returns the WRONG value. `scalar` is written as
+      `seed + 1` precisely so that mistake changes the answer instead of hiding.
+    - The value is read back AFTER `destroy`-free use and weighted, so an allocation that
+      returns a stale or aliased pointer moves the result rather than happening to agree.
+    """
+    yield ("region_new_allocation", """
+struct Pt:
+	x: i32
+	y: i32
+
+def scalar_form(seed: i32) -> i32:
+	region scratch(1024)
+	value: i32& = new[scratch] seed + 1
+	out: i32 = value[0]
+	destroy scratch
+	return out
+
+def ctor_form(seed: i32) -> i32:
+	region scratch(1024)
+	point: Pt& = new[scratch] Pt{x: seed + 1, y: seed + 2}
+	out: i32 = point.x * 10 + point.y
+	destroy scratch
+	return out
+
+def main() -> i64:
+	return (scalar_form(7) + ctor_form(3) * 3).i64()
+""")
+
+
+GENERATORS += [gen_region_new_allocation]
+
+
+
 if __name__ == "__main__":
     sys.exit(main())
