@@ -8016,5 +8016,42 @@ GENERATORS += [gen_monomorphized_ref_arithmetic]
 
 
 
+def gen_ref_to_ref_indexing():
+    """`p[i]` where `p: T&&` — a C `char**`, the shape `argv` actually has.
+
+    stage1 DECLINED every ref-to-ref index until 2026-08-13, which is why its driver could
+    not read argv at all and fell back to a stdin wire protocol. stage0 lowers it as
+    `getelementptr ptr, ptr %base, i64 %i` then `load ptr` — the same GEP+load stage1's
+    scalar-ref path already emitted, but gated to Signed/Unsigned/Float.
+
+    TWO places had to agree: the emitter (codegen_expr_index_fields) AND expression_type
+    (codegen_scope). Fixing only the emitter changes nothing — the type function returns
+    Unmodeled and the branch is never reached.
+
+    Indices 0 and 2 are read and weighted differently so an off-by-one in the GEP, or both
+    reads collapsing to the same slot, moves the answer.
+    """
+    yield ("ref_to_ref_indexing", """
+extern strlen(s: cstr) -> usize
+
+def widths(slots: mutable cstr&&, count: i64) -> i64 can[Unsafe.PointerCast]:
+	trusted [Unsafe.PointerCast]:
+		total: mutable i64 = 0
+		for i in 0..<count |total, slots|:
+			total <- total * 10 + strlen(slots[i].cast[cstr]).i64()
+		return total
+
+def main() -> i64 can[Unsafe.PointerCast, Memory.Allocate]:
+	trusted [Unsafe.PointerCast]:
+		table: mutable darray[cstr] = ["abc", "de", "fghi"]
+		base: mutable cstr&& = (&table[0]).cast[mutable cstr&&]
+		return widths(base, 3) % 251
+""")
+
+
+GENERATORS += [gen_ref_to_ref_indexing]
+
+
+
 if __name__ == "__main__":
     sys.exit(main())
