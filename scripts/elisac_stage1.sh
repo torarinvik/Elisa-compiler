@@ -135,6 +135,7 @@ while [[ $# -gt 0 ]]; do
       case "${2:-}" in
         obj)    emit_mode="obj" ;;
         llvm)   emit_mode="llvm" ;;
+        bc)     emit_mode="bc" ;;
         exe)    emit_mode="exe" ;;
         tokens) emit_mode="tokens" ;;
         ast)    emit_mode="ast" ;;
@@ -142,7 +143,7 @@ while [[ $# -gt 0 ]]; do
         fmt)    emit_mode="fmt" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -fnoalias)
@@ -241,6 +242,7 @@ driver_env=()
 driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
+[[ "$emit_mode" == "bc" ]] && driver_env+=("ELISA_STAGE1_EMIT=bc")
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
 if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" ]]; then
