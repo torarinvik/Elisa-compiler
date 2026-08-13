@@ -18,6 +18,17 @@ include "../semantic/semantic.elisa"
 # Stage1 meta-compile: prefer `u8&`/`i64` over `void&`/`isize` for the read extern so the
 # product driver itself lowers under stage1 (gen2). Link still resolves libc `read`.
 extern read(fd: i64, buf: u8&, count: usize) -> i64
+# Real-CLI support. `main(argc, argv)` is portable and stage0 has always supported it —
+# the "non-libc argv" note above was wrong about the obstacle. What actually blocked it
+# was that indexing a `T&&` (C's `char**`) DECLINED in stage1's backend until it was
+# implemented; there is no platform hook needed (`_NSGetArgv` works but is macOS-only).
+#
+# Flags are re-exported through setenv so the existing ELISA_STAGE1_* readers below need
+# no change: the CLI and the environment stay ONE code path, and the wrapper's env-var
+# invocations keep working exactly as before.
+extern open(path: cstr, flags: i64) -> i64
+extern close(fd: i64) -> i64
+extern setenv(name: cstr, value: cstr, overwrite: i64) -> i64
 # Diagnostics go to STDERR through the std's libc `write` (declared in debug_referee.elisa as
 # `write(fd: int, buf: void&, count: usize)`), NOT through `puts`: the driver includes
 # elisacore_std, whose own `puts` overload shadows libc's under both the stage0 seed and the
@@ -1693,6 +1704,92 @@ def emit_iface_report(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u
     return 0 if buffer.count == 0 else emit_tokens_flush(buffer)
 
 
+# Length of a NUL-terminated C string. Bounded so a missing terminator cannot spin.
+def cstr_length(text: cstr) -> i64 can[Abort.Panic]:
+    length: mutable i64 = 0
+    for _step in 0..<1048576 |length, text|:
+        break if text[length.usize()] == 0
+        length <- length + 1
+    return length
+
+
+# Whole file by PATH. Returns an empty buffer when the path cannot be opened; the caller
+# reports that as the usual "cannot read source" failure.
+def read_file(path: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    contents: mutable darray[u8] = []
+    descriptor: i64 = open(path, 0)
+    contents return if descriptor < 0
+    chunk: mutable darray[u8] = []
+    chunk.resize(8192)
+    while true |contents, chunk, descriptor|:
+        amount: i64 = read(descriptor, &chunk[0], 8192)
+        break if amount <= 0
+        for index in 0..<amount.usize() |contents, chunk|:
+            contents.push(chunk[index])
+    _ = close(descriptor)
+    return contents
+
+
+# Append a C string's bytes (without its terminator) to a buffer.
+def push_cstr(buffer: mutable darray[u8]&, text: cstr) -> void can[Abort.Panic, Memory.Allocate]:
+    length: i64 = cstr_length(text)
+    for index in 0..<length |buffer, text|:
+        buffer.push(text[index.usize()].u8())
+
+
+# Parse `elisac-stage1 [-emit MODE] [-o OUT] [-O0|-O1|-O2|-O3] SOURCE` and build the SAME
+# buffer the stdin wire protocol produces: output path, newline, source bytes, NUL. Every
+# downstream stage is therefore untouched by the CLI existing — the two front doors meet
+# immediately and share one compile path.
+#
+# Unknown `-flags` are IGNORED rather than rejected: the host wrapper passes through
+# linker/target options this driver does not implement yet, and failing on them would make
+# the CLI less usable than the wrapper it replaces.
+def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    request: mutable darray[u8] = []
+    slots: mutable cstr&& = argv.cast[mutable cstr&&]
+    output_path: mutable darray[u8] = []
+    source_index: mutable i64 = 0
+    index: mutable i64 = 1
+    while index < argc |index, slots, output_path, source_index|:
+        argument: cstr = slots[index].cast[cstr]
+        if argument == "-o" and index + 1 < argc:
+            index <- index + 1
+            push_cstr(&output_path, slots[index].cast[cstr])
+        elif argument == "-emit" and index + 1 < argc:
+            index <- index + 1
+            _ = setenv("ELISA_STAGE1_EMIT", slots[index].cast[cstr], 1)
+        elif argument == "-O0":
+            _ = setenv("ELISA_STAGE1_OPT", "0", 1)
+        elif argument == "-O1":
+            _ = setenv("ELISA_STAGE1_OPT", "1", 1)
+        elif argument == "-O2":
+            _ = setenv("ELISA_STAGE1_OPT", "2", 1)
+        elif argument == "-O3":
+            _ = setenv("ELISA_STAGE1_OPT", "3", 1)
+        elif argument[0] != 45:
+            source_index <- index
+        index <- index + 1
+    request return if source_index == 0
+    source_path: cstr = slots[source_index].cast[cstr]
+    # Default output mirrors stage0's: the source path with the emit-appropriate suffix is
+    # the WRAPPER's business, so with no -o the compile still needs a destination; use the
+    # source path plus ".o" rather than inventing a name the caller cannot predict.
+    if output_path.count == 0:
+        push_cstr(&output_path, source_path)
+        output_path.push(46)
+        output_path.push(111)
+    contents: darray[u8] = read_file(source_path)
+    request return if contents.count == 0
+    for path_index in 0..<output_path.count |request, output_path|:
+        request.push(output_path[path_index])
+    request.push(10)
+    for content_index in 0..<contents.count |request, contents|:
+        request.push(contents[content_index])
+    request.push(0)
+    return request
+
+
 def read_all() -> darray[u8] can[Memory.Allocate, Abort.Panic]:
     buf: mutable darray[u8] = []
     chunk: mutable darray[u8] = []
@@ -1706,8 +1803,12 @@ def read_all() -> darray[u8] can[Memory.Allocate, Abort.Panic]:
     return buf
 
 
-def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    raw: darray[u8] = read_all()
+def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    # TWO front doors, ONE compile path. With arguments this is an ordinary CLI; with none
+    # it is the original stdin wire protocol, which the host wrapper and the bootstrap both
+    # still use. cli_request builds exactly the buffer read_all would have produced, so
+    # nothing downstream can tell the difference.
+    raw: darray[u8] = cli_request(argc, argv) if argc > 1 else read_all()
     1 return if raw.count <= 1
 
     out_path: mutable darray[u8] = []
