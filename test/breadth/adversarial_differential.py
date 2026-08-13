@@ -7967,5 +7967,54 @@ GENERATORS += [gen_nested_or_pattern_binding]
 
 
 
+def gen_monomorphized_ref_arithmetic():
+    """`+` on a scalar ref: the INSTANTIATED type must govern, generic or concrete.
+
+    `p + n` where p is a scalar reference is VALUE arithmetic (deref the referent, add) —
+    only `u8&`/`void&` is genuine byte-pointer stepping. That rule is type-directed, so it
+    cannot be decided while T is still a type parameter, and until 2026-08-13 BOTH
+    compilers got the generic form wrong in DIFFERENT ways:
+
+    - stage0 typed generic `T& + n` as POINTER arithmetic and kept that meaning after
+      instantiation, so `T&` with T := usize stepped the address while the identical code
+      spelled `usize&` added the value. Fixed by re-analyzing each instantiation with the
+      type parameters bound (semantic.SpecializedExprTypes).
+    - stage1 computed the sum correctly but left the expression typed `T&`, so a following
+      `.usize()` treated the SUM as an ADDRESS — inttoptr then load — and faulted. Fixed by
+      applying the referent rule at the type level too (expression_type).
+
+    All three arms matter and none is redundant: `generic` and `concrete` must agree with
+    each other (that agreement IS monomorphization), and `stepping` guards the `u8&`
+    exception, which a fix that simply deref'd every ref would silently destroy.
+    """
+    yield ("monomorphized_ref_arithmetic", """
+def add_generic[T](p: mutable T&, n: usize) -> usize can[Unsafe.PointerArithmetic]:
+	trusted [Unsafe.PointerArithmetic]:
+		return (p + n).usize()
+
+def add_concrete(p: mutable usize&, n: usize) -> usize can[Unsafe.PointerArithmetic]:
+	trusted [Unsafe.PointerArithmetic]:
+		return (p + n).usize()
+
+def step_bytes[T](p: mutable T&, n: usize) -> mutable void& can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+	trusted [Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+		return (p + n).cast[mutable void&]
+
+def main() -> i64:
+	can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+		x: mutable usize = 40
+		y: mutable usize = 40
+		generic: usize = add_generic(&x, 5)
+		concrete: usize = add_concrete(&y, 5)
+		bytes: mutable u8[4] = [7, 9, 11, 13]
+		stepped: mutable u8& = step_bytes(&bytes[0], 2).cast[mutable u8&]
+		return (generic.i64() * 7 + concrete.i64() * 3 + stepped[0].i64()) % 251
+""")
+
+
+GENERATORS += [gen_monomorphized_ref_arithmetic]
+
+
+
 if __name__ == "__main__":
     sys.exit(main())
