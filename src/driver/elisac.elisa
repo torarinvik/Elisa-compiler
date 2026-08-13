@@ -1737,6 +1737,156 @@ def push_cstr(buffer: mutable darray[u8]&, text: cstr) -> void can[Abort.Panic, 
         buffer.push(text[index.usize()].u8())
 
 
+# ---- native `include` expansion --------------------------------------------------------
+#
+# stage0 does this itself (readSourceWithIncludes); stage1 relied on the host wrapper to
+# flatten first, which is why feeding an `include` straight to the binary reported
+# "undefined identifier". A compiler that cannot resolve its own includes is not a drop-in
+# replacement, however good its codegen is.
+#
+# Recursive, deduplicated (an already-included file is skipped, matching stage0's
+# include-once behaviour), and resolved RELATIVE TO THE INCLUDING FILE's directory.
+
+# The directory part of a path, with its trailing slash; empty when the path has none.
+def path_directory(path: darray[u8]&) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+    directory: mutable darray[u8] = []
+    last_slash: mutable i64 = -1
+    for index in 0..<path.count |last_slash, path|:
+        last_slash <- index.i64() if path[index] == 47
+    directory return if last_slash < 0
+    for index in 0..<(last_slash + 1).usize() |directory, path|:
+        directory.push(path[index])
+    return directory
+
+
+# Resolve `relative` against `base_directory` unless it is already absolute.
+def resolve_include_path(base_directory: darray[u8]&, relative: darray[u8]&) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+    resolved: mutable darray[u8] = []
+    if relative.count > 0 and relative[0.usize()] == 47:
+        for index in 0..<relative.count |resolved, relative|:
+            resolved.push(relative[index])
+        return resolved
+    for index in 0..<base_directory.count |resolved, base_directory|:
+        resolved.push(base_directory[index])
+    for index in 0..<relative.count |resolved, relative|:
+        resolved.push(relative[index])
+    return normalize_path(resolved)
+
+
+# Collapse `./` segments so the SAME file resolved along different paths compares equal.
+# Without this a diamond include (`top` -> `mid` -> `sub/lib`, and `top` -> `sub/lib`)
+# produced "dir/././sub/lib" and "dir/./sub/lib", the dedupe missed, and the second copy
+# was spliced in — "duplicate declaration". `..` is deliberately NOT resolved: that needs
+# real path canonicalisation, and leaving it alone only costs a missed dedupe, never a
+# wrong file.
+def normalize_path(path: darray[u8]&) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+    normalized: mutable darray[u8] = []
+    index: mutable usize = 0.usize()
+    while index < path.count |index, normalized, path|:
+        at_segment_start: bool = normalized.count == 0.usize() or normalized[normalized.count - 1.usize()] == 47
+        if at_segment_start and path[index] == 46 and index + 1.usize() < path.count and path[index + 1.usize()] == 47:
+            index <- index + 2.usize()
+            continue
+        normalized.push(path[index])
+        index <- index + 1.usize()
+    return normalized
+
+
+def same_path(left: darray[u8]&, right: darray[u8]&) -> bool can[Abort.Panic]:
+    false return if left.count != right.count
+    for index in 0..<left.count |left, right|:
+        false return if left[index] != right[index]
+    return true
+
+
+# The quoted path of an `include "..."` line (optionally `#include`, optionally indented),
+# or an empty buffer when the line is not an include directive.
+def include_directive_path(line: darray[u8]&) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+    empty: mutable darray[u8] = []
+    cursor: mutable usize = 0.usize()
+    while cursor < line.count |cursor, line|:
+        break if line[cursor] != 32 and line[cursor] != 9
+        cursor <- cursor + 1.usize()
+    cursor <- cursor + 1.usize() if cursor < line.count and line[cursor] == 35
+    while cursor < line.count |cursor, line|:
+        break if line[cursor] != 32 and line[cursor] != 9
+        cursor <- cursor + 1.usize()
+    keyword: sview = "include"
+    empty return if cursor + 7.usize() > line.count
+    for keyword_index in 0..<7 |empty, line, cursor, keyword|:
+        empty return if line[cursor + keyword_index.usize()] != sview_at(keyword, keyword_index)
+    cursor <- cursor + 7.usize()
+    empty return if cursor >= line.count or (line[cursor] != 32 and line[cursor] != 9)
+    while cursor < line.count |cursor, line|:
+        break if line[cursor] != 32 and line[cursor] != 9
+        cursor <- cursor + 1.usize()
+    empty return if cursor >= line.count or line[cursor] != 34
+    cursor <- cursor + 1.usize()
+    captured: mutable darray[u8] = []
+    while cursor < line.count |cursor, line, captured|:
+        break if line[cursor] == 34
+        captured.push(line[cursor])
+        cursor <- cursor + 1.usize()
+    empty return if cursor >= line.count or line[cursor] != 34
+    return captured
+
+
+# Whether `path` already appears in the NUL-separated `seen` buffer.
+def path_already_seen(seen: darray[u8]&, path: darray[u8]&) -> bool can[Abort.Panic]:
+    start: mutable usize = 0.usize()
+    index: mutable usize = 0.usize()
+    while index < seen.count |index, start, seen, path|:
+        if seen[index] == 0:
+            if index - start == path.count:
+                matched: mutable bool = true
+                for offset in 0..<path.count |matched, seen, path, start|:
+                    matched <- false if seen[start + offset] != path[offset]
+                true return if matched
+            start <- index + 1.usize()
+        index <- index + 1.usize()
+    return false
+
+
+# Append `path`'s contents to `out`, splicing any includes it names. `seen` accumulates the
+# already-included paths so a diamond include contributes once and a cycle terminates.
+def expand_includes(path: darray[u8]&, out: mutable darray[u8]&, seen: mutable darray[u8]&, depth: i64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    false return if depth > 64
+    true return if path_already_seen(seen, path)
+    # Record the path by APPENDING its bytes plus a NUL. A `darray[darray[u8]]` would need
+    # each entry allocated in a region outliving the table, which the region checker
+    # correctly rejects for a locally-built buffer; one flat buffer sidesteps the
+    # ownership question entirely.
+    for index in 0..<path.count |seen, path|:
+        seen.push(path[index])
+    seen.push(0)
+    path_c: mutable darray[u8] = []
+    for index in 0..<path.count |path_c, path|:
+        path_c.push(path[index])
+    path_c.push(0)
+    contents: darray[u8] = read_file((&path_c[0]).cast[cstr] can Unsafe.PointerCast)
+    false return if contents.count == 0
+    directory: darray[u8] = path_directory(path)
+    line: mutable darray[u8] = []
+    index: mutable usize = 0.usize()
+    while index <= contents.count |index, contents, line, out, seen, directory, depth|:
+        at_end: bool = index == contents.count
+        byte: u8 = 10 if at_end else contents[index]
+        if byte == 10:
+            included: darray[u8] = include_directive_path(line)
+            if included.count > 0:
+                resolved: darray[u8] = resolve_include_path(directory, included)
+                _ = expand_includes(resolved, out, seen, depth + 1)
+            else:
+                for line_index in 0..<line.count |out, line|:
+                    out.push(line[line_index])
+                out.push(10)
+            line <- []
+        else:
+            line.push(byte)
+        index <- index + 1.usize()
+    return true
+
+
 # Parse `elisac-stage1 [-emit MODE] [-o OUT] [-O0|-O1|-O2|-O3] SOURCE` and build the SAME
 # buffer the stdin wire protocol produces: output path, newline, source bytes, NUL. Every
 # downstream stage is therefore untouched by the CLI existing — the two front doors meet
@@ -1779,7 +1929,14 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
         push_cstr(&output_path, source_path)
         output_path.push(46)
         output_path.push(111)
-    contents: darray[u8] = read_file(source_path)
+    # Expand includes HERE, natively, rather than requiring the caller to pre-flatten.
+    # Falls back to the raw file when expansion finds nothing to do, so a single-file
+    # program takes the same path it always did.
+    source_path_bytes: mutable darray[u8] = []
+    push_cstr(&source_path_bytes, source_path)
+    included_seen: mutable darray[u8] = []
+    expanded_source: mutable darray[u8] = []
+    contents: mutable darray[u8] = expanded_source if expand_includes(source_path_bytes, &expanded_source, &included_seen, 0) else read_file(source_path)
     request return if contents.count == 0
     for path_index in 0..<output_path.count |request, output_path|:
         request.push(output_path[path_index])
