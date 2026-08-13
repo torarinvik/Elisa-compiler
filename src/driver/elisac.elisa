@@ -33,6 +33,8 @@ extern open(path: cstr, flags: i64, ...) -> i64
 extern close(fd: i64) -> i64
 extern setenv(name: cstr, value: cstr, overwrite: i64) -> i64
 extern mkdir(path: cstr, mode: u16) -> i64
+extern system(command: cstr) -> i64
+extern unlink(path: cstr) -> i64
 # Diagnostics go to STDERR through the std's libc `write` (declared in debug_referee.elisa as
 # `write(fd: int, buf: void&, count: usize)`), NOT through `puts`: the driver includes
 # elisacore_std, whose own `puts` overload shadows libc's under both the stage0 seed and the
@@ -2131,6 +2133,67 @@ def run_init(argc: i64, argv: mutable void&) -> i64 can[Abort.Panic, Memory.Allo
 
 # The emit modes this driver actually implements. stage0 has more; claiming them here by
 # silently falling through to the object path would be worse than saying no.
+# `-emit exe`: compile to a temporary object, then LINK it against the runtime with the
+# host clang, plus any -link/-L/-l the caller passed. Linking is host tooling — stage0 has
+# no `exe` mode of its own; this matches what scripts/elisac_stage1.sh does, moved into the
+# compiler so a CLI user gets a runnable binary without the wrapper.
+def link_executable(object_path: darray[u8]&, exe_path: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    command: mutable darray[u8] = []
+    for prefix_index in 0..<sview_len("clang -Wl,-dead_strip -o ") |command|:
+        command.push(sview_at("clang -Wl,-dead_strip -o ", prefix_index))
+    for exe_index in 0..<exe_path.count |command, exe_path|:
+        command.push(exe_path[exe_index])
+    command.push(32)
+    for object_index in 0..<object_path.count |command, object_path|:
+        command.push(object_path[object_index])
+    command.push(32)
+    # The runtime object. ELISA_STAGE1_RUNTIME_OBJ overrides the repo-relative default so a
+    # caller outside the tree can still link.
+    runtime_storage: mutable darray[u8] = []
+    if not env_value("ELISA_STAGE1_RUNTIME_OBJ", &runtime_storage):
+        for default_index in 0..<sview_len("build/runtime/elisacore_runtime.o") |runtime_storage|:
+            runtime_storage.push(sview_at("build/runtime/elisacore_runtime.o", default_index))
+    for runtime_index in 0..<runtime_storage.count |command, runtime_storage|:
+        command.push(runtime_storage[runtime_index])
+    link_storage: mutable darray[u8] = []
+    if env_value("ELISA_STAGE1_LINK", &link_storage):
+        command.push(32)
+        for link_index in 0..<link_storage.count |command, link_storage|:
+            command.push(link_storage[link_index])
+    command.push(0)
+    command_c: cstr = (&command[0]).cast[cstr] can Unsafe.PointerCast
+    status: i64 = system(command_c)
+    object_c: mutable darray[u8] = []
+    for object_index in 0..<object_path.count |object_c, object_path|:
+        object_c.push(object_path[object_index])
+    object_c.push(0)
+    object_cstr: cstr = (&object_c[0]).cast[cstr] can Unsafe.PointerCast
+    _ = unlink(object_cstr)
+    return 0 if status == 0 else 8
+
+
+# Shared reader for the ELISA_STAGE1_* string variables. Appends to `storage` and reports
+# whether anything was found.
+def env_value(name: sview, storage: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    flag_storage: mutable darray[u8] = []
+    for flag_index in 0..<sview_len(name) |flag_storage, name|:
+        flag_storage.push(sview_at(name, flag_index))
+    flag_storage.push(0)
+    flag_name: cstr = (&flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+    if getenv(flag_name) is value_bytes:
+        cursor: mutable i64 = 0
+        keep_scanning: mutable bool = true
+        while keep_scanning |cursor, keep_scanning, storage, value_bytes|:
+            byte_ref: u8& = value_bytes + cursor
+            value_byte: u8 = byte_ref
+            if value_byte == 0:
+                keep_scanning <- false
+            else:
+                storage.push(value_byte)
+                cursor <- cursor + 1
+    return storage.count > 0
+
+
 def cli_emit_mode_supported(mode: cstr) -> bool can[Abort.Panic]:
     true return if mode == "obj"
     true return if mode == "llvm"
@@ -2141,6 +2204,7 @@ def cli_emit_mode_supported(mode: cstr) -> bool can[Abort.Panic]:
     true return if mode == "fmt"
     true return if mode == "deps"
     true return if mode == "deps-json"
+    true return if mode == "exe"
     return false
 
 
@@ -2156,6 +2220,7 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
     request: mutable darray[u8] = []
     slots: mutable cstr&& = argv.cast[mutable cstr&&]
     output_path: mutable darray[u8] = []
+    link_flags: mutable darray[u8] = []
     source_index: mutable i64 = 0
     index: mutable i64 = 1
     while index < argc |index, slots, output_path, source_index|:
@@ -2182,6 +2247,15 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
                 write_stderr(message)
                 return request
             _ = setenv("ELISA_STAGE1_EMIT", requested_mode, 1)
+        elif (argument == "-link" or argument == "-L" or argument == "-l") and index + 1 < argc:
+            # Linker passthrough. Accumulated into ELISA_STAGE1_LINK as a space-separated
+            # string; `-L`/`-l` keep their prefix so the flag reaches clang as written.
+            link_prefix: sview = "" if argument == "-link" else ("-L" if argument == "-L" else "-l")
+            index <- index + 1
+            link_flags.push(32) if link_flags.count > 0
+            for prefix_index in 0..<sview_len(link_prefix) |link_flags, link_prefix|:
+                link_flags.push(sview_at(link_prefix, prefix_index))
+            push_cstr(&link_flags, slots[index].cast[cstr])
         elif argument == "-target-triple" and index + 1 < argc:
             # CROSS-COMPILATION. The backend already accepted a requested triple
             # (configure_module_target_for) and initializes the AArch64/ARM/x86/RISCV/wasm
@@ -2203,6 +2277,10 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
             # the CLI must set it too or a CLI-compiled program reports a bare line number.
             _ = setenv("ELISA_STAGE1_SRC", argument, 1)
         index <- index + 1
+    if link_flags.count > 0:
+        link_flags.push(0)
+        link_flags_c: cstr = (&link_flags[0]).cast[cstr] can Unsafe.PointerCast
+        _ = setenv("ELISA_STAGE1_LINK", link_flags_c, 1)
     request return if source_index == 0
     source_path: cstr = slots[source_index].cast[cstr]
     # Default output mirrors stage0's: the source path with the emit-appropriate suffix is
@@ -2427,6 +2505,24 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
         # of assembled. It runs after the optimisation pipeline above, so `-O2 -emit bc`
         # is optimised bitcode, matching what stage0 writes.
         7 return if LLVMWriteBitcodeToFile(module_handle, path_cstr) != 0
+    elif emit_mode_is("exe"):
+        # Emit the object BESIDE the requested executable (path + ".o"), link, then remove
+        # it. Writing next to the target keeps the temporary on the same filesystem the
+        # caller can write to.
+        object_path: mutable darray[u8] = []
+        for path_index in 0..<out_path.count |object_path, out_path|:
+            object_path.push(out_path[path_index]) if out_path[path_index] != 0
+        object_path.push(46)
+        object_path.push(111)
+        object_path.push(0)
+        object_cstr: cstr = (&object_path[0]).cast[cstr] can Unsafe.PointerCast
+        4 return if not Backend::emit_object(machine, module_handle, object_cstr)
+        object_path.pop()
+        exe_path: mutable darray[u8] = []
+        for path_index in 0..<out_path.count |exe_path, out_path|:
+            exe_path.push(out_path[path_index]) if out_path[path_index] != 0
+        link_status: i64 = link_executable(object_path, exe_path)
+        link_status return if link_status != 0
     else:
         4 return if not Backend::emit_object(machine, module_handle, path_cstr)
 
