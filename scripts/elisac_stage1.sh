@@ -234,6 +234,11 @@ fi
 # Optimisation level and emit mode reach the driver via env (the stdin protocol
 # carries only the output path and the source).
 driver_env=()
+# Diagnostics name the source file (stage0's `PATH:LINE: message`). The wrapper is the only
+# side that knows the ORIGINAL path once includes are flattened, so pass it for EVERY mode,
+# not just the report modes below — otherwise a wrapper-compiled program reports a bare
+# line number while the same file compiled through the CLI names itself.
+driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The

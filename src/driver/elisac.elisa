@@ -68,13 +68,83 @@ def write_stderr(buffer: darray[u8]&) -> void can[Abort.Panic, Unsafe.PointerCas
     # accept/reject DECISION matched stage0 while the compiler was unusable for the thing a
     # diagnostic exists to do. Errors only: warnings do not block the build, and stage1's
     # semantic layer still over-reports them relative to stage0.
+# Append the source path from ELISA_STAGE1_SRC, raw (no escaping — that is the JSON
+# tokens report's concern). Nothing is appended when the variable is unset, which is how a
+# pure-stdin caller that never named a file still gets a usable `LINE: message`.
+def push_source_path(buffer: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    flag_storage: mutable darray[u8] = []
+    for flag_index in 0..<sview_len("ELISA_STAGE1_SRC") |flag_storage|:
+        flag_storage.push(sview_at("ELISA_STAGE1_SRC", flag_index))
+    flag_storage.push(0)
+    flag_name: cstr = (&flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+    wrote_any: mutable bool = false
+    if getenv(flag_name) is path_bytes:
+        cursor: mutable i64 = 0
+        keep_scanning: mutable bool = true
+        while keep_scanning |cursor, keep_scanning, buffer, wrote_any, path_bytes|:
+            byte_ref: u8& = path_bytes + cursor
+            path_byte: u8 = byte_ref
+            if path_byte == 0:
+                keep_scanning <- false
+            else:
+                buffer.push(path_byte)
+                wrote_any <- true
+                cursor <- cursor + 1
+    return wrote_any
+
+
+# A PARSE error, in stage0's position shape `PATH:LINE:COLUMN: message`.
+#
+# stage1 previously reported parse errors by exiting 1 with NO output at all — the one
+# class of diagnostic every user hits first, and the compiler said nothing. Unlike a
+# semantic Diagnostic, Ast::ParseError carries BOTH line and column, so the position here
+# is exactly stage0's.
+#
+# The wording is deliberately close-but-not-identical to stage0's: stage0 names the
+# offending TOKEN KIND ("unexpected token DEDENT in expression"), which needs a token-kind
+# name table this driver does not have. The offending token's TEXT is printed instead,
+# which is the actionable part. Position parity first; wording parity is a separate job.
+def report_parse_error(failure: Ast::ParseError) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    line_buffer: mutable darray[u8] = []
+    if push_source_path(&line_buffer):
+        line_buffer.push(58)                              # ':'
+    append_decimal(line_buffer, failure.line)
+    line_buffer.push(58)                                  # ':'
+    append_decimal(line_buffer, failure.column)
+    line_buffer.push(58)                                  # ':'
+    line_buffer.push(32)                                  # ' '
+    text: sview = match failure.kind:
+        Ast::ParseErrorKind.ExpectedToken: "expected a different token"
+        Ast::ParseErrorKind.UnexpectedToken: "unexpected token"
+        Ast::ParseErrorKind.ExpectedDeclaration: "expected a declaration"
+        Ast::ParseErrorKind.ExpectedExpression: "expected an expression"
+        Ast::ParseErrorKind.MismatchedWithBindings: "or-arm alternatives bind different constants"
+        Ast::ParseErrorKind.SubmitOutsidePool: "submit outside a pool"
+        _: "parse error"
+    for text_index in 0..<sview_len(text) |line_buffer, text|:
+        line_buffer.push(sview_at(text, text_index))
+    if sview_len(failure.context) > 0:
+        for prefix_index in 0..<sview_len(" near \"") |line_buffer|:
+            line_buffer.push(sview_at(" near \"", prefix_index))
+        for context_index in 0..<sview_len(failure.context) |line_buffer, failure|:
+            line_buffer.push(sview_at(failure.context, context_index))
+        line_buffer.push(34)                              # '"'
+    line_buffer.push(10)
+    write_stderr(line_buffer)
+
+
 def report_diagnostic(diagnostic: Semantic::Diagnostic) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
     line_buffer: mutable darray[u8] = []
+    # stage0's shape is `PATH:LINE:COLSTART-COLEND: MESSAGE`. The path and line are here;
+    # the COLUMN SPAN is not, because Semantic::Diagnostic carries only `line` — supplying
+    # columns means threading spans through every diagnostic construction site, which is a
+    # separate piece of work. Emitting `PATH:LINE:` is what editors and CI actually need to
+    # jump to the fault, and it is strictly closer to stage0 than the previous bare LINE.
+    if push_source_path(&line_buffer):
+        line_buffer.push(58)                              # ':'
     append_decimal(line_buffer, diagnostic.line)
     line_buffer.push(58)                                  # ':'
     line_buffer.push(32)                                  # ' '
-    for label_index in 0..<sview_len("error: ") |line_buffer|:
-        line_buffer.push(sview_at("error: ", label_index))
     message: darray[u8] = Semantic::diagnostic_message(diagnostic)
     line_buffer.extend(message)
     line_buffer.push(10)                                  # '\n'
@@ -1919,6 +1989,9 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
             _ = setenv("ELISA_STAGE1_OPT", "3", 1)
         elif argument[0] != 45:
             source_index <- index
+            # Diagnostics name the file. The wrapper already set this for its own callers;
+            # the CLI must set it too or a CLI-compiled program reports a bare line number.
+            _ = setenv("ELISA_STAGE1_SRC", argument, 1)
         index <- index + 1
     request return if source_index == 0
     source_path: cstr = slots[source_index].cast[cstr]
@@ -1992,7 +2065,10 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
     # Safe because `-emit fmt` returns below, before the semantic gate and codegen.
     parser_set_preserve_parens(emit_mode_is("fmt"))
     file: mutable Ast::File = frontend_parser_parse_file(src_ptr, tokens)
-    1 return if file.errors.count != 0
+    if file.errors.count != 0:
+        for parse_error_index in 0..<file.errors.count |file|:
+            report_parse_error(file.errors[parse_error_index])
+        return 1
 
     # `-emit ast` prints the parse-tree summary and stops, as stage0 does.
     if emit_mode_is("ast"):
@@ -2025,7 +2101,10 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
         expanded_src_ptr <- &expanded[0]
         expanded_tokens <- frontend_tokenize_with_length(expanded_src_ptr, expanded_src_ptr, expanded.count)
         file <- frontend_parser_parse_file(expanded_src_ptr, expanded_tokens)
-        1 return if file.errors.count != 0
+        if file.errors.count != 0:
+            for parse_error_index in 0..<file.errors.count |file|:
+                report_parse_error(file.errors[parse_error_index])
+            return 1
 
     # Analyse before emitting, as stage0 does: exit 1 on any ERROR-severity finding
     # (severity 1); warnings (2) do not block. Status codes only — see the note on
