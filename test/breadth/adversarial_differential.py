@@ -7917,5 +7917,55 @@ GENERATORS += [gen_region_new_allocation]
 
 
 
+def gen_nested_or_pattern_binding():
+    """`Outer.Leaf(Inner.A(v) | Inner.B(v))` — a nested or-pattern that BINDS a payload.
+
+    Both compilers were wrong here, in different ways, until 2026-08-13:
+
+    - stage0 MISCOMPILED it. The payload spill was emitted inside the FIRST option's
+      basic block, which does not dominate the later options' blocks, so every option
+      after the first loaded an uninitialised slot and bound a CONSTANT. Keyword(40),
+      (55) and (99) all returned 1.
+    - stage1 DECLINED it, and the decline was deliberate: the lowering had been written,
+      verified, then reverted, because emitting the correct answer read as a differential
+      MISMATCH against the wrong oracle.
+
+    So this shape needs a probe that varies the payload across BOTH options. A single
+    value, or a value that happens to equal the variant ordinal, is exactly what let the
+    constant-binding bug look like a clean match for as long as it did.
+
+    `second` deliberately exercises the option that was broken (the non-first one) and
+    `first` guards against a fix that breaks the option that already worked.
+    """
+    yield ("nested_or_pattern_binding", """
+enum Token:
+	Ident(value: i64)
+	Keyword(value: i64)
+	Other
+
+enum Expr:
+	Leaf(kind: Token)
+	Missing
+
+def unwrap(t: Token) -> i64:
+	expr: Expr = Expr.Leaf(t)
+	match expr:
+		Expr.Leaf(Token.Ident(value) | Token.Keyword(value)):
+			return value
+		_:
+			return 999
+
+def main() -> i64:
+	second: i64 = unwrap(Token.Keyword(40))
+	first: i64 = unwrap(Token.Ident(7))
+	other: i64 = unwrap(Token.Other)
+	return (second * 3 + first * 5 + other) % 251
+""")
+
+
+GENERATORS += [gen_nested_or_pattern_binding]
+
+
+
 if __name__ == "__main__":
     sys.exit(main())
