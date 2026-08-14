@@ -145,6 +145,11 @@ while [[ $# -gt 0 ]]; do
         doc)    emit_mode="doc" ;;
         header) emit_mode="header" ;;
         test-runner) emit_mode="test-runner" ;;
+        # stage0 refuses `-o` for these three and prints the listing on stdout; the
+        # wrapper mirrors that rather than inventing a file-writing form.
+        tests) emit_mode="tests" ;;
+        benches) emit_mode="benches" ;;
+        fixtures) emit_mode="fixtures" ;;
         c-bind-check) emit_mode="c-bind-check" ;;
         c-bind-check-json) emit_mode="c-bind-check-json" ;;
         packed) emit_mode="packed" ;;
@@ -155,7 +160,7 @@ while [[ $# -gt 0 ]]; do
         interpret) emit_mode="interpret" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit tests, -emit benches, -emit fixtures, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -filter)
@@ -183,6 +188,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# `-emit tests|benches|fixtures` list annotated functions on STDOUT and stage0 rejects
+# `-o` for them, so they are the one shape that needs no output path.
+case "$emit_mode" in
+  tests|benches|fixtures)
+    if [[ -n "$out" ]]; then
+      echo "error: -o is not supported for -emit $emit_mode" >&2; exit 1
+    fi
+    out=/dev/null ;;
+esac
 [[ -n "$out" && -n "$src" ]] || { echo "usage: $0 -o out.o source.elisa" >&2; exit 2; }
 [[ -f "$src" ]] || { echo "missing source: $src" >&2; exit 2; }
 
@@ -269,6 +283,12 @@ if [[ "$emit_mode" == "c-archive" ]]; then
   # Set AFTER driver_env is initialised — an earlier placement was silently wiped by the
   # `driver_env=()` below it, so the archive shipped without the runtime object.
   [[ -f "$runtime_obj" ]] && driver_env+=("ELISA_RUNTIME_OBJ=$runtime_obj")
+fi
+# `-emit tests|benches|fixtures` also print on STDOUT, but stage0 refuses `-o` for them,
+# so unlike the text reports below they are NOT redirected — the listing IS the stdout.
+if [[ "$emit_mode" == "tests" || "$emit_mode" == "benches" || "$emit_mode" == "fixtures" ]]; then
+  driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
+  [[ -n "$test_filter" ]] && driver_env+=("ELISA_STAGE1_FILTER=$test_filter")
 fi
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.

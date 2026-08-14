@@ -3391,6 +3391,136 @@ def emit_test_runner_report(file: Ast::File&, source: u8&, source_len: usize) ->
     return emit_tokens_flush(buffer)
 
 
+# `-emit tests` / `-emit benches` / `-emit fixtures` — one TAB-separated
+# `NAME<TAB>SIGNATURE` row per annotated function, in declaration order, selected by the
+# same substring `-filter` the test runner uses. stage0 refuses `-o` for all three, so the
+# report always goes to stdout.
+#
+# The signature is stage0's SEMANTIC FuncType string, but every annotated function is
+# already constrained to take NO PARAMETERS — a param-bearing `@test`/`@bench`/`@fixture`
+# is a hard error raised before the listing runs — so the head is always `fn()`. That
+# leaves two variable parts:
+#
+#   * the RETURN TYPE, recovered from the declaration line's tokens exactly the way
+#     `-emit iface` recovers it (an absent `->` prints `void`); and
+#   * the permission clause, which stage0 renders from the FAMILY names only —
+#     `can[Memory.Allocate, Console.Write]` prints as `can[Console, Memory]`, i.e.
+#     deduplicated and SORTED, not source order. A `@fixture` may not require permissions
+#     at all, so in practice only tests and benches ever grow one.
+
+
+# `Memory.Allocate` -> `Memory`. An effect with no dot is already a family.
+def annotated_effect_family(effect: sview) -> sview can[Abort.Panic]:
+    dot: i64 = sview_find_byte(effect, 46)
+    effect return if dot < 0
+    return string_view_prefix(effect, dot)
+
+
+def annotated_family_less(left: sview, right: sview) -> bool can[Abort.Panic]:
+    shorter: usize = sview_len(left) if sview_len(left) < sview_len(right) else sview_len(right)
+    for probe in 0..<shorter |left, right|:
+        left_byte: u8 = sview_at(left, probe)
+        right_byte: u8 = sview_at(right, probe)
+        true return if left_byte < right_byte
+        false return if left_byte > right_byte
+    return sview_len(left) < sview_len(right)
+
+
+# ` can[A, B]`, families deduplicated and sorted ascending. Emits nothing when the
+# function declares no effects.
+def annotated_push_effects(buffer: mutable darray[u8]&, effects: darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    families: mutable darray[sview] = []
+    for effect in effects |families|:
+        family: sview = annotated_effect_family(effect)
+        seen: mutable bool = false
+        for known in families |seen, family|:
+            seen <- true if known == family
+        families.push(family) if not seen
+    return if families.count == 0
+    # Selection sort: the family count is bounded by the permission taxonomy, so the
+    # quadratic shape is irrelevant and the code stays obviously correct.
+    for slot in 0..<families.count |families|:
+        best: mutable usize = slot
+        for probe in (slot + 1)..<families.count |best, families|:
+            best <- probe if annotated_family_less(families[probe], families[best])
+        if best != slot:
+            swap: sview = families[slot]
+            families[slot] <- families[best]
+            families[best] <- swap
+    emit_tokens_push_sview(buffer, " can[")
+    for index in 0..<families.count |buffer, families|:
+        emit_tokens_push_sview(buffer, ", ") if index > 0
+        emit_tokens_push_sview(buffer, families[index])
+    emit_tokens_push_sview(buffer, "]")
+
+
+# `fn() -> RET`, the return type taken from the declaration line's tokens.
+def annotated_push_signature(buffer: mutable darray[u8]&, line: u32, tokens: darray[Lexer::Token]&, source: u8&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    emit_tokens_push_sview(buffer, "fn() -> ")
+    line_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
+    if not line_range.found:
+        emit_tokens_push_sview(buffer, "void")
+        return
+    arrow_index: mutable usize = 0
+    arrow_found: mutable bool = false
+    for arrow_probe in line_range.start..<line_range.stop |arrow_index, arrow_found, tokens|:
+        continue if arrow_found
+        if tokens[arrow_probe].kind == Lexer::TokenKind.Arrow:
+            arrow_index <- arrow_probe
+            arrow_found <- true
+    if not arrow_found:
+        emit_tokens_push_sview(buffer, "void")
+        return
+    # The type ends at the effects clause when there is one, otherwise at the trailing
+    # colon — which must be matched at bracket depth 0 so a tuple return `(a: i64)` or a
+    # `dict[i64, i64]` does not truncate it.
+    ret_stop: mutable usize = line_range.stop
+    depth: mutable i64 = 0
+    scanning: mutable bool = true
+    for ret_probe in (arrow_index + 1)..<line_range.stop |ret_stop, depth, scanning, tokens, source|:
+        continue if not scanning
+        ret_token: Lexer::Token = tokens[ret_probe]
+        depth <- depth + 1 if ret_token.kind == Lexer::TokenKind.LParen or ret_token.kind == Lexer::TokenKind.LBracket
+        depth <- depth - 1 if ret_token.kind == Lexer::TokenKind.RParen or ret_token.kind == Lexer::TokenKind.RBracket
+        stops: bool = depth == 0 and ((ret_token.kind == Lexer::TokenKind.Ident and Lexer::text_or_empty(ret_token, source) == "can") or ret_token.kind == Lexer::TokenKind.Colon)
+        if stops:
+            ret_stop <- ret_probe
+            scanning <- false
+    if ret_stop <= arrow_index + 1:
+        emit_tokens_push_sview(buffer, "void")
+        return
+    emit_iface_render_tokens(buffer, tokens, source, arrow_index + 1, ret_stop)
+
+
+def annotated_report_decls(buffer: mutable darray[u8]&, declarations: darray[Ast::Decl]&, annotation: sview, needle: darray[u8]&, tokens: darray[Lexer::Token]&, source: u8&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    for declaration in declarations |buffer, annotation, needle, tokens, source|:
+        if declaration is Decl.Module(ann_m_name, ann_m_body, ann_m_line):
+            annotated_report_decls(buffer, ann_m_body, annotation, needle, tokens, source)
+            continue
+        if declaration is Decl.Scoped(ann_s_body, ann_s_line):
+            annotated_report_decls(buffer, ann_s_body, annotation, needle, tokens, source)
+            continue
+        if declaration is Decl.Func(ann_f_name, ann_f_params, ann_f_ret, ann_f_body, ann_f_effects, ann_f_decorators, ann_f_line):
+            matched: mutable bool = false
+            for ann_f_decorator in ann_f_decorators |matched, annotation|:
+                matched <- true if ann_f_decorator.name == annotation
+            continue if not matched
+            continue if not test_name_matches(ann_f_name, needle)
+            emit_tokens_push_sview(buffer, ann_f_name)
+            buffer.push(9)
+            annotated_push_signature(buffer, ann_f_line, tokens, source)
+            annotated_push_effects(buffer, ann_f_effects)
+            buffer.push(10)
+
+
+def emit_annotated_report(file: Ast::File&, annotation: sview, tokens: darray[Lexer::Token]&, source: u8&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    needle: mutable darray[u8] = []
+    push_test_filter(&needle)
+    buffer: mutable darray[u8] = []
+    annotated_report_decls(&buffer, file.top_decls, annotation, needle, tokens, source)
+    return emit_tokens_flush(buffer)
+
+
 # `-emit header` — the C ABI header for a unit's exports.
 #
 # The GENERATOR already existed (src/backend/c_header.elisa, exercised by
@@ -4151,6 +4281,18 @@ def joined_path(base: darray[u8]&, leaf: sview) -> darray[u8] can[Abort.Panic, M
     return joined
 
 
+# joined_path for a leaf that is BUILT rather than literal — `init-lib` derives its file
+# names from the library name, so the leaf is a buffer, not an sview.
+def joined_path_bytes(base: darray[u8]&, leaf: darray[u8]&) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+    joined: mutable darray[u8] = []
+    for index in 0..<base.count |joined, base|:
+        joined.push(base[index])
+    joined.push(47)
+    for leaf_index in 0..<leaf.count |joined, leaf|:
+        joined.push(leaf[leaf_index])
+    return joined
+
+
 def run_init(argc: i64, argv: mutable void&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
     slots: mutable cstr&& = argv.cast[mutable cstr&&]
     project_name: mutable darray[u8] = []
@@ -4219,6 +4361,121 @@ def run_init(argc: i64, argv: mutable void&) -> i64 can[Abort.Panic, Memory.Allo
     _ = write_file(library_keep, "")
     _ = write_file(test_keep, "")
     return 0
+
+
+# `elisac init-lib <name> [--path <dir>]` — the LIBRARY scaffold, a different shape from
+# `init`'s application one: a `<name>.elisalib` bundle directory holding a manifest, a
+# README, and a src/ with a source and its matching `.elisai` interface. There is no
+# `--strict`, no project.json, and no build/native/test/lib tree.
+def run_init_lib(argc: i64, argv: mutable void&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    slots: mutable cstr&& = argv.cast[mutable cstr&&]
+    library_name: mutable darray[u8] = []
+    base_directory: mutable darray[u8] = []
+    index: mutable i64 = 2
+    rejected: mutable bool = false
+    while index < argc |index, slots, library_name, base_directory, rejected|:
+        argument: cstr = slots[index].cast[cstr]
+        if argument == "--path" and index + 1 < argc:
+            index <- index + 1
+            push_cstr(&base_directory, slots[index].cast[cstr])
+        elif argument[0] != 45 and library_name.count == 0:
+            push_cstr(&library_name, argument)
+        elif argument[0] == 45:
+            rejected <- true
+        index <- index + 1
+    if library_name.count == 0 or rejected:
+        usage: mutable darray[u8] = []
+        for usage_index in 0..<sview_len("usage: elisac init-lib <name> [--path <dir>]\n") |usage|:
+            usage.push(sview_at("usage: elisac init-lib <name> [--path <dir>]\n", usage_index))
+        write_stderr(usage)
+        return 1
+    root: mutable darray[u8] = []
+    if base_directory.count > 0:
+        make_directory(base_directory)
+        for base_index in 0..<base_directory.count |root, base_directory|:
+            root.push(base_directory[base_index])
+        root.push(47) if root[root.count - 1.usize()] != 47
+    for name_index in 0..<library_name.count |root, library_name|:
+        root.push(library_name[name_index])
+    for suffix_index in 0..<sview_len(".elisalib") |root|:
+        root.push(sview_at(".elisalib", suffix_index))
+    make_directory(root)
+    source_directory: darray[u8] = joined_path(root, "src")
+    make_directory(source_directory)
+    # `native/` is created EMPTY, so `find -type f` cannot see it — the same trap the
+    # `init` scaffold hit. It is part of stage0's bundle and a `diff -r` catches its
+    # absence where a file listing does not.
+    native_directory: darray[u8] = joined_path(root, "native")
+    make_directory(native_directory)
+    # The bundle CONTENTS are written by a helper so their buffers nest inside `root`'s
+    # lifetime instead of interleaving with it — the inferred region rejects overlapping
+    # growable locals once the stack budget is spent.
+    return write_init_lib_files(source_directory, root, library_name)
+
+
+def write_init_lib_files(source_directory: darray[u8]&, root: darray[u8]&, library_name: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    # One file per helper. Each of these builds two growable buffers (a path and a body),
+    # which is already the practical ceiling before the inferred region reports their live
+    # ranges as interleaved — writing all four inline does not compile.
+    write_init_lib_manifest(root, library_name)
+    write_init_lib_readme(root, library_name)
+    write_init_lib_source(source_directory, library_name)
+    write_init_lib_interface(source_directory, library_name)
+    return 0
+
+
+# `<name>` followed by a literal suffix, appended to an existing buffer so the caller keeps
+# the only growable.
+def push_name_with_suffix(buffer: mutable darray[u8]&, library_name: darray[u8]&, suffix: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    for name_index in 0..<library_name.count |buffer, library_name|:
+        buffer.push(library_name[name_index])
+    emit_tokens_push_sview(buffer, suffix)
+
+
+def write_init_lib_manifest(root: darray[u8]&, library_name: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    manifest: mutable darray[u8] = []
+    emit_tokens_push_sview(&manifest, "{\n  \"provides\": \"")
+    push_name_with_suffix(&manifest, library_name, "\",\n  \"entry\": \"src/")
+    push_name_with_suffix(&manifest, library_name, ".elisa\",\n  \"interface\": \"src/")
+    push_name_with_suffix(&manifest, library_name, ".elisai\",\n  \"include-dirs\": [\n    \"src\"\n  ]\n}\n")
+    manifest_path: darray[u8] = joined_path(root, "manifest.json")
+    _ = write_file_bytes(manifest_path, manifest)
+
+
+def write_init_lib_readme(root: darray[u8]&, library_name: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    readme: mutable darray[u8] = []
+    emit_tokens_push_sview(&readme, "# ")
+    push_name_with_suffix(&readme, library_name, "\n")
+    readme_path: darray[u8] = joined_path(root, "README.md")
+    _ = write_file_bytes(readme_path, readme)
+
+
+def write_init_lib_source(source_directory: darray[u8]&, library_name: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    body: mutable darray[u8] = []
+    emit_tokens_push_sview(&body, "def ")
+    push_name_with_suffix(&body, library_name, "_value() -> int:\n    return 1\n")
+    source_path: mutable darray[u8] = []
+    push_derived_bundle_path(&source_path, source_directory, library_name, ".elisa")
+    _ = write_file_bytes(source_path, body)
+
+
+def write_init_lib_interface(source_directory: darray[u8]&, library_name: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    body: mutable darray[u8] = []
+    emit_tokens_push_sview(&body, "extern ")
+    push_name_with_suffix(&body, library_name, "_value() -> int\n")
+    interface_path: mutable darray[u8] = []
+    push_derived_bundle_path(&interface_path, source_directory, library_name, ".elisai")
+    _ = write_file_bytes(interface_path, body)
+
+
+# `<directory>/<name><extension>`, appended in place.
+def push_derived_bundle_path(buffer: mutable darray[u8]&, directory: darray[u8]&, library_name: darray[u8]&, extension: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    for directory_index in 0..<directory.count |buffer, directory|:
+        buffer.push(directory[directory_index])
+    buffer.push(47)
+    push_name_with_suffix(buffer, library_name, extension)
+
+
 
 
 # The emit modes this driver actually implements. stage0 has more; claiming them here by
@@ -4297,6 +4554,9 @@ def cli_emit_mode_supported(mode: cstr) -> bool can[Abort.Panic]:
     true return if mode == "doc"
     true return if mode == "header"
     true return if mode == "test-runner"
+    true return if mode == "tests"
+    true return if mode == "benches"
+    true return if mode == "fixtures"
     true return if mode == "c-bind-check"
     true return if mode == "c-bind-check-json"
     true return if mode == "packed"
@@ -4348,8 +4608,8 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
                 for prefix_index in 0..<sview_len("unsupported -emit mode: ") |message|:
                     message.push(sview_at("unsupported -emit mode: ", prefix_index))
                 push_cstr(&message, requested_mode)
-                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe c-archive lowered progress interpret deps deps-json\n") |message|:
-                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe c-archive lowered progress interpret deps deps-json\n", suffix_index))
+                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner tests benches fixtures c-bind-check c-bind-check-json packed unsafe c-archive lowered progress interpret deps deps-json\n") |message|:
+                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner tests benches fixtures c-bind-check c-bind-check-json packed unsafe c-archive lowered progress interpret deps deps-json\n", suffix_index))
                 write_stderr(message)
                 return request
             _ = setenv("ELISA_STAGE1_EMIT", requested_mode, 1)
@@ -4486,6 +4746,7 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
     if argc > 1:
         first_argument: mutable cstr&& = argv.cast[mutable cstr&&]
         run_init(argc, argv) return if first_argument[1].cast[cstr] == "init"
+        run_init_lib(argc, argv) return if first_argument[1].cast[cstr] == "init-lib"
     raw: darray[u8] = cli_request(argc, argv) if argc > 1 else read_all()
     # `-emit deps`/`deps-json` answer from the include graph alone — no parse, no analysis.
     # Placed after cli_request so the CLI has recorded the source path it walks from.
@@ -4539,6 +4800,13 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
     # `-emit test-runner` echoes the unit and appends a synthesized `ctx_test_main`.
     if emit_mode_is("test-runner"):
         return emit_test_runner_report(file, src_ptr, source_len)
+    # `-emit tests` / `benches` / `fixtures` list the matching annotated functions.
+    if emit_mode_is("tests"):
+        return emit_annotated_report(file, "test", tokens, src_ptr)
+    if emit_mode_is("benches"):
+        return emit_annotated_report(file, "bench", tokens, src_ptr)
+    if emit_mode_is("fixtures"):
+        return emit_annotated_report(file, "fixture", tokens, src_ptr)
     # `-emit c-bind-check` compares each `@c_bind` struct's layout against the real C one.
     if emit_mode_is("c-bind-check"):
         return emit_c_bind_report(file, tokens, src_ptr, false)
