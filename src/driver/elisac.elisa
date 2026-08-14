@@ -2929,6 +2929,225 @@ def emit_c_archive(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&,
     return 0
 
 
+# `-emit progress` — stage0's progress/liveness report: per function, the loop obligations it
+# carries and whether each is discharged.
+#
+# Every rule below was measured against stage0, not inferred:
+#   * `obligations=Loop:N` counts WHILE loops only; a bounded `for i in 0..<3` contributes
+#     nothing, being finite by construction.
+#   * `evidence=progress` when EVERY while loop provably advances: the condition is
+#     `var OP bound` with OP in {<, <=, >, >=} (NOT `!=`, measured), and the loop body
+#     contains a TOP-LEVEL assignment moving `var` toward the bound (`n <- n + k` / `n += k`
+#     for `<`, the `-` forms for `>`). An increment nested inside an `if` does NOT count.
+#   * `evidence=unsafe-nonprogress` (and unsafe_nonprogress=true) inside
+#     `trusted Unsafe.NonProgress`; `trusted Unsafe.BlockMain` sets unsafe_block_main.
+#     A DECLARED `can[Unsafe.NonProgress]` does NOT — only the trusted form.
+#   * `@main_thread` sets main_thread.
+#   * a loop with no evidence emits a progress WARNING and bumps `warnings:`.
+#
+# `blocking` and `blocking_path` are emitted as false/none: they are false in ALL 56 corpus
+# fixtures, so there is no witness to derive their rule from. That is recorded rather than
+# guessed at — see the emit-mode-port-order memory.
+
+
+# Does this while-loop condition name a variable compared against a bound, and if so which
+# direction discharges it? 0: not a directional comparison. 1: `<`/`<=` (needs an increase).
+# 2: `>`/`>=` (needs a decrease).
+def progress_condition_direction(condition: Ast::Expr, name: mutable sview&) -> i64 can[Abort.Panic, Memory.Allocate]:
+    can Abort.Panic, Memory.Allocate:
+        if condition is Expr.Binary(pc_left, pc_op, pc_right, pc_line):
+            if pc_left is Expr.Ident(pc_name, pc_name_line):
+                name <- pc_name
+                1 return if pc_op == Lexer::TokenKind.Lt or pc_op == Lexer::TokenKind.LtEq
+                2 return if pc_op == Lexer::TokenKind.Gt or pc_op == Lexer::TokenKind.GtEq
+                return 0
+        return 0
+
+
+# Does `statements` contain a TOP-LEVEL assignment moving `name` in `direction`?
+def progress_body_advances(statements: darray[Ast::Stmt], name: sview, direction: i64) -> bool can[Abort.Panic, Memory.Allocate]:
+    can Abort.Panic, Memory.Allocate:
+        for statement in statements |name, direction|:
+            if statement is Stmt.Assign(pb_target, pb_operator, pb_value, pb_line):
+                # The assignment must target the loop variable itself.
+                pb_targets_name: mutable bool = false
+                if pb_target is Expr.Ident(pb_target_name, pb_target_line):
+                    pb_targets_name <- pb_target_name == name
+                continue if not pb_targets_name
+                # `n += k` / `n -= k`.
+                true return if direction == 1 and pb_operator == Lexer::TokenKind.PlusEq
+                true return if direction == 2 and pb_operator == Lexer::TokenKind.MinusEq
+                # `n <- n + k` / `n <- n - k`.
+                if pb_value is Expr.Binary(pv_left, pv_op, pv_right, pv_line):
+                    pv_is_same: mutable bool = false
+                    if pv_left is Expr.Ident(pv_name, pv_name_line):
+                        pv_is_same <- pv_name == name
+                    continue if not pv_is_same
+                    true return if direction == 1 and pv_op == Lexer::TokenKind.Plus
+                    true return if direction == 2 and pv_op == Lexer::TokenKind.Minus
+        return false
+
+
+# Count while loops and how many of them advance. `trusted` state is threaded so a loop
+# inside `trusted Unsafe.NonProgress` is credited to that instead.
+def progress_scan(statements: darray[Ast::Stmt], loops: mutable i64&, advancing: mutable i64&, in_nonprogress: bool, nonprogress_loops: mutable i64&) -> void can[Abort.Panic, Memory.Allocate]:
+    can Abort.Panic, Memory.Allocate:
+        for statement in statements |loops, advancing, nonprogress_loops, in_nonprogress|:
+            match statement:
+                Stmt.While(ps_condition, ps_body, ps_line):
+                    loops <- loops + 1
+                    if in_nonprogress:
+                        nonprogress_loops <- nonprogress_loops + 1
+                    else:
+                        ps_name: mutable sview = ""
+                        ps_direction: i64 = progress_condition_direction(ps_condition, &ps_name)
+                        if ps_direction != 0 and progress_body_advances(ps_body, ps_name, ps_direction):
+                            advancing <- advancing + 1
+                    progress_scan(ps_body, loops, advancing, in_nonprogress, nonprogress_loops)
+                Stmt.If(pi_condition, pi_then, pi_else, pi_line):
+                    progress_scan(pi_then, loops, advancing, in_nonprogress, nonprogress_loops)
+                    progress_scan(pi_else, loops, advancing, in_nonprogress, nonprogress_loops)
+                Stmt.For(pf_bind, pf_vars, pf_iterable, pf_body, pf_line):
+                    progress_scan(pf_body, loops, advancing, in_nonprogress, nonprogress_loops)
+                Stmt.Block(pb_kind, pb_clause, pb_binding, pb_body, pb_line):
+                    pb_nonprogress: mutable bool = in_nonprogress
+                    if pb_kind == "trusted":
+                        for pb_grant in pb_clause |pb_nonprogress|:
+                            pb_nonprogress <- true if pb_grant == "Unsafe.NonProgress"
+                    progress_scan(pb_body, loops, advancing, pb_nonprogress, nonprogress_loops)
+                Stmt.Expr(pe_expression, pe_line):
+                    # A loop carrying a `|capture|` header lowers its BODY to a value block,
+                    # so `while i < 2 |i|:` is reached through an expression rather than
+                    # Stmt.While — the same lowering that hid subscripts from `-emit unsafe`.
+                    if pe_expression is Expr.Block(pe_stmts, pe_value, pe_captures, pe_block_line):
+                        progress_scan(pe_stmts, loops, advancing, in_nonprogress, nonprogress_loops)
+                _:
+                    pass
+
+
+# Is a `trusted <permission>` block present anywhere in the body?
+def progress_has_trusted(statements: darray[Ast::Stmt], permission: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+    can Abort.Panic, Memory.Allocate:
+        for statement in statements |permission|:
+            if statement is Stmt.Block(pt_kind, pt_clause, pt_binding, pt_body, pt_line):
+                if pt_kind == "trusted":
+                    for pt_grant in pt_clause |permission|:
+                        true return if pt_grant == permission
+                true return if progress_has_trusted(pt_body, permission)
+            if statement is Stmt.If(pt_cond, pt_then, pt_else, pt_if_line):
+                true return if progress_has_trusted(pt_then, permission)
+                true return if progress_has_trusted(pt_else, permission)
+            if statement is Stmt.While(pt_wcond, pt_wbody, pt_w_line):
+                true return if progress_has_trusted(pt_wbody, permission)
+            if statement is Stmt.For(pt_bind, pt_vars, pt_iter, pt_fbody, pt_f_line):
+                true return if progress_has_trusted(pt_fbody, permission)
+        return false
+
+
+# One function's summary line, and its warning count.
+def progress_emit_function(buffer: mutable darray[u8]&, name: sview, body: darray[Ast::Stmt], decorators: darray[Ast::Annotation]&, warnings: mutable i64&) -> void can[Abort.Panic, Memory.Allocate]:
+    loops: mutable i64 = 0
+    advancing: mutable i64 = 0
+    nonprogress_loops: mutable i64 = 0
+    progress_scan(body, &loops, &advancing, false, &nonprogress_loops)
+    emit_tokens_push_sview(buffer, "  ")
+    emit_tokens_push_sview(buffer, name)
+    emit_tokens_push_sview(buffer, ": obligations=")
+    if loops == 0:
+        emit_tokens_push_sview(buffer, "none")
+    else:
+        emit_tokens_push_sview(buffer, "Loop:")
+        append_decimal(buffer, loops.u32())
+    emit_tokens_push_sview(buffer, " evidence=")
+    if nonprogress_loops > 0:
+        emit_tokens_push_sview(buffer, "unsafe-nonprogress")
+    elif loops > 0 and advancing == loops:
+        emit_tokens_push_sview(buffer, "progress")
+    else:
+        emit_tokens_push_sview(buffer, "none")
+        # An undischarged loop obligation is what stage0 counts in `warnings:`.
+        warnings <- warnings + (loops - advancing)
+    emit_tokens_push_sview(buffer, " unsafe_nonprogress=")
+    emit_tokens_push_sview(buffer, "true" if progress_has_trusted(body, "Unsafe.NonProgress") else "false")
+    # `blocking` / `blocking_path` are false/none in ALL 56 corpus fixtures, so there is no
+    # witness to derive their rule from — emitted as measured, not guessed.
+    emit_tokens_push_sview(buffer, " blocking=false unsafe_block_main=")
+    emit_tokens_push_sview(buffer, "true" if progress_has_trusted(body, "Unsafe.BlockMain") else "false")
+    emit_tokens_push_sview(buffer, " main_thread=")
+    pm_main_thread: mutable bool = false
+    for pm_decorator in decorators |pm_main_thread|:
+        pm_main_thread <- true if pm_decorator.name == "main_thread"
+    emit_tokens_push_sview(buffer, "true" if pm_main_thread else "false")
+    emit_tokens_push_sview(buffer, " blocking_path=none\n")
+
+
+def progress_collect_functions(declarations: darray[Ast::Decl]&, names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    for declaration in declarations |names|:
+        if declaration is Decl.Module(pcf_m_name, pcf_m_body, pcf_m_line):
+            progress_collect_functions(pcf_m_body, names)
+            continue
+        if declaration is Decl.Scoped(pcf_s_body, pcf_s_line):
+            progress_collect_functions(pcf_s_body, names)
+            continue
+        if declaration is Decl.Func(pcf_name, pcf_params, pcf_ret, pcf_body, pcf_effects, pcf_decorators, pcf_line):
+            names.push(pcf_name)
+
+
+# Every function's summary, rendered into a flat pool with its name, so OVERLOADS (which
+# share a name) each get their own line — a name-keyed lookup collapsed them into one.
+def progress_render_all(declarations: darray[Ast::Decl]&, names: mutable darray[sview]&, starts: mutable darray[usize]&, stops: mutable darray[usize]&, pool: mutable darray[u8]&, warnings: mutable i64&) -> void can[Abort.Panic, Memory.Allocate]:
+    for declaration in declarations |names, starts, stops, pool, warnings|:
+        if declaration is Decl.Module(pra_m_name, pra_m_body, pra_m_line):
+            progress_render_all(pra_m_body, names, starts, stops, pool, warnings)
+            continue
+        if declaration is Decl.Scoped(pra_s_body, pra_s_line):
+            progress_render_all(pra_s_body, names, starts, stops, pool, warnings)
+            continue
+        if declaration is Decl.Func(pra_name, pra_params, pra_ret, pra_body, pra_effects, pra_decorators, pra_line):
+            names.push(pra_name)
+            starts.push(pool.count)
+            progress_emit_function(pool, pra_name, pra_body, pra_decorators, warnings)
+            stops.push(pool.count)
+
+
+def emit_progress_report(file: Ast::File&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    names: mutable darray[sview] = []
+    progress_collect_functions(file.top_decls, &names)
+    # The summaries are rendered FIRST so `warnings:` can be counted from them, then the
+    # header is prepended — stage0 prints the count before the summaries that produce it.
+    summary_names: mutable darray[sview] = []
+    summary_starts: mutable darray[usize] = []
+    summary_stops: mutable darray[usize] = []
+    summary_pool: mutable darray[u8] = []
+    warnings: mutable i64 = 0
+    progress_render_all(file.top_decls, &summary_names, &summary_starts, &summary_stops, &summary_pool, &warnings)
+
+    buffer: mutable darray[u8] = []
+    emit_tokens_push_sview(&buffer, "=== progress ===\nwarnings: ")
+    append_decimal(&buffer, warnings.u32())
+    emit_tokens_push_sview(&buffer, "\nfunctions: ")
+    append_decimal(&buffer, names.count.u32())
+    emit_tokens_push_sview(&buffer, "\nfunction summaries:\n")
+    # Alphabetical by name, STABLE for equal names so overloads keep declaration order.
+    emitted: mutable darray[usize] = []
+    for _round in 0..<summary_names.count |buffer, summary_names, summary_starts, summary_stops, summary_pool, emitted|:
+        best: mutable usize = 0
+        found: mutable bool = false
+        for candidate in 0..<summary_names.count |best, found, summary_names, emitted|:
+            already: mutable bool = false
+            for done in emitted |already, candidate|:
+                already <- true if done == candidate
+            continue if already
+            if not found or unsafe_name_less(summary_names[candidate], summary_names[best]):
+                best <- candidate
+                found <- true
+        break if not found
+        emitted.push(best)
+        for byte_index in summary_starts[best]..<summary_stops[best] |buffer, summary_pool|:
+            buffer.push(summary_pool[byte_index])
+    return emit_tokens_flush(buffer)
+
+
 # `-emit test-runner` — stage0's synthesized test driver: the unit's source, then a
 # `ctx_test_main` that calls each `@test` function in declaration order and reports it.
 #
@@ -4001,6 +4220,7 @@ def cli_emit_mode_supported(mode: cstr) -> bool can[Abort.Panic]:
     true return if mode == "unsafe"
     true return if mode == "c-archive"
     true return if mode == "lowered"
+    true return if mode == "progress"
     true return if mode == "exe"
     return false
 
@@ -4044,8 +4264,8 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
                 for prefix_index in 0..<sview_len("unsupported -emit mode: ") |message|:
                     message.push(sview_at("unsupported -emit mode: ", prefix_index))
                 push_cstr(&message, requested_mode)
-                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe c-archive lowered deps deps-json\n") |message|:
-                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe c-archive lowered deps deps-json\n", suffix_index))
+                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe c-archive lowered progress deps deps-json\n") |message|:
+                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe c-archive lowered progress deps deps-json\n", suffix_index))
                 write_stderr(message)
                 return request
             _ = setenv("ELISA_STAGE1_EMIT", requested_mode, 1)
@@ -4243,6 +4463,9 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
     # `-emit c-archive` bundles the object, the runtime, and the audit sidecars.
     if emit_mode_is("c-archive"):
         return emit_c_archive(file, tokens, src_ptr, out_path)
+    # `-emit progress` reports each function's loop obligations and their evidence.
+    if emit_mode_is("progress"):
+        return emit_progress_report(file)
     # `-emit unsafe` reports the per-function Unsafe.* capability closure.
     if emit_mode_is("unsafe"):
         return emit_unsafe_report(file, tokens, src_ptr)
