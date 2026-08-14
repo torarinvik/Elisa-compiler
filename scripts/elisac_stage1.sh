@@ -141,9 +141,10 @@ while [[ $# -gt 0 ]]; do
         ast)    emit_mode="ast" ;;
         iface)  emit_mode="iface" ;;
         fmt)    emit_mode="fmt" ;;
+        doc)    emit_mode="doc" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -fnoalias)
@@ -245,7 +246,7 @@ driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ "$emit_mode" == "bc" ]] && driver_env+=("ELISA_STAGE1_EMIT=bc")
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
-if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" ]]; then
+if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" || "$emit_mode" == "doc" ]]; then
   # `-emit fmt` additionally needs the OFFSET MAP (see flatten_includes): stage0 names
   # its synthesized auto-regions `__auto_<pos.Offset>` with offsets measured over its
   # directive-bearing expansion. ELISA_STAGE1_SRC stays as given — the tokens report
