@@ -422,6 +422,134 @@ extend Backend:
             return out
 
 
+        # The `common:` block's fields for a packed enum, from the AST. Row field 0 is the tag,
+        # so common k occupies row field 1 + k in stage1's inline layout.
+        def packed_emit_common_fields(top: darray[Decl]&, enum_name: sview, commons: u32, out: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for declaration in top |enum_name, commons, out|:
+                    if declaration is Decl.Module(pcf_mod_name, pcf_mod_body, pcf_mod_line):
+                        packed_emit_common_fields(pcf_mod_body, enum_name, commons, out)
+                        continue
+                    if declaration is Decl.Scoped(pcf_scoped_body, pcf_scoped_line):
+                        packed_emit_common_fields(pcf_scoped_body, enum_name, commons, out)
+                        continue
+                    if declaration is Decl.Enum(pcf_name, pcf_variants, pcf_const, pcf_storage, pcf_line):
+                        continue if pcf_name != enum_name or pcf_variants.count == 0
+                        for common_index in 0..<commons.usize() |out, pcf_variants|:
+                            break if common_index >= pcf_variants[0].field_names.count
+                            header_push(out, "    - ")
+                            header_push(out, pcf_variants[0].field_names[common_index])
+                            header_push(out, ": ")
+                            if pcf_variants[0].fields[common_index] is Expr.Ident(pcf_type_name, pcf_type_line):
+                                header_push(out, pcf_type_name)
+                            else:
+                                header_push(out, "<type>")
+                            header_push(out, " inline row_field=")
+                            header_push_int(out, (1 + common_index).i64())
+                            out.push(10)
+                        return
+
+
+        # Lexicographic `a < b`, for the sorted variant list.
+        def packed_name_less(a: sview, b: sview) -> bool can[Abort.Panic]:
+            limit: usize = sview_len(a) if sview_len(a) < sview_len(b) else sview_len(b)
+            for index in 0..<limit |a, b|:
+                left: u8 = sview_at(a, index)
+                right: u8 = sview_at(b, index)
+                true return if left < right
+                false return if left > right
+            return sview_len(a) < sview_len(b)
+
+
+        # An Elisa scalar type NAME (`u32`, `i64`, `f64`) for a ValueType. `-emit packed`
+        # prints the declared spelling of a common field's type, not a C one, so
+        # header_type_name (which emits `uint32_t`) is not usable here.
+        def packed_elisa_type_name(value_type: ValueType, structs: StructTable&, out: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                if value_type.kind == TypeKind.Signed:
+                    header_push(out, "i8" if value_type.bits == 8 else ("i16" if value_type.bits == 16 else ("i32" if value_type.bits == 32 else "i64")))
+                    return
+                if value_type.kind == TypeKind.Unsigned:
+                    header_push(out, "u8" if value_type.bits == 8 else ("u16" if value_type.bits == 16 else ("u32" if value_type.bits == 32 else "u64")))
+                    return
+                if value_type.kind == TypeKind.Float:
+                    header_push(out, "f32" if value_type.bits == 32 else "f64")
+                    return
+                if value_type.kind == TypeKind.Bool:
+                    header_push(out, "bool")
+                    return
+                if value_type.kind == TypeKind.Struct and value_type.bits.usize() < structs.names.count:
+                    header_push(out, structs.names[value_type.bits.usize()])
+                    return
+                header_push(out, "<type>")
+
+
+        # `-emit packed` — the packed lowering profile, and every packed enum's ROW LAYOUT.
+        #
+        # Reports stage1's TRUE layout. stage1 places a `common:` block's fields INLINE in the
+        # row (between the tag and the payload) where stage0 keeps them in a SIDE TABLE; that
+        # choice is deliberate and documented in codegen_stmt_match.elisa. So for an enum with
+        # commons this prints `inline row_field=N` and `side-table common words: 0` where
+        # stage0 prints `side_table word_offset=N` — the same vocabulary, describing the layout
+        # each compiler actually uses. Enums with NO commons, and units with no packed enum at
+        # all, are byte-identical to stage0.
+        def generate_packed_report(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            structs: mutable StructTable = register_types_for_abi(file, ctx)
+            top: mutable darray[Decl] = file.top_decls
+            for declaration in top |structs|:
+                register_packed_enum(declaration, file.packed_enum_names, file.enum_common_owners, file.enum_common_counts, &structs)
+            out: mutable darray[u8] = []
+            header_push(out, "packed lowering\n  contract: canonical-compiler-graph\n  canonical: variant-sparse\n  readonly publication gate: Frozen\n")
+            reported: mutable usize = 0
+            for slot in 0..<structs.packed_names.count |out, structs, reported|:
+                # A placeholder row carries no variants; only a fully registered enum is a
+                # packed enum for reporting purposes.
+                continue if structs.packed_variant_count[slot] == 0
+                reported <- reported + 1
+                commons: u32 = structs.packed_common_counts[slot]
+                out.push(10)
+                header_push(out, structs.packed_names[slot])
+                header_push(out, "\n  effective abi: variant-sparse\n  row bytes: ")
+                header_push_int(out, packed_row_bytes(structs, slot.i64()))
+                header_push(out, "\n  common prefix words: ")
+                header_push_int(out, commons.i64())
+                # ZERO: stage1's commons live in the ROW, not a side table.
+                header_push(out, "\n  side-table common words: 0\n  variants: ")
+                # Sorted, as stage0 sorts them.
+                emitted_variants: mutable darray[sview] = []
+                start: usize = structs.packed_variant_start[slot]
+                count: usize = structs.packed_variant_count[slot]
+                for _round in 0..<count |out, structs, start, count, emitted_variants|:
+                    best: mutable sview = ""
+                    found: mutable bool = false
+                    for candidate in 0..<count |best, found, structs, start, emitted_variants|:
+                        name: sview = structs.packed_variants[start + candidate]
+                        already: mutable bool = false
+                        for done in emitted_variants |already, name|:
+                            already <- true if done == name
+                        continue if already
+                        if not found or packed_name_less(name, best):
+                            best <- name
+                            found <- true
+                    break if not found
+                    header_push(out, ", ") if emitted_variants.count > 0
+                    emitted_variants.push(best)
+                    header_push(out, best)
+                out.push(10)
+                if commons == 0:
+                    header_push(out, "  common fields: none\n")
+                    continue
+                header_push(out, "  common fields:\n")
+                # Names and types come from the AST, NOT the StructTable's per-variant field
+                # pool: the parser PREPENDS commons to every variant's field list, but the
+                # registered pool holds only the PAYLOAD fields — reading index 0 there
+                # returned the first payload field (`x`) where the common (`t`) was wanted.
+                packed_emit_common_fields(top, structs.packed_names[slot], commons, out)
+            header_push(out, "  enums: none\n") if reported == 0
+            out.push(0)
+            return out
+
+
         def generate_c_header_for_file(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, guard: sview) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             structs: mutable StructTable = register_types_for_abi(file, ctx)
             return generate_c_header(file, structs, guard)
