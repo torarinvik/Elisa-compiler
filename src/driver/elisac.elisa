@@ -2451,21 +2451,30 @@ def unsafe_scan_statements(statements: darray[Ast::Stmt], owner: sview, runtime_
 
 
 # Every function's DECLARED capabilities and its body's contributions.
-def unsafe_collect_declarations(declarations: darray[Ast::Decl]&, owners: mutable darray[sview]&, caps: mutable darray[sview]&, all_names: mutable darray[sview]&, call_from: mutable darray[sview]&, call_to: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+def unsafe_collect_declarations(declarations: darray[Ast::Decl]&, export_markers: darray[sview]&, owners: mutable darray[sview]&, caps: mutable darray[sview]&, all_names: mutable darray[sview]&, call_from: mutable darray[sview]&, call_to: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
     can Abort.Panic, Memory.Allocate:
         for declaration in declarations |owners, caps, all_names, call_from, call_to|:
             if declaration is Decl.Module(us_m_name, us_m_body, us_m_line):
-                unsafe_collect_declarations(us_m_body, owners, caps, all_names, call_from, call_to)
+                unsafe_collect_declarations(us_m_body, export_markers, owners, caps, all_names, call_from, call_to)
                 continue
             if declaration is Decl.Scoped(us_sc_body, us_sc_line):
-                unsafe_collect_declarations(us_sc_body, owners, caps, all_names, call_from, call_to)
+                unsafe_collect_declarations(us_sc_body, export_markers, owners, caps, all_names, call_from, call_to)
                 continue
             if declaration is Decl.Extern(us_x_name, us_x_start, us_x_arity, us_x_variadic, us_x_callable, us_x_ret, us_x_decorators, us_x_line):
                 # A callable extern carries Unsafe.RawExtern IMPLICITLY — stage0 reports it
                 # for an `extern puts(...)` that declares no `can` clause at all.
-                if us_x_callable:
-                    all_names.push(us_x_name)
-                    unsafe_add_row(owners, caps, us_x_name, "Unsafe.RawExtern")
+                #
+                # But `export fn name(...) = target` ALSO parses to Decl.Extern, and an EXPORT
+                # is not a foreign import: it publishes an Elisa function under a C symbol and
+                # calls nothing foreign. Counting those reported RawExtern: 4 for a unit with
+                # four exports and no externs at all, where stage0 reports 0.
+                continue if not us_x_callable
+                us_x_is_export: mutable bool = false
+                for us_x_annotation in export_markers |us_x_is_export, us_x_name|:
+                    us_x_is_export <- true if us_x_annotation == us_x_name
+                continue if us_x_is_export
+                all_names.push(us_x_name)
+                unsafe_add_row(owners, caps, us_x_name, "Unsafe.RawExtern")
                 continue
             if declaration is Decl.Func(us_f_name, us_f_params, us_f_ret, us_f_body, us_f_effects, us_f_decorators, us_f_line):
                 all_names.push(us_f_name)
@@ -2620,13 +2629,18 @@ def unsafe_dotted_capability(index: i64) -> sview can[Abort.Panic]:
     return ""
 
 
-def emit_unsafe_report(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+def build_unsafe_report(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     owners: mutable darray[sview] = []
     caps: mutable darray[sview] = []
     all_names: mutable darray[sview] = []
     call_from: mutable darray[sview] = []
     call_to: mutable darray[sview] = []
-    unsafe_collect_declarations(file.top_decls, &owners, &caps, &all_names, &call_from, &call_to)
+    # `export fn` shares Decl.Extern with a real foreign import; the `__export_fn` marker is
+    # what tells them apart.
+    export_markers: mutable darray[sview] = []
+    for export_annotation in file.enum_annotations |export_markers|:
+        export_markers.push(export_annotation.owner) if export_annotation.name == "__export_fn"
+    unsafe_collect_declarations(file.top_decls, export_markers, &owners, &caps, &all_names, &call_from, &call_to)
     unsafe_collect_token_grants(file, tokens, source, &owners, &caps)
     unsafe_close_over_calls(&owners, &caps, call_from, call_to)
 
@@ -2721,7 +2735,198 @@ def emit_unsafe_report(file: Ast::File&, tokens: darray[Lexer::Token]&, source: 
             buffer.push(10)
 
     emit_tokens_push_sview(&buffer, "trusted-total: 0\ntrusted: none\n")
-    return emit_tokens_flush(buffer)
+    return buffer
+
+
+# `-emit unsafe` writes the report built above; `-emit c-archive` writes the same bytes to
+# its `<base>.unsafe.txt` sidecar.
+def emit_unsafe_report(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    report: darray[u8] = build_unsafe_report(file, tokens, source)
+    return emit_tokens_flush(report)
+
+
+# `-emit c-archive` — the C ABI delivery bundle: a static library plus its audit sidecars.
+#
+#   <base>.a               module object + the Elisa runtime, via `ar rcs`
+#   <base>.h               the generated C header  (same generator as `-emit header`)
+#   <base>.unsafe.txt      the capability audit    (same builder as `-emit unsafe`)
+#   <base>.elisa-abi.json  a manifest naming all of the above
+#
+# stage0 runs the unsafe audit BEFORE writing anything, so a rejected program leaves no
+# linkable artifact behind — its own comment records that emitting first meant a refused
+# program still produced a complete `.a` that linked and ran.
+
+
+# The exported entities, in declaration order, for the manifest.
+def carchive_push_export_list(buffer: mutable darray[u8]&, file: Ast::File&, marker: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    first: mutable bool = true
+    for annotation in file.enum_annotations |buffer, first, marker|:
+        continue if annotation.name != marker
+        emit_tokens_push_sview(buffer, ",") if not first
+        emit_tokens_push_sview(buffer, "\n    \"")
+        emit_tokens_push_sview(buffer, annotation.owner)
+        buffer.push(34)
+        first <- false
+    emit_tokens_push_sview(buffer, "\n  ") if not first
+
+
+# A shell-quoted path. Single quotes, so a space or a shell metacharacter in a directory
+# name cannot split the argument.
+def carchive_push_quoted(buffer: mutable darray[u8]&, path: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+    buffer.push(39)
+    for index in 0..<path.count |buffer, path|:
+        buffer.push(path[index])
+    buffer.push(39)
+
+
+def carchive_push_path(buffer: mutable darray[u8]&, path: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+    for index in 0..<path.count |buffer, path|:
+        buffer.push(path[index])
+
+
+# `<archive>.a` -> `<archive>` (stage0's cArchiveSidecarBase), the stem every sidecar hangs off.
+def carchive_sidecar_base(out_path: darray[u8]&) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+    base: mutable darray[u8] = []
+    # The driver's out_path carries a TRAILING NUL (main appends one so the buffer can be
+    # handed to C directly). Copying it into a derived path embeds a NUL mid-string, and
+    # every command built from it truncates there — `ar rcs <archive>\0<member>` reached ar
+    # as an archive with NO members.
+    stop: mutable usize = out_path.count
+    while stop > 0 and out_path[stop - 1] == 0 |stop, out_path|:
+        stop <- stop - 1
+    if stop >= 2 and out_path[stop - 2] == 46 and out_path[stop - 1] == 97:
+        stop <- stop - 2
+    for index in 0..<stop |base, out_path|:
+        base.push(out_path[index])
+    return base
+
+
+# The Elisa runtime object to bundle, from ELISA_RUNTIME_OBJ. Empty when unset, in which
+# case the archive holds the module object alone and the manifest says runtime_included:false.
+def push_runtime_object_path(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    flag_storage: mutable darray[u8] = []
+    for flag_index in 0..<sview_len("ELISA_RUNTIME_OBJ") |flag_storage|:
+        flag_storage.push(sview_at("ELISA_RUNTIME_OBJ", flag_index))
+    flag_storage.push(0)
+    flag_name: cstr = (&flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+    if getenv(flag_name) is runtime_bytes:
+        cursor: mutable i64 = 0
+        scanning: mutable bool = true
+        while scanning |cursor, scanning, buffer, runtime_bytes|:
+            byte_ref: u8& = runtime_bytes + cursor
+            runtime_byte: u8 = byte_ref
+            if runtime_byte == 0:
+                scanning <- false
+            else:
+                buffer.push(runtime_byte)
+                cursor <- cursor + 1
+
+
+def emit_c_archive(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&, out_path: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    base: darray[u8] = carchive_sidecar_base(out_path)
+    header_path: mutable darray[u8] = []
+    carchive_push_path(&header_path, base)
+    emit_tokens_push_sview(&header_path, ".h")
+    unsafe_path: mutable darray[u8] = []
+    carchive_push_path(&unsafe_path, base)
+    emit_tokens_push_sview(&unsafe_path, ".unsafe.txt")
+    manifest_path: mutable darray[u8] = []
+    carchive_push_path(&manifest_path, base)
+    emit_tokens_push_sview(&manifest_path, ".elisa-abi.json")
+
+    # AUDIT FIRST — nothing is written until the header can be generated, so a unit with an
+    # exported type that has no C ABI form leaves no half-built archive.
+    guard: mutable darray[u8] = []
+    push_header_guard(&guard)
+    guard.push(0)
+    header_ctx: LLVMContextRef = LLVMContextCreate()
+    header_module: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_archive_header", header_ctx)
+    # The cast is its OWN statement: an inline `.cast[T] can Effect` inside an argument list
+    # does not parse in this dialect.
+    guard_cstr: cstr = (&guard[0]).cast[cstr] can Unsafe.PointerCast
+    header_bytes: darray[u8] = Backend::generate_c_header_for_file(file, header_module, header_ctx, sview(guard_cstr, 0, guard.count - 1))
+    if header_bytes.count == 0:
+        message: mutable darray[u8] = []
+        emit_tokens_push_sview(&message, "error: -emit c-archive: an exported type has no C ABI representation\n")
+        write_stderr(message)
+        return 1
+
+    # The module object, beside the archive so the temporary shares its filesystem.
+    # `ar` records a member by its BASENAME, so the object must literally be named
+    # `elisacore_module.o` — writing `<base>.elisacore_module.o` beside the archive produced a
+    # member called `lib.elisacore_module.o`. stage0 uses a temp DIR for the same reason.
+    work_dir: mutable darray[u8] = []
+    emit_tokens_push_sview(&work_dir, "/tmp/elisa-c-archive-stage1")
+    make_directory(work_dir)
+    object_path: darray[u8] = joined_path(work_dir, "elisacore_module.o")
+    _ = setenv("ELISA_STAGE1_OUT", "", 1)
+    ctx: LLVMContextRef = LLVMContextCreate()
+    module_handle: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1", ctx)
+    archive_builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+    emitted: i64 = Backend::emit_module(file, module_handle, ctx, archive_builder)
+    2 return if emitted <= 0 and unit_declares_function(file.top_decls)
+    triple_storage: mutable darray[u8] = []
+    machine: LLVMTargetMachineRef = Backend::configure_module_target_for(module_handle, requested_target_triple(&triple_storage))
+    object_c: mutable darray[u8] = []
+    carchive_push_path(&object_c, object_path)
+    object_c.push(0)
+    object_cstr: cstr = (&object_c[0]).cast[cstr] can Unsafe.PointerCast
+    4 return if not Backend::emit_object(machine, module_handle, object_cstr)
+
+    # `ar rcs <archive> <module.o> <runtime.o>` — the runtime object is the one the build
+    # already produces for `-emit exe`.
+    archive_command: mutable darray[u8] = []
+    # Every path is QUOTED: this repo lives under a directory with a SPACE in its name
+    # ("Coding Projects"), so an unquoted runtime path split into two ar arguments and the
+    # archive gained a bogus member called `Coding`.
+    emit_tokens_push_sview(&archive_command, "ar rcs ")
+    archive_path: mutable darray[u8] = []
+    for out_index in 0..<out_path.count |archive_path, out_path|:
+        archive_path.push(out_path[out_index]) if out_path[out_index] != 0
+    carchive_push_quoted(&archive_command, archive_path)
+    archive_command.push(32)
+    carchive_push_quoted(&archive_command, object_path)
+    runtime_object: mutable darray[u8] = []
+    push_runtime_object_path(&runtime_object)
+    if runtime_object.count > 0:
+        archive_command.push(32)
+        carchive_push_quoted(&archive_command, runtime_object)
+    if cbind_run(archive_command) != 0:
+        message: mutable darray[u8] = []
+        emit_tokens_push_sview(&message, "error: -emit c-archive: ar failed\n")
+        write_stderr(message)
+        return 1
+    _ = unlink(object_cstr)
+
+    header_body: mutable darray[u8] = []
+    for index in 0..<header_bytes.count |header_body, header_bytes|:
+        header_body.push(header_bytes[index]) if header_bytes[index] != 0
+    _ = write_file_bytes(&header_path, header_body)
+    unsafe_bytes: darray[u8] = build_unsafe_report(file, tokens, source)
+    _ = write_file_bytes(&unsafe_path, unsafe_bytes)
+
+    manifest: mutable darray[u8] = []
+    emit_tokens_push_sview(&manifest, "{\n  \"source\": \"")
+    _ = push_source_path(&manifest)
+    emit_tokens_push_sview(&manifest, "\",\n  \"archive\": \"")
+    carchive_push_path(&manifest, archive_path)
+    emit_tokens_push_sview(&manifest, "\",\n  \"objects\": [\n    \"elisacore_module.o\"")
+    emit_tokens_push_sview(&manifest, ",\n    \"elisacore_runtime.o\"") if runtime_object.count > 0
+    emit_tokens_push_sview(&manifest, "\n  ],\n  \"runtime_included\": ")
+    emit_tokens_push_sview(&manifest, "true" if runtime_object.count > 0 else "false")
+    emit_tokens_push_sview(&manifest, ",\n  \"runtime_object\": \"elisacore_runtime.o\",\n  \"header_audit\": \"")
+    carchive_push_path(&manifest, header_path)
+    emit_tokens_push_sview(&manifest, "\",\n  \"unsafe_report\": \"")
+    carchive_push_path(&manifest, unsafe_path)
+    emit_tokens_push_sview(&manifest, "\",\n  \"exported_functions\": [")
+    carchive_push_export_list(&manifest, file, "__export_fn")
+    emit_tokens_push_sview(&manifest, "],\n  \"exported_globals\": [")
+    carchive_push_export_list(&manifest, file, "__export_global")
+    emit_tokens_push_sview(&manifest, "],\n  \"exported_types\": [")
+    carchive_push_export_list(&manifest, file, "__export_type")
+    emit_tokens_push_sview(&manifest, "],\n  \"generated_by\": \"elisacore -emit c-archive\",\n  \"abi_contract\": \"checked-in C/C++ headers are the build contract; generated headers are audit artifacts\"\n}\n")
+    _ = write_file_bytes(&manifest_path, manifest)
+    return 0
 
 
 # `-emit test-runner` — stage0's synthesized test driver: the unit's source, then a
@@ -3794,6 +3999,7 @@ def cli_emit_mode_supported(mode: cstr) -> bool can[Abort.Panic]:
     true return if mode == "c-bind-check-json"
     true return if mode == "packed"
     true return if mode == "unsafe"
+    true return if mode == "c-archive"
     true return if mode == "exe"
     return false
 
@@ -3837,8 +4043,8 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
                 for prefix_index in 0..<sview_len("unsupported -emit mode: ") |message|:
                     message.push(sview_at("unsupported -emit mode: ", prefix_index))
                 push_cstr(&message, requested_mode)
-                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe deps deps-json\n") |message|:
-                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe deps deps-json\n", suffix_index))
+                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe c-archive deps deps-json\n") |message|:
+                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json packed unsafe c-archive deps deps-json\n", suffix_index))
                 write_stderr(message)
                 return request
             _ = setenv("ELISA_STAGE1_EMIT", requested_mode, 1)
@@ -4033,6 +4239,9 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
         return emit_c_bind_report(file, tokens, src_ptr, false)
     if emit_mode_is("c-bind-check-json"):
         return emit_c_bind_report(file, tokens, src_ptr, true)
+    # `-emit c-archive` bundles the object, the runtime, and the audit sidecars.
+    if emit_mode_is("c-archive"):
+        return emit_c_archive(file, tokens, src_ptr, out_path)
     # `-emit unsafe` reports the per-function Unsafe.* capability closure.
     if emit_mode_is("unsafe"):
         return emit_unsafe_report(file, tokens, src_ptr)
