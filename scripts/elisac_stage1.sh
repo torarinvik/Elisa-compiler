@@ -152,9 +152,10 @@ while [[ $# -gt 0 ]]; do
         c-archive) emit_mode="c-archive" ;;
         lowered) emit_mode="lowered" ;;
         progress) emit_mode="progress" ;;
+        interpret) emit_mode="interpret" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -filter)
@@ -258,6 +259,11 @@ driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ "$emit_mode" == "bc" ]] && driver_env+=("ELISA_STAGE1_EMIT=bc")
 # `-emit c-archive` writes its OWN files (the archive and three sidecars), so it needs the
 # mode and the source path but must NOT have stdout redirected like a text report.
+if [[ "$emit_mode" == "interpret" ]]; then
+  # Runs the program; its stdout IS the report, so no -o redirection.
+  driver_env+=("ELISA_STAGE1_EMIT=interpret" "ELISA_STAGE1_SRC=$src")
+  [[ -f "$runtime_obj" ]] && driver_env+=("ELISA_RUNTIME_OBJ=$runtime_obj")
+fi
 if [[ "$emit_mode" == "c-archive" ]]; then
   driver_env+=("ELISA_STAGE1_EMIT=c-archive" "ELISA_STAGE1_SRC=$src")
   # Set AFTER driver_env is initialised — an earlier placement was silently wiped by the
