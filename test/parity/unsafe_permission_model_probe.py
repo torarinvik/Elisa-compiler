@@ -17,18 +17,35 @@ over-claims invents capabilities a function does not need; a model that under-cl
 them. For an audit whose output is a SAFETY claim, both are wrong, and under-claiming is the
 worse direction — which is why the mode is not shipped on a partial model.
 
-Last run (2026-08-14): exact=31 partial=9, EXTRA=0, missing only Unsafe.UncheckedIndex (3)
-and Unsafe.BufferReinterpret (2). So the model is SOUND but incomplete, and the residue is
-exactly the capabilities stage0 infers from a BOUNDS-PROVENNESS judgement rather than from a
-declaration. Adding a syntactic "bare subscript => UncheckedIndex" rule was measured and
-made it WORSE: it closed 7 but introduced 4 EXTRA.
+Last run (2026-08-14): **exact=40 partial=0, MISSED=0, EXTRA=0** — complete on the corpus.
 
     python3 test/parity/unsafe_permission_model_probe.py
 
-Conclusion this encodes: finishing `-emit unsafe` means making stage1's EXISTING unproven-
-index checks (check_strict_unsafe_ops_walk, check_fixed_index_range, check_assoc_index_bounds
-— 27 sites) RECORD a per-function requirement, not only report a violation when ungranted.
-The rest of the set falls out of the sound model above.
+The full rule set, each rule decidable from the AST and declared types (NO prover):
+
+  1. declared Unsafe.* effects, from the signature AND in-body grant sites
+  2. externs contribute Unsafe.RawExtern
+  3. TRANSITIVE CLOSURE over the call graph
+  4. a bare subscript on a RUNTIME-LENGTH container (darray) needs Unsafe.UncheckedIndex,
+     except when
+       - the index is a loop variable bounded by `for i in 0..<container.count`, which
+         proves it against the container's own length, or
+       - the subscript has an index FALLBACK (`xs[i] else v`) or is a `get` form
+  5. `(&xs[0]).cast[T]` needs Unsafe.BufferReinterpret
+
+Getting here took three wrong turns, all corrected by measurement, and they are the reason
+this file exists:
+
+  * declared-only scored 30/56 and UNDER-reported — withdrawn.
+  * a crude "any bare subscript" rule over-claimed (4 EXTRA) while closing only 7 of 10.
+    The fix was making the rule TYPE-DIRECTED (runtime-length containers only), not broader.
+  * skipping any line containing `else` conflated an index fallback with a TERNARY else and
+    lost three files. stage1's AST settles that exactly — Expr.Index carries its own
+    Fallback — so the disambiguation is free in the real implementation.
+
+Rule 4's carve-out was found from a single counterexample (region_param_arena.elisa::prune,
+`for i in 0..<boxes.count: boxes[i]`). Expect more such idioms outside this corpus: keep
+EXTRA at zero and add carve-outs, never widen the rule to chase a MISS.
 """
 import collections
 import pathlib
@@ -59,7 +76,7 @@ def stage0_functions(src):
 
 def reconstruct(text):
     declared = collections.defaultdict(set)
-    bodies, cur = {}, None
+    bodies, header_of, cur = {}, {}, None
     for line in text.split("\n"):
         extern = re.match(r"^extern\s+([A-Za-z_]\w*)\s*\(", line)
         if extern:
@@ -69,6 +86,7 @@ def reconstruct(text):
         if func:
             cur = func.group(1)
             bodies[cur] = []
+            header_of[cur] = line
             declared[cur] |= set(re.findall(r"Unsafe\.\w+", line))
             continue
         if cur is not None:
@@ -77,6 +95,40 @@ def reconstruct(text):
                 continue
             bodies[cur].append(line)
             declared[cur] |= set(re.findall(r"Unsafe\.\w+", line))
+    # TYPE-DIRECTED unchecked-index rule: a bare subscript (no `get`, no `else` fallback)
+    # on a RUNTIME-LENGTH container is unproven by construction, because its length is never
+    # statically known. A fixed `array[T, N]` is excluded — stage0 proves a constant index in
+    # range. Names are collected from `x: ... darray[...]` declarations and parameters.
+    for func, body in bodies.items():
+        text_body = "\n".join(body)
+        runtime_len = set(re.findall(r"([A-Za-z_]\w*)\s*:[^=\n]*\bdarray\s*\[", text_body))
+        runtime_len |= set(re.findall(r"([A-Za-z_]\w*)\s*:[^,)\n]*\bdarray\s*\[", header_of.get(func, "")))
+        # `for i in 0..<xs.count` PROVES `xs[i]` in range against the container's own length.
+        # stage0 recognises this idiom and does not flag it; without the carve-out the model
+        # over-claims on it (measured on region_param_arena.elisa::prune).
+        bounded = collections.defaultdict(set)
+        for line in body:
+            m = re.search(r"for\s+([A-Za-z_]\w*)\s+in\s+0\s*\.\.<\s*([A-Za-z_]\w*)\.count", line)
+            if m:
+                bounded[m.group(2)].add(m.group(1))
+        for line in body:
+            code = line.split("#")[0]
+            # Only an INDEX FALLBACK (`xs[i] else v`) makes a subscript checked. A ternary
+            # `a if c else b` on the same line does not — skipping on a bare `else` lost
+            # sv_j/sv_k/two_darrays_sview_eq. stage1's AST settles this exactly: Expr.Index
+            # carries its own Fallback, so no textual disambiguation is needed there.
+            if re.search(r"\]\s*else\b", code) or "get " in code:
+                continue
+            # `(&xs[0]).cast[T]` reinterprets the container's buffer.
+            if re.search(r"&\s*[A-Za-z_]\w*\s*\[[^\]]*\]\s*\)?\s*\.cast\s*\[", code):
+                declared[func].add("Unsafe.BufferReinterpret")
+            for hit in re.finditer(r"\b([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*)?", code):
+                container, index = hit.group(1), hit.group(2)
+                if container not in runtime_len:
+                    continue
+                if index is not None and index in bounded.get(container, set()):
+                    continue
+                declared[func].add("Unsafe.UncheckedIndex")
     perms = {name: set(caps) for name, caps in declared.items()}
     for name in bodies:
         perms.setdefault(name, set())
