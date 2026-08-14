@@ -233,6 +233,18 @@ def runtime_std_enabled(source: u8&, length: usize) -> bool can[Abort.Panic, Mem
 #
 # ELISA_STAGE1_NO_SEMANTIC_GATE=1 turns it off — an escape hatch for bisecting a suspected
 # analyzer regression, not a supported mode.
+# Is an environment flag present (any value)?
+def env_flag_enabled(name: sview) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    flag_storage: mutable darray[u8] = []
+    for index in 0..<sview_len(name) |flag_storage, name|:
+        flag_storage.push(sview_at(name, index))
+    flag_storage.push(0)
+    flag_name: cstr = (&flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+    if getenv(flag_name) is present:
+        return true
+    return false
+
+
 def semantic_gate_enabled() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     # getenv needs a NUL-terminated string and an sview carries no terminator;
     # Backend::sview_to_cstr is private to that module, so terminate it here.
@@ -1808,6 +1820,419 @@ def emit_iface_block_decl(buffer: mutable darray[u8]&, tokens: darray[Lexer::Tok
         emit_iface_body_lines(buffer, tokens, source, body_range.start, body_range.stop, indent + 4)
 
 
+# `-emit c-bind-check` / `-emit c-bind-check-json` — stage0's C binding ABI verifier.
+#
+# For every `@c_bind("header.h", "CName")` struct it compares the ELISA layout (from LLVM's
+# target data) against the REAL C layout, obtained by generating a probe that prints
+# sizeof/_Alignof/offsetof, compiling it with `cc`, and running it. A size/align/offset
+# disagreement is an ABI bug that no amount of source review finds.
+#
+# The Backend supplies the Elisa half as a line protocol (c_bind_layout_for_file); the
+# driver owns the C half because it is the side that may write files and spawn processes.
+
+
+# The Nth string literal on `line`, without quotes — `@c_bind("hdr.h", "CName")` yields
+# "hdr.h" at 0 and "CName" at 1. The annotation ARGUMENTS are not kept on the
+# EnumAnnotation row (it carries only owner/name/line), so they are recovered from tokens,
+# the same way emit_ast_decorator_args recovers a decorator's argument text.
+def cbind_string_arg(tokens: darray[Lexer::Token]&, source: u8&, line: u32, which: i64) -> sview can[Abort.Panic, Memory.Allocate]:
+    seen: mutable i64 = 0
+    for probe in 0..<tokens.count |seen, tokens, source, line, which|:
+        continue if tokens[probe].line != line
+        continue if tokens[probe].kind != Lexer::TokenKind.StringLit
+        if seen == which:
+            return Lexer::text_or_empty(tokens[probe], source)
+        seen <- seen + 1
+    return ""
+
+
+# The optional trailing `prefix` flag on the decorator.
+def cbind_has_prefix_flag(tokens: darray[Lexer::Token]&, source: u8&, line: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+    for probe in 0..<tokens.count |tokens, source, line|:
+        continue if tokens[probe].line != line
+        continue if tokens[probe].kind != Lexer::TokenKind.Ident
+        true return if Lexer::text_or_empty(tokens[probe], source) == "prefix"
+    return false
+
+
+# A decimal integer starting at `start`, and the index just past it.
+def cbind_parse_int(bytes: darray[u8]&, start: usize) -> (value: i64, stop: usize) can[Abort.Panic]:
+    cursor: mutable usize = start
+    value: mutable i64 = 0
+    while cursor < bytes.count and bytes[cursor] >= 48 and bytes[cursor] <= 57 |cursor, value, bytes|:
+        value <- value * 10 + (bytes[cursor] - 48).i64()
+        cursor <- cursor + 1
+    return (value, cursor)
+
+
+# The next space- or newline-delimited field starting at `start`, as (start, stop, next).
+def cbind_next_word(bytes: darray[u8]&, start: usize) -> (lo: usize, hi: usize, after: usize) can[Abort.Panic]:
+    word_lo: mutable usize = start
+    while word_lo < bytes.count and (bytes[word_lo] == 32 or bytes[word_lo] == 9) |word_lo, bytes|:
+        word_lo <- word_lo + 1
+    stop: mutable usize = word_lo
+    while stop < bytes.count and bytes[stop] != 32 and bytes[stop] != 9 and bytes[stop] != 10 |stop, bytes|:
+        stop <- stop + 1
+    return (word_lo, stop, stop)
+
+
+# Do the bytes in [begin, end) equal `text`?
+def cbind_span_equals(data: darray[u8]&, span_lo: usize, span_hi: usize, wanted: sview) -> bool can[Abort.Panic]:
+    false return if span_hi - span_lo != sview_len(wanted)
+    for index in 0..<sview_len(wanted) |data, span_lo, wanted|:
+        false return if data[span_lo + index] != sview_at(wanted, index)
+    return true
+
+
+def write_file_bytes(path: darray[u8]&, contents: darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    for index in 0..<path.count |path_c, path|:
+        path_c.push(path[index])
+    path_c.push(0)
+    path_cstr: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    descriptor: i64 = open(path_cstr, 1537, 420)
+    false return if descriptor < 0
+    if contents.count > 0:
+        raw: void& = (&contents[0]).cast[void&] can Unsafe.PointerCast
+        _ = write(descriptor, raw, contents.count)
+    _ = close(descriptor)
+    return true
+
+
+def cbind_run(command: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    command_c: mutable darray[u8] = []
+    for index in 0..<command.count |command_c, command|:
+        command_c.push(command[index])
+    command_c.push(0)
+    command_cstr: cstr = (&command_c[0]).cast[cstr] can Unsafe.PointerCast
+    # system() answers a WAIT STATUS; the child's exit code is the high byte.
+    return system(command_cstr) / 256
+
+
+# One `printf` line of the probe, for a struct or one of its fields.
+def cbind_probe_line(probe: mutable darray[u8]&, elisa_name: sview, c_name: sview, field: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    if sview_len(field) == 0:
+        emit_tokens_push_sview(probe, "  printf(\"STRUCT %s %zu %zu\\n\", \"")
+        emit_tokens_push_sview(probe, elisa_name)
+        emit_tokens_push_sview(probe, "\", sizeof(")
+        emit_tokens_push_sview(probe, c_name)
+        emit_tokens_push_sview(probe, "), _Alignof(")
+        emit_tokens_push_sview(probe, c_name)
+        emit_tokens_push_sview(probe, "));\n")
+        return
+    emit_tokens_push_sview(probe, "  printf(\"FIELD %s %s %zu\\n\", \"")
+    emit_tokens_push_sview(probe, elisa_name)
+    emit_tokens_push_sview(probe, "\", \"")
+    emit_tokens_push_sview(probe, field)
+    emit_tokens_push_sview(probe, "\", offsetof(")
+    emit_tokens_push_sview(probe, c_name)
+    emit_tokens_push_sview(probe, ", ")
+    emit_tokens_push_sview(probe, field)
+    emit_tokens_push_sview(probe, "));\n")
+
+
+def emit_c_bind_report(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&, want_json: bool) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    owners: mutable darray[sview] = []
+    lines: mutable darray[u32] = []
+    # The `__c_bind_line` marker carries the DECORATOR's line, which is where its string
+    # arguments live. The plain `c_bind` row records the STRUCT header line instead.
+    for annotation in file.enum_annotations |owners, lines|:
+        if annotation.name == "__c_bind_line":
+            owners.push(annotation.owner)
+            lines.push(annotation.line)
+
+    if owners.count == 0:
+        empty: mutable darray[u8] = []
+        if want_json:
+            emit_tokens_push_sview(&empty, "{\n  \"version\": 1,\n  \"target_triple\": \"\",\n  \"structs\": []\n}\n")
+        else:
+            emit_tokens_push_sview(&empty, "c-bind-check: no @c_bind structs\n")
+        return emit_tokens_flush(empty)
+
+    # ---- the ELISA half, from LLVM target data ----
+    ctx: LLVMContextRef = LLVMContextCreate()
+    module_handle: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_cbind", ctx)
+    triple_storage: mutable darray[u8] = []
+    machine: LLVMTargetMachineRef = Backend::configure_module_target_for(module_handle, requested_target_triple(&triple_storage))
+    layout_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(machine)
+    facts: darray[u8] = Backend::c_bind_layout_for_file(file, module_handle, ctx, layout_data)
+    facts_base: cstr = (&facts[0]).cast[cstr] can Unsafe.PointerCast
+    # ELISA_STAGE1_CBIND_FACTS=1 dumps the Backend's line protocol verbatim. The Elisa half
+    # is the part with no external oracle — `cc` reports the C side for itself — so being
+    # able to see it directly is what makes a layout disagreement debuggable.
+    if env_flag_enabled("ELISA_STAGE1_CBIND_FACTS"):
+        dump: mutable darray[u8] = []
+        for dump_index in 0..<facts.count |dump, facts|:
+            dump.push(facts[dump_index]) if facts[dump_index] != 0
+        return emit_tokens_flush(dump)
+
+    elisa_names: mutable darray[sview] = []
+    elisa_sizes: mutable darray[i64] = []
+    elisa_aligns: mutable darray[i64] = []
+    field_owners: mutable darray[sview] = []
+    field_names: mutable darray[sview] = []
+    field_offsets: mutable darray[i64] = []
+    cursor: mutable usize = 0
+    while cursor < facts.count and facts[cursor] != 0 |cursor, facts, facts_base, elisa_names, elisa_sizes, elisa_aligns, field_owners, field_names, field_offsets|:
+        kind: u8 = facts[cursor]
+        name_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(facts, cursor + 2)
+        # sview(value, start, END) — the third argument is the END index, not a length.
+        name_span: sview = sview(facts_base, name_word.lo.i64(), name_word.hi.i64())
+        if kind == 83:
+            size_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(facts, name_word.after)
+            size_value: (value: i64, stop: usize) = cbind_parse_int(facts, size_word.lo)
+            align_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(facts, size_word.after)
+            align_value: (value: i64, stop: usize) = cbind_parse_int(facts, align_word.lo)
+            elisa_names.push(name_span)
+            elisa_sizes.push(size_value.value)
+            elisa_aligns.push(align_value.value)
+        elif kind == 70:
+            field_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(facts, name_word.after)
+            field_span: sview = sview(facts_base, field_word.lo.i64(), field_word.hi.i64())
+            offset_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(facts, field_word.after)
+            offset_value: (value: i64, stop: usize) = cbind_parse_int(facts, offset_word.lo)
+            field_owners.push(name_span)
+            field_names.push(field_span)
+            field_offsets.push(offset_value.value)
+        while cursor < facts.count and facts[cursor] != 10 and facts[cursor] != 0 |cursor, facts|:
+            cursor <- cursor + 1
+        cursor <- cursor + 1 if cursor < facts.count and facts[cursor] == 10
+
+    # ---- the C half: generate a probe, compile it, run it ----
+    work: mutable darray[u8] = []
+    emit_tokens_push_sview(&work, "/tmp/elisa-cbind-stage1")
+    make_directory(work)
+    probe_path: darray[u8] = joined_path(work, "probe.c")
+    binary_path: darray[u8] = joined_path(work, "probe")
+    output_path: darray[u8] = joined_path(work, "probe.out")
+    compile_log: darray[u8] = joined_path(work, "cc.log")
+
+    probe: mutable darray[u8] = []
+    emit_tokens_push_sview(&probe, "#include <stddef.h>\n#include <stdio.h>\n")
+    # Each DISTINCT header once. Two `@c_bind` structs naming the same header emitted it
+    # twice, which an UNGUARDED header answers with "typedef redefinition" — the guarded
+    # fixture I first wrote hid this, and the gate's unguarded one caught it.
+    seen_headers: mutable darray[sview] = []
+    for include_index in 0..<owners.count |probe, owners, lines, tokens, source, seen_headers|:
+        header_name: sview = cbind_string_arg(tokens, source, lines[include_index], 0)
+        already: mutable bool = false
+        for seen in seen_headers |already, header_name|:
+            already <- true if seen == header_name
+        continue if already
+        seen_headers.push(header_name)
+        emit_tokens_push_sview(&probe, "#include \"")
+        emit_tokens_push_sview(&probe, header_name)
+        emit_tokens_push_sview(&probe, "\"\n")
+    emit_tokens_push_sview(&probe, "int main(void) {\n")
+    for struct_index in 0..<owners.count |probe, owners, lines, tokens, source, field_owners, field_names|:
+        c_name: sview = cbind_string_arg(tokens, source, lines[struct_index], 1)
+        cbind_probe_line(&probe, owners[struct_index], c_name, "")
+        for field_index in 0..<field_owners.count |probe, field_owners, field_names, owners, struct_index, c_name|:
+            continue if field_owners[field_index] != owners[struct_index]
+            cbind_probe_line(&probe, owners[struct_index], c_name, field_names[field_index])
+    emit_tokens_push_sview(&probe, "  return 0;\n}\n")
+    if not write_file_bytes(&probe_path, probe):
+        failure: mutable darray[u8] = []
+        emit_tokens_push_sview(&failure, "error: could not write the C binding probe\n")
+        write_stderr(failure)
+        return 1
+
+    compile_command: mutable darray[u8] = []
+    emit_tokens_push_sview(&compile_command, "cc ")
+    for probe_index in 0..<probe_path.count |compile_command, probe_path|:
+        compile_command.push(probe_path[probe_index])
+    emit_tokens_push_sview(&compile_command, " -o ")
+    for binary_index in 0..<binary_path.count |compile_command, binary_path|:
+        compile_command.push(binary_path[binary_index])
+    emit_tokens_push_sview(&compile_command, " > ")
+    for log_index in 0..<compile_log.count |compile_command, compile_log|:
+        compile_command.push(compile_log[log_index])
+    emit_tokens_push_sview(&compile_command, " 2>&1")
+    if cbind_run(compile_command) != 0:
+        # stage0 reports the compiler's own diagnostics, which name the undeclared C type —
+        # far more useful than "the check failed".
+        failure: mutable darray[u8] = []
+        emit_tokens_push_sview(&failure, "error: failed to compile C binding probe with cc\n")
+        log_path_c: mutable darray[u8] = []
+        for log_copy in 0..<compile_log.count |log_path_c, compile_log|:
+            log_path_c.push(compile_log[log_copy])
+        log_path_c.push(0)
+        log_cstr: cstr = (&log_path_c[0]).cast[cstr] can Unsafe.PointerCast
+        log_bytes: darray[u8] = read_file(log_cstr)
+        for log_byte_index in 0..<log_bytes.count |failure, log_bytes|:
+            failure.push(log_bytes[log_byte_index]) if log_bytes[log_byte_index] != 0
+        write_stderr(failure)
+        return 1
+
+    run_command: mutable darray[u8] = []
+    for binary_run in 0..<binary_path.count |run_command, binary_path|:
+        run_command.push(binary_path[binary_run])
+    emit_tokens_push_sview(&run_command, " > ")
+    for out_index in 0..<output_path.count |run_command, output_path|:
+        run_command.push(output_path[out_index])
+    if cbind_run(run_command) != 0:
+        failure: mutable darray[u8] = []
+        emit_tokens_push_sview(&failure, "error: C binding probe did not run\n")
+        write_stderr(failure)
+        return 1
+
+    output_path_c: mutable darray[u8] = []
+    for out_copy in 0..<output_path.count |output_path_c, output_path|:
+        output_path_c.push(output_path[out_copy])
+    output_path_c.push(0)
+    output_cstr: cstr = (&output_path_c[0]).cast[cstr] can Unsafe.PointerCast
+    probe_output: darray[u8] = read_file(output_cstr)
+
+    # ---- compare ----
+    # C-side rows, parsed from the probe's stdout in the same shape as the Elisa facts.
+    c_struct_sizes: mutable darray[i64] = []
+    c_struct_aligns: mutable darray[i64] = []
+    for _slot in 0..<owners.count |c_struct_sizes, c_struct_aligns|:
+        c_struct_sizes.push(-1)
+        c_struct_aligns.push(-1)
+    c_field_offsets: mutable darray[i64] = []
+    for _field_slot in 0..<field_owners.count |c_field_offsets|:
+        c_field_offsets.push(-1)
+
+    scan: mutable usize = 0
+    while scan < probe_output.count and probe_output[scan] != 0 |scan, probe_output, owners, field_owners, field_names, c_struct_sizes, c_struct_aligns, c_field_offsets|:
+        head: (lo: usize, hi: usize, after: usize) = cbind_next_word(probe_output, scan)
+        is_struct: bool = cbind_span_equals(probe_output, head.lo, head.hi, "STRUCT")
+        is_field: bool = cbind_span_equals(probe_output, head.lo, head.hi, "FIELD")
+        if is_struct or is_field:
+            owner_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(probe_output, head.after)
+            if is_struct:
+                size_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(probe_output, owner_word.after)
+                size_value: (value: i64, stop: usize) = cbind_parse_int(probe_output, size_word.lo)
+                align_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(probe_output, size_word.after)
+                align_value: (value: i64, stop: usize) = cbind_parse_int(probe_output, align_word.lo)
+                for owner_index in 0..<owners.count |c_struct_sizes, c_struct_aligns, owners, probe_output, owner_word, size_value, align_value|:
+                    continue if not cbind_span_equals(probe_output, owner_word.lo, owner_word.hi, owners[owner_index])
+                    c_struct_sizes[owner_index] <- size_value.value
+                    c_struct_aligns[owner_index] <- align_value.value
+            else:
+                field_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(probe_output, owner_word.after)
+                offset_word: (lo: usize, hi: usize, after: usize) = cbind_next_word(probe_output, field_word.after)
+                offset_value: (value: i64, stop: usize) = cbind_parse_int(probe_output, offset_word.lo)
+                for row_index in 0..<field_owners.count |c_field_offsets, field_owners, field_names, probe_output, owner_word, field_word, offset_value|:
+                    continue if not cbind_span_equals(probe_output, owner_word.lo, owner_word.hi, field_owners[row_index])
+                    continue if not cbind_span_equals(probe_output, field_word.lo, field_word.hi, field_names[row_index])
+                    c_field_offsets[row_index] <- offset_value.value
+        while scan < probe_output.count and probe_output[scan] != 10 and probe_output[scan] != 0 |scan, probe_output|:
+            scan <- scan + 1
+        scan <- scan + 1 if scan < probe_output.count and probe_output[scan] == 10
+
+    # Every mismatch, in stage0's order: per struct, size then align then each field offset.
+    problems: mutable darray[u8] = []
+    for check_index in 0..<owners.count |problems, owners, elisa_names, elisa_sizes, elisa_aligns, c_struct_sizes, c_struct_aligns, field_owners, field_names, field_offsets, c_field_offsets|:
+        name: sview = owners[check_index]
+        elisa_slot: mutable i64 = -1
+        for locate in 0..<elisa_names.count |elisa_slot, elisa_names, name|:
+            elisa_slot <- locate.i64() if elisa_names[locate] == name
+        continue if elisa_slot < 0
+        elisa_size: i64 = elisa_sizes[elisa_slot.usize()]
+        elisa_align: i64 = elisa_aligns[elisa_slot.usize()]
+        if elisa_size != c_struct_sizes[check_index]:
+            emit_tokens_push_sview(&problems, name)
+            emit_tokens_push_sview(&problems, ": size mismatch Elisa=")
+            append_decimal(&problems, elisa_size.u32())
+            emit_tokens_push_sview(&problems, " C=")
+            append_decimal(&problems, c_struct_sizes[check_index].u32())
+            problems.push(10)
+        if elisa_align != c_struct_aligns[check_index]:
+            emit_tokens_push_sview(&problems, name)
+            emit_tokens_push_sview(&problems, ": align mismatch Elisa=")
+            append_decimal(&problems, elisa_align.u32())
+            emit_tokens_push_sview(&problems, " C=")
+            append_decimal(&problems, c_struct_aligns[check_index].u32())
+            problems.push(10)
+        for row in 0..<field_owners.count |problems, field_owners, field_names, field_offsets, c_field_offsets, name|:
+            continue if field_owners[row] != name
+            continue if field_offsets[row] == c_field_offsets[row]
+            emit_tokens_push_sview(&problems, name)
+            problems.push(46)
+            emit_tokens_push_sview(&problems, field_names[row])
+            emit_tokens_push_sview(&problems, ": offset mismatch Elisa=")
+            append_decimal(&problems, field_offsets[row].u32())
+            emit_tokens_push_sview(&problems, " C=")
+            append_decimal(&problems, c_field_offsets[row].u32())
+            problems.push(10)
+
+    if problems.count > 0:
+        failure: mutable darray[u8] = []
+        emit_tokens_push_sview(&failure, "error: C binding layout check failed:\n")
+        for problem_index in 0..<problems.count |failure, problems|:
+            failure.push(problems[problem_index])
+        write_stderr(failure)
+        return 1
+
+    report: mutable darray[u8] = []
+    if want_json:
+        emit_tokens_push_sview(&report, "{\n  \"version\": 1,\n  \"target_triple\": \"")
+        emit_tokens_push_sview(&report, requested_target_triple(&triple_storage))
+        emit_tokens_push_sview(&report, "\",\n  \"structs\": [\n")
+        for json_index in 0..<owners.count |report, owners, lines, tokens, source, elisa_names, elisa_sizes, elisa_aligns, c_struct_sizes, c_struct_aligns, field_owners, field_names, field_offsets, c_field_offsets|:
+            emit_tokens_push_sview(&report, ",\n") if json_index > 0
+            name: sview = owners[json_index]
+            elisa_slot: mutable i64 = -1
+            for locate in 0..<elisa_names.count |elisa_slot, elisa_names, name|:
+                elisa_slot <- locate.i64() if elisa_names[locate] == name
+            emit_tokens_push_sview(&report, "    {\n      \"elisa_name\": \"")
+            emit_tokens_push_sview(&report, name)
+            emit_tokens_push_sview(&report, "\",\n      \"c_name\": \"")
+            emit_tokens_push_sview(&report, cbind_string_arg(tokens, source, lines[json_index], 1))
+            emit_tokens_push_sview(&report, "\",\n      \"header\": \"")
+            emit_tokens_push_sview(&report, cbind_string_arg(tokens, source, lines[json_index], 0))
+            emit_tokens_push_sview(&report, "\",\n      \"prefix\": ")
+            emit_tokens_push_sview(&report, "true" if cbind_has_prefix_flag(tokens, source, lines[json_index]) else "false")
+            emit_tokens_push_sview(&report, ",\n      \"elisa\": {\n        \"size\": ")
+            append_decimal(&report, elisa_sizes[elisa_slot.usize()].u32())
+            emit_tokens_push_sview(&report, ",\n        \"align\": ")
+            append_decimal(&report, elisa_aligns[elisa_slot.usize()].u32())
+            emit_tokens_push_sview(&report, "\n      },\n      \"c\": {\n        \"size\": ")
+            append_decimal(&report, c_struct_sizes[json_index].u32())
+            emit_tokens_push_sview(&report, ",\n        \"align\": ")
+            append_decimal(&report, c_struct_aligns[json_index].u32())
+            emit_tokens_push_sview(&report, "\n      },\n      \"fields\": [\n")
+            first_field: mutable bool = true
+            for row in 0..<field_owners.count |report, field_owners, field_names, field_offsets, c_field_offsets, name, first_field|:
+                continue if field_owners[row] != name
+                emit_tokens_push_sview(&report, ",\n") if not first_field
+                first_field <- false
+                emit_tokens_push_sview(&report, "        {\n          \"name\": \"")
+                emit_tokens_push_sview(&report, field_names[row])
+                emit_tokens_push_sview(&report, "\",\n          \"elisa_offset\": ")
+                append_decimal(&report, field_offsets[row].u32())
+                emit_tokens_push_sview(&report, ",\n          \"c_offset\": ")
+                append_decimal(&report, c_field_offsets[row].u32())
+                emit_tokens_push_sview(&report, "\n        }")
+            emit_tokens_push_sview(&report, "\n      ]\n    }")
+        emit_tokens_push_sview(&report, "\n  ]\n}\n")
+    else:
+        for text_index in 0..<owners.count |report, owners, lines, tokens, source, elisa_names, elisa_sizes, elisa_aligns, field_owners|:
+            name: sview = owners[text_index]
+            elisa_slot: mutable i64 = -1
+            for locate in 0..<elisa_names.count |elisa_slot, elisa_names, name|:
+                elisa_slot <- locate.i64() if elisa_names[locate] == name
+            field_count: mutable u32 = 0
+            for row in 0..<field_owners.count |field_count, field_owners, name|:
+                field_count <- field_count + 1 if field_owners[row] == name
+            emit_tokens_push_sview(&report, "c-bind-check: ")
+            emit_tokens_push_sview(&report, name)
+            emit_tokens_push_sview(&report, " matches ")
+            emit_tokens_push_sview(&report, cbind_string_arg(tokens, source, lines[text_index], 1))
+            emit_tokens_push_sview(&report, " from ")
+            emit_tokens_push_sview(&report, cbind_string_arg(tokens, source, lines[text_index], 0))
+            emit_tokens_push_sview(&report, " (size=")
+            append_decimal(&report, elisa_sizes[elisa_slot.usize()].u32())
+            emit_tokens_push_sview(&report, " align=")
+            append_decimal(&report, elisa_aligns[elisa_slot.usize()].u32())
+            emit_tokens_push_sview(&report, " fields=")
+            append_decimal(&report, field_count)
+            emit_tokens_push_sview(&report, ")\n")
+    return emit_tokens_flush(report)
+
+
 # `-emit test-runner` — stage0's synthesized test driver: the unit's source, then a
 # `ctx_test_main` that calls each `@test` function in declaration order and reports it.
 #
@@ -2874,6 +3299,8 @@ def cli_emit_mode_supported(mode: cstr) -> bool can[Abort.Panic]:
     true return if mode == "doc"
     true return if mode == "header"
     true return if mode == "test-runner"
+    true return if mode == "c-bind-check"
+    true return if mode == "c-bind-check-json"
     true return if mode == "exe"
     return false
 
@@ -2917,8 +3344,8 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
                 for prefix_index in 0..<sview_len("unsupported -emit mode: ") |message|:
                     message.push(sview_at("unsupported -emit mode: ", prefix_index))
                 push_cstr(&message, requested_mode)
-                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner deps deps-json\n") |message|:
-                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner deps deps-json\n", suffix_index))
+                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json deps deps-json\n") |message|:
+                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner c-bind-check c-bind-check-json deps deps-json\n", suffix_index))
                 write_stderr(message)
                 return request
             _ = setenv("ELISA_STAGE1_EMIT", requested_mode, 1)
@@ -3108,6 +3535,11 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
     # `-emit test-runner` echoes the unit and appends a synthesized `ctx_test_main`.
     if emit_mode_is("test-runner"):
         return emit_test_runner_report(file, src_ptr, source_len)
+    # `-emit c-bind-check` compares each `@c_bind` struct's layout against the real C one.
+    if emit_mode_is("c-bind-check"):
+        return emit_c_bind_report(file, tokens, src_ptr, false)
+    if emit_mode_is("c-bind-check-json"):
+        return emit_c_bind_report(file, tokens, src_ptr, true)
     # `-emit fmt` runs the unparser; every unported shape prints a loud <fmt-*-todo>
     # marker, so partial coverage can never read as byte parity in the smoke.
     if emit_mode_is("fmt"):
