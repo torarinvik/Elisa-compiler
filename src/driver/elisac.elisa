@@ -33,6 +33,9 @@ extern open(path: cstr, flags: i64, ...) -> i64
 extern close(fd: i64) -> i64
 extern setenv(name: cstr, value: cstr, overwrite: i64) -> i64
 extern mkdir(path: cstr, mode: u16) -> i64
+# `#line` directives carry an ABSOLUTE path, so a relative -o/source argument is joined
+# onto the working directory (stage0 uses filepath.Abs).
+extern getcwd(buffer: void&, size: usize) -> void&
 extern system(command: cstr) -> i64
 extern unlink(path: cstr) -> i64
 # Diagnostics go to STDERR through the std's libc `write` (declared in debug_referee.elisa as
@@ -1805,6 +1808,166 @@ def emit_iface_block_decl(buffer: mutable darray[u8]&, tokens: darray[Lexer::Tok
         emit_iface_body_lines(buffer, tokens, source, body_range.start, body_range.stop, indent + 4)
 
 
+# `-emit test-runner` — stage0's synthesized test driver: the unit's source, then a
+# `ctx_test_main` that calls each `@test` function in declaration order and reports it.
+#
+# `-filter` selects tests by SUBSTRING of the name (measured against stage0: `checks`
+# matches both `checks_one` and `checks_two`; `one` matches only `checks_one`).
+
+
+# The source path as an ABSOLUTE path, which is what stage0's `#line` directive carries
+# (filepath.Abs). ELISA_STAGE1_SRC is passed through as the caller wrote it, so a relative
+# path is joined onto the working directory.
+def push_absolute_source_path(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    given: mutable darray[u8] = []
+    _ = push_source_path(&given)
+    return if given.count == 0
+    if given[0] == 47:
+        for absolute_index in 0..<given.count |buffer, given|:
+            buffer.push(given[absolute_index])
+        return
+    # $PWD FIRST, then getcwd(3). Go's os.Getwd — which is what stage0's filepath.Abs uses
+    # — returns the LOGICAL working directory from $PWD when it names the same place, while
+    # getcwd(3) returns the PHYSICAL one. On macOS that is the difference between `/tmp` and
+    # `/private/tmp`, and it is visible in the `#line` directive.
+    pwd_storage: mutable darray[u8] = []
+    for pwd_flag_index in 0..<sview_len("PWD") |pwd_storage|:
+        pwd_storage.push(sview_at("PWD", pwd_flag_index))
+    pwd_storage.push(0)
+    pwd_name: cstr = (&pwd_storage[0]).cast[cstr] can Unsafe.PointerCast
+    wrote_directory: mutable bool = false
+    if getenv(pwd_name) is pwd_bytes:
+        pwd_cursor: mutable i64 = 0
+        pwd_scanning: mutable bool = true
+        while pwd_scanning |pwd_cursor, pwd_scanning, buffer, wrote_directory, pwd_bytes|:
+            pwd_ref: u8& = pwd_bytes + pwd_cursor
+            pwd_byte: u8 = pwd_ref
+            if pwd_byte == 0:
+                pwd_scanning <- false
+            else:
+                buffer.push(pwd_byte)
+                wrote_directory <- true
+                pwd_cursor <- pwd_cursor + 1
+    if not wrote_directory:
+        cwd_storage: mutable darray[u8] = [0 for _ in 0..<4096]
+        cwd_pointer: void& = (&cwd_storage[0]).cast[void&] can Unsafe.PointerCast
+        _ = getcwd(cwd_pointer, 4096)
+        for cwd_index in 0..<cwd_storage.count |buffer, cwd_storage|:
+            break if cwd_storage[cwd_index] == 0
+            buffer.push(cwd_storage[cwd_index])
+    buffer.push(47)
+    # A leading `./` is redundant once the directory is prefixed — filepath.Abs cleans it.
+    skip: usize = 2 if given.count >= 2 and given[0] == 46 and given[1] == 47 else 0
+    for relative_index in skip..<given.count |buffer, given|:
+        buffer.push(given[relative_index])
+
+
+# The `-filter` value from ELISA_STAGE1_FILTER, or "" when unset.
+def push_test_filter(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    flag_storage: mutable darray[u8] = []
+    for flag_index in 0..<sview_len("ELISA_STAGE1_FILTER") |flag_storage|:
+        flag_storage.push(sview_at("ELISA_STAGE1_FILTER", flag_index))
+    flag_storage.push(0)
+    flag_name: cstr = (&flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+    if getenv(flag_name) is filter_bytes:
+        cursor: mutable i64 = 0
+        scanning: mutable bool = true
+        while scanning |cursor, scanning, buffer, filter_bytes|:
+            byte_ref: u8& = filter_bytes + cursor
+            filter_byte: u8 = byte_ref
+            if filter_byte == 0:
+                scanning <- false
+            else:
+                buffer.push(filter_byte)
+                cursor <- cursor + 1
+
+
+# Does `name` contain `needle`? stage0's filter is a SUBSTRING test, not an exact match.
+def test_name_matches(name: sview, needle: darray[u8]&) -> bool can[Abort.Panic]:
+    true return if needle.count == 0
+    false return if needle.count > sview_len(name)
+    for start in 0..<(sview_len(name) - needle.count + 1) |name, needle|:
+        matched: mutable bool = true
+        for probe in 0..<needle.count |matched, name, needle, start|:
+            matched <- false if sview_at(name, start + probe) != needle[probe]
+        true return if matched
+    return false
+
+
+# Every `@test`-decorated function name, in declaration order, that the filter selects.
+def test_collect_names(declarations: darray[Ast::Decl]&, needle: darray[u8]&, names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    for declaration in declarations |needle, names|:
+        if declaration is Decl.Module(test_m_name, test_m_body, test_m_line):
+            test_collect_names(test_m_body, needle, names)
+            continue
+        if declaration is Decl.Scoped(test_s_body, test_s_line):
+            test_collect_names(test_s_body, needle, names)
+            continue
+        if declaration is Decl.Func(test_f_name, test_f_params, test_f_ret, test_f_body, test_f_effects, test_f_decorators, test_f_line):
+            is_test: mutable bool = false
+            for test_f_decorator in test_f_decorators |is_test|:
+                is_test <- true if test_f_decorator.name == "test"
+            names.push(test_f_name) if is_test and test_name_matches(test_f_name, needle)
+
+
+# One `puts("<prefix><name>".cast[u8&])` line, TAB-indented to `depth` — stage0's
+# synthesized body uses tabs, not spaces.
+def test_push_puts(buffer: mutable darray[u8]&, depth: i64, prefix: sview, name: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    for tab_index in 0..<depth |buffer|:
+        buffer.push(9)
+    emit_tokens_push_sview(buffer, "puts(\"")
+    emit_tokens_push_sview(buffer, prefix)
+    emit_tokens_push_sview(buffer, name)
+    emit_tokens_push_sview(buffer, "\".cast[u8&])\n")
+
+
+def emit_test_runner_report(file: Ast::File&, source: u8&, source_len: usize) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    needle: mutable darray[u8] = []
+    push_test_filter(&needle)
+    names: mutable darray[sview] = []
+    test_collect_names(file.top_decls, needle, &names)
+
+    buffer: mutable darray[u8] = []
+    # The unit's source, attributed to the original file. For a SINGLE-FILE unit this is
+    # byte-identical to stage0. For an include-bearing unit stage0's echo also carries a
+    # directive per spliced file, which stage1's flattening does not emit; the emitted
+    # runner still compiles and runs. See the emit-mode-port-order note for why emitting
+    # those directives upstream currently breaks the line-keyed token recovery.
+    emit_tokens_push_sview(&buffer, "#line 1 ")
+    push_absolute_source_path(&buffer)
+    buffer.push(10)
+    for source_index in 0..<source_len |buffer, source|:
+        byte_ref: u8& = source + source_index.i64()
+        buffer.push(byte_ref)
+    buffer.push(10) if buffer.count > 0 and buffer[buffer.count - 1] != 10
+
+    emit_tokens_push_sview(&buffer, "\nextern puts(text: u8&) -> int can[Console.Write]\n\ndef ctx_test_main() -> int can[Console.Write]:\n")
+    if names.count == 0:
+        # ONE tab, and the grant sits on the CALL rather than a surrounding block.
+        emit_tokens_push_sview(&buffer, "\tputs(\"[ NO TESTS ] no @test functions matched filter \\\"")
+        for needle_index in 0..<needle.count |buffer, needle|:
+            buffer.push(needle[needle_index])
+        emit_tokens_push_sview(&buffer, "\\\"\".cast[u8&]) can Console.Write\n\treturn 1\n")
+    else:
+        emit_tokens_push_sview(&buffer, "\tcan Console.Write:\n")
+        for test_name in names |buffer|:
+            test_push_puts(&buffer, 2, "[ RUN      ] ", test_name)
+            buffer.push(9)
+            buffer.push(9)
+            emit_tokens_push_sview(&buffer, test_name)
+            emit_tokens_push_sview(&buffer, "()\n")
+            test_push_puts(&buffer, 2, "[       OK ] ", test_name)
+        buffer.push(9)
+        buffer.push(9)
+        emit_tokens_push_sview(&buffer, "puts(\"[ SUMMARY  ] ")
+        append_decimal(&buffer, names.count.u32())
+        emit_tokens_push_sview(&buffer, " test(s) selected; runnable=")
+        append_decimal(&buffer, names.count.u32())
+        emit_tokens_push_sview(&buffer, " skipped=0 failed=0\".cast[u8&])\n\t\treturn 0\n")
+    emit_tokens_push_sview(&buffer, "\nexport fn main() -> int = ctx_test_main\n")
+    return emit_tokens_flush(buffer)
+
+
 # `-emit header` — the C ABI header for a unit's exports.
 #
 # The GENERATOR already existed (src/backend/c_header.elisa, exercised by
@@ -2710,6 +2873,7 @@ def cli_emit_mode_supported(mode: cstr) -> bool can[Abort.Panic]:
     true return if mode == "deps-json"
     true return if mode == "doc"
     true return if mode == "header"
+    true return if mode == "test-runner"
     true return if mode == "exe"
     return false
 
@@ -2735,6 +2899,11 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
             index <- index + 1
             push_cstr(&output_path, slots[index].cast[cstr])
             _ = setenv("ELISA_STAGE1_OUT", slots[index].cast[cstr], 1)
+        elif argument == "-filter" and index + 1 < argc:
+            # Only `-emit test-runner` consumes it today; stage0 rejects it for any mode
+            # that cannot use it, which is checked below once the mode is known.
+            index <- index + 1
+            _ = setenv("ELISA_STAGE1_FILTER", slots[index].cast[cstr], 1)
         elif argument == "-emit" and index + 1 < argc:
             index <- index + 1
             requested_mode: cstr = slots[index].cast[cstr]
@@ -2748,8 +2917,8 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
                 for prefix_index in 0..<sview_len("unsupported -emit mode: ") |message|:
                     message.push(sview_at("unsupported -emit mode: ", prefix_index))
                 push_cstr(&message, requested_mode)
-                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header deps deps-json\n") |message|:
-                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header deps deps-json\n", suffix_index))
+                for suffix_index in 0..<sview_len("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner deps deps-json\n") |message|:
+                    message.push(sview_at("\nsupported: obj llvm bc tokens ast iface fmt doc header test-runner deps deps-json\n", suffix_index))
                 write_stderr(message)
                 return request
             _ = setenv("ELISA_STAGE1_EMIT", requested_mode, 1)
@@ -2936,6 +3105,9 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
     # report modes but needs no codegen.
     if emit_mode_is("header"):
         return emit_header_report(file)
+    # `-emit test-runner` echoes the unit and appends a synthesized `ctx_test_main`.
+    if emit_mode_is("test-runner"):
+        return emit_test_runner_report(file, src_ptr, source_len)
     # `-emit fmt` runs the unparser; every unported shape prints a loud <fmt-*-todo>
     # marker, so partial coverage can never read as byte parity in the smoke.
     if emit_mode_is("fmt"):

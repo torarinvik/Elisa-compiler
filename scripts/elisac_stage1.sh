@@ -121,6 +121,7 @@ src=""
 noalias=0
 bounds_check=0
 opt_level=0
+test_filter=""
 emit_mode="obj"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -143,11 +144,14 @@ while [[ $# -gt 0 ]]; do
         fmt)    emit_mode="fmt" ;;
         doc)    emit_mode="doc" ;;
         header) emit_mode="header" ;;
+        test-runner) emit_mode="test-runner" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
+    -filter)
+      test_filter="${2:-}"; shift 2 ;;
     -fnoalias)
       noalias=1; shift ;;
     -fbounds-check)
@@ -247,12 +251,13 @@ driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ "$emit_mode" == "bc" ]] && driver_env+=("ELISA_STAGE1_EMIT=bc")
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
-if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" || "$emit_mode" == "doc" || "$emit_mode" == "header" ]]; then
+if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" || "$emit_mode" == "doc" || "$emit_mode" == "header" || "$emit_mode" == "test-runner" ]]; then
   # `-emit fmt` additionally needs the OFFSET MAP (see flatten_includes): stage0 names
   # its synthesized auto-regions `__auto_<pos.Offset>` with offsets measured over its
   # directive-bearing expansion. ELISA_STAGE1_SRC stays as given — the tokens report
   # prints it verbatim and is byte-parity held.
   driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
+  [[ -n "$test_filter" ]] && driver_env+=("ELISA_STAGE1_FILTER=$test_filter")
   if [[ "$emit_mode" == "fmt" && -s "$flat.map" ]]; then
     driver_env+=("ELISA_STAGE1_OFFSET_MAP=$(cat "$flat.map")")
   fi
