@@ -6,11 +6,15 @@
 #
 #   * The PASS, SKIP, FILTER, NO-TESTS and SUMMARY paths are demanded BYTE-IDENTICAL,
 #     including the exit status (1 when anything failed or nothing matched).
-#   * A PANICKING test is compared only down to its status LINE. stage0 replays the
-#     child's captured stdout/stderr, which on this path carries a symbolized backtrace —
-#     raw addresses that differ between two builds of the same program, so no two runs
-#     agree byte-for-byte, let alone two compilers. The line that classifies the failure
-#     (`[ PANIC    ] name (signal abort trap)`) IS deterministic and is compared.
+#   * A PANICKING test is compared in full EXCEPT for the symbolized backtrace frames,
+#     whose raw addresses differ between two builds of the same program — so no two runs
+#     agree byte-for-byte, let alone two compilers. Everything else on that path is
+#     deterministic and IS compared: the classification line, the replayed
+#     `panic at FILE:LINE:COL: MESSAGE`, and the `[ ACTIVE   ]` line the shim writes.
+#
+#     That the panic TEXT is comparable at all is new. stage1 used to lower `panic` to a
+#     bare `abort()`, so a panicking program died silently and there was nothing to
+#     replay; the report is now emitted, and this case is what holds it.
 #
 # The signal name is the part most likely to regress: system() runs the command through
 # `/bin/sh -c`, which reports a signalled child as a NORMAL exit with code 128+N. Reading
@@ -44,12 +48,15 @@ compare() {
     fi
 }
 
-# Compare only the lines that cannot carry a backtrace address.
-compare_status_lines() {
+# Compare everything but the backtrace frames, which carry raw addresses. A frame line is
+# `    <n>   <image>   0x...  <symbol> + <off>`; collapse each to a marker so their
+# PRESENCE and COUNT still have to match while their contents do not.
+compare_modulo_backtrace() {
     local label="$1"; local src="$2"; shift 2
     local s0 s1 rc0 rc1
-    s0="$("$ELISACORE_BIN" -emit test "$@" "$src" </dev/null 2>/dev/null | grep -E '^\[ (RUN|  *OK|SKIPPED|PANIC|FAILED|SUMMARY) ')"; rc0=$?
-    s1="$(bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit test "$@" "$src" 2>/dev/null | grep -E '^\[ (RUN|  *OK|SKIPPED|PANIC|FAILED|SUMMARY) ')"; rc1=$?
+    strip() { sed -E 's/^ +[0-9]+ +[^ ]+ +0x[0-9a-f]+ .*/    <frame>/'; }
+    s0="$("$ELISACORE_BIN" -emit test "$@" "$src" </dev/null 2>/dev/null | strip)"; rc0=$?
+    s1="$(bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit test "$@" "$src" 2>/dev/null | strip)"; rc1=$?
     if [ "$s0" = "$s1" ]; then
         same=$((same + 1))
     else
@@ -108,8 +115,8 @@ compare "skipped"             "$WORK/skip.elisa"
 compare "skipped, filtered"   "$WORK/skip.elisa" -filter skipped
 
 # The failure path: status lines only (see the header).
-compare_status_lines "panic"                "$WORK/panic.elisa"
-compare_status_lines "panic, filtered out"  "$WORK/panic.elisa" -filter passes
+compare_modulo_backtrace "panic"               "$WORK/panic.elisa"
+compare_modulo_backtrace "panic, filtered out" "$WORK/panic.elisa" -filter passes
 
 # stage0 refuses -o; so must stage1.
 reject=0
