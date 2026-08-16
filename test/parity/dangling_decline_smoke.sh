@@ -36,21 +36,39 @@ decline_case() {
     pass=$((pass + 1))
 }
 
-# `dict[K, V]` has no backend layout unless the std declares it, so `sink`'s SIGNATURE
-# declines and `total`'s body declines with it. `main` still calls `total`, so the emitted
-# object references a symbol nothing defines: rc 2, not a silent 0.
-REFERENCED='def sink(d: dict[i64, i64]&) -> i64:\n    return 3\n\ndef total() -> i64:\n    table: mutable dict[i64, i64] = {}\n    return sink(table)\n\ndef main() -> i64:\n    return total() + 4\n'
-decline_case referenced_decline "$REFERENCED" 2
+# The declining construct is a `deque[i64]` LOCAL: stage1's backend has no layout for it,
+# so `total`'s body declines while `total`'s own signature stays emittable.
+#
+# It used to be a `dict[i64, i64]`, and stage1 has since GAINED dict support — the fixture
+# stopped declining, so all four cases exercised an ordinary successful compile and the
+# first one failed on an rc the compiler was right to return. A gate whose premise has
+# quietly evaporated is worse than no gate, so the premise is now ASSERTED below rather
+# than assumed: if `deque` gains support too, this says so in one line instead of looking
+# like a regression.
+DECLINING_BODY='    table: mutable deque[i64] = []\n'
+
+# PRECONDITION: the construct must actually decline. ELISA_DBG_DECLINE prints DROPPED per
+# stripped function.
+printf 'def total() -> i64:\n%b    return 3\n\ndef main() -> i64:\n    return 7\n' "$DECLINING_BODY" > "$WORK/precondition.elisa"
+if ! ELISA_DBG_DECLINE=1 RUN "$STAGE1" -o "$WORK/precondition.o" "$WORK/precondition.elisa" 2>&1 | grep -q 'DROPPED total'; then
+    echo "dangling_decline_smoke FAILED: the fixture no longer declines — stage1 gained support for"
+    echo "  the construct this gate leans on. Pick another (probe candidates with ELISA_DBG_DECLINE=1)."
+    exit 1
+fi
+
+# `main` still calls the declining `total`, so the emitted object references a symbol
+# nothing defines: rc 2, not a silent 0.
+decline_case referenced_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef main() -> i64:\n    return total() + 4\n' 2
 
 # The SAME declining function, never called. Its stripped declaration has no users, the
 # linker never looks for it, and the program is fine. This is the narrowing the self-host
 # build depends on: refusing every drop would refuse to compile the compiler.
-decline_case unreferenced_decline 'def sink(d: dict[i64, i64]&) -> i64:\n    return 3\n\ndef total() -> i64:\n    table: mutable dict[i64, i64] = {}\n    return sink(table)\n\ndef main() -> i64:\n    return 7\n' 0
+decline_case unreferenced_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef main() -> i64:\n    return 7\n' 0
 
 # A LIBRARY — no `main`. Its whole purpose is to be linked against something else, and
 # `native_runtime_support.elisa` legitimately leaves symbols for the runtime object to
 # satisfy. Same referenced decline as the first case; still compiles.
-decline_case library_decline 'def sink(d: dict[i64, i64]&) -> i64:\n    return 3\n\ndef total() -> i64:\n    table: mutable dict[i64, i64] = {}\n    return sink(table)\n\ndef entry() -> i64:\n    return total() + 4\n' 0
+decline_case library_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef entry() -> i64:\n    return total() + 4\n' 0
 
 # An ordinary program declines nothing and is unaffected.
 decline_case clean_program 'def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n' 0

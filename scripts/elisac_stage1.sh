@@ -150,6 +150,8 @@ while [[ $# -gt 0 ]]; do
         tests) emit_mode="tests" ;;
         benches) emit_mode="benches" ;;
         fixtures) emit_mode="fixtures" ;;
+        # `-emit test` runs the suite; like the listings, stage0 refuses `-o` for it.
+        test) emit_mode="test" ;;
         c-bind-check) emit_mode="c-bind-check" ;;
         c-bind-check-json) emit_mode="c-bind-check-json" ;;
         packed) emit_mode="packed" ;;
@@ -160,7 +162,7 @@ while [[ $# -gt 0 ]]; do
         interpret) emit_mode="interpret" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit tests, -emit benches, -emit fixtures, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit tests, -emit benches, -emit fixtures, -emit test, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -filter)
@@ -191,11 +193,17 @@ done
 # `-emit tests|benches|fixtures` list annotated functions on STDOUT and stage0 rejects
 # `-o` for them, so they are the one shape that needs no output path.
 case "$emit_mode" in
-  tests|benches|fixtures)
+  tests|benches|fixtures|test)
     if [[ -n "$out" ]]; then
       echo "error: -o is not supported for -emit $emit_mode" >&2; exit 1
     fi
     out=/dev/null ;;
+  interpret)
+    # stage0 refuses `-o` here too, but callers (including this repo's own gate) pass
+    # `-o /dev/null` to satisfy the wrapper's usual requirement. Accept either, and
+    # default the path so a bare `-emit interpret` behaves like stage0's rather than
+    # failing with a usage error — which read as exit 2 where stage0 answers 1.
+    out="${out:-/dev/null}" ;;
 esac
 [[ -n "$out" && -n "$src" ]] || { echo "usage: $0 -o out.o source.elisa" >&2; exit 2; }
 [[ -f "$src" ]] || { echo "missing source: $src" >&2; exit 2; }
@@ -286,9 +294,12 @@ if [[ "$emit_mode" == "c-archive" ]]; then
 fi
 # `-emit tests|benches|fixtures` also print on STDOUT, but stage0 refuses `-o` for them,
 # so unlike the text reports below they are NOT redirected — the listing IS the stdout.
-if [[ "$emit_mode" == "tests" || "$emit_mode" == "benches" || "$emit_mode" == "fixtures" ]]; then
+if [[ "$emit_mode" == "tests" || "$emit_mode" == "benches" || "$emit_mode" == "fixtures" || "$emit_mode" == "test" ]]; then
   driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
   [[ -n "$test_filter" ]] && driver_env+=("ELISA_STAGE1_FILTER=$test_filter")
+  # `-emit test` LINKS and RUNS, so it needs the runtime object the same way -emit exe
+  # and -emit interpret do.
+  [[ "$emit_mode" == "test" && -f "$runtime_obj" ]] && driver_env+=("ELISA_RUNTIME_OBJ=$runtime_obj")
 fi
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
