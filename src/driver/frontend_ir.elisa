@@ -1,0 +1,321 @@
+# Reading stage0's frontend IR bundle (`.elisair`, format v2).
+#
+# The v1 bundle was Go's `encoding/gob` over stage0's live AST structs, which no
+# other implementation could read: the payload was stage0's Go type graph, field
+# for field, with no schema on the wire. v2 replaced it with an explicit format —
+# numeric type and field IDs carried IN the file, every field length-delimited,
+# every node in a flat table addressed by index.
+#
+# That is what makes this file possible. stage1 models a far smaller AST than
+# stage0 (15 `Decl` variants against 40-odd node types), so it cannot reconstruct
+# stage0's tree. It does not have to: because the type table travels with the
+# bundle and every field carries its own length, a reader can walk the whole file
+# structurally, understand the parts it models, and SKIP the rest without losing
+# its place.
+#
+# What is implemented here is the CONTAINER: header, type table, node table, and
+# the value framing. Mapping decoded nodes onto stage1's own AST — which is what
+# accepting `.elisair` as a compiler INPUT would need — is separate work and is
+# not attempted here.
+#
+# Self-contained on purpose: it uses no driver-local helpers, so it can be
+# included by a probe as well as by the driver.
+
+module FrontendIr:
+    public:
+        # A parsed field: its ID and the byte span of its payload within the
+        # bundle image. Payloads stay as spans rather than being decoded eagerly,
+        # which is the point of the length-delimited framing — a field stage1 has
+        # no use for costs only the two integers that skip it.
+        struct IrField:
+            id: mutable u32
+            start: mutable usize
+            length: mutable usize
+
+        struct IrNode:
+            type_id: mutable u32
+            field_start: mutable usize
+            field_count: mutable usize
+
+        struct IrTypeField:
+            name_start: mutable usize
+            name_length: mutable usize
+            id: mutable u32
+            kind: mutable u8
+
+        struct IrType:
+            name_start: mutable usize
+            name_length: mutable usize
+            field_start: mutable usize
+            field_count: mutable usize
+            id: mutable u32
+
+        # The whole bundle, flattened. Index-addressed rather than tree-shaped:
+        # the format numbers its nodes, so the natural representation here is the
+        # same flat table, and it avoids building a recursive structure that would
+        # only be taken apart again.
+        struct IrBundle:
+            types: mutable darray[IrType]
+            type_fields: mutable darray[IrTypeField]
+            nodes: mutable darray[IrNode]
+            fields: mutable darray[IrField]
+            error_line: mutable sview
+            source_name_start: mutable usize
+            source_name_length: mutable usize
+            resolved_start: mutable usize
+            resolved_length: mutable usize
+            version: mutable u32
+            root: mutable u32
+            ok: mutable bool
+
+    private:
+        # Reading is a hand-rolled cursor: each decoder returns success and writes
+        # the next offset through an out-parameter, so a caller can chain reads
+        # with `ok <- ok and next_read(...)` and stop at the first short read.
+
+        def ir_uvarint(data: darray[u8]&, offset: usize, out_value: mutable u64&, out_next: mutable usize&) -> bool:
+            can Abort.Panic:
+                shift: mutable u32 = 0
+                result: mutable u64 = 0
+                position: mutable usize = offset
+                while position < data.count |shift, result, position, out_value, out_next|:
+                    byte: u8 = data[position]
+                    position <- position + 1
+                    result <- result | ((byte & 0x7f).u64() << shift.u64())
+                    if (byte & 0x80) == 0:
+                        out_value <- result
+                        out_next <- position
+                        return true
+                    shift <- shift + 7
+                    false return if shift > 63
+                return false
+
+        # Signed values are zigzagged, so the low bit carries the sign.
+        def ir_varint(data: darray[u8]&, offset: usize, out_value: mutable i64&, out_next: mutable usize&) -> bool:
+            can Abort.Panic:
+                raw: mutable u64 = 0
+                next: mutable usize = offset
+                false return if not ir_uvarint(data, offset, &raw, &next)
+                magnitude: i64 = (raw >> 1).i64()
+                out_value <- ((0 - magnitude) - 1) if (raw & 1) != 0 else magnitude
+                out_next <- next
+                return true
+
+        # A length-prefixed span, reported by bounds rather than copied.
+        def ir_span(data: darray[u8]&, offset: usize, out_start: mutable usize&, out_length: mutable usize&, out_next: mutable usize&) -> bool:
+            can Abort.Panic:
+                length: mutable u64 = 0
+                next: mutable usize = offset
+                false return if not ir_uvarint(data, offset, &length, &next)
+                false return if next + length.usize() > data.count
+                out_start <- next
+                out_length <- length.usize()
+                out_next <- next + length.usize()
+                return true
+
+        # "ELISAIR2\n", compared byte by byte so this file needs no string helpers.
+        def ir_magic_matches(data: darray[u8]&) -> bool:
+            can Abort.Panic:
+                false return if data.count < 9
+                false return if data[0] != 'E'.u8()
+                false return if data[1] != 'L'.u8()
+                false return if data[2] != 'I'.u8()
+                false return if data[3] != 'S'.u8()
+                false return if data[4] != 'A'.u8()
+                false return if data[5] != 'I'.u8()
+                false return if data[6] != 'R'.u8()
+                false return if data[7] != '2'.u8()
+                false return if data[8] != '\n'.u8()
+                return true
+
+        # A value descriptor in the type table. Nested descriptors (a list's
+        # element, a map's key and value, an inline struct's type name) are read
+        # only to keep the cursor aligned; the outermost kind is what skipping
+        # needs, so it is the only part retained.
+        def ir_skip_value_schema(data: darray[u8]&, offset: usize, out_kind: mutable u8&, out_next: mutable usize&) -> bool:
+            can Abort.Panic:
+                false return if offset >= data.count
+                kind: u8 = data[offset]
+                next: mutable usize = offset + 1
+                inner: mutable u8 = 0
+                name_start: mutable usize = 0
+                name_length: mutable usize = 0
+                if kind == 5:
+                    false return if not ir_skip_value_schema(data, next, &inner, &next)
+                if kind == 6:
+                    false return if not ir_skip_value_schema(data, next, &inner, &next)
+                    false return if not ir_skip_value_schema(data, next, &inner, &next)
+                if kind == 7:
+                    false return if not ir_span(data, next, &name_start, &name_length, &next)
+                out_kind <- kind
+                out_next <- next
+                return true
+
+        def ir_read_type_fields(data: darray[u8]&, offset: usize, count: usize, out_next: mutable usize&, bundle: lmut IrBundle) -> void:
+            can Memory.Allocate, Abort.Panic:
+                position: mutable usize = offset
+                for _ in 0..<count |bundle, position|:
+                    field_id: mutable u64 = 0
+                    name_start: mutable usize = 0
+                    name_length: mutable usize = 0
+                    kind: mutable u8 = 0
+                    ok: mutable bool = ir_uvarint(data, position, &field_id, &position)
+                    ok <- ok and ir_span(data, position, &name_start, &name_length, &position)
+                    ok <- ok and ir_skip_value_schema(data, position, &kind, &position)
+                    if not ok:
+                        bundle.ok <- false
+                        bundle.error_line <- "truncated field descriptor"
+                        break
+                    bundle.type_fields <- bundle.type_fields.push(IrTypeField{name_start: name_start, name_length: name_length, id: field_id.u32(), kind: kind})
+                out_next <- position
+
+        def ir_read_one_type(data: darray[u8]&, offset: usize, out_next: mutable usize&, bundle: lmut IrBundle) -> void:
+            can Memory.Allocate, Abort.Panic:
+                type_id: mutable u64 = 0
+                position: mutable usize = offset
+                name_start: mutable usize = 0
+                name_length: mutable usize = 0
+                field_count: mutable u64 = 0
+                ok: mutable bool = ir_uvarint(data, offset, &type_id, &position)
+                ok <- ok and ir_span(data, position, &name_start, &name_length, &position)
+                ok <- ok and ir_uvarint(data, position, &field_count, &position)
+                if not ok:
+                    bundle.ok <- false
+                    bundle.error_line <- "truncated type descriptor"
+                    return
+                first_field: usize = bundle.type_fields.count
+                bundle <- ir_read_type_fields(data, position, field_count.usize(), &position, bundle)
+                bundle.types <- bundle.types.push(IrType{name_start: name_start, name_length: name_length, field_start: first_field, field_count: field_count.usize(), id: type_id.u32()})
+                out_next <- position
+
+        def ir_read_type_table(data: darray[u8]&, offset: usize, out_next: mutable usize&, bundle: lmut IrBundle) -> void:
+            can Memory.Allocate, Abort.Panic:
+                count: mutable u64 = 0
+                position: mutable usize = offset
+                if not ir_uvarint(data, offset, &count, &position):
+                    bundle.ok <- false
+                    bundle.error_line <- "truncated type table"
+                    return
+                for _ in 0..<count.usize() |bundle, position|:
+                    bundle <- ir_read_one_type(data, position, &position, bundle)
+                    break if not bundle.ok
+                out_next <- position
+
+        def ir_read_node_fields(data: darray[u8]&, offset: usize, count: usize, limit: usize, bundle: lmut IrBundle) -> void:
+            can Memory.Allocate, Abort.Panic:
+                position: mutable usize = offset
+                for _ in 0..<count |bundle, position|:
+                    field_id: mutable u64 = 0
+                    payload_start: mutable usize = 0
+                    payload_length: mutable usize = 0
+                    ok: mutable bool = ir_uvarint(data, position, &field_id, &position)
+                    ok <- ok and ir_span(data, position, &payload_start, &payload_length, &position)
+                    if not ok or position > limit:
+                        bundle.ok <- false
+                        bundle.error_line <- "truncated node field"
+                        break
+                    bundle.fields <- bundle.fields.push(IrField{id: field_id.u32(), start: payload_start, length: payload_length})
+
+        def ir_read_node_body(data: darray[u8]&, start: usize, limit: usize, bundle: lmut IrBundle) -> void:
+            can Memory.Allocate, Abort.Panic:
+                type_id: mutable u64 = 0
+                position: mutable usize = start
+                field_count: mutable u64 = 0
+                ok: mutable bool = ir_uvarint(data, start, &type_id, &position)
+                ok <- ok and ir_uvarint(data, position, &field_count, &position)
+                if not ok:
+                    bundle.ok <- false
+                    bundle.error_line <- "truncated node header"
+                    return
+                first_field: usize = bundle.fields.count
+                bundle <- ir_read_node_fields(data, position, field_count.usize(), limit, bundle)
+                bundle.nodes <- bundle.nodes.push(IrNode{type_id: type_id.u32(), field_start: first_field, field_count: field_count.usize()})
+
+        def ir_read_node_table(data: darray[u8]&, offset: usize, out_next: mutable usize&, bundle: lmut IrBundle) -> void:
+            can Memory.Allocate, Abort.Panic:
+                count: mutable u64 = 0
+                position: mutable usize = offset
+                if not ir_uvarint(data, offset, &count, &position):
+                    bundle.ok <- false
+                    bundle.error_line <- "truncated node table"
+                    return
+                for _ in 0..<count.usize() |bundle, position|:
+                    body_start: mutable usize = 0
+                    body_length: mutable usize = 0
+                    if not ir_span(data, position, &body_start, &body_length, &position):
+                        bundle.ok <- false
+                        bundle.error_line <- "truncated node body"
+                        break
+                    bundle <- ir_read_node_body(data, body_start, body_start + body_length, bundle)
+                    break if not bundle.ok
+                out_next <- position
+
+        def ir_read_header(data: darray[u8]&, offset: usize, out_next: mutable usize&, bundle: lmut IrBundle) -> void:
+            can Memory.Allocate, Abort.Panic:
+                name_start: mutable usize = 0
+                name_length: mutable usize = 0
+                position: mutable usize = offset
+                source_start: mutable usize = 0
+                source_length: mutable usize = 0
+                ok: mutable bool = ir_span(data, offset, &name_start, &name_length, &position)
+                ok <- ok and ir_span(data, position, &source_start, &source_length, &position)
+                if not ok:
+                    bundle.ok <- false
+                    bundle.error_line <- "truncated bundle header"
+                    return
+                bundle.source_name_start <- name_start
+                bundle.source_name_length <- name_length
+                bundle.resolved_start <- source_start
+                bundle.resolved_length <- source_length
+                out_next <- position
+
+        def ir_read_root(data: darray[u8]&, offset: usize, bundle: lmut IrBundle) -> void:
+            can Memory.Allocate, Abort.Panic:
+                root: mutable u64 = 0
+                next: mutable usize = offset
+                if not ir_uvarint(data, offset, &root, &next):
+                    bundle.ok <- false
+                    bundle.error_line <- "truncated root reference"
+                    return
+                bundle.root <- root.u32()
+                if root == 0 or root.usize() > bundle.nodes.count:
+                    bundle.ok <- false
+                    bundle.error_line <- "root reference is out of range"
+
+    public:
+        # Parse a `.elisair` image. Never panics on malformed input — `ok` is false
+        # and `error_line` says what failed — because this reads files the
+        # compiler did not necessarily produce.
+        def ir_bundle_parse(data: darray[u8]&) -> IrBundle:
+            can Memory.Allocate, Abort.Panic:
+                bundle: mutable IrBundle = IrBundle{types: [], type_fields: [], nodes: [], fields: [], error_line: "", source_name_start: 0, source_name_length: 0, resolved_start: 0, resolved_length: 0, version: 0, root: 0, ok: true}
+                if not ir_magic_matches(data):
+                    bundle.ok <- false
+                    bundle.error_line <- "not a frontend IR bundle (bad magic)"
+                    return bundle
+                position: mutable usize = 9
+                version: mutable u64 = 0
+                if not ir_uvarint(data, position, &version, &position):
+                    bundle.ok <- false
+                    bundle.error_line <- "truncated version"
+                    return bundle
+                bundle.version <- version.u32()
+                if version != 2:
+                    bundle.ok <- false
+                    bundle.error_line <- "unsupported frontend IR version"
+                    return bundle
+                bundle <- ir_read_header(data, position, &position, bundle)
+                bundle return if not bundle.ok
+                bundle <- ir_read_type_table(data, position, &position, bundle)
+                bundle return if not bundle.ok
+                bundle <- ir_read_node_table(data, position, &position, bundle)
+                bundle return if not bundle.ok
+                bundle <- ir_read_root(data, position, bundle)
+                return bundle
+
+        # Resolve a type ID to its index in `types`, or the type count when absent.
+        def ir_type_index(bundle: IrBundle&, type_id: u32) -> usize:
+            can Abort.Panic:
+                for index in 0..<bundle.types.count:
+                    index return if bundle.types[index].id == type_id
+                return bundle.types.count
