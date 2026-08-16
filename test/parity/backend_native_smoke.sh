@@ -1133,14 +1133,47 @@ run_case darray_ref_write 'def fill(xs: mutable darray[i64]&, v: i64):\n    for 
 run_case array_ref_write 'def zero(a: mutable i64[3]&):\n    a[0] <- 0\n    a[1] <- 0\n    a[2] <- 0\n\ndef main() -> i64:\n    arr: mutable i64[3] = [1, 2, 3]\n    zero(&arr)\n    return arr[0] + arr[1] + arr[2]\n'   0
 run_case array_ref_read 'def total(a: i64[4]&) -> i64:\n    return a[0] + a[1] + a[2] + a[3]\n\ndef main() -> i64:\n    arr: i64[4] = [1, 2, 3, 4]\n    return total(&arr)\n'   10
 run_case try_value_vardecl 'error Bad:\n    Boom\n\ndef inner(x: i64) -> i64 error[Bad]:\n    raise Bad.Boom if x < 0\n    return x\n\ndef outer(x: i64) -> i64 error[Bad]:\n    v: i64 = try inner(x)\n    return v + 1\n\ndef main() -> i64:\n    catch outer(7):\n        ok:\n            return ok\n        error e:\n            return 0\n'   8
-# A packed constructor with NO active store declines: stage0 rejects the same program
-# ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and there
-# is no store to allocate the row from anyway.
-decline_case packed_enum_needs_store 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef read(n: Node) -> i64:\n    return match n:\n        Node.Leaf(v): v\n        Node.Tag(t): t\n\ndef main() -> i64:\n    return read(Node.Leaf(42))\n'
-# A RECURSIVE enum is AUTO-PROMOTED to packed by stage0 even though it was never declared
-# so ("packed enum constructor Node.Leaf requires an active in Node.Store: scope"), and it
-# declines here too -- for the independent reason that its payload is not a scalar.
-decline_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a: Node, b: Node)\n\ndef main() -> i64:\n    n: Node = Node.Leaf(42)\n    return match n:\n        Node.Leaf(v): v\n        Node.Pair(a, b): 0\n'
+# BOTH of these were `decline_case`s asserting the BACKEND refuses a store-less packed
+# constructor. They stopped declining, and the reason is worth stating because it is not a
+# regression in either compiler: fixing a stage0 scoping bug (Elisa-core a7655160) changed
+# how stage1's own source compiles, and these two shapes now reach codegen.
+#
+# The backend-only decline was never the guarantee that mattered. `emit_native` has no
+# semantic layer, so it was measuring a path no user can reach — every program below is
+# REJECTED by the CLI before codegen. The CLI decision is what is checked now.
+#
+# One of the two is a REAL and currently OPEN permissive gap in stage1, so it is ratcheted
+# rather than silently dropped:
+#
+#   packed_enum_needs_store    stage0 rejects, stage1 rejects   -- agree
+#   recursive_enum_is_packed   stage0 rejects, stage1 ACCEPTS   -- GAP (ratchet 1)
+#
+# The gap: stage0 auto-promotes a RECURSIVE enum to packed and still demands a store at the
+# CONSTRUCTOR (it exempts only `match`). stage1 exempts auto-promoted enums from both. The
+# exemption cannot simply be narrowed — the compiler's own AST enums are auto-promoted
+# recursive enums and its source constructs them everywhere, so the real rule has to be
+# read out of stage0's analyzer_packed_store_implicit.go before changing anything.
+packed_accept_case() {
+    local name="$1" src="$2" want_gap="$3"
+    total=$((total + 1))
+    printf '%b' "$src" > "$BUILD/pack_$name.elisa"
+    "$ELISACORE_BIN" -emit llvm -o /dev/null "$BUILD/pack_$name.elisa" </dev/null >/dev/null 2>&1
+    local rc0=$?
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit llvm -o /dev/null "$BUILD/pack_$name.elisa" >/dev/null 2>&1
+    local rc1=$?
+    local agree=0
+    [ "$rc0" -eq 0 ] && [ "$rc1" -eq 0 ] && agree=1
+    [ "$rc0" -ne 0 ] && [ "$rc1" -ne 0 ] && agree=1
+    if [ "$agree" -eq 1 ] && [ "$want_gap" -eq 0 ]; then pass=$((pass + 1)); return; fi
+    if [ "$agree" -eq 0 ] && [ "$want_gap" -eq 1 ]; then pass=$((pass + 1)); return; fi
+    if [ "$want_gap" -eq 1 ]; then
+        echo "  FAIL packed_$name: the ratcheted gap CLOSED (stage0 rc=$rc0, stage1 rc=$rc1) -- drop the ratchet"
+    else
+        echo "  FAIL packed_$name: acceptance diverged (stage0 rc=$rc0, stage1 rc=$rc1)"
+    fi
+}
+packed_accept_case enum_needs_store 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef read(n: Node) -> i64:\n    return match n:\n        Node.Leaf(v): v\n        Node.Tag(t): t\n\ndef main() -> i64:\n    return read(Node.Leaf(42))\n' 0
+packed_accept_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a: Node, b: Node)\n\ndef main() -> i64:\n    n: Node = Node.Leaf(42)\n    return match n:\n        Node.Leaf(v): v\n        Node.Pair(a, b): 0\n' 1
 # C variadic externs use the fixed parameter ABI plus C default argument promotions for the
 # unnamed tail. The call is observable through printf and stage0 accepts the same program.
 # `get OPT else return X` — the CONTROL-FLOW recovery form. The parser used to consume the
@@ -1257,7 +1290,10 @@ run_case contract_ensure_multi 'def maxi(a: i64, b: i64) -> i64:\n    ensure res
 # A `-> void` fn has no `result` to bind: it must DECLINE rather than drop the check --
 # an unenforced contract is worse than an unsupported one.
 stripped_case contract_ensure_void 'def touch(n: i64) -> void:\n    ensure n > 0\n    return\n\ndef main() -> i64:\n    touch(1)\n    return 42\n'
-decline_case dict_needs_generics 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 0\n'
+# WAS a decline case. stage1 has since gained real `dict` support and stage0 compiles
+# this too, so demanding a decline demanded a DIVERGENCE from the reference. Now pins the
+# behaviour instead: an empty dict declaration compiles, links and runs.
+run_case dict_empty_declaration 'def main() -> i64:\n    d: mutable dict[i64, i64] = {}\n    return 42\n' 42
 run_case darray_nonempty_literal 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2]\n    return xs[0] + xs[1] + 39\n' 42
 run_case for_over_darray 'def main() -> i64:\n    xs: darray[i64] = [1, 2, 3]\n    total: mutable i64 = 0\n    for x in xs:\n        total <- total + x\n    return total + 36\n' 42
 run_case comprehension_const_filter 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if false]\n    return xs.count + 42\n' 42
@@ -1272,7 +1308,26 @@ run_case mixed_widths_direct 'def main() -> i64:\n    a: i32 = 1\n    b: i64 = 2
 # INFINITE LOOP with no diagnostic (observed). stage1's parser folds `<-` and `=` into the
 # same Stmt.Assign, so the backend must reject `=` explicitly rather than emit a store and
 # silently disagree with the reference compiler.
-decline_case eq_is_not_assign 'def main() -> i64:\n    i: mutable i64 = 0\n    while i < 3:\n        i = i + 1\n    return i\n'
+# WAS `decline_eq_is_not_assign`, asserting the emitter refuses `i = i + 1` in an inner
+# scope. It does not refuse it any more, and it should not: `=` DECLARES, so an inner
+# `i = i + 1` is a new local one greater than the enclosing `i`, which is a legal program
+# both compilers accept.
+#
+# Auditing that expiry found a real stage0 bug (Elisa-core a7655160): stage0 brought the
+# new binding into scope BEFORE emitting its initializer, so `i` inside the initializer
+# resolved to the slot being declared — its native binary returned uninitialized stack
+# memory (221) where its interpreter returned 6. stage1 already read the outer slot.
+# This case pins the agreed answer.
+run_case shadowing_decl_reads_outer 'def main() -> i64:\n    i: mutable i64 = 5\n    if true:\n        i = i + 1\n        return i\n    return 0\n' 6
+
+# NOT covered here, deliberately: the LOOP form
+#     i: mutable i64 = 0
+#     while i < 3:
+#         i = i + 1
+# where the inner declaration means the outer `i` never advances, so the backend loops
+# forever while stage0's INTERPRETER answers 3. Whether a declaration may shadow a mutable
+# outer local at all is a language question, not a compiler repair, so no expectation is
+# asserted until it is settled.
 # A `|captures|` annotation on a loop is not modeled.
 # Capture-listed loops parse as Expr.Block wrapping the loop; in statement position
 # the block is just its statements, so these now compile and RUN.
