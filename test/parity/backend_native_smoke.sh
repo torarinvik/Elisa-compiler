@@ -1142,17 +1142,11 @@ run_case try_value_vardecl 'error Bad:\n    Boom\n\ndef inner(x: i64) -> i64 err
 # semantic layer, so it was measuring a path no user can reach — every program below is
 # REJECTED by the CLI before codegen. The CLI decision is what is checked now.
 #
-# One of the two is a REAL and currently OPEN permissive gap in stage1, so it is ratcheted
-# rather than silently dropped:
-#
-#   packed_enum_needs_store    stage0 rejects, stage1 rejects   -- agree
-#   recursive_enum_is_packed   stage0 rejects, stage1 ACCEPTS   -- GAP (ratchet 1)
-#
-# The gap: stage0 auto-promotes a RECURSIVE enum to packed and still demands a store at the
-# CONSTRUCTOR (it exempts only `match`). stage1 exempts auto-promoted enums from both. The
-# exemption cannot simply be narrowed — the compiler's own AST enums are auto-promoted
-# recursive enums and its source constructs them everywhere, so the real rule has to be
-# read out of stage0's analyzer_packed_store_implicit.go before changing anything.
+# Both agree now. The recursive one was an open permissive gap when these cases were
+# written and was closed by narrowing stage1's store-clause exemption: it had exempted
+# every AUTO-PROMOTED enum, where stage0 exempts AST REFINEMENTS specifically. A plain
+# recursive enum still owes a store at the constructor unless it is written `new X.V(...)`,
+# which is region-backed by design; a DECLARED `packed enum` owes one even then.
 packed_accept_case() {
     local name="$1" src="$2" want_gap="$3"
     total=$((total + 1))
@@ -1173,7 +1167,9 @@ packed_accept_case() {
     fi
 }
 packed_accept_case enum_needs_store 'packed enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef read(n: Node) -> i64:\n    return match n:\n        Node.Leaf(v): v\n        Node.Tag(t): t\n\ndef main() -> i64:\n    return read(Node.Leaf(42))\n' 0
-packed_accept_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a: Node, b: Node)\n\ndef main() -> i64:\n    n: Node = Node.Leaf(42)\n    return match n:\n        Node.Leaf(v): v\n        Node.Pair(a, b): 0\n' 1
+packed_accept_case recursive_enum_is_packed 'enum Node:\n    Leaf(v: i64)\n    Pair(a: Node, b: Node)\n\ndef main() -> i64:\n    n: Node = Node.Leaf(42)\n    return match n:\n        Node.Leaf(v): v\n        Node.Pair(a, b): 0\n' 0
+# `new X.V(...)` is the spelling that satisfies it for an auto-promoted enum: both accept.
+packed_accept_case recursive_new_is_accepted 'enum Node:\n    Leaf(v: i64)\n    Pair(a: Node, b: Node)\n\ndef build() -> i64:\n    region r(1024):\n        n: Node = new Node.Leaf(42)\n        return match n:\n            Node.Leaf(v): v\n            Node.Pair(a, b): 0\n    return 0\n\ndef main() -> i64:\n    return build()\n' 0
 # C variadic externs use the fixed parameter ABI plus C default argument promotions for the
 # unnamed tail. The call is observable through printf and stage0 accepts the same program.
 # `get OPT else return X` — the CONTROL-FLOW recovery form. The parser used to consume the
