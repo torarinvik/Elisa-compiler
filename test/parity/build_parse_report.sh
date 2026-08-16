@@ -23,14 +23,30 @@ if [[ -x "$RPT" ]]; then
   [[ -z "$_pr_stale" ]] && return 0 2>/dev/null || true
 fi
 
-if ! "$ELISACORE_BIN" -emit obj -O2 -permissive -o "$REPO_ROOT/build/parse_report.o" "$REPO_ROOT/test/breadth/parse_report.elisa" >/dev/null 2>"$REPO_ROOT/build/parse_report.err"; then
-  cat "$REPO_ROOT/build/parse_report.err" >&2
+# ATOMIC PUBLISH. The guard above narrows the race but cannot close it: 74 gate checks
+# source this script and run_all runs them in PARALLEL, so two can decide "stale" in the
+# same instant. Writing straight to $RPT then let a third check exec a HALF-WRITTEN binary
+# — observed once as a lone nullable_flow_smoke failure that passed on its own and did not
+# recur. Build under per-process names and `mv` into place: rename is atomic within a
+# filesystem, so a concurrent reader sees either the old binary or the new one, never a
+# partial one.
+_pr_tmp="$RPT.$$"
+_pr_obj="$REPO_ROOT/build/parse_report.$$.o"
+trap 'rm -f "$_pr_tmp" "$_pr_obj"' RETURN 2>/dev/null || true
+
+if ! "$ELISACORE_BIN" -emit obj -O2 -permissive -o "$_pr_obj" "$REPO_ROOT/test/breadth/parse_report.elisa" >/dev/null 2>"$REPO_ROOT/build/parse_report.$$.err"; then
+  cat "$REPO_ROOT/build/parse_report.$$.err" >&2
+  rm -f "$_pr_obj" "$REPO_ROOT/build/parse_report.$$.err"
   echo "error: failed to build parse_report.o" >&2
   exit 1
 fi
 
-if ! clang -O2 "$REPO_ROOT/build/parse_report.o" -o "$RPT" 2>"$REPO_ROOT/build/parse_report.link.err"; then
-  cat "$REPO_ROOT/build/parse_report.link.err" >&2
+if ! clang -O2 "$_pr_obj" -o "$_pr_tmp" 2>"$REPO_ROOT/build/parse_report.$$.link.err"; then
+  cat "$REPO_ROOT/build/parse_report.$$.link.err" >&2
+  rm -f "$_pr_obj" "$_pr_tmp" "$REPO_ROOT/build/parse_report.$$.link.err"
   echo "error: failed to link parse_report" >&2
   exit 1
 fi
+
+mv -f "$_pr_tmp" "$RPT"
+rm -f "$_pr_obj" "$REPO_ROOT/build/parse_report.$$.err" "$REPO_ROOT/build/parse_report.$$.link.err"
