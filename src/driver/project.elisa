@@ -1,0 +1,2188 @@
+# Stage1's project system: `project view` and `project deps` (text and --json).
+#
+# stage0 implements these in src/project_system_*.go and src/deps.go. This is a port of
+# THAT behaviour, not a reimplementation of the idea: the field defaults, the dedupe rules,
+# the dependency ordering, and the exact printed lines are all mirrored, because the parity
+# gate diffs stage1's bytes against stage0's on the same scaffold.
+#
+# Why in Elisa and not in scripts/elisac_stage1.sh, where `-emit deps` lives: the wrapper's
+# Python is justified for include EXPANSION, which is a pre-pass on the source text. The
+# project system reads configuration, resolves a dependency graph, and reports it — that is
+# compiler-driver work, and doing it in the wrapper would make the parity gate measure
+# Python rather than stage1.
+#
+# Three representation notes, each forced by something that did not compile:
+#   * Owned strings are `darray[u8]`. A list of strings is a StrList (one flat byte buffer
+#     plus start/length columns) rather than `darray[darray[u8]]` — see the comment on
+#     `expand_includes` in elisac.elisa for why a locally-built table of owned buffers
+#     fights the region checker.
+#   * A function that returns a SCALAR cannot call one that returns an owned `darray`:
+#     there is no region to infer at the call site. So every predicate and every "append
+#     into the caller's buffer" helper below works on offsets into an existing buffer and
+#     allocates nothing. That is why there is no `strlist_get`.
+#   * JSON is parsed DIRECTLY into the target structs rather than into a generic DOM. That
+#     is not just simpler: stage0 decodes with DisallowUnknownFields, so every key must be
+#     matched against a known name anyway, and an unknown one is an error.
+
+# libc, reached under ALIASED names. elisac.elisa already declares `open`/`read`/`close`/
+# `getcwd` for its own use and includes this file, so declaring them again under the plain
+# names would be a duplicate declaration; @link_name keeps one symbol behind two Elisa names.
+@link_name("open")
+extern project_open(path: cstr, flags: i64, ...) -> i64
+@link_name("read")
+extern project_read(fd: i64, buf: u8&, count: usize) -> i64
+@link_name("close")
+extern project_close(fd: i64) -> i64
+@link_name("getcwd")
+extern project_getcwd(buffer: void&, size: usize) -> void&
+@link_name("access")
+extern project_access(path: cstr, mode: i64) -> i64
+# Signature must MATCH src/backend/llvm_c.elisa's `getenv`, which the driver also
+# includes; a differing one is rejected as native symbol splitting.
+@link_name("getenv")
+extern project_getenv(name: cstr) -> u8&?
+
+
+module ProjectSystem:
+
+    # ---- byte-string helpers -----------------------------------------------------------
+    #
+    # All of these are allocation-free unless they return a `darray[u8]`.
+
+    def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+        false return if left.count != right.count
+        for index in 0..<left.count |left, right|:
+            false return if left[index] != right[index]
+        return true
+
+    # Compare `left[left_start ..< left_start+length]` against the whole of `right`.
+    def bytes_span_equal(left: darray[u8]&, left_start: usize, length: usize, right: darray[u8]&) -> bool:
+        false return if length != right.count
+        for index in 0..<length |left, right, left_start|:
+            false return if left[left_start + index] != right[index]
+        return true
+
+    def bytes_equal_view(value: darray[u8]&, text: sview) -> bool:
+        false return if value.count.i64() != sview_len(text).i64()
+        for index in 0..<value.count |value, text|:
+            false return if value[index] != sview_at(text, index.i64())
+        return true
+
+    def bytes_extend(target: mutable darray[u8]&, source: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            for index in 0..<source.count |target, source|:
+                target.push(source[index])
+
+    def bytes_extend_span(target: mutable darray[u8]&, source: darray[u8]&, start: usize, length: usize) -> void:
+        can Memory.Allocate, Abort.Panic:
+            for index in 0..<length |target, source, start|:
+                target.push(source[start + index])
+
+    def bytes_extend_view(target: mutable darray[u8]&, text: sview) -> void:
+        can Memory.Allocate, Abort.Panic:
+            length: i64 = sview_len(text).i64()
+            for index in 0..<length |target, text|:
+                target.push(sview_at(text, index))
+
+    # Append a NUL-terminated C string's bytes, for argv handling.
+    def bytes_extend_cstr(target: mutable darray[u8]&, text: cstr) -> void:
+        can Memory.Allocate, Abort.Panic:
+            index: mutable usize = 0.usize()
+            while index < 4096.usize() |index, target, text|:
+                byte: u8 = text[index].u8()
+                break if byte == 0
+                target.push(byte)
+                index <- index + 1.usize()
+
+    def bytes_copy(source: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            bytes_extend(&out, source)
+            return out
+
+    def bytes_from_view(text: sview) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            bytes_extend_view(&out, text)
+            return out
+
+    def bytes_is_space(byte: u8) -> bool:
+        return byte == 32 or byte == 9 or byte == 10 or byte == 13
+
+    # First index that is not whitespace (== count when the value is all space).
+    def bytes_trim_start(value: darray[u8]&) -> usize:
+        first: mutable usize = 0.usize()
+        while first < value.count |first, value|:
+            break if not bytes_is_space(value[first])
+            first <- first + 1.usize()
+        return first
+
+    # One past the last non-whitespace byte, never less than `bytes_trim_start`.
+    def bytes_trim_end(value: darray[u8]&) -> usize:
+        first: usize = bytes_trim_start(value)
+        last: mutable usize = value.count
+        while last > first |last, first, value|:
+            break if not bytes_is_space(value[last - 1.usize()])
+            last <- last - 1.usize()
+        return last
+
+    def bytes_is_blank(value: darray[u8]&) -> bool:
+        return bytes_trim_start(value) == value.count
+
+    def bytes_trimmed(value: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            start: usize = bytes_trim_start(value)
+            end: usize = bytes_trim_end(value)
+            out: mutable darray[u8] = []
+            bytes_extend_span(&out, value, start, end - start)
+            return out
+
+    # stage0's defaultString: the fallback whenever the value trims to nothing.
+    def bytes_or_default(value: darray[u8]&, fallback: sview) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            if bytes_is_blank(value):
+                bytes_extend_view(&out, fallback)
+                return out
+            bytes_extend(&out, value)
+            return out
+
+    # Byte-lexicographic `<`, matching Go's sort.Strings on the target names.
+    def bytes_less(left: darray[u8]&, right: darray[u8]&) -> bool:
+        limit: usize = left.count if left.count < right.count else right.count
+        for index in 0..<limit |left, right|:
+            true return if left[index] < right[index]
+            false return if left[index] > right[index]
+        return left.count < right.count
+
+    def bytes_ends_with_view(value: darray[u8]&, suffix: sview) -> bool:
+        want: i64 = sview_len(suffix).i64()
+        false return if value.count.i64() < want
+        offset: usize = value.count - want.usize()
+        for index in 0..<want |value, suffix, offset|:
+            false return if value[offset + index.usize()] != sview_at(suffix, index)
+        return true
+
+    def bytes_push_decimal(buffer: mutable darray[u8]&, value: usize) -> void:
+        can Memory.Allocate, Abort.Panic:
+            if value == 0.usize():
+                buffer.push(48)
+                return
+            digits: mutable darray[u8] = []
+            remaining: mutable usize = value
+            while remaining > 0.usize() |digits, remaining|:
+                digits.push((48.usize() + (remaining % 10.usize())).u8())
+                remaining <- remaining / 10.usize()
+            index: mutable usize = digits.count
+            while index > 0.usize() |index, buffer, digits|:
+                index <- index - 1.usize()
+                buffer.push(digits[index])
+
+    # ---- string lists ------------------------------------------------------------------
+
+    # A list of byte strings kept as one buffer plus offset columns. Entries are addressed
+    # by index and consumed through the span helpers below; nothing here hands out an owned
+    # copy, so predicates over a StrList stay allocation-free.
+    struct StrList:
+        data: mutable darray[u8]
+        starts: mutable darray[usize]
+        lengths: mutable darray[usize]
+
+    def strlist_new() -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            return StrList{data: [], starts: [], lengths: []}
+
+    def strlist_count(list: StrList&) -> usize:
+        return list.starts.count
+
+    def strlist_is_empty(list: StrList&) -> bool:
+        return list.starts.count == 0.usize()
+
+    def strlist_start(list: StrList&, index: usize) -> usize:
+        return list.starts[index]
+
+    def strlist_length(list: StrList&, index: usize) -> usize:
+        return list.lengths[index]
+
+    # The mutators take `lmut` and return void, so the caller threads them as
+    # `list <- strlist_push(list, value)`. A `mutable StrList&` parameter cannot infer a
+    # region for the darrays inside the struct; this is the same convention frontend_ir.elisa
+    # uses for IrBundle, and it is the reason these read as assignments rather than calls.
+    def strlist_push(list: lmut StrList, value: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            list.starts <- list.starts.push(list.data.count)
+            list.lengths <- list.lengths.push(value.count)
+            for index in 0..<value.count |list, value|:
+                list.data <- list.data.push(value[index])
+
+    def strlist_push_view(list: lmut StrList, text: sview) -> void:
+        can Memory.Allocate, Abort.Panic:
+            length: i64 = sview_len(text).i64()
+            list.starts <- list.starts.push(list.data.count)
+            list.lengths <- list.lengths.push(length.usize())
+            for index in 0..<length |list, text|:
+                list.data <- list.data.push(sview_at(text, index))
+
+    # Push `source[start ..< start+length]` as one entry.
+    def strlist_push_span(list: lmut StrList, source: darray[u8]&, start: usize, length: usize) -> void:
+        can Memory.Allocate, Abort.Panic:
+            list.starts <- list.starts.push(list.data.count)
+            list.lengths <- list.lengths.push(length)
+            for index in 0..<length |list, source, start|:
+                list.data <- list.data.push(source[start + index])
+
+    def strlist_append_entry(buffer: mutable darray[u8]&, list: StrList&, index: usize) -> void:
+        can Memory.Allocate, Abort.Panic:
+            start: usize = list.starts[index]
+            length: usize = list.lengths[index]
+            for offset in 0..<length |buffer, list, start|:
+                buffer.push(list.data[start + offset])
+
+    def strlist_entry_equals(list: StrList&, index: usize, value: darray[u8]&) -> bool:
+        return bytes_span_equal(list.data, list.starts[index], list.lengths[index], value)
+
+    def strlist_contains(list: StrList&, value: darray[u8]&) -> bool:
+        for index in 0..<list.starts.count |list, value|:
+            true return if strlist_entry_equals(list, index, value)
+        return false
+
+    def strlist_extend(target: lmut StrList, source: StrList&) -> void:
+        for index in 0..<source.starts.count |target, source|:
+            target <- strlist_push_span(target, source.data, source.starts[index], source.lengths[index])
+
+    def strlist_entry_copy(list: StrList&, index: usize) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            bytes_extend_span(&out, list.data, list.starts[index], list.lengths[index])
+            return out
+
+    # stage0's dedupeStrings: trim each value, drop the empty ones, keep first occurrence.
+    def strlist_dedupe(list: StrList&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            for index in 0..<list.starts.count |result, list|:
+                entry: darray[u8] = strlist_entry_copy(list, index)
+                trimmed: darray[u8] = bytes_trimmed(entry)
+                continue if trimmed.count == 0.usize()
+                # Written out rather than `strlist_contains(&result, trimmed)`: taking `&`
+                # on the local pins its region, and the `lmut` thread on the next line can
+                # then no longer infer one.
+                already: mutable bool = false
+                for seen in 0..<result.starts.count |already, result, trimmed|:
+                    already <- true if bytes_span_equal(result.data, result.starts[seen], result.lengths[seen], trimmed)
+                continue if already
+                result <- strlist_push(result, trimmed)
+            return result
+
+
+    # Entries joined with `, ` — stage0 prints dependency link flags that way.
+    def strlist_join_comma(list: StrList&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            for index in 0..<list.starts.count |out, list|:
+                if index > 0.usize():
+                    out.push(44)
+                    out.push(32)
+                strlist_append_entry(&out, list, index)
+            return out
+
+
+    # ---- filesystem ------------------------------------------------------------------------
+
+    # A NUL-terminated copy, for the libc calls below.
+    def bytes_to_cstr(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            bytes_extend(&out, path)
+            out.push(0)
+            return out
+
+    # An explicit `region` scope, because this returns a bool: a scalar-returning function
+    # has no inferred region, so the NUL-terminated copy needs somewhere to live. The scope
+    # is released on exit, which is correct — the copy does not outlive the call.
+    def file_exists(path: darray[u8]&) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            present: mutable bool = false
+            region probe(4096):
+                terminated: darray[u8] = bytes_to_cstr(path)
+                if terminated.count > 1.usize():
+                    handle: cstr = (&terminated[0.usize()]).cast[cstr] can Unsafe.PointerCast
+                    present <- project_access(handle, 0) == 0
+            return present
+
+    # Whole file by path; empty when it cannot be opened. Callers distinguish "absent" with
+    # `file_exists` beforehand, exactly as stage0 separates os.Stat from os.ReadFile.
+    def read_file_bytes(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            contents: mutable darray[u8] = []
+            terminated: darray[u8] = bytes_to_cstr(path)
+            contents return if terminated.count == 1.usize()
+            handle: cstr = (&terminated[0.usize()]).cast[cstr] can Unsafe.PointerCast
+            descriptor: i64 = project_open(handle, 0, 0)
+            contents return if descriptor < 0
+            chunk: mutable darray[u8] = []
+            chunk.resize(8192)
+            while true |contents, chunk, descriptor|:
+                amount: i64 = project_read(descriptor, &chunk[0.usize()], 8192.usize())
+                break if amount <= 0
+                for index in 0..<amount.usize() |contents, chunk|:
+                    contents.push(chunk[index])
+            _ = project_close(descriptor)
+            return contents
+
+    # The process working directory.
+    #
+    # $PWD is preferred over getcwd() because Go's os.Getwd does the same, and the difference
+    # is OBSERVABLE: stage0 run from a shell in /tmp reports "/tmp" (the logical path the
+    # shell exported) while getcwd(3) returns the resolved "/private/tmp". That string
+    # reaches the user in `could not find project.json from ...`.
+    #
+    # Go additionally stats $PWD and compares inodes against "."; this settles for "absolute
+    # and exists", which differs only for a $PWD left stale by something other than cd.
+    def working_directory() -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            logical: mutable darray[u8] = []
+            name: mutable darray[u8] = bytes_from_view("PWD")
+            name.push(0)
+            key: cstr = (&name[0.usize()]).cast[cstr] can Unsafe.PointerCast
+            if project_getenv(key) is real:
+                exported: cstr = project_getenv(key).cast[cstr] can Unsafe.PointerCast
+                bytes_extend_cstr(&logical, exported)
+                logical return if path_is_absolute(logical) and file_exists(logical)
+            buffer: mutable darray[u8] = []
+            buffer.resize(4096)
+            target: void& = (&buffer[0.usize()]).cast[void&] can Unsafe.PointerCast
+            _ = project_getcwd(target, 4096.usize())
+            out: mutable darray[u8] = []
+            for index in 0..<buffer.count |out, buffer|:
+                break if buffer[index] == 0
+                out.push(buffer[index])
+            return out
+
+    # The path `find_project_file` starts from, as stage0 names it in its failure message:
+    # the argument when one was given, otherwise the working directory.
+    def project_search_origin(start: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            trimmed: darray[u8] = bytes_trimmed(start)
+            trimmed return if trimmed.count > 0.usize()
+            return working_directory()
+
+    # Go's filepath.Abs: join a relative path onto the working directory, then Clean.
+    def absolute_path(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            path_clean(path) return if path_is_absolute(path)
+            cwd: darray[u8] = working_directory()
+            return path_join(cwd, path)
+
+    # ---- paths ---------------------------------------------------------------------------
+    #
+    # Go's path/filepath, restricted to what the project system uses. `filepath.Join` and
+    # `filepath.Abs` both CLEAN their result, and stage0's printed paths are all produced by
+    # one of the two, so cleaning is part of the observable output rather than a tidy-up.
+
+    def path_is_absolute(path: darray[u8]&) -> bool:
+        return path.count > 0.usize() and path[0.usize()] == 47
+
+    # Lexical Clean: collapse repeated separators, drop `.`, resolve `..` against the
+    # preceding segment, and leave a rooted path rooted. Never touches the filesystem, so a
+    # symlinked `..` resolves the way Go resolves it, not the way the kernel would.
+    # Segments are recorded as (start, length) spans into `path` itself and kept on a stack
+    # whose live height is `depth`. `..` lowers the height rather than removing an entry —
+    # `darray.pop` mis-resolves its overload on a `darray[usize]` here — and the next push
+    # overwrites the abandoned slot.
+    def path_clean(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            rooted: bool = path_is_absolute(path)
+            starts: mutable darray[usize] = []
+            lengths: mutable darray[usize] = []
+            depth: mutable usize = 0.usize()
+            segment_start: mutable usize = 0.usize()
+            index: mutable usize = 0.usize()
+            while index <= path.count |index, segment_start, depth, starts, lengths, path|:
+                at_end: bool = index == path.count
+                byte: u8 = 47 if at_end else path[index]
+                if byte == 47:
+                    length: usize = index - segment_start
+                    is_dot: bool = length == 1.usize() and path[segment_start] == 46
+                    is_parent: bool = length == 2.usize() and path[segment_start] == 46 and path[segment_start + 1.usize()] == 46
+                    if length == 0.usize() or is_dot:
+                        segment_start <- index + 1.usize()
+                        index <- index + 1.usize()
+                        continue
+                    keep: mutable bool = true
+                    if is_parent:
+                        keep <- false
+                        if depth > 0.usize():
+                            top_is_parent: bool = lengths[depth - 1.usize()] == 2.usize() and path[starts[depth - 1.usize()]] == 46 and path[starts[depth - 1.usize()] + 1.usize()] == 46
+                            if not top_is_parent:
+                                depth <- depth - 1.usize()
+                            else:
+                                keep <- true
+                        else:
+                            # A leading `..` is dropped on a rooted path (Go: `/..` is `/`)
+                            # and kept on a relative one, where it is meaningful.
+                            keep <- not rooted
+                    if keep:
+                        if depth < starts.count:
+                            starts[depth] <- segment_start
+                            lengths[depth] <- length
+                        else:
+                            starts <- starts.push(segment_start)
+                            lengths <- lengths.push(length)
+                        depth <- depth + 1.usize()
+                    segment_start <- index + 1.usize()
+                index <- index + 1.usize()
+            out: mutable darray[u8] = []
+            out.push(47) if rooted
+            for segment in 0..<depth |out, starts, lengths, path, rooted|:
+                out.push(47) if segment > 0.usize() or (out.count > 0.usize() and not rooted)
+                bytes_extend_span(&out, path, starts[segment], lengths[segment])
+            if out.count == 0.usize():
+                out.push(46)
+            return out
+
+    # filepath.Join: concatenate the non-empty elements with `/`, then Clean.
+    def path_join(base: darray[u8]&, leaf: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            joined: mutable darray[u8] = []
+            bytes_extend(&joined, base)
+            if joined.count > 0.usize() and leaf.count > 0.usize():
+                joined.push(47)
+            bytes_extend(&joined, leaf)
+            return path_clean(joined)
+
+    def path_join_view(base: darray[u8]&, leaf: sview) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            piece: darray[u8] = bytes_from_view(leaf)
+            return path_join(base, piece)
+
+    # The directory part, Cleaned — Go's filepath.Dir.
+    def path_dir(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            last_slash: mutable i64 = -1
+            for index in 0..<path.count |last_slash, path|:
+                last_slash <- index.i64() if path[index] == 47
+            out: mutable darray[u8] = []
+            if last_slash < 0:
+                out.push(46)
+                return out
+            if last_slash == 0:
+                out.push(47)
+                return out
+            bytes_extend_span(&out, path, 0.usize(), last_slash.usize())
+            return path_clean(out)
+
+    # stage0's projectRelativePath: absolute paths pass through, relative ones join onto the
+    # project root.
+    def path_relative_to(root: darray[u8]&, path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            if path_is_absolute(path):
+                return bytes_copy(path)
+            return path_join(root, path)
+
+    def strlist_copy(list: StrList&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            result <- strlist_extend(result, list)
+            return result
+
+    # Every entry made absolute against `root` — stage0 maps projectRelativePath over the
+    # include, foreign and easm lists of both the project and each manifest.
+    def strlist_relative_to(root: darray[u8]&, list: StrList&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            for index in 0..<list.starts.count |result, list, root|:
+                entry: darray[u8] = strlist_entry_copy(list, index)
+                resolved: darray[u8] = path_relative_to(root, entry)
+                result <- strlist_push(result, resolved)
+            return result
+
+    # ---- JSON ----------------------------------------------------------------------------
+    #
+    # Enough of RFC 8259 to read project.json and manifest.json, and no more. Values are
+    # pulled straight into the destination fields; there is no DOM. Every routine threads a
+    # JsonCursor — once `ok` goes false the caller stops, so a malformed file reports one
+    # failure rather than a cascade.
+    #
+    # The cursor is a struct rather than a pair of `mutable usize&` / `mutable bool&`
+    # out-parameters because a `mutable T&` reads as a reference, not a number: `data[position]`
+    # is rejected with "index must be numeric", while `data[cursor.position]` is a plain field
+    # read and works.
+    #
+    # stage0 decodes with DisallowUnknownFields, so an unrecognised key is an ERROR, not
+    # something to skip.
+
+    struct JsonCursor:
+        position: mutable usize
+        ok: mutable bool
+        # The key that failed, so the caller can reproduce Go's
+        # `json: unknown field "x"` verbatim rather than a generic message.
+        bad_key_start: mutable usize
+        bad_key_length: mutable usize
+
+    def json_skip_ws(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        while cursor.position < data.count |cursor, data|:
+            break if not bytes_is_space(data[cursor.position])
+            cursor.position <- cursor.position + 1.usize()
+
+    def json_at(data: darray[u8]&, position: usize) -> u8:
+        0 return if position >= data.count
+        return data[position]
+
+    def json_peek(data: darray[u8]&, cursor: mutable JsonCursor&) -> u8:
+        json_skip_ws(data, cursor)
+        return json_at(data, cursor.position)
+
+    # Append the UTF-8 encoding of a code point. A surrogate pair arrives as two \u escapes
+    # and is combined by the caller before this is reached.
+    def json_push_utf8(out: mutable darray[u8]&, code: u32) -> void:
+        can Memory.Allocate, Abort.Panic:
+            if code < 128:
+                out.push(code.u8())
+            elif code < 2048:
+                out.push((192 + (code / 64)).u8())
+                out.push((128 + (code % 64)).u8())
+            elif code < 65536:
+                out.push((224 + (code / 4096)).u8())
+                out.push((128 + ((code / 64) % 64)).u8())
+                out.push((128 + (code % 64)).u8())
+            else:
+                out.push((240 + (code / 262144)).u8())
+                out.push((128 + ((code / 4096) % 64)).u8())
+                out.push((128 + ((code / 64) % 64)).u8())
+                out.push((128 + (code % 64)).u8())
+
+    def json_hex_digit(byte: u8) -> i64:
+        (byte - 48).i64() return if byte >= 48 and byte <= 57
+        (byte - 97 + 10).i64() return if byte >= 97 and byte <= 102
+        (byte - 65 + 10).i64() return if byte >= 65 and byte <= 70
+        return -1
+
+    # Four hex digits at `position`, or -1 when they are not all hex.
+    def json_hex4(data: darray[u8]&, position: usize) -> i64:
+        value: mutable i64 = 0
+        for offset in 0..<4 |value, data, position|:
+            digit: i64 = json_hex_digit(json_at(data, position + offset.usize()))
+            -1 return if digit < 0
+            value <- value * 16 + digit
+        return value
+
+    def json_span_is(data: darray[u8]&, start: usize, length: usize, name: sview) -> bool:
+        false return if length.i64() != sview_len(name).i64()
+        false return if start + length > data.count
+        for index in 0..<length |data, name, start|:
+            false return if data[start + index] != sview_at(name, index.i64())
+        return true
+
+    # A quoted string with escapes resolved. The cursor must be at the opening quote and is
+    # left just past the closing one.
+    def json_parse_string(data: darray[u8]&, cursor: mutable JsonCursor&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            json_skip_ws(data, cursor)
+            if json_at(data, cursor.position) != 34:
+                cursor.ok <- false
+                return out
+            cursor.position <- cursor.position + 1.usize()
+            while cursor.position < data.count |cursor, out, data|:
+                byte: u8 = data[cursor.position]
+                if byte == 34:
+                    cursor.position <- cursor.position + 1.usize()
+                    return out
+                if byte != 92:
+                    out.push(byte)
+                    cursor.position <- cursor.position + 1.usize()
+                    continue
+                escape: u8 = json_at(data, cursor.position + 1.usize())
+                cursor.position <- cursor.position + 2.usize()
+                if escape == 34 or escape == 92 or escape == 47:
+                    out.push(escape)
+                elif escape == 98:
+                    out.push(8)
+                elif escape == 102:
+                    out.push(12)
+                elif escape == 110:
+                    out.push(10)
+                elif escape == 114:
+                    out.push(13)
+                elif escape == 116:
+                    out.push(9)
+                elif escape == 117:
+                    first: i64 = json_hex4(data, cursor.position)
+                    if first < 0:
+                        cursor.ok <- false
+                        return out
+                    cursor.position <- cursor.position + 4.usize()
+                    code: mutable i64 = first
+                    # A high surrogate followed by \uDC00-\uDFFF combines into one code
+                    # point, so the bytes match what Go's decoder produces.
+                    if first >= 55296 and first <= 56319 and json_at(data, cursor.position) == 92 and json_at(data, cursor.position + 1.usize()) == 117:
+                        low: i64 = json_hex4(data, cursor.position + 2.usize())
+                        if low >= 56320 and low <= 57343:
+                            code <- 65536 + (first - 55296) * 1024 + (low - 56320)
+                            cursor.position <- cursor.position + 6.usize()
+                    json_push_utf8(&out, code.u32())
+                else:
+                    cursor.ok <- false
+                    return out
+            cursor.ok <- false
+            return out
+
+    # Decode one quoted string DIRECTLY into `list` as a new entry. Like `json_skip_value`,
+    # this cannot delegate to `json_parse_string`: the function returns void and so has no
+    # region for an owned result. Appending into the list's own buffer avoids the temporary
+    # altogether, which is the same trick the escape handling below relies on.
+    def json_push_string_entry(data: darray[u8]&, cursor: mutable JsonCursor&, list: lmut StrList) -> void:
+        can Memory.Allocate, Abort.Panic:
+            json_skip_ws(data, cursor)
+            if json_at(data, cursor.position) != 34:
+                cursor.ok <- false
+                return
+            cursor.position <- cursor.position + 1.usize()
+            entry_start: usize = list.data.count
+            while cursor.position < data.count |cursor, list, data|:
+                byte: u8 = data[cursor.position]
+                if byte == 34:
+                    cursor.position <- cursor.position + 1.usize()
+                    list.starts <- list.starts.push(entry_start)
+                    list.lengths <- list.lengths.push(list.data.count - entry_start)
+                    return
+                if byte != 92:
+                    list.data <- list.data.push(byte)
+                    cursor.position <- cursor.position + 1.usize()
+                    continue
+                escape: u8 = json_at(data, cursor.position + 1.usize())
+                cursor.position <- cursor.position + 2.usize()
+                if escape == 34 or escape == 92 or escape == 47:
+                    list.data <- list.data.push(escape)
+                elif escape == 98:
+                    list.data <- list.data.push(8)
+                elif escape == 102:
+                    list.data <- list.data.push(12)
+                elif escape == 110:
+                    list.data <- list.data.push(10)
+                elif escape == 114:
+                    list.data <- list.data.push(13)
+                elif escape == 116:
+                    list.data <- list.data.push(9)
+                elif escape == 117:
+                    first_unit: i64 = json_hex4(data, cursor.position)
+                    if first_unit < 0:
+                        cursor.ok <- false
+                        return
+                    cursor.position <- cursor.position + 4.usize()
+                    code: mutable i64 = first_unit
+                    if first_unit >= 55296 and first_unit <= 56319 and json_at(data, cursor.position) == 92 and json_at(data, cursor.position + 1.usize()) == 117:
+                        low: i64 = json_hex4(data, cursor.position + 2.usize())
+                        if low >= 56320 and low <= 57343:
+                            code <- 65536 + (first_unit - 55296) * 1024 + (low - 56320)
+                            cursor.position <- cursor.position + 6.usize()
+                    scalar: u32 = code.u32()
+                    if scalar < 128:
+                        list.data <- list.data.push(scalar.u8())
+                    elif scalar < 2048:
+                        list.data <- list.data.push((192 + (scalar / 64)).u8())
+                        list.data <- list.data.push((128 + (scalar % 64)).u8())
+                    elif scalar < 65536:
+                        list.data <- list.data.push((224 + (scalar / 4096)).u8())
+                        list.data <- list.data.push((128 + ((scalar / 64) % 64)).u8())
+                        list.data <- list.data.push((128 + (scalar % 64)).u8())
+                    else:
+                        list.data <- list.data.push((240 + (scalar / 262144)).u8())
+                        list.data <- list.data.push((128 + ((scalar / 4096) % 64)).u8())
+                        list.data <- list.data.push((128 + ((scalar / 64) % 64)).u8())
+                        list.data <- list.data.push((128 + (scalar % 64)).u8())
+                else:
+                    cursor.ok <- false
+                    return
+            cursor.ok <- false
+
+    # Consume `[` ... `]` of strings into `list`. The cursor must be at the opening bracket.
+    def json_read_string_list(data: darray[u8]&, cursor: mutable JsonCursor&, list: lmut StrList) -> void:
+        can Memory.Allocate, Abort.Panic:
+            json_skip_ws(data, cursor)
+            if json_at(data, cursor.position) != 91:
+                cursor.ok <- false
+                return
+            cursor.position <- cursor.position + 1.usize()
+            first: mutable bool = true
+            while cursor.ok |cursor, list, first, data|:
+                json_skip_ws(data, cursor)
+                if json_at(data, cursor.position) == 93:
+                    cursor.position <- cursor.position + 1.usize()
+                    break
+                if not first:
+                    if json_at(data, cursor.position) != 44:
+                        cursor.ok <- false
+                        break
+                    cursor.position <- cursor.position + 1.usize()
+                first <- false
+                list <- json_push_string_entry(data, cursor, list)
+                break if not cursor.ok
+
+    # Step over a quoted string WITHOUT building it. `json_skip_value` returns void, so it
+    # cannot call `json_parse_string`: a void function has no region to allocate the result
+    # in. Scanning in place sidesteps that entirely.
+    def json_skip_string(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        if json_at(data, cursor.position) != 34:
+            cursor.ok <- false
+            return
+        cursor.position <- cursor.position + 1.usize()
+        while cursor.position < data.count |cursor, data|:
+            byte: u8 = data[cursor.position]
+            if byte == 92:
+                cursor.position <- cursor.position + 2.usize()
+                continue
+            cursor.position <- cursor.position + 1.usize()
+            return if byte == 34
+        cursor.ok <- false
+
+    # Step over any value, used only once its key has already been rejected so that the
+    # error message can name a position inside a well-formed document.
+    def json_skip_value(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        json_skip_ws(data, cursor)
+        byte: u8 = json_at(data, cursor.position)
+        if byte == 34:
+            json_skip_string(data, cursor)
+            return
+        if byte == 91 or byte == 123:
+            depth: mutable i64 = 0
+            while cursor.position < data.count |cursor, depth, data|:
+                current: u8 = data[cursor.position]
+                if current == 34:
+                    json_skip_string(data, cursor)
+                    break if not cursor.ok
+                    continue
+                depth <- depth + 1 if current == 91 or current == 123
+                depth <- depth - 1 if current == 93 or current == 125
+                cursor.position <- cursor.position + 1.usize()
+                break if depth == 0
+            cursor.ok <- false if depth != 0
+            return
+        # A bare literal or number: run to the next structural byte.
+        start: usize = cursor.position
+        while cursor.position < data.count |cursor, data|:
+            current: u8 = data[cursor.position]
+            break if current == 44 or current == 93 or current == 125 or bytes_is_space(current)
+            cursor.position <- cursor.position + 1.usize()
+        cursor.ok <- false if cursor.position == start
+
+    def json_read_bool(data: darray[u8]&, cursor: mutable JsonCursor&) -> bool:
+        json_skip_ws(data, cursor)
+        if json_span_is(data, cursor.position, 4.usize(), "true"):
+            cursor.position <- cursor.position + 4.usize()
+            return true
+        if json_span_is(data, cursor.position, 5.usize(), "false"):
+            cursor.position <- cursor.position + 5.usize()
+            return false
+        cursor.ok <- false
+        return false
+
+    # Position the cursor at the value of the next key of an object, reporting the key as a
+    # span into `data` (neither schema uses escapes in a key). Returns false at `}`.
+    def json_next_key(data: darray[u8]&, cursor: mutable JsonCursor&, first: mutable bool&, out_start: mutable usize&, out_length: mutable usize&) -> bool:
+        json_skip_ws(data, cursor)
+        if json_at(data, cursor.position) == 125:
+            cursor.position <- cursor.position + 1.usize()
+            return false
+        # `not first` is rejected on a `mutable bool&` (it reads as a reference, not a
+        # bool); the comparison form derefs.
+        if first == false:
+            if json_at(data, cursor.position) != 44:
+                cursor.ok <- false
+                return false
+            cursor.position <- cursor.position + 1.usize()
+            json_skip_ws(data, cursor)
+            # Go rejects a trailing comma before `}`, so this does too.
+            if json_at(data, cursor.position) == 125:
+                cursor.ok <- false
+                return false
+        first <- false
+        if json_at(data, cursor.position) != 34:
+            cursor.ok <- false
+            return false
+        cursor.position <- cursor.position + 1.usize()
+        out_start <- cursor.position
+        while cursor.position < data.count |cursor, data|:
+            break if data[cursor.position] == 34 or data[cursor.position] == 92
+            cursor.position <- cursor.position + 1.usize()
+        if json_at(data, cursor.position) != 34:
+            cursor.ok <- false
+            return false
+        out_length <- cursor.position - out_start
+        cursor.position <- cursor.position + 1.usize()
+        json_skip_ws(data, cursor)
+        if json_at(data, cursor.position) != 58:
+            cursor.ok <- false
+            return false
+        cursor.position <- cursor.position + 1.usize()
+        return true
+
+    # Consume the `{` that opens an object.
+    def json_open_object(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        json_skip_ws(data, cursor)
+        if json_at(data, cursor.position) != 123:
+            cursor.ok <- false
+            return
+        cursor.position <- cursor.position + 1.usize()
+
+    # After the top-level value: only whitespace may remain (Go reports trailing data).
+    def json_finish(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        json_skip_ws(data, cursor)
+        cursor.ok <- false if cursor.position != data.count
+
+    # ---- project.json / manifest.json ------------------------------------------------------
+    #
+    # Each parser BUILDS AND RETURNS its struct rather than filling one through an `lmut`
+    # parameter. That is what makes the string fields possible: a function returning a struct
+    # is region-polymorphic, so it may call `json_parse_string`, while a void one may not.
+    # `ir_bundle_parse` in frontend_ir.elisa has the same shape for the same reason.
+
+    struct TargetDef:
+        name: mutable darray[u8]
+        entry: mutable darray[u8]
+        emit: mutable darray[u8]
+        run_emit: mutable darray[u8]
+        output: mutable darray[u8]
+        opt: mutable darray[u8]
+        target_triple: mutable darray[u8]
+        packed_abi: mutable darray[u8]
+        dependencies: mutable StrList
+        include_dirs: mutable StrList
+        foreign: mutable StrList
+        easm: mutable StrList
+        link_flags: mutable StrList
+        exec: mutable StrList
+        platform_link_flags: mutable StrList
+        has_inherit_native: mutable bool
+        inherit_native: mutable bool
+        warn_strict: mutable bool
+        warn_perf: mutable bool
+        warn_concurrency: mutable bool
+        warn_progress: mutable bool
+
+    struct ProjectDef:
+        version: mutable darray[u8]
+        dependency_search_paths: mutable StrList
+        dependencies: mutable StrList
+        include_dirs: mutable StrList
+        foreign: mutable StrList
+        easm: mutable StrList
+        link_flags: mutable StrList
+        exec: mutable StrList
+        targets: mutable darray[TargetDef]
+
+    struct ManifestDef:
+        provides: mutable darray[u8]
+        entry: mutable darray[u8]
+        interface_path: mutable darray[u8]
+        dependencies: mutable StrList
+        include_dirs: mutable StrList
+        foreign: mutable StrList
+        easm: mutable StrList
+        link_flags: mutable StrList
+        exec: mutable StrList
+
+    def target_def_new() -> TargetDef:
+        can Memory.Allocate, Abort.Panic:
+            return TargetDef{name: [], entry: [], emit: [], run_emit: [], output: [], opt: [], target_triple: [], packed_abi: [], dependencies: StrList{data: [], starts: [], lengths: []}, include_dirs: StrList{data: [], starts: [], lengths: []}, foreign: StrList{data: [], starts: [], lengths: []}, easm: StrList{data: [], starts: [], lengths: []}, link_flags: StrList{data: [], starts: [], lengths: []}, exec: StrList{data: [], starts: [], lengths: []}, platform_link_flags: StrList{data: [], starts: [], lengths: []}, has_inherit_native: false, inherit_native: true, warn_strict: false, warn_perf: false, warn_concurrency: false, warn_progress: false}
+
+    # The host platform key used by a target's "platforms" map. stage0 reads runtime.GOOS and
+    # maps "darwin" to "macos"; a self-hosted binary has no equivalent, so this is the ONE
+    # place in the port that is specialised to the machine the compiler was built for. A
+    # Linux or Windows build must change this constant.
+    def host_platform_name() -> sview:
+        return "macos"
+
+    # `warnings: { strict, perf, concurrency, progress }` — every key optional, all bools.
+    # Written as out-parameters: the values are scalars, so nothing is allocated and the
+    # caller's TargetDef never has to be copied to carry them back.
+    def parse_target_warnings(data: darray[u8]&, cursor: mutable JsonCursor&, strict: mutable bool&, perf: mutable bool&, concurrency: mutable bool&, progress: mutable bool&) -> void:
+        json_open_object(data, cursor)
+        first: mutable bool = true
+        key_start: mutable usize = 0.usize()
+        key_length: mutable usize = 0.usize()
+        while cursor.ok |cursor, first, key_start, key_length, strict, perf, concurrency, progress, data|:
+            break if not json_next_key(data, cursor, &first, &key_start, &key_length)
+            if json_span_is(data, key_start, key_length, "strict"):
+                strict <- json_read_bool(data, cursor)
+            elif json_span_is(data, key_start, key_length, "perf"):
+                perf <- json_read_bool(data, cursor)
+            elif json_span_is(data, key_start, key_length, "concurrency"):
+                concurrency <- json_read_bool(data, cursor)
+            elif json_span_is(data, key_start, key_length, "progress"):
+                progress <- json_read_bool(data, cursor)
+            else:
+                cursor.bad_key_start <- key_start
+                cursor.bad_key_length <- key_length
+                cursor.ok <- false
+
+    # `platforms: { macos: { link-flags: [...] }, ... }`. stage0 keeps every platform and
+    # selects the host's at resolve time; since only the host entry can ever be used, this
+    # keeps just that one and discards the rest as it goes.
+    def parse_platforms(data: darray[u8]&, cursor: mutable JsonCursor&, selected: lmut StrList) -> void:
+        can Memory.Allocate, Abort.Panic:
+            json_open_object(data, cursor)
+            first: mutable bool = true
+            key_start: mutable usize = 0.usize()
+            key_length: mutable usize = 0.usize()
+            while cursor.ok |cursor, selected, first, key_start, key_length, data|:
+                break if not json_next_key(data, cursor, &first, &key_start, &key_length)
+                wanted: bool = json_span_is(data, key_start, key_length, host_platform_name())
+                json_open_object(data, cursor)
+                inner_first: mutable bool = true
+                inner_start: mutable usize = 0.usize()
+                inner_length: mutable usize = 0.usize()
+                while cursor.ok |cursor, selected, inner_first, inner_start, inner_length, data, wanted|:
+                    break if not json_next_key(data, cursor, &inner_first, &inner_start, &inner_length)
+                    if not json_span_is(data, inner_start, inner_length, "link-flags"):
+                        cursor.ok <- false
+                        break
+                    if wanted:
+                        selected <- json_read_string_list(data, cursor, selected)
+                    else:
+                        json_skip_value(data, cursor)
+
+    # `field <- json_read_string_list(...)` does not work: the function returns void, and the
+    # `x <- f(x)` threading form is only accepted when `x` is the local that was passed in,
+    # never a struct field. This wrapper does the threading against a local and hands back a
+    # value, so every call site stays one line.
+    def json_string_list(data: darray[u8]&, cursor: mutable JsonCursor&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            list: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            list <- json_read_string_list(data, cursor, list)
+            return list
+
+    def json_platform_link_flags(data: darray[u8]&, cursor: mutable JsonCursor&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            list: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            list <- parse_platforms(data, cursor, list)
+            return list
+
+    def parse_target(data: darray[u8]&, cursor: mutable JsonCursor&, name: darray[u8]&) -> TargetDef:
+        can Memory.Allocate, Abort.Panic:
+            target: mutable TargetDef = target_def_new()
+            target.name <- bytes_copy(name)
+            json_open_object(data, cursor)
+            first: mutable bool = true
+            key_start: mutable usize = 0.usize()
+            key_length: mutable usize = 0.usize()
+            while cursor.ok |cursor, target, first, key_start, key_length, data|:
+                break if not json_next_key(data, cursor, &first, &key_start, &key_length)
+                if json_span_is(data, key_start, key_length, "entry"):
+                    target.entry <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "emit"):
+                    target.emit <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "run-emit"):
+                    target.run_emit <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "output"):
+                    target.output <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "opt"):
+                    target.opt <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "target-triple"):
+                    target.target_triple <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "packed-abi"):
+                    target.packed_abi <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "dependencies"):
+                    target.dependencies <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "include-dirs"):
+                    target.include_dirs <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "foreign"):
+                    target.foreign <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "easm"):
+                    target.easm <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "link-flags"):
+                    target.link_flags <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "exec"):
+                    target.exec <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "inherit-project-native"):
+                    target.has_inherit_native <- true
+                    target.inherit_native <- json_read_bool(data, cursor)
+                elif json_span_is(data, key_start, key_length, "warnings"):
+                    parse_target_warnings(data, cursor, &target.warn_strict, &target.warn_perf, &target.warn_concurrency, &target.warn_progress)
+                elif json_span_is(data, key_start, key_length, "platforms"):
+                    target.platform_link_flags <- json_platform_link_flags(data, cursor)
+                else:
+                    cursor.bad_key_start <- key_start
+                    cursor.bad_key_length <- key_length
+                    cursor.ok <- false
+            return target
+
+    def project_def_new() -> ProjectDef:
+        can Memory.Allocate, Abort.Panic:
+            return ProjectDef{version: [], dependency_search_paths: StrList{data: [], starts: [], lengths: []}, dependencies: StrList{data: [], starts: [], lengths: []}, include_dirs: StrList{data: [], starts: [], lengths: []}, foreign: StrList{data: [], starts: [], lengths: []}, easm: StrList{data: [], starts: [], lengths: []}, link_flags: StrList{data: [], starts: [], lengths: []}, exec: StrList{data: [], starts: [], lengths: []}, targets: []}
+
+    def parse_project(data: darray[u8]&, cursor: mutable JsonCursor&) -> ProjectDef:
+        can Memory.Allocate, Abort.Panic:
+            project: mutable ProjectDef = project_def_new()
+            json_open_object(data, cursor)
+            first: mutable bool = true
+            key_start: mutable usize = 0.usize()
+            key_length: mutable usize = 0.usize()
+            while cursor.ok |cursor, project, first, key_start, key_length, data|:
+                break if not json_next_key(data, cursor, &first, &key_start, &key_length)
+                if json_span_is(data, key_start, key_length, "version"):
+                    project.version <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "dependency-search-paths"):
+                    project.dependency_search_paths <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "dependencies"):
+                    project.dependencies <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "include-dirs"):
+                    project.include_dirs <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "foreign"):
+                    project.foreign <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "easm"):
+                    project.easm <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "link-flags"):
+                    project.link_flags <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "exec"):
+                    project.exec <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "targets"):
+                    # Appended in document order and sorted by name at every point of use;
+                    # stage0 iterates a Go map and sorts, so document order is not observable.
+                    json_open_object(data, cursor)
+                    target_first: mutable bool = true
+                    target_start: mutable usize = 0.usize()
+                    target_length: mutable usize = 0.usize()
+                    while cursor.ok |cursor, project, target_first, target_start, target_length, data|:
+                        break if not json_next_key(data, cursor, &target_first, &target_start, &target_length)
+                        target_name: mutable darray[u8] = []
+                        bytes_extend_span(&target_name, data, target_start, target_length)
+                        project.targets <- project.targets.push(parse_target(data, cursor, target_name))
+                else:
+                    cursor.bad_key_start <- key_start
+                    cursor.bad_key_length <- key_length
+                    cursor.ok <- false
+            json_finish(data, cursor)
+            return project
+
+    def manifest_def_new() -> ManifestDef:
+        can Memory.Allocate, Abort.Panic:
+            return ManifestDef{provides: [], entry: [], interface_path: [], dependencies: StrList{data: [], starts: [], lengths: []}, include_dirs: StrList{data: [], starts: [], lengths: []}, foreign: StrList{data: [], starts: [], lengths: []}, easm: StrList{data: [], starts: [], lengths: []}, link_flags: StrList{data: [], starts: [], lengths: []}, exec: StrList{data: [], starts: [], lengths: []}}
+
+    def parse_manifest(data: darray[u8]&, cursor: mutable JsonCursor&) -> ManifestDef:
+        can Memory.Allocate, Abort.Panic:
+            manifest: mutable ManifestDef = manifest_def_new()
+            json_open_object(data, cursor)
+            first: mutable bool = true
+            key_start: mutable usize = 0.usize()
+            key_length: mutable usize = 0.usize()
+            while cursor.ok |cursor, manifest, first, key_start, key_length, data|:
+                break if not json_next_key(data, cursor, &first, &key_start, &key_length)
+                if json_span_is(data, key_start, key_length, "provides"):
+                    manifest.provides <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "entry"):
+                    manifest.entry <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "interface"):
+                    manifest.interface_path <- json_parse_string(data, cursor)
+                elif json_span_is(data, key_start, key_length, "dependencies"):
+                    manifest.dependencies <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "include-dirs"):
+                    manifest.include_dirs <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "foreign"):
+                    manifest.foreign <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "easm"):
+                    manifest.easm <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "link-flags"):
+                    manifest.link_flags <- json_string_list(data, cursor)
+                elif json_span_is(data, key_start, key_length, "exec"):
+                    manifest.exec <- json_string_list(data, cursor)
+                else:
+                    cursor.bad_key_start <- key_start
+                    cursor.bad_key_length <- key_length
+                    cursor.ok <- false
+            json_finish(data, cursor)
+            return manifest
+
+    # stage0 decodes with encoding/json, so its failures read
+    # `invalid json in PATH: json: unknown field "x"`. The unknown-field case is reproduced
+    # verbatim because it is deterministic and by far the most likely in practice. A pure
+    # SYNTAX error is not: Go reports character-level detail ("invalid character '}' looking
+    # for beginning of object key string") that would mean reimplementing its scanner's
+    # phrasing. Those get the same prefix and a generic detail — a known, documented text
+    # divergence, asserted as such in test/parity/project_report_smoke.sh.
+    def json_error_message(data: darray[u8]&, cursor: JsonCursor&, path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            message: mutable darray[u8] = []
+            bytes_extend_view(&message, "invalid json in ")
+            bytes_extend(&message, path)
+            bytes_extend_view(&message, ": ")
+            if cursor.bad_key_length > 0.usize():
+                bytes_extend_view(&message, "json: unknown field \"")
+                bytes_extend_span(&message, data, cursor.bad_key_start, cursor.bad_key_length)
+                bytes_extend_view(&message, "\"")
+                return message
+            bytes_extend_view(&message, "unexpected token at byte ")
+            bytes_push_decimal(&message, cursor.position)
+            return message
+
+    # ---- resolution ------------------------------------------------------------------------
+
+    # One dependency after its manifest has been read and its paths made absolute.
+    struct ResolvedManifest:
+        name: mutable darray[u8]
+        dir: mutable darray[u8]
+        manifest_path: mutable darray[u8]
+        entry_path: mutable darray[u8]
+        interface_path: mutable darray[u8]
+        include_dirs: mutable StrList
+        foreign: mutable StrList
+        easm: mutable StrList
+        link_flags: mutable StrList
+        exec: mutable StrList
+        dependencies: mutable StrList
+
+    # The manifests reachable from a target, plus the post-order the build must follow.
+    # `failed` carries the first error rather than aborting, so `project view` can report it
+    # the way stage0's `error: ...` line does.
+    struct ManifestGraph:
+        items: mutable darray[ResolvedManifest]
+        order: mutable darray[usize]
+        failed: mutable bool
+        error_text: mutable darray[u8]
+
+    def manifest_graph_new() -> ManifestGraph:
+        can Memory.Allocate, Abort.Panic:
+            return ManifestGraph{items: [], order: [], failed: false, error_text: []}
+
+    # The index of `name` in the loaded table, or the table size when it is absent.
+    def graph_index_of(graph: ManifestGraph&, name: darray[u8]&) -> usize:
+        for index in 0..<graph.items.count |graph, name|:
+            index return if bytes_equal(graph.items[index].name, name)
+        return graph.items.count
+
+    # stage0's findManifestPath: `<search>/<name>.elisalib/manifest.json` first, then
+    # `<search>/<name>/manifest.json`, in search-path order. Returns the DIRECTORY; the
+    # manifest path is that plus `/manifest.json`.
+    def find_manifest_dir(search_paths: StrList&, name: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            for index in 0..<search_paths.starts.count |search_paths, name|:
+                base: darray[u8] = strlist_entry_copy(search_paths, index)
+                suffixed: mutable darray[u8] = []
+                bytes_extend(&suffixed, name)
+                bytes_extend_view(&suffixed, ".elisalib")
+                library_dir: darray[u8] = path_join(base, suffixed)
+                library_manifest: darray[u8] = path_join_view(library_dir, "manifest.json")
+                library_dir return if file_exists(library_manifest)
+                plain_dir: darray[u8] = path_join(base, name)
+                plain_manifest: darray[u8] = path_join_view(plain_dir, "manifest.json")
+                plain_dir return if file_exists(plain_manifest)
+            empty: mutable darray[u8] = []
+            return empty
+
+    # stage0 refuses an entry or interface that is not surface source.
+    def is_surface_source(path: darray[u8]&) -> bool:
+        true return if bytes_ends_with_view(path, ".elisa")
+        return bytes_ends_with_view(path, ".elisai")
+
+    # Load every manifest reachable from `names`, breadth-first. Loading is separated from
+    # ordering because ordering is pure index arithmetic once the table exists, and a void
+    # ordering pass cannot allocate — see the region note at the top of this file.
+    def load_manifest_graph(search_paths: StrList&, names: StrList&) -> ManifestGraph:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            graph: mutable ManifestGraph = manifest_graph_new()
+            pending: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            pending <- strlist_extend(pending, names)
+            cursor_index: mutable usize = 0.usize()
+            while cursor_index < pending.starts.count |cursor_index, graph, pending, search_paths|:
+                name: darray[u8] = strlist_entry_copy(&pending, cursor_index)
+                cursor_index <- cursor_index + 1.usize()
+                trimmed: darray[u8] = bytes_trimmed(name)
+                continue if trimmed.count == 0.usize()
+                continue if graph_index_of(&graph, trimmed) < graph.items.count
+                directory: darray[u8] = find_manifest_dir(search_paths, trimmed)
+                if directory.count == 0.usize():
+                    if not graph.failed:
+                        graph.failed <- true
+                        message: mutable darray[u8] = []
+                        bytes_extend_view(&message, "dependency \"")
+                        bytes_extend(&message, trimmed)
+                        bytes_extend_view(&message, "\" could not be found in ")
+                        joined: darray[u8] = strlist_join_comma(search_paths)
+                        bytes_extend(&message, joined)
+                        graph.error_text <- message
+                    continue
+                manifest_path: darray[u8] = path_join_view(directory, "manifest.json")
+                raw: darray[u8] = read_file_bytes(manifest_path)
+                manifest_cursor: mutable JsonCursor = JsonCursor{position: 0.usize(), ok: true, bad_key_start: 0.usize(), bad_key_length: 0.usize()}
+                definition: ManifestDef = parse_manifest(raw, &manifest_cursor)
+                if not manifest_cursor.ok:
+                    if not graph.failed:
+                        graph.failed <- true
+                        message: mutable darray[u8] = []
+                        bytes_extend_view(&message, "invalid json in ")
+                        bytes_extend(&message, manifest_path)
+                        graph.error_text <- message
+                    continue
+                if not bytes_equal(definition.provides, trimmed):
+                    if not graph.failed:
+                        graph.failed <- true
+                        message: mutable darray[u8] = []
+                        bytes_extend_view(&message, "manifest ")
+                        bytes_extend(&message, manifest_path)
+                        bytes_extend_view(&message, " provides \"")
+                        bytes_extend(&message, definition.provides)
+                        bytes_extend_view(&message, "\" but was requested as \"")
+                        bytes_extend(&message, trimmed)
+                        bytes_extend_view(&message, "\"")
+                        graph.error_text <- message
+                    continue
+                resolved: mutable ResolvedManifest = ResolvedManifest{name: bytes_copy(trimmed), dir: bytes_copy(directory), manifest_path: bytes_copy(manifest_path), entry_path: [], interface_path: [], include_dirs: StrList{data: [], starts: [], lengths: []}, foreign: StrList{data: [], starts: [], lengths: []}, easm: StrList{data: [], starts: [], lengths: []}, link_flags: strlist_copy(&definition.link_flags), exec: strlist_copy(&definition.exec), dependencies: strlist_copy(&definition.dependencies)}
+                if not bytes_is_blank(definition.entry):
+                    resolved.entry_path <- path_relative_to(directory, definition.entry)
+                if not bytes_is_blank(definition.interface_path):
+                    resolved.interface_path <- path_relative_to(directory, definition.interface_path)
+                resolved.include_dirs <- strlist_relative_to(directory, &definition.include_dirs)
+                resolved.foreign <- strlist_relative_to(directory, &definition.foreign)
+                resolved.easm <- strlist_relative_to(directory, &definition.easm)
+                graph.items <- graph.items.push(resolved)
+                pending <- strlist_extend(pending, definition.dependencies)
+            return graph
+
+    # Depth-first post-order over the loaded table: a dependency is emitted before whatever
+    # needs it, and each name once.
+    #
+    # A CYCLE IS NOT AN ERROR HERE. stage0's visit() marks a manifest seen BEFORE recursing
+    # into its dependencies, so `a -> b -> a` simply stops at the second `a` and orders as
+    # `b, a`. Reporting a cycle instead made stage1 reject a project stage0 views happily.
+    # `state` is 0 unvisited / 1 reached / 2 emitted.
+    def order_manifest_graph(graph: ManifestGraph&, roots: StrList&) -> ManifestGraph:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable ManifestGraph = manifest_graph_new()
+            for index in 0..<graph.items.count |result, graph|:
+                result.items <- result.items.push(graph.items[index])
+            result.failed <- graph.failed
+            result.error_text <- bytes_copy(graph.error_text)
+            state: mutable darray[u8] = []
+            state.resize(graph.items.count)
+            for index in 0..<graph.items.count |state|:
+                state[index] <- 0
+            # An explicit stack of (node, child cursor) rather than recursion, so the walk
+            # can push results in post-order without a region-polymorphic helper.
+            # The stack height is an explicit counter and the slots are OVERWRITTEN rather
+            # than popped. That began as a workaround: `pile <- pile.resize(n)` used to make
+            # stage1's backend decline the whole unit. It no longer does — the assign form of
+            # `resize`/`clear` is lowered in codegen_stmt_assign_flow and pinned by
+            # darray_resize_assign_* in backend_native_smoke — so this shape is now a plain
+            # preference (no reallocation per pop), not a constraint.
+            stack_node: mutable darray[usize] = []
+            stack_child: mutable darray[usize] = []
+            depth: mutable usize = 0.usize()
+            for root in 0..<roots.starts.count |result, state, stack_node, stack_child, depth, graph, roots|:
+                root_name: darray[u8] = strlist_entry_copy(roots, root)
+                trimmed_root: darray[u8] = bytes_trimmed(root_name)
+                continue if trimmed_root.count == 0.usize()
+                start_index: usize = graph_index_of(graph, trimmed_root)
+                continue if start_index >= graph.items.count
+                continue if state[start_index] != 0
+                if depth < stack_node.count:
+                    stack_node[depth] <- start_index
+                    stack_child[depth] <- 0.usize()
+                else:
+                    stack_node <- stack_node.push(start_index)
+                    stack_child <- stack_child.push(0.usize())
+                depth <- depth + 1.usize()
+                state[start_index] <- 1
+                while depth > 0.usize() |result, state, stack_node, stack_child, depth, graph|:
+                    top: usize = depth - 1.usize()
+                    node: usize = stack_node[top]
+                    child: usize = stack_child[top]
+                    if child >= graph.items[node].dependencies.starts.count:
+                        state[node] <- 2
+                        result.order <- result.order.push(node)
+                        depth <- top
+                        continue
+                    stack_child[top] <- child + 1.usize()
+                    child_name: darray[u8] = strlist_entry_copy(&graph.items[node].dependencies, child)
+                    trimmed_child: darray[u8] = bytes_trimmed(child_name)
+                    continue if trimmed_child.count == 0.usize()
+                    child_index: usize = graph_index_of(graph, trimmed_child)
+                    continue if child_index >= graph.items.count
+                    continue if state[child_index] != 0
+                    state[child_index] <- 1
+                    if depth < stack_node.count:
+                        stack_node[depth] <- child_index
+                        stack_child[depth] <- 0.usize()
+                    else:
+                        stack_node <- stack_node.push(child_index)
+                        stack_child <- stack_child.push(0.usize())
+                    depth <- depth + 1.usize()
+            return result
+
+    # stage0's normalizeEmitMode. The canonical spellings pass through, the documented
+    # aliases fold onto them, and anything unrecognised is returned trimmed and unchanged —
+    # so an unknown mode reaches the caller intact rather than becoming an error here.
+    def normalize_emit_mode(value: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            lowered: mutable darray[u8] = []
+            trimmed: darray[u8] = bytes_trimmed(value)
+            for index in 0..<trimmed.count |lowered, trimmed|:
+                byte: u8 = trimmed[index]
+                lowered.push(byte + 32 if byte >= 65 and byte <= 90 else byte)
+            bytes_from_view("lowered") return if bytes_equal_view(lowered, "lower") or bytes_equal_view(lowered, "lowering") or bytes_equal_view(lowered, "grammar-lowered")
+            bytes_from_view("semantic") return if bytes_equal_view(lowered, "sema") or bytes_equal_view(lowered, "semantics") or bytes_equal_view(lowered, "lowered-semantic") or bytes_equal_view(lowered, "typed-report")
+            bytes_from_view("facts") return if bytes_equal_view(lowered, "fact") or bytes_equal_view(lowered, "fact-trace") or bytes_equal_view(lowered, "trace-facts")
+            bytes_from_view("unsafe") return if bytes_equal_view(lowered, "unsafe-summary") or bytes_equal_view(lowered, "unsafe-report")
+            bytes_from_view("progress") return if bytes_equal_view(lowered, "progress-summary") or bytes_equal_view(lowered, "progress-report")
+            bytes_from_view("fmt") return if bytes_equal_view(lowered, "format") or bytes_equal_view(lowered, "formatter")
+            bytes_from_view("doc") return if bytes_equal_view(lowered, "docs") or bytes_equal_view(lowered, "reference")
+            bytes_from_view("iface") return if bytes_equal_view(lowered, "interface") or bytes_equal_view(lowered, "api")
+            bytes_from_view("deps") return if bytes_equal_view(lowered, "dep") or bytes_equal_view(lowered, "dependencies")
+            bytes_from_view("deps-json") return if bytes_equal_view(lowered, "depsjson") or bytes_equal_view(lowered, "dependencies-json")
+            bytes_from_view("ir") return if bytes_equal_view(lowered, "frontend-ir") or bytes_equal_view(lowered, "bundle")
+            bytes_from_view("interpret") return if bytes_equal_view(lowered, "run") or bytes_equal_view(lowered, "interp")
+            bytes_from_view("serve") return if bytes_equal_view(lowered, "server")
+            bytes_from_view("tests") return if bytes_equal_view(lowered, "test-list")
+            bytes_from_view("benches") return if bytes_equal_view(lowered, "bench-list")
+            bytes_from_view("fixtures") return if bytes_equal_view(lowered, "fixture-list")
+            bytes_from_view("test") return if bytes_equal_view(lowered, "run-test") or bytes_equal_view(lowered, "run-tests")
+            bytes_from_view("test-runner") return if bytes_equal_view(lowered, "runner")
+            bytes_from_view("packed") return if bytes_equal_view(lowered, "packed-info") or bytes_equal_view(lowered, "packedinfo")
+            bytes_from_view("c-bind-check") return if bytes_equal_view(lowered, "cbind-check") or bytes_equal_view(lowered, "c-bind") or bytes_equal_view(lowered, "cbind")
+            bytes_from_view("c-bind-check-json") return if bytes_equal_view(lowered, "cbind-check-json") or bytes_equal_view(lowered, "c-bind-json") or bytes_equal_view(lowered, "cbind-json") or bytes_equal_view(lowered, "ffi-manifest") or bytes_equal_view(lowered, "abi-manifest")
+            bytes_from_view("bc") return if bytes_equal_view(lowered, "bitcode")
+            bytes_from_view("obj") return if bytes_equal_view(lowered, "object")
+            bytes_from_view("c-archive") return if bytes_equal_view(lowered, "carchive") or bytes_equal_view(lowered, "archive") or bytes_equal_view(lowered, "static-archive") or bytes_equal_view(lowered, "staticlib") or bytes_equal_view(lowered, "static-lib")
+            bytes_from_view("tokens") return if bytes_equal_view(lowered, "token") or bytes_equal_view(lowered, "token-kinds") or bytes_equal_view(lowered, "lex")
+            # A canonical spelling reaches here unchanged, as does anything unrecognised —
+            # stage0's default branch returns the trimmed input rather than failing.
+            lowered return if bytes_equal_view(lowered, "ast") or bytes_equal_view(lowered, "lowered") or bytes_equal_view(lowered, "semantic") or bytes_equal_view(lowered, "facts") or bytes_equal_view(lowered, "unsafe") or bytes_equal_view(lowered, "progress") or bytes_equal_view(lowered, "fmt") or bytes_equal_view(lowered, "doc") or bytes_equal_view(lowered, "iface") or bytes_equal_view(lowered, "deps") or bytes_equal_view(lowered, "deps-json") or bytes_equal_view(lowered, "ir") or bytes_equal_view(lowered, "interpret") or bytes_equal_view(lowered, "serve") or bytes_equal_view(lowered, "tests") or bytes_equal_view(lowered, "benches") or bytes_equal_view(lowered, "fixtures") or bytes_equal_view(lowered, "test") or bytes_equal_view(lowered, "test-runner") or bytes_equal_view(lowered, "llvm") or bytes_equal_view(lowered, "packed") or bytes_equal_view(lowered, "c-bind-check") or bytes_equal_view(lowered, "c-bind-check-json") or bytes_equal_view(lowered, "header") or bytes_equal_view(lowered, "bc") or bytes_equal_view(lowered, "obj") or bytes_equal_view(lowered, "c-archive") or bytes_equal_view(lowered, "tokens")
+            return trimmed
+
+    # stage0's parseOptimizationArg: an optional leading `O`, then 0, 2 or 3. Returns -1 for
+    # anything else, which the caller reports the way stage0's error does.
+    def parse_opt_level(value: darray[u8]&) -> i64:
+        trimmed_start: usize = bytes_trim_start(value)
+        trimmed_end: usize = bytes_trim_end(value)
+        first: mutable usize = trimmed_start
+        first <- first + 1.usize() if first < trimmed_end and (value[first] == 79 or value[first] == 111)
+        -1 return if trimmed_end - first != 1.usize()
+        digit: u8 = value[first]
+        0 return if digit == 48
+        2 return if digit == 50
+        3 return if digit == 51
+        return -1
+
+    # A target resolved against its project: every path absolute, every list deduped, and
+    # the dependency order fixed. This is what both `view` and `deps` report on.
+    struct ResolvedTarget:
+        project_file: mutable darray[u8]
+        project_root: mutable darray[u8]
+        name: mutable darray[u8]
+        entry_path: mutable darray[u8]
+        emit: mutable darray[u8]
+        run_emit: mutable darray[u8]
+        output_path: mutable darray[u8]
+        target_triple: mutable darray[u8]
+        include_dirs: mutable StrList
+        dependency_search_paths: mutable StrList
+        foreign: mutable StrList
+        easm: mutable StrList
+        link_flags: mutable StrList
+        project_exec: mutable StrList
+        target_exec: mutable StrList
+        opt_level: mutable i64
+        has_opt_level: mutable bool
+        strict_policy: mutable bool
+        perf_strict: mutable bool
+        concurrency_strict: mutable bool
+        failed: mutable bool
+        error_text: mutable darray[u8]
+
+    def resolved_target_new() -> ResolvedTarget:
+        can Memory.Allocate, Abort.Panic:
+            return ResolvedTarget{project_file: [], project_root: [], name: [], entry_path: [], emit: [], run_emit: [], output_path: [], target_triple: [], include_dirs: StrList{data: [], starts: [], lengths: []}, dependency_search_paths: StrList{data: [], starts: [], lengths: []}, foreign: StrList{data: [], starts: [], lengths: []}, easm: StrList{data: [], starts: [], lengths: []}, link_flags: StrList{data: [], starts: [], lengths: []}, project_exec: StrList{data: [], starts: [], lengths: []}, target_exec: StrList{data: [], starts: [], lengths: []}, opt_level: 0, has_opt_level: false, strict_policy: false, perf_strict: false, concurrency_strict: false, failed: false, error_text: []}
+
+    # stage0's defaultProjectTargetName: "default" wins; a lone target is taken whatever it
+    # is called; otherwise the alphabetically first name.
+    def default_target_index(project: ProjectDef&) -> usize:
+        count: usize = project.targets.count
+        count return if count == 0.usize()
+        for index in 0..<count |project|:
+            index return if bytes_equal_view(project.targets[index].name, "default")
+        0 return if count == 1.usize()
+        best: mutable usize = 0.usize()
+        for index in 1..<count |best, project|:
+            best <- index if bytes_less(project.targets[index].name, project.targets[best].name)
+        return best
+
+    # The index of the target `requested` names, or the target count when it is absent.
+    # Returns a scalar, so it has no inferred region: the trimmed copy of `requested` needs
+    # an explicit `region` scope to live in.
+    def select_target_index(project: ProjectDef&, requested: darray[u8]&) -> usize:
+        can Memory.Allocate, Abort.Panic:
+            default_target_index(project) return if bytes_is_blank(requested)
+            found: mutable usize = project.targets.count
+            region pick(4096):
+                wanted: darray[u8] = bytes_trimmed(requested)
+                for index in 0..<project.targets.count |found, project, wanted|:
+                    found <- index if bytes_equal(project.targets[index].name, wanted)
+            return found
+
+    # `dependency-search-paths`, defaulted, made absolute and deduped.
+    def resolved_search_paths(project: ProjectDef&, root: darray[u8]&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            configured: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            if strlist_is_empty(&project.dependency_search_paths):
+                configured <- strlist_push_view(configured, "lib")
+            else:
+                configured <- strlist_extend(configured, &project.dependency_search_paths)
+            absolute: StrList = strlist_relative_to(root, &configured)
+            return strlist_dedupe(&absolute)
+
+    # The dependency graph for a target, resolved and ordered. Built by the CALLER and passed
+    # into `resolve_project_target` rather than stored on the ResolvedTarget it returns.
+    def build_dependency_graph(project: ProjectDef&, project_file: darray[u8]&, requested: darray[u8]&) -> ManifestGraph:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            root: darray[u8] = path_dir(project_file)
+            search_paths: StrList = resolved_search_paths(project, root)
+            names: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            names <- strlist_extend(names, &project.dependencies)
+            selected: usize = select_target_index(project, requested)
+            if selected < project.targets.count:
+                names <- strlist_extend(names, &project.targets[selected].dependencies)
+            loaded: ManifestGraph = load_manifest_graph(&search_paths, &names)
+            ordered: ManifestGraph = order_manifest_graph(&loaded, &names)
+            return ordered
+
+    # stage0's resolveProjectTarget, in its order — the order matters, because the dedupes at
+    # the end keep FIRST occurrences and so the project's own entries must precede each
+    # dependency's.
+    def resolve_project_target(project: ProjectDef&, project_file: darray[u8]&, requested: darray[u8]&, graph: ManifestGraph&) -> ResolvedTarget:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            resolved: mutable ResolvedTarget = resolved_target_new()
+            resolved.project_file <- bytes_copy(project_file)
+            root: darray[u8] = path_dir(project_file)
+            resolved.project_root <- bytes_copy(root)
+            selected: mutable usize = project.targets.count
+            if bytes_is_blank(requested):
+                selected <- default_target_index(project)
+            else:
+                wanted: darray[u8] = bytes_trimmed(requested)
+                for index in 0..<project.targets.count |selected, project, wanted|:
+                    selected <- index if bytes_equal(project.targets[index].name, wanted)
+            if selected >= project.targets.count:
+                resolved.failed <- true
+                message: mutable darray[u8] = []
+                bytes_extend_view(&message, "project target \"")
+                bytes_extend(&message, requested)
+                bytes_extend_view(&message, "\" was not found in ")
+                bytes_extend(&message, project_file)
+                resolved.error_text <- message
+                return resolved
+            definition: TargetDef& = &project.targets[selected]
+            resolved.name <- bytes_copy(definition.name)
+            if bytes_is_blank(definition.entry):
+                resolved.failed <- true
+                message: mutable darray[u8] = []
+                bytes_extend_view(&message, "project target \"")
+                bytes_extend(&message, definition.name)
+                bytes_extend_view(&message, "\" is missing an entry")
+                resolved.error_text <- message
+                return resolved
+            resolved.entry_path <- path_relative_to(root, definition.entry)
+            if not is_surface_source(resolved.entry_path):
+                resolved.failed <- true
+                message: mutable darray[u8] = []
+                bytes_extend_view(&message, "project target \"")
+                bytes_extend(&message, definition.name)
+                bytes_extend_view(&message, "\" entry ")
+                bytes_extend(&message, resolved.entry_path)
+                bytes_extend_view(&message, " must be a .elisa or .elisai source file in the current MVP")
+                resolved.error_text <- message
+                return resolved
+            # `dependency-search-paths` defaults to a single "lib".
+            search_source: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            if strlist_is_empty(&project.dependency_search_paths):
+                search_source <- strlist_push_view(search_source, "lib")
+            else:
+                search_source <- strlist_extend(search_source, &project.dependency_search_paths)
+            absolute_search: StrList = strlist_relative_to(root, &search_source)
+            resolved.dependency_search_paths <- strlist_dedupe(&absolute_search)
+            if graph.failed:
+                resolved.failed <- true
+                resolved.error_text <- bytes_copy(graph.error_text)
+                return resolved
+            include_source: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            include_source <- strlist_extend(include_source, &project.include_dirs)
+            include_source <- strlist_extend(include_source, &definition.include_dirs)
+            include_dirs: mutable StrList = strlist_relative_to(root, &include_source)
+            # `inherit-project-native` false drops the PROJECT-level native inputs only; the
+            # target's own and its dependencies' are unaffected.
+            inherit: bool = definition.inherit_native or not definition.has_inherit_native
+            foreign_source: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            easm_source: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            link_flags: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            if inherit:
+                foreign_source <- strlist_extend(foreign_source, &project.foreign)
+                easm_source <- strlist_extend(easm_source, &project.easm)
+                link_flags <- strlist_extend(link_flags, &project.link_flags)
+            foreign_source <- strlist_extend(foreign_source, &definition.foreign)
+            easm_source <- strlist_extend(easm_source, &definition.easm)
+            foreign_files: mutable StrList = strlist_relative_to(root, &foreign_source)
+            easm_files: mutable StrList = strlist_relative_to(root, &easm_source)
+            # Link flags are NOT paths and are never resolved against the root.
+            link_flags <- strlist_extend(link_flags, &definition.link_flags)
+            link_flags <- strlist_extend(link_flags, &definition.platform_link_flags)
+            for position in 0..<graph.order.count |include_dirs, foreign_files, easm_files, link_flags, graph|:
+                slot: usize = graph.order[position]
+                include_dirs <- strlist_extend(include_dirs, &graph.items[slot].include_dirs)
+                foreign_files <- strlist_extend(foreign_files, &graph.items[slot].foreign)
+                easm_files <- strlist_extend(easm_files, &graph.items[slot].easm)
+                link_flags <- strlist_extend(link_flags, &graph.items[slot].link_flags)
+            resolved.include_dirs <- strlist_dedupe(&include_dirs)
+            resolved.foreign <- strlist_dedupe(&foreign_files)
+            resolved.easm <- strlist_dedupe(&easm_files)
+            resolved.link_flags <- strlist_dedupe(&link_flags)
+            resolved.emit <- bytes_from_view("llvm")
+            if not bytes_is_blank(definition.emit):
+                resolved.emit <- normalize_emit_mode(definition.emit)
+            resolved.run_emit <- bytes_from_view("interpret")
+            if not bytes_is_blank(definition.run_emit):
+                resolved.run_emit <- normalize_emit_mode(definition.run_emit)
+            if not bytes_is_blank(definition.output):
+                resolved.output_path <- path_relative_to(root, definition.output)
+            resolved.target_triple <- bytes_trimmed(definition.target_triple)
+            if not bytes_is_blank(definition.packed_abi):
+                resolved.failed <- true
+                message: mutable darray[u8] = []
+                bytes_extend_view(&message, "project target \"")
+                bytes_extend(&message, definition.name)
+                bytes_extend_view(&message, "\" uses removed packed-abi override; use canonical packed lowering or enum-level @packed_profile(...) instead")
+                resolved.error_text <- message
+                return resolved
+            if not bytes_is_blank(definition.opt):
+                level: i64 = parse_opt_level(definition.opt)
+                if level < 0:
+                    resolved.failed <- true
+                    message: mutable darray[u8] = []
+                    bytes_extend_view(&message, "project target \"")
+                    bytes_extend(&message, definition.name)
+                    bytes_extend_view(&message, "\": unsupported optimization level \"")
+                    bytes_extend(&message, definition.opt)
+                    bytes_extend_view(&message, "\" (expected O0, O2, or O3)")
+                    resolved.error_text <- message
+                    return resolved
+                resolved.opt_level <- level
+                resolved.has_opt_level <- true
+            resolved.project_exec <- strlist_copy(&project.exec)
+            resolved.target_exec <- strlist_copy(&definition.exec)
+            resolved.strict_policy <- definition.warn_strict
+            resolved.perf_strict <- definition.warn_strict or definition.warn_perf
+            resolved.concurrency_strict <- definition.warn_strict or definition.warn_concurrency
+            return resolved
+
+    # stage0's findProjectFile: a path naming project.json is taken as is, otherwise walk up
+    # from the directory until one is found.
+    def find_project_file(start: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            empty: mutable darray[u8] = []
+            base: mutable darray[u8] = bytes_trimmed(start)
+            if base.count == 0.usize():
+                base <- working_directory()
+            absolute: darray[u8] = absolute_path(base)
+            named: darray[u8] = path_join_view(absolute, "project.json")
+            absolute return if bytes_ends_with_view(absolute, "/project.json") and file_exists(absolute)
+            named return if file_exists(named)
+            directory: mutable darray[u8] = bytes_copy(absolute)
+            for _step in 0..<256 |directory, empty|:
+                candidate: darray[u8] = path_join_view(directory, "project.json")
+                candidate return if file_exists(candidate)
+                parent: darray[u8] = path_dir(directory)
+                break if bytes_equal(parent, directory)
+                directory <- parent
+            return empty
+
+    # ---- source include closure ------------------------------------------------------------
+    #
+    # stage0's collectSourceDependencies. Discovery and ordering are split for the same
+    # reason as the manifest graph: the ordering pass is pure index work and needs no region.
+
+    struct SourceGraph:
+        files: mutable StrList
+        edge_start: mutable darray[usize]
+        edge_count: mutable darray[usize]
+        edges: mutable darray[usize]
+        failed: mutable bool
+        error_text: mutable darray[u8]
+
+    # The quoted path of an `include "..."` line (optionally `#include`, optionally indented),
+    # reported as a span into `line`. Returns false when the line is not an include.
+    def include_directive_span(line: darray[u8]&, start: usize, limit: usize, out_start: mutable usize&, out_length: mutable usize&) -> bool:
+        cursor: mutable usize = start
+        while cursor < limit |cursor, line|:
+            break if line[cursor] != 32 and line[cursor] != 9
+            cursor <- cursor + 1.usize()
+        cursor <- cursor + 1.usize() if cursor < limit and line[cursor] == 35
+        while cursor < limit |cursor, line|:
+            break if line[cursor] != 32 and line[cursor] != 9
+            cursor <- cursor + 1.usize()
+        false return if cursor + 7.usize() > limit
+        keyword: sview = "include"
+        for index in 0..<7 |line, cursor, keyword|:
+            false return if line[cursor + index.usize()] != sview_at(keyword, index)
+        cursor <- cursor + 7.usize()
+        false return if cursor >= limit or (line[cursor] != 32 and line[cursor] != 9)
+        while cursor < limit |cursor, line|:
+            break if line[cursor] != 32 and line[cursor] != 9
+            cursor <- cursor + 1.usize()
+        false return if cursor >= limit or line[cursor] != 34
+        cursor <- cursor + 1.usize()
+        out_start <- cursor
+        while cursor < limit |cursor, line|:
+            break if line[cursor] == 34
+            cursor <- cursor + 1.usize()
+        false return if cursor >= limit or line[cursor] != 34
+        out_length <- cursor - out_start
+        cursor <- cursor + 1.usize()
+        # stage0 matches the whole line, so anything after the closing quote disqualifies it.
+        while cursor < limit |cursor, line|:
+            false return if line[cursor] != 32 and line[cursor] != 9 and line[cursor] != 13
+            cursor <- cursor + 1.usize()
+        return true
+
+    # stage0's resolveExpandedIncludePath: the including file's own directory first, then each
+    # configured include directory, first hit wins. Empty when nothing matches.
+    def project_resolve_include_path(current_dir: darray[u8]&, include_path: darray[u8]&, include_dirs: StrList&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            direct: darray[u8] = path_join(current_dir, include_path)
+            direct return if file_exists(direct)
+            for index in 0..<include_dirs.starts.count |include_dirs, include_path|:
+                base: darray[u8] = strlist_entry_copy(include_dirs, index)
+                candidate: darray[u8] = path_join(base, include_path)
+                candidate return if file_exists(candidate)
+            empty: mutable darray[u8] = []
+            return empty
+
+    def source_graph_index_of(files: StrList&, path: darray[u8]&) -> usize:
+        for index in 0..<files.starts.count |files, path|:
+            index return if strlist_entry_equals(files, index, path)
+        return files.starts.count
+
+    # Discover every file reachable from `entry`, recording each file's include targets.
+    def discover_sources(entry: darray[u8]&, include_dirs: StrList&) -> SourceGraph:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            graph: mutable SourceGraph = SourceGraph{files: StrList{data: [], starts: [], lengths: []}, edge_start: [], edge_count: [], edges: [], failed: false, error_text: []}
+            root: darray[u8] = absolute_path(entry)
+            # The file table is threaded through a LOCAL, not `graph.files`: the
+            # `x <- f(x)` form is only accepted when `x` is the local that was passed in.
+            files: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            files <- strlist_push(files, root)
+            scanned: mutable usize = 0.usize()
+            while scanned < files.starts.count |scanned, graph, files, include_dirs|:
+                path: darray[u8] = strlist_entry_copy(&files, scanned)
+                graph.edge_start <- graph.edge_start.push(graph.edges.count)
+                before: usize = graph.edges.count
+                contents: darray[u8] = read_file_bytes(path)
+                if contents.count == 0.usize() and not file_exists(path):
+                    if not graph.failed:
+                        graph.failed <- true
+                        message: mutable darray[u8] = []
+                        bytes_extend_view(&message, "open ")
+                        bytes_extend(&message, path)
+                        bytes_extend_view(&message, ": no such file or directory")
+                        graph.error_text <- message
+                directory: darray[u8] = path_dir(path)
+                line_start: mutable usize = 0.usize()
+                position: mutable usize = 0.usize()
+                while position <= contents.count |position, line_start, graph, files, contents, directory, include_dirs|:
+                    at_end: bool = position == contents.count
+                    byte: u8 = 10 if at_end else contents[position]
+                    if byte == 10:
+                        include_start: mutable usize = 0.usize()
+                        include_length: mutable usize = 0.usize()
+                        if include_directive_span(contents, line_start, position, &include_start, &include_length):
+                            requested: mutable darray[u8] = []
+                            bytes_extend_span(&requested, contents, include_start, include_length)
+                            target: darray[u8] = project_resolve_include_path(directory, requested, include_dirs)
+                            if target.count == 0.usize():
+                                if not graph.failed:
+                                    graph.failed <- true
+                                    message: mutable darray[u8] = []
+                                    bytes_extend_view(&message, "include \"")
+                                    bytes_extend(&message, requested)
+                                    bytes_extend_view(&message, "\" not found from ")
+                                    bytes_extend(&message, directory)
+                                    bytes_extend_view(&message, " or configured include directories")
+                                    graph.error_text <- message
+                            else:
+                                slot: mutable usize = source_graph_index_of(&files, target)
+                                if slot == files.starts.count:
+                                    files <- strlist_push(files, target)
+                                graph.edges <- graph.edges.push(slot)
+                        line_start <- position + 1.usize()
+                    position <- position + 1.usize()
+                graph.edge_count <- graph.edge_count.push(graph.edges.count - before)
+                scanned <- scanned + 1.usize()
+            graph.files <- files
+            return graph
+
+    # Pre-order DFS from file 0: the file itself, then each include in the order it appears.
+    # A file already emitted is skipped (stage0's `seen`), and a file still on the stack is a
+    # cycle (stage0's `active`).
+    def order_sources(graph: SourceGraph&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            ordered: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            total: usize = graph.files.starts.count
+            ordered return if total == 0.usize()
+            emitted: mutable darray[u8] = []
+            emitted.resize(total)
+            for index in 0..<total |emitted|:
+                emitted[index] <- 0
+            # The stack height is an explicit counter and the slots are OVERWRITTEN rather
+            # than popped. That began as a workaround: `pile <- pile.resize(n)` used to make
+            # stage1's backend decline the whole unit. It no longer does — the assign form of
+            # `resize`/`clear` is lowered in codegen_stmt_assign_flow and pinned by
+            # darray_resize_assign_* in backend_native_smoke — so this shape is now a plain
+            # preference (no reallocation per pop), not a constraint.
+            stack_node: mutable darray[usize] = []
+            stack_child: mutable darray[usize] = []
+            depth: mutable usize = 1.usize()
+            stack_node <- stack_node.push(0.usize())
+            stack_child <- stack_child.push(0.usize())
+            emitted[0.usize()] <- 1
+            ordered <- strlist_push_span(ordered, graph.files.data, graph.files.starts[0.usize()], graph.files.lengths[0.usize()])
+            while depth > 0.usize() |ordered, emitted, stack_node, stack_child, depth, graph|:
+                top: usize = depth - 1.usize()
+                node: usize = stack_node[top]
+                child: usize = stack_child[top]
+                if child >= graph.edge_count[node]:
+                    depth <- top
+                    continue
+                stack_child[top] <- child + 1.usize()
+                target: usize = graph.edges[graph.edge_start[node] + child]
+                continue if emitted[target] == 1
+                emitted[target] <- 1
+                ordered <- strlist_push_span(ordered, graph.files.data, graph.files.starts[target], graph.files.lengths[target])
+                if depth < stack_node.count:
+                    stack_node[depth] <- target
+                    stack_child[depth] <- 0.usize()
+                else:
+                    stack_node <- stack_node.push(target)
+                    stack_child <- stack_child.push(0.usize())
+                depth <- depth + 1.usize()
+            return ordered
+
+    # ---- reports -----------------------------------------------------------------------------
+
+    def push_line_view(out: mutable darray[u8]&, text: sview) -> void:
+        can Memory.Allocate, Abort.Panic:
+            bytes_extend_view(out, text)
+            out.push(10)
+
+    def push_labelled(out: mutable darray[u8]&, label: sview, value: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            bytes_extend_view(out, label)
+            bytes_extend(out, value)
+            out.push(10)
+
+    # `  - VALUE` for each entry, the indented list shape both reports use.
+    def push_bullets(out: mutable darray[u8]&, list: StrList&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            for index in 0..<list.starts.count |out, list|:
+                bytes_extend_view(out, "  - ")
+                strlist_append_entry(out, list, index)
+                out.push(10)
+
+    def push_bullets_deep(out: mutable darray[u8]&, list: StrList&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            for index in 0..<list.starts.count |out, list|:
+                bytes_extend_view(out, "      - ")
+                strlist_append_entry(out, list, index)
+                out.push(10)
+
+    # The order the dependency table is printed and walked in: post-order, as resolved.
+    def push_section_if_any(out: mutable darray[u8]&, header: sview, list: StrList&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            return if strlist_is_empty(list)
+            push_line_view(out, header)
+            push_bullets(out, list)
+
+    # stage0's runProjectView, line for line — split in two because the ORDER matters: the
+    # project line and the target table are printed BEFORE the target is resolved, so an
+    # unresolvable target still shows them, followed by the error on stderr.
+    def render_view_header(project: ProjectDef&, project_file: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            push_labelled(&out, "Project: ", project_file)
+            # Names are listed sorted; stage0 iterates a Go map and calls sort.Strings.
+            count: usize = project.targets.count
+            order: mutable darray[usize] = []
+            for index in 0..<count |order|:
+                order <- order.push(index)
+            for outer in 0..<count |order, project|:
+                for inner in 0..<count |order, project, outer|:
+                    continue if inner + 1.usize() >= count
+                    if bytes_less(project.targets[order[inner + 1.usize()]].name, project.targets[order[inner]].name):
+                        swap: usize = order[inner]
+                        order[inner] <- order[inner + 1.usize()]
+                        order[inner + 1.usize()] <- swap
+                _ = outer
+            bytes_extend_view(&out, "Targets (")
+            bytes_push_decimal(&out, count)
+            bytes_extend_view(&out, "):")
+            out.push(10)
+            for position in 0..<count |out, order, project|:
+                definition: TargetDef& = &project.targets[order[position]]
+                bytes_extend_view(&out, "- ")
+                bytes_extend(&out, definition.name)
+                bytes_extend_view(&out, " entry=")
+                bytes_extend(&out, definition.entry)
+                bytes_extend_view(&out, " emit=")
+                # The RAW configured value with its default, not the normalised one: stage0
+                # prints defaultString(definition.Emit, emitLLVM) here and only normalises
+                # for the selected target below.
+                listed_emit: darray[u8] = bytes_or_default(definition.emit, "llvm")
+                bytes_extend(&out, listed_emit)
+                bytes_extend_view(&out, " run=")
+                listed_run: darray[u8] = bytes_or_default(definition.run_emit, "interpret")
+                bytes_extend(&out, listed_run)
+                out.push(10)
+            return out
+
+    def render_view_body(resolved: ResolvedTarget&, graph: ManifestGraph&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            out.push(10)
+            push_labelled(&out, "Selected target: ", resolved.name)
+            push_labelled(&out, "Entry: ", resolved.entry_path)
+            push_labelled(&out, "Build emit: ", resolved.emit)
+            push_labelled(&out, "Run emit: ", resolved.run_emit)
+            triple: darray[u8] = bytes_or_default(resolved.target_triple, "<host-default>")
+            push_labelled(&out, "Target triple: ", triple)
+            if resolved.output_path.count > 0.usize():
+                push_labelled(&out, "Output: ", resolved.output_path)
+            if resolved.has_opt_level:
+                bytes_extend_view(&out, "Optimization: O")
+                bytes_push_decimal(&out, resolved.opt_level.usize())
+                out.push(10)
+            bytes_extend_view(&out, "Warning policy: strict=")
+            bytes_extend_view(&out, "on" if resolved.strict_policy else "off")
+            bytes_extend_view(&out, " perf=")
+            bytes_extend_view(&out, "error" if resolved.perf_strict else "warn")
+            bytes_extend_view(&out, " concurrency=")
+            bytes_extend_view(&out, "error" if resolved.concurrency_strict else "warn")
+            out.push(10)
+            push_line_view(&out, "Include dirs:")
+            push_bullets(&out, &resolved.include_dirs)
+            push_line_view(&out, "Dependency search paths:")
+            push_bullets(&out, &resolved.dependency_search_paths)
+            push_line_view(&out, "Resolved dependencies:")
+            if graph.order.count == 0.usize():
+                push_line_view(&out, "  - <none>")
+            else:
+                for position in 0..<graph.order.count |out, graph|:
+                    slot: usize = graph.order[position]
+                    bytes_extend_view(&out, "  - ")
+                    bytes_extend(&out, graph.items[slot].name)
+                    bytes_extend_view(&out, " (")
+                    bytes_extend(&out, graph.items[slot].dir)
+                    bytes_extend_view(&out, ")")
+                    out.push(10)
+                    if graph.items[slot].interface_path.count > 0.usize():
+                        push_labelled(&out, "    interface=", graph.items[slot].interface_path)
+                    if not strlist_is_empty(&graph.items[slot].foreign):
+                        joined: darray[u8] = strlist_join_comma(&graph.items[slot].foreign)
+                        push_labelled(&out, "    foreign=", joined)
+                    if not strlist_is_empty(&graph.items[slot].easm):
+                        joined: darray[u8] = strlist_join_comma(&graph.items[slot].easm)
+                        push_labelled(&out, "    easm=", joined)
+            push_section_if_any(&out, "Foreign sources:", &resolved.foreign)
+            push_section_if_any(&out, "EASM sources:", &resolved.easm)
+            push_section_if_any(&out, "Link flags:", &resolved.link_flags)
+            dependency_hooks: mutable usize = 0.usize()
+            for position in 0..<graph.order.count |dependency_hooks, graph|:
+                dependency_hooks <- dependency_hooks + strlist_count(&graph.items[graph.order[position]].exec)
+            bytes_extend_view(&out, "Exec hooks: project=")
+            bytes_push_decimal(&out, strlist_count(&resolved.project_exec))
+            bytes_extend_view(&out, " target=")
+            bytes_push_decimal(&out, strlist_count(&resolved.target_exec))
+            bytes_extend_view(&out, " dependencies=")
+            bytes_push_decimal(&out, dependency_hooks)
+            out.push(10)
+            return out
+
+    # The include closure of one root, in stage0's order.
+    def collect_sources(entry: darray[u8]&, include_dirs: StrList&) -> StrList:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            graph: SourceGraph = discover_sources(entry, include_dirs)
+            return order_sources(&graph)
+
+    # stage0's orderedProjectDependencyEntries: each dependency's entry (or, lacking one, its
+    # interface) in resolved order, then the target's own entry last.
+    def ordered_dependency_entries(resolved: ResolvedTarget&, graph: ManifestGraph&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            entries: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            for position in 0..<graph.order.count |entries, graph|:
+                slot: usize = graph.order[position]
+                if graph.items[slot].entry_path.count > 0.usize():
+                    entries <- strlist_push(entries, graph.items[slot].entry_path)
+                elif graph.items[slot].interface_path.count > 0.usize():
+                    entries <- strlist_push(entries, graph.items[slot].interface_path)
+            entries <- strlist_push(entries, resolved.entry_path)
+            return entries
+
+    # The union of every entry's closure, first occurrence wins.
+    def collect_all_sources(resolved: ResolvedTarget&, graph: ManifestGraph&) -> StrList:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            all_sources: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            entries: StrList = ordered_dependency_entries(resolved, graph)
+            for index in 0..<entries.starts.count |all_sources, entries, resolved|:
+                entry: darray[u8] = strlist_entry_copy(&entries, index)
+                files: StrList = collect_sources(entry, &resolved.include_dirs)
+                for file_index in 0..<files.starts.count |all_sources, files|:
+                    candidate: darray[u8] = strlist_entry_copy(&files, file_index)
+                    continue if strlist_contains(&all_sources, candidate)
+                    all_sources <- strlist_push(all_sources, candidate)
+            return all_sources
+
+    # A single dependency's own closure: from its entry when it has one, otherwise from its
+    # interface, and empty when it has neither.
+    def dependency_source_closure(resolved: ResolvedTarget&, graph: ManifestGraph&, slot: usize) -> StrList:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            empty: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            if graph.items[slot].entry_path.count > 0.usize():
+                return collect_sources(graph.items[slot].entry_path, &resolved.include_dirs)
+            if graph.items[slot].interface_path.count > 0.usize():
+                return collect_sources(graph.items[slot].interface_path, &resolved.include_dirs)
+            return empty
+
+    # stage0's text dependency report.
+    def render_project_deps_text(resolved: ResolvedTarget&, graph: ManifestGraph&, sources: StrList&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            push_labelled(&out, "Project: ", resolved.project_file)
+            push_labelled(&out, "Target: ", resolved.name)
+            push_labelled(&out, "Entry: ", resolved.entry_path)
+            push_labelled(&out, "Emit: ", resolved.emit)
+            push_labelled(&out, "Run emit: ", resolved.run_emit)
+            triple: darray[u8] = bytes_or_default(resolved.target_triple, "<host-default>")
+            bytes_extend_view(&out, "Target triple: ")
+            bytes_extend(&out, triple)
+            if resolved.output_path.count > 0.usize():
+                out.push(10)
+                bytes_extend_view(&out, "Output: ")
+                bytes_extend(&out, resolved.output_path)
+            out.push(10)
+            push_line_view(&out, "Sources:")
+            push_bullets(&out, sources)
+            push_section_if_any(&out, "Foreign sources:", &resolved.foreign)
+            push_section_if_any(&out, "EASM sources:", &resolved.easm)
+            push_section_if_any(&out, "Link flags:", &resolved.link_flags)
+            if graph.order.count != 0.usize():
+                push_line_view(&out, "Dependencies:")
+                for position in 0..<graph.order.count |out, graph, resolved|:
+                    slot: usize = graph.order[position]
+                    bytes_extend_view(&out, "  - ")
+                    bytes_extend(&out, graph.items[slot].name)
+                    out.push(10)
+                    push_labelled(&out, "    manifest: ", graph.items[slot].manifest_path)
+                    if graph.items[slot].entry_path.count > 0.usize():
+                        push_labelled(&out, "    entry: ", graph.items[slot].entry_path)
+                    if graph.items[slot].interface_path.count > 0.usize():
+                        push_labelled(&out, "    interface: ", graph.items[slot].interface_path)
+                    if not strlist_is_empty(&graph.items[slot].link_flags):
+                        joined: darray[u8] = strlist_join_comma(&graph.items[slot].link_flags)
+                        push_labelled(&out, "    linkFlags: ", joined)
+                    if not strlist_is_empty(&graph.items[slot].foreign):
+                        push_line_view(&out, "    foreign:")
+                        push_bullets_deep(&out, &graph.items[slot].foreign)
+                    if not strlist_is_empty(&graph.items[slot].easm):
+                        push_line_view(&out, "    easm:")
+                        push_bullets_deep(&out, &graph.items[slot].easm)
+                    dependency_sources: StrList = dependency_source_closure(resolved, graph, slot)
+                    if not strlist_is_empty(&dependency_sources):
+                        push_line_view(&out, "    sources:")
+                        push_bullets_deep(&out, &dependency_sources)
+            return out
+
+    # ---- JSON output -------------------------------------------------------------------------
+    #
+    # Go's encoding/json with MarshalIndent(v, "", "  "). Two details of that encoder are
+    # observable and reproduced here: it HTML-escapes `<`, `>` and `&` into </>/&
+    # even outside HTML, and it omits every field tagged omitempty when the value is empty.
+
+    def json_push_escaped(out: mutable darray[u8]&, value: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            out.push(34)
+            for index in 0..<value.count |out, value|:
+                byte: u8 = value[index]
+                if byte == 34:
+                    bytes_extend_view(out, "\\\"")
+                elif byte == 92:
+                    bytes_extend_view(out, "\\\\")
+                elif byte == 10:
+                    bytes_extend_view(out, "\\n")
+                elif byte == 13:
+                    bytes_extend_view(out, "\\r")
+                elif byte == 9:
+                    bytes_extend_view(out, "\\t")
+                elif byte == 60:
+                    bytes_extend_view(out, "\\u003c")
+                elif byte == 62:
+                    bytes_extend_view(out, "\\u003e")
+                elif byte == 38:
+                    bytes_extend_view(out, "\\u0026")
+                elif byte < 32:
+                    bytes_extend_view(out, "\\u00")
+                    digits: sview = "0123456789abcdef"
+                    out.push(sview_at(digits, (byte / 16).i64()))
+                    out.push(sview_at(digits, (byte % 16).i64()))
+                else:
+                    out.push(byte)
+            out.push(34)
+
+    def json_push_escaped_span(out: mutable darray[u8]&, source: darray[u8]&, start: usize, length: usize) -> void:
+        can Memory.Allocate, Abort.Panic:
+            out.push(34)
+            for index in 0..<length |out, source, start|:
+                byte: u8 = source[start + index]
+                if byte == 34:
+                    bytes_extend_view(out, "\\\"")
+                elif byte == 92:
+                    bytes_extend_view(out, "\\\\")
+                elif byte == 10:
+                    bytes_extend_view(out, "\\n")
+                elif byte == 13:
+                    bytes_extend_view(out, "\\r")
+                elif byte == 9:
+                    bytes_extend_view(out, "\\t")
+                elif byte == 60:
+                    bytes_extend_view(out, "\\u003c")
+                elif byte == 62:
+                    bytes_extend_view(out, "\\u003e")
+                elif byte == 38:
+                    bytes_extend_view(out, "\\u0026")
+                elif byte < 32:
+                    bytes_extend_view(out, "\\u00")
+                    digits: sview = "0123456789abcdef"
+                    out.push(sview_at(digits, (byte / 16).i64()))
+                    out.push(sview_at(digits, (byte % 16).i64()))
+                else:
+                    out.push(byte)
+            out.push(34)
+
+    def json_push_indent(out: mutable darray[u8]&, depth: usize) -> void:
+        can Memory.Allocate, Abort.Panic:
+            for _step in 0..<depth |out|:
+                out.push(32)
+                out.push(32)
+
+    # `"name": "value",` at `depth`, with the trailing comma when more fields follow.
+    def json_push_string_field(out: mutable darray[u8]&, depth: usize, name: sview, value: darray[u8]&, more: bool) -> void:
+        can Memory.Allocate, Abort.Panic:
+            json_push_indent(out, depth)
+            out.push(34)
+            bytes_extend_view(out, name)
+            bytes_extend_view(out, "\": ")
+            json_push_escaped(out, value)
+            out.push(44) if more
+            out.push(10)
+
+    def json_push_string_array(out: mutable darray[u8]&, depth: usize, name: sview, list: StrList&, more: bool) -> void:
+        can Memory.Allocate, Abort.Panic:
+            json_push_indent(out, depth)
+            out.push(34)
+            bytes_extend_view(out, name)
+            bytes_extend_view(out, "\": [")
+            out.push(10)
+            for index in 0..<list.starts.count |out, list, depth|:
+                json_push_indent(out, depth + 1.usize())
+                # Escaped straight from the list's buffer: this returns void, so there is no
+                # region here to hold an owned copy of the entry.
+                json_push_escaped_span(out, list.data, list.starts[index], list.lengths[index])
+                out.push(44) if index + 1.usize() < list.starts.count
+                out.push(10)
+            json_push_indent(out, depth)
+            out.push(93)
+            out.push(44) if more
+            out.push(10)
+
+    # stage0's json.MarshalIndent of projectDependencyReport. Field ORDER is the Go struct's
+    # declaration order, and every `omitempty` field is dropped when empty — both are
+    # observable in the byte output, so both are reproduced exactly.
+    def render_project_deps_json(resolved: ResolvedTarget&, graph: ManifestGraph&, sources: StrList&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            out.push(123)
+            out.push(10)
+            json_push_string_field(&out, 1.usize(), "project", resolved.project_file, true)
+            json_push_string_field(&out, 1.usize(), "target", resolved.name, true)
+            json_push_string_field(&out, 1.usize(), "entry", resolved.entry_path, true)
+            json_push_string_field(&out, 1.usize(), "emit", resolved.emit, true)
+            # Everything after runEmit is optional, so whether runEmit itself carries a comma
+            # depends on what follows it.
+            has_output: bool = resolved.output_path.count > 0.usize()
+            has_triple: bool = resolved.target_triple.count > 0.usize()
+            has_includes: bool = not strlist_is_empty(&resolved.include_dirs)
+            has_search: bool = not strlist_is_empty(&resolved.dependency_search_paths)
+            json_push_string_field(&out, 1.usize(), "runEmit", resolved.run_emit, true)
+            if has_output:
+                json_push_string_field(&out, 1.usize(), "output", resolved.output_path, true)
+            if has_triple:
+                json_push_string_field(&out, 1.usize(), "targetTriple", resolved.target_triple, true)
+            if has_includes:
+                json_push_string_array(&out, 1.usize(), "includeDirs", &resolved.include_dirs, true)
+            if has_search:
+                json_push_string_array(&out, 1.usize(), "dependencySearchPaths", &resolved.dependency_search_paths, true)
+            # `sources` has no omitempty, so it is always present; what follows it is optional.
+            trailing: bool = not strlist_is_empty(&resolved.foreign) or not strlist_is_empty(&resolved.easm) or not strlist_is_empty(&resolved.link_flags) or graph.order.count != 0.usize()
+            json_push_string_array(&out, 1.usize(), "sources", sources, trailing)
+            if not strlist_is_empty(&resolved.foreign):
+                more: bool = not strlist_is_empty(&resolved.easm) or not strlist_is_empty(&resolved.link_flags) or graph.order.count != 0.usize()
+                json_push_string_array(&out, 1.usize(), "foreign", &resolved.foreign, more)
+            if not strlist_is_empty(&resolved.easm):
+                more: bool = not strlist_is_empty(&resolved.link_flags) or graph.order.count != 0.usize()
+                json_push_string_array(&out, 1.usize(), "easm", &resolved.easm, more)
+            if not strlist_is_empty(&resolved.link_flags):
+                more: bool = graph.order.count != 0.usize()
+                json_push_string_array(&out, 1.usize(), "linkFlags", &resolved.link_flags, more)
+            if graph.order.count != 0.usize():
+                json_push_indent(&out, 1.usize())
+                bytes_extend_view(&out, "\"dependencies\": [")
+                out.push(10)
+                for position in 0..<graph.order.count |out, graph, resolved|:
+                    slot: usize = graph.order[position]
+                    json_push_indent(&out, 2.usize())
+                    out.push(123)
+                    out.push(10)
+                    dependency_sources: StrList = dependency_source_closure(resolved, graph, slot)
+                    has_entry: bool = graph.items[slot].entry_path.count > 0.usize()
+                    has_interface: bool = graph.items[slot].interface_path.count > 0.usize()
+                    has_dep_includes: bool = not strlist_is_empty(&graph.items[slot].include_dirs)
+                    has_dep_foreign: bool = not strlist_is_empty(&graph.items[slot].foreign)
+                    has_dep_easm: bool = not strlist_is_empty(&graph.items[slot].easm)
+                    has_dep_flags: bool = not strlist_is_empty(&graph.items[slot].link_flags)
+                    has_dep_sources: bool = not strlist_is_empty(&dependency_sources)
+                    json_push_string_field(&out, 3.usize(), "name", graph.items[slot].name, true)
+                    manifest_more: bool = has_entry or has_interface or has_dep_includes or has_dep_foreign or has_dep_easm or has_dep_flags or has_dep_sources
+                    json_push_string_field(&out, 3.usize(), "manifest", graph.items[slot].manifest_path, manifest_more)
+                    if has_entry:
+                        more: bool = has_interface or has_dep_includes or has_dep_foreign or has_dep_easm or has_dep_flags or has_dep_sources
+                        json_push_string_field(&out, 3.usize(), "entry", graph.items[slot].entry_path, more)
+                    if has_interface:
+                        more: bool = has_dep_includes or has_dep_foreign or has_dep_easm or has_dep_flags or has_dep_sources
+                        json_push_string_field(&out, 3.usize(), "interface", graph.items[slot].interface_path, more)
+                    if has_dep_includes:
+                        more: bool = has_dep_foreign or has_dep_easm or has_dep_flags or has_dep_sources
+                        json_push_string_array(&out, 3.usize(), "includeDirs", &graph.items[slot].include_dirs, more)
+                    if has_dep_foreign:
+                        more: bool = has_dep_easm or has_dep_flags or has_dep_sources
+                        json_push_string_array(&out, 3.usize(), "foreign", &graph.items[slot].foreign, more)
+                    if has_dep_easm:
+                        more: bool = has_dep_flags or has_dep_sources
+                        json_push_string_array(&out, 3.usize(), "easm", &graph.items[slot].easm, more)
+                    if has_dep_flags:
+                        json_push_string_array(&out, 3.usize(), "linkFlags", &graph.items[slot].link_flags, has_dep_sources)
+                    if has_dep_sources:
+                        json_push_string_array(&out, 3.usize(), "sources", &dependency_sources, false)
+                    json_push_indent(&out, 2.usize())
+                    out.push(125)
+                    out.push(44) if position + 1.usize() < graph.order.count
+                    out.push(10)
+                json_push_indent(&out, 1.usize())
+                out.push(93)
+                out.push(10)
+            out.push(125)
+            out.push(10)
+            return out

@@ -8,6 +8,9 @@
 # expand includes, and feed this driver.
 include "../backend/codegen.elisa"
 include "./emit_fmt_expr.elisa"
+# `project view` / `project deps`: reading project.json, resolving the dependency graph and
+# printing the two reports. See src/driver/project.elisa.
+include "./project.elisa"
 # The SEMANTIC layer is part of the product, not just of the tooling. Without it the driver
 # went parse -> emit and stage1 silently ACCEPTED programs stage0 rejects (`x: mutable u8 = 0;
 # x <- 300` emitted an object under stage1 and exited 1 under stage0). The bootstrap fixpoint
@@ -5128,6 +5131,113 @@ def emit_deps_report(json_form: bool) -> i64 can[Abort.Panic, Memory.Allocate, U
     return emit_tokens_flush(out)
 
 
+
+# ---- `elisac-stage1 project view|deps [target] [--project DIR] [--json]` -----------------
+#
+# stage0's runProjectView / runProjectDeps. The reports themselves live in ProjectSystem;
+# this is the argument handling and the two output streams.
+#
+# The error paths are written out inline rather than funnelled through a shared helper:
+# routing them through one `fail(detail)` makes stage1's own backend decline the whole unit
+# (zero functions emitted, exit 2, no diagnostic) while stage0 compiles it. Same code, minus
+# the trigger. test/parity/project_report_smoke.sh pins the behaviour either way.
+def write_stdout_bytes(buffer: darray[u8]&) -> void can[Abort.Panic, Unsafe.PointerCast, Console]:
+    can Console:
+        return if buffer.count == 0
+        raw: void& = (&buffer[0]).cast[void&] can Unsafe.PointerCast
+        _ = write(1, raw, buffer.count)
+
+
+def run_project(argc: i64, argv: mutable void&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    slots: mutable cstr&& = argv.cast[mutable cstr&&]
+    start: mutable darray[u8] = []
+    requested: mutable darray[u8] = []
+    command: mutable darray[u8] = []
+    want_json: mutable bool = false
+    rejected: mutable bool = false
+    index: mutable i64 = 2
+    while index < argc |index, start, requested, command, want_json, rejected, slots|:
+        piece: mutable darray[u8] = []
+        ProjectSystem::bytes_extend_cstr(&piece, slots[index.usize()].cast[cstr])
+        if ProjectSystem::bytes_equal_view(piece, "--project"):
+            index <- index + 1
+            start <- []
+            ProjectSystem::bytes_extend_cstr(&start, slots[index.usize()].cast[cstr]) if index < argc
+        elif ProjectSystem::bytes_equal_view(piece, "--json"):
+            want_json <- true
+        elif command.count == 0.usize():
+            command <- piece
+        elif piece.count > 0.usize() and piece[0.usize()] != 45:
+            requested <- piece
+        else:
+            # An unrecognised flag must not be ignored: `project view --bogus` silently
+            # reporting the default target would hide a typo in a scripted invocation.
+            rejected <- true
+        index <- index + 1
+    is_view: bool = ProjectSystem::bytes_equal_view(command, "view")
+    is_deps: bool = ProjectSystem::bytes_equal_view(command, "deps")
+    if rejected or not (is_view or is_deps):
+        usage: mutable darray[u8] = []
+        ProjectSystem::bytes_extend_view(&usage, "error: unsupported project subcommand \"")
+        ProjectSystem::bytes_extend(&usage, command)
+        ProjectSystem::bytes_extend_view(&usage, "\"\n")
+        write_stderr(usage)
+        return 1
+    project_file: darray[u8] = ProjectSystem::find_project_file(start)
+    if project_file.count == 0.usize():
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: could not find project.json from ")
+        origin: darray[u8] = ProjectSystem::project_search_origin(start)
+        ProjectSystem::bytes_extend(&message, origin)
+        message.push(10)
+        write_stderr(message)
+        return 1
+    raw: darray[u8] = ProjectSystem::read_file_bytes(project_file)
+    cursor: mutable ProjectSystem::JsonCursor = ProjectSystem::JsonCursor{position: 0.usize(), ok: true, bad_key_start: 0.usize(), bad_key_length: 0.usize()}
+    project: ProjectSystem::ProjectDef = ProjectSystem::parse_project(raw, &cursor)
+    if not cursor.ok:
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        detail: darray[u8] = ProjectSystem::json_error_message(raw, &cursor, project_file)
+        ProjectSystem::bytes_extend(&message, detail)
+        message.push(10)
+        write_stderr(message)
+        return 1
+    # stage0's loadResolvedProject rejects an empty target table at LOAD time, before the
+    # view header is printed — so this must come before the header, not at target selection.
+    if project.targets.count == 0.usize():
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        ProjectSystem::bytes_extend(&message, project_file)
+        ProjectSystem::bytes_extend_view(&message, " does not define any targets")
+        message.push(10)
+        write_stderr(message)
+        return 1
+
+    # stage0 prints the project line and the target table BEFORE resolving, so an
+    # unresolvable target still shows them.
+    if is_view:
+        header: darray[u8] = ProjectSystem::render_view_header(&project, project_file)
+        write_stdout_bytes(header)
+    graph: ProjectSystem::ManifestGraph = ProjectSystem::build_dependency_graph(&project, project_file, requested)
+    resolved: ProjectSystem::ResolvedTarget = ProjectSystem::resolve_project_target(&project, project_file, requested, &graph)
+    if resolved.failed:
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        ProjectSystem::bytes_extend(&message, resolved.error_text)
+        message.push(10)
+        write_stderr(message)
+        return 1
+    if is_view:
+        body: darray[u8] = ProjectSystem::render_view_body(&resolved, &graph)
+        write_stdout_bytes(body)
+        return 0
+    sources: ProjectSystem::StrList = ProjectSystem::collect_all_sources(&resolved, &graph)
+    if want_json:
+        json_payload: darray[u8] = ProjectSystem::render_project_deps_json(&resolved, &graph, &sources)
+        write_stdout_bytes(json_payload)
+        return 0
+    text_payload: darray[u8] = ProjectSystem::render_project_deps_text(&resolved, &graph, &sources)
+    write_stdout_bytes(text_payload)
+    return 0
+
+
 def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     # TWO front doors, ONE compile path. With arguments this is an ordinary CLI; with none
     # it is the original stdin wire protocol, which the host wrapper and the bootstrap both
@@ -5138,6 +5248,7 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
         first_argument: mutable cstr&& = argv.cast[mutable cstr&&]
         run_init(argc, argv) return if first_argument[1].cast[cstr] == "init"
         run_init_lib(argc, argv) return if first_argument[1].cast[cstr] == "init-lib"
+        run_project(argc, argv) return if first_argument[1].cast[cstr] == "project"
     raw: darray[u8] = cli_request(argc, argv) if argc > 1 else read_all()
     # `-emit deps`/`deps-json` answer from the include graph alone — no parse, no analysis.
     # Placed after cli_request so the CLI has recorded the source path it walks from.
