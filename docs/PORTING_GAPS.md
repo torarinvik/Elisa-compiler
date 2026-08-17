@@ -252,6 +252,22 @@ already exists. That is wrong:
   index path wanted an `Ident` base. It made the driver unable to compile itself. Fixed in
   all three place-resolution callers (chain resolver, read, assign) and pinned.
 
+### Diagnostics point at the WRONG LINE for any file with includes (new, open)
+
+Found while converging the two flattenings. stage0 reports the line in the ORIGINAL file;
+stage1 reports the line in the FLATTENED unit:
+
+```
+a.elisa includes b.elisa and c.elisa; the error is on a.elisa line 4
+  stage0: a.elisa:4:12-26: undefined identifier "undefined_here"
+  stage1: a.elisa:6:      undefined identifier "undefined_here"
+```
+
+So every diagnostic in a multi-file program names a line the reader cannot find. The
+filename is already right; what is missing is the flattened-line -> (file, line) map. The
+wrapper computes one for `-emit fmt` (ELISA_STAGE1_OFFSET_MAP), so the machinery half-exists.
+This is separate from the column-span refactor and probably cheaper.
+
 ### Still open
 
 Everything else in Part 1, plus: `-emit semantic`/`facts`/`ir`/`serve`, the four

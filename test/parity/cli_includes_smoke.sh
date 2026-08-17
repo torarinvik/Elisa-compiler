@@ -98,6 +98,23 @@ else
     fail "self_compile: the CLI could not compile src/driver/elisac.elisa unaided"
 fi
 
+# --- 5. The driver's flattening and the wrapper's agree, BYTE FOR BYTE ---------------------
+# Both routes compile the same sources; the only difference is who expanded the includes. The
+# objects must therefore be identical. They were not: the driver's expansion emitted one extra
+# blank line per included file, which shifted every subsequent line and so renamed the
+# internal loop-lambda symbols that carry a line number (3 of 22548 differed over the
+# compiler's own sources). This is the check that has to hold before the wrapper's flattening
+# can be deleted, so it is asserted rather than left as a footnote.
+total=$((total + 1))
+( cd "$ROOT" && RUN "$BIN" -o "$WORK/flat_cli.o" src/driver/elisac.elisa >/dev/null 2>&1 )
+( cd "$ROOT" && RUN bash scripts/elisac_stage1.sh -o "$WORK/flat_wrap.o" src/driver/elisac.elisa >/dev/null 2>&1 )
+if [ -s "$WORK/flat_cli.o" ] && [ -s "$WORK/flat_wrap.o" ] && cmp -s "$WORK/flat_cli.o" "$WORK/flat_wrap.o"; then
+    pass=$((pass + 1))
+else
+    echo "  FAIL flattening_agrees: driver-flattened and wrapper-flattened objects differ"
+    echo "    $(wc -c < "$WORK/flat_cli.o" 2>/dev/null) vs $(wc -c < "$WORK/flat_wrap.o" 2>/dev/null) bytes; differing symbols: $(diff <(nm "$WORK/flat_wrap.o" 2>/dev/null | awk '{print $2,$3}' | sort) <(nm "$WORK/flat_cli.o" 2>/dev/null | awk '{print $2,$3}' | sort) | grep -c '^[<>]')"
+fi
+
 if [ "$pass" -ne "$total" ]; then
     echo "cli_includes_smoke FAILED: passed=$pass total=$total"
     exit 1
