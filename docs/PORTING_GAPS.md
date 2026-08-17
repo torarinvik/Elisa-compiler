@@ -63,7 +63,7 @@ Until these move, "stage1 compiles itself" is true of the compiler but not of th
 | `project view [target]` | **ported** — identical (this session) |
 | `project deps [--json]` | **ported** — identical (this session) |
 | `project abi-lint` | **ported** — matches stage0 per rule, text and `--json` |
-| `project easm-lint` | **partly ported** — no-EASM targets match stage0; targets WITH `.easm` inputs are refused by name (needs the EASM parser) |
+| `project easm-lint` | **partly ported** — void/no-param routines VERIFIED (13 checks, matches stage0); parameterised routines refused (needs register dataflow) |
 | `build` | **ported** — matches stage0; refuses target shapes needing a host linker |
 | `run` | **ported** — needs `ELISA_RUNTIME_OBJ` |
 | `test` | **ported** — needs `ELISA_RUNTIME_OBJ` |
@@ -447,3 +447,33 @@ rather than reporting on them.
 Recommended order if the work continues: a decision on the fact system (it gates two emit
 modes), then column spans, then the EASM verifier, then `serve` last since it depends on the
 others.
+
+
+---
+
+## easm-lint: the void / no-parameter subset is DONE (2026-08-18)
+
+stage1 verifies it — module lines, issues, exit code — and the differential reads
+**130 agreeing / 782 refused / 0 diverged**, from 0/912/0.
+
+**The boundary is parameters and non-void returns**, not instruction complexity. Both force
+`inputs:`/`outputs:`, and declaring either reaches register dataflow
+(`input-register-unused`, `return-register-not-written`). Excluding them, an exhaustive
+5040-configuration sweep reaches exactly thirteen codes, all decidable from declarations plus
+the operand-free instruction list, and all thirteen are implemented.
+
+**Two lessons that generalise to the rest of the verifier:**
+
+1. *A partial checker cannot skip checks.* Three-of-thirteen implemented produced 808
+   divergences, because the contract checks fire on every routine — accepting any routine
+   claims them all. The refusal boundary has to be drawn so no accepted input can reach an
+   unimplemented check, which means landing a closed set atomically.
+2. *Measure the emission details, do not reason about them.* Four were wrong first try:
+   instruction-level issues carry the instruction's line; the exit code is 1 on any error
+   issue; `unknown-control-contract` precedes `missing-body`; both precede the `missing-*`
+   contract checks.
+
+**To widen it** the next closed set is parameterised routines, which needs the register
+liveness model (establish/read/overwrite over the instruction stream). Extend the corpus in
+`easm_lint_differential_smoke.sh` first and let the reachable-code count tell you the size of
+the set before writing anything.
