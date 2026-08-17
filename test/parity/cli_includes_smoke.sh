@@ -115,6 +115,42 @@ else
     echo "    $(wc -c < "$WORK/flat_cli.o" 2>/dev/null) vs $(wc -c < "$WORK/flat_wrap.o" 2>/dev/null) bytes; differing symbols: $(diff <(nm "$WORK/flat_wrap.o" 2>/dev/null | awk '{print $2,$3}' | sort) <(nm "$WORK/flat_cli.o" 2>/dev/null | awk '{print $2,$3}' | sort) | grep -c '^[<>]')"
 fi
 
+# --- 6. Diagnostics name the ORIGINAL file and line ----------------------------------------
+# stage1 used to report the line in the FLATTENED unit against the ROOT path, so in any
+# program with includes the location named a line the reader could not find, and a fault
+# inside an included file was attributed to the root file entirely.
+#
+# Compared against stage0 with the COLUMN SPAN stripped: stage1 has no columns yet (the AST
+# carries only a line), which is tracked separately. Everything left — the path and the line
+# — must match exactly.
+mkdir -p "$WORK/loc"
+printf 'def b1() -> i64:\n    return 1\n' > "$WORK/loc/b.elisa"
+printf 'def c1() -> i64:\n    return 2\n\ndef c2() -> i64:\n    return oops_in_c\n' > "$WORK/loc/c.elisa"
+printf 'include "./b.elisa"\ninclude "./c.elisa"\ndef main() -> i64:\n    return oops_in_root\n' > "$WORK/loc/a.elisa"
+
+# strip_cols: PATH:LINE:COLS: msg -> PATH:LINE: msg   (stage0 only; stage1 emits no columns)
+loc_of() { sed -E 's/^([^:]*):([0-9]+):[0-9]+(-[0-9]+)?: /\1:\2: /' | head -1; }
+
+total=$((total + 1))
+want="$("$ELISACORE_BIN" -emit semantic "$WORK/loc/a.elisa" 2>&1 >/dev/null | grep oops_in_c | loc_of)"
+got="$(RUN "$BIN" -o "$WORK/loc/a.o" "$WORK/loc/a.elisa" 2>&1 | grep oops_in_c | loc_of)"
+if [ -n "$want" ] && [ "$want" = "$got" ]; then
+    ok
+else
+    echo "  FAIL location_in_included_file:"; echo "    stage0: $want"; echo "    stage1: $got"
+fi
+
+# The same run must also place the ROOT file's own fault correctly — the root RESUMES after
+# each include, so its later lines are the case a start-of-file-only map gets wrong.
+total=$((total + 1))
+want="$("$ELISACORE_BIN" -emit semantic "$WORK/loc/a.elisa" 2>&1 >/dev/null | grep oops_in_root | loc_of)"
+got="$(RUN "$BIN" -o "$WORK/loc/a.o" "$WORK/loc/a.elisa" 2>&1 | grep oops_in_root | loc_of)"
+if [ -n "$want" ] && [ "$want" = "$got" ]; then
+    ok
+else
+    echo "  FAIL location_in_root_after_includes:"; echo "    stage0: $want"; echo "    stage1: $got"
+fi
+
 if [ "$pass" -ne "$total" ]; then
     echo "cli_includes_smoke FAILED: passed=$pass total=$total"
     exit 1

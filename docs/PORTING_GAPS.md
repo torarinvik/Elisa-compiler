@@ -252,7 +252,7 @@ already exists. That is wrong:
   index path wanted an `Ident` base. It made the driver unable to compile itself. Fixed in
   all three place-resolution callers (chain resolver, read, assign) and pinned.
 
-### Diagnostics point at the WRONG LINE for any file with includes (new, open)
+### Diagnostics point at the WRONG LINE for any file with includes (CLOSED)
 
 Found while converging the two flattenings. stage0 reports the line in the ORIGINAL file;
 stage1 reports the line in the FLATTENED unit:
@@ -263,10 +263,15 @@ a.elisa includes b.elisa and c.elisa; the error is on a.elisa line 4
   stage1: a.elisa:6:      undefined identifier "undefined_here"
 ```
 
-So every diagnostic in a multi-file program names a line the reader cannot find. The
-filename is already right; what is missing is the flattened-line -> (file, line) map. The
-wrapper computes one for `-emit fmt` (ELISA_STAGE1_OFFSET_MAP), so the machinery half-exists.
-This is separate from the column-span refactor and probably cheaper.
+FIXED. `expand_includes` now emits a `FLAT:ORIG:PATH` entry where each file starts AND where
+it resumes after every include it makes (a file's contents are not one contiguous run, so a
+start-only map is wrong for everything after its first include). The printers take the last
+entry at or below the reported line. A fault inside an included file now names that file and
+its own line — previously it was attributed to the ROOT file at a flattened line.
+
+Only the column span is left, and that is the AST refactor below. The map travels in
+ELISA_STAGE1_LINE_MAP, the same mechanism `-emit fmt` already uses, so no global state; the
+wrapper path (which flattens before the driver runs) is unchanged.
 
 ### Still open
 

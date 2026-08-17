@@ -121,11 +121,64 @@ def push_source_path(buffer: mutable darray[u8]&) -> bool can[Abort.Panic, Memor
 # offending TOKEN KIND ("unexpected token DEDENT in expression"), which needs a token-kind
 # name table this driver does not have. The offending token's TEXT is printed instead,
 # which is the actionable part. Position parity first; wording parity is a separate job.
+# Write `PATH:LINE` for a diagnostic reported at FLAT_LINE of the flattened unit.
+#
+# stage0 names the file the fault is IN and that file's own line number. stage1 reported the
+# flattened line against the ROOT path, so in any program with includes the location named a
+# line the reader could not find — `a.elisa:6` for a fault stage0 puts at `a.elisa:4`, and a
+# fault inside an included file was attributed to the root entirely.
+#
+# ELISA_STAGE1_LINE_MAP holds `FLAT:ORIG:PATH` entries (see push_line_map_entry). Take the
+# LAST entry whose FLAT is <= flat_line: that is the file-run the line falls in, and the
+# original line is `orig + (flat_line - flat)`. With no map — the wrapper flattens before the
+# driver runs and sets none — fall back to the previous behaviour unchanged.
+def push_diagnostic_location(buffer: mutable darray[u8]&, flat_line: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    map_storage: mutable darray[u8] = []
+    if env_value("ELISA_STAGE1_LINE_MAP", &map_storage):
+        best_flat: mutable u32 = 0
+        best_orig: mutable u32 = 0
+        best_start: mutable usize = 0.usize()
+        best_stop: mutable usize = 0.usize()
+        cursor: mutable usize = 0.usize()
+        while cursor < map_storage.count |cursor, best_flat, best_orig, best_start, best_stop, map_storage, flat_line|:
+            entry_stop: mutable usize = cursor
+            while entry_stop < map_storage.count |entry_stop, map_storage|:
+                break if map_storage[entry_stop] == 10
+                entry_stop <- entry_stop + 1.usize()
+            # FLAT ':' ORIG ':' PATH
+            scan: mutable usize = cursor
+            entry_flat: mutable u32 = 0
+            while scan < entry_stop |scan, entry_flat, map_storage|:
+                break if map_storage[scan] == 58
+                entry_flat <- entry_flat * 10 + (map_storage[scan] - 48).u32()
+                scan <- scan + 1.usize()
+            scan <- scan + 1.usize()
+            entry_orig: mutable u32 = 0
+            while scan < entry_stop |scan, entry_orig, map_storage|:
+                break if map_storage[scan] == 58
+                entry_orig <- entry_orig * 10 + (map_storage[scan] - 48).u32()
+                scan <- scan + 1.usize()
+            scan <- scan + 1.usize()
+            if entry_flat <= flat_line and entry_flat >= best_flat:
+                best_flat <- entry_flat
+                best_orig <- entry_orig
+                best_start <- scan
+                best_stop <- entry_stop
+            cursor <- entry_stop + 1.usize()
+        if best_flat > 0:
+            for path_index in best_start..<best_stop |buffer, map_storage|:
+                buffer.push(map_storage[path_index])
+            buffer.push(58)
+            append_decimal(buffer, best_orig + (flat_line - best_flat))
+            return
+    if push_source_path(buffer):
+        buffer.push(58)
+    append_decimal(buffer, flat_line)
+
+
 def report_parse_error(failure: Ast::ParseError) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
     line_buffer: mutable darray[u8] = []
-    if push_source_path(&line_buffer):
-        line_buffer.push(58)                              # ':'
-    append_decimal(line_buffer, failure.line)
+    push_diagnostic_location(&line_buffer, failure.line)
     line_buffer.push(58)                                  # ':'
     append_decimal(line_buffer, failure.column)
     line_buffer.push(58)                                  # ':'
@@ -157,9 +210,7 @@ def report_diagnostic(diagnostic: Semantic::Diagnostic) -> void can[Abort.Panic,
     # columns means threading spans through every diagnostic construction site, which is a
     # separate piece of work. Emitting `PATH:LINE:` is what editors and CI actually need to
     # jump to the fault, and it is strictly closer to stage0 than the previous bare LINE.
-    if push_source_path(&line_buffer):
-        line_buffer.push(58)                              # ':'
-    append_decimal(line_buffer, diagnostic.line)
+    push_diagnostic_location(&line_buffer, diagnostic.line)
     line_buffer.push(58)                                  # ':'
     line_buffer.push(32)                                  # ' '
     message: darray[u8] = Semantic::diagnostic_message(diagnostic)
@@ -4613,7 +4664,41 @@ def path_already_seen(seen: darray[u8]&, path: darray[u8]&) -> bool can[Abort.Pa
 
 # Append `path`'s contents to `out`, splicing any includes it names. `seen` accumulates the
 # already-included paths so a diamond include contributes once and a cycle terminates.
-def expand_includes(path: darray[u8]&, out: mutable darray[u8]&, seen: mutable darray[u8]&, depth: i64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+def setenv_bytes(name: sview, value: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    name_storage: mutable darray[u8] = []
+    for name_index in 0..<sview_len(name) |name_storage|:
+        name_storage.push(sview_at(name, name_index))
+    name_storage.push(0)
+    value_storage: mutable darray[u8] = []
+    for value_index in 0..<value.count |value_storage, value|:
+        value_storage.push(value[value_index])
+    value_storage.push(0)
+    # The casts are their own statements: an inline `expr.cast[T] can Effect` inside an
+    # argument list reads as the end of the call.
+    name_c: cstr = (&name_storage[0.usize()]).cast[cstr] can Unsafe.PointerCast
+    value_c: cstr = (&value_storage[0.usize()]).cast[cstr] can Unsafe.PointerCast
+    _ = setenv(name_c, value_c, 1)
+
+
+# One `FLAT:ORIG:PATH` line-map entry. FLAT is the 1-based line in the FLATTENED unit, ORIG
+# the 1-based line in PATH that it corresponds to. ORIG is needed because a file RESUMES
+# after each include it makes, so its contents are not one contiguous run and
+# `flat - start + 1` alone would be wrong for everything after the first include.
+def push_line_map_entry(line_map: mutable darray[u8]&, flat_line: u32, source_line: u32, path: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+    append_decimal(line_map, flat_line)
+    line_map.push(58)
+    append_decimal(line_map, source_line)
+    line_map.push(58)
+    for entry_index in 0..<path.count |line_map, path|:
+        line_map.push(path[entry_index])
+    line_map.push(10)
+
+
+# `line_map` accumulates `FLAT:ORIG:PATH` entries (see push_line_map_entry) — one where a
+# file starts, and one each time it RESUMES after an include. A diagnostic then names the
+# original file and line by finding the last entry at or below the reported line. Per
+# file-run, not per line, so the map over the compiler's 509-file closure is tens of KB.
+def expand_includes(path: darray[u8]&, out: mutable darray[u8]&, seen: mutable darray[u8]&, depth: i64, line_map: mutable darray[u8]&, emitted_lines: mutable u32&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     false return if depth > 64
     # ABSOLUTE, cleaned paths — stage0 prints what filepath.Abs produced, and more
     # importantly `path_already_seen` compares raw bytes: the same file reached as
@@ -4635,6 +4720,7 @@ def expand_includes(path: darray[u8]&, out: mutable darray[u8]&, seen: mutable d
     path_c.push(0)
     contents: darray[u8] = read_file((&path_c[0]).cast[cstr] can Unsafe.PointerCast)
     false return if contents.count == 0
+    push_line_map_entry(line_map, emitted_lines + 1, 1, absolute)
     directory: darray[u8] = path_directory(absolute)
     # Lines are SPANS into `contents`, not a copied-out buffer.
     #
@@ -4654,19 +4740,26 @@ def expand_includes(path: darray[u8]&, out: mutable darray[u8]&, seen: mutable d
     trailing_partial: bool = contents.count > 0.usize() and contents[contents.count - 1.usize()] != 10
     index: mutable usize = 0.usize()
     line_start: mutable usize = 0.usize()
-    while index < contents.count + (1.usize() if trailing_partial else 0.usize()) |index, line_start, contents, out, seen, directory, depth, trailing_partial|:
+    source_line: mutable u32 = 0
+    while index < contents.count + (1.usize() if trailing_partial else 0.usize()) |index, line_start, source_line, emitted_lines, line_map, absolute, contents, out, seen, directory, depth, trailing_partial|:
         at_end: bool = index == contents.count
         byte: u8 = 10 if at_end else contents[index]
         if byte == 10:
             included: darray[u8] = include_directive_path_span(contents, line_start, index)
             if included.count > 0:
                 resolved: darray[u8] = resolve_include_path(directory, included)
-                _ = expand_includes(resolved, out, seen, depth + 1)
+                _ = expand_includes(resolved, out, seen, depth + 1, line_map, emitted_lines)
+                # This file RESUMES after the include directive: the next flattened line is
+                # this file's line `source_line + 2` (source_line is 0-based and still points
+                # at the directive).
+                push_line_map_entry(line_map, emitted_lines + 1, source_line + 2, absolute)
             else:
                 for line_index in line_start..<index |out, contents|:
                     out.push(contents[line_index])
                 out.push(10)
+                emitted_lines <- emitted_lines + 1
             line_start <- index + 1.usize()
+            source_line <- source_line + 1
         index <- index + 1.usize()
     return true
 
@@ -5110,7 +5203,13 @@ def cli_request(argc: i64, argv: mutable void&) -> darray[u8] can[Memory.Allocat
     push_cstr(&source_path_bytes, source_path)
     included_seen: mutable darray[u8] = []
     expanded_source: mutable darray[u8] = []
-    contents: mutable darray[u8] = expanded_source if expand_includes(source_path_bytes, &expanded_source, &included_seen, 0) else read_file(source_path)
+    include_line_map: mutable darray[u8] = []
+    include_emitted_lines: mutable u32 = 0
+    contents: mutable darray[u8] = expanded_source if expand_includes(source_path_bytes, &expanded_source, &included_seen, 0, &include_line_map, &include_emitted_lines) else read_file(source_path)
+    # Publish the map so the diagnostic printers can name the ORIGINAL file and line. Via the
+    # environment, like ELISA_STAGE1_OFFSET_MAP: no global darray, and the wrapper path (which
+    # flattens before the driver runs, and sets no map) keeps its existing behaviour.
+    setenv_bytes("ELISA_STAGE1_LINE_MAP", include_line_map) if include_line_map.count > 0.usize()
     request return if contents.count == 0
     for path_index in 0..<output_path.count |request, output_path|:
         request.push(output_path[path_index])
@@ -5145,7 +5244,9 @@ def emit_deps_report(json_form: bool) -> i64 can[Abort.Panic, Memory.Allocate, U
     1 return if not push_source_path(&source_path_bytes)
     seen: mutable darray[u8] = []
     scratch: mutable darray[u8] = []
-    1 return if not expand_includes(source_path_bytes, &scratch, &seen, 0)
+    deps_line_map: mutable darray[u8] = []
+    deps_emitted_lines: mutable u32 = 0
+    1 return if not expand_includes(source_path_bytes, &scratch, &seen, 0, &deps_line_map, &deps_emitted_lines)
     out: mutable darray[u8] = []
     if not json_form:
         for byte_index in 0..<seen.count |out, seen|:
@@ -5309,22 +5410,6 @@ def run_project(argc: i64, argv: mutable void&) -> i64 can[Abort.Panic, Memory.A
 # of these four the driver still cannot do alone — a project whose target emits an object
 # and asks for a linked binary is REFUSED by name rather than silently left unlinked.
 
-def setenv_bytes(name: sview, value: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-    name_storage: mutable darray[u8] = []
-    for name_index in 0..<sview_len(name) |name_storage|:
-        name_storage.push(sview_at(name, name_index))
-    name_storage.push(0)
-    value_storage: mutable darray[u8] = []
-    for value_index in 0..<value.count |value_storage, value|:
-        value_storage.push(value[value_index])
-    value_storage.push(0)
-    # The casts are their own statements: an inline `expr.cast[T] can Effect` inside an
-    # argument list reads as the end of the call.
-    name_c: cstr = (&name_storage[0.usize()]).cast[cstr] can Unsafe.PointerCast
-    value_c: cstr = (&value_storage[0.usize()]).cast[cstr] can Unsafe.PointerCast
-    _ = setenv(name_c, value_c, 1)
-
-
 # Whether `build` on this target would need a host linker (stage0's
 # shouldLinkNativeProjectBuild: an object emit whose output is not itself a `.o`).
 def project_build_needs_linker(emit: darray[u8]&, output: darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate]:
@@ -5453,7 +5538,10 @@ def project_compile_request(argc: i64, argv: mutable void&, status: mutable i64&
     output_path: mutable darray[u8] = ProjectSystem::bytes_copy(resolved.output_path) if wants_output else ProjectSystem::bytes_copy(resolved.entry_path)
     included_seen: mutable darray[u8] = []
     expanded_source: mutable darray[u8] = []
-    _ = expand_includes(resolved.entry_path, &expanded_source, &included_seen, 0)
+    project_line_map: mutable darray[u8] = []
+    project_emitted_lines: mutable u32 = 0
+    _ = expand_includes(resolved.entry_path, &expanded_source, &included_seen, 0, &project_line_map, &project_emitted_lines)
+    setenv_bytes("ELISA_STAGE1_LINE_MAP", project_line_map) if project_line_map.count > 0.usize()
     if expanded_source.count == 0.usize():
         message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: could not read entry ")
         ProjectSystem::bytes_extend(&message, resolved.entry_path)
