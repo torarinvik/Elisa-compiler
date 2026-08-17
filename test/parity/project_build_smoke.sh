@@ -103,6 +103,38 @@ else
     echo "  FAIL build_artifact: missing or entry-less module ($(wc -c < "$a0" 2>/dev/null) vs $(wc -c < "$a1" 2>/dev/null) bytes)"
 fi
 
+# Resolution must follow the PROCESS's working directory, not an inherited $PWD.
+#
+# `working_directory` prefers $PWD so the symlinked spelling survives (stage0 prints
+# /tmp, not /private/tmp). It used to take $PWD whenever it was absolute and existed —
+# but a process whose cwd differs from the $PWD it inherited then resolved the project from
+# the PARENT's directory, and any tool that spawns the compiler with a working directory
+# (a build script, subprocess(cwd=...)) got "could not find project.json" for a project
+# sitting right there. Go's os.Getwd takes $PWD only when it names the same directory.
+#
+# Both halves are checked: the stale-$PWD case, and that the symlinked spelling still wins.
+total=$((total + 1))
+scaffold cwd_honoured
+cwd0="$( cd "$WORK/cwd_honoured/s0/demo" && env PWD=/ RUN "$ELISACORE_BIN" project view 2>&1 | head -1 | sed "s|/s0/demo|/PROJ|" )"
+cwd1="$( cd "$WORK/cwd_honoured/s1/demo" && env PWD=/ RUN "$BIN" project view 2>&1 | head -1 | sed "s|/s1/demo|/PROJ|" )"
+if [ "$cwd0" = "$cwd1" ]; then
+    pass=$((pass + 1))
+else
+    echo "  FAIL cwd_honoured (stale PWD):"; echo "    stage0: $cwd0"; echo "    stage1: $cwd1"
+fi
+
+total=$((total + 1))
+rm -rf /tmp/elisa_pwd_probe && mkdir -p /tmp/elisa_pwd_probe
+( cd /tmp/elisa_pwd_probe && "$ELISACORE_BIN" init demo >/dev/null 2>&1 )
+sym0="$( cd /tmp/elisa_pwd_probe/demo && RUN "$ELISACORE_BIN" project view 2>&1 | head -1 )"
+sym1="$( cd /tmp/elisa_pwd_probe/demo && RUN "$BIN" project view 2>&1 | head -1 )"
+rm -rf /tmp/elisa_pwd_probe
+if [ "$sym0" = "$sym1" ] && printf '%s' "$sym1" | grep -q "^Project: /tmp/"; then
+    pass=$((pass + 1))
+else
+    echo "  FAIL cwd_symlink_spelling:"; echo "    stage0: $sym0"; echo "    stage1: $sym1"
+fi
+
 # The runtime-object requirement names itself.
 total=$((total + 1))
 scaffold no_runtime
