@@ -123,6 +123,8 @@ bounds_check=0
 opt_level=0
 test_filter=""
 emit_mode="obj"
+target_triple=""
+link_flags=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o)
@@ -171,6 +173,18 @@ while [[ $# -gt 0 ]]; do
       noalias=1; shift ;;
     -fbounds-check)
       bounds_check=1; shift ;;
+    # Cross-compilation and linker passthrough. The DRIVER has implemented both for a
+    # while (requested_target_triple, and ELISA_STAGE1_LINK read in the c-archive/exe
+    # paths) — only this wrapper rejected them, so `-target-triple` and `-link/-L/-l`
+    # looked like compiler gaps when they were three missing cases in an argument loop.
+    -target-triple)
+      target_triple="${2:-}"; shift 2 ;;
+    -link)
+      link_flags+=("${2:-}"); shift 2 ;;
+    -L)
+      link_flags+=("-L${2:-}"); shift 2 ;;
+    -l)
+      link_flags+=("-l${2:-}"); shift 2 ;;
     -O0|-permissive) shift ;;
     # -O1/-O2/-O3 now run LLVM's `default<O{n}>` pass pipeline in the driver
     # (ELISA_STAGE1_OPT). The pipeline was disabled while `default<O2>` trapped on
@@ -246,6 +260,8 @@ driver_env=()
 # not just the report modes below — otherwise a wrapper-compiled program reports a bare
 # line number while the same file compiled through the CLI names itself.
 driver_env+=("ELISA_STAGE1_SRC=$src")
+[[ -n "$target_triple" ]] && driver_env+=("ELISA_STAGE1_TRIPLE=$target_triple")
+[[ ${#link_flags[@]} -gt 0 ]] && driver_env+=("ELISA_STAGE1_LINK=${link_flags[*]}")
 [[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
 [[ "$emit_mode" == "bc" ]] && driver_env+=("ELISA_STAGE1_EMIT=bc")
