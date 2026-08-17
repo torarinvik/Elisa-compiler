@@ -50,9 +50,23 @@
 #   empty-label-precondition      label contract <name> must require at least one machine-state precondition
 #   unexpected-top-level          expected module, target, export def, fragment, protocol, or template def
 #
-# Three inputs still need harvesting before those can be implemented: the per-instruction
-# CAPABILITY map (pause -> x86_64.sse.pause), the valid REGISTER set, and the legal control
-# atoms and entry facts. Each is obtainable the same way — vary one field and read stage0.
+# The three tables those checks need, from stage0 (easm.go / easm_oprules.go):
+#
+#   control atoms   allowedControlToken: returns | noreturn | tail_jumps | may_fault
+#   capabilities    easm_oprules.go, one entry per mnemonic —
+#                     pause -> x86_64.sse.pause      lfence -> x86_64.sse.lfence
+#                     trap  -> debug.trap            cpuid  -> x86_64.cpuid
+#                     rdtsc -> x86_64.rdtsc          yield  -> aarch64.yield
+#                     mrs/isb -> aarch64.cntvct      fldcw/fnstcw/stmxcsr -> x86_64.fpu_control
+#                   cpuid and rdtsc also carry ImplicitReads/ImplicitClobbers, which is why
+#                   the corpus above excludes them: they pull in the clobber checks.
+#   registers       isRegisterName: rax..r15, eax..ebp, the 8/16-bit forms, x0..x30, w0..w30,
+#                   sp, plus XMM and AArch64 SIMD names.
+#   require tokens  allowedRequireToken, a ~40-entry closed list.
+#
+# So the port has no discovery left: the corpus, the 22 messages, and the tables are all
+# here. What remains is writing the parser and the checks, each with a fixture that FAILS
+# first — a passing fixture cannot tell an implemented check from an unimplemented one.
 RUN() { if command -v timeout >/dev/null 2>&1; then timeout 20 "$@"; else "$@"; fi; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
