@@ -3,11 +3,16 @@
 #
 # stage1 reproduces the report for a target with NO EASM inputs — which is every project that
 # does not use EASM, and is the whole of stage0's output for them. A target that DOES carry
-# `.easm` inputs is refused by name: the per-module section needs stage0's EASM parser
-# (~13k lines, not ported), and printing the file list with an empty module section would read
-# as "no exports and no issues" — a false clean.
+# `.easm` inputs is refused by name.
 #
-# Both halves are asserted. The refusal is not a skip: if the parser is ever ported, the last
+# The refusal is not about the grammar. A routine-subset PARSER was written, matched stage0
+# exactly on a simple module, and was then removed: stage0's easm-lint VERIFIES. A two-export
+# fixture produced eight `Issues:` entries from an entry-fact whitelist, label and control
+# contract validation, parameter/input binding, and REGISTER DATAFLOW over the instruction
+# stream. A parser without those checks prints a module with no issues — "this EASM is fine"
+# about code stage0 rejects with eight errors.
+#
+# Both halves are asserted. The refusal is not a skip: if the verifier is ever ported, the last
 # check fails and says so, rather than the refusal quietly outliving the gap.
 RUN() { if command -v timeout >/dev/null 2>&1; then timeout 120 "$@"; else "$@"; fi; }
 set -u
@@ -82,7 +87,7 @@ target any
 EASM
 out="$( cd "$WORK/carries" && RUN "$BIN" project easm-lint 2>&1 )"
 rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "cannot parse them"; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "cannot verify them"; then
     pass=$((pass + 1))
 else
     echo "  FAIL carries_easm_refused: rc=$rc out='$(printf '%s' "$out" | head -1)'"

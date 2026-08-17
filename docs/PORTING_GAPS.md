@@ -400,9 +400,32 @@ of them is a design decision rather than a port.
   handler dispatches to `semantic`, `facts` and `ir` among other modes, so full parity is
   gated on the two items above. It is also a network service that compiles submitted source;
   worth a deliberate decision before it exists in a second implementation.
-- **The EASM parser** (`easm.ParseFile`, ~13.7k lines) — the remaining half of `easm-lint`,
-  and the only one of the four that is purely a matter of effort.
+- **The EASM VERIFIER** — the remaining half of `easm-lint`. Not a parser: see below.
 
-Recommended order if the work continues: the EASM parser (unblocked, verifiable against
-stage0 file by file), then a decision on the fact system, then column spans, then `serve`
-last since it depends on the others.
+### easm-lint is a VERIFIER, not a pretty-printer (measured, 2026-08-17)
+
+A routine-subset parser was written, matched stage0's `Module …` / `  export …` lines exactly
+on a simple fixture, and was then **removed**. Adding a second export with facts, labels and a
+`jmp` made stage0 emit eight `Issues:` entries the parser knew nothing about:
+
+```
+unsupported-entry-fact            an entry-fact whitelist
+label-contract-without-label      label contracts must match a body label
+empty-label-precondition          and must carry a machine-state precondition
+unknown-control-contract          control contracts are a closed set
+noreturn-jump-without-tail-contract
+missing-input-binding             parameters must appear in `inputs:`
+register-read-uninitialized       REGISTER DATAFLOW over the instruction stream
+```
+
+So the work is not "port the grammar" — the grammar is the easy part and took an afternoon.
+It is "port the verifier": a fact whitelist, contract validation, and a register
+establish/read dataflow over the decoded instruction stream. Estimate accordingly.
+
+A parser without those checks prints a module with no issues, which reads as "this EASM is
+fine" for code stage0 rejects with eight errors. That is why `easm-lint` refuses EASM inputs
+rather than reporting on them.
+
+Recommended order if the work continues: a decision on the fact system (it gates two emit
+modes), then column spans, then the EASM verifier, then `serve` last since it depends on the
+others.
