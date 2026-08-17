@@ -1245,6 +1245,17 @@ run_case darray_clear_assign 'def main() -> i64:\n    xs: mutable darray[i64] = 
 # Resize-assign into a STRUCT FIELD — the shape the project system actually uses, and the one
 # that reaches darray_address_of_expr through a field chain rather than a bare local.
 run_case darray_resize_assign_field 'struct Bag:\n    items: mutable darray[i64]\n\ndef main() -> i64:\n    b: mutable Bag = Bag{items: [1, 2, 3]}\n    b.items <- b.items.resize(6.usize())\n    return b.items.count.i64() + b.items[5] + 36\n' 42
+# INDEXING DIRECTLY INTO A CAST, with no local in between. `.cast[T]` parses as
+# Index(Field(x, "cast"), T), so `(p.cast[T&])[i]` is an Index whose BASE is an Index — and
+# every index path resolved a base that was an Ident or an array literal, so the whole
+# enclosing function declined. stage0 compiles it.
+#
+# Not hypothetical: `subcommand_compiles_project((argv.cast[mutable cstr&&])[1.usize()].cast[cstr])`
+# in the driver made stage1 unable to compile its own source, and the only symptom was the
+# whole-unit decline. The read and the write resolve through the same lvalue chain, so the
+# pair below pins both directions.
+run_case index_into_cast_read 'def main() -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:\n    xs: mutable darray[i64] = [40, 2]\n    base: void& = (&xs[0.usize()]).cast[void&] can Unsafe.PointerCast\n    return (base.cast[mutable i64&])[0.usize()] + (base.cast[mutable i64&])[1.usize()]\n' 42
+run_case index_into_cast_write 'def main() -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:\n    xs: mutable darray[i64] = [1, 2]\n    base: void& = (&xs[0.usize()]).cast[void&] can Unsafe.PointerCast\n    (base.cast[mutable i64&])[0.usize()] <- 40\n    return xs[0.usize()] + xs[1.usize()]\n' 42
 # OVERLOAD RESOLUTION onto a REFERENCE parameter. `pick(n)` with an i64 local must select
 # `pick(value: i64&)`, not the same-arity `pick(label: cstr)`.
 #
