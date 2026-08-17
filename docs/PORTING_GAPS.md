@@ -62,7 +62,7 @@ Until these move, "stage1 compiles itself" is true of the compiler but not of th
 | `init-lib <name>` | **ported** — identical output and rc |
 | `project view [target]` | **ported** — identical (this session) |
 | `project deps [--json]` | **ported** — identical (this session) |
-| `project abi-lint` | **ported** — matches stage0 per rule; `--json` form not yet |
+| `project abi-lint` | **ported** — matches stage0 per rule, text and `--json` |
 | `project easm-lint` | **not ported** — same |
 | `build` | **ported** — matches stage0; refuses target shapes needing a host linker |
 | `run` | **ported** — needs `ELISA_RUNTIME_OBJ` |
@@ -303,8 +303,8 @@ gate for any change to diagnostic strings.
 ## `project abi-lint` — PORTED (2026-08-17)
 
 Implemented in `src/driver/abi_lint.elisa`, all twelve matchers, verified one fixture per
-rule against stage0 (`project_abi_lint_smoke.sh`, 16 checks). The `--json` output form is
-the remaining piece. What follows is the scoping note that drove the work.
+rule against stage0 in BOTH the text and `--json` forms (`project_abi_lint_smoke.sh`, 31
+checks). What follows is the scoping note that drove the work.
 
 Not started, but no longer an estimate. What it needs, measured:
 

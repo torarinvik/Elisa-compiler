@@ -50,20 +50,26 @@ $triple_line
 JSON
 }
 
-# check <name> [extra-args...] — stage0 and stage1 must agree on stdout AND exit code.
-# Paths are folded because the two runs share a directory, so only the text can differ.
+# check <name> [extra-args...] — stage0 and stage1 must agree on stdout AND exit code, in
+# BOTH the text and the --json form. The JSON is not a rendering detail of the same data:
+# `omitempty` drops fields, `line` disappears on issues that carry none, and a clean project
+# prints `"issues": null` rather than an empty array — all of which are separately wrong-able.
 check() {
     local name="$1"; shift
-    total=$((total + 1))
-    local o0 o1 r0 r1
-    o0="$( cd "$WORK/$name" && RUN "$ELISACORE_BIN" project abi-lint "$@" 2>&1; echo "rc=$?" )"
-    o1="$( cd "$WORK/$name" && RUN "$BIN" project abi-lint "$@" 2>&1; echo "rc=$?" )"
-    if [ "$o0" = "$o1" ]; then
-        pass=$((pass + 1))
-    else
-        echo "  FAIL $name"
-        diff <(printf '%s\n' "$o0") <(printf '%s\n' "$o1") | sed 's/^/      /' | head -8
-    fi
+    local form
+    for form in text json; do
+        total=$((total + 1))
+        local o0 o1 extra=""
+        [ "$form" = "json" ] && extra="--json"
+        o0="$( cd "$WORK/$name" && RUN "$ELISACORE_BIN" project abi-lint "$@" $extra 2>&1; echo "rc=$?" )"
+        o1="$( cd "$WORK/$name" && RUN "$BIN" project abi-lint "$@" $extra 2>&1; echo "rc=$?" )"
+        if [ "$o0" = "$o1" ]; then
+            pass=$((pass + 1))
+        else
+            echo "  FAIL $name ($form)"
+            diff <(printf '%s\n' "$o0") <(printf '%s\n' "$o1") | sed 's/^/      /' | head -8
+        fi
+    done
 }
 
 # --- no native sources at all: the clean path, and the one that must NOT emit
