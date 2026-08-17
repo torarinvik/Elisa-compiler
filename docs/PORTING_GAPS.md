@@ -296,3 +296,61 @@ gate for any change to diagnostic strings.
   removed.
 - stage0 prints its warnings on **stdout**, not stderr, and warning output on large inputs
   was not reproducible run to run during this session. Worth a dedicated look.
+
+
+---
+
+## `project abi-lint` — scoped, with an oracle (2026-08-17)
+
+Not started, but no longer an estimate. What it needs, measured:
+
+**The report** is the easy half — the same resolved-target fields `project view` already
+prints, plus `Scanned native files`, `ABI contracts`, `Link flags`, and the issue list, in
+text and `--json` form (`formatNativeABILintReport` in stage0's `native_abi_lint.go`).
+
+**The rules are twelve REGEXES**, and Elisa has no regex library, so each becomes a
+hand-rolled matcher. This is the actual work, and the reason a partial port is dangerous: a
+subtly-wrong matcher makes the tool print `ABI lint: clean` for a project it did not check.
+
+```
+\b(__asm__|asm)\b                                   asm block detection
+(?i)(RunMainEntry|guest_exec|GuestExec|entry_trampoline|call_main_entry|jump_main_entry)
+%[0-9]                                              positional operands
+%%r(di|si|dx|cx|8|9)\b                              ABI argument registers
+\b(pushq|popq)\b|\b(andq|subq|addq|lea)\b[^\n]*%%rsp\b   stack mutation
+\bcall\s+\*        \bjmp\s+\*                        indirect call / jump
+(?i)(noreturn|__builtin_unreachable|\[\[noreturn\]\])
+"memory"            %%r(9|10|11)\b                   clobber / scratch parking
+^\s*#\s*include\s+"([^"]+)"                        recursive scan of quoted includes
+ELISA_ABI_CONTRACT\s+([^\n*/]+)                     contract extraction
+```
+
+Also needed: recursive scanning through quoted `#include`s with a seen-set, `ELISA_ABI_LINT_ALLOW(code)`
+suppression, dedupe+sort of contracts and scanned paths, and per-issue LINE attribution (the
+line the asm block starts on).
+
+**A verified oracle fixture.** A project whose target carries `"foreign": ["native/guest.c"]`
+with this source trips four rules plus the info rule:
+
+```c
+/* ELISA_ABI_CONTRACT guest_entry */
+void RunMainEntry(void *ctx) {
+    __asm__ volatile (
+        "movq %0, %%rdi\n"
+        "pushq %%rbp\n"
+        "call *%1\n"
+        : : "r"(ctx), "r"(ctx)
+    );
+}
+```
+
+stage0 reports, in this order: `inline-asm-positional-abi-operands` (warning),
+`inline-asm-stack-without-memory-clobber` (warning), `guest-entry-call-mangles-stack`
+(error), `guest-entry-no-scratch-register-parking` (warning), and
+`target-triple-defaulted` (info) — all at `guest.c:3` except the last, which is at the
+project file. Note the manifest key is `foreign`, not `native`.
+
+Build one fixture per rule and diff against stage0 as each matcher lands; the remaining rules
+(`native-source-read-failed`, `native-include-read-failed`,
+`missing-guest-entry-abi-contract`, `guest-entry-target-not-x86_64`,
+`guest-entry-jump-not-noreturn`) need their own.
