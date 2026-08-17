@@ -73,5 +73,26 @@ decline_case library_decline 'def total() -> i64:\n    table: mutable deque[i64]
 # An ordinary program declines nothing and is unaffected.
 decline_case clean_program 'def add(a: i64, b: i64) -> i64:\n    return a + b\n\ndef main() -> i64:\n    return add(40, 2)\n' 0
 
+# A unit in which EVERY function declines: nothing is emitted at all, and the driver exits 2
+# on the emitted_count guard rather than on the dangling-reference check above.
+#
+# That path used to be MUTE — exit 2, empty stdout, empty stderr, which is indistinguishable
+# from a crash or a wrapper bug. The names were in `!elisa.declined` the whole time and
+# nothing read them. Both halves are asserted: the rc, and that the message NAMES the
+# function, since an unattributed "something failed" is what made this expensive to debug.
+total=$((total + 1))
+printf 'def only() -> i64:\n%b    return 3\n' "$DECLINING_BODY" > "$WORK/mute.elisa"
+mute_out="$(RUN "$STAGE1" -o "$WORK/mute.o" "$WORK/mute.elisa" 2>&1 >/dev/null)"
+mute_rc=$?
+if [ "$mute_rc" -ne 2 ]; then
+    echo "  FAIL whole_unit_decline_rc: rc=$mute_rc want=2"
+elif ! printf '%s' "$mute_out" | grep -q 'error: backend emitted no functions'; then
+    echo "  FAIL whole_unit_decline_diagnostic: exited 2 in SILENCE (stderr: '$mute_out')"
+elif ! printf '%s' "$mute_out" | grep -q 'declined 1: only'; then
+    echo "  FAIL whole_unit_decline_names: diagnostic does not name the declining function (stderr: '$mute_out')"
+else
+    pass=$((pass + 1))
+fi
+
 if [ "$pass" -ne "$total" ]; then echo "dangling_decline_smoke FAILED: passed=$pass total=$total"; exit 1; fi
 echo "dangling_decline_smoke OK: $pass/$total (a called-but-declined body fails the compile)"

@@ -1231,6 +1231,47 @@ run_case darray_truncate_noop 'def main() -> i64:\n    xs: mutable darray[i64] =
 # shrinking. Grow (count 3->5, new elements read as 0) and shrink (5->2, prefix kept).
 run_case darray_resize_grow 'def main() -> i64:\n    xs: mutable darray[i64] = [7, 8, 9]\n    xs.resize(5.usize())\n    return xs.count.i64() + xs[3] + xs[4] + 37\n' 42
 run_case darray_resize_shrink 'def main() -> i64:\n    xs: mutable darray[i64] = [40, 8, 9, 10, 11]\n    xs.resize(2.usize())\n    return xs[0] + xs[1] + xs.count.i64() - 8\n' 42
+# The REASSIGNMENT spelling of the same three. `push`/`truncate` had in-place assign paths;
+# `resize` and `clear` did not, so `xs <- xs.resize(n)` fell to emit_expression, which models
+# neither, and DECLINED — taking every other function in the unit down with it (see the
+# emitted_count guard in elisac.elisa) with no diagnostic at all. stage0 compiles the form,
+# and `lmut` container code is written this way throughout, so the gap was reachable: one
+# such line in src/driver/project.elisa silently killed the whole driver.
+#
+# Each case pairs with its bare-statement twin above and must agree with it.
+run_case darray_resize_assign_grow 'def main() -> i64:\n    xs: mutable darray[i64] = [7, 8, 9]\n    xs <- xs.resize(5.usize())\n    return xs.count.i64() + xs[3] + xs[4] + 37\n' 42
+run_case darray_resize_assign_shrink 'def main() -> i64:\n    xs: mutable darray[i64] = [40, 8, 9, 10, 11]\n    xs <- xs.resize(2.usize())\n    return xs[0] + xs[1] + xs.count.i64() - 8\n' 42
+run_case darray_clear_assign 'def main() -> i64:\n    xs: mutable darray[i64] = [1, 2, 3]\n    xs <- xs.clear()\n    return xs.count.i64() + 42\n' 42
+# Resize-assign into a STRUCT FIELD — the shape the project system actually uses, and the one
+# that reaches darray_address_of_expr through a field chain rather than a bare local.
+run_case darray_resize_assign_field 'struct Bag:\n    items: mutable darray[i64]\n\ndef main() -> i64:\n    b: mutable Bag = Bag{items: [1, 2, 3]}\n    b.items <- b.items.resize(6.usize())\n    return b.items.count.i64() + b.items[5] + 36\n' 42
+# OVERLOAD RESOLUTION onto a REFERENCE parameter. `pick(n)` with an i64 local must select
+# `pick(value: i64&)`, not the same-arity `pick(label: cstr)`.
+#
+# overload_index_for_args compared the DECLARED `i64&` against the ACTUAL `i64` and rejected
+# it, even though the call emitter borrows the place implicitly — so the candidate set came
+# back empty and resolution fell back to "first overload with this arity". That was a SILENT
+# WRONG ANSWER, not a decline: stage0 answers 42 here and stage1 answered 7.
+#
+# It also had a second, louder face. elisacore_std's test.elisa declares `def fail(message:
+# cstr)` and the prelude pulls it into every program, so any user function named `fail` taking
+# one reference argument lost resolution to it and then DECLINED emitting its argument at
+# `cstr` — killing every function in the unit with no diagnostic. That is what made routing
+# errors through a shared `fail(detail)` helper "uncompilable" in the project system.
+#
+# Both declaration orders, because the bug was order-sensitive by construction.
+run_case overload_ref_param_second 'def pick(label: cstr) -> i64:\n    return 7\n\ndef pick(value: i64&) -> i64:\n    return value + 37\n\ndef main() -> i64:\n    n: mutable i64 = 5\n    return pick(n)\n' 42
+run_case overload_ref_param_first 'def pick(value: i64&) -> i64:\n    return value + 37\n\ndef pick(label: cstr) -> i64:\n    return 7\n\ndef main() -> i64:\n    n: mutable i64 = 5\n    return pick(n)\n' 42
+# The container spelling, which is the one the project system actually used.
+#
+# Do not name the helper `size_of`: it lexes as the reserved `sizeof` and stage0 rejects the
+# fixture outright, which in this harness is indistinguishable from a stage1 decline. That
+# cost a wrong diagnosis — a bad fixture read as a second backend gap in container types.
+# When a case here fails, compile it under stage0 first.
+run_case overload_ref_param_darray 'def byte_count(label: cstr) -> i64:\n    return 7\n\ndef byte_count(items: darray[u8]&) -> i64:\n    return items.count.i64() + 39\n\ndef main() -> i64:\n    xs: mutable darray[u8] = [1, 2, 3]\n    return byte_count(xs)\n' 42
+# An explicit `&` argument must still resolve to the same overload — this spelling always
+# worked, and is the control proving the fix did not simply move the failure.
+run_case overload_ref_param_explicit 'def pick(label: cstr) -> i64:\n    return 7\n\ndef pick(value: i64&) -> i64:\n    return value + 37\n\ndef main() -> i64:\n    n: mutable i64 = 5\n    return pick(&n)\n' 42
 # OVERLOADED generic UFCS: two `pick[T]` templates distinguished by receiver type. The right
 # BODY must be selected by the receiver (not by declaration order), and two instantiations of
 # the same name+args must not alias in the cache. Slot-aware generic overload resolution.
