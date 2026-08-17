@@ -63,7 +63,7 @@ Until these move, "stage1 compiles itself" is true of the compiler but not of th
 | `project view [target]` | **ported** — identical (this session) |
 | `project deps [--json]` | **ported** — identical (this session) |
 | `project abi-lint` | **ported** — matches stage0 per rule, text and `--json` |
-| `project easm-lint` | **not ported** — same |
+| `project easm-lint` | **partly ported** — no-EASM targets match stage0; targets WITH `.easm` inputs are refused by name (needs the EASM parser) |
 | `build` | **ported** — matches stage0; refuses target shapes needing a host linker |
 | `run` | **ported** — needs `ELISA_RUNTIME_OBJ` |
 | `test` | **ported** — needs `ELISA_RUNTIME_OBJ` |
@@ -232,8 +232,10 @@ already exists. That is wrong:
   in C/assembly inputs (~350 lines). The report shell is easy; the rules are the work. A
   partial port is worse than none here: it would print "ABI lint: clean" for a project it had
   not actually checked.
-- **`project easm-lint`** needs the whole EASM parser (`easm.ParseFile`, ~2000 lines) to say
-  anything at all beyond the empty-project case.
+- **`project easm-lint`** — the no-EASM case is now ported and byte-identical (that is every
+  project not using EASM). A target carrying `.easm` inputs is refused by name: the module
+  section needs `easm.ParseFile`, and the package is ~13.7k lines. Printing the file list with
+  an empty module section would read as "no exports, no issues" — a false clean.
 
 ### Closed since (same day, second pass)
 
