@@ -24,7 +24,7 @@ clean $'packed enum Expr:\n    Int(value: int)\n    Add(left: Expr, right: Expr)
 
 wrong_store="$(printf '%s' $'packed enum Expr:\n    Int(value: int)\n\npacked enum Token:\n    Ident\n\ndef bad(node: Expr, store: Token.Store[Local]) -> int:\n    move node in store as Expr.Int(value)\n    return value\n' | "$RPT")"
 echo "$wrong_store" | grep -q '^D 1$' || fail "wrong packed Store owner was not rejected exactly once: $wrong_store"
-echo "$wrong_store" | grep -q "requires store type 'Expr.Store', got Token.Store" || fail "wrong packed Store diagnostic missing: $wrong_store"
+echo "$wrong_store" | grep -q "requires store type \"Expr.Store\", got Token.Store" || fail "wrong packed Store diagnostic missing: $wrong_store"
 
 store_assign=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad(store: Expr.Store[Frozen], node: Expr) -> void:\n    store[0] <- node\n' | "$RPT")
 echo "$store_assign" | grep -Fq 'cannot assign to packed store index result' || fail "packed store index assignment not flagged: $store_assign"
@@ -50,7 +50,7 @@ clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    ca
 
 removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> Box:\n    return value as Box\n' | "$RPT")"
 echo "$removed" | grep -q '^P 1$' || fail "removed value cast was accepted: $removed"
-echo "$removed" | grep -q "unexpected token 'as'" || fail "removed value cast lacks directed error: $removed"
+echo "$removed" | grep -q "unexpected token \"as\"" || fail "removed value cast lacks directed error: $removed"
 
 removed_abi=$(printf '@packed_abi(dense_fixed)\npacked enum Expr:\n    Lit(value: int)\n' | "$RPT")
 echo "$removed_abi" | grep -Fq '@packed_abi on enum "Expr" has been removed' || fail "removed packed ABI annotation not flagged: $removed_abi"
@@ -62,7 +62,7 @@ echo "$removed_store_as" | grep -Eq '^P [1-9][0-9]*$' || fail "removed in-store 
 
 move_arity="$(printf '%s' $'struct Pair:\n    left: mutable i64\n    right: mutable i64\n\ndef bad(pair: Pair) -> void:\n    move pair as Pair(left)\n' | "$RPT")"
 echo "$move_arity" | grep -q '^D 1$' || fail "move struct arity mismatch was not rejected exactly once: $move_arity"
-echo "$move_arity" | grep -q "move-as pattern 'Pair' expects 2 bindings, got 1" || fail "move struct arity diagnostic missing: $move_arity"
+echo "$move_arity" | grep -q "move-as pattern \"Pair\" expects 2 bindings, got 1" || fail "move struct arity diagnostic missing: $move_arity"
 
 clean $'struct Pair:\n    left: mutable i64\n    right: mutable i64\n\ndef take(pair: Pair) -> i64:\n    move pair as Pair(left, right)\n    return left + right\n'
 

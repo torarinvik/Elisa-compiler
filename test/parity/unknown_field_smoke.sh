@@ -20,7 +20,7 @@ P2='struct Point:\n    x: i64\n    y: i64\n\n'
 
 # 1. a labeled field the struct does not declare MUST be flagged (and name the struct).
 out=$(printf "${P2}def f() -> Point:\n    return Point{x: 1, z: 3}\n" | "$RPT")
-echo "$out" | grep -q "struct literal 'Point' has no field 'z'" || fail "unknown field not flagged: $out"
+echo "$out" | grep -q "struct literal \"Point\" has no field \"z\"" || fail "unknown field not flagged: $out"
 
 # 2. an all-valid construction must NOT be flagged.
 out=$(printf "${P2}def g() -> Point:\n    return Point{x: 1, y: 2}\n" | "$RPT")
@@ -40,7 +40,7 @@ echo "$out" | grep -q "has no field" && fail "false positive on generic type exp
 
 # 6. a field label given twice MUST be flagged (DuplicateFieldInit, same code path).
 out=$(printf "${P2}def d() -> Point:\n    return Point{x: 1, x: 2, y: 3}\n" | "$RPT")
-echo "$out" | grep -q "struct literal 'Point' field 'x' is specified more than once" || fail "duplicate field label not flagged: $out"
+echo "$out" | grep -q "struct literal \"Point\" field \"x\" is specified more than once" || fail "duplicate field label not flagged: $out"
 
 # 7. a valid all-distinct construction must NOT be flagged as duplicate.
 out=$(printf "${P2}def e() -> Point:\n    return Point{x: 1, y: 2}\n" | "$RPT")
@@ -48,7 +48,7 @@ echo "$out" | grep -q "more than once" && fail "false positive on distinct field
 
 # 8. a by-label construction omitting a REQUIRED field MUST be flagged (MissingField).
 out=$(printf "${P2}def mf() -> Point:\n    return Point{x: 1}\n" | "$RPT")
-echo "$out" | grep -q "struct literal 'Point' is missing field 'y'" || fail "missing required field not flagged: $out"
+echo "$out" | grep -q "struct literal \"Point\" is missing field \"y\"" || fail "missing required field not flagged: $out"
 
 # 9. empty `{}` and positional construction bail (no missing-field report).
 out=$(printf "${P2}def em() -> Point:\n    return Point{}\n" | "$RPT")
@@ -63,7 +63,7 @@ echo "$out" | grep -q "is missing field" && fail "false positive on omittable (d
 
 # 11. a record update naming an absent field gets the record-update-specific finding.
 out=$(printf "${P2}def ru(point: Point) -> Point:\n    return point{z = 3}\n" | "$RPT")
-echo "$out" | grep -q "record update has no field 'z'" || fail "unknown record-update field not flagged: $out"
+echo "$out" | grep -q "record update has no field \"z\"" || fail "unknown record-update field not flagged: $out"
 
 # 12. valid record updates stay silent.
 out=$(printf "${P2}def rv(point: Point) -> Point:\n    return point{x = 3}\n" | "$RPT")

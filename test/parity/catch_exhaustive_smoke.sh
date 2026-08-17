@@ -10,7 +10,7 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 prefix=$'error FileError:\n    NotFound\n    Busy\nextern read_value(flag: bool) -> i64 error[FileError]\ndef load(flag: bool) -> i64:\n    return catch read_value(flag):\n        value:\n            value\n'
 
 missing=$(printf '%s%s' "$prefix" $'        NotFound:\n            1\n' | "$RPT")
-printf '%s\n' "$missing" | grep -q "non-exhaustive catch over 'FileError'; missing error 'Busy'"
+printf '%s\n' "$missing" | grep -q "non-exhaustive catch over \"FileError\"; missing error \"Busy\""
 
 complete=$(printf '%s%s' "$prefix" $'        NotFound:\n            1\n        Busy:\n            2\n' | "$RPT")
 printf '%s\n' "$complete" | grep -q '^D 0$'

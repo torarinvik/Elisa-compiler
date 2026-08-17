@@ -41,15 +41,15 @@ echo "$out" | grep -q "missing argument\|has no parameter\|specified more than o
 
 # 8. Named calls must still provide every required parameter.
 out=$(printf 'def sum3(x: i64, y: i64 = 1, z: i64 = 2) -> i64:\n    return x + y + z\n\ndef g() -> i64:\n    return sum3(z: 9)\n' | "$RPT")
-echo "$out" | grep -q "missing argument for parameter 'x'" || fail "missing required named arg not flagged: $out"
+echo "$out" | grep -q "missing argument for parameter \"x\"" || fail "missing required named arg not flagged: $out"
 
 # 9. Unknown named parameters are rejected.
 out=$(printf 'def f(x: i64) -> i64:\n    return x\n\ndef g() -> i64:\n    return f(y: 1)\n' | "$RPT")
-echo "$out" | grep -q "has no parameter 'y'" || fail "unknown named arg not flagged: $out"
+echo "$out" | grep -q "has no parameter \"y\"" || fail "unknown named arg not flagged: $out"
 
 # 10. A parameter may not be specified twice.
 out=$(printf 'def f(x: i64, y: i64) -> i64:\n    return x + y\n\ndef g() -> i64:\n    return f(1, x: 2)\n' | "$RPT")
-echo "$out" | grep -q "parameter 'x' is specified more than once" || fail "duplicate named arg not flagged: $out"
+echo "$out" | grep -q "parameter \"x\" is specified more than once" || fail "duplicate named arg not flagged: $out"
 
 # 11. Positional arguments may not follow named arguments.
 out=$(printf 'def f(x: i64, y: i64) -> i64:\n    return x + y\n\ndef g() -> i64:\n    return f(x: 1, 2)\n' | "$RPT")
@@ -61,7 +61,7 @@ echo "$out" | grep -q "expects.*arguments, got" && fail "false positive on overl
 
 # 13. Extern function signatures retain arity too (stage0 semantic parity).
 out=$(printf 'extern alloc(size: usize) -> int\n\ndef g() -> int:\n    return alloc()\n' | "$RPT")
-echo "$out" | grep -q "function 'alloc' expects 1 arguments, got 0\|wrong number of arguments" || fail "extern missing-required-arg not flagged: $out"
+echo "$out" | grep -q "function \"alloc\" expects 1 arguments, got 0\|wrong number of arguments" || fail "extern missing-required-arg not flagged: $out"
 
 # 14. REGRESSION: a function named `get` must be CALLABLE. `get` is contextual (`get EXPR
 # else …`), and the expression head used to route on the name alone, with no lookahead —
@@ -71,7 +71,7 @@ echo "$out" | grep -q "function 'alloc' expects 1 arguments, got 0\|wrong number
 # tuple" where stage0 reports an arity mismatch. The gate mirrors stage0
 # (parser_expr_parsepostfix…go: `Text == "get" && tokens[pos+1].Kind == TOKEN_IDENT`).
 out=$(printf 'def get(n: i64) -> i64:\n    return n\n\ndef g() -> i64:\n    return get(1, 2, 3)\n' | "$RPT")
-echo "$out" | grep -q "function 'get' expects 1 arguments, got 3" || fail "call to a function named 'get' was not parsed as a call: $out"
+echo "$out" | grep -q "function \"get\" expects 1 arguments, got 3" || fail "call to a function named \"get\" was not parsed as a call: $out"
 
 # 15. …and the `get EXPR else …` form it is contextual for must still parse.
 out=$(printf 'def find(k: i64) -> i64?:\n    return 42 if k > 0 else null\n\ndef g() -> i64:\n    v: i64 = get find(1) else return 0\n    return v\n' | "$RPT")

@@ -19,11 +19,11 @@ base='const enum NC:\n    Digit\n    Other\n\nstruct Lx:\n    bytes: darray[char
 
 # 1. WILDCARD on a closed const enum is rejected.
 out=$(printf "$base                Run(out), NC.Digit:\n                    break\n                Run(out), _:\n                    break\n        return result\n" | "$RPT")
-echo "$out" | grep -qi "wildcard" || fail "closed-enum '_' wildcard not rejected: $out"
+echo "$out" | grep -qi "wildcard" || fail "closed-enum \"_\" wildcard not rejected: $out"
 
 # 2. A MISSING variant is flagged.
 out=$(printf "$base                Run(out), NC.Digit:\n                    break\n        return result\n" | "$RPT")
-echo "$out" | grep -qi "missing variant 'Other'" || fail "missing variant not flagged: $out"
+echo "$out" | grep -qi "missing variant \"Other\"" || fail "missing variant not flagged: $out"
 
 # 3. A tag-complete state (no wildcard, every variant spelled) is CLEAN of Tier-2 diagnostics.
 out=$(printf "$base                Run(out), NC.Digit:\n                    break\n                Run(out), NC.Other:\n                    break\n        return result\n" | "$RPT")

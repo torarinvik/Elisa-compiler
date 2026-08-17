@@ -45,7 +45,7 @@ perr() { printf "$1" | "$RPT" | head -1 | awk '{print $2}'; }
 # 7. resolution descends into the new constructs: an undefined identifier in a block/loop-
 #    header body is flagged.
 out=$(printf 'def f(xs: darray[i64]) -> i64:\n    s: i64 =\n        for x in xs |acc = 0| -> acc:\n            acc <- acc + nope\n    return s\n' | "$RPT")
-echo "$out" | grep -q "undefined identifier 'nope'" || fail "loop-header body not resolved: $out"
+echo "$out" | grep -q "undefined identifier \"nope\"" || fail "loop-header body not resolved: $out"
 
 # 8. zero parse false positives across frontend + stdlib.
 t=0

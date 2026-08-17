@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Behavioral smoke: `match` as an EXPRESSION (return/assign position) parses (stage0
-# accepts it; stage1 previously rejected it with "unexpected token 'match'"), and
+# accepts it; stage1 previously rejected it with "unexpected token \"match\""), and
 # resolution descends into its arms. Statement-form match is unaffected.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,6 +20,6 @@ p=$(printf "${E}def f(e: E) -> i64:\n    x: i64 = match e:\n        E.A: 1\n    
 
 # 3. resolution descends into arms: an undefined identifier in an arm body is flagged.
 out=$(printf "${E}def f(e: E, k: i64) -> i64:\n    return match e:\n        E.A: k\n        E.B: nope\n" | "$RPT")
-echo "$out" | grep -q "undefined identifier 'nope'" || fail "arm body not resolved: $out"
+echo "$out" | grep -q "undefined identifier \"nope\"" || fail "arm body not resolved: $out"
 
 echo "match-expr smoke OK: return/assign match-expressions parse, arms resolve"

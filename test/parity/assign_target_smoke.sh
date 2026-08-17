@@ -12,7 +12,7 @@ fail() { echo "assign-target smoke FAIL: $1" >&2; exit 1; }
 
 # 1. `<-` on an undeclared name is flagged specifically.
 out=$(printf 'def f() -> i64:\n    x <- 5\n    return x\n' | "$RPT")
-echo "$out" | grep -q "undefined assignment target 'x' (use = to introduce a new local; <- requires an existing mutable target)" || fail "not flagged: $out"
+echo "$out" | grep -q "undefined assignment target \"x\" (use = to introduce a new local; <- requires an existing mutable target)" || fail "not flagged: $out"
 
 # 2. `<-` on a declared-mutable local is fine.
 out=$(printf 'def f() -> i64:\n    x: mutable i64 = 0\n    x <- 5\n    return x\n' | "$RPT")
@@ -20,7 +20,7 @@ echo "$out" | grep -q "undefined assignment target" && fail "false positive on d
 
 # 2b. `<-` to an immutable const is rejected; to a `global mutable` is fine.
 out=$(printf 'const K: i64 = 5\ndef f() -> i64:\n    K <- 10\n    return K\n' | "$RPT")
-echo "$out" | grep -q "cannot assign to immutable local 'K'" || fail "const write not flagged: $out"
+echo "$out" | grep -q "cannot assign to immutable local \"K\"" || fail "const write not flagged: $out"
 out=$(printf 'global mutable G: i64 = 0\ndef f() -> i64:\n    G <- 10\n    return G\n' | "$RPT")
 echo "$out" | grep -q "cannot assign to immutable" && fail "false positive on global mutable write: $out"
 
@@ -30,7 +30,7 @@ echo "$out" | grep -q "invalid assignment target" || fail "call-target assign no
 
 # 2d. a compound assign to an undeclared name is an undefined assignment target.
 out=$(printf 'def f() -> i64:\n    y += 1\n    return 1\n' | "$RPT")
-echo "$out" | grep -q "undefined assignment target 'y'" || fail "compound-assign undeclared not flagged: $out"
+echo "$out" | grep -q "undefined assignment target \"y\"" || fail "compound-assign undeclared not flagged: $out"
 
 # 2e. Read-only view and string-derived places cannot be written through.
 out=$(printf 'def f(src: mutable darray[i64]&) -> void:\n    ro: view[i64] = src[0:2]\n    ro[0] <- 1\n' | "$RPT")
@@ -40,7 +40,7 @@ echo "$out" | grep -q "cannot assign to read-only view index result" && fail "mu
 out=$(printf 'def f(text: cstr[row], view: sview) -> void:\n    text[0] <- 1\n    view[0] <- 1\n    text.len <- 1\n' | "$RPT")
 echo "$out" | grep -q "cannot assign to string index" || fail "string index not flagged: $out"
 echo "$out" | grep -q "cannot assign to string view index" || fail "string view index not flagged: $out"
-echo "$out" | grep -q "field 'len' is immutable" || fail "string len field not flagged: $out"
+echo "$out" | grep -q "field \"len\" is immutable" || fail "string len field not flagged: $out"
 
 # 2f. Writable capability cannot be laundered through a mutable view or loop binder.
 out=$(printf 'def f(src: darray[i64]&) -> void:\n    v: mutable view[i64] = src[0:2]\n' | "$RPT")

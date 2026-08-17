@@ -38,6 +38,6 @@ echo "$out" | grep -q 'cannot return reference: region dependency facts include 
 clean $'def id[T, @r](value: T& @r) -> T& @r:\n    alias: T& @r = value\n    return alias\n'
 
 out="$(printf '%s' $'def f() -> void:\n    destroy missing\n' | "$RPT")"
-echo "$out" | grep -q "undefined identifier 'missing'" || fail "destroy of unknown region was not resolved: $out"
+echo "$out" | grep -q "undefined identifier \"missing\"" || fail "destroy of unknown region was not resolved: $out"
 
 echo "region-scope smoke OK: declarations/strategies/@regions bind; destroy consumes a resolved region"

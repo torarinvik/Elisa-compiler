@@ -16,11 +16,11 @@ fail() { echo "duplicate-member smoke FAIL: $1" >&2; exit 1; }
 
 # 1. a repeated struct field MUST be flagged.
 out=$(printf 'struct P:\n    x: i64\n    x: i64\n' | "$RPT")
-echo "$out" | grep -q "duplicate field 'x' in struct 'P'" || fail "duplicate field not flagged: $out"
+echo "$out" | grep -q "duplicate field \"x\" in struct \"P\"" || fail "duplicate field not flagged: $out"
 
 # 2. a repeated enum variant MUST be flagged.
 out=$(printf 'enum E:\n    A\n    A\n' | "$RPT")
-echo "$out" | grep -q "duplicate variant 'A' in enum 'E'" || fail "duplicate variant not flagged: $out"
+echo "$out" | grep -q "duplicate variant \"A\" in enum \"E\"" || fail "duplicate variant not flagged: $out"
 
 # 3. distinct fields/variants must NOT be flagged.
 out=$(printf 'struct Q:\n    a: i64\n    b: i64\n\nenum F:\n    X\n    Y(v: i64)\n' | "$RPT")

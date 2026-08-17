@@ -17,7 +17,7 @@ fail() { echo "struct-layout smoke FAIL: $1" >&2; exit 1; }
 
 # 1. An unknown field type MUST be flagged (only lowercase names, to avoid cross-module false positives).
 out=$(printf 'struct Point:\n    x: unknown\n    y: i64\n' | "$RPT")
-echo "$out" | grep -q "L2 .*has unknown type 'unknown'" || fail "unknown field type not flagged on field line: $out"
+echo "$out" | grep -q "L2 .*has unknown type \"unknown\"" || fail "unknown field type not flagged on field line: $out"
 
 # 2. A directly self-recursive struct MUST be flagged.
 out=$(printf 'struct Node:\n    val: i64\n    next: Node\n' | "$RPT")
@@ -42,7 +42,7 @@ echo "$out" | grep -q "directly self-recursive" && fail "false positive on mutua
 
 # 7. A qualified type in a known module must flag an unknown member type.
 out=$(printf 'module M:\n    struct Good:\n        x: i64\n\nstruct Bad:\n    x: M::Missing\n' | "$RPT")
-echo "$out" | grep -q "has unknown type 'Missing'" || fail "qualified unknown field type not flagged: $out"
+echo "$out" | grep -q "has unknown type \"Missing\"" || fail "qualified unknown field type not flagged: $out"
 
 # 8. Nested/compound qualified paths remain conservative until nested ownership
 # metadata is modeled; a known nested type must not produce a false positive.
