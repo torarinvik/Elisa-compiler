@@ -64,6 +64,18 @@
 #                   sp, plus XMM and AArch64 SIMD names.
 #   require tokens  allowedRequireToken, a ~40-entry closed list.
 #
+# MEASURED, by building it and watching this harness reject it: implementing SOME checks and
+# accepting the routines they cover is NOT a sound increment. A parser plus three checks
+# (duplicate-param, unsupported-instruction, missing-capability) took 8 configurations to
+# agreement and put 808 into DIVERGED — because `missing-stack-contract` and
+# `missing-control-contract` apply to every routine, so accepting any routine at all claims
+# every check that could fire on it.
+#
+# The refusal boundary therefore cannot be drawn per-check. It has to be drawn so that no
+# ACCEPTED routine can reach an unimplemented check, which for the universal ones means
+# implementing them first. Practically: land the whole declaration-level set before the first
+# routine is accepted, and only then widen the instruction model.
+#
 # So the port has no discovery left: the corpus, the 22 messages, and the tables are all
 # here. What remains is writing the parser and the checks, each with a fixture that FAILS
 # first — a passing fixture cannot tell an implemented check from an unimplemented one.
