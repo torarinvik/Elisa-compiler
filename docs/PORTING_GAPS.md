@@ -178,7 +178,12 @@ Cheapest first, and each is independently landable:
 3. **Delete the wrapper's Python `deps` path** — the driver already produces the right bytes.
 4. **`project abi-lint` / `easm-lint`** — reporting subcommands over resolution that now
    exists; the same shape as the `view`/`deps` port just completed.
-5. **Column spans in diagnostics.** Threading work, no design questions.
+5. ~~**Column spans in diagnostics.** Threading work, no design questions.~~ **RE-SCOPED —
+   this is a refactor, not plumbing.** The lexer's `Token` carries `column`/`start`/`length`,
+   but the AST does not: all 49 `Expr`/`Stmt`/`Decl` variants carry a bare `line: u32`, and
+   `Expr` is a packed enum with AST refinement. Columns therefore require widening every
+   variant's position payload and updating every construction and every pattern match across
+   parser, semantic and backend. Do it as its own piece of work, not as a step in this list.
 6. **`build|run|test|bench` for real** — needs the link step; the wrapper already knows how.
 7. **Move include expansion into the driver.** The largest remaining "the CLI is not
    self-hosted" item.
@@ -237,6 +242,13 @@ compile-and-link subcommands, column spans in diagnostics, and the remaining wra
 responsibilities (the wrapper still flattens by default, and still owns linking). The two
 optional-type diagnostics and the namespace-hint call form are scoped in
 `KNOWN_DIVERGENCES`.
+
+### Gate
+
+Full parity gate **167/167** on the frozen tree (commit `a81370cd`), bootstrap fixpoint
+intact. Note what it caught that hand-picked gates did not: changing shared diagnostic TEXT
+turned 16 smokes red, because a sixth of the suite greps for message wording. Run the whole
+gate for any change to diagnostic strings.
 
 ### Newly found, not yet filed above
 
