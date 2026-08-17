@@ -22,6 +22,37 @@
 #     coverage moving from refused to agreeing without ever letting a false clean through.
 #
 # Today every configuration is REFUSED, and that is the baseline the number should climb from.
+#
+# The 22 codes this corpus reaches, with stage0's exact message text — harvested by running
+# the oracle, so a port implements against measured strings rather than re-derived ones. All
+# are severity `error`:
+#
+#   missing-body                  EASM export must contain a body
+#   missing-stack-contract        EASM export must declare stack behavior
+#   missing-control-contract      EASM export must declare control behavior
+#   unknown-control-contract      unknown control contract <atom>
+#   missing-capability            instruction "<op>" requires capability <cap>
+#   unsupported-instruction       unsupported EASM instruction "<op>"
+#   duplicate-param               duplicate EASM parameter <name>
+#   missing-input-binding         parameter <name> must be declared in inputs
+#   unknown-input-binding         input binding <name> does not name a parameter
+#   invalid-register-binding      input binding <name> must use = <register>
+#   missing-return-output         non-void EASM export must declare outputs: ret = <register>
+#   unknown-output-binding        EASM v1 only supports ret output binding, got <name>
+#   invalid-clobber-register      unknown clobber register <name>
+#   invalid-preserve-register     unknown preserve register <name>
+#   preserve-without-clobber      preserves declares <reg> but clobbers does not
+#   returns-missing-ret           returning function must contain ret
+#   noreturn-can-return           noreturn function contains ret
+#   noreturn-missing-terminal     noreturn function must end in jmp or trap
+#   unsupported-entry-fact        unsupported EASM entry fact "<fact>"
+#   label-contract-without-label  label contract <name> has no matching body label
+#   empty-label-precondition      label contract <name> must require at least one machine-state precondition
+#   unexpected-top-level          expected module, target, export def, fragment, protocol, or template def
+#
+# Three inputs still need harvesting before those can be implemented: the per-instruction
+# CAPABILITY map (pause -> x86_64.sse.pause), the valid REGISTER set, and the legal control
+# atoms and entry facts. Each is obtainable the same way — vary one field and read stage0.
 RUN() { if command -v timeout >/dev/null 2>&1; then timeout 20 "$@"; else "$@"; fi; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
