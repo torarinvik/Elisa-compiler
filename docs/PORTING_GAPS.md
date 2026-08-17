@@ -360,3 +360,49 @@ Build one fixture per rule and diff against stage0 as each matcher lands; the re
 (`native-source-read-failed`, `native-include-read-failed`,
 `missing-guest-entry-abi-contract`, `guest-entry-target-not-x86_64`,
 `guest-entry-jump-not-noreturn`) need their own.
+
+
+---
+
+## Final state, 2026-08-17 — gate 170/170
+
+**CLI subcommands: 9 of 10 fully, the 10th partly.** `init`, `init-lib`, `project view`,
+`project deps`, `build`, `run`, `test`, `bench`, `project abi-lint` all match stage0.
+`project easm-lint` matches for targets without EASM inputs and refuses the rest by name.
+
+**Emit modes: 24 of 28.** Missing `semantic`, `facts`, `ir`, `serve`.
+
+**Flags:** all accepted except `-addr`, which belongs with `serve`.
+
+**Diagnostics:** stage0-exact text, and the original file and line. Only the column span is
+missing.
+
+**Backend:** the CLI-reachable corpus is exhausted (275/275), and the CLI compiles the
+compiler's own 509-file closure unaided, producing an object byte-identical to the
+wrapper-flattened one.
+
+### What is left, and why each is blocked rather than merely large
+
+Two of the four are not "more effort" — they need something that does not exist yet, and one
+of them is a design decision rather than a port.
+
+- **`-emit ir`** — stage0 prints its pre-LLVM IR. stage1 HAS no intermediate representation:
+  it lowers the AST straight to LLVM. This is not a printer to write, it is a decision about
+  whether stage1 should grow an IR at all. That is the project owner's call, not a porting
+  task.
+- **`-emit semantic` / `facts`** — both dump the FACT SYSTEM (`fact_snapshot`, `fact_exits`,
+  `fact_transforms`, `fact_groups`, `fact_blocks`), with column spans in every position.
+  `grep -rl fact_snapshot src/` finds nothing: stage1 has no fact model to dump. So these need
+  two separate subsystems — the fact system, and the AST position widening — before any
+  printing work starts.
+- **`-emit serve` + `-addr`** — a 231-line HTTP server. Portable in principle (sockets via
+  libc externs, an HTTP/1.1 request parser, and the JSON encoder this repo now has), but its
+  handler dispatches to `semantic`, `facts` and `ir` among other modes, so full parity is
+  gated on the two items above. It is also a network service that compiles submitted source;
+  worth a deliberate decision before it exists in a second implementation.
+- **The EASM parser** (`easm.ParseFile`, ~13.7k lines) — the remaining half of `easm-lint`,
+  and the only one of the four that is purely a matter of effort.
+
+Recommended order if the work continues: the EASM parser (unblocked, verifiable against
+stage0 file by file), then a decision on the fact system, then column spans, then `serve`
+last since it depends on the others.
