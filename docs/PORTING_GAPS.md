@@ -419,8 +419,26 @@ register-read-uninitialized       REGISTER DATAFLOW over the instruction stream
 ```
 
 So the work is not "port the grammar" — the grammar is the easy part and took an afternoon.
-It is "port the verifier": a fact whitelist, contract validation, and a register
-establish/read dataflow over the decoded instruction stream. Estimate accordingly.
+It is "port the verifier", and that has now been MEASURED rather than estimated:
+
+* **126 distinct issue codes.**
+* 163 functions in `easm.go`, 19 of them analysis passes, over ~3.9k lines.
+* The supporting machinery is a machine-state model: register liveness
+  (`inputRegisterSet`, `outputRegisterSet`, `implicit-read-uninitialized`), stack alignment
+  tracking (`stackMod`, `call-stack-misaligned`, `large-stack-adjust-without-probe`),
+  callee-saved preservation proofs (`callee-saved-preservation-unproven`), direction-flag
+  state (`direction-flag-not-restored`), operand-size inference (`ambiguous-operand-size`,
+  `immediate-truncation`), frame carriers, capabilities, and lockstep composition.
+
+That is a static analyser over x86/ARM assembly semantics, not a report. Each of the 126
+codes needs a fixture that FAILS, verified against stage0, or the check is indistinguishable
+from an unimplemented one.
+
+**Why a partial port cannot be made safe here.** The usual escape — implement a subset and
+refuse anything outside it — does not work, because "this routine is clean" is a claim about
+ALL 126 checks. To know that none of them fire on even a two-instruction body, you have to
+have implemented them. Refusing everything until the analyser is complete is therefore the
+only sound intermediate state, which is exactly where `easm-lint` sits.
 
 A parser without those checks prints a module with no issues, which reads as "this EASM is
 fine" for code stage0 rejects with eight errors. That is why `easm-lint` refuses EASM inputs
