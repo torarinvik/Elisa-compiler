@@ -5,12 +5,17 @@
 # does not use EASM, and is the whole of stage0's output for them. A target that DOES carry
 # `.easm` inputs is refused by name.
 #
-# The refusal is not about the grammar. A routine-subset PARSER was written, matched stage0
-# exactly on a simple module, and was then removed: stage0's easm-lint VERIFIES. A two-export
-# fixture produced eight `Issues:` entries from an entry-fact whitelist, label and control
-# contract validation, parameter/input binding, and REGISTER DATAFLOW over the instruction
-# stream. A parser without those checks prints a module with no issues — "this EASM is fine"
-# about code stage0 rejects with eight errors.
+# stage1 now VERIFIES the void / no-parameter subset — the intrinsic shims real projects carry
+# (`pause; ret`, `trap`) — reproducing stage0's module lines, its issues and its exit code.
+#
+# The boundary is parameters and a non-void return. Those force `inputs:`/`outputs:`, and
+# declaring either reaches register dataflow (`input-register-unused`,
+# `return-register-not-written`) which this port does not model. An exhaustive sweep of the
+# void/no-param space reaches exactly THIRTEEN issue codes, all decidable from declarations
+# plus the operand-free instruction list, and all thirteen are implemented. Anything outside
+# that — parameters, non-void, `facts:`/`labels:`, operands, an unmodelled mnemonic — is
+# refused by name, because reporting "no issues" for a routine whose checks were skipped is a
+# false clean.
 #
 # Both halves are asserted. The refusal is not a skip: if the verifier is ever ported, the last
 # check fails and says so, rather than the refusal quietly outliving the gap.
@@ -77,33 +82,79 @@ check none
 project with_triple x86_64-unknown-linux-gnu
 check with_triple
 
-# A target that DOES carry EASM inputs. stage0 parses and reports modules; stage1 must refuse
-# by name and exit non-zero, NOT print a module-less report.
+# A MODELLED routine — void, no parameters, operand-free body — must be verified and reported
+# byte-identically, issues included.
 total=$((total + 1))
-project carries "" "asm/spin.easm"
-cat > "$WORK/carries/asm/spin.easm" <<'EASM'
+project modelled "" "asm/spin.easm"
+cat > "$WORK/modelled/asm/spin.easm" <<'EASM'
 module spin
 target any
+export def easm_spin_pause() -> void abi c:
+    clobbers: memory
+    stack: unchanged
+    control: returns
+    requires: x86_64.sse.pause
+    body:
+        pause
+        ret
 EASM
-out="$( cd "$WORK/carries" && RUN "$BIN" project easm-lint 2>&1 )"
+m0="$( cd "$WORK/modelled" && RUN "$ELISACORE_BIN" project easm-lint 2>&1; echo "rc=$?" )"
+m1="$( cd "$WORK/modelled" && RUN "$BIN" project easm-lint 2>&1; echo "rc=$?" )"
+if [ "$m0" = "$m1" ]; then pass=$((pass + 1)); else
+    echo "  FAIL modelled_routine"; diff <(printf '%s\n' "$m0") <(printf '%s\n' "$m1") | sed 's/^/      /' | head -6
+fi
+
+# The same routine with an ISSUE — no capability declared — must report it, and exit 1.
+total=$((total + 1))
+project modelled_issue "" "asm/spin.easm"
+cat > "$WORK/modelled_issue/asm/spin.easm" <<'EASM'
+module spin
+target any
+export def easm_spin_pause() -> void abi c:
+    stack: unchanged
+    control: returns
+    body:
+        pause
+        ret
+EASM
+i0="$( cd "$WORK/modelled_issue" && RUN "$ELISACORE_BIN" project easm-lint 2>&1; echo "rc=$?" )"
+i1="$( cd "$WORK/modelled_issue" && RUN "$BIN" project easm-lint 2>&1; echo "rc=$?" )"
+if [ "$i0" = "$i1" ] && printf '%s' "$i1" | grep -q "missing-capability"; then pass=$((pass + 1)); else
+    echo "  FAIL modelled_issue"; diff <(printf '%s\n' "$i0") <(printf '%s\n' "$i1") | sed 's/^/      /' | head -6
+fi
+
+# A routine OUTSIDE the subset must still be refused by name. Parameters are the boundary:
+# declaring inputs/outputs is what reaches register dataflow, which this port does not model.
+total=$((total + 1))
+project unmodelled "" "asm/spin.easm"
+cat > "$WORK/unmodelled/asm/spin.easm" <<'EASM'
+module spin
+target any
+export def takes(a: uintptr) -> void abi c:
+    stack: unchanged
+    control: returns
+    inputs: a = rdi
+    body:
+        ret
+EASM
+out="$( cd "$WORK/unmodelled" && RUN "$BIN" project easm-lint 2>&1 )"
 rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "cannot verify them"; then
     pass=$((pass + 1))
 else
-    echo "  FAIL carries_easm_refused: rc=$rc out='$(printf '%s' "$out" | head -1)'"
+    echo "  FAIL unmodelled_refused: rc=$rc out='$(printf '%s' "$out" | head -1)'"
 fi
 
-# stage0 must still handle that project — if it did not, the refusal above would be agreeing
-# with a broken oracle rather than declining a real capability.
+# stage0 must handle that same fixture, or the refusal proves nothing.
 total=$((total + 1))
-if ( cd "$WORK/carries" && RUN "$ELISACORE_BIN" project easm-lint 2>&1 | grep -q "^Module spin" ); then
+if ( cd "$WORK/unmodelled" && RUN "$ELISACORE_BIN" project easm-lint 2>&1 | grep -q "^Module spin" ); then
     pass=$((pass + 1))
 else
-    echo "  FAIL carries_easm_oracle: stage0 did not report a module for the fixture; the refusal case proves nothing"
+    echo "  FAIL unmodelled_oracle: stage0 did not report a module for the fixture"
 fi
 
 if [ "$pass" -ne "$total" ]; then
     echo "project_easm_lint_smoke FAILED: passed=$pass total=$total"
     exit 1
 fi
-echo "project_easm_lint_smoke OK: $pass/$total (no-EASM parity; EASM inputs refused by name)"
+echo "project_easm_lint_smoke OK: $pass/$total (void/no-param routines verified; the rest refused)"

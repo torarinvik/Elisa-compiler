@@ -642,7 +642,7 @@ extend ProjectSystem:
     # The zero-input case is not a degenerate corner: it is every project that does not use
     # EASM, and stage0's output for it is exactly these three lines.
 
-    def render_easm_lint_text(resolved: ResolvedTarget&) -> darray[u8]:
+    def render_easm_lint_text(resolved: ResolvedTarget&, verified: mutable bool&) -> darray[u8]:
         can Memory.Allocate, Abort.Panic:
             out: mutable darray[u8] = []
             bytes_extend_view(&out, "Target triple: ")
@@ -659,6 +659,9 @@ extend ProjectSystem:
                 bytes_extend_view(&out, "  - ")
                 strlist_append_entry(&out, &resolved.easm, index)
                 out.push(10)
+            body: darray[u8] = render_easm_full(resolved, verified)
+            # `verified` is a `mutable bool&`; a bare ref is not a bool condition here.
+            bytes_extend(&out, body) if verified == true
             return out
 
     # `targetTriple` is omitempty; `files` and `modules` are not, so both are always present
@@ -700,3 +703,419 @@ extend ProjectSystem:
     #
     # Porting it means porting the verifier, not the grammar. See docs/PORTING_GAPS.md.
 
+
+    # ---- EASM helpers ------------------------------------------------------------------------
+
+    def bytes_slice_from(value: darray[u8]&, from_index: usize) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            for index in from_index..<value.count |out, value|:
+                out.push(value[index])
+            return bytes_trimmed(out)
+
+    # `a, b , c` -> three trimmed entries (Go's splitCSV).
+    def easm_split_csv(value: darray[u8]&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            parts: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            start: mutable usize = 0.usize()
+            for index in 0..<value.count + 1.usize() |parts, start, value|:
+                at_end: bool = index == value.count
+                continue if not at_end and value[index] != 44
+                a: mutable usize = start
+                b: mutable usize = index
+                while a < b |a, value|:
+                    break if not (value[a] == 32 or value[a] == 9)
+                    a <- a + 1.usize()
+                while b > a |b, value|:
+                    break if not (value[b - 1.usize()] == 32 or value[b - 1.usize()] == 9)
+                    b <- b - 1.usize()
+                parts <- strlist_push_span(parts, value, a, b - a) if b > a
+                start <- index + 1.usize()
+            return parts
+
+    # The body column is space-joined mnemonics.
+    def easm_split_space(value: darray[u8]&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            parts: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            start: mutable usize = 0.usize()
+            for index in 0..<value.count + 1.usize() |parts, start, value|:
+                at_end: bool = index == value.count
+                continue if not at_end and value[index] != 32
+                parts <- strlist_push_span(parts, value, start, index - start) if index > start
+                start <- index + 1.usize()
+            return parts
+
+    # stage0's allowedControlToken.
+    def easm_control_known(atom: darray[u8]&) -> bool:
+        return bytes_equal_view(atom, "returns") or bytes_equal_view(atom, "noreturn") or bytes_equal_view(atom, "tail_jumps") or bytes_equal_view(atom, "may_fault")
+
+    # The operand-free mnemonics this port models. cpuid/rdtsc are excluded on purpose: they
+    # carry ImplicitReads/ImplicitClobbers, which reaches the clobber checks.
+    def easm_modelled_op(op: darray[u8]&) -> bool:
+        return bytes_equal_view(op, "pause") or bytes_equal_view(op, "ret") or bytes_equal_view(op, "trap") or bytes_equal_view(op, "lfence")
+
+    # Their Capability from stage0's easm_oprules.go.
+    def easm_op_capability(op: darray[u8]&) -> sview:
+        "x86_64.sse.pause" return if bytes_equal_view(op, "pause")
+        "x86_64.sse.lfence" return if bytes_equal_view(op, "lfence")
+        "debug.trap" return if bytes_equal_view(op, "trap")
+        return ""
+
+    # stage0's isRegisterName, the x86-64 names this subset can mention.
+    def easm_is_register(name: darray[u8]&) -> bool:
+        candidates: sview = "rax rbx rcx rdx rsi rdi rsp rbp r8 r9 r10 r11 r12 r13 r14 r15 eax ebx ecx edx esi edi esp ebp al ah ax bl bh bx cl ch cx dl dh dx sp"
+        start: mutable usize = 0.usize()
+        for index in 0..<sview_len(candidates) + 1.usize() |start, candidates, name|:
+            at_end: bool = index == sview_len(candidates)
+            continue if not at_end and sview_at(candidates, index) != 32
+            length: usize = index - start
+            matched: mutable bool = length == name.count
+            for byte_index in 0..<length |matched, candidates, name, start|:
+                continue if not matched
+                matched <- false if sview_at(candidates, start + byte_index) != name[byte_index]
+            true return if matched
+            start <- index + 1.usize()
+        return false
+
+    # One issue line in stage0's shape: `  [error] code file:line: message`.
+    def easm_push_issue(out: mutable darray[u8]&, code: sview, file: darray[u8]&, line: u32, message: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            bytes_extend_view(out, "  [error] ")
+            bytes_extend_view(out, code)
+            out.push(32)
+            bytes_extend(out, file)
+            out.push(58)
+            bytes_push_decimal(out, line.usize())
+            bytes_extend_view(out, ": ")
+            bytes_extend(out, message)
+            out.push(10)
+
+    # ---- EASM: verify the VOID / NO-PARAM subset ---------------------------------------------
+    #
+    # easm-lint is a machine-state verifier (126 codes). Reporting "clean" claims all of them,
+    # so a partial port must refuse any shape whose applicable checks it lacks — refusing
+    # per-check is not enough, because the universal contract checks fire on every routine.
+    #
+    # The boundary that makes a sound subset is VOID RETURN AND NO PARAMETERS. Declaring
+    # `inputs:`/`outputs:` is what pulls in register dataflow (`input-register-unused`,
+    # `return-register-not-written`), and a non-void or parameterised routine is REQUIRED to
+    # declare them. Excluding those, an exhaustive sweep of 5040 configurations reaches exactly
+    # THIRTEEN codes, all decidable from the declarations plus the operand-free instruction
+    # list. That subset is also the real-world one: the intrinsic shims projects actually carry
+    # (`pause; ret`, `trap`).
+    #
+    # Anything else — parameters, a non-void return, inputs/outputs, `facts:`/`labels:`, an
+    # instruction with operands, an unmodelled mnemonic, fragment/protocol/template/layout/
+    # lockstep — sets `ok` false and the whole report is refused.
+
+    def easm_check_routine(out: mutable darray[u8]&, file: darray[u8]&, line: u32, controls: StrList&, stacks: StrList&, clobbers: StrList&, preserves: StrList&, requires: StrList&, ops: StrList&, op_lines: darray[u32]&, have_body: bool) -> void:
+        can Memory.Allocate, Abort.Panic:
+          # An explicit region: this returns void, so the entry copies and message buffers
+          # below have nowhere else to live.
+          region checks(262144):
+              # 1. missing-capability, per instruction in body order.
+              for op_index in 0..<strlist_count(ops) |out, ops, requires, op_lines, file|:
+                  op: darray[u8] = strlist_entry_copy(ops, op_index)
+                  capability: sview = easm_op_capability(op)
+                  continue if sview_len(capability) == 0.usize()
+                  declared: mutable bool = false
+                  for r in 0..<strlist_count(requires) |declared, requires, capability|:
+                      entry: darray[u8] = strlist_entry_copy(requires, r)
+                      declared <- true if bytes_equal_view(entry, capability)
+                  continue if declared
+                  message: mutable darray[u8] = bytes_from_view("instruction \"")
+                  bytes_extend(&message, op)
+                  bytes_extend_view(&message, "\" requires capability ")
+                  bytes_extend_view(&message, capability)
+                  op_line: u32 = op_lines[op_index] if op_index < op_lines.count else 0
+                  easm_push_issue(out, "missing-capability", file, op_line, message)
+              # 2. invalid-clobber-register
+              for index in 0..<strlist_count(clobbers) |out, clobbers, file, line|:
+                  atom: darray[u8] = strlist_entry_copy(clobbers, index)
+                  continue if bytes_equal_view(atom, "memory") or bytes_equal_view(atom, "cc") or easm_is_register(atom)
+                  message: mutable darray[u8] = bytes_from_view("unknown clobber register ")
+                  bytes_extend(&message, atom)
+                  easm_push_issue(out, "invalid-clobber-register", file, line, message)
+              # 3. invalid-preserve-register, then 4. preserve-without-clobber, per atom.
+              for index in 0..<strlist_count(preserves) |out, preserves, clobbers, file, line|:
+                  atom: darray[u8] = strlist_entry_copy(preserves, index)
+                  if not easm_is_register(atom):
+                      message: mutable darray[u8] = bytes_from_view("unknown preserve register ")
+                      bytes_extend(&message, atom)
+                      easm_push_issue(out, "invalid-preserve-register", file, line, message)
+                  covered: mutable bool = false
+                  for c in 0..<strlist_count(clobbers) |covered, clobbers, atom|:
+                      entry: darray[u8] = strlist_entry_copy(clobbers, c)
+                      covered <- true if bytes_equal(entry, atom)
+                  continue if covered
+                  message2: mutable darray[u8] = bytes_from_view("preserves declares ")
+                  bytes_extend(&message2, atom)
+                  bytes_extend_view(&message2, " but clobbers does not")
+                  easm_push_issue(out, "preserve-without-clobber", file, line, message2)
+              # Order, all measured against stage0: unknown-control-contract, then
+              # missing-body, then the missing-* contract checks.
+              for index in 0..<strlist_count(controls) |out, controls, file, line|:
+                  atom: darray[u8] = strlist_entry_copy(controls, index)
+                  continue if easm_control_known(atom)
+                  message: mutable darray[u8] = bytes_from_view("unknown control contract ")
+                  bytes_extend(&message, atom)
+                  easm_push_issue(out, "unknown-control-contract", file, line, message)
+              if not have_body:
+                  no_body: darray[u8] = bytes_from_view("EASM export must contain a body")
+                  easm_push_issue(out, "missing-body", file, line, no_body)
+              # 5. missing-stack-contract
+              if strlist_count(stacks) == 0.usize():
+                  message: darray[u8] = bytes_from_view("EASM export must declare stack behavior")
+                  easm_push_issue(out, "missing-stack-contract", file, line, message)
+              # 6. missing-control-contract
+              if strlist_count(controls) == 0.usize():
+                  message: darray[u8] = bytes_from_view("EASM export must declare control behavior")
+                  easm_push_issue(out, "missing-control-contract", file, line, message)
+              # 8. the control-derived body checks.
+              has_ret: mutable bool = false
+              has_jmp: mutable bool = false
+              has_trap: mutable bool = false
+              last_terminal: mutable bool = false
+              for index in 0..<strlist_count(ops) |has_ret, has_jmp, has_trap, last_terminal, ops|:
+                  op: darray[u8] = strlist_entry_copy(ops, index)
+                  has_ret <- true if bytes_equal_view(op, "ret")
+                  has_jmp <- true if bytes_equal_view(op, "jmp")
+                  has_trap <- true if bytes_equal_view(op, "trap")
+                  last_terminal <- bytes_equal_view(op, "jmp") or bytes_equal_view(op, "trap")
+              wants_returns: mutable bool = false
+              wants_noreturn: mutable bool = false
+              wants_tail: mutable bool = false
+              wants_fault: mutable bool = false
+              for index in 0..<strlist_count(controls) |wants_returns, wants_noreturn, wants_tail, wants_fault, controls|:
+                  atom: darray[u8] = strlist_entry_copy(controls, index)
+                  wants_returns <- true if bytes_equal_view(atom, "returns")
+                  wants_noreturn <- true if bytes_equal_view(atom, "noreturn")
+                  wants_tail <- true if bytes_equal_view(atom, "tail_jumps")
+                  wants_fault <- true if bytes_equal_view(atom, "may_fault")
+              if wants_returns and not has_ret:
+                  message: darray[u8] = bytes_from_view("returning function must contain ret")
+                  easm_push_issue(out, "returns-missing-ret", file, line, message)
+              if wants_noreturn and has_ret:
+                  message: darray[u8] = bytes_from_view("noreturn function contains ret")
+                  easm_push_issue(out, "noreturn-can-return", file, line, message)
+              if wants_noreturn and not last_terminal:
+                  message: darray[u8] = bytes_from_view("noreturn function must end in jmp or trap")
+                  easm_push_issue(out, "noreturn-missing-terminal", file, line, message)
+              if wants_tail and not has_jmp:
+                  message: darray[u8] = bytes_from_view("tail_jumps control contract requires a jmp instruction")
+                  easm_push_issue(out, "tail-jumps-without-jump", file, line, message)
+              if wants_fault and not has_trap:
+                  message: darray[u8] = bytes_from_view("may_fault control contract requires memory, call, or trap behavior")
+                  easm_push_issue(out, "may-fault-without-faulting-op", file, line, message)
+
+    # Parse one file and, when every routine is inside the modelled subset, append its
+    # `Module …` / `  export …` lines to `text` and its issues to `issues`. Sets `ok` false
+    # for anything outside the subset — the caller then refuses the whole report.
+    def easm_verify_file(path: darray[u8]&, text: mutable darray[u8]&, issues: mutable darray[u8]&, ok: mutable bool&) -> void:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+          region parse(1048576):
+            source: darray[u8] = read_file_bytes(path)
+            starts: darray[usize] = abi_line_starts(source)
+            module_name: mutable darray[u8] = []
+            module_target: mutable darray[u8] = bytes_from_view("any")
+            exports: mutable darray[u8] = []
+            found: mutable darray[u8] = []
+            open_routine: mutable bool = false
+            r_name: mutable darray[u8] = []
+            r_abi: mutable darray[u8] = []
+            r_line: mutable u32 = 0
+            cur_ctl: mutable darray[u8] = []
+            cur_stk: mutable darray[u8] = []
+            cur_clb: mutable darray[u8] = []
+            cur_prs: mutable darray[u8] = []
+            cur_req: mutable darray[u8] = []
+            cur_ops: mutable darray[u8] = []
+            # Instruction-level issues carry the INSTRUCTION's line, not the header's.
+            cur_op_lines: mutable darray[u32] = []
+            have_body: mutable bool = false
+            in_body: mutable bool = false
+            for line_index in 0..<starts.count |ok, text, issues, exports, found, module_name, module_target, open_routine, r_name, r_abi, r_line, cur_ctl, cur_stk, cur_clb, cur_prs, cur_req, cur_ops, cur_op_lines, have_body, in_body, source, starts, path|:
+                continue if ok == false
+                stop_raw: usize = starts[line_index + 1.usize()] - 1.usize() if line_index + 1.usize() < starts.count else source.count
+                a: mutable usize = starts[line_index]
+                b: mutable usize = stop_raw
+                while a < b |a, source|:
+                    break if not (source[a] == 32 or source[a] == 9 or source[a] == 13)
+                    a <- a + 1.usize()
+                while b > a |b, source|:
+                    break if not (source[b - 1.usize()] == 32 or source[b - 1.usize()] == 9 or source[b - 1.usize()] == 13)
+                    b <- b - 1.usize()
+                for scan in a..<b |b, source, a|:
+                    if source[scan] == 35:
+                        b <- scan
+                        break
+                while b > a |b, source|:
+                    break if not (source[b - 1.usize()] == 32 or source[b - 1.usize()] == 9)
+                    b <- b - 1.usize()
+                continue if b <= a
+                line: mutable darray[u8] = []
+                for index in a..<b |line, source|:
+                    line.push(source[index])
+
+                if abi_span_is(line, 0.usize(), "module "):
+                    module_name <- bytes_slice_from(line, sview_len("module "))
+                    in_body <- false
+                    continue
+                if abi_span_is(line, 0.usize(), "target "):
+                    ok <- false if abi_contains(line, " lockstep ")
+                    module_target <- bytes_slice_from(line, sview_len("target ")) if not abi_contains(line, " lockstep ")
+                    in_body <- false
+                    continue
+                if abi_span_is(line, 0.usize(), "export def "):
+                    if open_routine:
+                        easm_emit_export(&exports, r_name, r_abi, cur_ctl, cur_stk)
+                        easm_check_from_text(&found, path, r_line, cur_ctl, cur_stk, cur_clb, cur_prs, cur_req, cur_ops, cur_op_lines, have_body)
+                    r_name <- []
+                    r_abi <- []
+                    cur_ctl <- []
+                    cur_stk <- []
+                    cur_clb <- []
+                    cur_prs <- []
+                    cur_req <- []
+                    cur_ops <- []
+                    cur_op_lines <- []
+                    have_body <- false
+                    r_line <- (line_index + 1.usize()).u32()
+                    ok <- false if not easm_parse_void_header(line, &r_name, &r_abi)
+                    open_routine <- true
+                    in_body <- false
+                    continue
+                if not open_routine:
+                    ok <- false
+                    continue
+                colon: mutable usize = line.count
+                for index in 0..<line.count |colon, line|:
+                    colon <- index if line[index] == 58 and colon == line.count
+                if colon < line.count and not in_body:
+                    sect: mutable darray[u8] = []
+                    for index in 0..<colon |sect, line|:
+                        sect.push(abi_lower(line[index]))
+                    value: darray[u8] = bytes_slice_from(line, colon + 1.usize())
+                    if bytes_equal_view(sect, "body"):
+                        in_body <- true
+                        continue
+                    bytes_extend(&cur_ctl, value) if bytes_equal_view(sect, "control")
+                    bytes_extend(&cur_stk, value) if bytes_equal_view(sect, "stack")
+                    bytes_extend(&cur_clb, value) if bytes_equal_view(sect, "clobbers")
+                    bytes_extend(&cur_prs, value) if bytes_equal_view(sect, "preserves")
+                    bytes_extend(&cur_req, value) if bytes_equal_view(sect, "requires")
+                    modelled: bool = bytes_equal_view(sect, "control") or bytes_equal_view(sect, "stack") or bytes_equal_view(sect, "clobbers") or bytes_equal_view(sect, "preserves") or bytes_equal_view(sect, "requires")
+                    # `inputs:`/`outputs:` reach register dataflow; `facts:`/`labels:` have
+                    # their own checks. Both are outside the subset.
+                    ok <- false if not modelled
+                    continue
+                if in_body:
+                    have_body <- true
+                    op: mutable darray[u8] = []
+                    for index in 0..<line.count |op, line|:
+                        break if line[index] == 32 or line[index] == 9
+                        op.push(abi_lower(line[index]))
+                    ok <- false if op.count != line.count or not easm_modelled_op(op)
+                    cur_ops.push(32) if cur_ops.count > 0.usize()
+                    bytes_extend(&cur_ops, op)
+                    cur_op_lines <- cur_op_lines.push((line_index + 1.usize()).u32())
+                    continue
+                ok <- false
+            if open_routine and ok == true:
+                easm_emit_export(&exports, r_name, r_abi, cur_ctl, cur_stk)
+                easm_check_from_text(&found, path, r_line, cur_ctl, cur_stk, cur_clb, cur_prs, cur_req, cur_ops, cur_op_lines, have_body)
+            if ok == true:
+                bytes_extend_view(text, "Module ")
+                bytes_extend(text, module_name)
+                bytes_extend_view(text, " target=")
+                bytes_extend(text, module_target)
+                text.push(10)
+                bytes_extend(text, exports)
+                bytes_extend(issues, found)
+
+    # `export def NAME() -> void abi ABI:` — the ONLY header shape in the subset. A parameter
+    # list or a non-void return is refused, which is what keeps register dataflow out of reach.
+    def easm_parse_void_header(line: darray[u8]&, name_out: mutable darray[u8]&, abi_out: mutable darray[u8]&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            false return if not abi_span_is(line, 0.usize(), "export def ")
+            cursor: mutable usize = sview_len("export def ")
+            name_start: usize = cursor
+            while cursor < line.count |cursor, line|:
+                break if not abi_is_word_byte(line[cursor])
+                cursor <- cursor + 1.usize()
+            false return if cursor == name_start
+            for index in name_start..<cursor |name_out, line|:
+                name_out.push(line[index])
+            false return if not abi_span_is(line, cursor, "()")
+            cursor <- cursor + 2.usize()
+            while cursor < line.count |cursor, line|:
+                break if line[cursor] != 32
+                cursor <- cursor + 1.usize()
+            false return if not abi_span_is(line, cursor, "-> void")
+            cursor <- cursor + sview_len("-> void")
+            while cursor < line.count |cursor, line|:
+                break if line[cursor] != 32
+                cursor <- cursor + 1.usize()
+            if abi_span_is(line, cursor, "abi "):
+                cursor <- cursor + 4.usize()
+                abi_start: usize = cursor
+                while cursor < line.count |cursor, line|:
+                    break if line[cursor] == 32 or line[cursor] == 58
+                    cursor <- cursor + 1.usize()
+                for index in abi_start..<cursor |abi_out, line|:
+                    abi_out.push(line[index])
+                while cursor < line.count |cursor, line|:
+                    break if line[cursor] != 32
+                    cursor <- cursor + 1.usize()
+            return cursor + 1.usize() == line.count and line[cursor] == 58
+
+    def easm_emit_export(out: mutable darray[u8]&, name: darray[u8]&, abi: darray[u8]&, control: darray[u8]&, stack_text: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+          region emit(65536):
+            bytes_extend_view(out, "  export ")
+            bytes_extend(out, name)
+            bytes_extend_view(out, " abi=")
+            if abi.count == 0.usize():
+                bytes_extend_view(out, "c")
+            else:
+                bytes_extend(out, abi)
+            bytes_extend_view(out, " control=")
+            easm_join_into(out, control)
+            bytes_extend_view(out, " stack=")
+            easm_join_into(out, stack_text)
+            out.push(10)
+
+    def easm_join_into(out: mutable darray[u8]&, value: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+          region join(16384):
+            parts: StrList = easm_split_csv(value)
+            for index in 0..<strlist_count(&parts) |out, parts|:
+                out.push(44) if index > 0.usize()
+                strlist_append_entry(out, &parts, index)
+
+    def easm_check_from_text(out: mutable darray[u8]&, file: darray[u8]&, line: u32, control: darray[u8]&, stack_text: darray[u8]&, clobbers: darray[u8]&, preserves: darray[u8]&, requires: darray[u8]&, ops_text: darray[u8]&, op_lines: darray[u32]&, have_body: bool) -> void:
+        can Memory.Allocate, Abort.Panic:
+          region split(65536):
+            controls: StrList = easm_split_csv(control)
+            stacks: StrList = easm_split_csv(stack_text)
+            clobs: StrList = easm_split_csv(clobbers)
+            press: StrList = easm_split_csv(preserves)
+            reqs: StrList = easm_split_csv(requires)
+            ops: StrList = easm_split_space(ops_text)
+            easm_check_routine(out, file, line, &controls, &stacks, &clobs, &press, &reqs, &ops, op_lines, have_body)
+
+    # The full body: per-module sections, then one Issues: block, exactly as stage0 orders it.
+    def render_easm_full(resolved: ResolvedTarget&, ok: mutable bool&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            modules: mutable darray[u8] = []
+            issues: mutable darray[u8] = []
+            for index in 0..<strlist_count(&resolved.easm) |modules, issues, ok, resolved|:
+                entry: darray[u8] = strlist_entry_copy(&resolved.easm, index)
+                absolute: darray[u8] = absolute_path(entry)
+                easm_verify_file(absolute, &modules, &issues, ok)
+            out: mutable darray[u8] = []
+            bytes_extend(&out, modules)
+            if issues.count > 0.usize():
+                bytes_extend_view(&out, "Issues:\n")
+                bytes_extend(&out, issues)
+            return out
