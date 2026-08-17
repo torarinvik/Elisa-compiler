@@ -1,7 +1,9 @@
 # What stage1 has not ported from stage0
 
-Measured 2026-08-17 against `~/.elisac/elisac` (stage0 `15502394`) and `bin/elisac-stage1`
-at commit `e381c6cc`, with the full parity gate green at 166/166.
+Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
+
+**Update, same day** — several items below are now CLOSED, and two were mis-scoped. See
+"Progress" at the end for what changed and what the corrected estimates are.
 
 Everything in **Part 1** was re-measured today. **Part 2** is carried from earlier sessions
 and is marked accordingly — treat those numbers as needing a re-measure before you act on
@@ -184,3 +186,63 @@ Cheapest first, and each is independently landable:
 9. **`-emit ir`** — needs an IR stage stage1 does not have. Largest item here; question
    whether stage1 wants one at all.
 10. **`-emit serve` + `-addr`** — a daemon; independent of everything above.
+
+
+---
+
+## Progress — 2026-08-17
+
+### Closed
+
+- **Diagnostic text.** 66 of stage0's 190 fixture messages differed from stage1's; now 3,
+  each asserted in `KNOWN_DIVERGENCES`. The gate that was supposed to catch this normalized
+  with `s/[^[:alnum:]_]+/ /g`, flattening every quote, colon and backtick before comparing —
+  it could not see punctuation at all. It is now strict. Fixed along the way: `'x'` vs
+  `"x"` (123 sites), a missing `&` on `static u8&` (10 messages, hidden because the fixtures
+  matched on a substring), the effect-grant hint bracketing, four `;`-vs-`:` splits, and one
+  parenthetical that told the reader the exact opposite of the rule it was explaining.
+- **`build|run|test|bench` failing silently.** They now name themselves. They had been
+  falling through to the compile path, where the subcommand was read as a source filename.
+- **The wrapper's Python `deps`.** Deleted; the driver's own implementation produces
+  stage0's bytes and now runs.
+- **Driver-side include expansion** — the big one, and it was not merely missing but
+  BROKEN. `expand_includes` panicked in the arena on any line longer than ~519 bytes (a
+  per-line accumulator growing under a non-relocating arena), and recorded paths verbatim so
+  the same file reached by two relative spellings did not dedup. No gate reached it, because
+  every gate goes through the wrapper, which flattens first. Fixed: `-emit deps` from the CLI
+  is byte-identical to stage0 over all six real graphs including the compiler's own 509-file
+  closure, and **`elisac-stage1 src/driver/elisac.elisa` now compiles unaided**, producing an
+  object with the same size and the same 22,548 symbols as the wrapper's.
+- **stage0 bug, fixed in stage0 rather than reproduced**: the effect-grant hint rendered
+  `add  can[...]` with a double space in the multi-effect branch and `add can X` with one in
+  the single-effect branch. Also un-rotted three stage0 backend tests that had been failing
+  since the syntax they use was removed.
+
+### Corrected scope
+
+Two items in "Suggested order" were estimated as small report ports over resolution that
+already exists. That is wrong:
+
+- **`project abi-lint`** needs stage0's native-source ABI scanner — 10 rules over inline asm
+  in C/assembly inputs (~350 lines). The report shell is easy; the rules are the work. A
+  partial port is worse than none here: it would print "ABI lint: clean" for a project it had
+  not actually checked.
+- **`project easm-lint`** needs the whole EASM parser (`easm.ParseFile`, ~2000 lines) to say
+  anything at all beyond the empty-project case.
+
+### Still open
+
+Everything else in Part 1, plus: `-emit semantic`/`facts`/`ir`/`serve`, the four
+compile-and-link subcommands, column spans in diagnostics, and the remaining wrapper
+responsibilities (the wrapper still flattens by default, and still owns linking). The two
+optional-type diagnostics and the namespace-hint call form are scoped in
+`KNOWN_DIVERGENCES`.
+
+### Newly found, not yet filed above
+
+- The driver's flattening and the wrapper's number lines slightly differently — 3 of 22,548
+  symbols in the self-compiled object differ, all internal loop-lambda names carrying a line
+  number. Harmless today, but the two must converge before the wrapper's flattening is
+  removed.
+- stage0 prints its warnings on **stdout**, not stderr, and warning output on large inputs
+  was not reproducible run to run during this session. Worth a dedicated look.
