@@ -54,7 +54,7 @@ documented in-code.
 
 Until these move, "stage1 compiles itself" is true of the compiler but not of the CLI.
 
-### 1.3 CLI subcommands
+### 1.3 CLI subcommands — 8 of 10 (updated)
 
 | Subcommand | Status |
 |---|---|
@@ -64,10 +64,10 @@ Until these move, "stage1 compiles itself" is true of the compiler but not of th
 | `project deps [--json]` | **ported** — identical (this session) |
 | `project abi-lint` | **not ported** — `error: unsupported project subcommand "abi-lint"` |
 | `project easm-lint` | **not ported** — same |
-| `build` | **not ported** — exits 1 **with no message at all** |
-| `run` | **not ported** — exits 1 silently |
-| `test` | **not ported** — exits 1 silently |
-| `bench` | **not ported** — exits 1 silently |
+| `build` | **ported** — matches stage0; refuses target shapes needing a host linker |
+| `run` | **ported** — needs `ELISA_RUNTIME_OBJ` |
+| `test` | **ported** — needs `ELISA_RUNTIME_OBJ` |
+| `bench` | **ported** |
 
 The silence on `build|run|test|bench` is worth fixing on its own, independently of
 implementing them: right now an unsupported subcommand is indistinguishable from a crash.
@@ -234,6 +234,23 @@ already exists. That is wrong:
   not actually checked.
 - **`project easm-lint`** needs the whole EASM parser (`easm.ParseFile`, ~2000 lines) to say
   anything at all beyond the empty-project case.
+
+### Closed since (same day, second pass)
+
+- **`build`, `run`, `test`, `bench`** — implemented and matching stage0's stdout, stderr and
+  exit code, by default target and by name, via `--project DIR`, and on both error paths.
+  `project_compile_request` resolves the target and builds the same request buffer the flag
+  CLI produces, so the compile pipeline is shared rather than duplicated. Linking is still
+  not done: a target that emits an object into a non-`.o` output is REFUSED by name.
+  `run`/`test` link before running and require `ELISA_RUNTIME_OBJ`, and say so.
+- **`-target-triple`, `-link`, `-L`, `-l`** — these were never compiler gaps. The driver has
+  implemented all four for a while; only the wrapper's argument loop rejected them. Three
+  missing cases in a shell script were reading as missing features. Cross-compilation works
+  end to end.
+- **A backend gap found by the gate**: indexing directly into a cast (`(p.cast[T&])[i]`)
+  declined the enclosing function, because `.cast[T]` is itself an `Index` node and every
+  index path wanted an `Ident` base. It made the driver unable to compile itself. Fixed in
+  all three place-resolution callers (chain resolver, read, assign) and pinned.
 
 ### Still open
 
