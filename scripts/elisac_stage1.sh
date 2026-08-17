@@ -221,42 +221,12 @@ flatten_includes "$src" "$flat.map" >"$flat"
 if grep -q 'def arena_alloc(' "$flat" 2>/dev/null; then
   export ELISA_STAGE1_RUNTIME_STD=1
 fi
-# `-emit deps` / `-emit deps-json`: the resolved include CLOSURE, root first then each
-# include in first-encounter (pre-order) fingerprint — the same walk flatten_includes
-# performs, printed instead of expanded, in stage0's two formats (absolute paths; the
-# JSON shape of Go's encoder with two-space indent). No driver involved: dependency
-# discovery is a wrapper concern exactly like include expansion.
-if [[ "$emit_mode" == "deps" || "$emit_mode" == "deps-json" ]]; then
-  python3 - "$src" "$emit_mode" > "$out" <<'DEPS_PY'
-import json, pathlib, re, sys
-path = pathlib.Path(sys.argv[1]).resolve()
-mode = sys.argv[2]
-include_re = re.compile(r'^[ \t]*(?:#\s*)?include[ \t]+"([^"]+)"[ \t]*$')
-seen = set()
-order = []
-def walk(p):
-    ap = p.resolve()
-    if ap in seen:
-        return
-    seen.add(ap)
-    order.append(str(ap))
-    base = p.parent
-    for line in p.read_text(encoding="utf-8").splitlines():
-        m = include_re.match(line)
-        if m:
-            rel = m.group(1)
-            inc = pathlib.Path(rel) if pathlib.Path(rel).is_absolute() else (base / rel)
-            if inc.exists():
-                walk(inc)
-walk(path)
-if mode == "deps":
-    sys.stdout.write("".join(f + "\n" for f in order))
-else:
-    payload = {"root": str(path), "files": order}
-    sys.stdout.write(json.dumps(payload, indent=2) + "\n")
-DEPS_PY
-  exit $?
-fi
+# `-emit deps` / `-emit deps-json` are handled by the DRIVER (emit_deps_report in
+# elisac.elisa), like every other emit mode. They used to be computed here in ~30 lines of
+# Python that re-walked the include graph — a second implementation of dependency discovery,
+# in a second language, shadowing a correct one: the driver produced stage0's exact bytes and
+# never got to run. Verified identical to stage0 for both formats over a nested include chain
+# before this was deleted.
 
 # `-emit exe`: compile to a temporary object, then link with the runtime object.
 runtime_obj="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
@@ -303,7 +273,7 @@ if [[ "$emit_mode" == "tests" || "$emit_mode" == "benches" || "$emit_mode" == "f
 fi
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
-if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" || "$emit_mode" == "doc" || "$emit_mode" == "header" || "$emit_mode" == "test-runner" || "$emit_mode" == "c-bind-check" || "$emit_mode" == "c-bind-check-json" || "$emit_mode" == "packed" || "$emit_mode" == "unsafe" || "$emit_mode" == "lowered" || "$emit_mode" == "progress" ]]; then
+if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" || "$emit_mode" == "doc" || "$emit_mode" == "header" || "$emit_mode" == "test-runner" || "$emit_mode" == "c-bind-check" || "$emit_mode" == "c-bind-check-json" || "$emit_mode" == "packed" || "$emit_mode" == "unsafe" || "$emit_mode" == "lowered" || "$emit_mode" == "progress" || "$emit_mode" == "deps" || "$emit_mode" == "deps-json" ]]; then
   # `-emit fmt` additionally needs the OFFSET MAP (see flatten_includes): stage0 names
   # its synthesized auto-regions `__auto_<pos.Offset>` with offsets measured over its
   # directive-bearing expansion. ELISA_STAGE1_SRC stays as given — the tokens report
