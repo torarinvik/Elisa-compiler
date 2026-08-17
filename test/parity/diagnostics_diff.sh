@@ -12,15 +12,38 @@ FIXTURES="${DIAGNOSTIC_DIFF_FIXTURES:-$REPO_ROOT/test/fixtures/diagnostics}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
+# Strips the LOCATION prefix and collapses runs of whitespace. Nothing else.
+#
+# It used to also run `s/[^[:alnum:]_]+/ /g`, flattening every quote, colon, paren and
+# backtick to a space — so the comparison was blind to punctuation, and 66 of stage0's 190
+# messages differed from stage1's in ways this gate reported as identical: `'x'` where
+# stage0 writes `"x"`, `add can[Abort.Panic]` for `add can Abort.Panic`, `cannot be used;`
+# for `cannot be used:`, a missing `&` on `static u8&`, and one hint whose parenthetical
+# was the exact inverse of stage0's. All fixed; the strictness is what keeps them fixed.
 normalize() {
     sed -E \
         -e 's/^[^:]*:[0-9]+:[0-9]+(-[0-9]+(:[0-9]+)?)?:[[:space:]]*//' \
         -e 's/^  L[0-9]+[[:space:]]*//' \
-        -e 's/[^[:alnum:]_]+/ /g' \
         -e 's/[[:space:]]+/ /g' \
-        -e 's/^ //' -e 's/ $//' \
-        | tr '[:upper:]' '[:lower:]'
+        -e 's/^ //' -e 's/ $//'
 }
+
+# stage0 messages stage1 does not reproduce VERBATIM yet. Each is ASSERTED, not skipped: a
+# known gap that gets fixed without being removed from this list fails the gate, so the list
+# cannot quietly outlive the divergence (see the stale-gate lesson in the project notes).
+#
+#   1. The CALL form of the namespace hint. stage1 raises the diagnostic from the Ident walk,
+#      which has no member name, so it renders the placeholder `M::member`; the plain field
+#      form already matches. Needs the member threaded from the Call/Field arm.
+#   2/3. An OPTIONAL type renders without its `?`. InferType carries kind+name only, and an
+#      optional interns under the name "optional" with the payload in a side list, so the
+#      payload spelling never reaches the message. Needs InferType to carry it.
+KNOWN_DIVERGENCES=(
+    '"M" is a namespace; write M::geti(...) (`.` accesses value members, `::` accesses namespaces)'
+    'variable "y" expects i64, got i64?'
+    'while condition must be bool, got i64?'
+)
+known_hit=()
 
 stage1_messages() {
     "$REPO_ROOT/build/parse_report" < "$1" \
@@ -56,9 +79,17 @@ for fixture in "$FIXTURES"/*.elisa; do
 $s1
 EOF
         if [ "$found" -eq 0 ]; then
-            printf 'diagnostic mismatch: %s\nstage0: %s\nstage1: %s\n' \
-                "${fixture#"$REPO_ROOT"/}" "$expected" "${s1//$'\n'/ | }" >&2
-            failed=$((failed + 1))
+            is_known=0
+            for known in "${KNOWN_DIVERGENCES[@]}"; do
+                [ "$known" = "$expected" ] && is_known=1
+            done
+            if [ "$is_known" -eq 1 ]; then
+                known_hit+=("$expected")
+            else
+                printf 'diagnostic mismatch: %s\nstage0: %s\nstage1: %s\n' \
+                    "${fixture#"$REPO_ROOT"/}" "$expected" "${s1//$'\n'/ | }" >&2
+                failed=$((failed + 1))
+            fi
         fi
     done <<EOF
 $s0
@@ -69,4 +100,19 @@ if [ "$failed" -ne 0 ]; then
     echo "diagnostics diff FAILED: $failed stage0 diagnostic(s) missing or changed" >&2
     exit 1
 fi
-echo "diagnostics diff OK: $checked fixtures, all stage0 diagnostics represented by stage1"
+
+# A KNOWN divergence that stopped diverging must be removed from the list, or the list stops
+# describing reality and the next reader trusts it.
+for known in "${KNOWN_DIVERGENCES[@]}"; do
+    still=0
+    for hit in ${known_hit+"${known_hit[@]}"}; do
+        [ "$hit" = "$known" ] && still=1
+    done
+    if [ "$still" -eq 0 ]; then
+        echo "diagnostics diff FAILED: KNOWN_DIVERGENCES lists a message stage1 now reproduces;" >&2
+        echo "  remove it from the list: $known" >&2
+        exit 1
+    fi
+done
+
+echo "diagnostics diff OK: $checked fixtures, byte-exact except ${#KNOWN_DIVERGENCES[@]} asserted divergences"
