@@ -1,0 +1,2364 @@
+# Writing stage0's frontend IR bundle (`.elisair`, format v2).
+#
+# The reader lives in `frontend_ir.elisa`; this is the other direction, and it is
+# the harder one. A reader may skip what it does not model — the format is built
+# for that. A WRITER cannot: whatever it emits is claimed to be the program.
+#
+# So the rule here is REFUSE BY NAME. Every construct stage1's AST cannot map onto
+# exactly one stage0 node records a refusal naming the construct, and the driver
+# prints it and exits non-zero. A bundle that decodes cleanly but describes a
+# different program is the failure this format makes easy to produce, and the
+# only defence is declining to guess.
+#
+# Why a writer is possible at all: the v2 decoder reconciles the file's type table
+# with its own schema BY NAME (`codec_decode.go`), and numeric IDs are file-local.
+# So this file only has to spell stage0's type and field names correctly. The IDs
+# below are stage0's own, taken from its committed registry, purely so the two
+# read alike.
+#
+# The oracle is exact and covers the whole tree:
+#
+#     elisac -emit lowered BUNDLE   ==   elisac -emit lowered SOURCE
+#
+# stage0 UNPARSES the tree it decoded, so a single wrong node type, field name or
+# nesting shows up as a textual diff of the program. See `test/parity/ir_writer_smoke.sh`.
+
+module IrWrite:
+    private:
+        # The walk threads four plain out-parameters rather than a state struct:
+        # `bodies` (node bodies, each already length-prefixed, in table order; node IDs
+        # are 1-based indices into it), `nodes` (how many), `refusal`, and per-node a
+        # (`fields`, `live`) pair. A `mutable Struct&` holding darrays cannot infer a
+        # region for them — the same constraint that makes project.elisa's StrList
+        # mutators `lmut` — and threading `lmut` through a recursive tree walk would put
+        # an assignment on every call. Bare `mutable darray[u8]&` has neither problem.
+
+        def ir_uvarint_out(buffer: mutable darray[u8]&, value: u64) -> void:
+            can Memory.Allocate, Abort.Panic:
+                remaining: mutable u64 = value
+                while true |buffer, remaining|:
+                    chunk: u8 = (remaining & 0x7f).u8()
+                    remaining <- remaining >> 7
+                    if remaining == 0:
+                        buffer.push(chunk)
+                        return
+                    buffer.push(chunk | 0x80)
+
+        # Signed values are zigzagged, low bit carrying the sign.
+        def ir_varint_out(buffer: mutable darray[u8]&, value: i64) -> void:
+            can Memory.Allocate, Abort.Panic:
+                zigzag: u64 = ((0 - value).u64() << 1) - 1 if value < 0 else (value.u64() << 1)
+                ir_uvarint_out(buffer, zigzag)
+
+        def ir_str_out(buffer: mutable darray[u8]&, text: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                ir_uvarint_out(buffer, sview_len(text).u64())
+                buffer.extend(text)
+
+        def ir_blob_out(buffer: mutable darray[u8]&, data: darray[u8]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                ir_uvarint_out(buffer, data.count.u64())
+                for byte in data |buffer|:
+                    buffer.push(byte)
+
+        # A field's header. The value DESCRIPTOR that follows is written by the caller
+        # as raw bytes (and, for an inline struct, its type name), because a descriptor
+        # is a nested shape rather than a fixed-width value.
+        def ir_field_desc_out(buffer: mutable darray[u8]&, field_id: u64, name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                ir_uvarint_out(buffer, field_id)
+                ir_str_out(buffer, name)
+
+        # ---- field accumulation -------------------------------------------------
+        #
+        # Fields at their zero value are OMITTED, as stage0's encoder omits them; a
+        # decoder leaves them zero. Each `ir_put_*` therefore returns early on a zero
+        # payload rather than writing an empty field.
+
+        def ir_put_bool(fields: mutable darray[u8]&, live: mutable u32&, field_id: u64, value: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if not value
+                ir_uvarint_out(fields, field_id)
+                ir_uvarint_out(fields, 1)
+                fields.push(1)
+                live <- live + 1
+
+        def ir_put_int(fields: mutable darray[u8]&, live: mutable u32&, field_id: u64, value: i64) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if value == 0
+                payload: mutable darray[u8] = []
+                ir_varint_out(&payload, value)
+                ir_uvarint_out(fields, field_id)
+                ir_blob_out(fields, payload)
+                live <- live + 1
+
+        def ir_put_str(fields: mutable darray[u8]&, live: mutable u32&, field_id: u64, text: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if sview_len(text) == 0
+                payload: mutable darray[u8] = []
+                ir_str_out(&payload, text)
+                ir_uvarint_out(fields, field_id)
+                ir_blob_out(fields, payload)
+                live <- live + 1
+
+        # A node reference is a uvarint table index; 0 is null and is omitted.
+        def ir_put_node(fields: mutable darray[u8]&, live: mutable u32&, field_id: u64, node_id: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if node_id == 0
+                payload: mutable darray[u8] = []
+                ir_uvarint_out(&payload, node_id.u64())
+                ir_uvarint_out(fields, field_id)
+                ir_blob_out(fields, payload)
+                live <- live + 1
+
+        def ir_put_node_list(fields: mutable darray[u8]&, live: mutable u32&, field_id: u64, node_ids: darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if node_ids.count == 0
+                payload: mutable darray[u8] = []
+                ir_uvarint_out(&payload, node_ids.count.u64())
+                for node_id in node_ids |payload|:
+                    ir_uvarint_out(&payload, node_id.u64())
+                ir_uvarint_out(fields, field_id)
+                ir_blob_out(fields, payload)
+                live <- live + 1
+
+        # An already-built payload (an inline struct, or a list of them).
+        def ir_put_raw(fields: mutable darray[u8]&, live: mutable u32&, field_id: u64, payload: darray[u8]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if payload.count == 0
+                ir_uvarint_out(fields, field_id)
+                ir_blob_out(fields, payload)
+                live <- live + 1
+
+        # Frame the accumulated fields as a node body and append it to the table.
+        # Returns the new node's 1-based ID.
+        def ir_emit_node(bodies: mutable darray[u8]&, nodes: mutable u32&, type_id: u64, fields: darray[u8]&, live: u32) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                body: mutable darray[u8] = []
+                ir_uvarint_out(&body, type_id)
+                ir_uvarint_out(&body, live.u64())
+                for byte in fields |body|:
+                    body.push(byte)
+                ir_blob_out(bodies, body)
+                nodes <- nodes + 1
+                return nodes
+
+        # Does the source open a line with `using`? Only a line-leading keyword counts,
+        # so the word inside a comment, a string or an identifier does not trip it.
+        def ir_source_unmodelled(source: sview) -> sview:
+            can Abort.Panic:
+                length: i64 = sview_len(source).i64()
+                at_line_start: mutable bool = true
+                index: mutable i64 = 0
+                while index < length |index, at_line_start, source|:
+                    byte: u8 = sview_at(source, index)
+                    if byte == 10:
+                        at_line_start <- true
+                        index <- index + 1
+                        continue
+                    if byte == 32 or byte == 9:
+                        index <- index + 1
+                        continue
+                    if at_line_start and index + 6 <= length:
+                        matched: mutable bool = true
+                        keyword: sview = "using "
+                        for offset in 0..<6 |matched, source, index, keyword|:
+                            matched <- false if sview_at(source, index + offset) != sview_at(keyword, offset)
+                        "`using` (consumed by the parser, absent from the AST)" return if matched
+                    # `def name[T](…)`: the GENERIC PARAMETER list is consumed by the
+                    # parser and absent from `Decl.Func`, so a signature rebuilt from the
+                    # AST would drop `[T]` silently.
+                    if at_line_start and index + 4 <= length and sview_at(source, index) == 100 and sview_at(source, index + 1) == 101 and sview_at(source, index + 2) == 102 and sview_at(source, index + 3) == 32:
+                        scan: mutable i64 = index + 4
+                        while scan < length |scan, source|:
+                            break if sview_at(source, scan) == 40 or sview_at(source, scan) == 91 or sview_at(source, scan) == 10
+                            scan <- scan + 1
+                        "generic parameter list (consumed by the parser, absent from Decl.Func)" return if scan < length and sview_at(source, scan) == 91
+                    at_line_start <- false
+                    index <- index + 1
+                return ""
+
+        def ir_refuse(refusal: mutable darray[u8]&, construct: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if refusal.count != 0
+                refusal.extend(construct)
+        # GENERATED — do not edit. Rewritten by `bash scripts/gen_ir_type_table.sh`,
+        # which reads stage0's frontendir schema so the wire kinds cannot drift.
+        def ir_write_type_table(buffer: mutable darray[u8]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                ir_uvarint_out(buffer, 70)
+                # lexer.Pos (type 278)
+                ir_uvarint_out(buffer, 278)
+                ir_str_out(buffer, "lexer.Pos")
+                ir_uvarint_out(buffer, 7)
+                ir_field_desc_out(buffer, 1, "Col")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 2, "EndCol")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 3, "EndLine")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 4, "EndOffset")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 5, "File")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 6, "Line")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 7, "Offset")
+                buffer.push(2)
+                # File (type 66)
+                ir_uvarint_out(buffer, 66)
+                ir_str_out(buffer, "File")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "DeclVisibility")
+                buffer.push(6)
+                buffer.push(4)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Decls")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Filename")
+                buffer.push(3)
+                # FuncDecl (type 71)
+                ir_uvarint_out(buffer, 71)
+                ir_str_out(buffer, "FuncDecl")
+                ir_uvarint_out(buffer, 34)
+                ir_field_desc_out(buffer, 1, "AmbientGrownContainerRegion")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Annotations")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "Annotation")
+                ir_field_desc_out(buffer, 3, "Body")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Changes")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "EnsuresPath")
+                ir_field_desc_out(buffer, 5, "ContractIncludes")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "ContractInclude")
+                ir_field_desc_out(buffer, 6, "Decreases")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 7, "DecreasesWild")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 8, "EnsureProofs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 9, "EnsureValues")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 10, "Ensures")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "EnsuresClause")
+                ir_field_desc_out(buffer, 11, "Forbids")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "PermissionRef")
+                ir_field_desc_out(buffer, 12, "Fulfills")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "FulfillsClause")
+                ir_field_desc_out(buffer, 13, "GenericParams")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "GenericParam")
+                ir_field_desc_out(buffer, 14, "Includes")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 15, "IsContract")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 16, "IsGhost")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 17, "IsLaw")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 18, "IsLemma")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 19, "LmutThreadSlots")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "LmutThreadSlot")
+                ir_field_desc_out(buffer, 20, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 21, "Override")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 22, "ParamContracts")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "ParamContract")
+                ir_field_desc_out(buffer, 23, "Params")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "ParamDecl")
+                ir_field_desc_out(buffer, 24, "PermissionParams")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 25, "Permissions")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "PermissionRef")
+                ir_field_desc_out(buffer, 26, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 27, "Preserves")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "EnsuresPath")
+                ir_field_desc_out(buffer, 28, "RegionParams")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 29, "Requires")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 30, "RequiresProofs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 31, "ReturnType")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 32, "Static")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 33, "TypeParams")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 34, "Uses")
+                buffer.push(5)
+                buffer.push(4)
+                # ParamDecl (type 204)
+                ir_uvarint_out(buffer, 204)
+                ir_str_out(buffer, "ParamDecl")
+                ir_uvarint_out(buffer, 5)
+                ir_field_desc_out(buffer, 1, "DefaultValue")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Mutable")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 3, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 5, "Type")
+                buffer.push(4)
+                # StructDecl (type 254)
+                ir_uvarint_out(buffer, 254)
+                ir_str_out(buffer, "StructDecl")
+                ir_uvarint_out(buffer, 18)
+                ir_field_desc_out(buffer, 1, "Affine")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 2, "Annotations")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "Annotation")
+                ir_field_desc_out(buffer, 3, "DerivedStates")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "DerivedStateDecl")
+                ir_field_desc_out(buffer, 4, "Droppable")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 5, "Fields")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "FieldDecl")
+                ir_field_desc_out(buffer, 6, "GenericParams")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "GenericParam")
+                ir_field_desc_out(buffer, 7, "HasStateParam")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 8, "Invariants")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 9, "Layout")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 10, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 11, "NamedStateCases")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 12, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 13, "RegionOwner")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 14, "RegionParams")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 15, "ReprC")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 16, "StateParamCount")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 17, "TerminalStateCases")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 18, "TypeParams")
+                buffer.push(5)
+                buffer.push(3)
+                # FieldDecl (type 64)
+                ir_uvarint_out(buffer, 64)
+                ir_str_out(buffer, "FieldDecl")
+                ir_uvarint_out(buffer, 9)
+                ir_field_desc_out(buffer, 1, "Annotations")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "Annotation")
+                ir_field_desc_out(buffer, 2, "BitGroup")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "DefaultValue")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Ghost")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 5, "IsTail")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 6, "Mutable")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 7, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 8, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 9, "Type")
+                buffer.push(4)
+                # EnumDecl (type 47)
+                ir_uvarint_out(buffer, 47)
+                ir_str_out(buffer, "EnumDecl")
+                ir_uvarint_out(buffer, 11)
+                ir_field_desc_out(buffer, 1, "Annotations")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "Annotation")
+                ir_field_desc_out(buffer, 2, "Common")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "FieldDecl")
+                ir_field_desc_out(buffer, 3, "IndexWidth")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "Layout")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 5, "LayoutSet")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 6, "LayoutSparse")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 7, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 8, "Packed")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 9, "Parent")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 10, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 11, "Variants")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "EnumVariantDecl")
+                # EnumVariantDecl (type 49)
+                ir_uvarint_out(buffer, 49)
+                ir_str_out(buffer, "EnumVariantDecl")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Payload")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "EnumPayloadDecl")
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # EnumPayloadDecl (type 48)
+                ir_uvarint_out(buffer, 48)
+                ir_str_out(buffer, "EnumPayloadDecl")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Relation")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "Type")
+                buffer.push(4)
+                # ConstEnumDecl (type 32)
+                ir_uvarint_out(buffer, 32)
+                ir_str_out(buffer, "ConstEnumDecl")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Members")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "ConstEnumMemberDecl")
+                ir_field_desc_out(buffer, 2, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 4, "Storage")
+                buffer.push(4)
+                # ConstEnumMemberDecl (type 33)
+                ir_uvarint_out(buffer, 33)
+                ir_str_out(buffer, "ConstEnumMemberDecl")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Value")
+                buffer.push(4)
+                # TypeAliasDecl (type 266)
+                ir_uvarint_out(buffer, 266)
+                ir_str_out(buffer, "TypeAliasDecl")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Target")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "TypeParams")
+                buffer.push(5)
+                buffer.push(3)
+                # ImportDecl (type 136)
+                ir_uvarint_out(buffer, 136)
+                ir_str_out(buffer, "ImportDecl")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "Module")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Names")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # NamespaceDecl (type 195)
+                ir_uvarint_out(buffer, 195)
+                ir_str_out(buffer, "NamespaceDecl")
+                ir_uvarint_out(buffer, 7)
+                ir_field_desc_out(buffer, 1, "Const")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 2, "Decls")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Extend")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 4, "Module")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 5, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 6, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 7, "Private")
+                buffer.push(1)
+                # ConstDecl (type 31)
+                ir_uvarint_out(buffer, 31)
+                ir_str_out(buffer, "ConstDecl")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Type")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Value")
+                buffer.push(4)
+                # GlobalDecl (type 77)
+                ir_uvarint_out(buffer, 77)
+                ir_str_out(buffer, "GlobalDecl")
+                ir_uvarint_out(buffer, 5)
+                ir_field_desc_out(buffer, 1, "Mutable")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 2, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 4, "Type")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 5, "Value")
+                buffer.push(4)
+                # NamedType (type 194)
+                ir_uvarint_out(buffer, 194)
+                ir_str_out(buffer, "NamedType")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # BuiltinTypeExpr (type 20)
+                ir_uvarint_out(buffer, 20)
+                ir_str_out(buffer, "BuiltinTypeExpr")
+                ir_uvarint_out(buffer, 5)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Region")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "TypeArgs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 5, "ValueArgs")
+                buffer.push(5)
+                buffer.push(4)
+                # RefType (type 220)
+                ir_uvarint_out(buffer, 220)
+                ir_str_out(buffer, "RefType")
+                ir_uvarint_out(buffer, 6)
+                ir_field_desc_out(buffer, 1, "Elem")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Explicit")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 4, "Region")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 5, "State")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 6, "Storage")
+                buffer.push(2)
+                # MutableType (type 193)
+                ir_uvarint_out(buffer, 193)
+                ir_str_out(buffer, "MutableType")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "Elem")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Linear")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # OwnedType (type 200)
+                ir_uvarint_out(buffer, 200)
+                ir_str_out(buffer, "OwnedType")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Elem")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # OptionalTypeExpr (type 199)
+                ir_uvarint_out(buffer, 199)
+                ir_str_out(buffer, "OptionalTypeExpr")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "Value")
+                buffer.push(4)
+                # GenericType (type 74)
+                ir_uvarint_out(buffer, 74)
+                ir_str_out(buffer, "GenericType")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Args")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 4, "Region")
+                buffer.push(3)
+                # ReturnStmt (type 228)
+                ir_uvarint_out(buffer, 228)
+                ir_str_out(buffer, "ReturnStmt")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "Value")
+                buffer.push(4)
+                # VarDeclStmt (type 271)
+                ir_uvarint_out(buffer, 271)
+                ir_str_out(buffer, "VarDeclStmt")
+                ir_uvarint_out(buffer, 7)
+                ir_field_desc_out(buffer, 1, "Ghost")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 2, "Mutable")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 3, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "Owner")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 5, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 6, "Type")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 7, "Value")
+                buffer.push(4)
+                # ExprStmt (type 60)
+                ir_uvarint_out(buffer, 60)
+                ir_str_out(buffer, "ExprStmt")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Expr")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # AssignStmt (type 12)
+                ir_uvarint_out(buffer, 12)
+                ir_str_out(buffer, "AssignStmt")
+                ir_uvarint_out(buffer, 7)
+                ir_field_desc_out(buffer, 1, "ArgManifest")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 2, "AsOverlayCall")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "FastMath")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 4, "Optional")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 5, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 6, "Target")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 7, "Value")
+                buffer.push(4)
+                # AugAssignStmt (type 14)
+                ir_uvarint_out(buffer, 14)
+                ir_str_out(buffer, "AugAssignStmt")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Op")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Target")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Value")
+                buffer.push(4)
+                # IfStmt (type 133)
+                ir_uvarint_out(buffer, 133)
+                ir_str_out(buffer, "IfStmt")
+                ir_uvarint_out(buffer, 7)
+                ir_field_desc_out(buffer, 1, "Cond")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Elifs")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "ElifClause")
+                ir_field_desc_out(buffer, 3, "Else")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "FromSource")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 5, "Hint")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 6, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 7, "Then")
+                buffer.push(5)
+                buffer.push(4)
+                # WhileStmt (type 276)
+                ir_uvarint_out(buffer, 276)
+                ir_str_out(buffer, "WhileStmt")
+                ir_uvarint_out(buffer, 6)
+                ir_field_desc_out(buffer, 1, "Body")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Captures")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Cond")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Hint")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 5, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 6, "RuntimeProgressBackstop")
+                buffer.push(1)
+                # IterForStmt (type 143)
+                ir_uvarint_out(buffer, 143)
+                ir_str_out(buffer, "IterForStmt")
+                ir_uvarint_out(buffer, 13)
+                ir_field_desc_out(buffer, 1, "Body")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Filter")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Mode")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 4, "MovedSource")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 5, "Pattern")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 6, "PatternFilter")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 7, "PatternFilterSubject")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 8, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 9, "PreReserve")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 10, "PreReserves")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 11, "Reverse")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 12, "Source")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 13, "WhereFilter")
+                buffer.push(4)
+                # BreakStmt (type 19)
+                ir_uvarint_out(buffer, 19)
+                ir_str_out(buffer, "BreakStmt")
+                ir_uvarint_out(buffer, 1)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # ContinueStmt (type 34)
+                ir_uvarint_out(buffer, 34)
+                ir_str_out(buffer, "ContinueStmt")
+                ir_uvarint_out(buffer, 1)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # MatchStmt (type 179)
+                ir_uvarint_out(buffer, 179)
+                ir_str_out(buffer, "MatchStmt")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Arms")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "MatchArm")
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Store")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Value")
+                buffer.push(4)
+                # MatchArm (type 170)
+                ir_uvarint_out(buffer, 170)
+                ir_str_out(buffer, "MatchArm")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Body")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Guard")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Pattern")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # PassStmt (type 206)
+                ir_uvarint_out(buffer, 206)
+                ir_str_out(buffer, "PassStmt")
+                ir_uvarint_out(buffer, 1)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # MatchVariantPattern (type 183)
+                ir_uvarint_out(buffer, 183)
+                ir_str_out(buffer, "MatchVariantPattern")
+                ir_uvarint_out(buffer, 7)
+                ir_field_desc_out(buffer, 1, "Args")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "MatchPatternArg")
+                ir_field_desc_out(buffer, 2, "As")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "EnumName")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 5, "ResolvedArgs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 6, "Rest")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 7, "Variant")
+                buffer.push(3)
+                # MatchBindPattern (type 171)
+                ir_uvarint_out(buffer, 171)
+                ir_str_out(buffer, "MatchBindPattern")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "Binder")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # MatchWildcardPattern (type 184)
+                ir_uvarint_out(buffer, 184)
+                ir_str_out(buffer, "MatchWildcardPattern")
+                ir_uvarint_out(buffer, 1)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # MatchLiteralPattern (type 174)
+                ir_uvarint_out(buffer, 174)
+                ir_str_out(buffer, "MatchLiteralPattern")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "Pinned")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Value")
+                buffer.push(4)
+                # MatchStringLiteralPattern (type 180)
+                ir_uvarint_out(buffer, 180)
+                ir_str_out(buffer, "MatchStringLiteralPattern")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "Value")
+                buffer.push(3)
+                # MatchStructPattern (type 181)
+                ir_uvarint_out(buffer, 181)
+                ir_str_out(buffer, "MatchStructPattern")
+                ir_uvarint_out(buffer, 7)
+                ir_field_desc_out(buffer, 1, "Args")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "MatchPatternArg")
+                ir_field_desc_out(buffer, 2, "As")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Brace")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 4, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 5, "ResolvedArgs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 6, "Rest")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 7, "TypeName")
+                buffer.push(3)
+                # MatchTuplePattern (type 182)
+                ir_uvarint_out(buffer, 182)
+                ir_str_out(buffer, "MatchTuplePattern")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Elems")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # MatchPatternArg (type 176)
+                ir_uvarint_out(buffer, 176)
+                ir_str_out(buffer, "MatchPatternArg")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Pattern")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # MoveBindNamePattern (type 187)
+                ir_uvarint_out(buffer, 187)
+                ir_str_out(buffer, "MoveBindNamePattern")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # Ident (type 132)
+                ir_uvarint_out(buffer, 132)
+                ir_str_out(buffer, "Ident")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # IntLit (type 139)
+                ir_uvarint_out(buffer, 139)
+                ir_str_out(buffer, "IntLit")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "IsHex")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Suffix")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "Value")
+                buffer.push(3)
+                # FloatLit (type 67)
+                ir_uvarint_out(buffer, 67)
+                ir_str_out(buffer, "FloatLit")
+                ir_uvarint_out(buffer, 3)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "Suffix")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Value")
+                buffer.push(3)
+                # StringLit (type 253)
+                ir_uvarint_out(buffer, 253)
+                ir_str_out(buffer, "StringLit")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "Value")
+                buffer.push(3)
+                # CharLit (type 28)
+                ir_uvarint_out(buffer, 28)
+                ir_str_out(buffer, "CharLit")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "Value")
+                buffer.push(3)
+                # BoolLit (type 18)
+                ir_uvarint_out(buffer, 18)
+                ir_str_out(buffer, "BoolLit")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "Value")
+                buffer.push(1)
+                # BinaryExpr (type 15)
+                ir_uvarint_out(buffer, 15)
+                ir_str_out(buffer, "BinaryExpr")
+                ir_uvarint_out(buffer, 5)
+                ir_field_desc_out(buffer, 1, "Left")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "LoweredCall")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Op")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 4, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 5, "Right")
+                buffer.push(4)
+                # UnaryExpr (type 268)
+                ir_uvarint_out(buffer, 268)
+                ir_str_out(buffer, "UnaryExpr")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "LoweredCall")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Op")
+                buffer.push(2)
+                ir_field_desc_out(buffer, 3, "Operand")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # CallExpr (type 22)
+                ir_uvarint_out(buffer, 22)
+                ir_str_out(buffer, "CallExpr")
+                ir_uvarint_out(buffer, 18)
+                ir_field_desc_out(buffer, 1, "ArgForwardPos")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "ArgItemOrder")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "CallArgItem")
+                ir_field_desc_out(buffer, 3, "ArgNames")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "ArgShorthand")
+                buffer.push(5)
+                buffer.push(1)
+                ir_field_desc_out(buffer, 5, "Args")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 6, "Func")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 7, "HasArgForward")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 8, "LmutRebindClaims")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "LmutRebindClaim")
+                ir_field_desc_out(buffer, 9, "LmutThreadEffect")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 10, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 11, "ResolvedArgs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 12, "ResolvedArgsValid")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 13, "ResolvedCommonArgs")
+                buffer.push(6)
+                buffer.push(3)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 14, "ResolvedImplicitArgs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 15, "ResolvedImplicitArgsValid")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 16, "Safe")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 17, "SafeConcurrencySugar")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 18, "SafeReceiver")
+                buffer.push(4)
+                # FieldExpr (type 65)
+                ir_uvarint_out(buffer, 65)
+                ir_str_out(buffer, "FieldExpr")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Field")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Object")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 4, "Safe")
+                buffer.push(1)
+                # IndexExpr (type 138)
+                ir_uvarint_out(buffer, 138)
+                ir_str_out(buffer, "IndexExpr")
+                ir_uvarint_out(buffer, 9)
+                ir_field_desc_out(buffer, 1, "AsBuiltinDictGet")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "AsOverlayCall")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "AsSpecialize")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Fallback")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 5, "Index")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 6, "Index2")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 7, "LegacyElseFallback")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 8, "Object")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 9, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # SliceExpr (type 233)
+                ir_uvarint_out(buffer, 233)
+                ir_str_out(buffer, "SliceExpr")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "End")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Object")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 4, "Start")
+                buffer.push(4)
+                # ParenExpr (type 205)
+                ir_uvarint_out(buffer, 205)
+                ir_str_out(buffer, "ParenExpr")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Inner")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # ListLitExpr (type 160)
+                ir_uvarint_out(buffer, 160)
+                ir_str_out(buffer, "ListLitExpr")
+                ir_uvarint_out(buffer, 6)
+                ir_field_desc_out(buffer, 1, "Brace")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 2, "Elems")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Keys")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Owner")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 5, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 6, "Spreads")
+                buffer.push(5)
+                buffer.push(1)
+                # TupleExpr (type 263)
+                ir_uvarint_out(buffer, 263)
+                ir_str_out(buffer, "TupleExpr")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Elems")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # StructLitExpr (type 255)
+                ir_uvarint_out(buffer, 255)
+                ir_str_out(buffer, "StructLitExpr")
+                ir_uvarint_out(buffer, 9)
+                ir_field_desc_out(buffer, 1, "ArgNames")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Args")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Brace")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 4, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 5, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 6, "ResolvedArgs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 7, "ResolvedArgsValid")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 8, "Spreads")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 9, "TypeArgs")
+                buffer.push(5)
+                buffer.push(4)
+                # RecordUpdateExpr (type 216)
+                ir_uvarint_out(buffer, 216)
+                ir_str_out(buffer, "RecordUpdateExpr")
+                ir_uvarint_out(buffer, 6)
+                ir_field_desc_out(buffer, 1, "ArgNames")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Args")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Base")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 5, "ResolvedArgs")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 6, "ResolvedArgsValid")
+                buffer.push(1)
+                # MatchExpr (type 172)
+                ir_uvarint_out(buffer, 172)
+                ir_str_out(buffer, "MatchExpr")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Arms")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "MatchArm")
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Store")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Value")
+                buffer.push(4)
+                # TernaryExpr (type 258)
+                ir_uvarint_out(buffer, 258)
+                ir_str_out(buffer, "TernaryExpr")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Alt")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Cond")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 4, "Value")
+                buffer.push(4)
+                # LambdaExpr (type 146)
+                ir_uvarint_out(buffer, 146)
+                ir_str_out(buffer, "LambdaExpr")
+                ir_uvarint_out(buffer, 8)
+                ir_field_desc_out(buffer, 1, "Body")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "BodyExpr")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 3, "Keyword")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "ParallelBody")
+                buffer.push(1)
+                ir_field_desc_out(buffer, 5, "Params")
+                buffer.push(5)
+                buffer.push(7)
+                ir_str_out(buffer, "ParamDecl")
+                ir_field_desc_out(buffer, 6, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 7, "ReturnType")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 8, "UsesShorthandParams")
+                buffer.push(1)
+                # ExprBlock (type 59)
+                ir_uvarint_out(buffer, 59)
+                ir_str_out(buffer, "ExprBlock")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Captures")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 3, "Stmts")
+                buffer.push(5)
+                buffer.push(4)
+                ir_field_desc_out(buffer, 4, "Value")
+                buffer.push(4)
+                # ShorthandMemberExpr (type 230)
+                ir_uvarint_out(buffer, 230)
+                ir_str_out(buffer, "ShorthandMemberExpr")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Parts")
+                buffer.push(5)
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # MoveExpr (type 192)
+                ir_uvarint_out(buffer, 192)
+                ir_str_out(buffer, "MoveExpr")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Operand")
+                buffer.push(4)
+                ir_field_desc_out(buffer, 2, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # UsingDecl (type 270)
+                ir_uvarint_out(buffer, 270)
+                ir_str_out(buffer, "UsingDecl")
+                ir_uvarint_out(buffer, 4)
+                ir_field_desc_out(buffer, 1, "Alias")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 2, "Member")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 3, "Name")
+                buffer.push(3)
+                ir_field_desc_out(buffer, 4, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                # DiscardStmt (type 40)
+                ir_uvarint_out(buffer, 40)
+                ir_str_out(buffer, "DiscardStmt")
+                ir_uvarint_out(buffer, 2)
+                ir_field_desc_out(buffer, 1, "Position")
+                buffer.push(7)
+                ir_str_out(buffer, "")
+                ir_field_desc_out(buffer, 2, "Value")
+                buffer.push(4)
+        # ---- the AST walk -------------------------------------------------------
+        #
+        # Every emitter returns the node's 1-based table ID, or 0 for "no node". A
+        # refusal does not unwind: the walk runs to completion and the entry point
+        # discards the image, so no partial bundle can escape.
+        #
+        # The mapping was READ OUT of stage0's own bundles rather than inferred from
+        # its Go declarations — `darray[T]` is a BuiltinTypeExpr and not a GenericType,
+        # `for x in xs` is an IterForStmt over a MoveBindNamePattern, and neither is
+        # visible in the type definitions.
+
+        # `lexer.Pos` travels INLINE (wire kind 7), not as a node reference: type ID
+        # then fields. `Ast::Pos` was given stage0's field names deliberately, so this
+        # is a copy rather than a translation.
+        def ir_pos_out(payload: mutable darray[u8]&, pos: Ast::Pos, filename: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                ir_put_int(&fields, &live, 1, pos.column.i64())
+                ir_put_int(&fields, &live, 2, pos.end_column.i64())
+                ir_put_int(&fields, &live, 3, pos.end_line.i64())
+                ir_put_int(&fields, &live, 4, pos.end_offset.i64())
+                ir_put_str(&fields, &live, 5, filename)
+                ir_put_int(&fields, &live, 6, pos.line.i64())
+                ir_put_int(&fields, &live, 7, pos.offset.i64())
+                ir_uvarint_out(payload, 278)
+                ir_uvarint_out(payload, live.u64())
+                for byte in fields |payload|:
+                    payload.push(byte)
+
+        def ir_put_pos(fields: mutable darray[u8]&, live: mutable u32&, field_id: u64, pos: Ast::Pos, filename: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                payload: mutable darray[u8] = []
+                ir_pos_out(&payload, pos, filename)
+                ir_put_raw(fields, live, field_id, payload)
+
+        # A list of strings, framed as one field payload.
+        def ir_put_str_list(fields: mutable darray[u8]&, live: mutable u32&, field_id: u64, texts: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if texts.count == 0
+                payload: mutable darray[u8] = []
+                ir_uvarint_out(&payload, texts.count.u64())
+                for text in texts |payload|:
+                    ir_str_out(&payload, text)
+                ir_put_raw(fields, live, field_id, payload)
+
+        # `darray`, `view` and friends are BUILTIN types in stage0, not generic named
+        # ones: `darray[i64]` decodes as BuiltinTypeExpr{Name, TypeArgs}, and a
+        # GenericType there would be a different program. The set is closed, so it is
+        # spelled out rather than guessed at from the syntax.
+        def ir_is_builtin_type_name(name: sview) -> bool:
+            can Abort.Panic:
+                true return if name == "darray"
+                true return if name == "view"
+                true return if name == "sview"
+                true return if name == "dict"
+                true return if name == "set"
+                true return if name == "deque"
+                true return if name == "array"
+                true return if name == "slice"
+                true return if name == "optional"
+                return false
+
+        # A TYPE position. stage1 parses types as ordinary expressions, so the shape is
+        # re-read as a type here; anything without one unambiguous stage0 counterpart
+        # refuses.
+        def ir_type_node(bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, expression: Ast::Expr, filename: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Ast::Expr.Absent:
+                        return 0
+                    Ast::Expr.Invalid:
+                        return 0
+                    Ast::Expr.Ident(type_name, type_pos):
+                        fields: mutable darray[u8] = []
+                        live: mutable u32 = 0
+                        ir_put_str(&fields, &live, 1, type_name)
+                        ir_put_pos(&fields, &live, 2, type_pos, filename)
+                        return ir_emit_node(bodies, nodes, 194, fields, live)
+                    Ast::Expr.Paren(inner, _):
+                        return ir_type_node(bodies, nodes, refusal, inner, filename)
+                    # `A::B` in a type position is one dotted NAME to stage0, not a path
+                    # node — the same spelling its analyser resolves identifiers to.
+                    Ast::Expr.Scope(base, member, scope_pos):
+                        dotted: mutable darray[u8] = []
+                        if not ir_dotted_name(&dotted, expression):
+                            ir_refuse(refusal, "qualified type path")
+                            return 0
+                        fields: mutable darray[u8] = []
+                        live: mutable u32 = 0
+                        ir_put_str(&fields, &live, 1, sview(&dotted[0], 0, dotted.count.i64()))
+                        ir_put_pos(&fields, &live, 2, scope_pos, filename)
+                        return ir_emit_node(bodies, nodes, 194, fields, live)
+                    Ast::Expr.Unary(operator, operand, unary_pos):
+                        inner_id: u32 = ir_type_node(bodies, nodes, refusal, operand, filename)
+                        fields: mutable darray[u8] = []
+                        live: mutable u32 = 0
+                        if operator == TokenKind.Ampersand:
+                            ir_put_node(&fields, &live, 1, inner_id)
+                            ir_put_pos(&fields, &live, 3, unary_pos, filename)
+                            return ir_emit_node(bodies, nodes, 220, fields, live)
+                        if operator == TokenKind.Mutable:
+                            ir_put_node(&fields, &live, 1, inner_id)
+                            ir_put_pos(&fields, &live, 3, unary_pos, filename)
+                            return ir_emit_node(bodies, nodes, 193, fields, live)
+                        if operator == TokenKind.Lmut:
+                            ir_put_node(&fields, &live, 1, inner_id)
+                            ir_put_bool(&fields, &live, 2, true)
+                            ir_put_pos(&fields, &live, 3, unary_pos, filename)
+                            return ir_emit_node(bodies, nodes, 193, fields, live)
+                        if operator == TokenKind.Owned:
+                            ir_put_node(&fields, &live, 1, inner_id)
+                            ir_put_pos(&fields, &live, 2, unary_pos, filename)
+                            return ir_emit_node(bodies, nodes, 200, fields, live)
+                        if operator == TokenKind.Question:
+                            ir_put_pos(&fields, &live, 1, unary_pos, filename)
+                            ir_put_node(&fields, &live, 2, inner_id)
+                            return ir_emit_node(bodies, nodes, 199, fields, live)
+                        ir_refuse(refusal, "type qualifier")
+                        return 0
+                    # `T[A, B]`: a builtin container, or a generic named type.
+                    Ast::Expr.Index(object, index, index_pos):
+                        argument_ids: mutable darray[u32] = []
+                        argument_ids.push(ir_type_node(bodies, nodes, refusal, index, filename))
+                        return ir_applied_type(bodies, nodes, refusal, object, argument_ids, index_pos, filename)
+                    Ast::Expr.IndexN(object, arguments, indexn_pos):
+                        argument_ids: mutable darray[u32] = []
+                        for argument in arguments |bodies, nodes, refusal, argument_ids|:
+                            argument_ids.push(ir_type_node(bodies, nodes, refusal, argument, filename))
+                        return ir_applied_type(bodies, nodes, refusal, object, argument_ids, indexn_pos, filename)
+                    _:
+                        ir_refuse(refusal, "type expression")
+                        return 0
+
+        # `BASE[ARGS]` in a type position: BuiltinTypeExpr for the closed builtin set,
+        # GenericType otherwise.
+        def ir_applied_type(bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, base: Ast::Expr, argument_ids: darray[u32]&, pos: Ast::Pos, filename: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                base_name: mutable darray[u8] = []
+                if not ir_dotted_name(&base_name, base):
+                    ir_refuse(refusal, "applied type base")
+                    return 0
+                name: sview = sview(&base_name[0], 0, base_name.count.i64())
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                if ir_is_builtin_type_name(name):
+                    ir_put_str(&fields, &live, 1, name)
+                    ir_put_pos(&fields, &live, 2, pos, filename)
+                    ir_put_node_list(&fields, &live, 4, argument_ids)
+                    return ir_emit_node(bodies, nodes, 20, fields, live)
+                ir_put_node_list(&fields, &live, 1, argument_ids)
+                ir_put_str(&fields, &live, 2, name)
+                ir_put_pos(&fields, &live, 3, pos, filename)
+                return ir_emit_node(bodies, nodes, 74, fields, live)
+
+        # Flatten an `Ident` / `A::B` / `A.B` chain into stage0's dotted spelling.
+        # Answers false for anything that is not a pure name path.
+        def ir_dotted_name(out_name: mutable darray[u8]&, expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Ast::Expr.Ident(name, _):
+                        out_name.extend(name)
+                        return true
+                    Ast::Expr.Scope(base, member, _):
+                        false return if not ir_dotted_name(out_name, base)
+                        out_name.push(46)
+                        out_name.extend(member)
+                        return true
+                    Ast::Expr.Field(object, field, _):
+                        false return if not ir_dotted_name(out_name, object)
+                        out_name.push(46)
+                        out_name.extend(field)
+                        return true
+                    _:
+                        return false
+
+        def ir_expr_node(bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, expression: Ast::Expr, filename: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                match expression:
+                    Ast::Expr.Absent:
+                        return 0
+                    Ast::Expr.Invalid:
+                        ir_refuse(refusal, "malformed expression")
+                        return 0
+                    # stage0 keeps the literal's SOURCE spelling; stage1's AST keeps the
+                    # decoded value and nothing else, so a hex or digit-separated literal
+                    # would come back respelled. Refusing is the only honest answer until
+                    # `Expr.IntLit` carries its text.
+                    Ast::Expr.IntLit(literal_value):
+                        digits: mutable darray[u8] = []
+                        Bytes::push_int(&digits, literal_value)
+                        ir_put_str(&fields, &live, 4, sview(&digits[0], 0, digits.count.i64()))
+                        return ir_emit_node(bodies, nodes, 139, fields, live)
+                    Ast::Expr.FloatLit(text):
+                        ir_put_str(&fields, &live, 3, text)
+                        return ir_emit_node(bodies, nodes, 67, fields, live)
+                    Ast::Expr.StringLit(text):
+                        ir_put_str(&fields, &live, 2, text)
+                        return ir_emit_node(bodies, nodes, 253, fields, live)
+                    Ast::Expr.CharLit(text):
+                        ir_put_str(&fields, &live, 2, text)
+                        return ir_emit_node(bodies, nodes, 28, fields, live)
+                    Ast::Expr.BoolLit(value):
+                        ir_put_bool(&fields, &live, 2, value)
+                        return ir_emit_node(bodies, nodes, 18, fields, live)
+                    Ast::Expr.Ident(name, ident_pos):
+                        ir_put_str(&fields, &live, 1, name)
+                        ir_put_pos(&fields, &live, 2, ident_pos, filename)
+                        return ir_emit_node(bodies, nodes, 132, fields, live)
+                    Ast::Expr.ShorthandMember(parts, member_pos):
+                        ir_put_str_list(&fields, &live, 1, parts)
+                        ir_put_pos(&fields, &live, 2, member_pos, filename)
+                        return ir_emit_node(bodies, nodes, 230, fields, live)
+                    Ast::Expr.Binary(left, operator, right, binary_pos):
+                        left_id: u32 = ir_expr_node(bodies, nodes, refusal, left, filename)
+                        right_id: u32 = ir_expr_node(bodies, nodes, refusal, right, filename)
+                        ir_put_node(&fields, &live, 1, left_id)
+                        # `emit_tokens_kind_code` is the fixture-validated stage1->stage0 kind
+                        # bridge (its codes are stage0's ordinal + 1), so the operator needs
+                        # no second table.
+                        ir_put_int(&fields, &live, 3, emit_tokens_kind_code(operator).i64() - 1)
+                        ir_put_pos(&fields, &live, 4, binary_pos, filename)
+                        ir_put_node(&fields, &live, 5, right_id)
+                        return ir_emit_node(bodies, nodes, 15, fields, live)
+                    Ast::Expr.Unary(operator, operand, unary_pos):
+                        operand_id: u32 = ir_expr_node(bodies, nodes, refusal, operand, filename)
+                        ir_put_int(&fields, &live, 2, emit_tokens_kind_code(operator).i64() - 1)
+                        ir_put_node(&fields, &live, 3, operand_id)
+                        ir_put_pos(&fields, &live, 4, unary_pos, filename)
+                        return ir_emit_node(bodies, nodes, 268, fields, live)
+                    Ast::Expr.Move(operand, move_pos):
+                        operand_id: u32 = ir_expr_node(bodies, nodes, refusal, operand, filename)
+                        ir_put_node(&fields, &live, 1, operand_id)
+                        ir_put_pos(&fields, &live, 2, move_pos, filename)
+                        return ir_emit_node(bodies, nodes, 192, fields, live)
+                    Ast::Expr.Paren(inner, paren_pos):
+                        inner_id: u32 = ir_expr_node(bodies, nodes, refusal, inner, filename)
+                        ir_put_node(&fields, &live, 1, inner_id)
+                        ir_put_pos(&fields, &live, 2, paren_pos, filename)
+                        return ir_emit_node(bodies, nodes, 205, fields, live)
+                    Ast::Expr.Field(object, field, field_pos):
+                        object_id: u32 = ir_expr_node(bodies, nodes, refusal, object, filename)
+                        ir_put_str(&fields, &live, 1, field)
+                        ir_put_node(&fields, &live, 2, object_id)
+                        ir_put_pos(&fields, &live, 3, field_pos, filename)
+                        return ir_emit_node(bodies, nodes, 65, fields, live)
+                    # `A::B` is a dotted NAME to stage0 — the same spelling its analyser
+                    # resolves a module member to — not a two-node path.
+                    Ast::Expr.Scope(base, member, scope_pos):
+                        dotted: mutable darray[u8] = []
+                        if not ir_dotted_name(&dotted, expression):
+                            ir_refuse(refusal, "qualified path")
+                            return 0
+                        ir_put_str(&fields, &live, 1, sview(&dotted[0], 0, dotted.count.i64()))
+                        ir_put_pos(&fields, &live, 2, scope_pos, filename)
+                        return ir_emit_node(bodies, nodes, 132, fields, live)
+                    Ast::Expr.Index(object, index, index_pos):
+                        object_id: u32 = ir_expr_node(bodies, nodes, refusal, object, filename)
+                        index_id: u32 = ir_expr_node(bodies, nodes, refusal, index, filename)
+                        ir_put_node(&fields, &live, 5, index_id)
+                        ir_put_node(&fields, &live, 8, object_id)
+                        ir_put_pos(&fields, &live, 9, index_pos, filename)
+                        return ir_emit_node(bodies, nodes, 138, fields, live)
+                    Ast::Expr.IndexN(object, arguments, indexn_pos):
+                        # stage0's IndexExpr has Index and Index2 and no more, so a
+                        # subscript of any other arity has no faithful node.
+                        if arguments.count != 2:
+                            ir_refuse(refusal, "multi-argument subscript")
+                            return 0
+                        object_id: u32 = ir_expr_node(bodies, nodes, refusal, object, filename)
+                        first_id: u32 = ir_expr_node(bodies, nodes, refusal, arguments[0], filename)
+                        second_id: u32 = ir_expr_node(bodies, nodes, refusal, arguments[1], filename)
+                        ir_put_node(&fields, &live, 5, first_id)
+                        ir_put_node(&fields, &live, 6, second_id)
+                        ir_put_node(&fields, &live, 8, object_id)
+                        ir_put_pos(&fields, &live, 9, indexn_pos, filename)
+                        return ir_emit_node(bodies, nodes, 138, fields, live)
+                    Ast::Expr.Slice(object, low, high, slice_pos):
+                        object_id: u32 = ir_expr_node(bodies, nodes, refusal, object, filename)
+                        low_id: u32 = ir_expr_node(bodies, nodes, refusal, low, filename)
+                        high_id: u32 = ir_expr_node(bodies, nodes, refusal, high, filename)
+                        ir_put_node(&fields, &live, 1, high_id)
+                        ir_put_node(&fields, &live, 2, object_id)
+                        ir_put_pos(&fields, &live, 3, slice_pos, filename)
+                        ir_put_node(&fields, &live, 4, low_id)
+                        return ir_emit_node(bodies, nodes, 233, fields, live)
+                    Ast::Expr.Call(callee, arguments, argument_names, call_pos):
+                        callee_id: u32 = ir_expr_node(bodies, nodes, refusal, callee, filename)
+                        argument_ids: mutable darray[u32] = []
+                        for argument in arguments |bodies, nodes, refusal, argument_ids|:
+                            argument_ids.push(ir_expr_node(bodies, nodes, refusal, argument, filename))
+                        any_name: mutable bool = false
+                        for argument_name in argument_names |any_name|:
+                            any_name <- true if sview_len(argument_name) != 0
+                        ir_put_str_list(&fields, &live, 3, argument_names) if any_name
+                        ir_put_node_list(&fields, &live, 5, argument_ids)
+                        ir_put_node(&fields, &live, 6, callee_id)
+                        ir_put_pos(&fields, &live, 10, call_pos, filename)
+                        return ir_emit_node(bodies, nodes, 22, fields, live)
+                    Ast::Expr.Array(elements, array_pos):
+                        element_ids: mutable darray[u32] = []
+                        for element in elements |bodies, nodes, refusal, element_ids|:
+                            element_ids.push(ir_expr_node(bodies, nodes, refusal, element, filename))
+                        ir_put_node_list(&fields, &live, 2, element_ids)
+                        ir_put_pos(&fields, &live, 5, array_pos, filename)
+                        return ir_emit_node(bodies, nodes, 160, fields, live)
+                    Ast::Expr.SetLit(elements, set_pos):
+                        element_ids: mutable darray[u32] = []
+                        for element in elements |bodies, nodes, refusal, element_ids|:
+                            element_ids.push(ir_expr_node(bodies, nodes, refusal, element, filename))
+                        ir_put_bool(&fields, &live, 1, true)
+                        ir_put_node_list(&fields, &live, 2, element_ids)
+                        ir_put_pos(&fields, &live, 5, set_pos, filename)
+                        return ir_emit_node(bodies, nodes, 160, fields, live)
+                    Ast::Expr.DictLit(entries, dict_pos):
+                        key_ids: mutable darray[u32] = []
+                        value_ids: mutable darray[u32] = []
+                        for entry_index in 0..<entries.count |bodies, nodes, refusal, key_ids, value_ids|:
+                            key_ids.push(ir_expr_node(bodies, nodes, refusal, entries[entry_index].key, filename))
+                            value_ids.push(ir_expr_node(bodies, nodes, refusal, entries[entry_index].value, filename))
+                        ir_put_bool(&fields, &live, 1, true)
+                        ir_put_node_list(&fields, &live, 2, value_ids)
+                        ir_put_node_list(&fields, &live, 3, key_ids)
+                        ir_put_pos(&fields, &live, 5, dict_pos, filename)
+                        return ir_emit_node(bodies, nodes, 160, fields, live)
+                    Ast::Expr.Tuple(elements, tuple_pos):
+                        element_ids: mutable darray[u32] = []
+                        for element in elements |bodies, nodes, refusal, element_ids|:
+                            element_ids.push(ir_expr_node(bodies, nodes, refusal, element, filename))
+                        ir_put_node_list(&fields, &live, 1, element_ids)
+                        ir_put_pos(&fields, &live, 2, tuple_pos, filename)
+                        return ir_emit_node(bodies, nodes, 263, fields, live)
+                    Ast::Expr.Construct(type_expression, initializers, construct_pos):
+                        type_name: mutable darray[u8] = []
+                        if not ir_dotted_name(&type_name, type_expression):
+                            ir_refuse(refusal, "constructed type path")
+                            return 0
+                        value_ids: mutable darray[u32] = []
+                        labels: mutable darray[sview] = []
+                        for initializer_index in 0..<initializers.count |bodies, nodes, refusal, value_ids, labels|:
+                            value_ids.push(ir_expr_node(bodies, nodes, refusal, initializers[initializer_index].value, filename))
+                            labels.push(initializers[initializer_index].name)
+                        ir_put_str_list(&fields, &live, 1, labels)
+                        ir_put_node_list(&fields, &live, 2, value_ids)
+                        ir_put_bool(&fields, &live, 3, true)
+                        ir_put_str(&fields, &live, 4, sview(&type_name[0], 0, type_name.count.i64()))
+                        ir_put_pos(&fields, &live, 5, construct_pos, filename)
+                        return ir_emit_node(bodies, nodes, 255, fields, live)
+                    Ast::Expr.RecordUpdate(base, initializers, update_pos):
+                        base_id: u32 = ir_expr_node(bodies, nodes, refusal, base, filename)
+                        value_ids: mutable darray[u32] = []
+                        labels: mutable darray[sview] = []
+                        for initializer_index in 0..<initializers.count |bodies, nodes, refusal, value_ids, labels|:
+                            value_ids.push(ir_expr_node(bodies, nodes, refusal, initializers[initializer_index].value, filename))
+                            labels.push(initializers[initializer_index].name)
+                        ir_put_str_list(&fields, &live, 1, labels)
+                        ir_put_node_list(&fields, &live, 2, value_ids)
+                        ir_put_node(&fields, &live, 3, base_id)
+                        ir_put_pos(&fields, &live, 4, update_pos, filename)
+                        return ir_emit_node(bodies, nodes, 216, fields, live)
+                    Ast::Expr.If(condition, then_expr, else_expr, if_pos):
+                        condition_id: u32 = ir_expr_node(bodies, nodes, refusal, condition, filename)
+                        then_id: u32 = ir_expr_node(bodies, nodes, refusal, then_expr, filename)
+                        else_id: u32 = ir_expr_node(bodies, nodes, refusal, else_expr, filename)
+                        ir_put_node(&fields, &live, 1, else_id)
+                        ir_put_node(&fields, &live, 2, condition_id)
+                        ir_put_pos(&fields, &live, 3, if_pos, filename)
+                        ir_put_node(&fields, &live, 4, then_id)
+                        return ir_emit_node(bodies, nodes, 258, fields, live)
+                    Ast::Expr.Match(scrutinee, arms, match_pos):
+                        scrutinee_id: u32 = ir_expr_node(bodies, nodes, refusal, scrutinee, filename)
+                        arms_payload: mutable darray[u8] = []
+                        ir_arms_out(&arms_payload, bodies, nodes, refusal, arms, filename)
+                        ir_put_raw(&fields, &live, 1, arms_payload)
+                        ir_put_pos(&fields, &live, 2, match_pos, filename)
+                        ir_put_node(&fields, &live, 4, scrutinee_id)
+                        return ir_emit_node(bodies, nodes, 172, fields, live)
+                    Ast::Expr.Block(statements, value, captures, block_pos):
+                        statement_ids: mutable darray[u32] = []
+                        for statement in statements |bodies, nodes, refusal, statement_ids|:
+                            statement_ids.push(ir_stmt_node(bodies, nodes, refusal, statement, filename))
+                        value_id: u32 = ir_expr_node(bodies, nodes, refusal, value, filename)
+                        ir_put_str_list(&fields, &live, 1, captures)
+                        ir_put_pos(&fields, &live, 2, block_pos, filename)
+                        ir_put_node_list(&fields, &live, 3, statement_ids)
+                        ir_put_node(&fields, &live, 4, value_id)
+                        return ir_emit_node(bodies, nodes, 59, fields, live)
+                    Ast::Expr.Lambda(parameter_names, body, lambda_pos):
+                        body_ids: mutable darray[u32] = []
+                        for statement in body |bodies, nodes, refusal, body_ids|:
+                            body_ids.push(ir_stmt_node(bodies, nodes, refusal, statement, filename))
+                        params_payload: mutable darray[u8] = []
+                        ir_uvarint_out(&params_payload, parameter_names.count.u64())
+                        for parameter_name in parameter_names |params_payload|:
+                            ir_named_param_out(&params_payload, parameter_name)
+                        ir_put_node_list(&fields, &live, 1, body_ids)
+                        ir_put_raw(&fields, &live, 5, params_payload) if parameter_names.count != 0
+                        ir_put_pos(&fields, &live, 6, lambda_pos, filename)
+                        return ir_emit_node(bodies, nodes, 146, fields, live)
+                    # `T where PRED` stands for BOTH of stage0's TryExpr and GetExpr in
+                    # stage1's AST, so there is no single node to pick. Refused by name
+                    # rather than guessed: this is exactly the false clean the format
+                    # makes easy to produce.
+                    Ast::Expr.Refinement(_, _, _):
+                        ir_refuse(refusal, "refinement (`try` / `get` are one node in stage1)")
+                        return 0
+                    _:
+                        ir_refuse(refusal, "expression")
+                        return 0
+
+        # A `ParamDecl` inline struct carrying only a name — the shape a lambda's
+        # parameter list needs.
+        def ir_named_param_out(payload: mutable darray[u8]&, name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                ir_put_str(&fields, &live, 3, name)
+                ir_uvarint_out(payload, 204)
+                ir_uvarint_out(payload, live.u64())
+                for byte in fields |payload|:
+                    payload.push(byte)
+
+        # ---- patterns -----------------------------------------------------------
+
+        def ir_pattern_node(bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, pattern: Ast::Pattern, filename: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                match pattern:
+                    Ast::Pattern.Wildcard:
+                        return ir_emit_node(bodies, nodes, 184, fields, live)
+                    Ast::Pattern.Binding(name):
+                        ir_put_str(&fields, &live, 2, name)
+                        return ir_emit_node(bodies, nodes, 171, fields, live)
+                    # The literal's KIND is deferred in stage1's AST (only the raw text is
+                    # kept), and stage0 has a separate node for a string literal pattern.
+                    # A leading quote is the discriminator the text does carry.
+                    Ast::Pattern.Literal(text):
+                        if sview_len(text) != 0 and sview_at(text, 0) == 34:
+                            ir_put_str(&fields, &live, 2, text)
+                            return ir_emit_node(bodies, nodes, 180, fields, live)
+                        value_id: u32 = ir_literal_value_node(bodies, nodes, refusal, text, filename)
+                        ir_put_node(&fields, &live, 3, value_id)
+                        return ir_emit_node(bodies, nodes, 174, fields, live)
+                    Ast::Pattern.Variant(path, subpatterns):
+                        enum_name: mutable darray[u8] = []
+                        variant_name: mutable darray[u8] = []
+                        if not ir_split_last_component(path, &enum_name, &variant_name):
+                            ir_refuse(refusal, "variant pattern path")
+                            return 0
+                        args_payload: mutable darray[u8] = []
+                        ir_pattern_args_out(&args_payload, bodies, nodes, refusal, subpatterns, filename)
+                        ir_put_raw(&fields, &live, 1, args_payload)
+                        ir_put_str(&fields, &live, 3, sview(&enum_name[0], 0, enum_name.count.i64())) if enum_name.count != 0
+                        ir_put_str(&fields, &live, 7, sview(&variant_name[0], 0, variant_name.count.i64()))
+                        return ir_emit_node(bodies, nodes, 183, fields, live)
+                    Ast::Pattern.Struct(path, subpatterns):
+                        args_payload: mutable darray[u8] = []
+                        ir_pattern_args_out(&args_payload, bodies, nodes, refusal, subpatterns, filename)
+                        ir_put_raw(&fields, &live, 1, args_payload)
+                        ir_put_bool(&fields, &live, 3, true)
+                        ir_put_str(&fields, &live, 7, path)
+                        return ir_emit_node(bodies, nodes, 181, fields, live)
+                    Ast::Pattern.Tuple(elements):
+                        element_ids: mutable darray[u32] = []
+                        for element in elements |bodies, nodes, refusal, element_ids|:
+                            element_ids.push(ir_pattern_node(bodies, nodes, refusal, element, filename))
+                        ir_put_node_list(&fields, &live, 1, element_ids)
+                        return ir_emit_node(bodies, nodes, 182, fields, live)
+                    _:
+                        ir_refuse(refusal, "pattern")
+                        return 0
+
+        # A pattern's literal text as the expression node stage0's MatchLiteralPattern
+        # holds. Only the forms whose spelling survives are accepted.
+        def ir_literal_value_node(bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, text: sview, filename: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                if text == "true" or text == "false":
+                    ir_put_bool(&fields, &live, 2, text == "true")
+                    return ir_emit_node(bodies, nodes, 18, fields, live)
+                if sview_len(text) != 0 and sview_at(text, 0) == 39:
+                    ir_put_str(&fields, &live, 2, text)
+                    return ir_emit_node(bodies, nodes, 28, fields, live)
+                digit_only: mutable bool = sview_len(text) != 0
+                for index in 0..<sview_len(text).i64() |digit_only, text|:
+                    digit_only <- false if sview_at(text, index) < 48 or sview_at(text, index) > 57
+                if not digit_only:
+                    ir_refuse(refusal, "literal pattern")
+                    return 0
+                ir_put_str(&fields, &live, 4, text)
+                return ir_emit_node(bodies, nodes, 139, fields, live)
+
+        def ir_pattern_args_out(payload: mutable darray[u8]&, bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, subpatterns: darray[Ast::Pattern]&, filename: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if subpatterns.count == 0
+                ir_uvarint_out(payload, subpatterns.count.u64())
+                for subpattern_index in 0..<subpatterns.count |payload, bodies, nodes, refusal|:
+                    label: mutable darray[u8] = []
+                    inner: mutable Ast::Pattern = subpatterns[subpattern_index]
+                    # `{field: binding}` keeps the selector on a `Field` wrapper; stage0
+                    # carries it as the argument's Name instead.
+                    match subpatterns[subpattern_index]:
+                        Ast::Pattern.Field(selector, nested):
+                            label.extend(selector)
+                            inner <- nested[0] if nested.count != 0
+                        _:
+                            pass
+                    inner_id: u32 = ir_pattern_node(bodies, nodes, refusal, inner, filename)
+                    fields: mutable darray[u8] = []
+                    live: mutable u32 = 0
+                    ir_put_str(&fields, &live, 1, sview(&label[0], 0, label.count.i64())) if label.count != 0
+                    ir_put_node(&fields, &live, 2, inner_id)
+                    ir_uvarint_out(payload, 176)
+                    ir_uvarint_out(payload, live.u64())
+                    for byte in fields |payload|:
+                        payload.push(byte)
+
+        # `A.B.C` -> ("A.B", "C"). Answers false for a bare name with no owner, which is
+        # not a variant path.
+        def ir_split_last_component(path: sview, out_owner: mutable darray[u8]&, out_last: mutable darray[u8]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                length: i64 = sview_len(path).i64()
+                false return if length == 0
+                split: mutable i64 = -1
+                for index in 0..<length |split, path|:
+                    split <- index if sview_at(path, index) == 46
+                if split < 0:
+                    out_last.extend(path)
+                    return true
+                for index in 0..<split |out_owner, path|:
+                    out_owner.push(sview_at(path, index))
+                for index in (split + 1)..<length |out_last, path|:
+                    out_last.push(sview_at(path, index))
+                return true
+
+        def ir_arms_out(payload: mutable darray[u8]&, bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, arms: darray[Ast::MatchArm]&, filename: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if arms.count == 0
+                ir_uvarint_out(payload, arms.count.u64())
+                for arm_index in 0..<arms.count |payload, bodies, nodes, refusal|:
+                    pattern_id: u32 = ir_pattern_node(bodies, nodes, refusal, arms[arm_index].pattern, filename)
+                    guard_id: u32 = ir_expr_node(bodies, nodes, refusal, arms[arm_index].guard, filename)
+                    body_ids: mutable darray[u32] = []
+                    for statement in arms[arm_index].body |bodies, nodes, refusal, body_ids|:
+                        body_ids.push(ir_stmt_node(bodies, nodes, refusal, statement, filename))
+                    fields: mutable darray[u8] = []
+                    live: mutable u32 = 0
+                    ir_put_node_list(&fields, &live, 1, body_ids)
+                    ir_put_node(&fields, &live, 2, guard_id)
+                    ir_put_node(&fields, &live, 3, pattern_id)
+                    ir_uvarint_out(payload, 170)
+                    ir_uvarint_out(payload, live.u64())
+                    for byte in fields |payload|:
+                        payload.push(byte)
+
+        # ---- statements ---------------------------------------------------------
+
+        def ir_stmt_node(bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, statement: Ast::Stmt, filename: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                match statement:
+                    Ast::Stmt.Invalid:
+                        ir_refuse(refusal, "malformed statement")
+                        return 0
+                    Ast::Stmt.Expr(expression, expr_pos):
+                        expression_id: u32 = ir_expr_node(bodies, nodes, refusal, expression, filename)
+                        ir_put_node(&fields, &live, 1, expression_id)
+                        ir_put_pos(&fields, &live, 2, expr_pos, filename)
+                        return ir_emit_node(bodies, nodes, 60, fields, live)
+                    Ast::Stmt.Return(value, return_pos):
+                        value_id: mutable u32 = 0
+                        if value is return_value:
+                            value_id <- ir_expr_node(bodies, nodes, refusal, return_value, filename)
+                        ir_put_pos(&fields, &live, 1, return_pos, filename)
+                        ir_put_node(&fields, &live, 2, value_id)
+                        return ir_emit_node(bodies, nodes, 228, fields, live)
+                    Ast::Stmt.VarDecl(name, type_expression, value, var_pos):
+                        # stage0 carries a local's mutability on the STATEMENT and its type
+                        # WITHOUT the qualifier; emitting both printed `mutable mutable i64`.
+                        type_id: u32 = ir_type_node(bodies, nodes, refusal, ir_strip_mutable(type_expression), filename)
+                        value_id: u32 = ir_expr_node(bodies, nodes, refusal, value, filename)
+                        ir_put_bool(&fields, &live, 2, ir_type_is_mutable(type_expression))
+                        ir_put_str(&fields, &live, 3, name)
+                        ir_put_pos(&fields, &live, 5, var_pos, filename)
+                        ir_put_node(&fields, &live, 6, type_id)
+                        ir_put_node(&fields, &live, 7, value_id)
+                        return ir_emit_node(bodies, nodes, 271, fields, live)
+                    Ast::Stmt.Assign(target, operator, value, assign_pos):
+                        target_id: u32 = ir_expr_node(bodies, nodes, refusal, target, filename)
+                        value_id: u32 = ir_expr_node(bodies, nodes, refusal, value, filename)
+                        # The three forms are three different stage0 nodes, and the
+                        # difference is not cosmetic: `=` DEFINES a local (or discards, for
+                        # `_`), `<-` MUTATES an existing one, and a compound carries its
+                        # operator. Collapsing them printed `_ <- b` for a discard.
+                        if operator == TokenKind.Assign:
+                            if ir_is_underscore(target):
+                                ir_put_pos(&fields, &live, 1, assign_pos, filename)
+                                ir_put_node(&fields, &live, 2, value_id)
+                                return ir_emit_node(bodies, nodes, 40, fields, live)
+                            bound_name: mutable darray[u8] = []
+                            if not ir_dotted_name(&bound_name, target):
+                                ir_refuse(refusal, "definition target")
+                                return 0
+                            ir_put_str(&fields, &live, 3, sview(&bound_name[0], 0, bound_name.count.i64()))
+                            ir_put_pos(&fields, &live, 5, assign_pos, filename)
+                            ir_put_node(&fields, &live, 7, value_id)
+                            return ir_emit_node(bodies, nodes, 271, fields, live)
+                        if operator == TokenKind.LArrow:
+                            ir_put_pos(&fields, &live, 5, assign_pos, filename)
+                            ir_put_node(&fields, &live, 6, target_id)
+                            ir_put_node(&fields, &live, 7, value_id)
+                            return ir_emit_node(bodies, nodes, 12, fields, live)
+                        ir_put_int(&fields, &live, 1, emit_tokens_kind_code(operator).i64() - 1)
+                        ir_put_pos(&fields, &live, 2, assign_pos, filename)
+                        ir_put_node(&fields, &live, 3, target_id)
+                        ir_put_node(&fields, &live, 4, value_id)
+                        return ir_emit_node(bodies, nodes, 14, fields, live)
+                    Ast::Stmt.If(condition, then_body, else_body, if_pos):
+                        condition_id: u32 = ir_expr_node(bodies, nodes, refusal, condition, filename)
+                        then_ids: mutable darray[u32] = []
+                        for statement_in_then in then_body |bodies, nodes, refusal, then_ids|:
+                            then_ids.push(ir_stmt_node(bodies, nodes, refusal, statement_in_then, filename))
+                        else_ids: mutable darray[u32] = []
+                        for statement_in_else in else_body |bodies, nodes, refusal, else_ids|:
+                            else_ids.push(ir_stmt_node(bodies, nodes, refusal, statement_in_else, filename))
+                        ir_put_node(&fields, &live, 1, condition_id)
+                        ir_put_node_list(&fields, &live, 3, else_ids)
+                        ir_put_bool(&fields, &live, 4, true)
+                        ir_put_pos(&fields, &live, 6, if_pos, filename)
+                        ir_put_node_list(&fields, &live, 7, then_ids)
+                        return ir_emit_node(bodies, nodes, 133, fields, live)
+                    Ast::Stmt.While(condition, body, while_pos):
+                        condition_id: u32 = ir_expr_node(bodies, nodes, refusal, condition, filename)
+                        body_ids: mutable darray[u32] = []
+                        for statement_in_body in body |bodies, nodes, refusal, body_ids|:
+                            body_ids.push(ir_stmt_node(bodies, nodes, refusal, statement_in_body, filename))
+                        ir_put_node_list(&fields, &live, 1, body_ids)
+                        ir_put_node(&fields, &live, 3, condition_id)
+                        ir_put_pos(&fields, &live, 5, while_pos, filename)
+                        return ir_emit_node(bodies, nodes, 276, fields, live)
+                    Ast::Stmt.For(bind, variables, iterable, body, for_pos):
+                        if variables.count != 1:
+                            ir_refuse(refusal, "destructuring for-loop")
+                            return 0
+                        pattern_fields: mutable darray[u8] = []
+                        pattern_live: mutable u32 = 0
+                        ir_put_str(&pattern_fields, &pattern_live, 1, variables[0])
+                        pattern_id: u32 = ir_emit_node(bodies, nodes, 187, pattern_fields, pattern_live)
+                        source_id: u32 = ir_expr_node(bodies, nodes, refusal, iterable, filename)
+                        body_ids: mutable darray[u32] = []
+                        for statement_in_body in body |bodies, nodes, refusal, body_ids|:
+                            body_ids.push(ir_stmt_node(bodies, nodes, refusal, statement_in_body, filename))
+                        ir_put_node_list(&fields, &live, 1, body_ids)
+                        ir_put_node(&fields, &live, 5, pattern_id)
+                        ir_put_pos(&fields, &live, 8, for_pos, filename)
+                        ir_put_node(&fields, &live, 12, source_id)
+                        return ir_emit_node(bodies, nodes, 143, fields, live)
+                    # stage0's BreakStmt and ContinueStmt carry no label, so a labelled
+                    # one has no node to land in.
+                    Ast::Stmt.Break(label, break_pos):
+                        if sview_len(label) != 0:
+                            ir_refuse(refusal, "labelled break")
+                            return 0
+                        ir_put_pos(&fields, &live, 1, break_pos, filename)
+                        return ir_emit_node(bodies, nodes, 19, fields, live)
+                    Ast::Stmt.Continue(label, continue_pos):
+                        if sview_len(label) != 0:
+                            ir_refuse(refusal, "labelled continue")
+                            return 0
+                        ir_put_pos(&fields, &live, 1, continue_pos, filename)
+                        return ir_emit_node(bodies, nodes, 34, fields, live)
+                    Ast::Stmt.Match(scrutinee, arms, match_pos):
+                        scrutinee_id: u32 = ir_expr_node(bodies, nodes, refusal, scrutinee, filename)
+                        arms_payload: mutable darray[u8] = []
+                        ir_arms_out(&arms_payload, bodies, nodes, refusal, arms, filename)
+                        ir_put_raw(&fields, &live, 1, arms_payload)
+                        ir_put_pos(&fields, &live, 2, match_pos, filename)
+                        ir_put_node(&fields, &live, 4, scrutinee_id)
+                        return ir_emit_node(bodies, nodes, 179, fields, live)
+                    _:
+                        ir_refuse(refusal, "statement")
+                        return 0
+
+        # Does any local in this body declare a heap container? That is stage0's trigger
+        # for inference-by-default (`maybeWrapFunctionBodyInAutoRegion`), reproduced here
+        # only closely enough to DECLINE — never closely enough to claim the wrap.
+        def ir_body_allocates_regionlessly(body: darray[Ast::Stmt]&) -> bool:
+            can Abort.Panic, Memory.Allocate:
+                for statement in body:
+                    match statement:
+                        Ast::Stmt.VarDecl(_, type_expression, _, _):
+                            true return if ir_type_is_container(ir_strip_mutable(type_expression))
+                        Ast::Stmt.If(_, then_body, else_body, _):
+                            true return if ir_body_allocates_regionlessly(then_body)
+                            true return if ir_body_allocates_regionlessly(else_body)
+                        Ast::Stmt.While(_, inner_body, _):
+                            true return if ir_body_allocates_regionlessly(inner_body)
+                        Ast::Stmt.For(_, _, _, inner_body, _):
+                            true return if ir_body_allocates_regionlessly(inner_body)
+                        Ast::Stmt.Block(_, _, _, inner_body, _):
+                            true return if ir_body_allocates_regionlessly(inner_body)
+                        _:
+                            pass
+                return false
+
+        def ir_type_is_container(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic, Memory.Allocate:
+                head: mutable Ast::Expr = type_expression
+                match type_expression:
+                    Ast::Expr.Index(object, _, _):
+                        head <- object
+                    Ast::Expr.IndexN(object, _, _):
+                        head <- object
+                    _:
+                        return false
+                match head:
+                    Ast::Expr.Ident(name, _):
+                        return name == "darray" or name == "dict" or name == "set" or name == "deque"
+                    _:
+                        return false
+                return false
+
+        # Peel a leading `mutable` off a declared type: stage0 records the qualifier on the
+        # declaration and the bare type underneath it.
+        def ir_strip_mutable(type_expression: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic:
+                match type_expression:
+                    Ast::Expr.Unary(operator, operand, _):
+                        operand return if operator == TokenKind.Mutable
+                        return type_expression
+                    _:
+                        return type_expression
+                return type_expression
+
+        # `_` as an assignment target is a DISCARD, not a binding.
+        def ir_is_underscore(target: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match target:
+                    Ast::Expr.Ident(name, _):
+                        return name == "_"
+                    _:
+                        return false
+                return false
+
+        # Is a declared type written `mutable T`? stage0 carries mutability on the
+        # VarDeclStmt as well as in the type, and its unparser reads the statement.
+        def ir_type_is_mutable(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Ast::Expr.Unary(operator, _, _):
+                        return operator == TokenKind.Mutable
+                    _:
+                        return false
+                return false
+
+        # ---- declarations -------------------------------------------------------
+
+        # `ParamDecl` is an inline struct, not a node: type ID then fields.
+        def ir_param_out(payload: mutable darray[u8]&, bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, parameter: Ast::ParamDecl&, filename: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                declared_type_id: u32 = ir_type_node(bodies, nodes, refusal, parameter.type_expression, filename)
+                # `T!` is a ref carrying the AFFINE typestate in stage0, not a bare `T`.
+                type_id: mutable u32 = declared_type_id
+                if parameter.is_affine and declared_type_id != 0:
+                    affine_fields: mutable darray[u8] = []
+                    affine_live: mutable u32 = 0
+                    ir_put_node(&affine_fields, &affine_live, 1, declared_type_id)
+                    ir_put_int(&affine_fields, &affine_live, 5, 2)
+                    type_id <- ir_emit_node(bodies, nodes, 220, affine_fields, affine_live)
+                default_id: mutable u32 = 0
+                if parameter.has_default:
+                    default_id <- ir_expr_node(bodies, nodes, refusal, parameter.default_value, filename)
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                ir_put_node(&fields, &live, 1, default_id)
+                ir_put_bool(&fields, &live, 2, parameter.is_mutable)
+                ir_put_str(&fields, &live, 3, parameter.name)
+                ir_put_node(&fields, &live, 5, type_id)
+                ir_uvarint_out(payload, 204)
+                ir_uvarint_out(payload, live.u64())
+                for byte in fields |payload|:
+                    payload.push(byte)
+
+        def ir_decl_node(bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, declaration: Ast::Decl, filename: sview) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                match declaration:
+                    Ast::Decl.Func(name, params, return_type, body, effects, decorators, func_pos):
+                        # stage0's PARSER wraps a body that allocates region-lessly in a
+                        # synthesized `__auto_<offset>` region, and its bundle carries that
+                        # wrap because `-emit ir` writes the post-parse, post-analysis tree.
+                        # stage1's parser does no such wrap, so the two trees describe
+                        # different programs. Detected conservatively — a container local
+                        # anywhere in the body — and REFUSED, because the alternative is a
+                        # bundle that decodes cleanly and unparses a different function.
+                        if ir_body_allocates_regionlessly(body):
+                            ir_refuse(refusal, "function body needing stage0's synthesized auto-region")
+                            return 0
+                        params_payload: mutable darray[u8] = []
+                        if params.count != 0:
+                            ir_uvarint_out(&params_payload, params.count.u64())
+                            for parameter_index in 0..<params.count |bodies, nodes, refusal, params_payload|:
+                                ir_param_out(&params_payload, bodies, nodes, refusal, &params[parameter_index], filename)
+                        return_type_id: mutable u32 = 0
+                        if return_type is declared_return_type:
+                            return_type_id <- ir_type_node(bodies, nodes, refusal, declared_return_type, filename)
+                        body_ids: mutable darray[u32] = []
+                        for statement in body |bodies, nodes, refusal, body_ids|:
+                            body_ids.push(ir_stmt_node(bodies, nodes, refusal, statement, filename))
+                        ir_put_node_list(&fields, &live, 3, body_ids)
+                        ir_put_str(&fields, &live, 20, name)
+                        ir_put_raw(&fields, &live, 23, params_payload)
+                        ir_put_pos(&fields, &live, 26, func_pos, filename)
+                        ir_put_node(&fields, &live, 31, return_type_id)
+                        return ir_emit_node(bodies, nodes, 71, fields, live)
+                    Ast::Decl.Struct(name, members, affinity, has_named_states, has_derive, invariants, struct_pos):
+                        if has_named_states or has_derive:
+                            ir_refuse(refusal, "typestate struct")
+                            return 0
+                        members_payload: mutable darray[u8] = []
+                        if members.count != 0:
+                            ir_uvarint_out(&members_payload, members.count.u64())
+                            for member_index in 0..<members.count |bodies, nodes, refusal, members_payload|:
+                                ir_field_decl_out(&members_payload, bodies, nodes, refusal, &members[member_index], filename)
+                        invariant_ids: mutable darray[u32] = []
+                        for invariant in invariants |bodies, nodes, refusal, invariant_ids|:
+                            invariant_ids.push(ir_expr_node(bodies, nodes, refusal, invariant, filename))
+                        ir_put_bool(&fields, &live, 1, affinity == "affine" or affinity == "linear")
+                        ir_put_raw(&fields, &live, 5, members_payload)
+                        ir_put_node_list(&fields, &live, 8, invariant_ids)
+                        ir_put_str(&fields, &live, 10, name)
+                        ir_put_pos(&fields, &live, 12, struct_pos, filename)
+                        return ir_emit_node(bodies, nodes, 254, fields, live)
+                    Ast::Decl.Enum(name, variants, is_const, storage_type, enum_pos):
+                        if is_const:
+                            members_payload: mutable darray[u8] = []
+                            if variants.count != 0:
+                                ir_uvarint_out(&members_payload, variants.count.u64())
+                                for variant_index in 0..<variants.count |bodies, nodes, refusal, members_payload|:
+                                    ir_const_member_out(&members_payload, bodies, nodes, refusal, &variants[variant_index], filename)
+                            storage_id: u32 = ir_type_node(bodies, nodes, refusal, storage_type, filename)
+                            ir_put_raw(&fields, &live, 1, members_payload)
+                            ir_put_str(&fields, &live, 2, name)
+                            ir_put_pos(&fields, &live, 3, enum_pos, filename)
+                            ir_put_node(&fields, &live, 4, storage_id)
+                            return ir_emit_node(bodies, nodes, 32, fields, live)
+                        variants_payload: mutable darray[u8] = []
+                        if variants.count != 0:
+                            ir_uvarint_out(&variants_payload, variants.count.u64())
+                            for variant_index in 0..<variants.count |bodies, nodes, refusal, variants_payload|:
+                                ir_variant_out(&variants_payload, bodies, nodes, refusal, &variants[variant_index], filename)
+                        ir_put_str(&fields, &live, 7, name)
+                        ir_put_pos(&fields, &live, 10, enum_pos, filename)
+                        ir_put_raw(&fields, &live, 11, variants_payload)
+                        return ir_emit_node(bodies, nodes, 47, fields, live)
+                    Ast::Decl.Alias(name, target, alias_pos):
+                        target_id: u32 = ir_type_node(bodies, nodes, refusal, target, filename)
+                        ir_put_str(&fields, &live, 1, name)
+                        ir_put_pos(&fields, &live, 2, alias_pos, filename)
+                        ir_put_node(&fields, &live, 3, target_id)
+                        return ir_emit_node(bodies, nodes, 266, fields, live)
+                    Ast::Decl.Import(module, import_pos):
+                        ir_put_str(&fields, &live, 1, module)
+                        ir_put_pos(&fields, &live, 3, import_pos, filename)
+                        return ir_emit_node(bodies, nodes, 136, fields, live)
+                    Ast::Decl.Module(name, body, module_pos):
+                        # stage0 spells a nested namespace `Outer.Inner`, not `Outer::Inner`.
+                        dotted_module: mutable darray[u8] = []
+                        skip_next_colon: mutable bool = false
+                        for index in 0..<sview_len(name).i64() |dotted_module, name, skip_next_colon|:
+                            if skip_next_colon:
+                                skip_next_colon <- false
+                                continue
+                            if sview_at(name, index) == 58 and index + 1 < sview_len(name).i64() and sview_at(name, index + 1) == 58:
+                                dotted_module.push(46)
+                                skip_next_colon <- true
+                                continue
+                            dotted_module.push(sview_at(name, index))
+                        member_ids: mutable darray[u32] = []
+                        for member in body |bodies, nodes, refusal, member_ids|:
+                            member_ids.push(ir_decl_node(bodies, nodes, refusal, member, filename))
+                        ir_put_node_list(&fields, &live, 2, member_ids)
+                        ir_put_bool(&fields, &live, 4, true)
+                        ir_put_str(&fields, &live, 5, sview(&dotted_module[0], 0, dotted_module.count.i64()))
+                        ir_put_pos(&fields, &live, 6, module_pos, filename)
+                        return ir_emit_node(bodies, nodes, 195, fields, live)
+                    Ast::Decl.Const(name, type_expression, value, is_mutable, const_pos):
+                        type_id: u32 = ir_type_node(bodies, nodes, refusal, type_expression, filename)
+                        value_id: u32 = ir_expr_node(bodies, nodes, refusal, value, filename)
+                        if is_mutable:
+                            ir_put_bool(&fields, &live, 1, true)
+                            ir_put_str(&fields, &live, 2, name)
+                            ir_put_pos(&fields, &live, 3, const_pos, filename)
+                            ir_put_node(&fields, &live, 4, type_id)
+                            ir_put_node(&fields, &live, 5, value_id)
+                            return ir_emit_node(bodies, nodes, 77, fields, live)
+                        ir_put_str(&fields, &live, 1, name)
+                        ir_put_pos(&fields, &live, 2, const_pos, filename)
+                        ir_put_node(&fields, &live, 3, type_id)
+                        ir_put_node(&fields, &live, 4, value_id)
+                        return ir_emit_node(bodies, nodes, 31, fields, live)
+                    # An `impl` body and a `static if` branch are the SAME stage1 node, so
+                    # neither can be recovered from it.
+                    Ast::Decl.Scoped(_, _):
+                        ir_refuse(refusal, "impl / static-if scope (one node in stage1)")
+                        return 0
+                    _:
+                        ir_refuse(refusal, "declaration")
+                        return 0
+
+        def ir_field_decl_out(payload: mutable darray[u8]&, bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, member: Ast::StructMember&, filename: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                type_id: u32 = ir_type_node(bodies, nodes, refusal, ir_strip_mutable(member.type_expression), filename)
+                default_id: mutable u32 = 0
+                if member.has_default:
+                    default_id <- ir_expr_node(bodies, nodes, refusal, member.default_value, filename)
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                ir_put_node(&fields, &live, 3, default_id)
+                ir_put_bool(&fields, &live, 4, member.is_ghost)
+                ir_put_bool(&fields, &live, 6, ir_type_is_mutable(member.type_expression))
+                ir_put_str(&fields, &live, 7, member.name)
+                ir_put_node(&fields, &live, 9, type_id)
+                ir_uvarint_out(payload, 64)
+                ir_uvarint_out(payload, live.u64())
+                for byte in fields |payload|:
+                    payload.push(byte)
+
+        def ir_variant_out(payload: mutable darray[u8]&, bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, variant: Ast::EnumVariant&, filename: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                ir_put_str(&fields, &live, 1, variant.name)
+                payload_fields: mutable darray[u8] = []
+                if variant.fields.count != 0:
+                    ir_uvarint_out(&payload_fields, variant.fields.count.u64())
+                    for field_index in 0..<variant.fields.count |bodies, nodes, refusal, payload_fields|:
+                        type_id: u32 = ir_type_node(bodies, nodes, refusal, variant.fields[field_index], filename)
+                        one: mutable darray[u8] = []
+                        one_live: mutable u32 = 0
+                        ir_put_str(&one, &one_live, 1, variant.field_names[field_index]) if field_index < variant.field_names.count
+                        ir_put_node(&one, &one_live, 4, type_id)
+                        ir_uvarint_out(&payload_fields, 48)
+                        ir_uvarint_out(&payload_fields, one_live.u64())
+                        for byte in one |payload_fields|:
+                            payload_fields.push(byte)
+                ir_put_raw(&fields, &live, 2, payload_fields)
+                ir_uvarint_out(payload, 49)
+                ir_uvarint_out(payload, live.u64())
+                for byte in fields |payload|:
+                    payload.push(byte)
+
+        def ir_const_member_out(payload: mutable darray[u8]&, bodies: mutable darray[u8]&, nodes: mutable u32&, refusal: mutable darray[u8]&, variant: Ast::EnumVariant&, filename: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                value_id: u32 = ir_expr_node(bodies, nodes, refusal, variant.value_expr, filename)
+                fields: mutable darray[u8] = []
+                live: mutable u32 = 0
+                ir_put_str(&fields, &live, 1, variant.name)
+                ir_put_node(&fields, &live, 3, value_id)
+                ir_uvarint_out(payload, 33)
+                ir_uvarint_out(payload, live.u64())
+                for byte in fields |payload|:
+                    payload.push(byte)
+    public:
+        # Serialize `file` as a v2 `.elisair` bundle. On refusal the returned buffer is
+        # empty and `refusal` names the construct that stopped the walk.
+        def ir_write_bundle(file: Ast::File&, filename: sview, source: sview, refusal: mutable darray[u8]&) -> darray[u8]:
+            can Memory.Allocate, Abort.Panic:
+                # A few constructs are consumed by stage1's PARSER and never reach the
+                # AST — `using` is the live one (parser_decl_module.elisa consumes the
+                # whole target list, aliases and all). The walk cannot refuse what it
+                # cannot see, so the source is scanned for them first. A source scan is
+                # conservative by construction: at worst it declines a file it could have
+                # written, which costs coverage, never correctness.
+                unmodelled: sview = ir_source_unmodelled(source)
+                if sview_len(unmodelled) != 0:
+                    refusal.extend(unmodelled)
+                bodies: mutable darray[u8] = []
+                nodes: mutable u32 = 0
+                decl_ids: mutable darray[u32] = []
+                for declaration in file.top_decls |bodies, nodes, refusal, decl_ids|:
+                    decl_ids.push(ir_decl_node(&bodies, &nodes, refusal, declaration, filename))
+                root_fields: mutable darray[u8] = []
+                root_live: mutable u32 = 0
+                ir_put_node_list(&root_fields, &root_live, 2, decl_ids)
+                ir_put_str(&root_fields, &root_live, 3, filename)
+                root_id: u32 = ir_emit_node(&bodies, &nodes, 66, root_fields, root_live)
+                image: mutable darray[u8] = []
+                image return if refusal.count != 0
+                image.extend("ELISAIR2\n")
+                ir_uvarint_out(&image, 2)
+                ir_str_out(&image, filename)
+                ir_uvarint_out(&image, sview_len(source).u64())
+                image.extend(source)
+                ir_write_type_table(&image)
+                ir_uvarint_out(&image, nodes.u64())
+                for byte in bodies |image|:
+                    image.push(byte)
+                ir_uvarint_out(&image, root_id.u64())
+                return image
