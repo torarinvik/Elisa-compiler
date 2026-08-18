@@ -50,16 +50,33 @@ extend Semantic:
                     return InferType{kind: SemTypeKind.Tuple, name: "tuple"}
                 # Indexing a container-typed local: `xs[i]` yields the element type,
                 # `d[k]` the dict VALUE type (Phase C — via the interned type table).
-                # Only bare-Ident receivers are modeled; `.cast[T]`'s bracket is a
-                # type application (object is a Field), so it stays Unknown here.
+                # Structural receivers are modeled through fields and indexes; `.cast[T]`
+                # remains Unknown because its bracket is a type application, not indexing.
                 if expression is Expr.Index(indexed_object, index_expression, index_line):
-                    if indexed_object is Expr.Ident(container_name, container_line):
-                        element_type: InferType = infer_from_type_id(indexed_element_type_id(local_type_id_of(container_name, table), table), table)
-                        element_type return if element_type.kind != SemTypeKind.Unknown
-                        # Indexing a STRING local yields a char (oracle-verified:
-                        # stage0 types `s[0]` char for cstr/dstr/sview).
-                        receiver_type: InferType = infer_expression_type(indexed_object, names, types, table)
-                        primitive_type(SemTypeKind.Char) return if receiver_type.kind == SemTypeKind.String
+                    # Use the structural expression channel for every receiver shape, not
+                    # only a bare identifier.  This covers `state.rows[i].raw[j]` and similar
+                    # chains through reference parameters; the previous bare-ident-only arm
+                    # silently returned Unknown for those chains, letting an invalid `get`
+                    # initializer reach backend lowering.
+                    receiver_id: u32 = structural_type_id_of(indexed_object, names, types, table)
+                    element_type: InferType = infer_from_type_id(indexed_element_type_id(receiver_id, table), table)
+                    element_type return if element_type.kind != SemTypeKind.Unknown
+                    # Indexing a STRING local yields a char (oracle-verified:
+                    # stage0 types `s[0]` char for cstr/dstr/sview).
+                    receiver_type: InferType = infer_expression_type(indexed_object, names, types, table)
+                    primitive_type(SemTypeKind.Char) return if receiver_type.kind == SemTypeKind.String
+                    return primitive_type(SemTypeKind.Unknown)
+                if expression is Expr.IndexN(indexed_object_n, index_arguments, index_n_line):
+                    # Multi-argument subscripts use the same structural walk as repeated
+                    # single indexes.  Type applications (for example `.cast[T]`) have no
+                    # container TypeId, so they naturally remain Unknown here.
+                    selected_id: mutable u32 = structural_type_id_of(indexed_object_n, names, types, table)
+                    for _ in index_arguments |selected_id|:
+                        selected_id <- indexed_element_type_id(selected_id, table)
+                    selected_type: InferType = infer_from_type_id(selected_id, table)
+                    selected_type return if selected_type.kind != SemTypeKind.Unknown
+                    receiver_type_n: InferType = infer_expression_type(indexed_object_n, names, types, table)
+                    primitive_type(SemTypeKind.Char) return if receiver_type_n.kind == SemTypeKind.String
                     return primitive_type(SemTypeKind.Unknown)
                 # NOTE: array/list literals `[…]` are deliberately NOT given a firm type here.
                 # `[]` (and `[…]`) is the canonical empty/collection initializer for dstr and
@@ -78,8 +95,16 @@ extend Semantic:
                         # Structural field (Phase C): `p.items` where items is a
                         # container/optional-typed registered field.
                         structural_field: InferType = infer_from_type_id(field_type_id_of(table, object_type.name, field), table)
-                        structural_field return if structural_field.kind == SemTypeKind.Container or structural_field.kind == SemTypeKind.Optional
+                        structural_field return if structural_field.kind == SemTypeKind.Container or structural_field.kind == SemTypeKind.Optional or structural_field.kind == SemTypeKind.Ref
                         return primitive_type(SemTypeKind.Unknown)
+                    # Field access through a reference parameter has no Named coarse type,
+                    # but its structural row can still be unwrapped for an exact field type.
+                    field_object_id: mutable u32 = structural_type_id_of(object, names, types, table)
+                    while interned_kind(field_object_id, table) == SemTypeKind.Ref:
+                        field_object_id <- interned_elem(field_object_id, 0, table)
+                    if interned_kind(field_object_id, table) == SemTypeKind.Named:
+                        ref_field: InferType = infer_from_type_id(field_type_id_of(table, interned_name(field_object_id, table), field), table)
+                        ref_field return if ref_field.kind != SemTypeKind.Unknown
                     # Size fields of the KNOWN container heads are integers (usize) —
                     # user generics are excluded (their `count` could be anything).
                     is_known_container: bool = object_type.kind == SemTypeKind.Container and (object_type.name == "darray" or object_type.name == "dict" or object_type.name == "set" or object_type.name == "list" or object_type.name == "array")
@@ -106,6 +131,16 @@ extend Semantic:
                         structural_return: InferType = infer_from_type_id(function_return_type_id(table, function_name), table)
                         structural_return return if structural_return.kind == SemTypeKind.Container or structural_return.kind == SemTypeKind.Optional
                     return primitive_type(SemTypeKind.Unknown)
+                # The parser retains control-flow `get EXPR else return ...` as GetElse.
+                # Its value type is the guarded expression after the absence path exits.
+                # Without this arm, all such expressions inferred Unknown and bypassed the
+                # initializer type wall entirely.
+                if expression is Expr.GetElse(guarded, recovery, getelse_line):
+                    guarded_type: InferType = infer_expression_type(guarded, names, types, table)
+                    if guarded_type.kind == SemTypeKind.Optional:
+                        guarded_id: u32 = structural_type_id_of(guarded, names, types, table)
+                        return infer_from_type_id(interned_elem(guarded_id, 0, table), table)
+                    return guarded_type
                 if expression is Expr.Unary(operator, operand, unary_line):
                     primitive_type(SemTypeKind.Bool) return if operator == TokenKind.Not
                     # `!x` is the volatile/atomic READ sigil (NOT logical not — that's
@@ -144,7 +179,7 @@ extend Semantic:
                 return when row_kind:
                     SemTypeKind.Int | SemTypeKind.Float | SemTypeKind.String -> InferType{kind: row_kind, name: interned_name(type_id, table)}
                     SemTypeKind.Bool | SemTypeKind.Char -> primitive_type(row_kind)
-                    SemTypeKind.Named | SemTypeKind.Container | SemTypeKind.Optional -> InferType{kind: row_kind, name: interned_name(type_id, table)}
+                    SemTypeKind.Named | SemTypeKind.Container | SemTypeKind.Optional | SemTypeKind.Ref -> InferType{kind: row_kind, name: interned_name(type_id, table)}
                     _ -> primitive_type(SemTypeKind.Unknown)
 
 
@@ -153,10 +188,15 @@ extend Semantic:
         # (element 1). 0 (Unknown) for other heads/shapes.
         def indexed_element_type_id(container_id: u32, table: SymbolTable&) -> u32:
             can Abort.Panic:
-                0 return if interned_kind(container_id, table) != SemTypeKind.Container
-                head: sview = interned_name(container_id, table)
-                interned_elem(container_id, 0, table) return if head == "darray" or head == "array" or head == "set"
-                interned_elem(container_id, 1, table) return if head == "dict"
+                receiver_id: mutable u32 = container_id
+                # Indexing through `values: darray[T]&` is legal and yields T; the
+                # reference wrapper is storage, not the indexed container head.
+                while interned_kind(receiver_id, table) == SemTypeKind.Ref:
+                    receiver_id <- interned_elem(receiver_id, 0, table)
+                0 return if interned_kind(receiver_id, table) != SemTypeKind.Container
+                head: sview = interned_name(receiver_id, table)
+                interned_elem(receiver_id, 0, table) return if head == "darray" or head == "array" or head == "set"
+                interned_elem(receiver_id, 1, table) return if head == "dict"
                 return 0
 
 
