@@ -477,3 +477,70 @@ the operand-free instruction list, and all thirteen are implemented.
 liveness model (establish/read/overwrite over the instruction stream). Extend the corpus in
 `easm_lint_differential_smoke.sh` first and let the reachable-code count tell you the size of
 the set before writing anything.
+
+---
+
+## The AST carries SPANS now (2026-08-18)
+
+`§1.5` said the column span "needs token offsets threaded into the diagnostic record". That
+turned out to be the smaller half. The AST itself had nowhere to put one: every positioned
+node carried a bare `line: u32`, so the span did not exist to be threaded. Both remaining
+big-ticket items — diagnostics columns and the fact system, whose every position is
+`file:line:col-endcol` — were blocked on the same missing field.
+
+### What landed
+
+* **`Ast::Pos`** on all 48 positioned `Expr`/`Stmt`/`Decl` variants. It mirrors stage0's
+  `lexer.Pos` field for field (minus `File`, one per compilation, recovered from the
+  driver's flat-buffer line map) so the frontend-IR writer can emit stage0's own `Position`
+  nodes with no translation table.
+* **Real spans at 187 parser construction sites** (`pos_of_token`). 87 sites remain
+  line-only (`pos_at_line`) — synthesized nodes with no token behind them. `grep
+  pos_at_line` is the exact list.
+* **`Ast::expr_pos`** — an expression's own span, which is what stage0 reports a diagnostic
+  at. `if xs.count:` is reported at `xs.count`, not at the `if`.
+* **`Semantic::Diagnostic.pos`**, defaulted, and the driver prints `PATH:LINE:COL-ENDCOL:`
+  when it is set. A check that has not been threaded degrades to `PATH:LINE:` — what every
+  check printed before — so this converges check by check.
+
+### Why widening beat adding
+
+A new payload slot changes the ARITY of every pattern site: ~11,200 of them. Widening the
+existing one changes only the ~340 constructions and the reads that wanted a line. And every
+such read is a TYPE error, so the compiler enumerated them — the migration could not
+silently keep a wrong value anywhere.
+
+### The bug it exposed, which is the reason it was worth doing
+
+`packed_row_llvm_type` hard-coded the AST AoS row as `{i32, [32 x i32]}`. stage0 COMPUTES
+that number (max over the hierarchy's leaves of `ceil(payload_bytes/4)`); 32 was simply what
+it came to when the constant was written. `Pos` took `Decl.Func` to 144 bytes, so every
+constructor wrote 16 bytes past its record and into the next node's tag.
+
+Nothing declined and nothing faulted at the write. It surfaced as an exhaustive `match`
+falling through to its unreachable arm — and only in **gen2**, the compiler stage1 builds,
+because gen1 is built by stage0, which sized the row correctly. Fixed by computing it;
+`packed_aos_row_width_smoke.sh` now compares the two compilers' emitted row types directly.
+
+### Where the columns stand, measured
+
+`diagnostic_columns_smoke.sh` exists because `diagnostics_diff.sh` strips the location
+prefix before comparing — it is about message text, and is structurally blind to positions.
+That is how stage1 printed `file:2:` against stage0's `file:2:5-6` with every message gate
+green.
+
+Three outcomes, the same discipline the easm-lint differential uses:
+
+```
+355 fixtures — 3 agreeing, 148 pending (line only), 0 diverged
+```
+
+**DIVERGED fails the gate.** A wrong column is worse than none: it sends a reader, or an
+editor's jump-to-error, to the wrong place. The first threading pass produced 64 of them,
+all the same mistake — it attached the enclosing STATEMENT's span where stage0 reports the
+offending EXPRESSION's. Those were dropped back to line-only rather than shipped.
+
+**To close the 148:** each is one check whose position parameter is still a bare `line: u32`
+threaded down from its caller. The fix per check is to take the offending expression instead
+and report `Ast::expr_pos` of it — `check_affine_collection` and `resolve_types` are the two
+worked examples. The count is printed on every run, so it cannot quietly stop shrinking.
