@@ -631,11 +631,103 @@ extend Backend:
             return -1
 
 
+        # The AoS row's payload area, in u32 slots.
+        #
+        # stage0 sizes it as the MAXIMUM over the whole hierarchy's leaves of
+        # `ceil(payload_bytes / 4)` (ensurePackedEnumRowType + enumVariantPayloadSlots, with
+        # a u32 slot type). stage1 had `32` written in — which WAS that maximum for the AST
+        # as it stood, and silently stopped being one the moment a variant grew. Widening the
+        # AST's position payload from a bare `line: u32` to a 24-byte `Pos` span pushed
+        # `Decl.Func` to 144 bytes, so every constructor wrote 16 bytes PAST its record and
+        # into the next node's tag.
+        #
+        # Nothing declined and nothing faulted at the write. It surfaced far away, as an
+        # exhaustive `match` falling through to its unreachable arm — and only in gen2, the
+        # compiler stage1 builds, because gen1 is built by stage0 and stage0 sizes the row
+        # correctly. That is the signature of this class of bug: a hard-coded layout constant
+        # is invisible until the thing it was measured from changes.
+        #
+        # A field kind this pass cannot size yields 0, which propagates to "cannot size this
+        # variant" and leaves the floor in place rather than guessing. An undersized row
+        # corrupts memory, so no answer is better than a wrong one.
+        def packed_row_field_align(value_type: ValueType, structs: mutable StructTable&) -> u64 can[Abort.Panic]:
+            can Abort.Panic:
+                # A packed handle is the u32 row INDEX, not the row.
+                4 return if value_type.kind == TypeKind.PackedEnum
+                8 return if value_type.kind == TypeKind.SView or value_type.kind == TypeKind.DArray or value_type.kind == TypeKind.View
+                8 return if value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.Fn
+                if value_type.kind == TypeKind.Optional:
+                    return packed_row_field_align(optional_payload_of(value_type, structs), structs)
+                return payload_type_align(value_type, structs)
+
+
+        def packed_row_field_bytes(value_type: ValueType, structs: mutable StructTable&) -> u64 can[Abort.Panic]:
+            can Abort.Panic:
+                4 return if value_type.kind == TypeKind.PackedEnum
+                16 return if value_type.kind == TypeKind.SView
+                24 return if value_type.kind == TypeKind.DArray or value_type.kind == TypeKind.View
+                8 return if value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.Fn
+                # `T?` lowers to `{i1 present, T}`, and the flag pads out to the payload's own
+                # alignment — which is why `Expr?` measures 8 and not 5.
+                if value_type.kind == TypeKind.Optional:
+                    inner: ValueType = optional_payload_of(value_type, structs)
+                    inner_align: u64 = packed_row_field_align(inner, structs)
+                    inner_bytes: u64 = packed_row_field_bytes(inner, structs)
+                    0 return if inner_align == 0 or inner_bytes == 0
+                    return inner_align + inner_bytes
+                return payload_type_byte_size(value_type, structs)
+
+
+        # One variant's payload in u32 slots, laid out C-style: each field at the next
+        # multiple of its own alignment, the aggregate rounded to the widest.
+        def packed_variant_row_slots(structs: mutable StructTable&, variant_slot: usize) -> u32 can[Abort.Panic]:
+            can Abort.Panic:
+                0 return if variant_slot >= structs.packed_field_type_count.count
+                field_start: usize = structs.packed_field_type_start[variant_slot]
+                field_count: usize = structs.packed_field_type_count[variant_slot]
+                0 return if field_count == 0
+                offset: mutable u64 = 0
+                widest_align: mutable u64 = 1
+                unsized: mutable bool = false
+                for field_index in 0..<field_count |offset, widest_align, unsized, field_start, structs|:
+                    member: ValueType = copied_type(structs.packed_field_types[field_start + field_index])
+                    member_align: u64 = packed_row_field_align(member, structs)
+                    member_size: u64 = packed_row_field_bytes(member, structs)
+                    if member_align == 0 or member_size == 0:
+                        unsized <- true
+                    else:
+                        offset <- offset + (member_align - (offset % member_align)) if offset % member_align != 0
+                        offset <- offset + member_size
+                        widest_align <- member_align if member_align > widest_align
+                0 return if unsized
+                offset <- offset + (widest_align - (offset % widest_align)) if offset % widest_align != 0
+                return ((offset + 3) / 4).u32()
+
+
+        # The AST root row's payload slots: the widest variant across every Node refinement.
+        #
+        # Floored at the historical 32 so a hierarchy this pass cannot fully size can only
+        # ever WIDEN the row, never shrink it below what already shipped. The floor is not a
+        # substitute for measuring — `packed_ast_row_slots_smoke.sh` asserts this number
+        # against the `[N x i32]` stage0 emits for the same source.
+        def packed_ast_row_slots(structs: mutable StructTable&) -> u32 can[Abort.Panic]:
+            can Abort.Panic:
+                widest: mutable u32 = 32
+                for enum_slot in 0..<structs.packed_names.count |widest, structs|:
+                    continue if not packed_is_ast_refinement(structs, enum_slot.i64())
+                    variant_start: usize = structs.packed_variant_start[enum_slot]
+                    variant_count: usize = structs.packed_variant_count[enum_slot]
+                    for variant_offset in 0..<variant_count |widest, structs, variant_start|:
+                        slots: u32 = packed_variant_row_slots(structs, (variant_start + variant_offset))
+                        widest <- slots if slots > widest
+                return widest
+
+
         # The ROW LAYOUT `{i32 tag, [N x i64] payload}` — what a row contains, as distinct
         # from the handle (an i32 index) that names it.
         def packed_row_llvm_type(structs: mutable StructTable&, enum_index: i64, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if packed_is_ast_root_row(structs, packed_root_index_of(structs, enum_index)):
-                row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt32TypeInContext(ctx), 32)]
+                row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt32TypeInContext(ctx), packed_ast_row_slots(structs))]
                 row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
                 return LLVMStructTypeInContext(ctx, row_pointer, 2, 0)
             words: u32 = structs.packed_payload_words[enum_index.usize()]
@@ -653,9 +745,10 @@ extend Backend:
         # A store row's size in bytes: the `{i32, [N x i64]}` handle laid out at i64
         # alignment, so the tag's 4 bytes pad to 8. stage0 passes 16 for a one-word payload
         # (`state_new_variant_sparse(ptr %owner, i64 16)`), which this reproduces.
-        def packed_row_bytes(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
+        def packed_row_bytes(structs: mutable StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
             can Abort.Panic:
-                132 return if packed_is_ast_root_row(structs, packed_root_index_of(structs, enum_index))
+                # 4 (u32 tag) + 4 per u32 payload slot — 132 while the row was [32 x i32].
+                (4 + 4 * packed_ast_row_slots(structs).i64()) return if packed_is_ast_root_row(structs, packed_root_index_of(structs, enum_index))
                 # 8 (tag, padded to i64 alignment) + 8 per common + 8 per payload word. stage0
                 # passes 16 with no commons and 24 with one — both reproduced.
                 return 8 + 8 * structs.packed_common_counts[enum_index.usize()].i64() + 8 * structs.packed_payload_words[enum_index.usize()].i64()
