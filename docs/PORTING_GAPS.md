@@ -544,3 +544,81 @@ offending EXPRESSION's. Those were dropped back to line-only rather than shipped
 threaded down from its caller. The fix per check is to take the offending expression instead
 and report `Ast::expr_pos` of it — `check_affine_collection` and `resolve_types` are the two
 worked examples. The count is printed on every run, so it cannot quietly stop shrinking.
+
+---
+
+## `-emit ir`: the writer is fully SPECIFIED now, not merely "blocked" (2026-08-18)
+
+The earlier note said `-emit ir` could not be ported because stage1 "has no IR". That was
+wrong in a useful way: the bundle is not an IR at all, it is a **serialized AST**
+(`buildFrontendIRBundle` = version + filename + resolved source + `*ast.File`). stage1 has an
+AST, so the only real question was whether it could write stage0's encoding.
+
+It can, and everything needed is now measured.
+
+### The oracle — exact, and over the whole tree
+
+```
+elisac -emit lowered <bundle>   ==   elisac -emit lowered <source>
+```
+
+Verified identical for a bundle stage0 writes. stage0 UNPARSES the tree it decoded, so a
+single wrong node type, field name or nesting shows up as a textual diff of the program.
+That is a far stronger check than `-emit ast`, which prints only declaration headlines.
+
+### Why a writer is possible at all
+
+The v2 decoder reconciles the file's type table with its own schema **by NAME**
+(`codec_decode.go`: `schema.TypeByName(fileType.Name)`, then a field-name match). Numeric IDs
+are file-local. So a writer numbers its own types and fields from 1 and only has to spell
+stage0's names correctly — and `Ast::Pos` was deliberately given stage0's `lexer.Pos` field
+names, so positions need no translation.
+
+### The framing, read back out of a bundle rather than transcribed
+
+```
+magic "ELISAIR2\n" | uvarint version(2) | str filename | bytes source
+type table:  uvarint count, then per type: id, name, field count,
+             then per field: id, name, value descriptor
+node table:  uvarint count, then per node: bytes(body)
+             body = uvarint typeID + fields
+fields     = uvarint liveCount, then per field: uvarint id, uvarint len, bytes
+root       : uvarint node id   (ids are 1-based; 0 is null)
+```
+
+**The detail that is easy to get wrong**: `Position` and `Params` are wire kind **7**, an
+inline STRUCT (uvarint type ID then its fields) — not node references. Reading a real
+bundle's type table is what showed it; the Go struct definitions do not say so. Ints are
+zigzag varints, `IntLit.Value` is a STRING, and a field at its zero value is omitted.
+
+### The minimal closed set, with stage0's exact field names
+
+```
+lexer.Pos    Col EndCol EndLine EndOffset File Line Offset
+File         DeclVisibility Decls Filename
+FuncDecl     Name Params ReturnType Body Position  (+29 more, all omittable)
+ParamDecl    DefaultValue Mutable Name Position Type      (inline struct)
+NamedType    Name Position
+ReturnStmt   Position Value
+VarDeclStmt  Ghost Mutable Name Owner Position Type Value
+ExprStmt     Expr Position
+Ident        Name Position
+IntLit       IsHex Position Suffix Value
+BinaryExpr   Left LoweredCall Op Position Right
+CallExpr     Func Args ArgNames Position  (+14 more)
+```
+
+### What remains
+
+Writing the encoder in Elisa and growing the node mapping until the corpus stops refusing.
+Two language constraints shape it: an `lmut` receiver must be threaded as `x <- f(x, …)`
+rather than mutated in place, and the guard form is `VALUE return if COND`.
+
+Constructs where stage1's AST cannot pick a single stage0 type — `Expr.Refinement` stands
+for both `TryExpr` and `GetExpr` — must be REFUSED BY NAME, not guessed. A bundle that
+decodes cleanly but describes a different program is the false clean this format makes
+easy to produce.
+
+A partial writer was drafted and deliberately NOT committed: an unreachable half-module in
+`src/` rots, which is exactly how the driver's own include walker stayed broken behind a
+wrapper for months.
