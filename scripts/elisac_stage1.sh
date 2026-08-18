@@ -13,6 +13,15 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+# Keep the host linker in the same LLVM installation as the C API library used to
+# build the stage1 product. Apple clang can link ordinary objects, but it may not
+# parse textual IR printed by a newer Homebrew LLVM (for example, LLVM 22 emits
+# attributes Apple clang 21 does not understand).
+LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
+ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
+if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
+  ELISA_CLANG_TOOL="$(command -v clang || true)"
+fi
 STAGE0_BIN="${ELISACORE_BIN:-${HOME}/.elisac/elisac}"
 
 flatten_includes() {
@@ -102,7 +111,11 @@ seed_build() {
   # recurses once per AST level through emit_expression. 0x20000000 (512MB) is the max
   # ld64 allows on arm64 and gives the compiler's own main thread far more headroom than
   # the default ~8MB before a pathological input can overflow the native stack.
-  clang -o "$BIN" "$ROOT/build/elisac_stage1.o" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
+  [[ -x "$ELISA_CLANG_TOOL" ]] || {
+    echo "seed requires clang compatible with LLVM_CONFIG=$LLVM_CONFIG (set ELISA_CLANG)" >&2
+    exit 2
+  }
+  "$ELISA_CLANG_TOOL" -o "$BIN" "$ROOT/build/elisac_stage1.o" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
   echo "seed: wrote $BIN" >&2
 }
 
@@ -314,7 +327,12 @@ fi
 compile_rc=$?
 if [[ -n "$link_out" ]]; then
   [[ "$compile_rc" == 0 && -f "$out" ]] || { rm -f "$out"; exit "${compile_rc:-1}"; }
-  clang -Wl,-dead_strip -o "$link_out" "$out" "$runtime_obj" || { rm -f "$out"; exit 1; }
+  [[ -x "$ELISA_CLANG_TOOL" ]] || {
+    echo "-emit exe requires clang compatible with LLVM_CONFIG=$LLVM_CONFIG (set ELISA_CLANG)" >&2
+    rm -f "$out"
+    exit 2
+  }
+  "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$link_out" "$out" "$runtime_obj" || { rm -f "$out"; exit 1; }
   rm -f "$out"
 fi
 exit "$compile_rc"

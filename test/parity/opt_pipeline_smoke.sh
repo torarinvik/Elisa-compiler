@@ -14,6 +14,13 @@ set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || { echo "opt_pipeline SKIP: no runtime object"; exit 0; }
+LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
+LLVM_CLANG="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
+if [ ! -x "$LLVM_CLANG" ]; then
+    LLVM_CLANG="$(command -v clang || true)"
+fi
+[ -x "$LLVM_CLANG" ] || { echo "opt_pipeline SKIP: no clang for LLVM_CONFIG=$LLVM_CONFIG"; exit 0; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -27,7 +34,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
     if ! bash "$ROOT/scripts/elisac_stage1.sh" -O0 -o "$WORK/$name.o0.o" "$src" >/dev/null 2>&1; then
         continue    # a decline is the corpus's business, not this smoke's
     fi
-    clang -Wl,-dead_strip -o "$WORK/$name.o0" "$WORK/$name.o0.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || continue
+    "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o0" "$WORK/$name.o0.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || continue
     timeout 10 "$WORK/$name.o0" >/dev/null 2>&1 </dev/null; rc0=$?
     [ "$rc0" -eq 124 ] && continue
     # -O2 through the pass pipeline
@@ -35,7 +42,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
         echo "  FAIL $name: -O2 compile failed where -O0 succeeded"
         failed=$((failed + 1)); continue
     fi
-    clang -Wl,-dead_strip -o "$WORK/$name.o2" "$WORK/$name.o2.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O2 link"; failed=$((failed + 1)); continue; }
+    "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o2" "$WORK/$name.o2.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O2 link"; failed=$((failed + 1)); continue; }
     timeout 10 "$WORK/$name.o2" >/dev/null 2>&1 </dev/null; rc2=$?
     checked=$((checked + 1))
     if [ "$rc0" != "$rc2" ]; then
@@ -52,7 +59,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
         echo "  FAIL $name: -O3 compile failed where -O0 succeeded"
         failed=$((failed + 1)); continue
     fi
-    clang -Wl,-dead_strip -o "$WORK/$name.o3" "$WORK/$name.o3.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O3 link"; failed=$((failed + 1)); continue; }
+    "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o3" "$WORK/$name.o3.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O3 link"; failed=$((failed + 1)); continue; }
     timeout 10 "$WORK/$name.o3" >/dev/null 2>&1 </dev/null; rc3=$?
     if [ "$rc0" != "$rc3" ]; then
         echo "  FAIL $name: -O0 exit $rc0, -O3 exit $rc3"
@@ -64,7 +71,7 @@ done
 LL_SRC="$ROOT/test/repro/region_statement_form.elisa"
 if bash "$ROOT/scripts/elisac_stage1.sh" -emit llvm -o "$WORK/ll.ll" "$LL_SRC" >/dev/null 2>&1 \
    && grep -q "define i64 @main" "$WORK/ll.ll" \
-   && clang -c -o "$WORK/ll.o" "$WORK/ll.ll" >/dev/null 2>&1; then
+   && "$LLVM_CLANG" -c -o "$WORK/ll.o" "$WORK/ll.ll" >/dev/null 2>&1; then
     :
 else
     echo "  FAIL -emit llvm: no parseable IR with @main"

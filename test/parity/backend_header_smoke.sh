@@ -40,10 +40,14 @@ struct Outer layout(c):
 struct Node layout(c):
     value: i64
     next: Node&
+struct CallbackTable layout(c):
+    user: mutable void&?
+    callback: fn(mutable void&?, i32) -> void
 
 export type Pair as Public
 export type Outer as PublicOuter
 export type Node as PublicNode
+export type CallbackTable as PublicCallbackTable
 
 global seed: i64 = 7
 export global seed as ctx_seed
@@ -85,6 +89,7 @@ grep -q 'struct PublicOuter' "$BUILD/generated.h"
 grep -q 'Inner inner;' "$BUILD/generated.h"
 grep -q 'struct PublicNode' "$BUILD/generated.h"
 grep -q 'PublicNode \*next;' "$BUILD/generated.h"
+grep -q 'void (\*callback)(void \*arg0, int32_t arg1);' "$BUILD/generated.h"
 grep -q 'int64_t add(' "$BUILD/generated.h"
 cc -x c -fsyntax-only "$BUILD/generated.h"
 c++ -x c++ -fsyntax-only "$BUILD/generated.h"
