@@ -995,6 +995,13 @@ diff_case struct_darray_count 'struct Bag:\n    items: mutable darray[i64]\n\nde
 diff_case struct_darray_grow 'struct Bag:\n    items: mutable darray[i64]\n\ndef main() -> i64:\n    b: mutable Bag = Bag{items: []}\n    for i in 0..<100:\n        b.items.push(1)\n    total: mutable i64 = 0\n    for j in 0..<100:\n        total <- total + (b.items[j] can Unsafe.UncheckedIndex)\n    return total - 58\n'
 diff_case ref_mutate   'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    bump(c)\n    return c.value\n'
 diff_case ref_accumulate 'struct Acc:\n    total: mutable i64\n\ndef add(a: mutable Acc&, n: i64) -> void:\n    a.total <- a.total + n\n\ndef main() -> i64:\n    a: mutable Acc = Acc{total: 0}\n    for i in 0..<9:\n        add(a, i)\n    return a.total + 6\n'
+# A reference parameter is already the pointee pointer at the call boundary. Forwarding
+# it as `relay(c)` must preserve that pointer; spelling `&c` would pass the address of the
+# parameter's pointer slot (a different value). This is the exact shape used by the
+# self-hosted ChordBrain output list, so keep it in both the stage1 behavior lane and the
+# stage0 differential lane.
+run_case ref_forwarded_param 'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef relay(c: mutable Counter&) -> void:\n    bump(c)\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    relay(c)\n    return c.value\n' 42
+diff_case ref_forwarded_param 'struct Counter:\n    value: mutable i64\n\ndef bump(c: mutable Counter&) -> void:\n    c.value <- c.value + 1\n\ndef relay(c: mutable Counter&) -> void:\n    bump(c)\n\ndef main() -> i64:\n    c: mutable Counter = Counter{value: 41}\n    relay(c)\n    return c.value\n'
 diff_case struct_param 'struct Point:\n    x: i64\n    y: i64\n\ndef total(p: Point) -> i64:\n    return p.x + p.y\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return total(p)\n'
 diff_case struct_large 'struct Big:\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n    e: i64\n\ndef sum(g: Big) -> i64:\n    return g.a + g.b + g.c + g.d + g.e\n\ndef main() -> i64:\n    g: Big = Big{a: 10, b: 10, c: 10, d: 10, e: 2}\n    return sum(g)\n'
 diff_case struct_mixed_abi 'struct M:\n    a: u8\n    b: f64\n\ndef total(m: M) -> i64:\n    return m.a.i64() + m.b.i64()\n\ndef main() -> i64:\n    return total(M{a: 40, b: 2.5})\n'
