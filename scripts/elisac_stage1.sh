@@ -3,7 +3,7 @@
 #
 # Usage:
 #   elisac_stage1.sh -o out.o source.elisa
-#   elisac_stage1.sh -emit wasm -o demo.wasm source.elisa  # also writes demo.mjs/.d.ts/.json
+#   elisac_stage1.sh -emit wasm -o demo.wasm source.elisa  # also writes ESM/types/manifest sidecars
 #   elisac_stage1.sh --seed          # one-time seed build using stage0 (optional)
 #   elisac_stage1.sh --emit-driver   # only build the product binary (needs seed elisac)
 #

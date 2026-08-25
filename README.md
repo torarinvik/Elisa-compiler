@@ -29,7 +29,7 @@ WASM is equally direct and includes the browser/Node integration layer:
 
 ```sh
 scripts/elisac_stage1.sh -emit wasm -o build/hello.wasm path/to/hello.elisa
-# writes hello.wasm, hello.mjs, hello.d.ts, and hello.json
+# writes hello.wasm, hello.mjs, hello.d.mts, hello.d.ts, and hello.json
 ```
 
 See [docs/wasm.md](docs/wasm.md) for export adapters, JavaScript loading, memory, and
