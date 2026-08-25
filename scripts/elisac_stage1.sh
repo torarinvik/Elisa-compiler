@@ -3,6 +3,7 @@
 #
 # Usage:
 #   elisac_stage1.sh -o out.o source.elisa
+#   elisac_stage1.sh -emit wasm -o demo.wasm source.elisa  # also writes demo.mjs/.d.ts/.json
 #   elisac_stage1.sh --seed          # one-time seed build using stage0 (optional)
 #   elisac_stage1.sh --emit-driver   # only build the product binary (needs seed elisac)
 #
@@ -137,6 +138,7 @@ opt_level=0
 test_filter=""
 emit_mode="obj"
 target_triple=""
+wasm_ld=""
 link_flags=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -153,6 +155,7 @@ while [[ $# -gt 0 ]]; do
         llvm)   emit_mode="llvm" ;;
         bc)     emit_mode="bc" ;;
         exe)    emit_mode="exe" ;;
+        wasm)   emit_mode="wasm" ;;
         tokens) emit_mode="tokens" ;;
         ast)    emit_mode="ast" ;;
         iface)  emit_mode="iface" ;;
@@ -180,7 +183,7 @@ while [[ $# -gt 0 ]]; do
         interpret) emit_mode="interpret" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit tests, -emit benches, -emit fixtures, -emit test, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit ir, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit wasm, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit tests, -emit benches, -emit fixtures, -emit test, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit ir, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -filter)
@@ -195,6 +198,8 @@ while [[ $# -gt 0 ]]; do
     # looked like compiler gaps when they were three missing cases in an argument loop.
     -target-triple)
       target_triple="${2:-}"; shift 2 ;;
+    --wasm-ld)
+      wasm_ld="${2:-}"; shift 2 ;;
     -link)
       link_flags+=("${2:-}"); shift 2 ;;
     -L)
@@ -219,6 +224,30 @@ while [[ $# -gt 0 ]]; do
       src="$1"; shift ;;
   esac
 done
+
+# WASM is a packaging target, not just another object suffix: it needs a wasm-ld link,
+# imported linear memory, and the generated ESM/TypeScript facade. Keep that orchestration
+# in one dependency-light Python helper so the shell wrapper remains pleasant to use and
+# callers get a complete module with one command.
+if [[ "$emit_mode" == "wasm" ]]; then
+  [[ -n "$src" ]] || { echo "usage: $0 -emit wasm -o out.wasm source.elisa" >&2; exit 2; }
+  if [[ -z "$out" ]]; then
+    out="${src%.*}.wasm"
+  elif [[ "$out" != *.wasm ]]; then
+    out="${out}.wasm"
+  fi
+  wasm_python="${PYTHON_BIN:-python3}"
+  command -v "$wasm_python" >/dev/null 2>&1 || {
+    echo "-emit wasm requires Python 3 (set PYTHON_BIN)" >&2
+    exit 2
+  }
+  wasm_command=("$wasm_python" "$ROOT/scripts/wasm_build.py" --root "$ROOT" --compiler "$0" --source "$src" --output "$out" --target "${target_triple:-wasm32-unknown-unknown}")
+  [[ -n "$wasm_ld" ]] && wasm_command+=(--wasm-ld "$wasm_ld")
+  [[ "$noalias" == 1 ]] && wasm_command+=(--compiler-flag=-fnoalias)
+  [[ "$bounds_check" == 1 ]] && wasm_command+=(--compiler-flag=-fbounds-check)
+  [[ "$opt_level" != 0 ]] && wasm_command+=("--compiler-flag=-O$opt_level")
+  exec "${wasm_command[@]}"
+fi
 
 # `-emit tests|benches|fixtures` list annotated functions on STDOUT and stage0 rejects
 # `-o` for them, so they are the one shape that needs no output path.
@@ -277,6 +306,7 @@ driver_env=()
 # line number while the same file compiled through the CLI names itself.
 driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ -n "$target_triple" ]] && driver_env+=("ELISA_STAGE1_TRIPLE=$target_triple")
+[[ "$target_triple" == wasm* ]] && driver_env+=("ELISA_STAGE1_WASM=1")
 [[ ${#link_flags[@]} -gt 0 ]] && driver_env+=("ELISA_STAGE1_LINK=${link_flags[*]}")
 [[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
