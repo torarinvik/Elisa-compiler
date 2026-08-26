@@ -28,7 +28,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 same=0
 differ=0
 skipped=0
-for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa; do
+for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa "$REPO_ROOT"/test/fixtures/unsafe/*.elisa; do
     name="$(basename "$src" .elisa)"
     if ! "$ELISACORE_BIN" -emit unsafe "$src" </dev/null > "$WORK/s0" 2>/dev/null; then
         skipped=$((skipped + 1)); continue

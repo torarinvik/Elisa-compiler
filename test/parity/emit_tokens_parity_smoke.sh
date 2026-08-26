@@ -17,7 +17,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 same=0
 failed=0
-for src in "$REPO_ROOT"/test/repro/*.elisa; do
+for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/lexer/machine_state_edge_cases.elisa; do
     grep -q '^include' "$src" && continue
     name="$(basename "$src" .elisa)"
     "$ELISACORE_BIN" -emit tokens "$src" </dev/null > "$WORK/$name.s0" 2>/dev/null || continue
