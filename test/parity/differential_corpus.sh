@@ -100,8 +100,26 @@ match=0; mismatch=0; declined=0; skipped=0; intermittent=0
 # joined string yields nonexistent directories and a silent EMPTY corpus.
 CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 [ -d "$ELISA_CORE" ] && CORPUS_DIRS+=("$ELISA_CORE")
+
+# `$ELISA_CORE/repro/` is EXCLUDED. It holds minimal BUG DEMONSTRATIONS, most of
+# them curated because stage1 does NOT agree with stage0 -- that is what the file
+# is for. Sweeping them in asks a ratchet whose whole premise is "stage1 matches
+# stage0" to enforce that over the one directory guaranteed to violate it, so
+# every repro filed broke the gate. That punishes filing repros, which is exactly
+# backwards.
+#
+# Measured before the exclusion: 145 programs, 1 MISMATCH and 11 declines, and
+# ALL TWELVE were repro/ files. The mismatch was
+# nw_json_hex_escape_literal_stage1, whose own header predicts "stage0: exit 4 /
+# stage1: exit 14" -- the corpus was rediscovering a bug that was already written
+# down, and failing the gate to report it.
+#
+# A repro that declines is a FILED BUG, not a regression. The ratchet's job is to
+# catch regressions in ordinary programs; repros are tracked by their own files.
 find "${CORPUS_DIRS[@]}" -name '*.elisa' -print0 2>/dev/null \
-  | xargs -0 grep -l '^def main' 2>/dev/null | sort > "$WORK/programs.txt"
+  | xargs -0 grep -l '^def main' 2>/dev/null \
+  | grep -v '/repro/' \
+  | sort > "$WORK/programs.txt"
 
 # Read the list on FD 3, and give every child /dev/null for stdin. Reading it on plain
 # stdin loses the corpus: a compiled program that reads input DRAINS the list, and the loop

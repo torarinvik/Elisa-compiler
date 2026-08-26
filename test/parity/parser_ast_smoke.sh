@@ -8,7 +8,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
-output="$($ELISACORE_BIN -emit test "$REPO_ROOT/test/parity/parser_ast_test.elisa" 2>&1)"
+output="$("$ELISACORE_BIN" -emit test "$REPO_ROOT/test/parity/parser_ast_test.elisa" 2>&1)"
 printf '%s\n' "$output"
 
 summary="$(printf '%s\n' "$output" | grep '\[ SUMMARY  \]' | tail -1)"

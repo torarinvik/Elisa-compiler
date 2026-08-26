@@ -133,8 +133,13 @@ make_error_fixture() {
 make_error_fixture missingdep <<'JSON'
 {"dependencies":["ghost"],"targets":{"app":{"entry":"src/main.elisa"}}}
 JSON
+# "O9", not "O1". O1 USED to be this fixture's example of an invalid level, and
+# stopped being one when -O1 support was added -- at which point the fixture was
+# silently asserting that a VALID option is rejected, and it only surfaced as a
+# stage0/stage1 exit-status disagreement (stage0 accepted, stage1 still refused).
+# Pick a level neither compiler will ever grow.
 make_error_fixture badopt <<'JSON'
-{"targets":{"app":{"entry":"src/main.elisa","opt":"O1"}}}
+{"targets":{"app":{"entry":"src/main.elisa","opt":"O9"}}}
 JSON
 make_error_fixture badentry <<'JSON'
 {"targets":{"app":{"entry":"src/main.txt"}}}
