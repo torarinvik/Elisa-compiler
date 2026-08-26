@@ -676,21 +676,41 @@ extend Backend:
                     # BEFORE enums exist -- so a `const cs: C[2]` first registers with an
                     # unresolved element type, and skipping here would freeze that provisional
                     # answer even after `C` is known. (Caught by const_array_of_enum.)
-                    existing_const: i64 = const_index_of(structs, const_name)
-                    if existing_const >= 0:
-                        structs.const_types[existing_const.usize()] <- const_declared
-                        return
-                    structs.const_names <- structs.const_names.push(const_name)
-                    structs.const_types <- structs.const_types.push(const_declared)
-                    structs.const_values <- structs.const_values.push(0)
                     # A FLOAT const with a float-literal initializer resolves here (its text is
                     # inlined at use); other consts fold in fold_consts.
                     const_reg_float_text: mutable sview = ""
                     if const_declared.kind == TypeKind.Float:
                         if const_value is Expr.FloatLit(const_reg_float_lit):
                             const_reg_float_text <- const_reg_float_lit
-                    structs.const_resolved <- structs.const_resolved.push(const_reg_float_text != "")
+                    # A `const cstr = "..."` resolves here too: its text is all the use site
+                    # needs, and leaving it unresolved declined every function that read it.
+                    const_reg_cstr_text: mutable sview = ""
+                    if const_declared.kind == TypeKind.CStr:
+                        if const_value is Expr.StringLit(const_reg_cstr_lit):
+                            const_reg_cstr_text <- const_reg_cstr_lit
+                    existing_const: i64 = const_index_of(structs, const_name)
+                    if existing_const >= 0:
+                        structs.const_types[existing_const.usize()] <- const_declared
+                        # The TEXT carriers are re-resolved for exactly the reason the type is:
+                        # selection registers a const BEFORE its annotation can resolve, so the
+                        # first pass may have seen an Unmodeled type and recorded no text.
+                        # Freezing that provisional answer left `const GREETING: cstr = "..."`
+                        # unresolved forever, and every function reading it DECLINED.
+                        if const_reg_float_text != "":
+                            structs.const_float_text[existing_const.usize()] <- const_reg_float_text
+                            structs.const_resolved[existing_const.usize()] <- true
+                        if const_reg_cstr_text != "":
+                            structs.const_cstr_text[existing_const.usize()] <- const_reg_cstr_text
+                            structs.const_resolved[existing_const.usize()] <- true
+                        return
+                    structs.const_names <- structs.const_names.push(const_name)
+                    structs.const_types <- structs.const_types.push(const_declared)
+                    structs.const_values <- structs.const_values.push(0)
+                    structs.const_resolved <- structs.const_resolved.push(const_reg_float_text != "" or const_reg_cstr_text != "")
                     structs.const_float_text <- structs.const_float_text.push(const_reg_float_text)
+                    structs.const_cstr_text <- structs.const_cstr_text.push(const_reg_cstr_text)
+                    structs.const_float_values <- structs.const_float_values.push(0.0)
+                    structs.const_float_ok <- structs.const_float_ok.push(false)
                     structs.const_globals <- structs.const_globals.push(zeroed)
                     structs.const_global_ok <- structs.const_global_ok.push(false)
 
@@ -728,10 +748,82 @@ extend Backend:
                                 return structs.binding_types[bind_scan].bits.i64()
                     const_index: i64 = const_index_of(structs, ident_name)
                     if const_index >= 0 and structs.const_resolved[const_index.usize()]:
-                        return structs.const_values[const_index.usize()]
+                        # RESOLVED does not mean "has an integer value". A float or cstr const
+                        # is resolved through its own carrier and leaves const_values at 0, so
+                        # returning it here would hand back a silent zero -- the same failure
+                        # this file's float folding work exists to remove. Fold only what is
+                        # actually an integer; anything else declines.
+                        const_atom_type: ValueType = copied_type(structs.const_types[const_index.usize()])
+                        if is_integer_type(const_atom_type) or const_atom_type.kind == TypeKind.Bool:
+                            return structs.const_values[const_index.usize()]
                     ok <- false
                     return 0
                 return 0
+
+        # Fold a FLOAT const initializer to an actual f64. The integer folder above cannot do
+        # this: it would truncate every leaf and, worse, `fold_consts` used to mark a float
+        # const RESOLVED on the strength of an integer fold while leaving its inlined source
+        # text empty -- so `const D: f64 = W - S` emitted ConstRealOfString("") and read back
+        # as 0.0 with no diagnostic at all.
+        #
+        # Leaves go through LLVM's own decimal parser (ConstRealOfString -> ConstRealGetDouble)
+        # so the bits match what a float LITERAL of the same text would have produced.
+        def fold_const_float_expr(expression: Expr, structs: mutable StructTable&, ok: mutable bool&) -> f64 can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                if expression is Expr.FloatLit(float_literal_text):
+                    float_text_storage: mutable darray[u8] = []
+                    loses_info: mutable i32 = 0
+                    parsed: LLVMValueRef = LLVMConstRealOfString(LLVMDoubleTypeInContext(structs.context), sview_to_cstr(float_literal_text, float_text_storage))
+                    return LLVMConstRealGetDouble(parsed, &loses_info)
+                # An integer literal is a valid float initializer (`const H: f64 = 2`).
+                if expression is Expr.IntLit(float_int_literal):
+                    return float_int_literal.f64()
+                if expression is Expr.Paren(float_paren_inner, float_paren_line):
+                    return fold_const_float_expr(float_paren_inner, structs, ok)
+                if expression is Expr.Ident(float_ident_name, float_ident_line):
+                    float_const_index: i64 = const_index_of(structs, float_ident_name)
+                    if float_const_index >= 0:
+                        if structs.const_float_ok[float_const_index.usize()]:
+                            return structs.const_float_values[float_const_index.usize()]
+                        # A float const that resolved as a LITERAL carries text, not a value.
+                        if structs.const_float_text[float_const_index.usize()] != "":
+                            ident_text_storage: mutable darray[u8] = []
+                            ident_loses_info: mutable i32 = 0
+                            ident_parsed: LLVMValueRef = LLVMConstRealOfString(LLVMDoubleTypeInContext(structs.context), sview_to_cstr(structs.const_float_text[float_const_index.usize()], ident_text_storage))
+                            return LLVMConstRealGetDouble(ident_parsed, &ident_loses_info)
+                        # An INTEGER const used in a float expression (`const N: int = 3`).
+                        if structs.const_resolved[float_const_index.usize()] and is_integer_type(copied_type(structs.const_types[float_const_index.usize()])):
+                            return structs.const_values[float_const_index.usize()].f64()
+                    ok <- false
+                    return 0.0
+                if expression is Expr.Unary(float_unary_operator, float_unary_operand, float_unary_line):
+                    float_operand: f64 = fold_const_float_expr(float_unary_operand, structs, ok)
+                    return 0.0 - float_operand if float_unary_operator == TokenKind.Minus else (float_operand if float_unary_operator == TokenKind.Plus else 0.0)
+                # `X.f64()` and friends are Calls in the AST, and are value-preserving here.
+                if expression is Expr.Call(float_cast_callee, float_cast_arguments, float_cast_argument_names, float_cast_line):
+                    if float_cast_callee is Expr.Field(float_cast_object, float_cast_name, float_cast_field_line):
+                        float_cast_type: ValueType = scalar_type_of_name(float_cast_name)
+                        if float_cast_type.kind == TypeKind.Float and float_cast_arguments.count == 0:
+                            return fold_const_float_expr(float_cast_object, structs, ok)
+                    ok <- false
+                    return 0.0
+                if expression is Expr.Binary(float_left, float_operator, float_right, float_line):
+                    float_left_value: f64 = fold_const_float_expr(float_left, structs, ok)
+                    float_right_value: f64 = fold_const_float_expr(float_right, structs, ok)
+                    float_operands_ok: bool = ok
+                    return 0.0 if not float_operands_ok
+                    return float_left_value + float_right_value if float_operator == TokenKind.Plus
+                    return float_left_value - float_right_value if float_operator == TokenKind.Minus
+                    return float_left_value * float_right_value if float_operator == TokenKind.Star
+                    # Division by a zero CONSTANT is not folded: leave it to decline rather
+                    # than bake in an inf/nan the source never wrote.
+                    if float_operator == TokenKind.Slash:
+                        if float_right_value != 0.0:
+                            return float_left_value / float_right_value
+                    ok <- false
+                    return 0.0
+                ok <- false
+                return 0.0
 
         def fold_const_binary_values(left_value: i64, operator: TokenKind, right_value: i64, ok: mutable bool&) -> i64 can[Abort.Panic]:
             if operator == TokenKind.EqEq:
@@ -833,8 +925,13 @@ extend Backend:
             # Registered as ordinary resolved consts so fold_const_expr reaches them by name.
         def register_target_consts(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             bool_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
-            names: darray[sview] = ["ELISA_TARGET_OS_MACOS", "ELISA_TARGET_OS_LINUX", "ELISA_TARGET_OS_WINDOWS", "ELISA_TARGET_OS_FREEBSD", "ELISA_TARGET_OS_POSIX", "ELISA_TARGET_ARCH_X86_64", "ELISA_TARGET_ARCH_ARM64", "PLATFORM_WINDOWS", "PLATFORM_APPLE", "PLATFORM_DARWIN", "PLATFORM_LINUX", "PLATFORM_FREEBSD", "ARCH_X86_64", "ARCH_ARM64"]
-            values: darray[i64] = [1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1]
+            # The WASM predicates are present-but-FALSE. stage1 emits only for the host, so
+            # their VALUE is 0 -- but they must EXIST, because the vendored runtime's arena
+            # now selects its reserve_commit reservation with
+            # `static if ELISA_TARGET_ARCH_WASM`, and an unregistered name there does not
+            # resolve.
+            names: darray[sview] = ["ELISA_TARGET_OS_MACOS", "ELISA_TARGET_OS_LINUX", "ELISA_TARGET_OS_WINDOWS", "ELISA_TARGET_OS_FREEBSD", "ELISA_TARGET_OS_POSIX", "ELISA_TARGET_OS_WASI", "ELISA_TARGET_ARCH_X86_64", "ELISA_TARGET_ARCH_ARM64", "ELISA_TARGET_ARCH_WASM32", "ELISA_TARGET_ARCH_WASM64", "ELISA_TARGET_ARCH_WASM", "PLATFORM_WINDOWS", "PLATFORM_APPLE", "PLATFORM_DARWIN", "PLATFORM_LINUX", "PLATFORM_FREEBSD", "ARCH_X86_64", "ARCH_ARM64"]
+            values: darray[i64] = [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1]
             for index in 0..<names.count |structs, names, values, bool_type|:
                 continue if const_index_of(structs, names[index]) >= 0
                 structs.const_names <- structs.const_names.push(names[index])
@@ -842,6 +939,12 @@ extend Backend:
                 structs.const_values <- structs.const_values.push(values[index])
                 structs.const_resolved <- structs.const_resolved.push(true)
                 structs.const_float_text <- structs.const_float_text.push("")
+                # EVERY const column must grow together. A short column is indexed by the
+                # same const_index as the rest, so leaving one behind is an out-of-bounds
+                # read waiting for the first target predicate that reaches that branch.
+                structs.const_cstr_text <- structs.const_cstr_text.push("")
+                structs.const_float_values <- structs.const_float_values.push(0.0)
+                structs.const_float_ok <- structs.const_float_ok.push(false)
                 structs.const_globals <- structs.const_globals.push(zeroed)
                 structs.const_global_ok <- structs.const_global_ok.push(false)
 
@@ -959,6 +1062,18 @@ extend Backend:
                         const_index: i64 = const_index_of(structs, const_name)
                         continue if const_index < 0
                         continue if structs.const_resolved[const_index.usize()]
+                        # A FLOAT const folds in the FLOAT domain. Running it through the
+                        # integer folder marked it resolved with an empty inlined text, and the
+                        # use site then emitted ConstRealOfString("") -- 0.0, silently.
+                        if copied_type(structs.const_types[const_index.usize()]).kind == TypeKind.Float:
+                            float_folded_ok: mutable bool = true
+                            float_folded: f64 = fold_const_float_expr(const_value, structs, float_folded_ok)
+                            continue if not float_folded_ok
+                            structs.const_float_values[const_index.usize()] <- float_folded
+                            structs.const_float_ok[const_index.usize()] <- true
+                            structs.const_resolved[const_index.usize()] <- true
+                            progressed <- true
+                            continue
                         folded_ok: mutable bool = true
                         folded: i64 = fold_const_expr(const_value, structs, folded_ok)
                         continue if not folded_ok
