@@ -73,13 +73,16 @@ extend Backend:
             # struct bindings only and answers null for an Array.
         def fixed_array_storage_address(iterable: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                if iterable is Expr.Ident(array_name, array_name_line):
-                    declared: ValueType = lookup_type(local_scope, array_name)
-                    if lookup_slot(local_scope, array_name) is array_slot:
-                        array_slot return if declared.kind == TypeKind.Array
-                        if declared.kind == TypeKind.Ref and ref_target_of(declared, structs).kind == TypeKind.Array:
-                            return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), array_slot, "array.ref")
-                    return null
+                match iterable:
+                    Expr.Ident(array_name, array_name_line):
+                        declared: ValueType = lookup_type(local_scope, array_name)
+                        if lookup_slot(local_scope, array_name) is array_slot:
+                            array_slot return if declared.kind == TypeKind.Array
+                            if declared.kind == TypeKind.Ref and ref_target_of(declared, structs).kind == TypeKind.Array:
+                                return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), array_slot, "array.ref")
+                        return null
+                    _:
+                        pass
                 return struct_chain_address(iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder)
 
 
@@ -131,778 +134,838 @@ extend Backend:
             # `break` / `continue`. A LABEL is not modeled (the subset has no labelled
             # loops), and neither is a `break` outside any loop — an empty stack declines
             # rather than emitting a branch to nowhere.
-            if statement is Stmt.Break(break_label, break_line):
-                EmitStatus.Declined return if break_label != ""
-                EmitStatus.Declined return if loops.exits.count == 0
-                # A `break` leaves every scope inside the loop at once, so it runs their
-                # scope-exit `defer`s on the way out — the normal end-of-iteration unwind is
-                # in emit_statements_scoped, which a `break` jumps straight past.
-                if loops.defer_marks.count > 0:
-                    EmitStatus.Declined return if not emit_deferred_actions_from(local_scope, loops.defer_marks[loops.defer_marks.count - 1], true, fns, structs, generics, runtime, m, ctx, builder)
-                _ = LLVMBuildBr(builder, loops.exits[loops.exits.count - 1])
-                return EmitStatus.Terminated
+            match statement:
+                Stmt.Break(break_label, break_line):
+                    EmitStatus.Declined return if break_label != ""
+                    EmitStatus.Declined return if loops.exits.count == 0
+                    # A `break` leaves every scope inside the loop at once, so it runs their
+                    # scope-exit `defer`s on the way out — the normal end-of-iteration unwind is
+                    # in emit_statements_scoped, which a `break` jumps straight past.
+                    if loops.defer_marks.count > 0:
+                        EmitStatus.Declined return if not emit_deferred_actions_from(local_scope, loops.defer_marks[loops.defer_marks.count - 1], true, fns, structs, generics, runtime, m, ctx, builder)
+                    _ = LLVMBuildBr(builder, loops.exits[loops.exits.count - 1])
+                    return EmitStatus.Terminated
 
-            if statement is Stmt.Continue(continue_label, continue_line):
-                EmitStatus.Declined return if continue_label != ""
-                EmitStatus.Declined return if loops.continues.count == 0
-                # `continue` ends the ITERATION, which is the same scope exit.
-                if loops.defer_marks.count > 0:
-                    EmitStatus.Declined return if not emit_deferred_actions_from(local_scope, loops.defer_marks[loops.defer_marks.count - 1], true, fns, structs, generics, runtime, m, ctx, builder)
-                _ = LLVMBuildBr(builder, loops.continues[loops.continues.count - 1])
-                return EmitStatus.Terminated
+                _:
+                    pass
+            match statement:
+                Stmt.Continue(continue_label, continue_line):
+                    EmitStatus.Declined return if continue_label != ""
+                    EmitStatus.Declined return if loops.continues.count == 0
+                    # `continue` ends the ITERATION, which is the same scope exit.
+                    if loops.defer_marks.count > 0:
+                        EmitStatus.Declined return if not emit_deferred_actions_from(local_scope, loops.defer_marks[loops.defer_marks.count - 1], true, fns, structs, generics, runtime, m, ctx, builder)
+                    _ = LLVMBuildBr(builder, loops.continues[loops.continues.count - 1])
+                    return EmitStatus.Terminated
 
-            if statement is Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
-                # `bind` is a MODIFIER ("parallel" / "mutable" / ""), NOT the loop
-                # variable — the names live in `variables`. Data-parallel range loops are
-                    # lowered through the structured runtime combinator; other parallel forms are
-                    # still rejected until their source-view lowering is available.
-                if for_bind == "parallel":
-                    parallel_range_status: EmitStatus = emit_parallel_range_for(for_variables, for_iterable, for_body, for_line.line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                    parallel_range_status return if parallel_range_status != EmitStatus.Declined
-                    parallel_band_status: EmitStatus = emit_parallel_band_for(for_variables, for_iterable, for_body, for_line.line, local_scope, fns, structs, generics, runtime, m, ctx, builder)
-                    parallel_band_status return if parallel_band_status != EmitStatus.Declined
-                EmitStatus.Declined return if for_bind != ""
-                # `for x in xs where COND:` — the parser wraps the iterable as
-                # Expr.Refinement(base, condition). NOTHING here matched Refinement, so the
-                # whole loop declined -- including a plain boolean filter, not just the
-                # pattern-filter forms.
-                #
-                # Desugar rather than thread a condition through every iteration path:
-                # `for x in (base where c): body` IS `for x in base: if c: body`, and the
-                # rewrite reaches the range, darray, fixed-array, dict and enumerate paths
-                # below without touching any of them. The filter is evaluated INSIDE the
-                # body, after the loop variable is bound, which is what lets it reference
-                # that variable at all.
-                #
-                # A BARE PATTERN filter (`where Enum.Variant(binders)`) is not a boolean and
-                # is not rewritten here: it would need the payload BOUND as well as tested,
-                # so it keeps declining rather than being emitted as a condition it is not.
-                # A RANGE base is excluded deliberately: stage0's PARSER REJECTS
-                # `for i in 0..<10 where c:` outright ("expected :, got where"), while
-                # stage1's parser accepts it. Emitting the desugaring for that shape would
-                # make stage1 run a program stage0 refuses -- the PERMISSIVE direction,
-                # which the gate ratchets at zero. Declining keeps both compilers refusing
-                # it. The container forms (`for x in xs where c:`) ARE valid in stage0 and
-                # are what this handles.
-                if for_iterable is Expr.Refinement(for_filter_base, for_filter_condition, for_filter_line):
-                    for_base_is_range: mutable bool = false
-                    if for_filter_base is Expr.Binary(for_range_lo, for_range_operator, for_range_hi, for_range_line):
-                        for_base_is_range <- for_range_operator == TokenKind.RangeLt or for_range_operator == TokenKind.RangeLe
-                    EmitStatus.Declined return if for_base_is_range
-                    # A BARE PATTERN filter (`where Enum.Variant(binders)`) is a PATTERN,
-                    # not a predicate: it must BIND the payload as well as test the tag. It
-                    # is exactly what `LOOPVAR is Enum.Variant(binders)` already means, and
-                    # that form is fully lowered (tag test + payload binding), so rewrite to
-                    # it rather than growing a second pattern-matching path here. The
-                    # semantic layer already puts the binders in scope for the body.
+                _:
+                    pass
+            match statement:
+                Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
+                    # `bind` is a MODIFIER ("parallel" / "mutable" / ""), NOT the loop
+                    # variable — the names live in `variables`. Data-parallel range loops are
+                        # lowered through the structured runtime combinator; other parallel forms are
+                        # still rejected until their source-view lowering is available.
+                    if for_bind == "parallel":
+                        parallel_range_status: EmitStatus = emit_parallel_range_for(for_variables, for_iterable, for_body, for_line.line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                        parallel_range_status return if parallel_range_status != EmitStatus.Declined
+                        parallel_band_status: EmitStatus = emit_parallel_band_for(for_variables, for_iterable, for_body, for_line.line, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        parallel_band_status return if parallel_band_status != EmitStatus.Declined
+                    EmitStatus.Declined return if for_bind != ""
+                    # `for x in xs where COND:` — the parser wraps the iterable as
+                    # Expr.Refinement(base, condition). NOTHING here matched Refinement, so the
+                    # whole loop declined -- including a plain boolean filter, not just the
+                    # pattern-filter forms.
                     #
-                    # Single loop variable only: with several binders (`for k, v in d`) there
-                    # is no one subject for the `is` test, so that shape keeps declining.
-                    for_filter_test: mutable Expr = for_filter_condition
-                    if is_bare_pattern_filter_expr(for_filter_condition) or is_bare_variant_filter_expr(for_filter_condition, structs):
-                        EmitStatus.Declined return if for_variables.count != 1
-                        for_filter_test <- (Expr.Binary((Expr.Ident(for_variables[0], for_filter_line)), TokenKind.Is, for_filter_condition, for_filter_line))
-                    for_filtered_body: mutable darray[Stmt] = [(Stmt.If(for_filter_test, for_body, [], for_filter_line))]
-                    return emit_statement((Stmt.For(for_bind, for_variables, for_filter_base, for_filtered_body, for_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                # `for row in s.rows():` — ROW ITERATION over a `layout(soa)` aggregate. The
-                # binder is a row VIEW; rather than materialise stage0's `{ptr, i64}` pair, the
-                # aggregate's address and the loop index are recorded as a binder and
-                # `row.field` resolves straight to the element address (the same GEP the
-                # explicit `s[i].field` form produces).
-                #
-                # `rows` is accepted both called (`s.rows()`) and bare (`s.rows`) — stage0's own
-                # corpus writes it both ways.
-                if for_variables.count == 1 or for_variables.count == 2:
-                    # The row SEQUENCE, peeled out of its wrappers: `s.rows()`, the bare
-                    # `s.rows`, `s.rows().enumerate()` (index + row) and `rev(s.rows())`
-                    # (descending) are the four spellings stage0's corpus uses.
-                    soa_iter_walk: mutable Expr = for_iterable
-                    soa_iter_reversed: mutable bool = false
-                    soa_iter_enumerated: mutable bool = false
-                    if soa_iter_walk is Expr.Call(soa_rev_callee, soa_rev_args, soa_rev_names, soa_rev_line):
-                        if soa_rev_callee is Expr.Ident(soa_rev_name, soa_rev_name_line):
-                            if soa_rev_name == "rev" and soa_rev_args.count == 1:
-                                soa_iter_reversed <- true
-                                soa_iter_walk <- soa_rev_args[0]
-                    if soa_iter_walk is Expr.Call(soa_en_callee, soa_en_args, soa_en_names, soa_en_line):
-                        if soa_en_callee is Expr.Field(soa_en_object, soa_en_method, soa_en_method_line):
-                            if soa_en_method == "enumerate" and soa_en_args.count == 0:
-                                soa_iter_enumerated <- true
-                                soa_iter_walk <- soa_en_object
-                    soa_iter_source: mutable Expr = Expr.Absent
-                    if soa_iter_walk is Expr.Call(soa_it_callee, soa_it_args, soa_it_names, soa_it_line):
-                        if soa_it_callee is Expr.Field(soa_it_object, soa_it_method, soa_it_method_line):
-                            soa_iter_source <- soa_it_object if soa_it_method == "rows" and soa_it_args.count == 0
-                    if soa_iter_walk is Expr.Field(soa_bare_object, soa_bare_method, soa_bare_line):
-                        soa_iter_source <- soa_bare_object if soa_bare_method == "rows"
-                    # An enumerate needs both binders. Otherwise one binder is the row VIEW and
-                    # N binders DESTRUCTURE the row, one per column in declaration order
-                    # (`for {name_key, depth} in s.rows()` — the brace form parses as a plain
-                    # multi-binder head).
-                    soa_iter_destructured: mutable bool = false
-                    if not (soa_iter_source is Expr.Absent) and not soa_iter_enumerated:
-                        soa_head_type: ValueType = expression_type(soa_iter_source, local_scope, fns, structs, generics)
-                        if soa_head_type.kind == TypeKind.Struct:
-                            soa_iter_destructured <- for_variables.count == structs.field_count[soa_head_type.bits.usize()] and for_variables.count > 1.usize()
-                    soa_iter_source <- Expr.Absent if soa_iter_enumerated and for_variables.count != 2
-                    soa_iter_source <- Expr.Absent if not soa_iter_enumerated and for_variables.count != 1 and not soa_iter_destructured
-                    if not (soa_iter_source is Expr.Absent):
-                        soa_iter_type: ValueType = expression_type(soa_iter_source, local_scope, fns, structs, generics)
-                        if soa_iter_type.kind == TypeKind.Struct and struct_declares_soa_layout(structs, structs.names[soa_iter_type.bits.usize()]) and structs.field_count[soa_iter_type.bits.usize()] > 0.usize():
-                            if struct_chain_address(soa_iter_source, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_iter_base:
-                                soa_iter_llvm: LLVMTypeRef = llvm_type_of(soa_iter_type, structs, ctx)
-                                soa_iter_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                                soa_iter_index: LLVMValueRef = LLVMBuildAlloca(builder, soa_iter_i64, "soa.iter.i")
-                                soa_iter_col0_pre: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(soa_iter_type, structs, ctx), soa_iter_base, 0, "soa.iter.col0.pre")
-                                soa_iter_count_pre: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_iter_col0_pre, 1, "soa.iter.count.pre.ptr"), "soa.iter.count.pre")
-                                # `rev(...)` walks DOWN from count-1; the forward form starts at 0.
-                                _ = LLVMBuildStore(builder, LLVMBuildSub(builder, soa_iter_count_pre, LLVMConstInt(soa_iter_i64, 1, 0), "soa.iter.last") if soa_iter_reversed else LLVMConstInt(soa_iter_i64, 0, 0), soa_iter_index)
-                                soa_iter_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                                soa_iter_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.cond")
-                                soa_iter_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.body")
-                                soa_iter_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.step")
-                                soa_iter_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.done")
-                                _ = LLVMBuildBr(builder, soa_iter_cond)
-                                LLVMPositionBuilderAtEnd(builder, soa_iter_cond)
-                                soa_iter_col0: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_iter_llvm, soa_iter_base, 0, "soa.iter.col0")
-                                soa_iter_count: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_iter_col0, 1, "soa.iter.count.ptr"), "soa.iter.count")
-                                soa_iter_at: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.iter.at")
-                                # 40 = SLT, 39 = SGE. Reversed runs while the index is still >= 0.
-                                _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 39, soa_iter_at, LLVMConstInt(soa_iter_i64, 0, 0), "soa.iter.more.rev") if soa_iter_reversed else LLVMBuildICmp(builder, 40, soa_iter_at, soa_iter_count, "soa.iter.more"), soa_iter_body, soa_iter_done)
-                                LLVMPositionBuilderAtEnd(builder, soa_iter_body)
-                                # `for i, row in s.rows().enumerate()` — the FIRST binder is the
-                                # running index, the second the row.
-                                # One local per column, loaded from that column at the current
-                                # row. The binder ORDER is the declaration order, which is what
-                                # the brace form means.
-                                if soa_iter_destructured:
-                                    soa_de_slot: usize = soa_iter_type.bits.usize()
-                                    soa_de_declined: mutable bool = false
-                                    for soa_de_index in 0..<for_variables.count |soa_de_declined, soa_de_slot, soa_iter_base, soa_iter_llvm, soa_iter_index, soa_iter_i64, for_variables, local_scope, structs, ctx, builder|:
-                                        soa_de_type: ValueType = darray_element_of(copied_type(structs.field_types[structs.field_start[soa_de_slot] + soa_de_index]), structs)
-                                        if soa_de_type.kind == TypeKind.Unmodeled:
-                                            soa_de_declined <- true
-                                        else:
-                                            soa_de_column: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_iter_llvm, soa_iter_base, soa_de_index.u32(), "soa.de.col")
-                                            soa_de_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_de_column, 0, "soa.de.items.ptr"), "soa.de.items")
-                                            soa_de_offsets: mutable darray[LLVMValueRef] = [LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.de.at")]
-                                            soa_de_offset_pointer: void& = (&soa_de_offsets[0]).cast[void&] can Unsafe.PointerCast
-                                            soa_de_llvm: LLVMTypeRef = llvm_type_of(soa_de_type, structs, ctx)
-                                            soa_de_element: LLVMValueRef = LLVMBuildGEP2(builder, soa_de_llvm, soa_de_items, soa_de_offset_pointer, 1, "soa.de.elem")
-                                            soa_de_storage: mutable darray[u8] = []
-                                            soa_de_local: LLVMValueRef = LLVMBuildAlloca(builder, soa_de_llvm, sview_to_cstr(for_variables[soa_de_index], soa_de_storage))
-                                            _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, soa_de_llvm, soa_de_element, "soa.de.value"), soa_de_local)
-                                            declare_local(local_scope, for_variables[soa_de_index], soa_de_local, soa_de_type)
-                                    EmitStatus.Declined return if soa_de_declined
-                                if soa_iter_enumerated:
-                                    soa_iter_index_storage: mutable darray[u8] = []
-                                    soa_iter_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, soa_iter_i64, sview_to_cstr(for_variables[0], soa_iter_index_storage))
-                                    _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.iter.at.bind"), soa_iter_index_slot)
-                                    declare_local(local_scope, for_variables[0], soa_iter_index_slot, ValueType{kind: TypeKind.Signed, bits: 64})
-                                # A DESTRUCTURED head binds columns, not a row view, so it pushes
-                                # a name nothing can reference (the binders are real locals).
-                                structs.soa_row_binder_names <- structs.soa_row_binder_names.push("" if soa_iter_destructured else (for_variables[1] if soa_iter_enumerated else for_variables[0]))
-                                structs.soa_row_binder_slots <- structs.soa_row_binder_slots.push(soa_iter_type.bits)
-                                structs.soa_row_binder_bases <- structs.soa_row_binder_bases.push(soa_iter_base)
-                                structs.soa_row_binder_indexes <- structs.soa_row_binder_indexes.push(soa_iter_index)
-                                loops.exits <- loops.exits.push(soa_iter_done)
-                                loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                                loops.continues <- loops.continues.push(soa_iter_step)
-                                soa_iter_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                                _ = loops.exits.pop()
-                                _ = loops.defer_marks.pop()
-                                _ = loops.continues.pop()
-                                structs.soa_row_binder_names <- structs.soa_row_binder_names.truncate(structs.soa_row_binder_names.count - 1)
-                                structs.soa_row_binder_slots <- structs.soa_row_binder_slots.truncate(structs.soa_row_binder_slots.count - 1)
-                                structs.soa_row_binder_bases <- structs.soa_row_binder_bases.truncate(structs.soa_row_binder_bases.count - 1)
-                                structs.soa_row_binder_indexes <- structs.soa_row_binder_indexes.truncate(structs.soa_row_binder_indexes.count - 1)
-                                EmitStatus.Declined return if soa_iter_status == EmitStatus.Declined
-                                branch_if_open(soa_iter_status, builder, soa_iter_step)
-                                LLVMPositionBuilderAtEnd(builder, soa_iter_step)
-                                soa_iter_next: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.iter.at.next")
-                                _ = LLVMBuildStore(builder, LLVMBuildSub(builder, soa_iter_next, LLVMConstInt(soa_iter_i64, 1, 0), "soa.iter.dec") if soa_iter_reversed else LLVMBuildAdd(builder, soa_iter_next, LLVMConstInt(soa_iter_i64, 1, 0), "soa.iter.inc"), soa_iter_index)
-                                _ = LLVMBuildBr(builder, soa_iter_cond)
-                                LLVMPositionBuilderAtEnd(builder, soa_iter_done)
-                                return EmitStatus.Open
-                            return EmitStatus.Declined
-                # `for k, v in d` — DICT ITERATION over the std DynDict (a LIBRARY type; its
-                # layout is `items: DictBucket&? , count, used, capacity, arena`, with
-                # DictBucket = `key, value, state:u8` (state 1 == occupied)). Walk the raw
-                # bucket array 0..<capacity, bind k/v only for occupied slots. Mirrors stage0's
-                # two-binder iter loop over dict entries.
-                # `for chunk in chunks:` — walking a ChunksExactView. The count is the struct's
-                # third field and each chunk is the same view the `chunks[i]` read builds, so
-                # the loop only supplies the index.
-                if for_variables.count == 1:
-                    ce_recv: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
-                    if ce_recv.kind == TypeKind.Struct and synthesized_struct_base_is(structs, ce_recv, "ChunksExactView"):
-                        ce_view_type: ValueType = copied_type(structs.field_types[structs.field_start[ce_recv.bits.usize()]])
-                        ce_element: ValueType = view_element_of(ce_view_type, structs)
-                        EmitStatus.Declined return if ce_element.kind == TypeKind.Unmodeled
-                        if emit_expression(for_iterable, ce_recv, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ce_agg:
-                            ce_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                            ce_view_llvm: LLVMTypeRef = llvm_type_of(ce_view_type, structs, ctx)
-                            ce_base: LLVMValueRef = LLVMBuildExtractValue(builder, ce_agg, 0, "ce.base")
-                            ce_len: LLVMValueRef = LLVMBuildExtractValue(builder, ce_agg, 1, "ce.len")
-                            ce_count: LLVMValueRef = LLVMBuildExtractValue(builder, ce_agg, 2, "ce.count")
-                            ce_data: LLVMValueRef = LLVMBuildExtractValue(builder, ce_base, 0, "ce.data")
-                            ce_index: LLVMValueRef = LLVMBuildAlloca(builder, ce_i64, "ce.i")
-                            _ = LLVMBuildStore(builder, LLVMConstInt(ce_i64, 0, 0), ce_index)
-                            ce_storage: mutable darray[u8] = []
-                            ce_bind: LLVMValueRef = LLVMBuildAlloca(builder, ce_view_llvm, sview_to_cstr(for_variables[0], ce_storage))
-                            declare_local(local_scope, for_variables[0], ce_bind, ce_view_type)
-                            ce_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                            ce_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ce_function, "ce.cond")
-                            ce_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ce_function, "ce.body")
-                            ce_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ce_function, "ce.step")
-                            ce_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ce_function, "ce.exit")
-                            _ = LLVMBuildBr(builder, ce_cond)
-                            LLVMPositionBuilderAtEnd(builder, ce_cond)
-                            ce_cur: LLVMValueRef = LLVMBuildLoad2(builder, ce_i64, ce_index, "ce.cur")
-                            # 40 = SLT.
-                            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 40, ce_cur, ce_count, "ce.more"), ce_bodyb, ce_exit)
-                            LLVMPositionBuilderAtEnd(builder, ce_bodyb)
-                            ce_offsets: mutable darray[LLVMValueRef] = [LLVMBuildMul(builder, ce_cur, ce_len, "ce.offset")]
-                            ce_offsets_pointer: void& = (&ce_offsets[0]).cast[void&] can Unsafe.PointerCast
-                            ce_at: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(ce_element, structs, ctx), ce_data, ce_offsets_pointer, 1, "ce.at")
-                            ce_chunk: mutable LLVMValueRef = LLVMGetUndef(ce_view_llvm)
-                            ce_chunk <- LLVMBuildInsertValue(builder, ce_chunk, ce_at, 0, "ce.chunk.data")
-                            ce_chunk <- LLVMBuildInsertValue(builder, ce_chunk, ce_len, 1, "ce.chunk.len")
-                            _ = LLVMBuildStore(builder, ce_chunk, ce_bind)
-                            loops.exits <- loops.exits.push(ce_exit)
-                            loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                            loops.continues <- loops.continues.push(ce_step)
-                            ce_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                            _ = loops.exits.pop()
-                            _ = loops.defer_marks.pop()
-                            _ = loops.continues.pop()
-                            EmitStatus.Declined return if ce_status == EmitStatus.Declined
-                            branch_if_open(ce_status, builder, ce_step)
-                            LLVMPositionBuilderAtEnd(builder, ce_step)
-                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, ce_i64, ce_index, "ce.next.cur"), LLVMConstInt(ce_i64, 1, 0), "ce.next"), ce_index)
-                            _ = LLVMBuildBr(builder, ce_cond)
-                            LLVMPositionBuilderAtEnd(builder, ce_exit)
-                            return EmitStatus.Open
-                        return EmitStatus.Declined
-                # `for {a, b} in items:` — DESTRUCTURED struct elements. The brace head parses
-                # as a plain multi-binder loop, so N binders over a container of STRUCTS means
-                # one local per named FIELD (bound by name, not position). Checked before the
-                # enumerate/dict paths, which claim their own two-binder shapes.
-                if for_variables.count > 1.usize() and not (for_iterable is Expr.Call(sd_probe_callee, sd_probe_args, sd_probe_names, sd_probe_line)):
-                    sd_darray_type: ValueType = darray_type_behind_expr(for_iterable, local_scope, structs)
-                    sd_fixed_type: ValueType = iterable_fixed_array_type(for_iterable, local_scope, fns, structs, generics)
-                    sd_element: mutable ValueType = unmodeled_type()
-                    sd_header: mutable LLVMValueRef? = null
-                    if sd_darray_type.kind == TypeKind.DArray:
-                        sd_element <- darray_element_of(sd_darray_type, structs)
-                        sd_header <- darray_address_of_expr(for_iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder)
-                    elif sd_fixed_type.kind == TypeKind.Array:
-                        sd_element <- copied_type(structs.array_elements[sd_fixed_type.bits.usize()])
-                        sd_header <- fixed_array_header_slot(for_iterable, sd_fixed_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
-                    if sd_element.kind == TypeKind.Struct and structs.field_count[sd_element.bits.usize()] == for_variables.count:
-                        if sd_header is sd_slot:
-                            sd_struct_slot: usize = sd_element.bits.usize()
-                            sd_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                            sd_elem_llvm: LLVMTypeRef = llvm_type_of(sd_element, structs, ctx)
-                            sd_count: LLVMValueRef = LLVMBuildLoad2(builder, sd_i64, LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), sd_slot, 1, "sd.cnt.ptr"), "sd.cnt")
-                            sd_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), sd_slot, 0, "sd.items.ptr"), "sd.items")
-                            sd_index: LLVMValueRef = LLVMBuildAlloca(builder, sd_i64, "sd.i")
-                            _ = LLVMBuildStore(builder, LLVMConstInt(sd_i64, 0, 0), sd_index)
-                            sd_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                            sd_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sd_function, "sd.cond")
-                            sd_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sd_function, "sd.body")
-                            sd_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sd_function, "sd.step")
-                            sd_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sd_function, "sd.exit")
-                            _ = LLVMBuildBr(builder, sd_cond)
-                            LLVMPositionBuilderAtEnd(builder, sd_cond)
-                            sd_cur: LLVMValueRef = LLVMBuildLoad2(builder, sd_i64, sd_index, "sd.cur")
-                            # 40 = SLT.
-                            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 40, sd_cur, sd_count, "sd.more"), sd_bodyb, sd_exit)
-                            LLVMPositionBuilderAtEnd(builder, sd_bodyb)
-                            sd_offsets: mutable darray[LLVMValueRef] = [sd_cur]
-                            sd_offsets_pointer: void& = (&sd_offsets[0]).cast[void&] can Unsafe.PointerCast
-                            sd_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, sd_elem_llvm, sd_items, sd_offsets_pointer, 1, "sd.elem.ptr")
-                            sd_declined: mutable bool = false
-                            for sd_bind in 0..<for_variables.count |sd_declined, sd_struct_slot, sd_elem_ptr, sd_elem_llvm, for_variables, local_scope, structs, ctx, builder|:
-                                # The binder is not the field name under a rename, so the
-                                # recorded pattern field wins when there is one.
-                                sd_selector: mutable sview = for_brace_field_at(for_line.line.i64(), sd_bind, structs)
-                                sd_selector <- for_variables[sd_bind] if sd_selector == ""
-                                sd_field: i64 = field_index_of(structs, sd_struct_slot, sd_selector)
-                                if sd_field < 0:
-                                    sd_declined <- true
-                                else:
-                                    sd_field_type: ValueType = copied_type(structs.field_types[structs.field_start[sd_struct_slot] + sd_field.usize()])
-                                    sd_field_llvm: LLVMTypeRef = llvm_type_of(sd_field_type, structs, ctx)
-                                    sd_field_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, sd_elem_llvm, sd_elem_ptr, sd_field.u32(), "sd.field.ptr")
-                                    sd_storage: mutable darray[u8] = []
-                                    sd_local: LLVMValueRef = LLVMBuildAlloca(builder, sd_field_llvm, sview_to_cstr(for_variables[sd_bind], sd_storage))
-                                    _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, sd_field_llvm, sd_field_ptr, "sd.field"), sd_local)
-                                    declare_local(local_scope, for_variables[sd_bind], sd_local, sd_field_type)
-                            EmitStatus.Declined return if sd_declined
-                            loops.exits <- loops.exits.push(sd_exit)
-                            loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                            loops.continues <- loops.continues.push(sd_step)
-                            sd_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                            _ = loops.exits.pop()
-                            _ = loops.defer_marks.pop()
-                            _ = loops.continues.pop()
-                            EmitStatus.Declined return if sd_status == EmitStatus.Declined
-                            branch_if_open(sd_status, builder, sd_step)
-                            LLVMPositionBuilderAtEnd(builder, sd_step)
-                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, sd_i64, sd_index, "sd.next.cur"), LLVMConstInt(sd_i64, 1, 0), "sd.next"), sd_index)
-                            _ = LLVMBuildBr(builder, sd_cond)
-                            LLVMPositionBuilderAtEnd(builder, sd_exit)
-                            return EmitStatus.Open
-                if for_variables.count == 2:
-                    # `for i, x in xs.enumerate()` — INDEX + VALUE iteration over a darray. The
-                    # first binder is the running index (i64), the second the element. Detected by
-                    # the `.enumerate()` receiver before the dict path (its iterable is a call, not
-                    # a DynDict value).
-                    if for_iterable is Expr.Call(en_callee, en_args, en_arg_names, en_call_line):
-                        if en_callee is Expr.Field(en_source, en_method, en_method_line):
-                            if en_method == "enumerate" and en_args.count == 0:
-                                en_source_type: mutable ValueType = darray_type_behind_expr(en_source, local_scope, structs)
-                                # A FIXED array enumerates too (`for i, x in items.enumerate()`
-                                # where `items: array[T, 3]`). Rather than a second copy of the
-                                # loop, borrow the same trick the plain `for x in xs` walk uses:
-                                # build a synthetic darray HEADER over the array's storage and
-                                # run the darray path unchanged.
-                                en_fixed_type: ValueType = iterable_fixed_array_type(en_source, local_scope, fns, structs, generics)
-                                en_fixed_header: mutable LLVMValueRef? = null
-                                if en_source_type.kind != TypeKind.DArray and en_fixed_type.kind == TypeKind.Array:
-                                    en_fixed_header <- fixed_array_header_slot(en_source, en_fixed_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
-                                    en_source_type <- intern_darray_type(copied_type(structs.array_elements[en_fixed_type.bits.usize()]), structs) if en_fixed_header is en_fixed_present
-                                EmitStatus.Declined return if en_source_type.kind != TypeKind.DArray
-                                en_source_opt: LLVMValueRef? = en_fixed_header if en_fixed_header is en_fixed_ready else darray_address_of_expr(en_source, local_scope, fns, structs, generics, runtime, m, ctx, builder)
-                                if en_source_opt is en_source_slot:
-                                    en_elem_type: ValueType = darray_element_of(en_source_type, structs)
-                                    EmitStatus.Declined return if en_elem_type.kind == TypeKind.Unmodeled
-                                    en_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                                    en_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
-                                    en_elem_llvm: LLVMTypeRef = llvm_type_of(en_elem_type, structs, ctx)
-                                    en_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, en_header, en_source_slot, 1, "enum.cnt.ptr")
-                                    en_count: LLVMValueRef = LLVMBuildLoad2(builder, en_i64, en_count_ptr, "enum.cnt")
-                                    en_items_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, en_header, en_source_slot, 0, "enum.items.ptr")
-                                    en_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), en_items_ptr, "enum.items")
-                                    en_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, en_i64, "enum.i")
-                                    _ = LLVMBuildStore(builder, LLVMConstInt(en_i64, 0, 0), en_index_slot)
-                                    en_idx_name_storage: mutable darray[u8] = []
-                                    en_idx_slot: LLVMValueRef = LLVMBuildAlloca(builder, en_i64, sview_to_cstr(for_variables[0], en_idx_name_storage))
-                                    declare_local(local_scope, for_variables[0], en_idx_slot, ValueType{kind: TypeKind.Signed, bits: 64})
-                                    en_val_name_storage: mutable darray[u8] = []
-                                    en_val_slot: LLVMValueRef = LLVMBuildAlloca(builder, en_elem_llvm, sview_to_cstr(for_variables[1], en_val_name_storage))
-                                    declare_local(local_scope, for_variables[1], en_val_slot, en_elem_type)
-                                    en_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                                    en_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.cond")
-                                    en_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.body")
-                                    en_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.step")
-                                    en_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.exit")
-                                    _ = LLVMBuildBr(builder, en_cond)
-                                    LLVMPositionBuilderAtEnd(builder, en_cond)
-                                    en_cur: LLVMValueRef = LLVMBuildLoad2(builder, en_i64, en_index_slot, "enum.cur")
-                                    en_more: LLVMValueRef = LLVMBuildICmp(builder, 40, en_cur, en_count, "enum.more")
-                                    _ = LLVMBuildCondBr(builder, en_more, en_bodyb, en_exit)
-                                    LLVMPositionBuilderAtEnd(builder, en_bodyb)
-                                    # i = cur; x = items[cur].
-                                    _ = LLVMBuildStore(builder, en_cur, en_idx_slot)
-                                    en_gep_indices: mutable darray[LLVMValueRef] = [en_cur]
-                                    en_gep_pointer: void& = (&en_gep_indices[0]).cast[void&] can Unsafe.PointerCast
-                                    en_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, en_elem_llvm, en_items, en_gep_pointer, 1, "enum.elem.ptr")
-                                    _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, en_elem_llvm, en_elem_ptr, "enum.elem"), en_val_slot)
-                                    loops.exits <- loops.exits.push(en_exit)
+                    # Desugar rather than thread a condition through every iteration path:
+                    # `for x in (base where c): body` IS `for x in base: if c: body`, and the
+                    # rewrite reaches the range, darray, fixed-array, dict and enumerate paths
+                    # below without touching any of them. The filter is evaluated INSIDE the
+                    # body, after the loop variable is bound, which is what lets it reference
+                    # that variable at all.
+                    #
+                    # A BARE PATTERN filter (`where Enum.Variant(binders)`) is not a boolean and
+                    # is not rewritten here: it would need the payload BOUND as well as tested,
+                    # so it keeps declining rather than being emitted as a condition it is not.
+                    # A RANGE base is excluded deliberately: stage0's PARSER REJECTS
+                    # `for i in 0..<10 where c:` outright ("expected :, got where"), while
+                    # stage1's parser accepts it. Emitting the desugaring for that shape would
+                    # make stage1 run a program stage0 refuses -- the PERMISSIVE direction,
+                    # which the gate ratchets at zero. Declining keeps both compilers refusing
+                    # it. The container forms (`for x in xs where c:`) ARE valid in stage0 and
+                    # are what this handles.
+                    match for_iterable:
+                        Expr.Refinement(for_filter_base, for_filter_condition, for_filter_line):
+                            for_base_is_range: mutable bool = false
+                            match for_filter_base:
+                                Expr.Binary(for_range_lo, for_range_operator, for_range_hi, for_range_line):
+                                    for_base_is_range <- for_range_operator == TokenKind.RangeLt or for_range_operator == TokenKind.RangeLe
+                                _:
+                                    pass
+                            EmitStatus.Declined return if for_base_is_range
+                            # A BARE PATTERN filter (`where Enum.Variant(binders)`) is a PATTERN,
+                            # not a predicate: it must BIND the payload as well as test the tag. It
+                            # is exactly what `LOOPVAR is Enum.Variant(binders)` already means, and
+                            # that form is fully lowered (tag test + payload binding), so rewrite to
+                            # it rather than growing a second pattern-matching path here. The
+                            # semantic layer already puts the binders in scope for the body.
+                            #
+                            # Single loop variable only: with several binders (`for k, v in d`) there
+                            # is no one subject for the `is` test, so that shape keeps declining.
+                            for_filter_test: mutable Expr = for_filter_condition
+                            if is_bare_pattern_filter_expr(for_filter_condition) or is_bare_variant_filter_expr(for_filter_condition, structs):
+                                EmitStatus.Declined return if for_variables.count != 1
+                                for_filter_test <- (Expr.Binary((Expr.Ident(for_variables[0], for_filter_line)), TokenKind.Is, for_filter_condition, for_filter_line))
+                            for_filtered_body: mutable darray[Stmt] = [(Stmt.If(for_filter_test, for_body, [], for_filter_line))]
+                            return emit_statement((Stmt.For(for_bind, for_variables, for_filter_base, for_filtered_body, for_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                        _:
+                            pass
+                    # `for row in s.rows():` — ROW ITERATION over a `layout(soa)` aggregate. The
+                    # binder is a row VIEW; rather than materialise stage0's `{ptr, i64}` pair, the
+                    # aggregate's address and the loop index are recorded as a binder and
+                    # `row.field` resolves straight to the element address (the same GEP the
+                    # explicit `s[i].field` form produces).
+                    #
+                    # `rows` is accepted both called (`s.rows()`) and bare (`s.rows`) — stage0's own
+                    # corpus writes it both ways.
+                    if for_variables.count == 1 or for_variables.count == 2:
+                        # The row SEQUENCE, peeled out of its wrappers: `s.rows()`, the bare
+                        # `s.rows`, `s.rows().enumerate()` (index + row) and `rev(s.rows())`
+                        # (descending) are the four spellings stage0's corpus uses.
+                        soa_iter_walk: mutable Expr = for_iterable
+                        soa_iter_reversed: mutable bool = false
+                        soa_iter_enumerated: mutable bool = false
+                        match soa_iter_walk:
+                            Expr.Call(soa_rev_callee, soa_rev_args, soa_rev_names, soa_rev_line):
+                                match soa_rev_callee:
+                                    Expr.Ident(soa_rev_name, soa_rev_name_line):
+                                        if soa_rev_name == "rev" and soa_rev_args.count == 1:
+                                            soa_iter_reversed <- true
+                                            soa_iter_walk <- soa_rev_args[0]
+                                    _:
+                                        pass
+                            _:
+                                pass
+                        match soa_iter_walk:
+                            Expr.Call(soa_en_callee, soa_en_args, soa_en_names, soa_en_line):
+                                match soa_en_callee:
+                                    Expr.Field(soa_en_object, soa_en_method, soa_en_method_line):
+                                        if soa_en_method == "enumerate" and soa_en_args.count == 0:
+                                            soa_iter_enumerated <- true
+                                            soa_iter_walk <- soa_en_object
+                                    _:
+                                        pass
+                            _:
+                                pass
+                        soa_iter_source: mutable Expr = Expr.Absent
+                        match soa_iter_walk:
+                            Expr.Call(soa_it_callee, soa_it_args, soa_it_names, soa_it_line):
+                                match soa_it_callee:
+                                    Expr.Field(soa_it_object, soa_it_method, soa_it_method_line):
+                                        soa_iter_source <- soa_it_object if soa_it_method == "rows" and soa_it_args.count == 0
+                                    _:
+                                        pass
+                            _:
+                                pass
+                        match soa_iter_walk:
+                            Expr.Field(soa_bare_object, soa_bare_method, soa_bare_line):
+                                soa_iter_source <- soa_bare_object if soa_bare_method == "rows"
+                            _:
+                                pass
+                        # An enumerate needs both binders. Otherwise one binder is the row VIEW and
+                        # N binders DESTRUCTURE the row, one per column in declaration order
+                        # (`for {name_key, depth} in s.rows()` — the brace form parses as a plain
+                        # multi-binder head).
+                        soa_iter_destructured: mutable bool = false
+                        if not (soa_iter_source is Expr.Absent) and not soa_iter_enumerated:
+                            soa_head_type: ValueType = expression_type(soa_iter_source, local_scope, fns, structs, generics)
+                            if soa_head_type.kind == TypeKind.Struct:
+                                soa_iter_destructured <- for_variables.count == structs.field_count[soa_head_type.bits.usize()] and for_variables.count > 1.usize()
+                        soa_iter_source <- Expr.Absent if soa_iter_enumerated and for_variables.count != 2
+                        soa_iter_source <- Expr.Absent if not soa_iter_enumerated and for_variables.count != 1 and not soa_iter_destructured
+                        if not (soa_iter_source is Expr.Absent):
+                            soa_iter_type: ValueType = expression_type(soa_iter_source, local_scope, fns, structs, generics)
+                            if soa_iter_type.kind == TypeKind.Struct and struct_declares_soa_layout(structs, structs.names[soa_iter_type.bits.usize()]) and structs.field_count[soa_iter_type.bits.usize()] > 0.usize():
+                                if struct_chain_address(soa_iter_source, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_iter_base:
+                                    soa_iter_llvm: LLVMTypeRef = llvm_type_of(soa_iter_type, structs, ctx)
+                                    soa_iter_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                    soa_iter_index: LLVMValueRef = LLVMBuildAlloca(builder, soa_iter_i64, "soa.iter.i")
+                                    soa_iter_col0_pre: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(soa_iter_type, structs, ctx), soa_iter_base, 0, "soa.iter.col0.pre")
+                                    soa_iter_count_pre: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_iter_col0_pre, 1, "soa.iter.count.pre.ptr"), "soa.iter.count.pre")
+                                    # `rev(...)` walks DOWN from count-1; the forward form starts at 0.
+                                    _ = LLVMBuildStore(builder, LLVMBuildSub(builder, soa_iter_count_pre, LLVMConstInt(soa_iter_i64, 1, 0), "soa.iter.last") if soa_iter_reversed else LLVMConstInt(soa_iter_i64, 0, 0), soa_iter_index)
+                                    soa_iter_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                    soa_iter_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.cond")
+                                    soa_iter_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.body")
+                                    soa_iter_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.step")
+                                    soa_iter_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, soa_iter_function, "soa.iter.done")
+                                    _ = LLVMBuildBr(builder, soa_iter_cond)
+                                    LLVMPositionBuilderAtEnd(builder, soa_iter_cond)
+                                    soa_iter_col0: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_iter_llvm, soa_iter_base, 0, "soa.iter.col0")
+                                    soa_iter_count: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_iter_col0, 1, "soa.iter.count.ptr"), "soa.iter.count")
+                                    soa_iter_at: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.iter.at")
+                                    # 40 = SLT, 39 = SGE. Reversed runs while the index is still >= 0.
+                                    _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 39, soa_iter_at, LLVMConstInt(soa_iter_i64, 0, 0), "soa.iter.more.rev") if soa_iter_reversed else LLVMBuildICmp(builder, 40, soa_iter_at, soa_iter_count, "soa.iter.more"), soa_iter_body, soa_iter_done)
+                                    LLVMPositionBuilderAtEnd(builder, soa_iter_body)
+                                    # `for i, row in s.rows().enumerate()` — the FIRST binder is the
+                                    # running index, the second the row.
+                                    # One local per column, loaded from that column at the current
+                                    # row. The binder ORDER is the declaration order, which is what
+                                    # the brace form means.
+                                    if soa_iter_destructured:
+                                        soa_de_slot: usize = soa_iter_type.bits.usize()
+                                        soa_de_declined: mutable bool = false
+                                        for soa_de_index in 0..<for_variables.count |soa_de_declined, soa_de_slot, soa_iter_base, soa_iter_llvm, soa_iter_index, soa_iter_i64, for_variables, local_scope, structs, ctx, builder|:
+                                            soa_de_type: ValueType = darray_element_of(copied_type(structs.field_types[structs.field_start[soa_de_slot] + soa_de_index]), structs)
+                                            if soa_de_type.kind == TypeKind.Unmodeled:
+                                                soa_de_declined <- true
+                                            else:
+                                                soa_de_column: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_iter_llvm, soa_iter_base, soa_de_index.u32(), "soa.de.col")
+                                                soa_de_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_de_column, 0, "soa.de.items.ptr"), "soa.de.items")
+                                                soa_de_offsets: mutable darray[LLVMValueRef] = [LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.de.at")]
+                                                soa_de_offset_pointer: void& = (&soa_de_offsets[0]).cast[void&] can Unsafe.PointerCast
+                                                soa_de_llvm: LLVMTypeRef = llvm_type_of(soa_de_type, structs, ctx)
+                                                soa_de_element: LLVMValueRef = LLVMBuildGEP2(builder, soa_de_llvm, soa_de_items, soa_de_offset_pointer, 1, "soa.de.elem")
+                                                soa_de_storage: mutable darray[u8] = []
+                                                soa_de_local: LLVMValueRef = LLVMBuildAlloca(builder, soa_de_llvm, sview_to_cstr(for_variables[soa_de_index], soa_de_storage))
+                                                _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, soa_de_llvm, soa_de_element, "soa.de.value"), soa_de_local)
+                                                declare_local(local_scope, for_variables[soa_de_index], soa_de_local, soa_de_type)
+                                        EmitStatus.Declined return if soa_de_declined
+                                    if soa_iter_enumerated:
+                                        soa_iter_index_storage: mutable darray[u8] = []
+                                        soa_iter_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, soa_iter_i64, sview_to_cstr(for_variables[0], soa_iter_index_storage))
+                                        _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.iter.at.bind"), soa_iter_index_slot)
+                                        declare_local(local_scope, for_variables[0], soa_iter_index_slot, ValueType{kind: TypeKind.Signed, bits: 64})
+                                    # A DESTRUCTURED head binds columns, not a row view, so it pushes
+                                    # a name nothing can reference (the binders are real locals).
+                                    structs.soa_row_binder_names <- structs.soa_row_binder_names.push("" if soa_iter_destructured else (for_variables[1] if soa_iter_enumerated else for_variables[0]))
+                                    structs.soa_row_binder_slots <- structs.soa_row_binder_slots.push(soa_iter_type.bits)
+                                    structs.soa_row_binder_bases <- structs.soa_row_binder_bases.push(soa_iter_base)
+                                    structs.soa_row_binder_indexes <- structs.soa_row_binder_indexes.push(soa_iter_index)
+                                    loops.exits <- loops.exits.push(soa_iter_done)
                                     loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                                    loops.continues <- loops.continues.push(en_step)
-                                    en_body_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                    loops.continues <- loops.continues.push(soa_iter_step)
+                                    soa_iter_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                                     _ = loops.exits.pop()
                                     _ = loops.defer_marks.pop()
                                     _ = loops.continues.pop()
-                                    EmitStatus.Declined return if en_body_status == EmitStatus.Declined
-                                    branch_if_open(en_body_status, builder, en_step)
-                                    LLVMPositionBuilderAtEnd(builder, en_step)
-                                    _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, en_i64, en_index_slot, "enum.next.cur"), LLVMConstInt(en_i64, 1, 0), "enum.next"), en_index_slot)
-                                    _ = LLVMBuildBr(builder, en_cond)
-                                    LLVMPositionBuilderAtEnd(builder, en_exit)
+                                    structs.soa_row_binder_names <- structs.soa_row_binder_names.truncate(structs.soa_row_binder_names.count - 1)
+                                    structs.soa_row_binder_slots <- structs.soa_row_binder_slots.truncate(structs.soa_row_binder_slots.count - 1)
+                                    structs.soa_row_binder_bases <- structs.soa_row_binder_bases.truncate(structs.soa_row_binder_bases.count - 1)
+                                    structs.soa_row_binder_indexes <- structs.soa_row_binder_indexes.truncate(structs.soa_row_binder_indexes.count - 1)
+                                    EmitStatus.Declined return if soa_iter_status == EmitStatus.Declined
+                                    branch_if_open(soa_iter_status, builder, soa_iter_step)
+                                    LLVMPositionBuilderAtEnd(builder, soa_iter_step)
+                                    soa_iter_next: LLVMValueRef = LLVMBuildLoad2(builder, soa_iter_i64, soa_iter_index, "soa.iter.at.next")
+                                    _ = LLVMBuildStore(builder, LLVMBuildSub(builder, soa_iter_next, LLVMConstInt(soa_iter_i64, 1, 0), "soa.iter.dec") if soa_iter_reversed else LLVMBuildAdd(builder, soa_iter_next, LLVMConstInt(soa_iter_i64, 1, 0), "soa.iter.inc"), soa_iter_index)
+                                    _ = LLVMBuildBr(builder, soa_iter_cond)
+                                    LLVMPositionBuilderAtEnd(builder, soa_iter_done)
                                     return EmitStatus.Open
                                 return EmitStatus.Declined
-                    dict_iter_type: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
-                    EmitStatus.Declined return if dict_iter_type.kind != TypeKind.Struct
-                    dict_slot: usize = dict_iter_type.bits.usize()
-                    EmitStatus.Declined return if structs.names[dict_slot] != "DynDict"
-                    dict_items_index: i64 = field_index_of(structs, dict_slot, "items")
-                    dict_capacity_index: i64 = field_index_of(structs, dict_slot, "capacity")
-                    EmitStatus.Declined return if dict_items_index < 0 or dict_capacity_index < 0
-                    dict_items_field_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_slot] + dict_items_index.usize()])
-                    EmitStatus.Declined return if dict_items_field_type.kind != TypeKind.Optional
-                    dict_items_ref_type: ValueType = optional_payload_of(dict_items_field_type, structs)
-                    EmitStatus.Declined return if dict_items_ref_type.kind != TypeKind.Ref
-                    dict_bucket_type: ValueType = ref_target_of(dict_items_ref_type, structs)
-                    EmitStatus.Declined return if dict_bucket_type.kind != TypeKind.Struct
-                    dict_bucket_slot: usize = dict_bucket_type.bits.usize()
-                    dict_key_index: i64 = field_index_of(structs, dict_bucket_slot, "key")
-                    dict_value_index: i64 = field_index_of(structs, dict_bucket_slot, "value")
-                    dict_state_index: i64 = field_index_of(structs, dict_bucket_slot, "state")
-                    EmitStatus.Declined return if dict_key_index < 0 or dict_value_index < 0 or dict_state_index < 0
-                    dict_key_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_bucket_slot] + dict_key_index.usize()])
-                    dict_value_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_bucket_slot] + dict_value_index.usize()])
-                    if struct_chain_address(for_iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dict_address:
-                        dict_llvm: LLVMTypeRef = llvm_type_of(dict_iter_type, structs, ctx)
-                        dict_optional_llvm: LLVMTypeRef = llvm_type_of(dict_items_field_type, structs, ctx)
-                        dict_bucket_llvm: LLVMTypeRef = llvm_type_of(dict_bucket_type, structs, ctx)
-                        dict_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                        dict_i8: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
-                        # items is `DictBucket&?` — a TAGGED optional {i1, ptr}; the raw array
-                        # pointer is field 1. Empty dict → null items, but capacity is then 0 so
-                        # the loop body never runs.
-                        dict_items_opt_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_llvm, dict_address, dict_items_index.u32(), "dict.items.opt.ptr")
-                        dict_items_opt: LLVMValueRef = LLVMBuildLoad2(builder, dict_optional_llvm, dict_items_opt_ptr, "dict.items.opt")
-                        dict_items_raw: LLVMValueRef = optional_payload_value_of(dict_items_opt, dict_items_field_type, structs, ctx, builder)
-                        dict_capacity_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_llvm, dict_address, dict_capacity_index.u32(), "dict.cap.ptr")
-                        dict_capacity: LLVMValueRef = LLVMBuildLoad2(builder, dict_i64, dict_capacity_ptr, "dict.cap")
-                        dict_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, dict_i64, "dict.i")
-                        _ = LLVMBuildStore(builder, LLVMConstInt(dict_i64, 0, 0), dict_index_slot)
-                        dict_key_storage: mutable darray[u8] = []
-                        dict_key_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(dict_key_type, structs, ctx), sview_to_cstr(for_variables[0], dict_key_storage))
-                        declare_local(local_scope, for_variables[0], dict_key_slot, dict_key_type)
-                        dict_value_storage: mutable darray[u8] = []
-                        dict_value_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(dict_value_type, structs, ctx), sview_to_cstr(for_variables[1], dict_value_storage))
-                        declare_local(local_scope, for_variables[1], dict_value_slot, dict_value_type)
-                        dict_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                        dict_head: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.head")
-                        dict_check: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.check")
-                        dict_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.body")
-                        dict_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.step")
-                        dict_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.exit")
-                        _ = LLVMBuildBr(builder, dict_head)
-                        LLVMPositionBuilderAtEnd(builder, dict_head)
-                        dict_current: LLVMValueRef = LLVMBuildLoad2(builder, dict_i64, dict_index_slot, "dict.cur")
-                        dict_keep: LLVMValueRef = LLVMBuildICmp(builder, 36, dict_current, dict_capacity, "dict.cmp")
-                        _ = LLVMBuildCondBr(builder, dict_keep, dict_check, dict_exit)
-                        # CHECK: load this slot's state; occupied (1) → body, else → step.
-                        LLVMPositionBuilderAtEnd(builder, dict_check)
-                        dict_slot_indices: mutable darray[LLVMValueRef] = [dict_current]
-                        dict_slot_indices_pointer: void& = (&dict_slot_indices[0]).cast[void&] can Unsafe.PointerCast
-                        dict_bucket_ptr: LLVMValueRef = LLVMBuildGEP2(builder, dict_bucket_llvm, dict_items_raw, dict_slot_indices_pointer, 1, "dict.bucket.ptr")
-                        dict_state_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_state_index.u32(), "dict.state.ptr")
-                        dict_state: LLVMValueRef = LLVMBuildLoad2(builder, dict_i8, dict_state_ptr, "dict.state")
-                        dict_occupied: LLVMValueRef = LLVMBuildICmp(builder, 32, dict_state, LLVMConstInt(dict_i8, 1, 0), "dict.occ")
-                        _ = LLVMBuildCondBr(builder, dict_occupied, dict_body, dict_step)
-                        # BODY: bind k = bucket.key, v = bucket.value, then run the loop body.
-                        LLVMPositionBuilderAtEnd(builder, dict_body)
-                        dict_key_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_key_index.u32(), "dict.key.ptr")
-                        _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(dict_key_type, structs, ctx), dict_key_ptr, "dict.key"), dict_key_slot)
-                        dict_value_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_value_index.u32(), "dict.value.ptr")
-                        _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(dict_value_type, structs, ctx), dict_value_ptr, "dict.value"), dict_value_slot)
-                        loops.exits <- loops.exits.push(dict_exit)
-                        loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                        loops.continues <- loops.continues.push(dict_step)
-                        dict_body_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                        _ = loops.exits.pop()
-                        _ = loops.defer_marks.pop()
-                        _ = loops.continues.pop()
-                        EmitStatus.Declined return if dict_body_status == EmitStatus.Declined
-                        branch_if_open(dict_body_status, builder, dict_step)
-                        LLVMPositionBuilderAtEnd(builder, dict_step)
-                        dict_next: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, dict_i64, dict_index_slot, "dict.next.cur"), LLVMConstInt(dict_i64, 1, 0), "dict.next")
-                        _ = LLVMBuildStore(builder, dict_next, dict_index_slot)
-                        _ = LLVMBuildBr(builder, dict_head)
-                        LLVMPositionBuilderAtEnd(builder, dict_exit)
-                        return EmitStatus.Open
-                    return EmitStatus.Declined
-                EmitStatus.Declined return if for_variables.count != 1
-                for_variable: sview = for_variables[0]
-                # A single-variable darray iteration uses the header's count/items fields
-                # and otherwise follows the same CFG shape as integer ranges.
-                # The iterable's darray header address — works for a local (`xs`), a borrowed
-                # darray param (`xs: darray[T]&`), a struct FIELD (`b.items`, incl. through a
-                # `Bag&` ref), and a nested `m[i]` — all via the general darray locators.
-                # `for x in rev(xs):` — the REVERSED iteration builtin. It is not a real call
-                # (nothing declares `rev`); it wraps the iterable and flips the traversal
-                # order. Unwrapped here so the darray loop below reads the same container,
-                # with only the element index mirrored.
-                for_reversed: mutable bool = false
-                for_source: mutable Expr = for_iterable
-                if for_iterable is Expr.Call(rev_callee, rev_args, rev_arg_names, rev_call_line):
-                    if rev_callee is Expr.Ident(rev_name, rev_name_line):
-                        if rev_name == "rev" and rev_args.count == 1:
-                            for_reversed <- true
-                            for_source <- rev_args[0]
-                container_type: mutable ValueType = iterable_darray_type(for_source, local_scope, fns, structs, generics)
-                if true:
-                    if container_type.kind == TypeKind.DArray:
-                        if darray_read_slot(for_source, container_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is container_slot:
-                            element_type: ValueType = darray_element_of(container_type, structs)
-                            EmitStatus.Declined return if element_type.kind == TypeKind.Unmodeled
-                            header: LLVMTypeRef = darray_llvm_type(structs, ctx)
-                            int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                            count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, header, container_slot, 1, "for.darray.count.ptr")
-                            count_value: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, count_ptr, "for.darray.count")
-                            items_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, header, container_slot, 0, "for.darray.items.ptr")
-                            items_value: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_ptr, "for.darray.items")
-                            index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, "for.darray.i")
-                            _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), index_slot)
-                            loop_name_storage: mutable darray[u8] = []
-                            element_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(element_type, structs, ctx), sview_to_cstr(for_variable, loop_name_storage))
-                            declare_local(local_scope, for_variable, element_slot, element_type)
-                            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                            head_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.head")
-                            body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.body")
-                            step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.step")
-                            exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.exit")
-                            _ = LLVMBuildBr(builder, head_block)
-                            LLVMPositionBuilderAtEnd(builder, head_block)
-                            current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, index_slot, "for.darray.cur")
-                            keep_going: LLVMValueRef = LLVMBuildICmp(builder, 36, current, count_value, "for.darray.cmp")
-                            _ = LLVMBuildCondBr(builder, keep_going, body_block, exit_block)
-                            LLVMPositionBuilderAtEnd(builder, body_block)
-                            # REVERSED: walk the same 0..<count counter but read the mirrored
-                            # element, `count - 1 - i`. Keeping the counter forward means the
-                            # bound check, the step and the exit edge are all unchanged.
-                            effective_index: mutable LLVMValueRef = current
-                            if for_reversed:
-                                effective_index <- LLVMBuildSub(builder, LLVMBuildSub(builder, count_value, LLVMConstInt(int64_type, 1, 0), "for.darray.last"), current, "for.darray.mirror")
-                            indices: mutable darray[LLVMValueRef] = [effective_index]
-                            indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
-                            element_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items_value, indices_pointer, 1, "for.darray.elem.ptr")
-                            _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), element_pointer, "for.darray.elem"), element_slot)
-                            loops.exits <- loops.exits.push(exit_block)
+                    # `for k, v in d` — DICT ITERATION over the std DynDict (a LIBRARY type; its
+                    # layout is `items: DictBucket&? , count, used, capacity, arena`, with
+                    # DictBucket = `key, value, state:u8` (state 1 == occupied)). Walk the raw
+                    # bucket array 0..<capacity, bind k/v only for occupied slots. Mirrors stage0's
+                    # two-binder iter loop over dict entries.
+                    # `for chunk in chunks:` — walking a ChunksExactView. The count is the struct's
+                    # third field and each chunk is the same view the `chunks[i]` read builds, so
+                    # the loop only supplies the index.
+                    if for_variables.count == 1:
+                        ce_recv: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
+                        if ce_recv.kind == TypeKind.Struct and synthesized_struct_base_is(structs, ce_recv, "ChunksExactView"):
+                            ce_view_type: ValueType = copied_type(structs.field_types[structs.field_start[ce_recv.bits.usize()]])
+                            ce_element: ValueType = view_element_of(ce_view_type, structs)
+                            EmitStatus.Declined return if ce_element.kind == TypeKind.Unmodeled
+                            if emit_expression(for_iterable, ce_recv, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ce_agg:
+                                ce_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                ce_view_llvm: LLVMTypeRef = llvm_type_of(ce_view_type, structs, ctx)
+                                ce_base: LLVMValueRef = LLVMBuildExtractValue(builder, ce_agg, 0, "ce.base")
+                                ce_len: LLVMValueRef = LLVMBuildExtractValue(builder, ce_agg, 1, "ce.len")
+                                ce_count: LLVMValueRef = LLVMBuildExtractValue(builder, ce_agg, 2, "ce.count")
+                                ce_data: LLVMValueRef = LLVMBuildExtractValue(builder, ce_base, 0, "ce.data")
+                                ce_index: LLVMValueRef = LLVMBuildAlloca(builder, ce_i64, "ce.i")
+                                _ = LLVMBuildStore(builder, LLVMConstInt(ce_i64, 0, 0), ce_index)
+                                ce_storage: mutable darray[u8] = []
+                                ce_bind: LLVMValueRef = LLVMBuildAlloca(builder, ce_view_llvm, sview_to_cstr(for_variables[0], ce_storage))
+                                declare_local(local_scope, for_variables[0], ce_bind, ce_view_type)
+                                ce_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                ce_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ce_function, "ce.cond")
+                                ce_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ce_function, "ce.body")
+                                ce_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ce_function, "ce.step")
+                                ce_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ce_function, "ce.exit")
+                                _ = LLVMBuildBr(builder, ce_cond)
+                                LLVMPositionBuilderAtEnd(builder, ce_cond)
+                                ce_cur: LLVMValueRef = LLVMBuildLoad2(builder, ce_i64, ce_index, "ce.cur")
+                                # 40 = SLT.
+                                _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 40, ce_cur, ce_count, "ce.more"), ce_bodyb, ce_exit)
+                                LLVMPositionBuilderAtEnd(builder, ce_bodyb)
+                                ce_offsets: mutable darray[LLVMValueRef] = [LLVMBuildMul(builder, ce_cur, ce_len, "ce.offset")]
+                                ce_offsets_pointer: void& = (&ce_offsets[0]).cast[void&] can Unsafe.PointerCast
+                                ce_at: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(ce_element, structs, ctx), ce_data, ce_offsets_pointer, 1, "ce.at")
+                                ce_chunk: mutable LLVMValueRef = LLVMGetUndef(ce_view_llvm)
+                                ce_chunk <- LLVMBuildInsertValue(builder, ce_chunk, ce_at, 0, "ce.chunk.data")
+                                ce_chunk <- LLVMBuildInsertValue(builder, ce_chunk, ce_len, 1, "ce.chunk.len")
+                                _ = LLVMBuildStore(builder, ce_chunk, ce_bind)
+                                loops.exits <- loops.exits.push(ce_exit)
+                                loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                                loops.continues <- loops.continues.push(ce_step)
+                                ce_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                _ = loops.exits.pop()
+                                _ = loops.defer_marks.pop()
+                                _ = loops.continues.pop()
+                                EmitStatus.Declined return if ce_status == EmitStatus.Declined
+                                branch_if_open(ce_status, builder, ce_step)
+                                LLVMPositionBuilderAtEnd(builder, ce_step)
+                                _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, ce_i64, ce_index, "ce.next.cur"), LLVMConstInt(ce_i64, 1, 0), "ce.next"), ce_index)
+                                _ = LLVMBuildBr(builder, ce_cond)
+                                LLVMPositionBuilderAtEnd(builder, ce_exit)
+                                return EmitStatus.Open
+                            return EmitStatus.Declined
+                    # `for {a, b} in items:` — DESTRUCTURED struct elements. The brace head parses
+                    # as a plain multi-binder loop, so N binders over a container of STRUCTS means
+                    # one local per named FIELD (bound by name, not position). Checked before the
+                    # enumerate/dict paths, which claim their own two-binder shapes.
+                    sd_iterable_is_call: mutable bool = false
+                    match for_iterable:
+                        Expr.Call(sd_probe_callee, sd_probe_args, sd_probe_names, sd_probe_line):
+                            sd_iterable_is_call <- true
+                        _:
+                            pass
+                    if for_variables.count > 1.usize() and not sd_iterable_is_call:
+                        sd_darray_type: ValueType = darray_type_behind_expr(for_iterable, local_scope, structs)
+                        sd_fixed_type: ValueType = iterable_fixed_array_type(for_iterable, local_scope, fns, structs, generics)
+                        sd_element: mutable ValueType = unmodeled_type()
+                        sd_header: mutable LLVMValueRef? = null
+                        if sd_darray_type.kind == TypeKind.DArray:
+                            sd_element <- darray_element_of(sd_darray_type, structs)
+                            sd_header <- darray_address_of_expr(for_iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        elif sd_fixed_type.kind == TypeKind.Array:
+                            sd_element <- copied_type(structs.array_elements[sd_fixed_type.bits.usize()])
+                            sd_header <- fixed_array_header_slot(for_iterable, sd_fixed_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        if sd_element.kind == TypeKind.Struct and structs.field_count[sd_element.bits.usize()] == for_variables.count:
+                            if sd_header is sd_slot:
+                                sd_struct_slot: usize = sd_element.bits.usize()
+                                sd_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                sd_elem_llvm: LLVMTypeRef = llvm_type_of(sd_element, structs, ctx)
+                                sd_count: LLVMValueRef = LLVMBuildLoad2(builder, sd_i64, LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), sd_slot, 1, "sd.cnt.ptr"), "sd.cnt")
+                                sd_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), sd_slot, 0, "sd.items.ptr"), "sd.items")
+                                sd_index: LLVMValueRef = LLVMBuildAlloca(builder, sd_i64, "sd.i")
+                                _ = LLVMBuildStore(builder, LLVMConstInt(sd_i64, 0, 0), sd_index)
+                                sd_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                sd_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sd_function, "sd.cond")
+                                sd_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sd_function, "sd.body")
+                                sd_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sd_function, "sd.step")
+                                sd_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sd_function, "sd.exit")
+                                _ = LLVMBuildBr(builder, sd_cond)
+                                LLVMPositionBuilderAtEnd(builder, sd_cond)
+                                sd_cur: LLVMValueRef = LLVMBuildLoad2(builder, sd_i64, sd_index, "sd.cur")
+                                # 40 = SLT.
+                                _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 40, sd_cur, sd_count, "sd.more"), sd_bodyb, sd_exit)
+                                LLVMPositionBuilderAtEnd(builder, sd_bodyb)
+                                sd_offsets: mutable darray[LLVMValueRef] = [sd_cur]
+                                sd_offsets_pointer: void& = (&sd_offsets[0]).cast[void&] can Unsafe.PointerCast
+                                sd_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, sd_elem_llvm, sd_items, sd_offsets_pointer, 1, "sd.elem.ptr")
+                                sd_declined: mutable bool = false
+                                for sd_bind in 0..<for_variables.count |sd_declined, sd_struct_slot, sd_elem_ptr, sd_elem_llvm, for_variables, local_scope, structs, ctx, builder|:
+                                    # The binder is not the field name under a rename, so the
+                                    # recorded pattern field wins when there is one.
+                                    sd_selector: mutable sview = for_brace_field_at(for_line.line.i64(), sd_bind, structs)
+                                    sd_selector <- for_variables[sd_bind] if sd_selector == ""
+                                    sd_field: i64 = field_index_of(structs, sd_struct_slot, sd_selector)
+                                    if sd_field < 0:
+                                        sd_declined <- true
+                                    else:
+                                        sd_field_type: ValueType = copied_type(structs.field_types[structs.field_start[sd_struct_slot] + sd_field.usize()])
+                                        sd_field_llvm: LLVMTypeRef = llvm_type_of(sd_field_type, structs, ctx)
+                                        sd_field_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, sd_elem_llvm, sd_elem_ptr, sd_field.u32(), "sd.field.ptr")
+                                        sd_storage: mutable darray[u8] = []
+                                        sd_local: LLVMValueRef = LLVMBuildAlloca(builder, sd_field_llvm, sview_to_cstr(for_variables[sd_bind], sd_storage))
+                                        _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, sd_field_llvm, sd_field_ptr, "sd.field"), sd_local)
+                                        declare_local(local_scope, for_variables[sd_bind], sd_local, sd_field_type)
+                                EmitStatus.Declined return if sd_declined
+                                loops.exits <- loops.exits.push(sd_exit)
+                                loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                                loops.continues <- loops.continues.push(sd_step)
+                                sd_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                _ = loops.exits.pop()
+                                _ = loops.defer_marks.pop()
+                                _ = loops.continues.pop()
+                                EmitStatus.Declined return if sd_status == EmitStatus.Declined
+                                branch_if_open(sd_status, builder, sd_step)
+                                LLVMPositionBuilderAtEnd(builder, sd_step)
+                                _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, sd_i64, sd_index, "sd.next.cur"), LLVMConstInt(sd_i64, 1, 0), "sd.next"), sd_index)
+                                _ = LLVMBuildBr(builder, sd_cond)
+                                LLVMPositionBuilderAtEnd(builder, sd_exit)
+                                return EmitStatus.Open
+                    if for_variables.count == 2:
+                        # `for i, x in xs.enumerate()` — INDEX + VALUE iteration over a darray. The
+                        # first binder is the running index (i64), the second the element. Detected by
+                        # the `.enumerate()` receiver before the dict path (its iterable is a call, not
+                        # a DynDict value).
+                        match for_iterable:
+                            Expr.Call(en_callee, en_args, en_arg_names, en_call_line):
+                                match en_callee:
+                                    Expr.Field(en_source, en_method, en_method_line):
+                                        if en_method == "enumerate" and en_args.count == 0:
+                                            en_source_type: mutable ValueType = darray_type_behind_expr(en_source, local_scope, structs)
+                                            # A FIXED array enumerates too (`for i, x in items.enumerate()`
+                                            # where `items: array[T, 3]`). Rather than a second copy of the
+                                            # loop, borrow the same trick the plain `for x in xs` walk uses:
+                                            # build a synthetic darray HEADER over the array's storage and
+                                            # run the darray path unchanged.
+                                            en_fixed_type: ValueType = iterable_fixed_array_type(en_source, local_scope, fns, structs, generics)
+                                            en_fixed_header: mutable LLVMValueRef? = null
+                                            if en_source_type.kind != TypeKind.DArray and en_fixed_type.kind == TypeKind.Array:
+                                                en_fixed_header <- fixed_array_header_slot(en_source, en_fixed_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                                en_source_type <- intern_darray_type(copied_type(structs.array_elements[en_fixed_type.bits.usize()]), structs) if en_fixed_header is en_fixed_present
+                                            EmitStatus.Declined return if en_source_type.kind != TypeKind.DArray
+                                            en_source_opt: LLVMValueRef? = en_fixed_header if en_fixed_header is en_fixed_ready else darray_address_of_expr(en_source, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                            if en_source_opt is en_source_slot:
+                                                en_elem_type: ValueType = darray_element_of(en_source_type, structs)
+                                                EmitStatus.Declined return if en_elem_type.kind == TypeKind.Unmodeled
+                                                en_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                                en_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                                en_elem_llvm: LLVMTypeRef = llvm_type_of(en_elem_type, structs, ctx)
+                                                en_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, en_header, en_source_slot, 1, "enum.cnt.ptr")
+                                                en_count: LLVMValueRef = LLVMBuildLoad2(builder, en_i64, en_count_ptr, "enum.cnt")
+                                                en_items_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, en_header, en_source_slot, 0, "enum.items.ptr")
+                                                en_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), en_items_ptr, "enum.items")
+                                                en_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, en_i64, "enum.i")
+                                                _ = LLVMBuildStore(builder, LLVMConstInt(en_i64, 0, 0), en_index_slot)
+                                                en_idx_name_storage: mutable darray[u8] = []
+                                                en_idx_slot: LLVMValueRef = LLVMBuildAlloca(builder, en_i64, sview_to_cstr(for_variables[0], en_idx_name_storage))
+                                                declare_local(local_scope, for_variables[0], en_idx_slot, ValueType{kind: TypeKind.Signed, bits: 64})
+                                                en_val_name_storage: mutable darray[u8] = []
+                                                en_val_slot: LLVMValueRef = LLVMBuildAlloca(builder, en_elem_llvm, sview_to_cstr(for_variables[1], en_val_name_storage))
+                                                declare_local(local_scope, for_variables[1], en_val_slot, en_elem_type)
+                                                en_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                                en_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.cond")
+                                                en_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.body")
+                                                en_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.step")
+                                                en_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.exit")
+                                                _ = LLVMBuildBr(builder, en_cond)
+                                                LLVMPositionBuilderAtEnd(builder, en_cond)
+                                                en_cur: LLVMValueRef = LLVMBuildLoad2(builder, en_i64, en_index_slot, "enum.cur")
+                                                en_more: LLVMValueRef = LLVMBuildICmp(builder, 40, en_cur, en_count, "enum.more")
+                                                _ = LLVMBuildCondBr(builder, en_more, en_bodyb, en_exit)
+                                                LLVMPositionBuilderAtEnd(builder, en_bodyb)
+                                                # i = cur; x = items[cur].
+                                                _ = LLVMBuildStore(builder, en_cur, en_idx_slot)
+                                                en_gep_indices: mutable darray[LLVMValueRef] = [en_cur]
+                                                en_gep_pointer: void& = (&en_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                                                en_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, en_elem_llvm, en_items, en_gep_pointer, 1, "enum.elem.ptr")
+                                                _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, en_elem_llvm, en_elem_ptr, "enum.elem"), en_val_slot)
+                                                loops.exits <- loops.exits.push(en_exit)
+                                                loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                                                loops.continues <- loops.continues.push(en_step)
+                                                en_body_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                                _ = loops.exits.pop()
+                                                _ = loops.defer_marks.pop()
+                                                _ = loops.continues.pop()
+                                                EmitStatus.Declined return if en_body_status == EmitStatus.Declined
+                                                branch_if_open(en_body_status, builder, en_step)
+                                                LLVMPositionBuilderAtEnd(builder, en_step)
+                                                _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, en_i64, en_index_slot, "enum.next.cur"), LLVMConstInt(en_i64, 1, 0), "enum.next"), en_index_slot)
+                                                _ = LLVMBuildBr(builder, en_cond)
+                                                LLVMPositionBuilderAtEnd(builder, en_exit)
+                                                return EmitStatus.Open
+                                            return EmitStatus.Declined
+                                    _:
+                                        pass
+                            _:
+                                pass
+                        dict_iter_type: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
+                        EmitStatus.Declined return if dict_iter_type.kind != TypeKind.Struct
+                        dict_slot: usize = dict_iter_type.bits.usize()
+                        EmitStatus.Declined return if structs.names[dict_slot] != "DynDict"
+                        dict_items_index: i64 = field_index_of(structs, dict_slot, "items")
+                        dict_capacity_index: i64 = field_index_of(structs, dict_slot, "capacity")
+                        EmitStatus.Declined return if dict_items_index < 0 or dict_capacity_index < 0
+                        dict_items_field_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_slot] + dict_items_index.usize()])
+                        EmitStatus.Declined return if dict_items_field_type.kind != TypeKind.Optional
+                        dict_items_ref_type: ValueType = optional_payload_of(dict_items_field_type, structs)
+                        EmitStatus.Declined return if dict_items_ref_type.kind != TypeKind.Ref
+                        dict_bucket_type: ValueType = ref_target_of(dict_items_ref_type, structs)
+                        EmitStatus.Declined return if dict_bucket_type.kind != TypeKind.Struct
+                        dict_bucket_slot: usize = dict_bucket_type.bits.usize()
+                        dict_key_index: i64 = field_index_of(structs, dict_bucket_slot, "key")
+                        dict_value_index: i64 = field_index_of(structs, dict_bucket_slot, "value")
+                        dict_state_index: i64 = field_index_of(structs, dict_bucket_slot, "state")
+                        EmitStatus.Declined return if dict_key_index < 0 or dict_value_index < 0 or dict_state_index < 0
+                        dict_key_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_bucket_slot] + dict_key_index.usize()])
+                        dict_value_type: ValueType = copied_type(structs.field_types[structs.field_start[dict_bucket_slot] + dict_value_index.usize()])
+                        if struct_chain_address(for_iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dict_address:
+                            dict_llvm: LLVMTypeRef = llvm_type_of(dict_iter_type, structs, ctx)
+                            dict_optional_llvm: LLVMTypeRef = llvm_type_of(dict_items_field_type, structs, ctx)
+                            dict_bucket_llvm: LLVMTypeRef = llvm_type_of(dict_bucket_type, structs, ctx)
+                            dict_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                            dict_i8: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+                            # items is `DictBucket&?` — a TAGGED optional {i1, ptr}; the raw array
+                            # pointer is field 1. Empty dict → null items, but capacity is then 0 so
+                            # the loop body never runs.
+                            dict_items_opt_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_llvm, dict_address, dict_items_index.u32(), "dict.items.opt.ptr")
+                            dict_items_opt: LLVMValueRef = LLVMBuildLoad2(builder, dict_optional_llvm, dict_items_opt_ptr, "dict.items.opt")
+                            dict_items_raw: LLVMValueRef = optional_payload_value_of(dict_items_opt, dict_items_field_type, structs, ctx, builder)
+                            dict_capacity_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_llvm, dict_address, dict_capacity_index.u32(), "dict.cap.ptr")
+                            dict_capacity: LLVMValueRef = LLVMBuildLoad2(builder, dict_i64, dict_capacity_ptr, "dict.cap")
+                            dict_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, dict_i64, "dict.i")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(dict_i64, 0, 0), dict_index_slot)
+                            dict_key_storage: mutable darray[u8] = []
+                            dict_key_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(dict_key_type, structs, ctx), sview_to_cstr(for_variables[0], dict_key_storage))
+                            declare_local(local_scope, for_variables[0], dict_key_slot, dict_key_type)
+                            dict_value_storage: mutable darray[u8] = []
+                            dict_value_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(dict_value_type, structs, ctx), sview_to_cstr(for_variables[1], dict_value_storage))
+                            declare_local(local_scope, for_variables[1], dict_value_slot, dict_value_type)
+                            dict_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            dict_head: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.head")
+                            dict_check: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.check")
+                            dict_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.body")
+                            dict_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.step")
+                            dict_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.exit")
+                            _ = LLVMBuildBr(builder, dict_head)
+                            LLVMPositionBuilderAtEnd(builder, dict_head)
+                            dict_current: LLVMValueRef = LLVMBuildLoad2(builder, dict_i64, dict_index_slot, "dict.cur")
+                            dict_keep: LLVMValueRef = LLVMBuildICmp(builder, 36, dict_current, dict_capacity, "dict.cmp")
+                            _ = LLVMBuildCondBr(builder, dict_keep, dict_check, dict_exit)
+                            # CHECK: load this slot's state; occupied (1) → body, else → step.
+                            LLVMPositionBuilderAtEnd(builder, dict_check)
+                            dict_slot_indices: mutable darray[LLVMValueRef] = [dict_current]
+                            dict_slot_indices_pointer: void& = (&dict_slot_indices[0]).cast[void&] can Unsafe.PointerCast
+                            dict_bucket_ptr: LLVMValueRef = LLVMBuildGEP2(builder, dict_bucket_llvm, dict_items_raw, dict_slot_indices_pointer, 1, "dict.bucket.ptr")
+                            dict_state_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_state_index.u32(), "dict.state.ptr")
+                            dict_state: LLVMValueRef = LLVMBuildLoad2(builder, dict_i8, dict_state_ptr, "dict.state")
+                            dict_occupied: LLVMValueRef = LLVMBuildICmp(builder, 32, dict_state, LLVMConstInt(dict_i8, 1, 0), "dict.occ")
+                            _ = LLVMBuildCondBr(builder, dict_occupied, dict_body, dict_step)
+                            # BODY: bind k = bucket.key, v = bucket.value, then run the loop body.
+                            LLVMPositionBuilderAtEnd(builder, dict_body)
+                            dict_key_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_key_index.u32(), "dict.key.ptr")
+                            _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(dict_key_type, structs, ctx), dict_key_ptr, "dict.key"), dict_key_slot)
+                            dict_value_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_value_index.u32(), "dict.value.ptr")
+                            _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(dict_value_type, structs, ctx), dict_value_ptr, "dict.value"), dict_value_slot)
+                            loops.exits <- loops.exits.push(dict_exit)
                             loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                            loops.continues <- loops.continues.push(step_block)
-                            body_status: mutable EmitStatus = EmitStatus.Open
-                            body_status <- emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                            loops.continues <- loops.continues.push(dict_step)
+                            dict_body_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                             _ = loops.exits.pop()
                             _ = loops.defer_marks.pop()
                             _ = loops.continues.pop()
-                            EmitStatus.Declined return if body_status == EmitStatus.Declined
-                            branch_if_open(body_status, builder, step_block)
-                            LLVMPositionBuilderAtEnd(builder, step_block)
-                            next_index: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, int64_type, index_slot, "for.darray.next.cur"), LLVMConstInt(int64_type, 1, 0), "for.darray.next")
-                            _ = LLVMBuildStore(builder, next_index, index_slot)
-                            _ = LLVMBuildBr(builder, head_block)
-                            LLVMPositionBuilderAtEnd(builder, exit_block)
+                            EmitStatus.Declined return if dict_body_status == EmitStatus.Declined
+                            branch_if_open(dict_body_status, builder, dict_step)
+                            LLVMPositionBuilderAtEnd(builder, dict_step)
+                            dict_next: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, dict_i64, dict_index_slot, "dict.next.cur"), LLVMConstInt(dict_i64, 1, 0), "dict.next")
+                            _ = LLVMBuildStore(builder, dict_next, dict_index_slot)
+                            _ = LLVMBuildBr(builder, dict_head)
+                            LLVMPositionBuilderAtEnd(builder, dict_exit)
                             return EmitStatus.Open
-                # `for x in v` over a `view[T]`. A view is a `{ptr data, i64 len}` VALUE, not a
-                # header in memory like a darray, so data and len come from extractvalue rather
-                # than a GEP+load; the CFG is otherwise the darray loop's. Without this, view
-                # INDEXING worked while iterating the same view declined -- which is how the
-                # gap stayed hidden.
-                view_iter_type: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
-                if view_iter_type.kind == TypeKind.View:
-                    view_element_type: ValueType = view_element_of(view_iter_type, structs)
-                    EmitStatus.Declined return if view_element_type.kind == TypeKind.Unmodeled
-                    if emit_expression(for_iterable, view_iter_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_iter_value:
-                        view_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                        view_data: LLVMValueRef = LLVMBuildExtractValue(builder, view_iter_value, 0, "for.view.data")
-                        view_len: LLVMValueRef = LLVMBuildExtractValue(builder, view_iter_value, 1, "for.view.len")
-                        view_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, view_i64, "for.view.i")
-                        _ = LLVMBuildStore(builder, LLVMConstInt(view_i64, 0, 0), view_index_slot)
-                        view_element_llvm: LLVMTypeRef = llvm_type_of(view_element_type, structs, ctx)
-                        view_name_storage: mutable darray[u8] = []
-                        view_element_slot: LLVMValueRef = LLVMBuildAlloca(builder, view_element_llvm, sview_to_cstr(for_variable, view_name_storage))
-                        declare_local(local_scope, for_variable, view_element_slot, view_element_type)
-                        view_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                        view_head_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, view_function, "for.view.head")
-                        view_body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, view_function, "for.view.body")
-                        view_step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, view_function, "for.view.step")
-                        view_exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, view_function, "for.view.exit")
-                        _ = LLVMBuildBr(builder, view_head_block)
-                        LLVMPositionBuilderAtEnd(builder, view_head_block)
-                        view_current: LLVMValueRef = LLVMBuildLoad2(builder, view_i64, view_index_slot, "for.view.cur")
-                        view_keep_going: LLVMValueRef = LLVMBuildICmp(builder, 36, view_current, view_len, "for.view.cmp")
-                        _ = LLVMBuildCondBr(builder, view_keep_going, view_body_block, view_exit_block)
-                        LLVMPositionBuilderAtEnd(builder, view_body_block)
-                        view_indices: mutable darray[LLVMValueRef] = [view_current]
-                        view_indices_pointer: void& = (&view_indices[0]).cast[void&] can Unsafe.PointerCast
-                        view_element_pointer: LLVMValueRef = LLVMBuildGEP2(builder, view_element_llvm, view_data, view_indices_pointer, 1, "for.view.elem.ptr")
-                        _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, view_element_llvm, view_element_pointer, "for.view.elem"), view_element_slot)
-                        loops.exits <- loops.exits.push(view_exit_block)
-                        loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                        loops.continues <- loops.continues.push(view_step_block)
-                        view_body_status: mutable EmitStatus = EmitStatus.Open
-                        view_body_status <- emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                        _ = loops.exits.pop()
-                        _ = loops.defer_marks.pop()
-                        _ = loops.continues.pop()
-                        EmitStatus.Declined return if view_body_status == EmitStatus.Declined
-                        branch_if_open(view_body_status, builder, view_step_block)
-                        LLVMPositionBuilderAtEnd(builder, view_step_block)
-                        view_next: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, view_i64, view_index_slot, "for.view.next.cur"), LLVMConstInt(view_i64, 1, 0), "for.view.next")
-                        _ = LLVMBuildStore(builder, view_next, view_index_slot)
-                        _ = LLVMBuildBr(builder, view_head_block)
-                        LLVMPositionBuilderAtEnd(builder, view_exit_block)
-                        return EmitStatus.Open
-                    return EmitStatus.Declined
-                # `for c in s` over a STRING. sview (`{ptr, i64 len}`) iterates its bytes by
-                # index < len; cstr (a bare NUL-terminated ptr) iterates until a 0 byte. The
-                # loop variable is a u8. Mirrors the darray CFG.
-                string_iter_type: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
-                if string_iter_type.kind == TypeKind.SView or string_iter_type.kind == TypeKind.CStr:
-                    if emit_expression(for_iterable, string_iter_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is string_value:
-                        is_cstr: bool = string_iter_type.kind == TypeKind.CStr
-                        u8_type: ValueType = ValueType{kind: TypeKind.Unsigned, bits: 8}
-                        u8_llvm: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
-                        int64_type_s: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                        pointer_type_s: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
-                        # cstr IS a bare ptr; sview's data pointer is field 0, length field 1.
-                        data_ptr: LLVMValueRef = string_value if is_cstr else LLVMBuildExtractValue(builder, string_value, 0, "for.str.ptr")
-                        str_len: LLVMValueRef = LLVMConstInt(int64_type_s, 0, 0) if is_cstr else LLVMBuildExtractValue(builder, string_value, 1, "for.str.len")
-                        str_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type_s, "for.str.i")
-                        _ = LLVMBuildStore(builder, LLVMConstInt(int64_type_s, 0, 0), str_index_slot)
-                        str_name_storage: mutable darray[u8] = []
-                        str_element_slot: LLVMValueRef = LLVMBuildAlloca(builder, u8_llvm, sview_to_cstr(for_variable, str_name_storage))
-                        declare_local(local_scope, for_variable, str_element_slot, u8_type)
-                        str_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                        str_head: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.head")
-                        str_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.body")
-                        str_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.step")
-                        str_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.exit")
-                        # The BOUND is tested BEFORE the byte is read, in its own block.
-                        #
-                        # `data[len]` must never be touched. A bounded view whose data ends
-                        # exactly at an arena block boundary made that one-past-the-end load
-                        # fault — the ~3% intermittent SIGSEGV in stage1-compiled
-                        # easm_lockstep_parse_smoke, whose crash report shows the faulting
-                        # address just past a `VM_ALLOCATE … rw-` region with nothing mapped
-                        # after it. It is intermittent only because a block usually HAS a mapped
-                        # neighbour; that is a property of the address space, not of the program.
-                        #
-                        # A NEGATIVE length is the std's NUL-TERMINATED SENTINEL
-                        # (`sview(literal, 0, -1)`, the shape Bytes.push_str iterates for every
-                        # string literal), and a cstr has no length at all. Both of those DO have
-                        # to read the byte to know whether to stop, so they take the second test;
-                        # they are terminated by content, and reading up to and including the NUL
-                        # is exactly what they are allowed to do.
-                        str_read: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.read")
-                        _ = LLVMBuildBr(builder, str_head)
-                        LLVMPositionBuilderAtEnd(builder, str_head)
-                        str_cur: LLVMValueRef = LLVMBuildLoad2(builder, int64_type_s, str_index_slot, "for.str.cur")
-                        # SIGNED: an unsigned compare read a -1 sentinel as 2^64-1 and walked off
-                        # the buffer (a stage1-compiled parse_report died with SIGBUS on its first
-                        # diagnostic). Signed also makes a negative length fail this test, which is
-                        # why the sentinel is admitted explicitly rather than by comparison.
-                        str_in_bounds: mutable LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0)
-                        if not is_cstr:
-                            str_bounded: LLVMValueRef = LLVMBuildICmp(builder, 40, str_cur, str_len, "for.str.cmp")
-                            str_nul_terminated: LLVMValueRef = LLVMBuildICmp(builder, 40, str_len, LLVMConstInt(int64_type_s, 0, 0), "for.str.neglen")
-                            str_in_bounds <- LLVMBuildSelect(builder, str_nul_terminated, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), str_bounded, "for.str.inbounds")
-                        _ = LLVMBuildCondBr(builder, str_in_bounds, str_read, str_exit)
-                        LLVMPositionBuilderAtEnd(builder, str_read)
-                        str_byte_indices: mutable darray[LLVMValueRef] = [str_cur]
-                        str_byte_indices_pointer: void& = (&str_byte_indices[0]).cast[void&] can Unsafe.PointerCast
-                        str_byte_ptr: LLVMValueRef = LLVMBuildGEP2(builder, u8_llvm, data_ptr, str_byte_indices_pointer, 1, "for.str.byte.ptr")
-                        str_byte: LLVMValueRef = LLVMBuildLoad2(builder, u8_llvm, str_byte_ptr, "for.str.byte")
-                        # Content termination: a cstr and a negative-length sview stop at the NUL.
-                        # A bounded view is already in range, so it always continues.
-                        str_notnul: LLVMValueRef = LLVMBuildICmp(builder, 33, str_byte, LLVMConstInt(u8_llvm, 0, 0), "for.str.notnul")
-                        str_keep: mutable LLVMValueRef = str_notnul
-                        if not is_cstr:
-                            str_nul_termed2: LLVMValueRef = LLVMBuildICmp(builder, 40, str_len, LLVMConstInt(int64_type_s, 0, 0), "for.str.neglen2")
-                            str_keep <- LLVMBuildSelect(builder, str_nul_termed2, str_notnul, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), "for.str.keep")
-                        _ = LLVMBuildCondBr(builder, str_keep, str_body, str_exit)
-                        LLVMPositionBuilderAtEnd(builder, str_body)
-                        _ = LLVMBuildStore(builder, str_byte, str_element_slot)
-                        loops.exits <- loops.exits.push(str_exit)
-                        loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                        loops.continues <- loops.continues.push(str_step)
-                        str_body_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                        _ = loops.exits.pop()
-                        _ = loops.defer_marks.pop()
-                        _ = loops.continues.pop()
-                        EmitStatus.Declined return if str_body_status == EmitStatus.Declined
-                        branch_if_open(str_body_status, builder, str_step)
-                        LLVMPositionBuilderAtEnd(builder, str_step)
-                        str_next: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, int64_type_s, str_index_slot, "for.str.next.cur"), LLVMConstInt(int64_type_s, 1, 0), "for.str.next")
-                        _ = LLVMBuildStore(builder, str_next, str_index_slot)
-                        _ = LLVMBuildBr(builder, str_head)
-                        LLVMPositionBuilderAtEnd(builder, str_exit)
-                        return EmitStatus.Open
-                    return EmitStatus.Declined
-                if for_iterable is Expr.Binary(range_low, range_operator, range_high, range_line):
-                    # A STEPPED range — `LOW..<HIGH..STEP` — parses as a bare `..` whose LEFT
-                    # operand is itself a spelled range (that is the one legal bare `..`; see
-                    # the AmbiguousBareRange rule). Unfold it here so the ordinary lowering
-                    # below sees the real bounds and only the increment changes. Without this
-                    # the whole `for` declined, which took its enclosing function with it.
-                    step_low: mutable Expr = range_low
-                    step_operator: mutable TokenKind = range_operator
-                    step_high: mutable Expr = range_high
-                    step_expr: mutable Expr = (Expr.Absent)
-                    have_step: mutable bool = false
-                    if range_operator == TokenKind.Range:
-                        if range_low is Expr.Binary(inner_low, inner_operator, inner_high, inner_line):
-                            if inner_operator == TokenKind.RangeLt or inner_operator == TokenKind.RangeLe or inner_operator == TokenKind.RangeGt:
-                                step_low <- inner_low
-                                step_operator <- inner_operator
-                                step_high <- inner_high
-                                step_expr <- range_high
-                                have_step <- true
-                    inclusive: bool = step_operator == TokenKind.RangeLe
-                    # `a..>b` is a countdown (stage0: start=a, while i>b, i-=1). Used by
-                    # `for _ in count..>0` in lexer advance_chars.
-                    descending: bool = step_operator == TokenKind.RangeGt
-                    EmitStatus.Declined return if step_operator != TokenKind.RangeLt and not inclusive and not descending
-
-                    # The loop variable's type comes from the range bounds; a bare
-                    # `0..<10` is two literals, so it defaults to signed 64.
-                    loop_type: ValueType = resolve_type(step_low, resolve_type(step_high, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics), local_scope, fns, structs, generics)
-                    EmitStatus.Declined return if not is_integer_type(loop_type)
-                    low_opt: LLVMValueRef? = emit_expression(step_low, loop_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
-                    high_opt: LLVMValueRef? = emit_expression(step_high, loop_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
-                    if low_opt is low_value:
-                        if high_opt is high_value:
-                            name_storage: mutable darray[u8] = []
-                            # `_` is a discard binder — still need a counter slot, just no name.
-                            slot_name: cstr = "for.i" if for_variable == "_" else sview_to_cstr(for_variable, name_storage)
-                            slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, slot_name)
-                            _ = LLVMBuildStore(builder, low_value, slot)
-                            declare_local(local_scope, for_variable, slot, loop_type) if for_variable != "_"
-
-                            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                            head_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.head")
-                            body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.body")
-                            step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.step")
-                            exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.exit")
-
-                            _ = LLVMBuildBr(builder, head_block)
-                            LLVMPositionBuilderAtEnd(builder, head_block)
-                            loop_llvm_type: LLVMTypeRef = llvm_type_of(loop_type, structs, ctx)
-                            counter: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, slot, "for.i")
-                            # Ascending: 41 = SLE (`..=`), 40 = SLT (`..<`).
-                            # Descending `a..>b`: SGT (38) / UGT (34) — stage0 icmp sgt.
-                            signed_predicate: mutable i32 = 41 if inclusive else 40
-                            signed_predicate <- 38 if descending else signed_predicate
-                            predicate: i32 = unsigned_predicate_of(signed_predicate) if loop_type.kind == TypeKind.Unsigned else signed_predicate
-                            keep_going: LLVMValueRef = LLVMBuildICmp(builder, predicate, counter, high_value, "for.cmp")
-                            _ = LLVMBuildCondBr(builder, keep_going, body_block, exit_block)
-
-                            LLVMPositionBuilderAtEnd(builder, body_block)
-                            loops.exits <- loops.exits.push(exit_block)
+                        return EmitStatus.Declined
+                    EmitStatus.Declined return if for_variables.count != 1
+                    for_variable: sview = for_variables[0]
+                    # A single-variable darray iteration uses the header's count/items fields
+                    # and otherwise follows the same CFG shape as integer ranges.
+                    # The iterable's darray header address — works for a local (`xs`), a borrowed
+                    # darray param (`xs: darray[T]&`), a struct FIELD (`b.items`, incl. through a
+                    # `Bag&` ref), and a nested `m[i]` — all via the general darray locators.
+                    # `for x in rev(xs):` — the REVERSED iteration builtin. It is not a real call
+                    # (nothing declares `rev`); it wraps the iterable and flips the traversal
+                    # order. Unwrapped here so the darray loop below reads the same container,
+                    # with only the element index mirrored.
+                    for_reversed: mutable bool = false
+                    for_source: mutable Expr = for_iterable
+                    match for_iterable:
+                        Expr.Call(rev_callee, rev_args, rev_arg_names, rev_call_line):
+                            match rev_callee:
+                                Expr.Ident(rev_name, rev_name_line):
+                                    if rev_name == "rev" and rev_args.count == 1:
+                                        for_reversed <- true
+                                        for_source <- rev_args[0]
+                                _:
+                                    pass
+                        _:
+                            pass
+                    container_type: mutable ValueType = iterable_darray_type(for_source, local_scope, fns, structs, generics)
+                    if true:
+                        if container_type.kind == TypeKind.DArray:
+                            if darray_read_slot(for_source, container_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is container_slot:
+                                element_type: ValueType = darray_element_of(container_type, structs)
+                                EmitStatus.Declined return if element_type.kind == TypeKind.Unmodeled
+                                header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, header, container_slot, 1, "for.darray.count.ptr")
+                                count_value: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, count_ptr, "for.darray.count")
+                                items_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, header, container_slot, 0, "for.darray.items.ptr")
+                                items_value: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_ptr, "for.darray.items")
+                                index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, "for.darray.i")
+                                _ = LLVMBuildStore(builder, LLVMConstInt(int64_type, 0, 0), index_slot)
+                                loop_name_storage: mutable darray[u8] = []
+                                element_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(element_type, structs, ctx), sview_to_cstr(for_variable, loop_name_storage))
+                                declare_local(local_scope, for_variable, element_slot, element_type)
+                                function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                head_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.head")
+                                body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.body")
+                                step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.step")
+                                exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.darray.exit")
+                                _ = LLVMBuildBr(builder, head_block)
+                                LLVMPositionBuilderAtEnd(builder, head_block)
+                                current: LLVMValueRef = LLVMBuildLoad2(builder, int64_type, index_slot, "for.darray.cur")
+                                keep_going: LLVMValueRef = LLVMBuildICmp(builder, 36, current, count_value, "for.darray.cmp")
+                                _ = LLVMBuildCondBr(builder, keep_going, body_block, exit_block)
+                                LLVMPositionBuilderAtEnd(builder, body_block)
+                                # REVERSED: walk the same 0..<count counter but read the mirrored
+                                # element, `count - 1 - i`. Keeping the counter forward means the
+                                # bound check, the step and the exit edge are all unchanged.
+                                effective_index: mutable LLVMValueRef = current
+                                if for_reversed:
+                                    effective_index <- LLVMBuildSub(builder, LLVMBuildSub(builder, count_value, LLVMConstInt(int64_type, 1, 0), "for.darray.last"), current, "for.darray.mirror")
+                                indices: mutable darray[LLVMValueRef] = [effective_index]
+                                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                                element_pointer: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(element_type, structs, ctx), items_value, indices_pointer, 1, "for.darray.elem.ptr")
+                                _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), element_pointer, "for.darray.elem"), element_slot)
+                                loops.exits <- loops.exits.push(exit_block)
+                                loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                                loops.continues <- loops.continues.push(step_block)
+                                body_status: mutable EmitStatus = EmitStatus.Open
+                                body_status <- emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                _ = loops.exits.pop()
+                                _ = loops.defer_marks.pop()
+                                _ = loops.continues.pop()
+                                EmitStatus.Declined return if body_status == EmitStatus.Declined
+                                branch_if_open(body_status, builder, step_block)
+                                LLVMPositionBuilderAtEnd(builder, step_block)
+                                next_index: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, int64_type, index_slot, "for.darray.next.cur"), LLVMConstInt(int64_type, 1, 0), "for.darray.next")
+                                _ = LLVMBuildStore(builder, next_index, index_slot)
+                                _ = LLVMBuildBr(builder, head_block)
+                                LLVMPositionBuilderAtEnd(builder, exit_block)
+                                return EmitStatus.Open
+                    # `for x in v` over a `view[T]`. A view is a `{ptr data, i64 len}` VALUE, not a
+                    # header in memory like a darray, so data and len come from extractvalue rather
+                    # than a GEP+load; the CFG is otherwise the darray loop's. Without this, view
+                    # INDEXING worked while iterating the same view declined -- which is how the
+                    # gap stayed hidden.
+                    view_iter_type: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
+                    if view_iter_type.kind == TypeKind.View:
+                        view_element_type: ValueType = view_element_of(view_iter_type, structs)
+                        EmitStatus.Declined return if view_element_type.kind == TypeKind.Unmodeled
+                        if emit_expression(for_iterable, view_iter_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_iter_value:
+                            view_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                            view_data: LLVMValueRef = LLVMBuildExtractValue(builder, view_iter_value, 0, "for.view.data")
+                            view_len: LLVMValueRef = LLVMBuildExtractValue(builder, view_iter_value, 1, "for.view.len")
+                            view_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, view_i64, "for.view.i")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(view_i64, 0, 0), view_index_slot)
+                            view_element_llvm: LLVMTypeRef = llvm_type_of(view_element_type, structs, ctx)
+                            view_name_storage: mutable darray[u8] = []
+                            view_element_slot: LLVMValueRef = LLVMBuildAlloca(builder, view_element_llvm, sview_to_cstr(for_variable, view_name_storage))
+                            declare_local(local_scope, for_variable, view_element_slot, view_element_type)
+                            view_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            view_head_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, view_function, "for.view.head")
+                            view_body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, view_function, "for.view.body")
+                            view_step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, view_function, "for.view.step")
+                            view_exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, view_function, "for.view.exit")
+                            _ = LLVMBuildBr(builder, view_head_block)
+                            LLVMPositionBuilderAtEnd(builder, view_head_block)
+                            view_current: LLVMValueRef = LLVMBuildLoad2(builder, view_i64, view_index_slot, "for.view.cur")
+                            view_keep_going: LLVMValueRef = LLVMBuildICmp(builder, 36, view_current, view_len, "for.view.cmp")
+                            _ = LLVMBuildCondBr(builder, view_keep_going, view_body_block, view_exit_block)
+                            LLVMPositionBuilderAtEnd(builder, view_body_block)
+                            view_indices: mutable darray[LLVMValueRef] = [view_current]
+                            view_indices_pointer: void& = (&view_indices[0]).cast[void&] can Unsafe.PointerCast
+                            view_element_pointer: LLVMValueRef = LLVMBuildGEP2(builder, view_element_llvm, view_data, view_indices_pointer, 1, "for.view.elem.ptr")
+                            _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, view_element_llvm, view_element_pointer, "for.view.elem"), view_element_slot)
+                            loops.exits <- loops.exits.push(view_exit_block)
                             loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
-                            loops.continues <- loops.continues.push(step_block)
-                            body_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                            loops.continues <- loops.continues.push(view_step_block)
+                            view_body_status: mutable EmitStatus = EmitStatus.Open
+                            view_body_status <- emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                             _ = loops.exits.pop()
                             _ = loops.defer_marks.pop()
                             _ = loops.continues.pop()
-                            EmitStatus.Declined return if body_status == EmitStatus.Declined
-                            branch_if_open(body_status, builder, step_block)
-
-                            LLVMPositionBuilderAtEnd(builder, step_block)
-                            cur: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, slot, "for.cur")
-                            # The increment: 1, or the range's own STEP. Emitted here rather
-                            # than hoisted because the step of a `for` is a constant in every
-                            # spelling the grammar allows.
-                            increment: mutable LLVMValueRef = LLVMConstInt(loop_llvm_type, 1, 0)
-                            if have_step:
-                                if emit_expression(step_expr, loop_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is step_value:
-                                    increment <- step_value
-                                else:
-                                    return EmitStatus.Declined
-                            stepped: LLVMValueRef = LLVMBuildSub(builder, cur, increment, "for.next") if descending else LLVMBuildAdd(builder, cur, increment, "for.next")
-                            _ = LLVMBuildStore(builder, stepped, slot)
-                            _ = LLVMBuildBr(builder, head_block)
-
-                            LLVMPositionBuilderAtEnd(builder, exit_block)
+                            EmitStatus.Declined return if view_body_status == EmitStatus.Declined
+                            branch_if_open(view_body_status, builder, view_step_block)
+                            LLVMPositionBuilderAtEnd(builder, view_step_block)
+                            view_next: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, view_i64, view_index_slot, "for.view.next.cur"), LLVMConstInt(view_i64, 1, 0), "for.view.next")
+                            _ = LLVMBuildStore(builder, view_next, view_index_slot)
+                            _ = LLVMBuildBr(builder, view_head_block)
+                            LLVMPositionBuilderAtEnd(builder, view_exit_block)
                             return EmitStatus.Open
-                return EmitStatus.Declined
+                        return EmitStatus.Declined
+                    # `for c in s` over a STRING. sview (`{ptr, i64 len}`) iterates its bytes by
+                    # index < len; cstr (a bare NUL-terminated ptr) iterates until a 0 byte. The
+                    # loop variable is a u8. Mirrors the darray CFG.
+                    string_iter_type: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
+                    if string_iter_type.kind == TypeKind.SView or string_iter_type.kind == TypeKind.CStr:
+                        if emit_expression(for_iterable, string_iter_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is string_value:
+                            is_cstr: bool = string_iter_type.kind == TypeKind.CStr
+                            u8_type: ValueType = ValueType{kind: TypeKind.Unsigned, bits: 8}
+                            u8_llvm: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+                            int64_type_s: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                            pointer_type_s: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+                            # cstr IS a bare ptr; sview's data pointer is field 0, length field 1.
+                            data_ptr: LLVMValueRef = string_value if is_cstr else LLVMBuildExtractValue(builder, string_value, 0, "for.str.ptr")
+                            str_len: LLVMValueRef = LLVMConstInt(int64_type_s, 0, 0) if is_cstr else LLVMBuildExtractValue(builder, string_value, 1, "for.str.len")
+                            str_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type_s, "for.str.i")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(int64_type_s, 0, 0), str_index_slot)
+                            str_name_storage: mutable darray[u8] = []
+                            str_element_slot: LLVMValueRef = LLVMBuildAlloca(builder, u8_llvm, sview_to_cstr(for_variable, str_name_storage))
+                            declare_local(local_scope, for_variable, str_element_slot, u8_type)
+                            str_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            str_head: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.head")
+                            str_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.body")
+                            str_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.step")
+                            str_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.exit")
+                            # The BOUND is tested BEFORE the byte is read, in its own block.
+                            #
+                            # `data[len]` must never be touched. A bounded view whose data ends
+                            # exactly at an arena block boundary made that one-past-the-end load
+                            # fault — the ~3% intermittent SIGSEGV in stage1-compiled
+                            # easm_lockstep_parse_smoke, whose crash report shows the faulting
+                            # address just past a `VM_ALLOCATE … rw-` region with nothing mapped
+                            # after it. It is intermittent only because a block usually HAS a mapped
+                            # neighbour; that is a property of the address space, not of the program.
+                            #
+                            # A NEGATIVE length is the std's NUL-TERMINATED SENTINEL
+                            # (`sview(literal, 0, -1)`, the shape Bytes.push_str iterates for every
+                            # string literal), and a cstr has no length at all. Both of those DO have
+                            # to read the byte to know whether to stop, so they take the second test;
+                            # they are terminated by content, and reading up to and including the NUL
+                            # is exactly what they are allowed to do.
+                            str_read: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, str_function, "for.str.read")
+                            _ = LLVMBuildBr(builder, str_head)
+                            LLVMPositionBuilderAtEnd(builder, str_head)
+                            str_cur: LLVMValueRef = LLVMBuildLoad2(builder, int64_type_s, str_index_slot, "for.str.cur")
+                            # SIGNED: an unsigned compare read a -1 sentinel as 2^64-1 and walked off
+                            # the buffer (a stage1-compiled parse_report died with SIGBUS on its first
+                            # diagnostic). Signed also makes a negative length fail this test, which is
+                            # why the sentinel is admitted explicitly rather than by comparison.
+                            str_in_bounds: mutable LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0)
+                            if not is_cstr:
+                                str_bounded: LLVMValueRef = LLVMBuildICmp(builder, 40, str_cur, str_len, "for.str.cmp")
+                                str_nul_terminated: LLVMValueRef = LLVMBuildICmp(builder, 40, str_len, LLVMConstInt(int64_type_s, 0, 0), "for.str.neglen")
+                                str_in_bounds <- LLVMBuildSelect(builder, str_nul_terminated, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), str_bounded, "for.str.inbounds")
+                            _ = LLVMBuildCondBr(builder, str_in_bounds, str_read, str_exit)
+                            LLVMPositionBuilderAtEnd(builder, str_read)
+                            str_byte_indices: mutable darray[LLVMValueRef] = [str_cur]
+                            str_byte_indices_pointer: void& = (&str_byte_indices[0]).cast[void&] can Unsafe.PointerCast
+                            str_byte_ptr: LLVMValueRef = LLVMBuildGEP2(builder, u8_llvm, data_ptr, str_byte_indices_pointer, 1, "for.str.byte.ptr")
+                            str_byte: LLVMValueRef = LLVMBuildLoad2(builder, u8_llvm, str_byte_ptr, "for.str.byte")
+                            # Content termination: a cstr and a negative-length sview stop at the NUL.
+                            # A bounded view is already in range, so it always continues.
+                            str_notnul: LLVMValueRef = LLVMBuildICmp(builder, 33, str_byte, LLVMConstInt(u8_llvm, 0, 0), "for.str.notnul")
+                            str_keep: mutable LLVMValueRef = str_notnul
+                            if not is_cstr:
+                                str_nul_termed2: LLVMValueRef = LLVMBuildICmp(builder, 40, str_len, LLVMConstInt(int64_type_s, 0, 0), "for.str.neglen2")
+                                str_keep <- LLVMBuildSelect(builder, str_nul_termed2, str_notnul, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), "for.str.keep")
+                            _ = LLVMBuildCondBr(builder, str_keep, str_body, str_exit)
+                            LLVMPositionBuilderAtEnd(builder, str_body)
+                            _ = LLVMBuildStore(builder, str_byte, str_element_slot)
+                            loops.exits <- loops.exits.push(str_exit)
+                            loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                            loops.continues <- loops.continues.push(str_step)
+                            str_body_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                            _ = loops.exits.pop()
+                            _ = loops.defer_marks.pop()
+                            _ = loops.continues.pop()
+                            EmitStatus.Declined return if str_body_status == EmitStatus.Declined
+                            branch_if_open(str_body_status, builder, str_step)
+                            LLVMPositionBuilderAtEnd(builder, str_step)
+                            str_next: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, int64_type_s, str_index_slot, "for.str.next.cur"), LLVMConstInt(int64_type_s, 1, 0), "for.str.next")
+                            _ = LLVMBuildStore(builder, str_next, str_index_slot)
+                            _ = LLVMBuildBr(builder, str_head)
+                            LLVMPositionBuilderAtEnd(builder, str_exit)
+                            return EmitStatus.Open
+                        return EmitStatus.Declined
+                    match for_iterable:
+                        Expr.Binary(range_low, range_operator, range_high, range_line):
+                            # A STEPPED range — `LOW..<HIGH..STEP` — parses as a bare `..` whose LEFT
+                            # operand is itself a spelled range (that is the one legal bare `..`; see
+                            # the AmbiguousBareRange rule). Unfold it here so the ordinary lowering
+                            # below sees the real bounds and only the increment changes. Without this
+                            # the whole `for` declined, which took its enclosing function with it.
+                            step_low: mutable Expr = range_low
+                            step_operator: mutable TokenKind = range_operator
+                            step_high: mutable Expr = range_high
+                            step_expr: mutable Expr = (Expr.Absent)
+                            have_step: mutable bool = false
+                            if range_operator == TokenKind.Range:
+                                match range_low:
+                                    Expr.Binary(inner_low, inner_operator, inner_high, inner_line):
+                                        if inner_operator == TokenKind.RangeLt or inner_operator == TokenKind.RangeLe or inner_operator == TokenKind.RangeGt:
+                                            step_low <- inner_low
+                                            step_operator <- inner_operator
+                                            step_high <- inner_high
+                                            step_expr <- range_high
+                                            have_step <- true
+                                    _:
+                                        pass
+                            inclusive: bool = step_operator == TokenKind.RangeLe
+                            # `a..>b` is a countdown (stage0: start=a, while i>b, i-=1). Used by
+                            # `for _ in count..>0` in lexer advance_chars.
+                            descending: bool = step_operator == TokenKind.RangeGt
+                            EmitStatus.Declined return if step_operator != TokenKind.RangeLt and not inclusive and not descending
+
+                            # The loop variable's type comes from the range bounds; a bare
+                            # `0..<10` is two literals, so it defaults to signed 64.
+                            loop_type: ValueType = resolve_type(step_low, resolve_type(step_high, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics), local_scope, fns, structs, generics)
+                            EmitStatus.Declined return if not is_integer_type(loop_type)
+                            low_opt: LLVMValueRef? = emit_expression(step_low, loop_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                            high_opt: LLVMValueRef? = emit_expression(step_high, loop_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                            if low_opt is low_value:
+                                if high_opt is high_value:
+                                    name_storage: mutable darray[u8] = []
+                                    # `_` is a discard binder — still need a counter slot, just no name.
+                                    slot_name: cstr = "for.i" if for_variable == "_" else sview_to_cstr(for_variable, name_storage)
+                                    slot: LLVMValueRef = LLVMBuildAlloca(builder, int64_type, slot_name)
+                                    _ = LLVMBuildStore(builder, low_value, slot)
+                                    declare_local(local_scope, for_variable, slot, loop_type) if for_variable != "_"
+
+                                    function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                    head_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.head")
+                                    body_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.body")
+                                    step_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.step")
+                                    exit_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "for.exit")
+
+                                    _ = LLVMBuildBr(builder, head_block)
+                                    LLVMPositionBuilderAtEnd(builder, head_block)
+                                    loop_llvm_type: LLVMTypeRef = llvm_type_of(loop_type, structs, ctx)
+                                    counter: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, slot, "for.i")
+                                    # Ascending: 41 = SLE (`..=`), 40 = SLT (`..<`).
+                                    # Descending `a..>b`: SGT (38) / UGT (34) — stage0 icmp sgt.
+                                    signed_predicate: mutable i32 = 41 if inclusive else 40
+                                    signed_predicate <- 38 if descending else signed_predicate
+                                    predicate: i32 = unsigned_predicate_of(signed_predicate) if loop_type.kind == TypeKind.Unsigned else signed_predicate
+                                    keep_going: LLVMValueRef = LLVMBuildICmp(builder, predicate, counter, high_value, "for.cmp")
+                                    _ = LLVMBuildCondBr(builder, keep_going, body_block, exit_block)
+
+                                    LLVMPositionBuilderAtEnd(builder, body_block)
+                                    loops.exits <- loops.exits.push(exit_block)
+                                    loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                                    loops.continues <- loops.continues.push(step_block)
+                                    body_status: EmitStatus = emit_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                    _ = loops.exits.pop()
+                                    _ = loops.defer_marks.pop()
+                                    _ = loops.continues.pop()
+                                    EmitStatus.Declined return if body_status == EmitStatus.Declined
+                                    branch_if_open(body_status, builder, step_block)
+
+                                    LLVMPositionBuilderAtEnd(builder, step_block)
+                                    cur: LLVMValueRef = LLVMBuildLoad2(builder, loop_llvm_type, slot, "for.cur")
+                                    # The increment: 1, or the range's own STEP. Emitted here rather
+                                    # than hoisted because the step of a `for` is a constant in every
+                                    # spelling the grammar allows.
+                                    increment: mutable LLVMValueRef = LLVMConstInt(loop_llvm_type, 1, 0)
+                                    if have_step:
+                                        if emit_expression(step_expr, loop_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is step_value:
+                                            increment <- step_value
+                                        else:
+                                            return EmitStatus.Declined
+                                    stepped: LLVMValueRef = LLVMBuildSub(builder, cur, increment, "for.next") if descending else LLVMBuildAdd(builder, cur, increment, "for.next")
+                                    _ = LLVMBuildStore(builder, stepped, slot)
+                                    _ = LLVMBuildBr(builder, head_block)
+
+                                    LLVMPositionBuilderAtEnd(builder, exit_block)
+                                    return EmitStatus.Open
+                        _:
+                            pass
+                    return EmitStatus.Declined
+                _:
+                    pass
             handled <- false
             return EmitStatus.Declined
