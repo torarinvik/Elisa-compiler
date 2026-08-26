@@ -29,5 +29,9 @@ fi
 echo "RUNTIME DRIFT DETECTED — vendored copy diverges from Elisa-core:" >&2
 cat /tmp/runtime_drift.txt >&2
 echo >&2
-echo "Re-vendor with:  cp \"$CANONICAL\"/*.elisa \"$VENDORED\"/" >&2
+# `diff -rq` compares EVERY file in the directory, so the fix has to copy every
+# file too. The old advice here was `*.elisa`, which silently skips the emitted
+# `.elisai` interfaces -- following it left the drift in place and looked like
+# the guard was wrong.
+echo "Re-vendor with:  cp \"$CANONICAL\"/* \"$VENDORED\"/" >&2
 exit 1
