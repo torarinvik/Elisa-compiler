@@ -2,26 +2,43 @@ extend Lexer:
     private:
         # The number scanner's character classes — a TOTAL partition of char, so the
         # `machine` below dispatches on classes instead of re-testing raw chars
-        # (classified dispatch, docs/125 §9). `ExpMark` ('e'/'E') is split out of the
-        # hex-letter class so Whole/Fraction can see an exponent lead while Hex
-        # consumes it as a plain hex digit (Digit | ExpMark | HexAlpha == hex digit).
+        # (classified dispatch, docs/125 §9). Exponent markers are split into valid/other
+        # forms so Whole/Fraction can see a valid exponent lead while Hex consumes either
+        # spelling as a plain hex digit.
         const enum NumberClass of u8:
             Digit        # '0'..'9'
-            ExpMark      # 'e' | 'E' (also a hex digit)
+            ExpMarkValid # 'e' | 'E' followed by a valid exponent
+            ExpMarkOther # 'e' | 'E' without a valid exponent (still a hex digit)
             HexAlpha     # 'a'..'d', 'f', 'A'..'D', 'F' (hex letters minus e/E)
-            Dot          # '.'
+            FractionDot  # '.' that opens a decimal fraction
+            OtherDot     # '.' that is not a decimal fraction
             Sign         # '+' | '-'
+            HexPrefix    # the leading '0' in a 0x/0X literal
             Other
 
         @inline(always)
         def classify_number_char(c: char) -> NumberClass:
             return when c:
                 '0'..='9' -> NumberClass.Digit
-                'e' | 'E' -> NumberClass.ExpMark
+                'e' | 'E' -> NumberClass.ExpMarkOther
                 'a'..='d' | 'f' | 'A'..='D' | 'F' -> NumberClass.HexAlpha
-                '.' -> NumberClass.Dot
+                '.' -> NumberClass.OtherDot
                 '+' | '-' -> NumberClass.Sign
                 _ -> NumberClass.Other
+
+        # Classify the current cursor for the number state machine. The lookahead-sensitive
+        # classes keep the machine arms straight-line: no nested `if` is needed to decide
+        # whether a leading zero opens hex, a dot opens a fraction, or `e` starts an exponent.
+        @inline(always)
+        def classify_number_input(lexer: Lexer&) -> NumberClass:
+            c: char = lexer.current_char()
+            if c == '0' and (lexer.peek(1) == 'x' or lexer.peek(1) == 'X'):
+                return NumberClass.HexPrefix
+            if c == '.' and lexer.should_read_float_fraction():
+                return NumberClass.FractionDot
+            if (c == 'e' or c == 'E') and lexer.exponent_follows():
+                return NumberClass.ExpMarkValid
+            return classify_number_char(c)
 
         @inline(always)
         def is_digit(character: char) -> bool:
@@ -69,86 +86,89 @@ extend Lexer:
             lexer.peek(2).is_digit() return if exponent_next_char == '+' or exponent_next_char == '-'
             return exponent_next_char.is_digit()
 
-        # Number phases as a flat state machine (docs/125 §9). Payload machines still
-        # decline under stage1 meta-compile, so the same transitions are a while+if
-        # ladder over a mode tag (u8), with kind carried as a sibling local.
+        # Number phases as a state machine (docs/125 §9). The machine owns all cursor and
+        # classification transitions; the eventual token kind is scratch state on the driven
+        # lexer because `machine over` is a statement form.
         def read_number(lexer: lmut Lexer) -> Token:
             position: LexerPosition = lexer.cursor_position()
             start: usize = lexer.position
 
-            # Modes: 0 Lead, 1 Whole, 2 Hex, 3 Fraction, 4 ExpLead, 5 ExpDigits, 6 Done
-            mode: mutable u8 = 0
-            kind: mutable TokenKind = TokenKind.IntLit
-            while mode != 6 and not lexer.is_end_of_source() |lexer, mode, kind|:
-                class: NumberClass = classify_number_char(lexer.current_char())
-                if mode == 0:
-                    # Lead: '0x'/'0X' forks to Hex; anything else reclassifies as Whole.
-                    if class == NumberClass.Digit and lexer.current_char() == '0' and (lexer.peek(1) == 'x' or lexer.peek(1) == 'X'):
-                        lexer <- lexer.advance_char()
-                        lexer <- lexer.advance_char()
-                        kind <- TokenKind.HexLit
-                        mode <- 2
-                    else:
-                        mode <- 1
-                elif mode == 2:
-                    # Hex: consume hex digits (Digit | ExpMark | HexAlpha); else done.
-                    if class == NumberClass.Digit or class == NumberClass.ExpMark or class == NumberClass.HexAlpha:
-                        lexer.position <- lexer.position + 1
-                        lexer.column <- lexer.column + 1
-                    else:
-                        mode <- 6
-                elif mode == 1:
-                    # Whole decimal.
-                    if class == NumberClass.Digit:
-                        lexer.position <- lexer.position + 1
-                        lexer.column <- lexer.column + 1
-                    elif class == NumberClass.Dot and lexer.should_read_float_fraction():
-                        lexer <- lexer.advance_char()
-                        kind <- TokenKind.FloatLit
-                        mode <- 3
-                    elif class == NumberClass.ExpMark and lexer.exponent_follows():
-                        lexer <- lexer.advance_char()
-                        kind <- TokenKind.FloatLit
-                        mode <- 4
-                    else:
-                        mode <- 6
-                elif mode == 3:
-                    # Fraction digits, optional exponent.
-                    if class == NumberClass.Digit:
-                        lexer.position <- lexer.position + 1
-                        lexer.column <- lexer.column + 1
-                    elif class == NumberClass.ExpMark and lexer.exponent_follows():
-                        lexer <- lexer.advance_char()
-                        mode <- 4
-                    else:
-                        mode <- 6
-                elif mode == 4:
-                    # ExpLead: optional sign, then digits.
-                    if class == NumberClass.Sign:
-                        lexer <- lexer.advance_char()
-                        mode <- 5
-                    elif class == NumberClass.Digit:
-                        lexer.position <- lexer.position + 1
-                        lexer.column <- lexer.column + 1
-                        mode <- 5
-                    else:
-                        mode <- 6
-                elif mode == 5:
-                    if class == NumberClass.Digit:
-                        lexer.position <- lexer.position + 1
-                        lexer.column <- lexer.column + 1
-                    else:
-                        mode <- 6
-                else:
-                    mode <- 6
+            # Lexing a number is a finite state machine. The input class is recomputed once
+            # per iteration and each arm performs at most one cursor transition, making the
+            # accepted spellings and termination state explicit.
+            lexer.number_kind <- TokenKind.IntLit
+            machine over lexer.classify_number_input() while not lexer.is_end_of_source():
+                state Lead
+                state Whole
+                state Hex
+                state Fraction
+                state ExpLead
+                state ExpDigits
+                state Done
+                start Lead
+
+                Lead, NumberClass.HexPrefix:
+                    lexer <- lexer.advance_char()
+                    lexer <- lexer.advance_char()
+                    lexer.number_kind <- TokenKind.HexLit
+                    -> Hex
+                Lead, NumberClass.Digit | NumberClass.ExpMarkValid | NumberClass.ExpMarkOther | NumberClass.HexAlpha | NumberClass.FractionDot | NumberClass.OtherDot | NumberClass.Sign | NumberClass.Other:
+                    -> Whole
+
+                Whole, NumberClass.Digit:
+                    lexer <- lexer.advance_char()
+                    -> Whole
+                Whole, NumberClass.FractionDot:
+                    lexer <- lexer.advance_char()
+                    lexer.number_kind <- TokenKind.FloatLit
+                    -> Fraction
+                Whole, NumberClass.ExpMarkValid:
+                    lexer <- lexer.advance_char()
+                    lexer.number_kind <- TokenKind.FloatLit
+                    -> ExpLead
+                Whole, NumberClass.ExpMarkOther | NumberClass.HexAlpha | NumberClass.OtherDot | NumberClass.Sign | NumberClass.HexPrefix | NumberClass.Other:
+                    -> Done
+
+                Hex, NumberClass.Digit | NumberClass.ExpMarkValid | NumberClass.ExpMarkOther | NumberClass.HexAlpha:
+                    lexer <- lexer.advance_char()
+                    -> Hex
+                Hex, NumberClass.FractionDot | NumberClass.OtherDot | NumberClass.Sign | NumberClass.HexPrefix | NumberClass.Other:
+                    -> Done
+
+                Fraction, NumberClass.Digit:
+                    lexer <- lexer.advance_char()
+                    -> Fraction
+                Fraction, NumberClass.ExpMarkValid:
+                    lexer <- lexer.advance_char()
+                    -> ExpLead
+                Fraction, NumberClass.ExpMarkOther | NumberClass.HexAlpha | NumberClass.FractionDot | NumberClass.OtherDot | NumberClass.Sign | NumberClass.HexPrefix | NumberClass.Other:
+                    -> Done
+
+                ExpLead, NumberClass.Sign:
+                    lexer <- lexer.advance_char()
+                    -> ExpDigits
+                ExpLead, NumberClass.Digit:
+                    lexer <- lexer.advance_char()
+                    -> ExpDigits
+                ExpLead, NumberClass.ExpMarkValid | NumberClass.ExpMarkOther | NumberClass.HexAlpha | NumberClass.FractionDot | NumberClass.OtherDot | NumberClass.HexPrefix | NumberClass.Other:
+                    -> Done
+
+                ExpDigits, NumberClass.Digit:
+                    lexer <- lexer.advance_char()
+                    -> ExpDigits
+                ExpDigits, NumberClass.ExpMarkValid | NumberClass.ExpMarkOther | NumberClass.HexAlpha | NumberClass.FractionDot | NumberClass.OtherDot | NumberClass.Sign | NumberClass.HexPrefix | NumberClass.Other:
+                    -> Done
+
+                Done, NumberClass.Digit | NumberClass.ExpMarkValid | NumberClass.ExpMarkOther | NumberClass.HexAlpha | NumberClass.FractionDot | NumberClass.OtherDot | NumberClass.Sign | NumberClass.HexPrefix | NumberClass.Other:
+                    break
 
             text_end: usize = lexer.position
             rebind suffix: sview?, lexer = lexer.read_type_suffix()
             if suffix is suffix_text:
                 lexer.position <- text_end + suffix_text.len.usize()
                 lexer.column <- lexer.column + suffix_text.len
-            final_kind: TokenKind = kind if kind == TokenKind.HexLit else TokenKind.FloatLit if kind == TokenKind.FloatLit or suffix_names_float(suffix) else TokenKind.IntLit
-            return Token(final_kind, position, start, text_end, lexer.position)
+            result_kind: TokenKind = TokenKind.HexLit if lexer.number_kind == TokenKind.HexLit else TokenKind.FloatLit if lexer.number_kind == TokenKind.FloatLit or suffix_names_float(suffix) else TokenKind.IntLit
+            return Token(result_kind, position, start, text_end, lexer.position)
 
 
         # Whether a type suffix spells a float type.
