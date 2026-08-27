@@ -13,25 +13,32 @@ extend Parser:
                         names.push(binder)
                     Ast::Pattern.Variant(path, fields) | Ast::Pattern.Struct(path, fields):
                         handles: darray[Ast::Pattern] = [field for field in fields]
-                        for handle in handles:
-                            pattern_binding_names(handle, names)
+                        pattern_binding_names_many(handles, names)
                     Ast::Pattern.Field(selector, inner):
                         handles: darray[Ast::Pattern] = [element for element in inner]
-                        for handle in handles:
-                            pattern_binding_names(handle, names)
+                        pattern_binding_names_many(handles, names)
                     Ast::Pattern.Tuple(elements) | Ast::Pattern.Or(elements):
                         handles: darray[Ast::Pattern] = [element for element in elements]
-                        for handle in handles:
-                            pattern_binding_names(handle, names)
+                        pattern_binding_names_many(handles, names)
                     Ast::Pattern.As(name, inner):
                         names.push(name)
                         handles: darray[Ast::Pattern] = [element for element in inner]
-                        for handle in handles:
-                            pattern_binding_names(handle, names)
+                        pattern_binding_names_many(handles, names)
                     Ast::Pattern.Rest(name):
                         names.push(name) if name != ""
                     _:
                         pass
+
+        # Walk child patterns with an explicit machine state. The binding sink remains the
+        # driven resource, so recursive collection has no hidden sequential loop.
+        def pattern_binding_names_many(handles: darray[Ast::Pattern], names: mutable darray[sview]&) -> void:
+            machine over handles for handle in handles:
+                state Scan
+                start Scan
+
+                Scan, _:
+                    pattern_binding_names(handle, names)
+                    -> Scan
 
 
         # Qualified head path of a move pattern (`Expr.Int`), or "" for a plain
@@ -68,26 +75,32 @@ extend Parser:
         # lossless fallback for pattern forms not yet structured.
         def capture_pattern_span(parser: lmut Parser) -> sview:
             pattern_start: usize = parser.cursor().start.usize()
+            start_position: usize = parser.position
+            machine over parser.position while true:
+                state Scan(depth: int)
+                start Scan(0)
+
+                # Stop at the arm colon / end of line, and ALSO at an unbalanced closer — a
+                # closer at depth 0 belongs to the enclosing construct.
+                Scan(depth), _ if depth == 0 and (parser.peek() == TokenKind.Colon or parser.peek() == TokenKind.Newline or parser.peek() == TokenKind.RParen or parser.peek() == TokenKind.RBracket or parser.peek() == TokenKind.RBrace) or parser.peek() == TokenKind.Eof:
+                    break
+
+                Scan(depth), _ if parser.peek() == TokenKind.LParen or parser.peek() == TokenKind.LBracket or parser.peek() == TokenKind.LBrace:
+                    parser.position <- parser.position + 1
+                    -> Scan(depth + 1)
+
+                Scan(depth), _ if parser.peek() == TokenKind.RParen or parser.peek() == TokenKind.RBracket or parser.peek() == TokenKind.RBrace:
+                    parser.position <- parser.position + 1
+                    -> Scan(depth - 1)
+
+                Scan(depth), _:
+                    parser.position <- parser.position + 1
+                    -> Scan(depth)
+
             pattern_end: mutable usize = pattern_start
-            depth: mutable int = 0
-            while parser.peek() != TokenKind.Eof |parser, pattern_end, depth|:
-                kind: TokenKind = parser.peek()
-                # Stop at the arm colon / end of line, and ALSO at an unbalanced
-                # closer — a `)`/`]`/`}` at depth 0 belongs to the enclosing
-                # construct (e.g. an exotic subpattern inside `Variant(...)`), and
-                # consuming it would unbalance the walk and eat past the pattern.
-                is_terminal: bool = kind == TokenKind.Colon or kind == TokenKind.Newline or kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace
-                break if depth == 0 and is_terminal
-
-                is_opener: bool = kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace
-                is_closer: bool = kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace
-                if is_opener:
-                    depth <- depth + 1
-                elif is_closer:
-                    depth <- depth - 1
-                rebind consumed_token: Token, parser = parser.advance()
-                pattern_end <- consumed_token.start.usize() + consumed_token.length.usize()
-
+            if parser.position > start_position:
+                last_token: Token = parser.tokens[parser.position - 1]
+                pattern_end <- last_token.start.usize() + last_token.length.usize()
             return parser.span_view(pattern_start, pattern_end)
 
 
@@ -263,9 +276,17 @@ extend Parser:
                     rebind first_segment: Token, parser = parser.advance()
                     shorthand_start: usize = first_segment.start.usize()
                     shorthand_end: mutable usize = first_segment.start.usize() + first_segment.length.usize()
-                    while parser.peek() == TokenKind.Dot and parser.peek_at(1) == TokenKind.Ident |parser|:
-                        parser, _ <- parser.advance()
-                        rebind segment_token: Token, parser = parser.advance()
+                    shorthand_position: usize = parser.position
+                    machine over parser.position while parser.peek() == TokenKind.Dot and parser.peek_at(1) == TokenKind.Ident:
+                        state More
+                        start More
+
+                        More, _:
+                            parser.position <- parser.position + 1
+                            parser.position <- parser.position + 1
+                            -> More
+                    if parser.position > shorthand_position:
+                        segment_token: Token = parser.tokens[parser.position - 1]
                         shorthand_end <- segment_token.start.usize() + segment_token.length.usize()
                     return (Ast::Pattern.Variant(parser.span_view(shorthand_start, shorthand_end), []))
 
@@ -449,14 +470,25 @@ extend Parser:
             # Deliberately narrow — only a trailing ASSIGNMENT. A tail that `return`s, raises
             # or yields a value is fine, and anything else stays unflagged rather than risking
             # a false rejection of a program stage0 accepts.
-            for tail_arm in arms_buffer |parser, catch_token|:
-                continue if tail_arm.body.count == 0
-                match tail_arm.body[tail_arm.body.count - 1]:
-                    Stmt.Assign(tail_target, tail_operator, tail_value, tail_line):
-                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__catch_match", name: "__catch_arm_tail", line: catch_token.line})
-                    _:
-                        pass
+            machine over parser.enum_annotations while true:
+                state Scan(index: usize)
+                start Scan(0)
+
+                Scan(index), _ if index >= arms_buffer.count:
+                    break
+
+                Scan(index), _:
+                    parser <- parser.record_catch_tail(arms_buffer[index], catch_token)
+                    -> Scan(index + 1)
             return (Ast::Stmt.Match(scrutinee, arms_buffer, Ast::pos_of_token(catch_token)))
+
+        def record_catch_tail(parser: lmut Parser, tail_arm: Ast::MatchArm, catch_token: Token) -> void:
+            return if tail_arm.body.count == 0
+            match tail_arm.body[tail_arm.body.count - 1]:
+                Stmt.Assign(tail_target, tail_operator, tail_value, tail_line):
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__catch_match", name: "__catch_arm_tail", line: catch_token.line})
+                _:
+                    pass
 
 
         # Parse the `: NEWLINE INDENT (PATTERN: <block>)* DEDENT` arm block shared by
