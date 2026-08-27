@@ -29,30 +29,44 @@ extend Parser:
         # Does the current arm header carry a top-level `with`? Scans from the cursor to the
         # arm's block colon at bracket-depth 0, skipping grouped sub-spans; `|` doesn't nest.
         def arm_header_has_with(parser: Parser&) -> bool:
-            index: mutable usize = parser.position
-            depth: mutable i64 = 0
-            while index < parser.tokens.count |index, depth|:
-                token: Token = parser.tokens[index]
-                kind: TokenKind = token.kind
-                # At depth 0 a terminator/`with` is never a bracket, so the guards commute
-                # with the depth updates and preserve the original elif ladder exactly.
-                false return if depth == 0 and (kind == TokenKind.Colon or kind == TokenKind.Newline or kind == TokenKind.Eof)
-                true return if depth == 0 and kind == TokenKind.With
-                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace
-                depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace
-                index <- index + 1
+            machine over parser.position:
+                state Scan(index: usize, depth: i64)
+                start Scan(parser.position, 0)
+
+                Scan(index, _), _ if index >= parser.tokens.count:
+                    return false
+
+                Scan(index, 0), _ if parser.tokens[index].kind == TokenKind.Colon or parser.tokens[index].kind == TokenKind.Newline or parser.tokens[index].kind == TokenKind.Eof:
+                    return false
+
+                Scan(index, 0), _ if parser.tokens[index].kind == TokenKind.With:
+                    return true
+
+                Scan(index, depth), _ if parser.tokens[index].kind == TokenKind.LParen or parser.tokens[index].kind == TokenKind.LBracket or parser.tokens[index].kind == TokenKind.LBrace:
+                    -> Scan(index + 1, depth + 1)
+
+                Scan(index, depth), _ if parser.tokens[index].kind == TokenKind.RParen or parser.tokens[index].kind == TokenKind.RBracket or parser.tokens[index].kind == TokenKind.RBrace:
+                    -> Scan(index + 1, depth - 1)
+
+                Scan(index, depth), _:
+                    -> Scan(index + 1, depth)
             return false
 
         # Is the next non-Newline token a `|` (alternative separator on a continuation line)?
         def next_nonnewline_is_pipe(parser: Parser&) -> bool:
-            index: mutable usize = parser.position
-            while index < parser.tokens.count |index|:
-                probe: Token = parser.tokens[index]
-                break if probe.kind != TokenKind.Newline
-                index <- index + 1
-            false return if index >= parser.tokens.count
-            landing: Token = parser.tokens[index]
-            return landing.kind == TokenKind.Pipe
+            machine over parser.position:
+                state Scan(index: usize)
+                start Scan(parser.position)
+
+                Scan(index), _ if index >= parser.tokens.count:
+                    return false
+
+                Scan(index), _ if parser.tokens[index].kind == TokenKind.Newline:
+                    -> Scan(index + 1)
+
+                Scan(index), _:
+                    return parser.tokens[index].kind == TokenKind.Pipe
+            return false
 
         # Parse a full `with`-bearing arm and fan it out into one MatchArm per alternative.
         def parse_with_arm(parser: lmut Parser) -> darray[Ast::MatchArm]:
@@ -62,11 +76,16 @@ extend Parser:
             # A `|` separating alternatives may sit on a continuation line, so a layout
             # Newline can precede it (unlike inside an expression). Skip newlines only when a
             # `|` actually follows, so a header that ends at `if`/`:` isn't over-consumed.
-            while parser.next_nonnewline_is_pipe() |parser, alternatives|:
-                parser <- parser.skip_newlines()
-                parser, _ <- parser.advance()                       # `|`
-                rebind alt: WithArmAlternative, parser = parser.parse_with_alternative()
-                alternatives.push(alt)
+            machine over parser.position while parser.next_nonnewline_is_pipe():
+                state More
+                start More
+
+                More, _:
+                    parser <- parser.skip_newlines()
+                    parser.position <- parser.position + 1                       # `|`
+                    rebind alt: WithArmAlternative, parser = parser.parse_with_alternative()
+                    alternatives.push(alt)
+                    -> More
 
             # docs/125 §5 R1 — every alternative of a `with`-arm must bind the IDENTICAL set
             # of constant names, so the shared body reads a discriminator uniformly. A name
@@ -125,9 +144,22 @@ extend Parser:
             rebind first: Ast::Pattern, parser = parser.parse_pattern_primary()
             first return if parser.peek() != TokenKind.Comma
             elements: mutable darray[Ast::Pattern] = [first]
-            while parser.accept(TokenKind.Comma) |parser, elements|:
-                break if parser.peek() == TokenKind.Colon or parser.peek() == TokenKind.Newline
-                elements.push(parser.parse_pattern_primary())
+            machine over parser.position while parser.peek() == TokenKind.Comma:
+                state More
+                state Element
+                start More
+
+                More, _:
+                    parser.position <- parser.position + 1
+                    -> Element
+
+                Element, _ if parser.peek() == TokenKind.Colon or parser.peek() == TokenKind.Newline:
+                    break
+
+                Element, _:
+                    rebind next_pattern: Ast::Pattern, parser = parser.parse_pattern_primary()
+                    elements.push(next_pattern)
+                    -> More
             return (Ast::Pattern.Tuple(elements))
 
         # Trailing `with NAME = LITERAL[, NAME = LITERAL]*` into immutable, inferred VarDecls,
@@ -137,23 +169,28 @@ extend Parser:
             decls: mutable darray[Ast::Stmt] = []
             decls return if parser.peek() != TokenKind.With
             parser, _ <- parser.advance()   # with
-            while true |parser, decls|:
-                name_token: Token = parser.cursor()
-                name: sview = Lexer::text_or_empty(name_token, parser.source)
-                line: u32 = name_token.line
-                parser, _ <- parser.expect(TokenKind.Ident)
-                parser, _ <- parser.expect(TokenKind.Assign)
-                # A `with` constant is a LITERAL / qualified-member value, never a computed
-                # expression: parse at the postfix level so a following `|` (the alternative
-                # separator) is NOT swallowed as a bit-or operator.
-                # Unary signed literals (`-1`) are valid constants too. Unary parsing
-                # still stops before the top-level `|` alternative separator.
-                rebind value_opt: Ast::Expr?, parser = parser.unary_expression()
-                value: mutable Ast::Expr = (Ast::Expr.Invalid)
-                if value_opt is parsed_value:
-                    value <- parsed_value
-                decls.push((Ast::Stmt.VarDecl(name, (Ast::Expr.Invalid), value, Ast::pos_at_line(line))))
-                break if not parser.accept(TokenKind.Comma)
+            machine over parser.position while true:
+                state Item
+                state Separator
+                start Item
+
+                Item, _:
+                    name_token: Token = parser.cursor()
+                    name: sview = Lexer::text_or_empty(name_token, parser.source)
+                    line: u32 = name_token.line
+                    rebind ignored_name: Token, parser = parser.expect(TokenKind.Ident)
+                    rebind ignored_assign: Token, parser = parser.expect(TokenKind.Assign)
+                    rebind value_opt: Ast::Expr?, parser = parser.unary_expression()
+                    value: Ast::Expr = get value_opt else (Ast::Expr.Invalid)
+                    decls.push((Ast::Stmt.VarDecl(name, (Ast::Expr.Invalid), value, Ast::pos_at_line(line))))
+                    -> Separator
+
+                Separator, _ if parser.peek() == TokenKind.Comma:
+                    parser.position <- parser.position + 1
+                    -> Item
+
+                Separator, _:
+                    break
             return decls
 
         # docs/125 §5 R1 (see parse_with_arm). Emits SyntaxMismatchedWithBindings once per
