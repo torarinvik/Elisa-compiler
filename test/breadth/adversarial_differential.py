@@ -567,6 +567,32 @@ def pick(s: Side, n: i64) -> i64:
 def main() -> i64:
     return pick(Side.Right, 1) * 10 + pick(Side.Left, 9)
 """)
+    yield ("when_string_bool_columns", """
+def pick(text: sview, enabled: bool) -> i64:
+    return when text, enabled:
+        "module" | "extend", _ -> 1
+        "ghost", true -> 2
+        _, _ -> 3
+
+def main() -> i64:
+    return pick("extend", false) * 100 + pick("ghost", true) * 10 + pick("ghost", false)
+""")
+    yield ("when_cstr_statement_columns", """
+global mutable answer: i64 = 0
+
+def choose(text: cstr, enabled: bool) -> void:
+    when text, enabled:
+        "module" | "extend", _ ->
+            answer <- 4
+        "ghost", true ->
+            answer <- 7
+        _, _ ->
+            answer <- 9
+
+def main() -> i64:
+    choose("ghost", true)
+    return answer
+""")
     yield ("when_in_local_and_nested", """
 def pick(a: i64, b: i64) -> i64:
     inner: i64 = when a, b:

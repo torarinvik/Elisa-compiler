@@ -80,6 +80,9 @@ guard when_table \
 guard when_or_columns \
   'def f(a: i64, b: i64) -> i64:\n    return when a, b:\n        0, 0 -> 10\n        _, _ -> 20\n\ndef main() -> i64:\n    return f(0, 0)\n' \
   'multi-column `when` — wildcard/or columns in a decision table'
+guard when_string_columns \
+  'def f(text: sview, enabled: bool) -> i64:\n    return when text, enabled:\n        "module" | "extend", _ -> 10\n        "ghost", true -> 20\n        _, _ -> 30\n\ndef main() -> i64:\n    return f("extend", false)\n' \
+  'multi-column `when` — sview content equality and string alternation'
 
 [ "$a_pass" -eq "$a_total" ] || fail "stage A regression: $a_pass/$a_total (a previously FIXED self-host blocker is back)"
 echo "self_host_gen3_smoke stage A OK: $a_pass/$a_total (fixed blockers still fixed)"
