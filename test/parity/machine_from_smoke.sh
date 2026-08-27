@@ -39,4 +39,18 @@ out=$(printf 'enum Route:\n    In(i64)\n    Left\n    Right\ndef route(x: i64) -
 echo "$out" | grep -q "^P 0$" || fail "declared-out machine had parse errors: $out"
 echo "$out" | grep -q "^D 0$" || fail "declared-out machine had diagnostics: $out"
 
-echo "machine from smoke OK: acyclic + cyclic(decreases) + state payloads (next-construct + entry + arm-binding) + R5 declared out-edges parse P0 D0"
+# 6. Canonical graph syntax plus function-local typed states. `-> Mid(bool)` is an enum
+# constructor checked by the ordinary type system; `=> value` is the expression result.
+out=$(printf 'def classify(x: i64) -> i64:\n    state Start\n    state Mid(flag: bool)\n    state End(value: i64)\n    return start Start:\n        Start:\n            -> Mid(true) if x > 0\n            -> Mid(false)\n        Mid(flag):\n            -> End(10) if flag\n            -> End(20)\n        End(value):\n            => value\n' | "$RPT")
+echo "$out" | grep -q "^P 0$" || fail "local typed arrow machine had parse errors: $out"
+echo "$out" | grep -q "^D 0$" || fail "local typed arrow machine had diagnostics: $out"
+
+# 7. The transition payload is not documentation: ordinary enum-constructor checking
+# rejects an i64 sent to a bool state parameter.
+out=$(printf 'def bad() -> i64:\n    state Start\n    state Mid(flag: bool)\n    return start Start:\n        Start:\n            -> Mid(1)\n        Mid(flag):\n            => 0\n' | "$RPT")
+echo "$out" | grep -q "^P 0$" || fail "bad typed transition should remain structurally parseable: $out"
+if echo "$out" | grep -q "^D 0$"; then
+  fail "wrong transition payload type was accepted: $out"
+fi
+
+echo "machine from smoke OK: legacy aliases + canonical arrows + local typed states + payloads + graph checks parse P0 D0"
