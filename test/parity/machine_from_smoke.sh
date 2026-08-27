@@ -53,4 +53,9 @@ if echo "$out" | grep -q "^D 0$"; then
   fail "wrong transition payload type was accepted: $out"
 fi
 
+# 8. Payload-less local states may be declared concisely as one normalized group.
+out=$(printf 'def compact(flag: bool) -> i64:\n    state {Start, Left, Right}\n    return start Start:\n        Start:\n            -> Left if flag\n            -> Right\n        Left:\n            => 1\n        Right:\n            => 2\n' | "$RPT")
+echo "$out" | grep -q "^P 0$" || fail "grouped local state declaration had parse errors: $out"
+echo "$out" | grep -q "^D 0$" || fail "grouped local state declaration had diagnostics: $out"
+
 echo "machine from smoke OK: legacy aliases + canonical arrows + local typed states + payloads + graph checks parse P0 D0"
