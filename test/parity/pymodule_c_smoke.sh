@@ -20,9 +20,9 @@ bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c -o "$SOURCE_DIR/fastmath.
 bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -o "$SOURCE_DIR/fastmath.o" \
     "$ROOT/test/repro/pymodule_export.elisa" >/dev/null
 
-"$CLANG" -bundle -undefined dynamic_lookup $("$PYTHON_CONFIG" --includes) \
+"$CLANG" -bundle -undefined dynamic_lookup -fno-builtin $("$PYTHON_CONFIG" --includes) \
     -o "$WORK/fastmath.cpython-314-darwin.so" "$SOURCE_DIR/fastmath.c" "$SOURCE_DIR/fastmath.o" \
-    "$ROOT/build/runtime/elisacore_runtime.o"
+    "$ROOT/build/runtime/elisacore_runtime.o" "$ROOT/scripts/pymodule_runtime_fallback.c"
 
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import fastmath

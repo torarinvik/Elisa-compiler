@@ -721,6 +721,20 @@ PY
       exit 1
     fi
   fi
+  # A pymodule object is linked together with the complete Elisa runtime. User functions are
+  # reached through their generated `elisa_pymodule_*` wrappers, so any same-named definition
+  # already present in the runtime must remain local to the module object. A common function
+  # such as `fail` otherwise produces a duplicate-symbol linker error before Python can import
+  # the extension. Localizing only the exact intersection preserves every public wrapper.
+  pymodule_objcopy_tool="${ELISA_LLVM_OBJCOPY:-$LLVM_BIN_DIR/llvm-objcopy}"
+  if [[ -x "$pymodule_nm_tool" && -x "$pymodule_objcopy_tool" ]]; then
+    "$pymodule_nm_tool" --defined-only -g --format=posix "$pymodule_obj" | awk '{print $1}' | sort -u >"$pymodule_work/module-defined.txt"
+    "$pymodule_nm_tool" --defined-only -g --format=posix "$runtime_obj" | awk '{print $1}' | sort -u >"$pymodule_work/runtime-defined.txt"
+    comm -12 "$pymodule_work/module-defined.txt" "$pymodule_work/runtime-defined.txt" >"$pymodule_work/localize-symbols.txt"
+    if [[ -s "$pymodule_work/localize-symbols.txt" ]]; then
+      "$pymodule_objcopy_tool" --localize-symbols="$pymodule_work/localize-symbols.txt" "$pymodule_obj"
+    fi
+  fi
   pymodule_link_inputs=("$pymodule_c" "$pymodule_obj" "$runtime_obj")
   # The runtime intentionally leaves the host callback hooks unresolved. This is true for
   # both an object auto-built above and the repository's normal prebuilt runtime object.
@@ -738,60 +752,8 @@ PY
     # host implementations are supplied by an executable, not by a Python extension. Provide
     # the documented fallback behavior (return the caller's fallback value/no-op) so importing a
     # simple module does not fail on unrelated runtime entry points.
-    pymodule_callback_fallback="$pymodule_work/native_callback_fallback.c"
     pymodule_callback_fallback_obj="$pymodule_work/native_callback_fallback.o"
-    cat >"$pymodule_callback_fallback" <<'C'
-#include <stddef.h>
-#include <stdint.h>
-
-void *elisa_native_callback_ptr(uint8_t *name) {
-    (void)name;
-    return NULL;
-}
-uint32_t elisa_native_callback_call_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) {
-    (void)name; (void)arg; return fallback;
-}
-int32_t elisa_native_callback_call_i32_voidp(uint8_t *name, void *arg, int32_t fallback) {
-    (void)name; (void)arg; return fallback;
-}
-uintptr_t elisa_native_callback_call_usize_voidp(uint8_t *name, void *arg, uintptr_t fallback) {
-    (void)name; (void)arg; return fallback;
-}
-intptr_t elisa_native_callback_call_isize_voidp(uint8_t *name, void *arg, intptr_t fallback) {
-    (void)name; (void)arg; return fallback;
-}
-uint32_t elisa_native_callback_spawn_join_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) {
-    (void)name; (void)arg; return fallback;
-}
-void *elisa_native_callback_context_new_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) {
-    (void)name; (void)arg; (void)fallback; return NULL;
-}
-void *elisa_native_callback_context_entry_u32_voidp(void) {
-    return NULL;
-}
-int32_t elisa_native_callback_context_start_u32_voidp(void *ctx, uintptr_t *thread) {
-    (void)ctx; (void)thread; return -1;
-}
-uint32_t elisa_native_callback_context_join_u32_voidp(uintptr_t handle, void *ctx, uint32_t fallback) {
-    (void)handle; (void)ctx; return fallback;
-}
-uint32_t elisa_native_callback_context_spawn_join_u32_voidp(void *ctx, uint32_t fallback) {
-    (void)ctx; return fallback;
-}
-uint32_t elisa_native_callback_context_result_u32(void *ctx, uint32_t fallback) {
-    (void)ctx; return fallback;
-}
-void elisa_native_callback_context_free(void *ctx) {
-    (void)ctx;
-}
-void va_copy(void *destination, void *source) {
-    (void)destination; (void)source;
-}
-void va_end(void *argument) {
-    (void)argument;
-}
-C
-    "$ELISA_CLANG_TOOL" -c -fPIC -fno-builtin -O2 -o "$pymodule_callback_fallback_obj" "$pymodule_callback_fallback"
+    "$ELISA_CLANG_TOOL" -c -fPIC -fno-builtin -O2 -o "$pymodule_callback_fallback_obj" "$ROOT/scripts/pymodule_runtime_fallback.c"
     pymodule_link_inputs+=("$pymodule_callback_fallback_obj")
   fi
   pymodule_link_command=()
