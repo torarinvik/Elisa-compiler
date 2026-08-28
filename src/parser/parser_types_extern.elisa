@@ -40,6 +40,7 @@ extend Parser:
             is_export_global: bool = is_export and parser.peek() == TokenKind.Global
             export_head: Token = parser.cursor()
             is_export_type: bool = is_export and parser.peek() == TokenKind.Ident and Lexer::text_or_empty(export_head, parser.source) == "type"
+            is_export_pymodule: bool = is_export and parser.peek() == TokenKind.Ident and Lexer::text_or_empty(export_head, parser.source) == "pymodule"
             # Threading both the parsed `Ast::Decl` and the advanced `parser` out of a
             # two-real-branch ternary (`A() if cond else B()`) isn't reliable here, so
             # each branch is routed through a dedicated single-call out-param helper
@@ -47,8 +48,90 @@ extend Parser:
             decl: mutable Ast::Decl = (Ast::Decl.Invalid)
             parser <- parser.capture_export_global_decl(token, decl) if is_export_global
             parser <- parser.capture_export_type_decl(token, decl) if is_export_type
-            parser <- parser.capture_extern_signature_decl(token, decl) if not is_export_global and not is_export_type
+            parser <- parser.capture_export_pymodule_decl(token, decl) if is_export_pymodule
+            parser <- parser.capture_extern_signature_decl(token, decl) if not is_export_global and not is_export_type and not is_export_pymodule
             return decl
+
+        # `export pymodule NAME:` is the Python-module export surface. The module body is
+        # intentionally metadata-only in this first stage: each `fn public = target` row (or the
+        # opt-in `fn *`/`const *` wildcard) is retained in the file annotation table, while the
+        # ordinary declarations stay in the enclosing file and are compiled exactly as before.
+        # Keeping this out of Decl avoids changing the stable AST layout shared by stage0/stage1
+        # and gives the backend a clean metadata boundary for native-symbol and CPython-wrapper
+        # emission.
+        def capture_export_pymodule_decl(parser: lmut Parser, token: Token, decl: mutable Ast::Decl&) -> void:
+            can Abort.Panic, Memory.Allocate:
+                parser, _ <- parser.advance()                         # `pymodule`
+                module_token: Token = parser.cursor()
+                module_name: sview = Lexer::text_or_empty(module_token, parser.source) if parser.peek() == TokenKind.Ident else ""
+                parser <- parser.error_at(Ast::ParseErrorKind.ExpectedDeclaration, module_token) if module_name == ""
+                parser, _ <- parser.advance() if module_name != ""
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: module_name, name: "__export_pymodule", line: token.line}) if module_name != ""
+                parser <- parser.capture_export_pymodule_body(module_name) if parser.peek() == TokenKind.Colon
+                parser <- parser.skip_extern_line_remainder() if parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof
+                decl <- (Ast::Decl.Extern(module_name, 0, 0, false, false, "", parser.pending_decorators, Ast::pos_of_token(token)))
+
+        # Consume the indented `pymodule` body and record one annotation pair per function.
+        # `__pymodule_fn` is keyed by the public Python name; the matching
+        # `__pymodule_target_ref` row carries the Elisa target and shares its source line.
+        # Assigned targets are retained as a source-backed path, so `fn add = Math::add`
+        # stays lossless in manifests and can be resolved without allocating a joined name.
+        def capture_export_pymodule_body(parser: lmut Parser, module_name: sview) -> void:
+            can Abort.Panic, Memory.Allocate:
+                parser, _ <- parser.expect(TokenKind.Colon)
+                parser, _ <- parser.expect(TokenKind.Newline)
+                rebind accepted_indent: bool, parser = parser.accept(TokenKind.Indent)
+                return if not accepted_indent
+                while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, module_name|:
+                    parser <- parser.skip_newlines()
+                    break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+                    line: u32 = parser.cursor().line
+                    fn_word: Token = parser.cursor()
+                    is_fn: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(fn_word, parser.source) == "fn"
+                    is_const: bool = parser.peek() == TokenKind.Const
+                    parser, _ <- parser.advance() if is_fn or is_const
+                    public_token: Token = parser.cursor()
+                    is_wildcard: bool = (is_fn or is_const) and parser.peek() == TokenKind.Star
+                    public_name: sview = "*" if is_wildcard else (Lexer::text_or_empty(public_token, parser.source) if (is_fn or is_const) and parser.peek() == TokenKind.Ident else "")
+                    parser, _ <- parser.advance() if public_name != ""
+                    accepted_assign: bool = parser.peek() == TokenKind.Assign
+                    parser, _ <- parser.accept(TokenKind.Assign) if accepted_assign
+                    target_token: Token = parser.cursor()
+                    # The common case is a same-name export (`fn parse`), so the
+                    # assignment is optional when the line ends after the public name.
+                    # Keep `fn public = implementation` for explicit renames.
+                    shorthand: bool = (is_fn or is_const) and public_name != "" and not accepted_assign and (parser.peek() == TokenKind.Newline or parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof)
+                    target_name: mutable sview = public_name if shorthand else ""
+                    if accepted_assign and parser.peek() == TokenKind.Ident:
+                        target_start: usize = target_token.start.usize()
+                        target_end: mutable usize = (target_token.start + target_token.length).usize()
+                        parser, _ <- parser.advance()
+                        # The final segment is the callable/constant name. Keep the whole
+                        # `Module::name` path in the annotation; consumers split it at the
+                        # last scope separator when they need the owner and leaf separately.
+                        while parser.peek() == TokenKind.Scope and parser.peek_at(1) == TokenKind.Ident |parser, target_end|:
+                            parser, _ <- parser.advance()
+                            rebind target_segment: Token, parser = parser.advance()
+                            target_end <- (target_segment.start + target_segment.length).usize()
+                        target_name <- parser.span_view(target_start, target_end)
+                    # `fn *` / `const *` are explicit opt-in wildcards. They are expanded by the
+                    # pymodule emitters after the complete AST is available, so the declaration
+                    # may appear before the functions/constants it exports.
+                    wildcard_row: bool = is_wildcard and not accepted_assign and (parser.peek() == TokenKind.Newline or parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof)
+                    if is_fn and wildcard_row:
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "*", name: "__pymodule_fn_all", line: line})
+                    elif is_const and wildcard_row:
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "*", name: "__pymodule_const_all", line: line})
+                    elif is_fn and public_name != "" and target_name != "":
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: public_name, name: "__pymodule_fn", line: line})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_name, name: "__pymodule_target_ref", line: line})
+                    elif is_const and public_name != "" and target_name != "":
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: public_name, name: "__pymodule_const", line: line})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_name, name: "__pymodule_const_target_ref", line: line})
+                    else:
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, fn_word)
+                    parser <- parser.skip_extern_line_remainder()
+                parser, _ <- parser.expect(TokenKind.Dedent)
 
         def capture_export_type_decl(parser: lmut Parser, token: Token, decl: mutable Ast::Decl&) -> void:
             parser, _ <- parser.advance()

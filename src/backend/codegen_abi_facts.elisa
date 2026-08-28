@@ -3,6 +3,14 @@
 
 extend Backend:
     private:
+        # LLVM represents a null constant with a live opaque handle. `zeroed` only denotes
+        # an absent C handle, so callers deciding whether an optional LLVM value is usable
+        # must test both states explicitly.
+        def llvm_value_is_null(value: LLVMValueRef) -> bool can[Abort.Panic]:
+            true return if value == zeroed
+            return LLVMIsNull(value) != 0
+
+
         # `__fstr(chunk_or_value, …)` — the compiler-emitted f-string builder the parser
         # desugars `f"…{x}…"` into. Each argument is a STRING-LIKE piece (a literal chunk or an
         # interpolated dstr/sview — the checker rejects a non-string interpolant), so lowering
@@ -130,6 +138,95 @@ extend Backend:
             return carries
 
 
+        # Python's stable wrapper exposes error payload storage through one caller-owned pointer.
+        # Scalar payloads use the field's native type; structured payloads use the complete error
+        # union struct, which lets the C shim inspect the active tag and copy named fields without
+        # inventing a second variant-specific ABI.
+        def error_set_single_payload_type(structs: StructTable&, set_name: sview) -> ValueType can[Abort.Panic]:
+            missing: ValueType = ValueType{kind: TypeKind.Unmodeled, bits: 0}
+            missing return if set_name == ""
+            declared: mutable bool = false
+            for declared_name in structs.error_set_decl_names |declared, set_name|:
+                declared <- true if declared_name == set_name
+            missing return if not declared
+            set_index: i64 = penum_index_of(structs, set_name)
+            missing return if set_index < 0
+            variant_start: usize = structs.penum_variant_start[set_index.usize()]
+            variant_span: usize = structs.penum_variant_count[set_index.usize()]
+            field_total: mutable usize = 0
+            payload: mutable ValueType = missing
+            for offset in 0..<variant_span |field_total, payload, variant_start, structs|:
+                field_start: usize = structs.penum_field_type_start[variant_start + offset]
+                field_span: usize = structs.penum_field_type_count[variant_start + offset]
+                field_total <- field_total + field_span
+                if field_span == 1:
+                    payload <- copied_type(structs.penum_field_types[field_start])
+            return payload if field_total == 1
+            return missing
+
+
+        def error_payload_type_supported(payload: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            if payload.kind == TypeKind.Struct:
+                # Struct payloads all use the same by-value LLVM representation. The Python
+                # bridge chooses the concrete owning copier (named record, dictionary, or set),
+                # while the backend must still thread the arena for the struct-shaped ABI.
+                return true
+            if payload.kind == TypeKind.Optional:
+                # Value optionals use stage0's `{i1, T}` representation while pointer/text/object
+                # optionals use the niche representation (`T` itself). Keep the backend facts
+                # aligned with the Python shim's supported optional spellings.
+                optional_payload: ValueType = optional_payload_of(payload, structs)
+                return optional_payload.kind == TypeKind.Signed or optional_payload.kind == TypeKind.Unsigned or optional_payload.kind == TypeKind.Bool or optional_payload.kind == TypeKind.Float or optional_payload.kind == TypeKind.SView or optional_payload.kind == TypeKind.CStr or optional_payload.kind == TypeKind.PyObject
+            return payload.kind == TypeKind.Signed or payload.kind == TypeKind.Unsigned or payload.kind == TypeKind.Bool or payload.kind == TypeKind.Float or payload.kind == TypeKind.CStr or payload.kind == TypeKind.SView or payload.kind == TypeKind.PyObject or payload.kind == TypeKind.DArray or payload.kind == TypeKind.View
+
+
+        # Structured Python payloads use the native error-union layout as their source of truth.
+        # Every field must be in the bridge's owning-conversion subset (scalar/text/object or a
+        # supported aggregate container) so the generated C shim can copy it before arena release.
+        def error_set_payload_supported(structs: mutable StructTable&, set_name: sview) -> bool can[Abort.Panic]:
+            false return if set_name == ""
+            declared: mutable bool = false
+            for declared_name in structs.error_set_decl_names |declared, set_name|:
+                declared <- true if declared_name == set_name
+            false return if not declared
+            set_index: i64 = penum_index_of(structs, set_name)
+            false return if set_index < 0
+            variant_start: usize = structs.penum_variant_start[set_index.usize()]
+            variant_span: usize = structs.penum_variant_count[set_index.usize()]
+            saw_field: mutable bool = false
+            for offset in 0..<variant_span |saw_field, variant_start, structs|:
+                field_start: usize = structs.penum_field_type_start[variant_start + offset]
+                field_span: usize = structs.penum_field_type_count[variant_start + offset]
+                for field_offset in 0..<field_span |saw_field, field_start, structs|:
+                    saw_field <- true
+                    return false if not error_payload_type_supported(copied_type(structs.penum_field_types[field_start + field_offset]), structs)
+            return saw_field
+
+
+        # A darray carried by an error payload borrows element storage. Thread the caller's
+        # arena through every function in that error family so payloads built inside the native
+        # function stay alive until the Python shim has copied them into a list/bytes object.
+        # Dictionaries and sets share the caller arena with darray/view payloads. The Python
+        # bridge copies their bucket tables before releasing that arena.
+        def error_set_payload_needs_arena(structs: mutable StructTable&, set_name: sview) -> bool can[Abort.Panic]:
+            false return if set_name == ""
+            declared: mutable bool = false
+            for declared_name in structs.error_set_decl_names |declared, set_name|:
+                declared <- true if declared_name == set_name
+            false return if not declared
+            set_index: i64 = penum_index_of(structs, set_name)
+            false return if set_index < 0
+            variant_start: usize = structs.penum_variant_start[set_index.usize()]
+            variant_span: usize = structs.penum_variant_count[set_index.usize()]
+            for offset in 0..<variant_span |variant_start, structs|:
+                field_start: usize = structs.penum_field_type_start[variant_start + offset]
+                field_span: usize = structs.penum_field_type_count[variant_start + offset]
+                for field_offset in 0..<field_span |field_start, structs|:
+                    field_kind: TypeKind = copied_type(structs.penum_field_types[field_start + field_offset]).kind
+                    true return if field_kind == TypeKind.Struct or field_kind == TypeKind.DArray or field_kind == TypeKind.View
+            return false
+
+
         # The index of an error set variant's FIRST payload slot in the `%ErrSet__E` struct.
         # Measured from stage0's IR: field 0 is the i32 tag, then every variant's fields
         # CONCATENATED in declaration order — the slots are NOT overlapped, so a variant's
@@ -217,6 +314,8 @@ extend Backend:
         # the callee's auto-region and FREED on return (use-after-free on the next `.get`).
         def is_growable_container_struct(value_type: ValueType, structs: StructTable&) -> bool can[Abort.Panic]:
             false return if value_type.kind != TypeKind.Struct
+            true return if synthesized_struct_base_is(structs, value_type, "DynDict")
+            true return if synthesized_struct_base_is(structs, value_type, "DynSet")
             container_name: sview = structs.names[value_type.bits.usize()]
             return when container_name:
                 "DynDict" | "DynSet" -> true
@@ -282,25 +381,506 @@ extend Backend:
                 true return if region_line == line
             return false
 
+        # The methods whose receiver can allocate into its backing region. A reference parameter
+        # only acquires a hidden region slot when the body actually grows that receiver. Counting
+        # every reference aggregate from its TYPE was the source of the self-hosting corruption:
+        # `check_assigns` has three read-only darray references but only grows `table.diagnostics`,
+        # so stage0 gives it one slot, not four.
+        def region_growth_method(method: sview) -> bool can[Abort.Panic]:
+            return method == "push" or method == "extend" or method == "insert" or method == "resize" or method == "reserve" or method == "put" or method == "add" or method == "append"
+
+
+        def region_growth_root(expression: Expr) -> sview can[Abort.Panic]:
+            if expression is Expr.Ident(region_root_name, region_root_line):
+                return region_root_name
+            if expression is Expr.Paren(region_root_inner, region_root_paren_line):
+                return region_growth_root(region_root_inner)
+            if expression is Expr.Move(region_root_moved, region_root_move_line):
+                return region_growth_root(region_root_moved)
+            if expression is Expr.Unary(region_root_operator, region_root_operand, region_root_unary_line):
+                return region_growth_root(region_root_operand)
+            if expression is Expr.Field(region_root_object, region_root_field, region_root_field_line):
+                return region_growth_root(region_root_object)
+            if expression is Expr.Index(region_root_indexed, region_root_index, region_root_index_line):
+                return region_growth_root(region_root_indexed)
+            if expression is Expr.Slice(region_root_sliced, region_root_low, region_root_high, region_root_slice_line):
+                return region_growth_root(region_root_sliced)
+            return ""
+
+
+        def ref_type_can_grow(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                false return if value_type.kind != TypeKind.Ref
+                target: ValueType = ref_target_of(value_type, structs)
+                true return if target.kind == TypeKind.DArray
+                true return if is_growable_container_struct(target, structs)
+                true return if target.kind == TypeKind.Struct and struct_contains_darray(target, structs)
+                return false
+
+
+        def region_mark_root(root: sview, params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return if root == ""
+                for parameter_index in 0..<params.count |params, flags, root, structs|:
+                    continue if params[parameter_index].name != root
+                    parameter_type: ValueType = parameter_value_type(params[parameter_index].type_expression, structs)
+                    flags[parameter_index] <- true if ref_type_can_grow(parameter_type, structs)
+                    return
+
+
+        def region_scan_expression(expression: Expr, params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                if expression is Expr.Call(region_call_callee, region_call_arguments, region_call_names, region_call_line):
+                    if region_call_callee is Expr.Field(region_call_receiver, region_call_method, region_call_field_line):
+                        region_mark_root(region_growth_root(region_call_receiver), params, flags, structs) if region_growth_method(region_call_method)
+                    region_scan_expression(region_call_callee, params, flags, structs)
+                    for region_call_argument in region_call_arguments |params, flags, structs|:
+                        region_scan_expression(region_call_argument, params, flags, structs)
+                    return
+                if expression is Expr.Field(region_field_object, region_field_name, region_field_line):
+                    region_scan_expression(region_field_object, params, flags, structs)
+                    return
+                if expression is Expr.Scope(region_scope_base, region_scope_name, region_scope_line):
+                    region_scan_expression(region_scope_base, params, flags, structs)
+                    return
+                if expression is Expr.Index(region_index_object, region_index_value, region_index_line):
+                    region_scan_expression(region_index_object, params, flags, structs)
+                    region_scan_expression(region_index_value, params, flags, structs)
+                    return
+                if expression is Expr.Slice(region_slice_object, region_slice_low, region_slice_high, region_slice_line):
+                    region_scan_expression(region_slice_object, params, flags, structs)
+                    region_scan_expression(region_slice_low, params, flags, structs)
+                    region_scan_expression(region_slice_high, params, flags, structs)
+                    return
+                if expression is Expr.IndexN(region_indexn_object, region_indexn_arguments, region_indexn_line):
+                    region_scan_expression(region_indexn_object, params, flags, structs)
+                    for region_indexn_argument in region_indexn_arguments |params, flags, structs|:
+                        region_scan_expression(region_indexn_argument, params, flags, structs)
+                    return
+                if expression is Expr.Binary(region_binary_left, region_binary_operator, region_binary_right, region_binary_line):
+                    region_scan_expression(region_binary_left, params, flags, structs)
+                    region_scan_expression(region_binary_right, params, flags, structs)
+                    return
+                if expression is Expr.Unary(region_unary_operator, region_unary_operand, region_unary_line):
+                    region_scan_expression(region_unary_operand, params, flags, structs)
+                    return
+                if expression is Expr.Move(region_move_operand, region_move_line):
+                    region_scan_expression(region_move_operand, params, flags, structs)
+                    return
+                if expression is Expr.RegionNew(region_new_operand, region_new_region, region_new_line):
+                    region_scan_expression(region_new_operand, params, flags, structs)
+                    return
+                if expression is Expr.Paren(region_paren_inner, region_paren_line):
+                    region_scan_expression(region_paren_inner, params, flags, structs)
+                    return
+                if expression is Expr.Array(region_array_elements, region_array_line) or expression is Expr.Tuple(region_array_elements, region_tuple_line) or expression is Expr.SetLit(region_array_elements, region_set_line):
+                    for region_element in region_array_elements |params, flags, structs|:
+                        region_scan_expression(region_element, params, flags, structs)
+                    return
+                if expression is Expr.DictLit(region_dict_entries, region_dict_line):
+                    for region_entry in region_dict_entries |params, flags, structs|:
+                        region_scan_expression(region_entry.key, params, flags, structs)
+                        region_scan_expression(region_entry.value, params, flags, structs)
+                    return
+                if expression is Expr.Construct(region_construct_type, region_construct_fields, region_construct_line):
+                    region_scan_expression(region_construct_type, params, flags, structs)
+                    for region_field_init in region_construct_fields |params, flags, structs|:
+                        region_scan_expression(region_field_init.value, params, flags, structs)
+                    return
+                if expression is Expr.RecordUpdate(region_update_base, region_update_fields, region_update_line):
+                    region_scan_expression(region_update_base, params, flags, structs)
+                    for region_field_init in region_update_fields |params, flags, structs|:
+                        region_scan_expression(region_field_init.value, params, flags, structs)
+                    return
+                if expression is Expr.If(region_if_condition, region_if_then, region_if_else, region_if_line):
+                    region_scan_expression(region_if_condition, params, flags, structs)
+                    region_scan_expression(region_if_then, params, flags, structs)
+                    region_scan_expression(region_if_else, params, flags, structs)
+                    return
+                if expression is Expr.Match(region_match_scrutinee, region_match_arms, region_match_line) or expression is Expr.Catch(region_match_scrutinee, region_match_arms, region_catch_line):
+                    region_scan_expression(region_match_scrutinee, params, flags, structs)
+                    for region_arm in region_match_arms |params, flags, structs|:
+                        region_scan_expression(region_arm.guard, params, flags, structs)
+                        region_scan_statements(region_arm.body, params, flags, structs)
+                    return
+                if expression is Expr.Comprehension(region_comp_var, region_comp_iterable, region_comp_condition, region_comp_body, region_comp_line):
+                    region_scan_expression(region_comp_iterable, params, flags, structs)
+                    region_scan_expression(region_comp_condition, params, flags, structs)
+                    region_scan_expression(region_comp_body, params, flags, structs)
+                    return
+                if expression is Expr.Refinement(region_refinement_base, region_refinement_predicate, region_refinement_line):
+                    region_scan_expression(region_refinement_base, params, flags, structs)
+                    region_scan_expression(region_refinement_predicate, params, flags, structs)
+                    return
+                if expression is Expr.GetElse(region_get_guarded, region_get_recovery, region_get_line):
+                    region_scan_expression(region_get_guarded, params, flags, structs)
+                    region_scan_statements(region_get_recovery, params, flags, structs)
+                    return
+                if expression is Expr.Block(region_block_statements, region_block_value, region_block_captures, region_block_line):
+                    region_scan_statements(region_block_statements, params, flags, structs)
+                    region_scan_expression(region_block_value, params, flags, structs)
+                    return
+
+
+        def region_scan_statements(statements: darray[Stmt], params: darray[ParamDecl]&, flags: mutable darray[bool]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for region_statement in statements |params, flags, structs|:
+                    if region_statement is Stmt.Expr(region_statement_expression, region_statement_line):
+                        region_scan_expression(region_statement_expression, params, flags, structs)
+                    elif region_statement is Stmt.VarDecl(region_var_name, region_var_type, region_var_value, region_var_line):
+                        region_scan_expression(region_var_type, params, flags, structs)
+                        region_scan_expression(region_var_value, params, flags, structs)
+                    elif region_statement is Stmt.Assign(region_assign_target, region_assign_operator, region_assign_value, region_assign_line):
+                        region_scan_expression(region_assign_target, params, flags, structs)
+                        region_scan_expression(region_assign_value, params, flags, structs)
+                    elif region_statement is Stmt.Return(region_return_value, region_return_line):
+                        if region_return_value is region_returned:
+                            region_scan_expression(region_returned, params, flags, structs)
+                    elif region_statement is Stmt.If(region_stmt_if_condition, region_stmt_if_then, region_stmt_if_else, region_stmt_if_line):
+                        region_scan_expression(region_stmt_if_condition, params, flags, structs)
+                        region_scan_statements(region_stmt_if_then, params, flags, structs)
+                        region_scan_statements(region_stmt_if_else, params, flags, structs)
+                    elif region_statement is Stmt.While(region_stmt_while_condition, region_stmt_while_body, region_stmt_while_line):
+                        region_scan_expression(region_stmt_while_condition, params, flags, structs)
+                        region_scan_statements(region_stmt_while_body, params, flags, structs)
+                    elif region_statement is Stmt.For(region_for_bind, region_for_variables, region_for_iterable, region_for_body, region_for_line):
+                        region_scan_expression(region_for_iterable, params, flags, structs)
+                        region_scan_statements(region_for_body, params, flags, structs)
+                    elif region_statement is Stmt.Block(region_stmt_block_kind, region_stmt_block_clause, region_stmt_block_binding, region_stmt_block_body, region_stmt_block_line):
+                        region_scan_statements(region_stmt_block_body, params, flags, structs)
+                    elif region_statement is Stmt.Match(region_stmt_match_scrutinee, region_stmt_match_arms, region_stmt_match_line):
+                        region_scan_expression(region_stmt_match_scrutinee, params, flags, structs)
+                        for region_stmt_arm in region_stmt_match_arms |params, flags, structs|:
+                            region_scan_expression(region_stmt_arm.guard, params, flags, structs)
+                            region_scan_statements(region_stmt_arm.body, params, flags, structs)
+                    elif region_statement is Stmt.Contract(region_contract_kind, region_contract_expression, region_contract_line):
+                        region_scan_expression(region_contract_expression, params, flags, structs)
+
+
+        def body_region_parameter_flags(params: darray[ParamDecl]&, body: darray[Stmt], structs: mutable StructTable&, flags: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for _ in 0..<params.count |flags|:
+                    flags.push(false)
+                region_scan_statements(body, params, flags, structs)
+                return
+
+
+        def region_callee_name(callee: Expr) -> sview can[Abort.Panic]:
+            if callee is Expr.Ident(region_callee_ident, region_callee_ident_line):
+                return region_callee_ident
+            if callee is Expr.Field(region_callee_object, region_callee_field, region_callee_field_line):
+                return region_callee_field
+            if callee is Expr.Scope(region_callee_base, region_callee_scope, region_callee_scope_line):
+                return region_callee_scope
+            return ""
+
+
+        def region_fact_parameter_has_region(callee_name: sview, parameter_position: usize, structs: StructTable&) -> bool can[Abort.Panic]:
+            for function_index in 0..<structs.region_fact_names.count |structs, callee_name, parameter_position|:
+                continue if structs.region_fact_names[function_index] != callee_name
+                continue if parameter_position >= structs.region_fact_counts[function_index]
+                return structs.region_fact_params[structs.region_fact_starts[function_index] + parameter_position]
+            return false
+
+
+        def region_mark_forwarded(root: sview, parameter_position: usize, callee_name: sview, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return if root == "" or callee_name == ""
+                return if not region_fact_parameter_has_region(callee_name, parameter_position, structs)
+                for caller_position in 0..<params.count |params, structs, fact_row, root, changed|:
+                    continue if params[caller_position].name != root
+                    slot: usize = structs.region_fact_starts[fact_row] + caller_position
+                    if not structs.region_fact_params[slot]:
+                        structs.region_fact_params[slot] <- true
+                        changed <- true
+                    return
+
+
+        def region_scan_forwarding_expression(expression: Expr, params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                if expression is Expr.Call(region_forward_call_callee, region_forward_call_arguments, region_forward_call_names, region_forward_call_line):
+                    callee_name: sview = region_callee_name(region_forward_call_callee)
+                    receiver_offset: mutable usize = 0.usize()
+                    if region_forward_call_callee is Expr.Field(region_forward_receiver, region_forward_method, region_forward_field_line):
+                        receiver_offset <- 1.usize()
+                        region_mark_forwarded(region_growth_root(region_forward_receiver), 0.usize(), callee_name, params, structs, fact_row, changed)
+                    for argument_index in 0..<region_forward_call_arguments.count |region_forward_call_arguments, callee_name, params, structs, fact_row, changed|:
+                        position: usize = argument_index + receiver_offset
+                        region_mark_forwarded(region_growth_root(region_forward_call_arguments[argument_index]), position, callee_name, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_call_callee, params, structs, fact_row, changed)
+                    for region_forward_argument in region_forward_call_arguments |params, structs, fact_row, changed|:
+                        region_scan_forwarding_expression(region_forward_argument, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Field(region_forward_field_object, region_forward_field_name, region_forward_field_line):
+                    region_scan_forwarding_expression(region_forward_field_object, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Scope(region_forward_scope_base, region_forward_scope_name, region_forward_scope_line):
+                    region_scan_forwarding_expression(region_forward_scope_base, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Index(region_forward_index_object, region_forward_index_value, region_forward_index_line):
+                    region_scan_forwarding_expression(region_forward_index_object, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_index_value, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Slice(region_forward_slice_object, region_forward_slice_low, region_forward_slice_high, region_forward_slice_line):
+                    region_scan_forwarding_expression(region_forward_slice_object, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_slice_low, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_slice_high, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.IndexN(region_forward_indexn_object, region_forward_indexn_arguments, region_forward_indexn_line):
+                    region_scan_forwarding_expression(region_forward_indexn_object, params, structs, fact_row, changed)
+                    for region_forward_indexn_argument in region_forward_indexn_arguments |params, structs, fact_row, changed|:
+                        region_scan_forwarding_expression(region_forward_indexn_argument, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Binary(region_forward_binary_left, region_forward_binary_operator, region_forward_binary_right, region_forward_binary_line):
+                    region_scan_forwarding_expression(region_forward_binary_left, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_binary_right, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Unary(region_forward_unary_operator, region_forward_unary_operand, region_forward_unary_line):
+                    region_scan_forwarding_expression(region_forward_unary_operand, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Move(region_forward_move_operand, region_forward_move_line):
+                    region_scan_forwarding_expression(region_forward_move_operand, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.RegionNew(region_forward_new_operand, region_forward_new_region, region_forward_new_line):
+                    region_scan_forwarding_expression(region_forward_new_operand, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Paren(region_forward_paren_inner, region_forward_paren_line):
+                    region_scan_forwarding_expression(region_forward_paren_inner, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Array(region_forward_array_elements, region_forward_array_line) or expression is Expr.Tuple(region_forward_array_elements, region_forward_tuple_line) or expression is Expr.SetLit(region_forward_array_elements, region_forward_set_line):
+                    for region_forward_element in region_forward_array_elements |params, structs, fact_row, changed|:
+                        region_scan_forwarding_expression(region_forward_element, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.DictLit(region_forward_dict_entries, region_forward_dict_line):
+                    for region_forward_entry in region_forward_dict_entries |params, structs, fact_row, changed|:
+                        region_scan_forwarding_expression(region_forward_entry.key, params, structs, fact_row, changed)
+                        region_scan_forwarding_expression(region_forward_entry.value, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Construct(region_forward_construct_type, region_forward_construct_fields, region_forward_construct_line):
+                    region_scan_forwarding_expression(region_forward_construct_type, params, structs, fact_row, changed)
+                    for region_forward_field_init in region_forward_construct_fields |params, structs, fact_row, changed|:
+                        region_scan_forwarding_expression(region_forward_field_init.value, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.RecordUpdate(region_forward_update_base, region_forward_update_fields, region_forward_update_line):
+                    region_scan_forwarding_expression(region_forward_update_base, params, structs, fact_row, changed)
+                    for region_forward_field_init in region_forward_update_fields |params, structs, fact_row, changed|:
+                        region_scan_forwarding_expression(region_forward_field_init.value, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.If(region_forward_if_condition, region_forward_if_then, region_forward_if_else, region_forward_if_line):
+                    region_scan_forwarding_expression(region_forward_if_condition, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_if_then, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_if_else, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Match(region_forward_match_scrutinee, region_forward_match_arms, region_forward_match_line) or expression is Expr.Catch(region_forward_match_scrutinee, region_forward_match_arms, region_forward_catch_line):
+                    region_scan_forwarding_expression(region_forward_match_scrutinee, params, structs, fact_row, changed)
+                    for region_forward_arm in region_forward_match_arms |params, structs, fact_row, changed|:
+                        region_scan_forwarding_expression(region_forward_arm.guard, params, structs, fact_row, changed)
+                        region_scan_forwarding_statements(region_forward_arm.body, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Comprehension(region_forward_comp_var, region_forward_comp_iterable, region_forward_comp_condition, region_forward_comp_body, region_forward_comp_line):
+                    region_scan_forwarding_expression(region_forward_comp_iterable, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_comp_condition, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_comp_body, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Refinement(region_forward_refinement_base, region_forward_refinement_predicate, region_forward_refinement_line):
+                    region_scan_forwarding_expression(region_forward_refinement_base, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_refinement_predicate, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.GetElse(region_forward_get_guarded, region_forward_get_recovery, region_forward_get_line):
+                    region_scan_forwarding_expression(region_forward_get_guarded, params, structs, fact_row, changed)
+                    region_scan_forwarding_statements(region_forward_get_recovery, params, structs, fact_row, changed)
+                    return
+                if expression is Expr.Block(region_forward_block_statements, region_forward_block_value, region_forward_block_captures, region_forward_block_line):
+                    region_scan_forwarding_statements(region_forward_block_statements, params, structs, fact_row, changed)
+                    region_scan_forwarding_expression(region_forward_block_value, params, structs, fact_row, changed)
+                    return
+
+
+        def region_scan_forwarding_statements(statements: darray[Stmt], params: darray[ParamDecl]&, structs: mutable StructTable&, fact_row: usize, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for region_forward_statement in statements |params, structs, fact_row, changed|:
+                    if region_forward_statement is Stmt.Expr(region_forward_statement_expression, region_forward_statement_line):
+                        region_scan_forwarding_expression(region_forward_statement_expression, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.VarDecl(region_forward_var_name, region_forward_var_type, region_forward_var_value, region_forward_var_line):
+                        region_scan_forwarding_expression(region_forward_var_value, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.Assign(region_forward_assign_target, region_forward_assign_operator, region_forward_assign_value, region_forward_assign_line):
+                        region_scan_forwarding_expression(region_forward_assign_target, params, structs, fact_row, changed)
+                        region_scan_forwarding_expression(region_forward_assign_value, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.Return(region_forward_return_value, region_forward_return_line):
+                        if region_forward_return_value is region_forward_returned:
+                            region_scan_forwarding_expression(region_forward_returned, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.If(region_forward_stmt_if_condition, region_forward_stmt_if_then, region_forward_stmt_if_else, region_forward_stmt_if_line):
+                        region_scan_forwarding_expression(region_forward_stmt_if_condition, params, structs, fact_row, changed)
+                        region_scan_forwarding_statements(region_forward_stmt_if_then, params, structs, fact_row, changed)
+                        region_scan_forwarding_statements(region_forward_stmt_if_else, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.While(region_forward_stmt_while_condition, region_forward_stmt_while_body, region_forward_stmt_while_line):
+                        region_scan_forwarding_expression(region_forward_stmt_while_condition, params, structs, fact_row, changed)
+                        region_scan_forwarding_statements(region_forward_stmt_while_body, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.For(region_forward_for_bind, region_forward_for_variables, region_forward_for_iterable, region_forward_for_body, region_forward_for_line):
+                        region_scan_forwarding_expression(region_forward_for_iterable, params, structs, fact_row, changed)
+                        region_scan_forwarding_statements(region_forward_for_body, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.Block(region_forward_stmt_block_kind, region_forward_stmt_block_clause, region_forward_stmt_block_binding, region_forward_stmt_block_body, region_forward_stmt_block_line):
+                        region_scan_forwarding_statements(region_forward_stmt_block_body, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.Match(region_forward_stmt_match_scrutinee, region_forward_stmt_match_arms, region_forward_stmt_match_line):
+                        region_scan_forwarding_expression(region_forward_stmt_match_scrutinee, params, structs, fact_row, changed)
+                        for region_forward_stmt_arm in region_forward_stmt_match_arms |params, structs, fact_row, changed|:
+                            region_scan_forwarding_expression(region_forward_stmt_arm.guard, params, structs, fact_row, changed)
+                            region_scan_forwarding_statements(region_forward_stmt_arm.body, params, structs, fact_row, changed)
+                    elif region_forward_statement is Stmt.Contract(region_forward_contract_kind, region_forward_contract_expression, region_forward_contract_line):
+                        region_scan_forwarding_expression(region_forward_contract_expression, params, structs, fact_row, changed)
+
+
+        def region_fact_row(name: sview, line: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+            for function_index in 0..<structs.region_fact_names.count |structs, name, line|:
+                return function_index.i64() if structs.region_fact_names[function_index] == name and structs.region_fact_lines[function_index] == line
+            return -1
+
+
+        def region_record_declarations(declarations: darray[Decl], structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for declaration in declarations |structs|:
+                    if declaration is Decl.Func(region_fact_name, region_fact_params, region_fact_return, region_fact_body, region_fact_effects, region_fact_decorators, region_fact_line):
+                        flags: mutable darray[bool] = []
+                        body_region_parameter_flags(region_fact_params, region_fact_body, structs, flags)
+                        structs.region_fact_names <- structs.region_fact_names.push(region_fact_name)
+                        structs.region_fact_lines <- structs.region_fact_lines.push(region_fact_line.line)
+                        structs.region_fact_starts <- structs.region_fact_starts.push(structs.region_fact_params.count)
+                        structs.region_fact_counts <- structs.region_fact_counts.push(region_fact_params.count)
+                        for flag in flags |structs|:
+                            structs.region_fact_params <- structs.region_fact_params.push(flag)
+                    elif declaration is Decl.Module(region_fact_module_name, region_fact_module_body, region_fact_module_line):
+                        region_record_declarations(region_fact_module_body, structs)
+                    elif declaration is Decl.Scoped(region_fact_scoped_body, region_fact_scoped_line):
+                        region_record_declarations(region_fact_scoped_body, structs)
+
+
+        def region_apply_forwarding_declarations(declarations: darray[Decl], structs: mutable StructTable&, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for declaration in declarations |structs, changed|:
+                    if declaration is Decl.Func(region_forward_fact_name, region_forward_fact_params, region_forward_fact_return, region_forward_fact_body, region_forward_fact_effects, region_forward_fact_decorators, region_forward_fact_line):
+                        row: i64 = region_fact_row(region_forward_fact_name, region_forward_fact_line.line, structs)
+                        region_scan_forwarding_statements(region_forward_fact_body, region_forward_fact_params, structs, row.usize(), changed) if row >= 0
+                    elif declaration is Decl.Module(region_forward_module_name, region_forward_module_body, region_forward_module_line):
+                        region_apply_forwarding_declarations(region_forward_module_body, structs, changed)
+                    elif declaration is Decl.Scoped(region_forward_scoped_body, region_forward_scoped_line):
+                        region_apply_forwarding_declarations(region_forward_scoped_body, structs, changed)
+
+
+        def register_region_abi_facts(top: darray[Decl], structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                region_record_declarations(top, structs)
+                changed: mutable bool = true
+                rounds: mutable usize = 0
+                while changed and rounds <= structs.region_fact_names.count |structs, changed, rounds|:
+                    changed <- false
+                    region_apply_forwarding_declarations(top, structs, changed)
+                    rounds <- rounds + 1
+
+
+        def region_flags_for_function(params: darray[ParamDecl]&, body: darray[Stmt], line: u32, structs: mutable StructTable&, flags: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                row: i64 = region_fact_row_from_params(params, line, structs)
+                if row >= 0:
+                    start: usize = structs.region_fact_starts[row.usize()]
+                    for parameter_index in 0..<params.count |flags, structs, start, row|:
+                        flags.push(structs.region_fact_params[start + parameter_index])
+                    return
+                region_flags_for_function(params, body, line, structs, flags)
+
+
+        def region_fact_row_from_params(params: darray[ParamDecl]&, line: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+            for row in 0..<structs.region_fact_lines.count |structs, params, line|:
+                continue if structs.region_fact_lines[row] != line or structs.region_fact_counts[row] != params.count
+                return row.i64()
+            return -1
+
+
+        # Number of hidden caller-region parameters required by this function. Return storage and
+        # explicit function region parameters remain signature facts; reference-parameter slots
+        # come only from `body_region_parameter_flags`, matching stage0's inference pass.
+        def signature_arena_count(params: darray[ParamDecl]&, return_value_type: ValueType, body: darray[Stmt], line: u32, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                count: mutable usize = 0
+                count <- count + 1.usize() if ast_value_needs_arena(return_value_type, structs)
+                count <- count + 1.usize() if return_value_type.kind == TypeKind.DArray
+                count <- count + 1.usize() if is_growable_container_struct(return_value_type, structs)
+                count <- count + 1.usize() if return_value_type.kind == TypeKind.Struct and struct_contains_darray(return_value_type, structs)
+                flags: mutable darray[bool] = []
+                region_flags_for_function(params, body, line, structs, flags)
+                for parameter_index in 0..<flags.count |flags, count|:
+                    count <- count + 1.usize() if flags[parameter_index]
+                count <- count + 1.usize() if line_has_region_parameter(line, structs)
+                return count
+
+
+        # The std collection helpers own their allocation ABI explicitly. Mutating helpers
+        # receive `a: mutable Arena&` as their first declared parameter; read-only helpers do
+        # not grow at all. Their generic `dict[K, T]&`/`set[T]&` parameters must therefore NOT
+        # acquire a second hidden arena merely because type binding later reveals a growable
+        # concrete struct. Stage0 decides the generic template ABI before specialization, so
+        # adding that slot here makes the stage1 monomorph disagree with both the runtime symbol
+        # and its own callers.
+        def generic_helper_uses_explicit_allocator(name: sview) -> bool can[Abort.Panic]:
+            return sview_matches_prefix(name, "arena_dict_", 0, 11) or sview_matches_prefix(name, "arena_set_", 0, 10)
+
+
+        # Whether one explicit parameter contributes a hidden caller-region slot. Kept separate
+        # from the aggregate signature counter so direct calls can map each hidden slot back to
+        # the actual argument's declaration arena (e.g. table -> caller, var_types -> scratch).
+        def value_type_carries_caller_region(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                false return if value_type.kind != TypeKind.Ref
+                target: ValueType = ref_target_of(value_type, structs)
+                true return if target.kind == TypeKind.DArray
+                true return if is_growable_container_struct(target, structs)
+                true return if target.kind == TypeKind.Struct and struct_contains_darray(target, structs)
+                return ast_value_needs_arena(target, structs)
+
+
+        def function_parameter_has_region(fns: FnTable&, fn_index: i64, parameter_position: usize) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                false return if fn_index < 0 or fn_index.usize() >= fns.param_start.count
+                flat_index: usize = fns.param_start[fn_index.usize()] + parameter_position
+                return flat_index < fns.param_region_slots.count and fns.param_region_slots[flat_index]
+
+
+        # A returned aggregate owns storage visible to the caller. When this fact is present,
+        # the function's ambient allocation region is the hidden caller slot, even if the body
+        # also creates temporary darrays. Using a callee-local scratch region here frees the
+        # returned backing immediately before the caller can read it.
+        def value_type_returns_caller_region(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            true return if value_type.kind == TypeKind.DArray
+            true return if is_growable_container_struct(value_type, structs)
+            true return if value_type.kind == TypeKind.Struct and struct_contains_darray(value_type, structs)
+            return ast_value_needs_arena(value_type, structs)
+
+
         def signature_needs_arena(params: darray[ParamDecl]&, return_value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                true return if ast_value_needs_arena(return_value_type, structs)
-                true return if return_value_type.kind == TypeKind.DArray
-                # A RETURNED dict/set carries bucket storage the caller reads after the call.
-                true return if is_growable_container_struct(return_value_type, structs)
-                true return if return_value_type.kind == TypeKind.Struct and struct_contains_darray(return_value_type, structs)
-                for parameter in params |structs|:
-                    parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
-                    continue if parameter_type.kind != TypeKind.Ref
-                    arena_param_target: ValueType = ref_target_of(parameter_type, structs)
-                    # A `darray[T]&` param may be GROWN (`xs.push`); a `Struct&` whose fields hold a
-                    # darray may grow that field (`b.items.push`). Both need the CALLER's arena
-                    # threaded so the growth outlives the call (else a use-after-free).
-                    true return if arena_param_target.kind == TypeKind.DArray
-                    true return if is_growable_container_struct(arena_param_target, structs)
-                    true return if arena_param_target.kind == TypeKind.Struct and struct_contains_darray(arena_param_target, structs)
-                    true return if ast_value_needs_arena(arena_param_target, structs)
-                return false
+                # Generic callers that have a body use signature_arena_count directly. This
+                # compatibility helper is retained for type-only probes and deliberately does
+                # not infer a reference slot from shape alone.
+                return ast_value_needs_arena(return_value_type, structs) or return_value_type.kind == TypeKind.DArray or is_growable_container_struct(return_value_type, structs) or (return_value_type.kind == TypeKind.Struct and struct_contains_darray(return_value_type, structs))
+
+
+        # Stage0's internal ABI returns genuinely large aggregates through a hidden leading
+        # destination pointer. This is deliberately a size rule, not a kind-only shortcut:
+        # small structs (including the runtime's ordinary three-word headers) remain first-class
+        # values, while compiler state such as Ast.File and Backend.StructTable uses sret.
+        # Keep the threshold identical to stage0's aggregateMemoryClassThresholdBytes.
+        def value_type_uses_sret(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            aggregate: bool = value_type.kind == TypeKind.Struct or value_type.kind == TypeKind.Array or value_type.kind == TypeKind.PayloadEnum or value_type.kind == TypeKind.Optional
+            return false if not aggregate
+            # Do not duplicate LLVM's aggregate layout in the ABI decision. The handwritten
+            # payload-size helper is intentionally conservative for packed-enum metadata, but
+            # it cannot account for every normal struct field (notably recursive/self-hosting
+            # compiler state). A missed sret decision changes every following ABI slot and can
+            # corrupt the caller before any verifier can diagnose it. LLVMSizeOf is evaluated
+            # against the target data passed into StructTable, which is the layout used by the
+            # emitted type. `LLVMSizeOf` itself is a ConstantExpr and cannot be read with the
+            # ConstantInt accessor.
+            aggregate_type: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            return LLVMABISizeOfType(structs.target_data, aggregate_type) >= 1024.u64()
 
 
             # The recursive AST hierarchy is a compiler-internal packed value. Stage0 threads
@@ -315,10 +895,16 @@ extend Backend:
             # A bare AST hierarchy enum name whose CONSTRUCTION allocates into the packed store.
         def is_ast_enum_name(name: sview, structs: StructTable&) -> bool can[Abort.Panic]:
             can Abort.Panic:
-                for refinement_name in structs.ast_refinement_names |name|:
-                    true return if refinement_name == name
-                # The reserved, variant-less root counts only when it IS the compiler's AST root.
-                return name == "Node" and packed_is_ast_root(structs, packed_index_of(structs, "Node"))
+                enum_index: i64 = packed_index_of(structs, name)
+                # `packed_is_ast_root` answers whether an enum uses the AoS packed-store
+                # representation. It is intentionally true for every user packed enum, so it
+                # is not an AST-hierarchy predicate. Confusing the two made an ordinary
+                # recursive `enum Node` acquire the compiler's hidden AST-store parameter;
+                # a helper constructing it then required a store from its caller and stage1
+                # declined a program that stage0 lowered with a local store. Only the sealed
+                # zero-variant Node row and explicit Node refinements are compiler AST.
+                true return if packed_is_ast_refinement(structs, enum_index)
+                return packed_is_ast_root_row(structs, enum_index)
 
             # Syntactic test for a packed-AST CONSTRUCTOR call `Ast::Expr.Ident(…)` /
             # `Stmt.VarDecl(…)`: the callee is `NS::Enum.Variant` or `Enum.Variant` where Enum is
@@ -350,6 +936,10 @@ extend Backend:
                         match callee:
                             Expr.Ident(name, name_line):
                                 true return if name == "frontend_parser_parse_file" or name == "frontend_parse"
+                                # Pymodule report helpers traverse packed AST values through
+                                # composed helper calls, so the hidden store requirement must
+                                # propagate through their complete call chain.
+                                true return if sview_len(name) > 14.usize() and sview_matches_prefix(name, "emit_pymodule_", 0, 14)
                             _:
                                 pass
                         match callee:
@@ -474,8 +1064,9 @@ extend Backend:
             can Abort.Panic:
                 false return if depth > 6
                 if value_type.kind == TypeKind.PackedEnum:
-                    root: i64 = packed_root_index_of(structs, value_type.bits.i64())
-                    true return if root >= 0 and packed_is_ast_root(structs, root)
+                    enum_index: i64 = value_type.bits.i64()
+                    root: i64 = packed_root_index_of(structs, enum_index)
+                    true return if root >= 0 and (packed_is_ast_root_row(structs, root) or packed_is_ast_refinement(structs, enum_index))
                 if value_type.kind == TypeKind.DArray:
                     return type_is_or_contains_packed_ast(darray_element_of(value_type, structs), depth + 1, structs)
                 if value_type.kind == TypeKind.Ref:
@@ -505,16 +1096,16 @@ extend Backend:
                     true return if type_is_or_contains_packed_ast(param_type, 0, structs)
                 return false
 
-            # Hidden arena ABI count. Parser AST routines are compiled by stage0 with two
-            # independently threaded arena positions around the packed store (`arena, store,
-            # arena`). The stage1 backend keeps both positions even though the runtime currently
-            # uses the same caller arena for each. Backend routines carry store context only;
-            # their AST handles are store-backed and do not imply a region parameter.
-        def frontend_arena_count(owner: sview, name: sview, signature_wants_arena: bool, wants_store: bool) -> usize can[Abort.Panic]:
+        # Hidden arena ABI count. The packed store is passed first and the independent
+        # caller-owned region parameters follow it, exactly as stage0 lowers FuncType.RegionParams.
+        # `owner`/`name` remain in the helper signature because callers also use it for extern and
+        # synthesized declarations; the source signature, not the namespace, determines the count.
+        def frontend_arena_count(owner: sview, name: sview, signature_arena_slots: usize, wants_store: bool) -> usize can[Abort.Panic]:
             can Abort.Panic:
-                if owner == "Parser" or (sview_len(name) > 7 and sview_matches_prefix(name, "Parser.", 0, 7)):
-                    return 2 if wants_store else 1
-                return 1 if signature_wants_arena else 0
+                _ = owner
+                _ = name
+                _ = wants_store
+                return signature_arena_slots
 
 
             # The darray ValueType behind `name`, whether it is a local darray or a
@@ -635,11 +1226,19 @@ extend Backend:
             # stage0 monomorphizes `darray_pop[T]`, while a self-hosted stage1 build must be able
             # to emit the compiler's own `u8`/Token/ValueType pops without an external generic
             # library object.
-        def emit_darray_pop_value(slot: LLVMValueRef, array_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_darray_pop_value(slot: LLVMValueRef, array_type: ValueType, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             element_type: ValueType = darray_element_of(array_type, structs)
             header: LLVMTypeRef = darray_llvm_type(structs, ctx)
             count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, slot, 1, "pop.count.ptr")
             count: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), count_pointer, "pop.count")
+            non_empty: LLVMValueRef = LLVMBuildICmp(builder, 34, count, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "pop.nonempty")
+            parent: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            pop_ok: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "pop.ok")
+            pop_fail: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "pop.empty")
+            _ = LLVMBuildCondBr(builder, non_empty, pop_ok, pop_fail)
+            LLVMPositionBuilderAtEnd(builder, pop_fail)
+            emit_trap_unreachable(m, ctx, builder)
+            LLVMPositionBuilderAtEnd(builder, pop_ok)
             new_count: LLVMValueRef = LLVMBuildSub(builder, count, LLVMConstInt(LLVMInt64TypeInContext(ctx), 1, 0), "pop.new.count")
             _ = LLVMBuildStore(builder, new_count, count_pointer)
             items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, header, slot, 0, "pop.items.ptr")
@@ -706,7 +1305,12 @@ extend Backend:
         # get a nonzero answer has to decline.
         def payload_type_align(value_type: ValueType, structs: mutable StructTable&) -> u64 can[Abort.Panic]:
             can Abort.Panic:
+                if value_type.kind == TypeKind.Optional:
+                    optional_payload: ValueType = optional_payload_of(value_type, structs)
+                    return payload_type_align(optional_payload, structs)
                 1 return if value_type.kind == TypeKind.Bool
+                8 return if value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.PyObject or value_type.kind == TypeKind.SView
+                8 return if value_type.kind == TypeKind.DArray or value_type.kind == TypeKind.View
                 if value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned or value_type.kind == TypeKind.Float:
                     0 return if value_type.bits == 0 or value_type.bits % 8 != 0
                     return (value_type.bits / 8).u64()
@@ -719,6 +1323,7 @@ extend Backend:
                 if value_type.kind == TypeKind.Array:
                     return payload_type_align(array_element_of(value_type, structs), structs)
                 0 return if value_type.kind != TypeKind.Struct
+                return 8 if is_growable_container_struct(value_type, structs)
                 struct_slot: usize = value_type.bits.usize()
                 0 return if struct_slot >= structs.field_start.count
                 widest_align: mutable u64 = 1
@@ -738,7 +1343,22 @@ extend Backend:
 
         def payload_type_byte_size(value_type: ValueType, structs: mutable StructTable&) -> u64 can[Abort.Panic]:
             can Abort.Panic:
+                if value_type.kind == TypeKind.Optional:
+                    optional_payload: ValueType = optional_payload_of(value_type, structs)
+                    optional_payload_size: u64 = payload_type_byte_size(optional_payload, structs)
+                    optional_payload_align: u64 = payload_type_align(optional_payload, structs)
+                    0 return if optional_payload_size == 0 or optional_payload_align == 0
+                    return optional_payload_size if optional_is_niche(value_type, structs)
+                    optional_offset: mutable u64 = 1
+                    optional_offset <- optional_offset + (optional_payload_align - (optional_offset % optional_payload_align)) if optional_offset % optional_payload_align != 0
+                    optional_offset <- optional_offset + optional_payload_size
+                    optional_offset <- optional_offset + (optional_payload_align - (optional_offset % optional_payload_align)) if optional_offset % optional_payload_align != 0
+                    return optional_offset
                 1 return if value_type.kind == TypeKind.Bool
+                8 return if value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.PyObject
+                16 return if value_type.kind == TypeKind.SView
+                24 return if value_type.kind == TypeKind.DArray
+                16 return if value_type.kind == TypeKind.View
                 if value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned or value_type.kind == TypeKind.Float:
                     0 return if value_type.bits == 0 or value_type.bits % 8 != 0
                     return (value_type.bits / 8).u64()
@@ -756,6 +1376,7 @@ extend Backend:
                     0 return if array_element_size == 0
                     return structs.array_extents[value_type.bits.usize()].u64() * array_element_size
                 0 return if value_type.kind != TypeKind.Struct
+                return 40 if is_growable_container_struct(value_type, structs)
                 struct_slot: usize = value_type.bits.usize()
                 0 return if struct_slot >= structs.field_start.count
                 field_start: usize = structs.field_start[struct_slot]
@@ -1258,10 +1879,15 @@ extend Backend:
             # Active per-function disjoint scope state. The slot arrays are rebuilt for
             # each body so element GEPs can be associated with their source parameter.
             disjoint_function_name: mutable sview
-            # `arena` is per-FUNCTION (each gets its own auto region), so it is the one
-            # mutable field: the module-level Runtime carries a placeholder that
-            # emit_function_body replaces with the function's own region slot.
+            # `arena` is the current allocation region. `caller_arena` is the hidden
+            # caller-owned region used by by-reference container parameters. A function can
+            # need both at once: local scratch containers belong to `arena`, while mutations
+            # of `mutable darray&`/container-struct parameters must grow in `caller_arena`.
             arena: mutable LLVMValueRef
+            caller_arena: mutable LLVMValueRef
+            # Complete hidden-region mapping. The scalar caller_arena view is only the first
+            # slot; multi-owner functions need the distinct arena for each forwarded reference.
+            caller_arenas: mutable darray[LLVMValueRef]
             arena_alloc: LLVMValueRef
             arena_realloc: LLVMValueRef
             arena_free: LLVMValueRef

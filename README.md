@@ -40,6 +40,7 @@ runtime import customization. The standing end-to-end check is
 |-------|------|
 | `src/driver/elisac.elisa` | Product entry: real lexer → parser → `Backend::emit` → object |
 | `scripts/elisac_stage1.sh` | Host CLI (`-o`, include flatten) wrapping `bin/elisac-stage1` |
+| `scripts/pymodule_pyi.py` | Dependency-free renderer for typed Python stubs from the manifest |
 | `bin/elisac-stage1` | Seeded product binary (not checked in; rebuild with `--seed`) |
 | `test/parity/stage1_product_smoke.sh` | Standing gate: fixture exit 42 without stage0 |
 

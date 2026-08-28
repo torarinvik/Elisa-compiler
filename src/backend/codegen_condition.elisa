@@ -752,12 +752,51 @@ extend Backend:
                 if packed_scrutinee:
                     mis_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "mis.state")
                     mis_index: LLVMValueRef = LLVMBuildZExt(builder, scrutinee_raw, LLVMInt64TypeInContext(ctx), "mis.index")
-                    mis_tag_args: mutable darray[LLVMValueRef] = [mis_state, mis_index]
-                    mis_tag_pointer: void& = (&mis_tag_args[0]).cast[void&] can Unsafe.PointerCast
-                    mis_record <- LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, mis_tag_pointer, 2, "mis.record")
                     mis_row_type <- packed_row_llvm_type(structs, scrutinee_type.bits.i64(), ctx)
-                    mis_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, 0, "mis.tag.ptr")
-                    mis_scrutinee <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), mis_tag_ptr, "mis.tag")
+                    if runtime.packed_mode == 2:
+                        # The AoS reader returns the row pointer, so the existing binding
+                        # path can address tag and payload fields directly.
+                        mis_tag_args: mutable darray[LLVMValueRef] = [mis_state, mis_index]
+                        mis_tag_pointer: void& = (&mis_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                        mis_record <- LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, mis_tag_pointer, 2, "mis.record")
+                        mis_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, 0, "mis.tag.ptr")
+                        mis_scrutinee <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), mis_tag_ptr, "mis.tag")
+                    else:
+                        # Canonical/index packed readers return WORDS, not row pointers.
+                        # Reusing the AoS record path here produced invalid LLVM (`gep ...
+                        # i64`) and, when accepted by LLVM-C, treated a payload word as an
+                        # address. Materialize a temporary row from the tag, common words,
+                        # and payload words so the binding code below has one well-typed row
+                        # shape for all profiles. This is a compiler temporary only; the
+                        # source value remains the compact store index.
+                        mis_record <- LLVMBuildAlloca(builder, mis_row_type, "mis.record")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(mis_row_type), mis_record)
+                        mis_tag_args: mutable darray[LLVMValueRef] = [mis_state, scrutinee_raw]
+                        mis_tag_args <- [mis_state, mis_index] if runtime.packed_mode == 1
+                        mis_tag_pointer: void& = (&mis_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                        mis_scrutinee <- LLVMBuildCall2(builder, runtime.packed_read_tag_type, runtime.packed_read_tag, mis_tag_pointer, 2, "mis.tag")
+                        mis_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, 0, "mis.tag.ptr")
+                        _ = LLVMBuildStore(builder, mis_scrutinee, mis_tag_ptr)
+                        mis_common_count: u32 = structs.packed_common_counts[scrutinee_type.bits.usize()]
+                        for mis_common_index in 0..<mis_common_count.usize() |mis_common_index, mis_state, scrutinee_raw, mis_record, mis_row_type, runtime, ctx, builder, structs|:
+                            mis_common_args: mutable darray[LLVMValueRef] = [scrutinee_raw, mis_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + mis_common_index).u64(), 0)]
+                            mis_common_args <- [LLVMBuildExtractValue(builder, runtime.active_store, 0, "mis.common.arena"), scrutinee_raw, mis_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + mis_common_index).u64(), 0)] if runtime.packed_mode == 1
+                            mis_common_pointer: void& = (&mis_common_args[0]).cast[void&] can Unsafe.PointerCast
+                            mis_common_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, mis_common_pointer, mis_common_args.count.u32(), "mis.common.word")
+                            mis_common_field: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, (1 + mis_common_index).u32(), "mis.common.ptr")
+                            _ = LLVMBuildStore(builder, mis_common_word, mis_common_field)
+                        mis_payload_words: u32 = structs.packed_payload_words[scrutinee_type.bits.usize()]
+                        mis_payload_array: LLVMTypeRef = LLVMArrayType(LLVMInt64TypeInContext(ctx), mis_payload_words)
+                        mis_payload_base: LLVMValueRef = LLVMBuildStructGEP2(builder, mis_row_type, mis_record, (1 + mis_common_count).u32(), "mis.payload.base")
+                        for mis_word_index in 0..<mis_payload_words.usize() |mis_word_index, mis_state, scrutinee_raw, mis_record, mis_row_type, mis_payload_array, mis_payload_base, mis_common_count, runtime, ctx, builder|:
+                            mis_word_args: mutable darray[LLVMValueRef] = [scrutinee_raw, mis_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + mis_common_count + mis_word_index.u32()).u64(), 0)]
+                            mis_word_args <- [LLVMBuildExtractValue(builder, runtime.active_store, 0, "mis.payload.arena"), scrutinee_raw, mis_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + mis_common_count + mis_word_index.u32()).u64(), 0)] if runtime.packed_mode == 1
+                            mis_word_pointer: void& = (&mis_word_args[0]).cast[void&] can Unsafe.PointerCast
+                            mis_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, mis_word_pointer, mis_word_args.count.u32(), "mis.payload.word")
+                            mis_payload_indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), LLVMConstInt(LLVMInt32TypeInContext(ctx), mis_word_index.u64(), 0)]
+                            mis_payload_indices_pointer: void& = (&mis_payload_indices[0]).cast[void&] can Unsafe.PointerCast
+                            mis_payload_pointer: LLVMValueRef = LLVMBuildGEP2(builder, mis_payload_array, mis_payload_base, mis_payload_indices_pointer, 2, "mis.payload.ptr")
+                            _ = LLVMBuildStore(builder, mis_word, mis_payload_pointer)
                     mis_compare_type <- LLVMInt32TypeInContext(ctx)
                 if penum_scrutinee:
                     mis_scrutinee <- LLVMBuildExtractValue(builder, scrutinee_raw, 0, "mis.penum.tag")

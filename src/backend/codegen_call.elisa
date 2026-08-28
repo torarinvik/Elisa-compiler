@@ -166,7 +166,7 @@ extend Backend:
                         explicit_pop_type: ValueType = darray_type_behind_expr(arguments[0], local_scope, structs)
                         if explicit_pop_type.kind == TypeKind.DArray:
                             if darray_address_of_expr(arguments[0], local_scope, fns, structs, generics, runtime, m, ctx, builder) is explicit_pop_slot:
-                                return emit_darray_pop_value(explicit_pop_slot, explicit_pop_type, structs, ctx, builder)
+                                return emit_darray_pop_value(explicit_pop_slot, explicit_pop_type, structs, m, ctx, builder)
                         return null
                     explicit_type: ValueType = annotation_value_type(generic_argument, structs)
                     null return if explicit_type.kind == TypeKind.Unmodeled
@@ -195,7 +195,7 @@ extend Backend:
                     pop_array_type: ValueType = darray_type_behind_expr(pop_object, local_scope, structs)
                     if pop_array_type.kind == TypeKind.DArray:
                         if darray_address_of_expr(pop_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pop_slot:
-                            return emit_darray_pop_value(pop_slot, pop_array_type, structs, ctx, builder)
+                            return emit_darray_pop_value(pop_slot, pop_array_type, structs, m, ctx, builder)
                     return null
             if callee is Expr.Ident(callee_name, callee_line):
                 # UFCS lowering may present `items.pop()` as the normalized free call
@@ -207,7 +207,7 @@ extend Backend:
                     normalized_pop_type: ValueType = darray_type_behind_expr(arguments[0], local_scope, structs)
                     if normalized_pop_type.kind == TypeKind.DArray:
                         if darray_address_of_expr(arguments[0], local_scope, fns, structs, generics, runtime, m, ctx, builder) is normalized_pop_slot:
-                            return emit_darray_pop_value(normalized_pop_slot, normalized_pop_type, structs, ctx, builder)
+                            return emit_darray_pop_value(normalized_pop_slot, normalized_pop_type, structs, m, ctx, builder)
                 # `ctx_hash_value(key)` — the compiler-emitted hash builtin (no user function
                 # of that name exists), lowered per the key's concrete type.
                 if callee_name == "ctx_hash_value" and arguments.count == 1:
@@ -611,6 +611,14 @@ extend Backend:
 
                         packed_arena: LLVMValueRef = LLVMBuildExtractValue(builder, packed_runtime.active_store, 0, "packed.arena")
                         packed_state: LLVMValueRef = LLVMBuildExtractValue(builder, packed_runtime.active_store, 2, "packed.state")
+                        # Recursive AST payloads contain darray side-tables. Those tables
+                        # belong to the AoS store's arena, not to the constructor's temporary
+                        # function arena. The latter is normally freed when this parser helper
+                        # returns; using it for the clone leaves a dangling side-table header
+                        # and turns a valid node handle into a later semantic crash. Keep the
+                        # original runtime for expression evaluation, but direct aggregate
+                        # adoption below at the store owner.
+                        packed_runtime.arena <- packed_arena
                         packed_alloc_args: mutable darray[LLVMValueRef] = [packed_arena, packed_state, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0)]
                         if runtime.packed_mode == 2:
                             packed_alloc_args <- [packed_arena, packed_state]
@@ -652,7 +660,7 @@ extend Backend:
                                     # constructor receives a side table built in a nested
                                     # region; storing the source header directly leaves the
                                     # AST pointing at storage that may be freed on return.
-                                    if emit_clone_aggregate_value(packed_payload_value, packed_payload_type, packed_payload_type, structs, runtime, m, ctx, builder) is adopted_payload:
+                                    if emit_clone_aggregate_value(packed_payload_value, packed_payload_type, packed_payload_type, structs, packed_runtime, m, ctx, builder) is adopted_payload:
                                         _ = LLVMBuildStore(builder, adopted_payload, packed_payload_pointer)
                                     else:
                                         return null
@@ -668,7 +676,7 @@ extend Backend:
                                         payload_value <- LLVMBuildInsertValue(builder, payload_value, field_value, payload_index.u32(), "packed.payload.field")
                                     else:
                                         return null
-                                if emit_clone_aggregate_value(payload_value, packed_payload_type, packed_payload_type, structs, runtime, m, ctx, builder) is adopted_payload:
+                                if emit_clone_aggregate_value(payload_value, packed_payload_type, packed_payload_type, structs, packed_runtime, m, ctx, builder) is adopted_payload:
                                     payload_value <- adopted_payload
                                 else:
                                     return null
@@ -950,6 +958,8 @@ extend Backend:
             arena_count: usize = fns.arena_counts[fn_index.usize()]
             wants_arena: bool = arena_count > 0
             wants_store: bool = fns.needs_store[fn_index.usize()]
+            call_return_type: ValueType = copied_type(fns.returns[fn_index.usize()])
+            sret_return: bool = not fns.is_error[fn_index.usize()] and value_type_uses_sret(call_return_type, structs, ctx)
             variadic_call: bool = fns.is_variadic[fn_index.usize()]
             fixed_arguments: usize = fns.param_count[fn_index.usize()]
             null return if variadic_call and total_arguments < fixed_arguments
@@ -959,10 +969,14 @@ extend Backend:
             # every defaulted call declined (`table.add_symbol(name, kind, line)` against a
             # 7-param add_symbol is the shape).
             uses_defaults: bool = not variadic_call and total_arguments < fixed_arguments
-            expected_params: usize = fixed_arguments + arena_count + (1 if wants_store else 0) if variadic_call or uses_defaults else total_arguments + arena_count + (1 if wants_store else 0)
+            expected_params: usize = fixed_arguments + arena_count + (1 if wants_store else 0) + (1 if sret_return else 0) if variadic_call or uses_defaults else total_arguments + arena_count + (1 if wants_store else 0) + (1 if sret_return else 0)
             null return if LLVMCountParams(target).i64() != expected_params.i64()
 
             argument_values: mutable darray[LLVMValueRef] = []
+            sret_slot: mutable LLVMValueRef = zeroed
+            if sret_return:
+                sret_slot <- LLVMBuildAlloca(builder, llvm_type_of(call_return_type, structs, ctx), "call.sret")
+                argument_values.push(sret_slot)
             declined: mutable bool = false
             argument_index: mutable usize = 0
             if has_receiver:
@@ -1098,12 +1112,12 @@ extend Backend:
             # the value itself.
             fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
             # A VOID call must be unnamed: "instructions returning void cannot have a name".
-            result_name: cstr = call_result_name(copied_type(fns.returns[fn_index.usize()]))
+            result_name: cstr = call_result_name(call_return_type)
             # Hand the callee OUR region when its signature threads one: the container
             # it grows is ours, so its backing must come from a region that outlives
-            # the call.
-            call_threaded_arena: LLVMValueRef = call_site_arena(arguments, local_scope, runtime)
-            argument_values.push(call_threaded_arena) if wants_arena
+            # the call. Stage0 orders hidden arguments as explicit values, packed store,
+            # then the independent caller-region slots.
+            call_threaded_arena: mutable LLVMValueRef = call_site_arena(arguments, local_scope, runtime)
             # The implicit ACTIVE-STORE argument. When the CALL SITE is outside any
             # `in store:` block there is no active store, and `runtime.active_store` is
             # `zeroed` -- which pushed a bare `ptr null` where the callee declares a
@@ -1115,6 +1129,12 @@ extend Backend:
             # A store passed as an ORDINARY argument is the one the callee means -- that is
             # how stage0's `eval(node, store)` gets it -- so prefer it, and DECLINE rather
             # than hand over a null. Passing a null store is never right.
+            # The arena path has a separate invariant: an arena-threading call made from a
+            # function with an active local region must never receive a null slot. Keep the
+            # ambient region as the final ABI fallback when argument ownership could not be
+            # recovered (for example a raw pointer expression with no named local root).
+            if llvm_value_is_null(call_threaded_arena) and not llvm_value_is_null(runtime.arena):
+                call_threaded_arena <- runtime.arena
             if wants_store:
                 call_store: mutable LLVMValueRef = runtime.active_store
                 if runtime.active_store_enum < 0:
@@ -1126,7 +1146,28 @@ extend Backend:
                             call_store <- store_argument_value
                 null return if call_store == zeroed
                 argument_values.push(call_store)
-            argument_values.push(call_threaded_arena) if arena_count > 1
+            # Hidden region slots are independent. Map each slot-bearing explicit parameter
+            # back to the source argument so a forwarded reference preserves its owner arena;
+            # use the ambient call arena only for a return/explicit region slot or an omitted
+            # defaulted argument. Passing one arena to every slot is ABI-compatible at the
+            # type level but corrupts the compiler's multi-table walkers at runtime.
+            direct_arena_slot: mutable usize = 0
+            for parameter_position in 0..<fixed_arguments |argument_values, direct_arena_slot, arena_count, fns, fn_index, structs, has_receiver, receiver, arguments, argument_names, local_scope, runtime, call_threaded_arena|:
+                parameter_type: ValueType = copied_type(fns.param_types[fns.param_start[fn_index.usize()] + parameter_position])
+                continue if not function_parameter_has_region(fns, fn_index, parameter_position)
+                direct_arena: mutable LLVMValueRef = call_threaded_arena
+                if has_receiver and parameter_position == 0:
+                    direct_arena <- growth_arena_for(receiver, local_scope, runtime)
+                else:
+                    source_first_position: usize = 1 if has_receiver else 0
+                    source_index: i64 = named_argument_index(argument_names, fns.param_names, fns.param_start[fn_index.usize()], fixed_arguments, source_first_position, parameter_position)
+                    if source_index >= 0 and source_index.usize() < arguments.count:
+                        direct_arena <- growth_arena_for(arguments[source_index.usize()], local_scope, runtime)
+                argument_values.push(direct_arena)
+                direct_arena_slot <- direct_arena_slot + 1
+            while direct_arena_slot < arena_count |argument_values, direct_arena_slot, call_threaded_arena|:
+                argument_values.push(call_threaded_arena)
+                direct_arena_slot <- direct_arena_slot + 1
             # A VOID value is not a value: `f(g())` where `g` returns void built a call whose
             # operand is `void <badref>`, which the verifier rejects and which crashed the
             # object path inside LLVM's DataLayout rather than producing a diagnostic. One
@@ -1135,6 +1176,12 @@ extend Backend:
             for void_probe in argument_values |void_argument, ctx|:
                 void_argument <- true if LLVMTypeOf(void_probe) == LLVMVoidTypeInContext(ctx)
             null return if void_argument
-            LLVMBuildCall2(builder, fn_type, target, null, 0, result_name) return if argument_values.count == 0
-            args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
-            return LLVMBuildCall2(builder, fn_type, target, args_pointer, argument_values.count.u32(), result_name)
+            call_result: mutable LLVMValueRef = zeroed
+            if argument_values.count == 0:
+                call_result <- LLVMBuildCall2(builder, fn_type, target, null, 0, result_name)
+            else:
+                args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast
+                call_result <- LLVMBuildCall2(builder, fn_type, target, args_pointer, argument_values.count.u32(), result_name)
+            add_call_type_attribute(call_result, 1, "sret", llvm_type_of(call_return_type, structs, ctx), ctx) if sret_return
+            return LLVMBuildLoad2(builder, llvm_type_of(call_return_type, structs, ctx), sret_slot, "call.sret.value") if sret_return
+            return call_result

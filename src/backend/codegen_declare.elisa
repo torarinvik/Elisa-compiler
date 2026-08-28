@@ -103,23 +103,24 @@ extend Backend:
             return qualified_name_cstr(owner, function_name, name_storage)
 
 
-        def declared_parameter_llvm_types(declared_param_types: darray[ValueType], arena_count: usize, wants_store: bool, structs: mutable StructTable&, ctx: LLVMContextRef) -> darray[LLVMTypeRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declared_parameter_llvm_types(declared_param_types: darray[ValueType], arena_count: usize, wants_store: bool, sret_return: bool, structs: mutable StructTable&, ctx: LLVMContextRef) -> darray[LLVMTypeRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             llvm_param_types: mutable darray[LLVMTypeRef] = []
+            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if sret_return
             llvm_param_types.extend([llvm_type_of(declared_param_type, structs, ctx) for declared_param_type in declared_param_types])
-            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if arena_count > 0
             if wants_store:
                 ast_store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: 0}
                 llvm_param_types.push(llvm_type_of(ast_store_type, structs, ctx))
-            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if arena_count > 1
+            for _arena_index in 0..<arena_count:
+                llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0))
             return llvm_param_types
 
 
-        def add_declared_function_with_params(fn_name: cstr, params_pointer: void&, total_params: u32, llvm_return: LLVMTypeRef, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def add_declared_function_with_params(fn_name: cstr, params_pointer: void&?, total_params: u32, llvm_return: LLVMTypeRef, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             fn_type: LLVMTypeRef = LLVMFunctionType(llvm_return, params_pointer, total_params, 0)
             return LLVMAddFunction(m, fn_name, fn_type)
 
 
-        def build_declared_function(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, overload_count: i64, force_ast_store: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def build_declared_function(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, overload_count: i64, force_ast_store: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             name_storage: mutable darray[u8] = []
             # A method declared inside `impl I for C:` is emitted as `__impl__I__C__method`,
             # which is what stage0 names it. Only the EMITTED SYMBOL changes: the FnTable
@@ -131,13 +132,18 @@ extend Backend:
             impl_storage.push(0) if impl_symbol
             fn_name: cstr = (&impl_storage[0]).cast[cstr] can Unsafe.PointerCast if impl_symbol else declared_function_name(owner, function_name, overload_count, params.count, name_storage)
             wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store or params_include_packed_ast(declared_param_types, structs)
+            is_error_fn: bool = line_is_error_returning(error_lines, line)
+            sret_return: bool = not is_error_fn and value_type_uses_sret(return_value_type, structs, ctx)
+            error_set_name: sview = line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, line) if is_error_fn else ""
             # Parser/Lexer functions construct opaque AST handles whose nested side
             # tables are not visible in the source signature. Keep their allocations
             # in the caller's region just like an explicit darray return.
-            signature_wants_arena: bool = signature_needs_arena(params, return_value_type, structs) or line_has_region_parameter(line, structs)
-            arena_count: usize = frontend_arena_count(owner, function_name, signature_wants_arena, wants_store)
-            llvm_param_types: mutable darray[LLVMTypeRef] = declared_parameter_llvm_types(declared_param_types, arena_count, wants_store, structs, ctx)
-            is_error_fn: bool = line_is_error_returning(error_lines, line)
+            signature_arena_slots: mutable usize = signature_arena_count(params, return_value_type, body, line, structs)
+            signature_arena_slots <- 0.usize() if generic_helper_uses_explicit_allocator(function_name)
+            signature_arena_slots <- signature_arena_slots + 1.usize() if line_has_region_parameter(line, structs)
+            signature_arena_slots <- signature_arena_slots + 1.usize() if error_set_payload_needs_arena(structs, error_set_name)
+            arena_count: usize = frontend_arena_count(owner, function_name, signature_arena_slots, wants_store)
+            llvm_param_types: mutable darray[LLVMTypeRef] = declared_parameter_llvm_types(declared_param_types, arena_count, wants_store, sret_return, structs, ctx)
             if is_error_fn:
                 error_out_param: mutable darray[LLVMTypeRef] = []
                 error_out_param.push(LLVMPointerTypeInContext(ctx, 0))
@@ -145,28 +151,38 @@ extend Backend:
                 llvm_param_types <- error_out_param
             llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
             llvm_return <- LLVMInt32TypeInContext(ctx) if is_error_fn
+            llvm_return <- LLVMVoidTypeInContext(ctx) if sret_return
             # A set with a PAYLOAD-carrying variant returns the `%ErrSet__E` struct instead of
             # the bare i32 code — stage0's ABI, measured. A fieldless set keeps the i32, which
             # is every error set in this compiler's own source, so self-hosting is untouched.
-            error_set_name: sview = line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, line) if is_error_fn else ""
             llvm_return <- error_set_llvm_type(structs, error_set_name, ctx) if is_error_fn and error_set_has_payload(structs, error_set_name)
-            params_pointer: void& = (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
+            # LLVM accepts a null parameter array when the count is zero.  Indexing
+            # an empty darray here used to trap while declaring ordinary zero-arg
+            # functions, hiding the actual source diagnostic behind SIGTRAP.
+            params_pointer: mutable void&? = null
+            if llvm_param_types.count > 0:
+                params_pointer <- (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
             handle: LLVMValueRef = add_declared_function_with_params(fn_name, params_pointer, llvm_param_types.count.u32(), llvm_return, m, ctx)
             apply_function_decorators(handle, decorators, annotation_args, true, ctx)
-            apply_noalias_parameter_attributes(handle, params, 1 + (1 if is_error_fn else 0), structs, ctx)
+            add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx) if sret_return
+            apply_noalias_parameter_attributes(handle, params, 1 + (1 if is_error_fn else 0) + (1 if sret_return else 0), structs, ctx)
             return handle
 
 
-        def declare_function_from_types(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, force_ast_store: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_function_from_types(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, force_ast_store: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 overload_count: mutable i64 = 0
                 for oi in 0..<fns.names.count |oi, fns, owner, function_name, overload_count|:
                     overload_count <- overload_count + 1 if fns.names[oi] == function_name and fns.owners[oi] == owner
                 wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store or params_include_packed_ast(declared_param_types, structs)
-                signature_wants_arena: bool = signature_needs_arena(params, return_value_type, structs) or line_has_region_parameter(line, structs)
-                arena_count: usize = frontend_arena_count(owner, function_name, signature_wants_arena, wants_store)
+                declaration_error_set_name: sview = line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, line) if line_is_error_returning(error_lines, line) else ""
+                signature_arena_slots: mutable usize = signature_arena_count(params, return_value_type, body, line, structs)
+                signature_arena_slots <- 0.usize() if generic_helper_uses_explicit_allocator(function_name)
+                signature_arena_slots <- signature_arena_slots + 1.usize() if line_has_region_parameter(line, structs)
+                signature_arena_slots <- signature_arena_slots + 1.usize() if error_set_payload_needs_arena(structs, declaration_error_set_name)
+                arena_count: usize = frontend_arena_count(owner, function_name, signature_arena_slots, wants_store)
                 is_error_fn: bool = line_is_error_returning(error_lines, line)
-                handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, declared_param_types, decorators, line, owner, overload_count, force_ast_store, error_lines, annotation_args, structs, m, ctx)
+                handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, overload_count, force_ast_store, error_lines, annotation_args, structs, m, ctx)
                 fns.names <- fns.names.push(function_name)
                 fns.lines <- fns.lines.push(line)
                 fns.owners <- fns.owners.push(owner)
@@ -180,10 +196,13 @@ extend Backend:
                 fns.returns <- fns.returns.push(return_value_type)
                 fns.param_start <- fns.param_start.push(fns.param_types.count)
                 fns.param_count <- fns.param_count.push(params.count)
+                region_flags: mutable darray[bool] = []
+                region_flags_for_function(params, body, line, structs, region_flags)
                 for parameter_index in 0..<declared_param_types.count |fns, params|:
                     fns.param_names <- fns.param_names.push(params[parameter_index].name)
                     fns.param_defaults <- fns.param_defaults.push(params[parameter_index].default_value)
                     fns.param_types <- fns.param_types.push(declared_param_types[parameter_index])
+                    fns.param_region_slots <- fns.param_region_slots.push(region_flags[parameter_index])
                 return handle
 
 
@@ -227,7 +246,7 @@ extend Backend:
                     # resolves nothing further from a bare name, and leaving it set past the
                     # return would carry this module into the next declaration.
                     structs.current_owner <- declared_owner_saved
-                    return declare_function_from_types(function_name, params, return_value_type, declared_param_types, decorators, line, owner, statements_mention_ast_store_call(body, structs), error_lines, annotation_args, fns, structs, m, ctx)
+                    return declare_function_from_types(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, statements_mention_ast_store_call(body, structs), error_lines, annotation_args, fns, structs, m, ctx)
 
                 structs.current_owner <- declared_owner_saved
                 return null
@@ -435,6 +454,12 @@ extend Backend:
 
         def declare_extern(declaration: Decl, extern_params: darray[ExternParam]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, return_is_pointer: bool, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
+                # `export pymodule NAME:` is a frontend-only export contract. Its declaration
+                # node is deliberately an Extern for AST compatibility, but it must not become
+                # an opaque handle/global in the ordinary Elisa object; the Python emitter owns
+                # the metadata and introduces stable wrapper symbols after ordinary bodies.
+                for pymodule_annotation in annotations |extern_name|:
+                    true return if pymodule_annotation.owner == extern_name and pymodule_annotation.name == "__export_pymodule"
                 linker_name: sview = extern_link_name(decorators, annotation_args, extern_name)
                 # `extern name: T` (a typed non-call extern) is a GLOBAL, not a function.
                 if not callable:
@@ -701,6 +726,7 @@ extend Backend:
                     fns.param_names <- fns.param_names.push(extern_params[param_start.usize() + parameter_index].name)
                     fns.param_defaults <- fns.param_defaults.push((Expr.Invalid))
                     fns.param_types <- fns.param_types.push(declared_param_types[parameter_index])
+                    fns.param_region_slots <- fns.param_region_slots.push(false)
                 # A file that CONSTRUCTS a ThreadPool needs `pool_shutdown` to close the
                 # `pool`/`scope` guard, and stage0 declares that companion IMPLICITLY — the
                 # backend corpus sources extern only `pool_new`, which is why every guard block
@@ -728,6 +754,7 @@ extend Backend:
                     fns.param_names <- fns.param_names.push("pool")
                     fns.param_defaults <- fns.param_defaults.push((Expr.Invalid))
                     fns.param_types <- fns.param_types.push(intern_ref_type(return_value_type, structs))
+                    fns.param_region_slots <- fns.param_region_slots.push(false)
                 return true
             return false
 
@@ -778,9 +805,12 @@ extend Backend:
                 # own: the container's backing outlives this call, so allocating it from a
                 # region freed at return would hand the caller freed memory.
                 # An error fn's out-param is LLVM param 0; declared params (and the arena)
-                # shift past it by one.
+                # shift past it by one. Large aggregate returns use the same leading slot
+                # shape, but their slot is the sret destination and the function returns void.
                 fn_is_error: bool = line_is_error_returning(error_lines, function_line_of(declaration))
                 error_param_offset: u32 = 1 if fn_is_error else 0
+                sret_return: bool = not fn_is_error and value_type_uses_sret(return_value_type, structs, ctx)
+                leading_param_offset: u32 = 1 if fn_is_error or sret_return else 0
                 if fn_is_error:
                     local_runtime.error_out <- LLVMGetParam(fn, 0)
                     local_runtime.in_error_fn <- true
@@ -808,9 +838,32 @@ extend Backend:
                 # still defined rather than silently ABI-less.
                 ast_store_needed: bool = function_needs_store_for_declaration(declaration, fns)
                 declared_arena_count: i64 = function_arena_count_for_declaration(declaration, fns)
-                arena_count: mutable usize = frontend_arena_count(owner, function_name, signature_needs_arena(params, return_value_type, structs) or line_has_region_parameter(function_line_of(declaration), structs), ast_store_needed)
+                signature_arena_slots: mutable usize = signature_arena_count(params, return_value_type, body, function_line_of(declaration), structs)
+                signature_arena_slots <- signature_arena_slots + 1.usize() if line_has_region_parameter(function_line_of(declaration), structs)
+                arena_count: mutable usize = frontend_arena_count(owner, function_name, signature_arena_slots, ast_store_needed)
                 arena_count <- declared_arena_count.usize() if declared_arena_count >= 0
                 threads_arena: bool = arena_count > 0
+                function_region_row: i64 = function_index_of_line(fns, owner, function_name, function_line_of(declaration))
+                # A hidden arena parameter is an ABI fact. For functions without one,
+                # allocate the lazy per-function carrier only when the body can actually
+                # construct or grow region-backed data. Scalar-only bodies must not acquire
+                # an `arena_free` dependency just because the old bootstrap emitter wrapped
+                # every function uniformly.
+                needs_auto_region: mutable bool = auto_region_statements_need_arena(body, fns, structs, generics)
+                local_packed_store_root: i64 = auto_region_statements_packed_store_root(body, structs)
+                # A hidden AST store normally arrives with its own arena in the store
+                # value. Store-aware helpers therefore do not acquire a carrier merely
+                # because their ABI carries a store; actual packed constructors and the
+                # synthetic compiler-main root are handled by the body scan below.
+                # The hidden store precedes the region slots in the stage0 ABI. Region slots are
+                # caller-owned, but the body may still need a separate function-local scratch
+                # arena for temporaries such as the `digits` array in append_decimal.
+                caller_arena_parameter_index: u32 = params.count.u32() + leading_param_offset + (1 if ast_store_needed else 0)
+                if threads_arena:
+                    local_runtime.caller_arenas <- []
+                    for arena_index in 0..<arena_count |local_runtime, fn, caller_arena_parameter_index|:
+                        local_runtime.caller_arenas <- local_runtime.caller_arenas.push(LLVMGetParam(fn, caller_arena_parameter_index + arena_index.u32()))
+                    local_runtime.caller_arena <- local_runtime.caller_arenas[0]
                 # `arena_free` must NOT own an auto region. The epilogue releases the region by
                 # CALLING arena_free, so arena_free would call itself unconditionally on every
                 # exit path — an infinite recursion that exhausts the stack and then faults in
@@ -825,25 +878,52 @@ extend Backend:
                 # epilogue calls a DIFFERENT function, so it terminates — and it allocates
                 # nothing, so it has no use for a region. Clearing `owns_arena` suppresses both
                 # the regions-stack unwind and emit_region_free, which are separate paths.
-                if threads_arena:
-                    local_runtime.arena <- LLVMGetParam(fn, params.count.u32() + error_param_offset)
-                    local_runtime.owns_arena <- false
-                else:
+                if needs_auto_region and not (threads_arena and value_type_returns_caller_region(return_value_type, structs)):
                     arena_type: LLVMTypeRef = arena_llvm_type(ctx)
                     arena_slot: LLVMValueRef = LLVMBuildAlloca(builder, arena_type, "auto.region")
                     _ = LLVMBuildStore(builder, LLVMConstNull(arena_type), arena_slot)
                     strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, arena_type, arena_slot, 3, "region.strategy")
                     _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), strategy_pointer)
                     local_runtime.arena <- arena_slot
+                    local_runtime.owns_arena <- true
                     # Keep arena_free from taking ownership of its own carrier.
                     local_runtime.owns_arena <- false if function_name == "arena_free" and owner == ""
+                elif threads_arena:
+                    # There is no local allocation to reclaim. Container growth through a
+                    # by-reference parameter still uses the caller-owned region.
+                    local_runtime.arena <- local_runtime.caller_arena
+                    local_runtime.owns_arena <- false
+                else:
+                    # No body operation should consume this placeholder. It is a correctly
+                    # typed null pointer so a declined/unmodeled path cannot accidentally
+                    # turn a zeroed LLVM handle into an arbitrary pointer.
+                    local_runtime.arena <- LLVMConstNull(LLVMPointerTypeInContext(ctx, 0))
+                    local_runtime.owns_arena <- false
                 if ast_store_needed:
-                    store_parameter_index: u32 = params.count.u32() + error_param_offset + (1 if threads_arena else 0)
+                    store_parameter_index: u32 = params.count.u32() + leading_param_offset
                     local_runtime.active_store <- LLVMGetParam(fn, store_parameter_index)
                     # The AST hierarchy is a single compiler-internal store rooted at
                     # `Node`. Use the actual registered root index so constructors and
                     # matches in Parser/Backend bodies can validate the hidden store ABI.
                     local_runtime.active_store_enum <- packed_index_of(structs, "Node")
+                    local_runtime.active_store_is_block <- true
+                elif local_packed_store_root >= 0:
+                    # User packed/recursive enums use an implicit store owned by the
+                    # function's inferred region. Only the compiler's sealed AST hierarchy
+                    # receives the hidden store parameter above; treating every packed enum
+                    # as AST would force helper callers to carry a store ABI that stage0 does
+                    # not have. The store is created once at function entry and reused by all
+                    # bare `new Enum.V(...)` constructions and matches in this region.
+                    local_packed_row_bytes: i64 = packed_row_bytes(structs, local_packed_store_root)
+                    local_packed_state_args: mutable darray[LLVMValueRef] = [local_runtime.arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), local_packed_row_bytes.u64(), 0)]
+                    local_packed_state_pointer: void& = (&local_packed_state_args[0]).cast[void&] can Unsafe.PointerCast
+                    local_packed_state: LLVMValueRef = LLVMBuildCall2(builder, local_runtime.packed_state_new_type, local_runtime.packed_state_new, local_packed_state_pointer, 2, "local.packed.store.state")
+                    local_packed_store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: local_packed_store_root.u32()}
+                    local_packed_store_llvm: LLVMTypeRef = llvm_type_of(local_packed_store_type, structs, ctx)
+                    local_packed_with_arena: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetUndef(local_packed_store_llvm), local_runtime.arena, 0, "local.packed.store.arena")
+                    local_packed_with_row: LLVMValueRef = LLVMBuildInsertValue(builder, local_packed_with_arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), local_packed_row_bytes.u64(), 0), 1, "local.packed.store.row_bytes")
+                    local_runtime.active_store <- LLVMBuildInsertValue(builder, local_packed_with_row, local_packed_state, 2, "local.packed.store")
+                    local_runtime.active_store_enum <- local_packed_store_root
                     local_runtime.active_store_is_block <- true
                 # Stage0's executable entry point is deliberately store-free in its public
                 # signature, but it creates the compiler AST store before calling the
@@ -857,7 +937,7 @@ extend Backend:
                 # variant-less header). A program that declares its own `packed enum Node:`
                 # got a free active store here, so its constructor emitted where stage0
                 # rejects it ("requires an active in Node.Store: scope").
-                if owner == "" and function_name == "main" and packed_is_ast_root(structs, packed_index_of(structs, "Node")):
+                if owner == "" and function_name == "main" and needs_auto_region and packed_is_ast_root_row(structs, packed_index_of(structs, "Node")):
                     root_index: i64 = packed_index_of(structs, "Node")
                     false return if root_index < 0
                     row_bytes: i64 = packed_row_bytes(structs, root_index)
@@ -880,15 +960,20 @@ extend Backend:
                 # is threaded in, in which case it is the CALLER's and nothing here frees it,
                 # so the stack stays empty.
                 regions: mutable RegionStack = RegionStack{arenas: []}
-                regions.arenas.push(local_runtime.arena) if not threads_arena and local_runtime.owns_arena
-                parameter_index: mutable u32 = error_param_offset
+                regions.arenas.push(local_runtime.arena) if local_runtime.owns_arena
+                parameter_index: mutable u32 = leading_param_offset
+                parameter_arena_index: mutable i64 = 0
                 for parameter in params |local_scope, parameter_index, fn, ctx, builder|:
                     parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
+                    source_parameter_index: u32 = parameter_index - leading_param_offset
                     name_storage: mutable darray[u8] = []
                     slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(parameter_type, structs, ctx), sview_to_cstr(parameter.name, name_storage))
                     _ = LLVMBuildStore(builder, LLVMGetParam(fn, parameter_index), slot)
                     declare_local(local_scope, parameter.name, slot, parameter_type)
-                    source_parameter_index: u32 = parameter_index - error_param_offset
+                    has_parameter_region: bool = function_region_row >= 0 and fns.param_start[function_region_row.usize()] + source_parameter_index.usize() < fns.param_region_slots.count and fns.param_region_slots[fns.param_start[function_region_row.usize()] + source_parameter_index.usize()]
+                    if has_parameter_region:
+                        mark_last_local_parameter_arena(local_scope, parameter_arena_index)
+                        parameter_arena_index <- parameter_arena_index + 1
                     if local_runtime.disjoint_function_mask != 0 and disjoint_numeric_darray_ref(parameter.type_expression, structs):
                         bit: mutable u64 = 1
                         for _ in 0..<source_parameter_index |bit|:
@@ -899,7 +984,7 @@ extend Backend:
                     # DWARF argument numbers start at 1, and count DECLARED parameters --
                     # the error out-param and the threaded arena are ABI additions the
                     # source never named, so they are not numbered here.
-                    declare_debug_variable(parameter.name, slot, parameter_type, parameter_index + 1 - error_param_offset, line.line, fn, local_runtime, structs, ctx, builder)
+                    declare_debug_variable(parameter.name, slot, parameter_type, parameter_index + 1 - leading_param_offset, line.line, fn, local_runtime, structs, ctx, builder)
                     parameter_index <- parameter_index + 1
 
                 body_status: mutable EmitStatus = EmitStatus.Open

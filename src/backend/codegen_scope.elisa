@@ -200,6 +200,13 @@ extend Backend:
             local_scope.local_fn_origins <- local_scope.local_fn_origins.push("")
             local_scope.local_declared_arenas <- local_scope.local_declared_arenas.push(zeroed)
             local_scope.local_has_declared_arena <- local_scope.local_has_declared_arena.push(false)
+            local_scope.local_parameter_arena_indices <- local_scope.local_parameter_arena_indices.push(-1)
+
+
+        # Associate the most recently declared parameter with one hidden caller-region slot.
+        def mark_last_local_parameter_arena(local_scope: mutable Scope&, arena_index: i64) -> void can[Abort.Panic, Memory.Allocate]:
+            return if local_scope.local_parameter_arena_indices.count == 0
+            local_scope.local_parameter_arena_indices[local_scope.local_parameter_arena_indices.count - 1.usize()] <- arena_index
 
 
         # Pin the most recently declared local to `arena`, the region its `@region` qualifier
@@ -295,7 +302,7 @@ extend Backend:
             # reaches owns it; a root declared before EVERY frame gets the outermost frame's
             # `outer` arena; no frames (or no named root) is the ambient runtime.arena — the
             # pre-existing behavior, and correct outside region blocks.
-        def growth_arena_for(expression: Expr, local_scope: Scope&, runtime: Runtime&) -> LLVMValueRef can[Abort.Panic]:
+        def growth_arena_for(expression: Expr, local_scope: mutable Scope&, runtime: Runtime&) -> LLVMValueRef can[Abort.Panic]:
             can Abort.Panic:
                 ga_root: sview = growth_root_name(expression)
                 runtime.arena return if ga_root == ""
@@ -303,6 +310,17 @@ extend Backend:
                 for ga_index in 0..<local_scope.names.count |ga_found, local_scope, ga_root|:
                     ga_found <- ga_index.i64() if local_scope.names[ga_index] == ga_root
                 runtime.arena return if ga_found < 0
+                # A reference parameter aliases storage owned by the caller. Its growth must
+                # never fall back to the callee's scratch arena, even when the function also
+                # has local region-backed temporaries.
+                ga_type: ValueType = lookup_type(local_scope, ga_root)
+                if ga_type.kind == TypeKind.Ref:
+                    if ga_found.usize() < local_scope.local_parameter_arena_indices.count:
+                        parameter_arena_index: i64 = local_scope.local_parameter_arena_indices[ga_found.usize()]
+                        if parameter_arena_index >= 0 and parameter_arena_index.usize() < runtime.caller_arenas.count:
+                            return runtime.caller_arenas[parameter_arena_index.usize()]
+                    return runtime.caller_arena if not llvm_value_is_null(runtime.caller_arena)
+                    return runtime.arena
                 # An EXPLICIT `@region` pin wins over the lexical frame rule below: the
                 # declaration named the arena, so growth must go to the same one the initial
                 # allocation did.
@@ -318,7 +336,7 @@ extend Backend:
 
             # `runtime` with its arena swapped to the declaration arena of `expression`'s root —
             # what a growth site (push/extend/resize) must emit its reallocation against.
-        def growth_runtime_for(expression: Expr, local_scope: Scope&, runtime: Runtime&) -> Runtime can[Abort.Panic, Memory.Allocate]:
+        def growth_runtime_for(expression: Expr, local_scope: mutable Scope&, runtime: Runtime&) -> Runtime can[Abort.Panic, Memory.Allocate]:
             can Abort.Panic:
                 grown: mutable Runtime = copied_runtime(runtime)
                 grown.arena <- growth_arena_for(expression, local_scope, runtime)
@@ -342,7 +360,14 @@ extend Backend:
             # scratch region `inferred` lives in, and every push into `structs` died with it.
         def call_site_arena(arguments: darray[Expr]&, local_scope: mutable Scope&, runtime: Runtime&) -> LLVMValueRef can[Abort.Panic]:
             can Abort.Panic:
-                runtime.arena return if local_scope.region_frame_starts.count == 0
+                if local_scope.region_frame_starts.count == 0:
+                    for no_frame_argument in arguments |local_scope, runtime|:
+                        no_frame_root: sview = growth_root_name(no_frame_argument)
+                        continue if no_frame_root == ""
+                        no_frame_type: ValueType = lookup_type(local_scope, no_frame_root)
+                        if no_frame_type.kind == TypeKind.Ref:
+                            return growth_arena_for(no_frame_argument, local_scope, runtime)
+                    return runtime.arena
                 best_level: mutable i64 = 2147483647
                 best_arena: mutable LLVMValueRef = zeroed
                 have_best: mutable bool = false
@@ -479,8 +504,15 @@ extend Backend:
         # Return the source-argument index that supplies parameter `wanted`. Positional
         # arguments fill the next unassigned parameter; labelled arguments select by name.
         # `first_position` is 1 for UFCS calls because parameter 0 is the implicit receiver.
+        # An entirely empty name vector is the canonical AST representation for an all-positional
+        # call built by a lowering pass (for example `machine from`'s enum-state constructor),
+        # so it must not be read as an argument-count mismatch. The old loop returned -1 for that
+        # shape, making every lowered multi-field constructor decline while the same source-written
+        # constructor compiled.
         def named_argument_index(argument_names: darray[sview]&, parameter_names: darray[sview]&, parameter_start: usize, parameter_count: usize, first_position: usize, wanted: usize) -> i64 can[Abort.Panic, Memory.Allocate]:
             -1 return if wanted < first_position or wanted >= parameter_count
+            if argument_names.count == 0:
+                return (wanted - first_position).i64()
             assigned: mutable darray[bool] = [false for _slot in 0..<parameter_count]
             assigned[0] <- true if first_position == 1 and parameter_count > 0
             next_pos: mutable usize = first_position
@@ -1294,6 +1326,10 @@ extend Backend:
 
         def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, structs: mutable StructTable&, fast_math: bool, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                # This helper is the scalar fallback. Aggregate equality must
+                # be lowered by a dedicated protocol/runtime path; never pass an
+                # aggregate through to LLVMBuildICmp, which would leave invalid IR.
+                null return if operand_type.kind == TypeKind.Array or operand_type.kind == TypeKind.DArray or operand_type.kind == TypeKind.View or operand_type.kind == TypeKind.Struct
                 # Floats are a different instruction family end to end: fadd/fdiv/fcmp, never
                 # add/sdiv/icmp. Bitwise and shifts have no float form and decline.
                 if operand_type.kind == TypeKind.Float:

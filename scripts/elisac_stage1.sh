@@ -24,6 +24,52 @@ if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
 fi
 STAGE0_BIN="${ELISACORE_BIN:-${HOME}/.elisac/elisac}"
+# Include expansion is a host-side Python step. Resolve the same interpreter selected by
+# `PYTHON_BIN` (including a command name such as `python3.14`) before any emit mode runs so
+# custom toolchains are honored consistently by the wrapper and its recursive invocations.
+resolve_python_tools() {
+  PYTHON_HOST="${PYTHON_BIN:-$(command -v python3 || true)}"
+  if [[ -n "${PYTHON_BIN:-}" && "$PYTHON_BIN" != */* ]]; then
+    PYTHON_HOST="$(command -v "$PYTHON_BIN" || true)"
+  fi
+  PYTHON_CONFIG_HOST="${PYTHON_CONFIG:-}"
+  if [[ -n "${PYTHON_CONFIG_HOST}" && "$PYTHON_CONFIG_HOST" != */* ]]; then
+    PYTHON_CONFIG_HOST="$(command -v "$PYTHON_CONFIG_HOST" || true)"
+  elif [[ -z "${PYTHON_CONFIG_HOST}" && -n "${PYTHON_BIN:-}" ]]; then
+    python_config_sibling="${PYTHON_HOST}-config"
+    if [[ -x "$python_config_sibling" ]]; then
+      PYTHON_CONFIG_HOST="$python_config_sibling"
+    else
+      PYTHON_CONFIG_HOST="$(command -v python3-config || true)"
+    fi
+  elif [[ -z "${PYTHON_CONFIG_HOST}" ]]; then
+    PYTHON_CONFIG_HOST="$(command -v python3-config || true)"
+  fi
+
+}
+
+validate_python_toolchain() {
+  # A generic `python3-config` on PATH is not guaranteed to belong to the
+  # interpreter selected above.  On this host `/usr/bin/python3` is Python 3.9
+  # while Homebrew's `python3-config` is Python 3.14; mixing those headers with
+  # the selected runtime produces an extension that compiles but fails at import
+  # time (for example with an unresolved `_PyObject_DelAttrString`).  Reject an
+  # explicitly supplied mismatch and discard an implicit one so the pymodule-so
+  # path can derive the include directory from the selected interpreter itself.
+  if [[ -x "$PYTHON_HOST" && -x "$PYTHON_CONFIG_HOST" ]]; then
+    python_host_version="$("$PYTHON_HOST" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || true)"
+    python_config_includes="$("$PYTHON_CONFIG_HOST" --includes 2>/dev/null || true)"
+    python_config_version="$(printf '%s\n' "$python_config_includes" | sed -nE 's/.*python([0-9]+)\.([0-9]+).*/\1.\2/p' | head -n 1)"
+    if [[ -n "$python_host_version" && -n "$python_config_version" && "$python_host_version" != "$python_config_version" ]]; then
+      if [[ -n "${PYTHON_CONFIG:-}" ]]; then
+        echo "python toolchain mismatch: $PYTHON_HOST is Python $python_host_version but $PYTHON_CONFIG is Python $python_config_version" >&2
+        exit 2
+      fi
+      PYTHON_CONFIG_HOST=""
+    fi
+  fi
+}
+resolve_python_tools
 
 flatten_includes() {
   # Writes the flattened source to stdout. When $2 is given, also writes an OFFSET MAP
@@ -34,7 +80,7 @@ flatten_includes() {
   # ascending `flatoff:delta` pairs — the driver's fmt adds the covering delta to a token
   # offset to recover stage0's number. Indented include directives (stage0 re-indents the
   # spliced lines) are not modeled; this repo's includes are all at column 0.
-  python3 - "$1" "${2:-}" <<'PY'
+  "$PYTHON_HOST" - "$1" "${2:-}" <<'PY'
 import re, pathlib, sys
 path = pathlib.Path(sys.argv[1]).resolve()
 map_path = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
@@ -97,8 +143,98 @@ if map_path:
 PY
 }
 
+terminate_guarded_pid() {
+  local pid="$1" ticks=0
+  kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [[ "$ticks" -lt 20 ]]; do
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
 seed_build() {
-  local libdir
+  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output
+  # The EXIT trap runs after this function's locals have gone out of scope under
+  # `set -u`; retain the private lock path in a function-external variable so a
+  # successful high-memory seed always releases its lock without an unbound-var exit.
+  ELISA_SEED_LOCK_DIR="$ROOT/build/.elisac-stage1-seed.lock"
+  seed_lock="$ELISA_SEED_LOCK_DIR"
+  if ! mkdir "$seed_lock" 2>/dev/null; then
+    seed_lock_pid=""
+    if [[ -f "$seed_lock/pid" ]]; then
+      seed_lock_pid="$(<"$seed_lock/pid")"
+    fi
+    if [[ -n "$seed_lock_pid" ]] && kill -0 "$seed_lock_pid" 2>/dev/null; then
+      echo "seed: another stage1 seed is already running (pid $seed_lock_pid); refusing a concurrent high-memory build" >&2
+      exit 2
+    fi
+    # A killed shell may leave only its lock directory behind. Reclaim it only when
+    # the recorded owner is no longer alive; the target is this private lock directory.
+    rm -f "$seed_lock/pid"
+    rmdir "$seed_lock" 2>/dev/null || {
+      echo "seed: could not acquire stale lock $seed_lock" >&2
+      exit 2
+    }
+    mkdir "$seed_lock" || {
+      echo "seed: could not acquire lock $seed_lock" >&2
+      exit 2
+    }
+  fi
+  # Worktrees have distinct local locks, but a stage0 seed is a host-wide high-memory
+  # operation. Serialize all Elisa self-host seeds on this machine so independent Codex
+  # worktrees cannot reproduce the multi-gigabyte contention that previously froze the host.
+  ELISA_SEED_GLOBAL_LOCK_DIR="${ELISA_STAGE1_GLOBAL_SEED_LOCK_DIR:-${TMPDIR:-/tmp}/elisac-stage1-global-seed.lock}"
+  global_seed_lock="$ELISA_SEED_GLOBAL_LOCK_DIR"
+  if ! mkdir "$global_seed_lock" 2>/dev/null; then
+    global_seed_lock_pid=""
+    if [[ -f "$global_seed_lock/pid" ]]; then
+      global_seed_lock_pid="$(<"$global_seed_lock/pid")"
+    fi
+    if [[ -n "$global_seed_lock_pid" ]] && kill -0 "$global_seed_lock_pid" 2>/dev/null; then
+      rm -f "$seed_lock/pid"
+      rmdir "$seed_lock" 2>/dev/null || true
+      echo "seed: another Elisa self-host seed is already running on this host (pid $global_seed_lock_pid); refusing concurrent high-memory build" >&2
+      exit 2
+    fi
+    rm -f "$global_seed_lock/pid"
+    rmdir "$global_seed_lock" 2>/dev/null || {
+      rm -f "$seed_lock/pid"
+      rmdir "$seed_lock" 2>/dev/null || true
+      echo "seed: could not acquire stale global lock $global_seed_lock" >&2
+      exit 2
+    }
+    mkdir "$global_seed_lock" || {
+      rm -f "$seed_lock/pid"
+      rmdir "$seed_lock" 2>/dev/null || true
+      echo "seed: could not acquire global lock $global_seed_lock" >&2
+      exit 2
+    }
+  fi
+  printf '%s\n' "$$" >"$seed_lock/pid"
+  printf '%s\n' "$$" >"$global_seed_lock/pid"
+  # Never link directly over the product binary. Readers may be compiling through the wrapper
+  # while another session refreshes the seed; an in-place clang output can expose a truncated
+  # executable or make two adjacent parity probes use different compiler generations. Link next
+  # to the final path and publish it with one same-filesystem rename after the complete image is
+  # ready.
+  seed_output="${BIN}.tmp.$$"
+  ELISA_SEED_OUTPUT="$seed_output"
+  cleanup_seed_lock() {
+    if [[ -n "${ELISA_SEED_OUTPUT:-}" ]]; then
+      rm -f "$ELISA_SEED_OUTPUT"
+    fi
+    rm -f "$ELISA_SEED_LOCK_DIR/pid"
+    rmdir "$ELISA_SEED_LOCK_DIR" 2>/dev/null || true
+    if [[ -n "${ELISA_SEED_GLOBAL_LOCK_DIR:-}" ]]; then
+      rm -f "$ELISA_SEED_GLOBAL_LOCK_DIR/pid"
+      rmdir "$ELISA_SEED_GLOBAL_LOCK_DIR" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_seed_lock EXIT INT TERM HUP
   libdir="$("$LLVM_CONFIG" --libdir)"
   mkdir -p "$ROOT/bin" "$ROOT/build"
   if [[ ! -x "$STAGE0_BIN" ]]; then
@@ -106,7 +242,41 @@ seed_build() {
     exit 2
   fi
   echo "seed: building product with stage0 $STAGE0_BIN" >&2
-  "$STAGE0_BIN" -emit obj -O2 -o "$ROOT/build/elisac_stage1.o" "$ROOT/src/driver/elisac.elisa"
+  # The compiler itself is a large input. A duplicated seed can consume the whole
+  # workstation before either invocation reports an error, so bound one seed by default.
+  # Keep one-shot seed builds below the same 4 GiB operational ceiling used by ordinary
+  # stage1 invocations. The compiler is large, but allowing the default seed to claim 5.5 GiB
+  # made two independent worktrees capable of freezing a developer machine at the same time;
+  # raise ELISA_STAGE1_SEED_MAX_RSS_KB deliberately on a host sized for a larger build.
+  seed_max_rss_kb="${ELISA_STAGE1_SEED_MAX_RSS_KB:-4194304}"
+  seed_rss_poll_seconds="${ELISA_STAGE1_RSS_POLL_SECONDS:-0.05}"
+  seed_opt_level="${ELISA_STAGE1_SEED_OPT_LEVEL:--O2}"
+  case "$seed_opt_level" in
+    -O0|-O1|-O2|-O3) ;;
+    *)
+      echo "seed: ELISA_STAGE1_SEED_OPT_LEVEL must be -O0, -O1, -O2 or -O3 (got $seed_opt_level)" >&2
+      exit 2
+      ;;
+  esac
+  "$STAGE0_BIN" -emit obj "$seed_opt_level" -o "$ROOT/build/elisac_stage1.o" "$ROOT/src/driver/elisac.elisa" &
+  seed_pid=$!
+  seed_peak_rss_kb=0
+  while kill -0 "$seed_pid" 2>/dev/null; do
+    # The child may exit between kill(0) and ps(1). With `set -euo pipefail`, the
+    # resulting non-zero ps status used to abort the seed shell before `wait` could
+    # collect the child's successful status, making a completed seed look failed.
+    seed_rss_kb="$(ps -o rss= -p "$seed_pid" 2>/dev/null | awk '{print $1}')" || seed_rss_kb=""
+    if [[ -n "$seed_rss_kb" && "$seed_rss_kb" -gt "$seed_peak_rss_kb" ]]; then
+      seed_peak_rss_kb="$seed_rss_kb"
+    fi
+    if [[ -n "$seed_rss_kb" && "$seed_rss_kb" -gt "$seed_max_rss_kb" ]]; then
+      echo "seed: memory guard stopped pid $seed_pid at ${seed_rss_kb} KB (limit ${seed_max_rss_kb} KB; peak ${seed_peak_rss_kb} KB)" >&2
+      terminate_guarded_pid "$seed_pid"
+      exit 125
+    fi
+    sleep "$seed_rss_poll_seconds"
+  done
+  wait "$seed_pid"
   # -stack_size: a deeply left-nested expression (adversarial input, see
   # malformed_input_fuzz.py / the depth guard in codegen_scope.elisa's expression_type)
   # recurses once per AST level through emit_expression. 0x20000000 (512MB) is the max
@@ -116,7 +286,14 @@ seed_build() {
     echo "seed requires clang compatible with LLVM_CONFIG=$LLVM_CONFIG (set ELISA_CLANG)" >&2
     exit 2
   }
-  "$ELISA_CLANG_TOOL" -o "$BIN" "$ROOT/build/elisac_stage1.o" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
+  # The compiler source includes the complete standard runtime.  Its optional
+  # native-callback and varargs entry points are deliberately unreachable from
+  # the compiler itself and are provided only when linking an executable/runtime
+  # consumer.  Dead-strip those sections here, matching the other self-host
+  # product links, instead of requiring unrelated host runtime symbols.
+  "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$seed_output" "$ROOT/build/elisac_stage1.o" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
+  mv -f "$seed_output" "$BIN"
+  ELISA_SEED_OUTPUT=""
   echo "seed: wrote $BIN" >&2
 }
 
@@ -155,6 +332,10 @@ wasm_ld=""
 link_flags=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --python)
+      PYTHON_BIN="${2:-}"; shift 2 ;;
+    --python-config)
+      PYTHON_CONFIG="${2:-}"; shift 2 ;;
     -o)
       out="${2:-}"; shift 2 ;;
     -emit)
@@ -175,6 +356,10 @@ while [[ $# -gt 0 ]]; do
         fmt)    emit_mode="fmt" ;;
         doc)    emit_mode="doc" ;;
         header) emit_mode="header" ;;
+        pymodule) emit_mode="pymodule" ;;
+        pymodule-c) emit_mode="pymodule-c" ;;
+        pymodule-pyi) emit_mode="pymodule-pyi" ;;
+        pymodule-so) emit_mode="pymodule-so" ;;
         test-runner) emit_mode="test-runner" ;;
         # stage0 refuses `-o` for these three and prints the listing on stdout; the
         # wrapper mirrors that rather than inventing a file-writing form.
@@ -196,7 +381,7 @@ while [[ $# -gt 0 ]]; do
         interpret) emit_mode="interpret" ;;
         deps)      emit_mode="deps" ;;
         deps-json) emit_mode="deps-json" ;;
-        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit wasm, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit test-runner, -emit tests, -emit benches, -emit fixtures, -emit test, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit ir, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
+        *) echo "only -emit obj, -emit llvm, -emit bc, -emit exe, -emit wasm, -emit tokens, -emit ast, -emit iface, -emit fmt, -emit doc, -emit header, -emit pymodule, -emit pymodule-c, -emit pymodule-pyi, -emit pymodule-so, -emit test-runner, -emit tests, -emit benches, -emit fixtures, -emit test, -emit c-bind-check, -emit c-bind-check-json, -emit packed, -emit unsafe, -emit c-archive, -emit lowered, -emit progress, -emit ir, -emit interpret, -emit deps and -emit deps-json are supported" >&2; exit 2 ;;
       esac
       shift 2 ;;
     -filter)
@@ -237,6 +422,19 @@ while [[ $# -gt 0 ]]; do
       src="$1"; shift ;;
   esac
 done
+resolve_python_tools
+if [[ "$emit_mode" == "pymodule-so" ]]; then
+  validate_python_toolchain
+fi
+# Recursive emit steps re-enter this same wrapper. Export the resolved absolute paths so
+# one-off CLI overrides remain in force for those child invocations instead of falling back to
+# the host's default python3/python3-config.
+if [[ -n "$PYTHON_HOST" ]]; then
+  export PYTHON_BIN="$PYTHON_HOST"
+fi
+if [[ -n "$PYTHON_CONFIG_HOST" ]]; then
+  export PYTHON_CONFIG="$PYTHON_CONFIG_HOST"
+fi
 
 # WASM is a packaging target, not just another object suffix: it needs a wasm-ld link,
 # imported linear memory, and the generated ESM/TypeScript facade. Keep that orchestration
@@ -277,12 +475,37 @@ case "$emit_mode" in
     # failing with a usage error — which read as exit 2 where stage0 answers 1.
     out="${out:-/dev/null}" ;;
 esac
-[[ -n "$out" && -n "$src" ]] || { echo "usage: $0 -o out.o source.elisa" >&2; exit 2; }
+[[ -n "$src" ]] || { echo "usage: $0 [-o out.o] source.elisa" >&2; exit 2; }
+if [[ "$emit_mode" != "pymodule-so" && "$emit_mode" != "pymodule-pyi" && -z "$out" ]]; then
+  echo "usage: $0 -o out.o source.elisa" >&2
+  exit 2
+fi
 [[ -f "$src" ]] || { echo "missing source: $src" >&2; exit 2; }
+[[ -x "$PYTHON_HOST" ]] || {
+  echo "stage1 requires python3 for include expansion (set PYTHON_BIN)" >&2
+  exit 2
+}
+# Keep all Python-facing emitters consistent: explicit manifest, generated C, stub, and
+# complete-extension paths may point into a directory that does not exist yet.
+case "$emit_mode" in
+  pymodule|pymodule-c)
+    [[ -z "$out" ]] || mkdir -p "$(dirname -- "$out")" ;;
+esac
 
 flat="$(mktemp)"
-trap 'rm -f "$flat" "$flat.map"' EXIT
+stage1_request="$(mktemp)"
+trap 'rm -f "$flat" "$flat.map" "$stage1_request"' EXIT
 flatten_includes "$src" "$flat.map" >"$flat"
+# `# smt` belongs to the original source header, but include flattening can place that
+# header far beyond the first few lines of the expanded buffer. Detect it here, before the
+# source enters the self-hosted compiler, and pass a one-bit fact through the environment.
+# This keeps stage1's in-compiler fallback bounded; an 11 MB self-host input must not turn
+# a header check into an O(source-size) loop in every generated compiler.
+if grep -Eq '^[[:space:]]*#[[:space:]]*smt([[:space:]]|$)' "$src"; then
+  export ELISA_STAGE1_SMT=1
+else
+  unset ELISA_STAGE1_SMT
+fi
 # Trusted-stdlib marker: stage0 skips the user-code-only passes (raw-concurrency surface
 # removal, region-tied return) for elisacore_std's OWN sources, deciding per FILE. stage1
 # cannot — flattening concatenates without line directives, so a declaration's origin is gone
@@ -308,6 +531,352 @@ if [[ "$emit_mode" == "exe" ]]; then
   link_out="$out"
   out="$(mktemp).o"
   emit_mode="obj"
+fi
+
+# `-emit pymodule-so` is the host-facing convenience path for the complete Python
+# extension pipeline.  The compiler still owns the language-facing pieces (the
+# machine-readable export manifest, the CPython C shim, and the native object); this
+# wrapper owns the platform toolchain invocation so a user only needs one command.
+if [[ "$emit_mode" == "pymodule-so" ]]; then
+  [[ -x "$ELISA_CLANG_TOOL" ]] || {
+    echo "-emit pymodule-so requires clang compatible with LLVM_CONFIG=$LLVM_CONFIG (set ELISA_CLANG)" >&2
+    exit 2
+  }
+  python_config="$PYTHON_CONFIG_HOST"
+  python_bin="$PYTHON_HOST"
+  [[ -x "$python_bin" ]] || {
+    echo "-emit pymodule-so requires python3 (set PYTHON_BIN)" >&2
+    exit 2
+  }
+  pymodule_runtime_auto=0
+  if [[ ! -f "$runtime_obj" && "${ELISA_PYMODULE_AUTO_RUNTIME:-1}" != "0" ]]; then
+    runtime_support="$ROOT/elisacore_std/native_runtime_support.elisa"
+    [[ -f "$runtime_support" ]] || {
+      echo "-emit pymodule-so cannot auto-build the runtime: missing $runtime_support; run scripts/build_runtime_object.sh or set ELISA_RUNTIME_OBJ" >&2
+      exit 2
+    }
+    mkdir -p "$(dirname -- "$runtime_obj")"
+    echo "pymodule-so: building runtime object at $runtime_obj" >&2
+    "$0" -emit obj -O0 -o "$runtime_obj" "$runtime_support"
+    pymodule_runtime_auto=1
+  fi
+  [[ -f "$runtime_obj" ]] || {
+    echo "-emit pymodule-so requires the runtime object at $runtime_obj (run scripts/build_runtime_object.sh or set ELISA_PYMODULE_AUTO_RUNTIME=0)" >&2
+    exit 2
+  }
+
+  pymodule_work="$(mktemp -d)"
+  trap 'rm -f "$flat" "$flat.map"; rm -rf "$pymodule_work"' EXIT
+  pymodule_manifest="$pymodule_work/manifest.json"
+  pymodule_c="$pymodule_work/module.c"
+  pymodule_obj="$pymodule_work/module.o"
+
+  # Emit the manifest first so the no-output-path form can derive its canonical
+  # module name before choosing an ABI-tagged filename.
+  "$0" -emit pymodule -o "$pymodule_manifest" "$src"
+  pymodule_module="$("$python_bin" - "$pymodule_manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+module = manifest.get("module")
+if not isinstance(module, str) or not module:
+    raise SystemExit("pymodule manifest has no module name")
+print(module)
+PY
+)"
+  if [[ -z "$out" ]]; then
+    out="$pymodule_module"
+  fi
+
+  # Python's import machinery recognizes ABI-tagged extension suffixes (and the plain .so
+  # fallback), not an arbitrary suffixless filename. Keep the convenient no-output-path and
+  # -o demo spellings importable by appending the selected interpreter's canonical suffix;
+  # explicit .so or ABI-tagged output names remain untouched.
+  pymodule_ext_suffix="$("$python_bin" - <<'PY'
+import sysconfig
+
+suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+print(suffix)
+PY
+)"
+  [[ -n "$pymodule_ext_suffix" ]] || {
+    echo "-emit pymodule-so could not determine Python's extension suffix" >&2
+    exit 2
+  }
+  pymodule_output_has_suffix=0
+  pymodule_extension_suffixes="$("$python_bin" - <<'PY'
+import _imp
+
+for suffix in _imp.extension_suffixes():
+    print(suffix)
+PY
+)"
+  while IFS= read -r pymodule_known_suffix; do
+    if [[ -n "$pymodule_known_suffix" && "$out" == *"$pymodule_known_suffix" ]]; then
+      pymodule_output_has_suffix=1
+      break
+    fi
+  done <<< "$pymodule_extension_suffixes"
+  if [[ "$pymodule_output_has_suffix" == 0 ]]; then
+    out="${out}${pymodule_ext_suffix}"
+  fi
+
+  # Validate the import-facing basename before compiling the generated shim/object. This turns
+  # a common typo (`-o wrong-name.so`) into an immediate diagnostic instead of doing all the
+  # expensive native work first. The suffix matcher also accepts ABI-tagged names from a
+  # different Python installation, which is useful when the build and import interpreters
+  # intentionally differ.
+  pymodule_output_base="$(basename -- "$out")"
+  pymodule_output_stem="$pymodule_output_base"
+  while IFS= read -r pymodule_known_suffix; do
+    if [[ -n "$pymodule_known_suffix" && "$pymodule_output_base" == *"$pymodule_known_suffix" ]]; then
+      # Remove the exact suffix. Python ABI tags contain punctuation, but no Bash glob
+      # metacharacters, so the variable expansion is an exact match.
+      pymodule_output_stem="${pymodule_output_base%$pymodule_known_suffix}"
+      break
+    fi
+  done <<< "$pymodule_extension_suffixes"
+  if [[ "$pymodule_output_stem" != "$pymodule_module" && "$pymodule_output_base" == "$pymodule_module"* ]]; then
+    pymodule_output_suffix="${pymodule_output_base#"$pymodule_module"}"
+    case "$pymodule_output_suffix" in
+      .abi3.so|.cpython-[0-9]*.so|.pypy*.so)
+        pymodule_output_stem="$pymodule_module"
+        ;;
+    esac
+  fi
+  if [[ "$pymodule_output_stem" != "$pymodule_module" ]]; then
+    echo "pymodule-so: output filename '$pymodule_output_base' must be named '$pymodule_module' plus a Python extension suffix to import as $pymodule_module" >&2
+    exit 2
+  fi
+  mkdir -p "$(dirname -- "$out")"
+
+  # Re-enter this wrapper for the generated C shim and native object. Keeping these calls
+  # through the public CLI preserves include flattening, stdlib detection, diagnostics,
+  # optimisation flags, and target-triple behaviour in one place.
+  "$0" -emit pymodule-c -o "$pymodule_c" "$src"
+  pymodule_compile_args=()
+  case "$opt_level" in
+    1) pymodule_compile_args+=("-O1") ;;
+    2) pymodule_compile_args+=("-O2") ;;
+    3) pymodule_compile_args+=("-O3") ;;
+  esac
+  [[ -n "$target_triple" ]] && pymodule_compile_args+=("-target-triple" "$target_triple")
+  [[ "$noalias" == 1 ]] && pymodule_compile_args+=("-fnoalias")
+  [[ "$bounds_check" == 1 ]] && pymodule_compile_args+=("-fbounds-check")
+  if [[ ${#pymodule_compile_args[@]} -gt 0 ]]; then
+    "$0" -emit obj -o "$pymodule_obj" "${pymodule_compile_args[@]}" "$src"
+  else
+    "$0" -emit obj -o "$pymodule_obj" "$src"
+  fi
+
+  if [[ -n "$python_config" ]]; then
+    [[ -x "$python_config" ]] || {
+      echo "-emit pymodule-so requires a usable python3-config (set PYTHON_CONFIG)" >&2
+      exit 2
+    }
+    read -r -a pymodule_include_flags <<< "$("$python_config" --includes)"
+  else
+    pymodule_include_dir="$("$python_bin" -c 'import sysconfig; print(sysconfig.get_config_var("INCLUDEPY") or sysconfig.get_path("include") or "")' 2>/dev/null || true)"
+    [[ -n "$pymodule_include_dir" && -d "$pymodule_include_dir" ]] || {
+      echo "-emit pymodule-so could not determine Python headers for $python_bin (set PYTHON_CONFIG)" >&2
+      exit 2
+    }
+    pymodule_include_flags=("-I$pymodule_include_dir")
+  fi
+  # The object backend can deliberately decline an unsupported target body. On Darwin the
+  # bundle linker permits unresolved symbols for Python's C API, which would otherwise let a
+  # missing Elisa wrapper survive until `import module` with an opaque dynamic-loader error.
+  # Audit every manifest row before linking so the user gets the exact exported symbol that
+  # needs a supported native ABI.
+  pymodule_nm_tool="${ELISA_LLVM_NM:-$LLVM_BIN_DIR/llvm-nm}"
+  if [[ -x "$pymodule_nm_tool" ]]; then
+    "$pymodule_nm_tool" -g "$pymodule_obj" >"$pymodule_work/symbols.txt"
+    if ! "$python_bin" - "$pymodule_manifest" "$pymodule_work/symbols.txt" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+with open(sys.argv[2], encoding="utf-8") as f:
+    symbols = {line.split()[-1].lstrip("_") for line in f if line.split()}
+module = manifest["module"]
+missing = [
+    f"elisa_pymodule_{module}_{entry['name']}"
+    for entry in manifest.get("functions", [])
+    if f"elisa_pymodule_{module}_{entry['name']}" not in symbols
+]
+missing += [
+    f"elisa_pymodule_{module}_{entry['name']}"
+    for entry in manifest.get("constants", [])
+    if f"elisa_pymodule_{module}_{entry['name']}" not in symbols
+]
+if missing:
+    for symbol in missing:
+        print(f"error: native pymodule symbol missing from object: {symbol}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+      exit 1
+    fi
+  fi
+  pymodule_link_inputs=("$pymodule_c" "$pymodule_obj" "$runtime_obj")
+  # The runtime intentionally leaves the host callback hooks unresolved. This is true for
+  # both an object auto-built above and the repository's normal prebuilt runtime object.
+  # Supply the extension-safe fallbacks whenever those imports are present; restricting this
+  # to the auto-build path produced a .so that linked successfully on Darwin but failed at
+  # import time with `_elisa_native_callback_call_i32_voidp` missing.
+  pymodule_needs_callback_fallback="$pymodule_runtime_auto"
+  pymodule_host_nm="${ELISA_LLVM_NM:-$LLVM_BIN_DIR/llvm-nm}"
+  if [[ "$pymodule_needs_callback_fallback" != 1 && -x "$pymodule_host_nm" ]] && \
+      "$pymodule_host_nm" -u "$runtime_obj" 2>/dev/null | grep -q 'elisa_native_callback_'; then
+    pymodule_needs_callback_fallback=1
+  fi
+  if [[ "$pymodule_needs_callback_fallback" == 1 ]]; then
+    # The complete runtime also carries optional native-callback and varargs hooks whose
+    # host implementations are supplied by an executable, not by a Python extension. Provide
+    # the documented fallback behavior (return the caller's fallback value/no-op) so importing a
+    # simple module does not fail on unrelated runtime entry points.
+    pymodule_callback_fallback="$pymodule_work/native_callback_fallback.c"
+    pymodule_callback_fallback_obj="$pymodule_work/native_callback_fallback.o"
+    cat >"$pymodule_callback_fallback" <<'C'
+#include <stddef.h>
+#include <stdint.h>
+
+void *elisa_native_callback_ptr(uint8_t *name) {
+    (void)name;
+    return NULL;
+}
+uint32_t elisa_native_callback_call_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) {
+    (void)name; (void)arg; return fallback;
+}
+int32_t elisa_native_callback_call_i32_voidp(uint8_t *name, void *arg, int32_t fallback) {
+    (void)name; (void)arg; return fallback;
+}
+uintptr_t elisa_native_callback_call_usize_voidp(uint8_t *name, void *arg, uintptr_t fallback) {
+    (void)name; (void)arg; return fallback;
+}
+intptr_t elisa_native_callback_call_isize_voidp(uint8_t *name, void *arg, intptr_t fallback) {
+    (void)name; (void)arg; return fallback;
+}
+uint32_t elisa_native_callback_spawn_join_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) {
+    (void)name; (void)arg; return fallback;
+}
+void *elisa_native_callback_context_new_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) {
+    (void)name; (void)arg; (void)fallback; return NULL;
+}
+void *elisa_native_callback_context_entry_u32_voidp(void) {
+    return NULL;
+}
+int32_t elisa_native_callback_context_start_u32_voidp(void *ctx, uintptr_t *thread) {
+    (void)ctx; (void)thread; return -1;
+}
+uint32_t elisa_native_callback_context_join_u32_voidp(uintptr_t handle, void *ctx, uint32_t fallback) {
+    (void)handle; (void)ctx; return fallback;
+}
+uint32_t elisa_native_callback_context_spawn_join_u32_voidp(void *ctx, uint32_t fallback) {
+    (void)ctx; return fallback;
+}
+uint32_t elisa_native_callback_context_result_u32(void *ctx, uint32_t fallback) {
+    (void)ctx; return fallback;
+}
+void elisa_native_callback_context_free(void *ctx) {
+    (void)ctx;
+}
+void va_copy(void *destination, void *source) {
+    (void)destination; (void)source;
+}
+void va_end(void *argument) {
+    (void)argument;
+}
+C
+    "$ELISA_CLANG_TOOL" -c -fPIC -fno-builtin -O2 -o "$pymodule_callback_fallback_obj" "$pymodule_callback_fallback"
+    pymodule_link_inputs+=("$pymodule_callback_fallback_obj")
+  fi
+  pymodule_link_command=()
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    pymodule_link_command=("$ELISA_CLANG_TOOL" -bundle -undefined dynamic_lookup -Wl,-dead_strip)
+  elif [[ "$(uname -s)" == "Linux" ]]; then
+    pymodule_link_command=("$ELISA_CLANG_TOOL" -shared -fPIC -Wl,--gc-sections)
+  else
+    echo "-emit pymodule-so is unsupported on $(uname -s)" >&2
+    exit 2
+  fi
+  pymodule_link_command+=("${pymodule_include_flags[@]}" -o "$out" "${pymodule_link_inputs[@]}")
+  "${pymodule_link_command[@]}"
+  # A native extension is most useful when IDEs can discover its typed surface immediately.
+  # Keep the sidecar beside the extension and name it after the manifest module, rather than
+  # after the ABI-tagged filename (`demo.cpython-314-darwin.so` -> `demo.pyi`).
+  pymodule_stub="$(dirname -- "$out")/$pymodule_module.pyi"
+  "$python_bin" "$ROOT/scripts/pymodule_pyi.py" "$pymodule_manifest" "$pymodule_stub"
+  echo "pymodule-so: wrote $out and $pymodule_stub (import as $pymodule_module)" >&2
+  exit 0
+fi
+
+# Run the self-hosted compiler as a direct child so its RSS can be observed. The previous
+# stdin pipeline made it possible for a large compile to escape every wrapper-level guard:
+# the shell only waited on the pipeline while the compiler itself grew into swap. The limit
+# is deliberately conservative for ordinary development; a dedicated build host can raise
+# ELISA_STAGE1_MAX_RSS_KB explicitly.
+run_stage1_driver_guarded() {
+  local driver_pid driver_rss driver_peak=0 driver_rc=0
+  local driver_max_rss_kb="${ELISA_STAGE1_MAX_RSS_KB:-4194304}"
+  local driver_rss_poll_seconds="${ELISA_STAGE1_RSS_POLL_SECONDS:-0.05}"
+  env "${driver_env[@]+${driver_env[@]}}" "$BIN" <"$stage1_request" &
+  driver_pid=$!
+  while kill -0 "$driver_pid" 2>/dev/null; do
+    # The compiler can finish between kill(0) and ps(1). Do not let that ordinary
+    # observation race trip `set -euo pipefail`: the wait below owns the child's
+    # authoritative exit status.
+    driver_rss="$(ps -o rss= -p "$driver_pid" 2>/dev/null | awk '{print $1}')" || driver_rss=""
+    if [[ -n "$driver_rss" && "$driver_rss" -gt "$driver_peak" ]]; then
+      driver_peak="$driver_rss"
+    fi
+    if [[ -n "$driver_rss" && "$driver_rss" -gt "$driver_max_rss_kb" ]]; then
+      echo "stage1: memory guard stopped pid $driver_pid at ${driver_rss} KB (limit ${driver_max_rss_kb} KB; peak ${driver_peak} KB)" >&2
+      terminate_guarded_pid "$driver_pid"
+      return 125
+    fi
+    sleep "$driver_rss_poll_seconds"
+  done
+  wait "$driver_pid" || driver_rc=$?
+  return "$driver_rc"
+}
+
+# `-emit pymodule-pyi` renders a type-checker stub from the compiler-owned JSON contract. It
+# intentionally has no native-toolchain dependency: a manifest is enough to describe the Python
+# surface, so editor/type-checking workflows remain useful even when clang or the runtime object
+# are not installed on the host.
+if [[ "$emit_mode" == "pymodule-pyi" ]]; then
+  python_bin="$PYTHON_HOST"
+  [[ -x "$python_bin" ]] || {
+    echo "-emit pymodule-pyi requires python3 (set PYTHON_BIN)" >&2
+    exit 2
+  }
+  pymodule_work="$(mktemp -d)"
+  trap 'rm -f "$flat" "$flat.map"; rm -rf "$pymodule_work"' EXIT
+  pymodule_manifest="$pymodule_work/manifest.json"
+  "$0" -emit pymodule -o "$pymodule_manifest" "$src"
+  pymodule_module="$("$python_bin" - "$pymodule_manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+module = manifest.get("module")
+if not isinstance(module, str) or not module:
+    raise SystemExit("pymodule manifest has no module name")
+print(module)
+PY
+)"
+  if [[ -z "$out" ]]; then
+    out="$pymodule_module.pyi"
+  fi
+  mkdir -p "$(dirname -- "$out")"
+  "$python_bin" "$ROOT/scripts/pymodule_pyi.py" "$pymodule_manifest" "$out"
+  echo "pymodule-pyi: wrote $out" >&2
+  exit 0
 fi
 
 # Optimisation level and emit mode reach the driver via env (the stdin protocol
@@ -348,7 +917,7 @@ if [[ "$emit_mode" == "tests" || "$emit_mode" == "benches" || "$emit_mode" == "f
 fi
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
-if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" || "$emit_mode" == "doc" || "$emit_mode" == "header" || "$emit_mode" == "test-runner" || "$emit_mode" == "c-bind-check" || "$emit_mode" == "c-bind-check-json" || "$emit_mode" == "packed" || "$emit_mode" == "unsafe" || "$emit_mode" == "lowered" || "$emit_mode" == "progress" || "$emit_mode" == "deps" || "$emit_mode" == "deps-json" || "$emit_mode" == "ir" ]]; then
+if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" || "$emit_mode" == "doc" || "$emit_mode" == "header" || "$emit_mode" == "pymodule" || "$emit_mode" == "pymodule-c" || "$emit_mode" == "test-runner" || "$emit_mode" == "c-bind-check" || "$emit_mode" == "c-bind-check-json" || "$emit_mode" == "packed" || "$emit_mode" == "unsafe" || "$emit_mode" == "lowered" || "$emit_mode" == "progress" || "$emit_mode" == "deps" || "$emit_mode" == "deps-json" || "$emit_mode" == "ir" ]]; then
   # `-emit fmt` additionally needs the OFFSET MAP (see flatten_includes): stage0 names
   # its synthesized auto-regions `__auto_<pos.Offset>` with offsets measured over its
   # directive-bearing expansion. ELISA_STAGE1_SRC stays as given — the tokens report
@@ -360,16 +929,18 @@ if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "ifac
   fi
   exec > "$out"
 fi
-# stdin protocol: output path line, then source
+# stdin protocol: output path line, then source. Materialize the request so the compiler can
+# be monitored directly; this is bounded by the already-created flattened source, not an
+# unbounded shell pipe buffer.
+{ printf '%s\n' "$out"; cat "$flat"; } >"$stage1_request"
 if [[ "$noalias" == 1 && "$bounds_check" == 1 ]]; then
-  { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" ELISACORE_NOALIAS_MUTABLE_REFS=1 ELISACORE_FORCE_BOUNDS_CHECK=1 "$BIN"
+  driver_env+=("ELISACORE_NOALIAS_MUTABLE_REFS=1" "ELISACORE_FORCE_BOUNDS_CHECK=1")
 elif [[ "$noalias" == 1 ]]; then
-  { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" ELISACORE_NOALIAS_MUTABLE_REFS=1 "$BIN"
+  driver_env+=("ELISACORE_NOALIAS_MUTABLE_REFS=1")
 elif [[ "$bounds_check" == 1 ]]; then
-  { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" ELISACORE_FORCE_BOUNDS_CHECK=1 "$BIN"
-else
-  { printf '%s\n' "$out"; cat "$flat"; } | env "${driver_env[@]+"${driver_env[@]}"}" "$BIN"
+  driver_env+=("ELISACORE_FORCE_BOUNDS_CHECK=1")
 fi
+run_stage1_driver_guarded
 compile_rc=$?
 if [[ -n "$link_out" ]]; then
   [[ "$compile_rc" == 0 && -f "$out" ]] || { rm -f "$out"; exit "${compile_rc:-1}"; }
