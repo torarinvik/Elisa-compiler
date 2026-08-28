@@ -761,6 +761,11 @@ diff_case region_count_via_ref 'def size(xs: darray[i64]&) -> i64:\n    return x
 diff_case region_index_via_ref 'def first(xs: darray[i64]&) -> i64:\n    return xs[0] can Unsafe.UncheckedIndex\n\ndef main() -> i64:\n    ys: mutable darray[i64] = []\n    ys.push(42)\n    return first(ys)\n'
 # Two levels: main's arena is threaded through outer into inner.
 diff_case region_two_levels 'def inner(out: mutable darray[i64]&) -> void:\n    out.push(42)\n\ndef outer(out: mutable darray[i64]&) -> void:\n    inner(out)\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    outer(xs)\n    return xs[0]\n'
+# A threaded callee may construct an aggregate temporary before adopting it into the
+# caller-owned container. Both the outer header AND the nested row backing must use the
+# caller region; a callee scratch arena leaves `rows[0]` valid-looking but dangling.
+# 500 elements force several reallocations before the aggregate escapes.
+diff_case region_ref_adopts_nested_temporary 'def build_row[@r](out: mutable darray[darray[i64]]& @r) -> void:\n    row: mutable darray[i64] @r = []\n    for i in 0..<500:\n        row.push(i)\n    out.push(row)\n\ndef main() -> i64:\n    rows: mutable darray[darray[i64]] = []\n    build_row(rows)\n    row: darray[i64] = rows[0] can Unsafe.UncheckedIndex\n    return (row[499] can Unsafe.UncheckedIndex) - 457\n'
 # REGION-RETURN INFERENCE. A container RETURN type is the second trigger for the implicit
 # trailing arena param: stage0 emits `def build() -> darray[i64]` as
 # `define %DynArray__i64 @build(ptr %0)` and allocates the returned darray's backing from
