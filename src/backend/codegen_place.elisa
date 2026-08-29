@@ -43,7 +43,7 @@ extend Backend:
                     opt_payload: ValueType = optional_payload_of(declared, structs)
                     if opt_payload.kind == TypeKind.Ref:
                         opt_addr_target: ValueType = ref_target_of(opt_payload, structs)
-                        null return if opt_addr_target.kind != TypeKind.Struct
+                        null return if opt_addr_target.kind == TypeKind.Unmodeled
                         opt_llvm: LLVMTypeRef = llvm_type_of(declared, structs, ctx)
                         opt_loaded: LLVMValueRef = LLVMBuildLoad2(builder, opt_llvm, slot, "opt.heap.load")
                         return optional_payload_value_of(opt_loaded, declared, structs, ctx, builder)
@@ -101,6 +101,40 @@ extend Backend:
                         return struct_type_of_name(chain_name, local_scope, structs)
                     _:
                         pass
+                # `elisa_nonnull(pointer).field` is a transparent pointer wrapper emitted by
+                # the C translator. Its result is the same pointee reference as the argument;
+                # retain that type for the chain walker instead of requiring a bare Ident.
+                match object:
+                    Expr.Call(chain_wrapper, chain_wrapper_args, _, _):
+                        if chain_wrapper is Expr.Ident(chain_wrapper_name, _):
+                            if chain_wrapper_name == "elisa_nonnull" and chain_wrapper_args.count == 1:
+                                wrapped_chain_type: ValueType = struct_chain_type(chain_wrapper_args[0], local_scope, structs)
+                                if wrapped_chain_type.kind == TypeKind.Optional:
+                                    wrapped_payload_fallback: ValueType = optional_payload_of(wrapped_chain_type, structs)
+                                    return wrapped_payload_fallback if wrapped_payload_fallback.kind == TypeKind.Ref
+                                return wrapped_chain_type
+                        pass
+                    _:
+                        pass
+                # Address-of is transparent to the chain type resolver: `(&array)[i]` is a
+                # reference to the array's element container, not an unknown expression.
+                match object:
+                    Expr.Unary(chain_unary_operator, chain_unary_operand, _):
+                        if chain_unary_operator == TokenKind.Ampersand:
+                            unary_place_type: ValueType = struct_chain_type(chain_unary_operand, local_scope, structs)
+                            if unary_place_type.kind != TypeKind.Unmodeled:
+                                return intern_ref_type(unary_place_type, structs)
+                    _:
+                        pass
+                # A cast used directly as a chain receiver (`(p).cast[T&].field`) is also a
+                # type-preserving place. The parser stores the type application as Index(Field).
+                match object:
+                    Expr.Index(chain_cast_base, chain_cast_type, _):
+                        if chain_cast_base is Expr.Field(chain_cast_object, chain_cast_name, _):
+                            if chain_cast_name == "cast":
+                                return annotation_value_type(chain_cast_type, structs)
+                    _:
+                        pass
                 match object:
                     Expr.Field(chain_inner, chain_field, chain_field_line):
                         inner_type: mutable ValueType = struct_chain_type(chain_inner, local_scope, structs)
@@ -156,6 +190,12 @@ extend Backend:
                             # `p[i]` where `p: T&` is a ref to a NUMERIC scalar (Slice's `p[i] <- v` assign
                             # target): the element IS that scalar, so the write fallback can type its value.
                             ref_element return if ref_element.kind == TypeKind.Signed or ref_element.kind == TypeKind.Unsigned or ref_element.kind == TypeKind.Float
+                            # A pointer-to-pointer (`T&&`) indexes to another pointer. This is
+                            # the nested shape emitted for C `char **` buffers such as
+                            # `nonnull(output)[0][i]`; retaining the Ref is what lets the outer
+                            # index perform its second GEP instead of treating the first result
+                            # as an opaque scalar.
+                            ref_element return if ref_element.kind == TypeKind.Ref or ref_element.kind == TypeKind.CStr
                             # An OPTIONAL element (`darray[heap Region&?]`, which stores_core writes
                             # through `regions.items[i] <- r`). This was reverted once, for a good
                             # reason that no longer holds: stage1 then gave an optional ref a
@@ -186,7 +226,7 @@ extend Backend:
                             opt_ref_payload: ValueType = optional_payload_of(container_type, structs)
                             if opt_ref_payload.kind == TypeKind.Ref:
                                 opt_ref_element: ValueType = ref_target_of(opt_ref_payload, structs)
-                                opt_ref_element return if opt_ref_element.kind == TypeKind.Struct or opt_ref_element.kind == TypeKind.Signed or opt_ref_element.kind == TypeKind.Unsigned or opt_ref_element.kind == TypeKind.Float
+                                opt_ref_element return if opt_ref_element.kind == TypeKind.Struct or opt_ref_element.kind == TypeKind.Signed or opt_ref_element.kind == TypeKind.Unsigned or opt_ref_element.kind == TypeKind.Float or opt_ref_element.kind == TypeKind.Ref or opt_ref_element.kind == TypeKind.CStr or opt_ref_element.kind == TypeKind.Optional
                     _:
                         pass
                 return unmodeled_type()
@@ -244,6 +284,35 @@ extend Backend:
                     pass
             match object:
                 Expr.Field(chain_inner, chain_field, chain_field_line):
+                    # A pointer-producing call is a valid field receiver too: translated C can
+                    # spell `elisa_nonnull(make_item()).value`. The older structural walker only
+                    # knows about named locals and fields, so give a reference-valued rvalue its
+                    # ordinary expression type and form the GEP directly before falling through
+                    # to the slot-aware chain logic below.
+                    rvalue_field_receiver_type: mutable ValueType = expression_type(chain_inner, local_scope, fns, structs, generics)
+                    rvalue_field_struct_type: mutable ValueType = unmodeled_type()
+                    rvalue_field_is_optional: mutable bool = false
+                    if rvalue_field_receiver_type.kind == TypeKind.Ref:
+                        rvalue_field_struct_type <- ref_target_of(rvalue_field_receiver_type, structs)
+                    elif rvalue_field_receiver_type.kind == TypeKind.Optional:
+                        rvalue_field_payload: ValueType = optional_payload_of(rvalue_field_receiver_type, structs)
+                        if rvalue_field_payload.kind == TypeKind.Ref:
+                            rvalue_field_struct_type <- ref_target_of(rvalue_field_payload, structs)
+                            rvalue_field_is_optional <- true
+                    if rvalue_field_struct_type.kind == TypeKind.Struct:
+                        rvalue_field_slot: usize = rvalue_field_struct_type.bits.usize()
+                        rvalue_field_position: i64 = field_index_of(structs, rvalue_field_slot, chain_field)
+                        if rvalue_field_position >= 0:
+                            rvalue_field_base: mutable LLVMValueRef = zeroed
+                            if rvalue_field_is_optional:
+                                if emit_expression(chain_inner, rvalue_field_receiver_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_field_optional_value:
+                                    rvalue_field_base <- optional_payload_value_of(rvalue_field_optional_value, rvalue_field_receiver_type, structs, ctx, builder)
+                            else:
+                                if emit_expression(chain_inner, rvalue_field_receiver_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_field_pointer:
+                                    rvalue_field_base <- rvalue_field_pointer
+                            if rvalue_field_base != zeroed:
+                                emit_pointer_deref_guard(rvalue_field_base, runtime, m, ctx, builder)
+                                return LLVMBuildStructGEP2(builder, llvm_type_of(rvalue_field_struct_type, structs, ctx), rvalue_field_base, rvalue_field_position.u32(), "rvalue.field.ptr")
                     # `rows[r].field` on a `layout(soa)` aggregate -- the element address inside
                     # that field's COLUMN. Resolved here, in the one lvalue chain resolver, so the
                     # READ and the WRITE (`rows[r].field <- v`) both get it from one place.
@@ -357,7 +426,31 @@ extend Backend:
                                 rvalue_indices: mutable darray[LLVMValueRef] = [rvalue_index]
                                 rvalue_indices_pointer: void& = (&rvalue_indices[0]).cast[void&] can Unsafe.PointerCast
                                 return LLVMBuildGEP2(builder, llvm_type_of(rvalue_element_type, structs, ctx), rvalue_base, rvalue_indices_pointer, 1, "rvalue.index.ptr")
-                        return null
+                        pass
+                    # `elisa_nonnull(p)[i]` is a common C-pointer spelling. The generic wrapper
+                    # is semantically transparent, but its generic-call lowering may decline in
+                    # an lvalue address probe before the call path has inferred the type. Peel
+                    # the wrapper for the address operation and use the original pointer value;
+                    # this preserves the C address calculation without inventing a temporary.
+                    match indexed_container:
+                        Expr.Call(nonnull_index_callee, nonnull_index_args, _, _):
+                            if nonnull_index_callee is Expr.Ident(nonnull_index_name, _):
+                                if nonnull_index_name == "elisa_nonnull" and nonnull_index_args.count == 1:
+                                    nonnull_source_type: ValueType = expression_type(nonnull_index_args[0], local_scope, fns, structs, generics)
+                                    nonnull_element_type: mutable ValueType = unmodeled_type()
+                                    if nonnull_source_type.kind == TypeKind.Ref:
+                                        nonnull_element_type <- ref_target_of(nonnull_source_type, structs)
+                                    elif nonnull_source_type.kind == TypeKind.Optional:
+                                        nonnull_payload_type: ValueType = optional_payload_of(nonnull_source_type, structs)
+                                        nonnull_element_type <- ref_target_of(nonnull_payload_type, structs) if nonnull_payload_type.kind == TypeKind.Ref
+                                    if nonnull_element_type.kind != TypeKind.Unmodeled:
+                                        if emit_expression(nonnull_index_args[0], nonnull_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is nonnull_base:
+                                            if emit_expression(index_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is nonnull_index:
+                                                nonnull_indices: mutable darray[LLVMValueRef] = [nonnull_index]
+                                                nonnull_indices_pointer: void& = (&nonnull_indices[0]).cast[void&] can Unsafe.PointerCast
+                                                return LLVMBuildGEP2(builder, llvm_type_of(nonnull_element_type, structs, ctx), nonnull_base, nonnull_indices_pointer, 1, "nonnull.index.ptr")
+                        _:
+                            pass
                     # `(p.cast[T&])[i]` — indexing DIRECTLY into a cast, with no local in between.
                     # `.cast[T]` parses as Index(Field(x, "cast"), T), so the base here is an
                     # Index, and every branch below wants an Ident (or an array literal). The
@@ -429,6 +522,25 @@ extend Backend:
                                     if ref_element.kind == TypeKind.Array:
                                         ref_array_base: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), container_slot, "chain.arr.ref.base")
                                         return emit_index_address(ref_array_base, ref_element, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                # C pointer declarations are represented as nullable references
+                                # (`T&?`). After the translator's `elisa_nonnull`/flow guard, the
+                                # nullable value is still the pointer base; load its niche
+                                # representation and index by the pointee stride. Treat this the
+                                # same as the ordinary `T&` branch above so direct `p[i]` stores
+                                # do not require an artificial nonnull wrapper.
+                                if container_type.kind == TypeKind.Optional:
+                                    optional_container_payload: ValueType = optional_payload_of(container_type, structs)
+                                    if optional_container_payload.kind == TypeKind.Ref:
+                                        optional_ref_element: ValueType = ref_target_of(optional_container_payload, structs)
+                                        if optional_ref_element.kind != TypeKind.Unmodeled:
+                                            optional_container_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(container_type, structs, ctx), container_slot, "optional.ref.base")
+                                            optional_base_pointer: LLVMValueRef = optional_payload_value_of(optional_container_value, container_type, structs, ctx, builder)
+                                            if emit_expression(index_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is optional_index_value:
+                                                optional_element_llvm: LLVMTypeRef = llvm_type_of(optional_ref_element, structs, ctx)
+                                                optional_indices: mutable darray[LLVMValueRef] = [optional_index_value]
+                                                optional_indices_pointer: void& = (&optional_indices[0]).cast[void&] can Unsafe.PointerCast
+                                                return LLVMBuildGEP2(builder, optional_element_llvm, optional_base_pointer, optional_indices_pointer, 1, "optional.ref.index.ptr")
+                                            return null
                             # `xs[i]` where `xs` is a global const ARRAY — the base "slot" is the
                             # `@xs` global itself, GEP'd exactly like a local fixed array.
                             const_array_index: i64 = const_index_of(structs, container_name)
@@ -474,6 +586,15 @@ extend Backend:
                     return null
                 _:
                     pass
+            # A reference-valued call/cast is an addressable C pointer rvalue. It has no local
+            # slot for the older chain walker, but its emitted value already IS the address.
+            # This covers `elisa_nonnull(p).field`, `make_item().field`, and the same shapes
+            # nested under an index without inventing a temporary copy.
+            rvalue_chain_type: ValueType = expression_type(object, local_scope, fns, structs, generics)
+            if rvalue_chain_type.kind == TypeKind.Ref:
+                if emit_expression(object, rvalue_chain_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_chain_pointer:
+                    emit_pointer_deref_guard(rvalue_chain_pointer, runtime, m, ctx, builder)
+                    return rvalue_chain_pointer
             return null
 
 
