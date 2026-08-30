@@ -41,6 +41,42 @@ BASELINE_GEN3_RC="${BASELINE_GEN3_RC:-0}"
 
 fail() { echo "self_host_gen3_smoke FAIL: $1" >&2; exit 1; }
 
+terminate_guarded_pid() {
+    local pid="$1" ticks=0
+    kill -TERM "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && [[ "$ticks" -lt 20 ]]; do
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+# Stage B/C feed the 11 MB flattened compiler through stdin. A shell pipeline cannot observe
+# the compiler child reliably, so keep these two self-hosting legs under the same RSS ceiling as
+# scripts/elisac_stage1.sh. This is an operational safety boundary, not a semantic fallback:
+# crossing it fails the smoke and leaves the compiler bug visible instead of freezing the host.
+run_guarded_request() {
+    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-4194304}"
+    "$binary" <"$request" >"$output" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        rss="$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print $1}')" || rss=""
+        if [[ -n "$rss" && "$rss" -gt "$peak" ]]; then
+            peak="$rss"
+        fi
+        if [[ -n "$rss" && "$rss" -gt "$max_rss" ]]; then
+            echo "self_host_gen3_smoke: memory guard stopped pid $pid at ${rss} KB (limit ${max_rss} KB; peak ${peak} KB)" >&2
+            terminate_guarded_pid "$pid"
+            return 125
+        fi
+        sleep "${ELISA_STAGE1_RSS_POLL_SECONDS:-0.05}"
+    done
+    wait "$pid"
+}
+
 [ -x "$BIN" ] || { echo "self_host_gen3_smoke SKIP: no seed ($BIN); run scripts/elisac_stage1.sh --seed"; exit 0; }
 # The seed is a CACHED artifact and nothing rebuilds it automatically — `self_host_gen2.sh`
 # happily builds gen2 from a stale gen1, which silently tests old code (this bit during
@@ -106,8 +142,9 @@ def flatten(p, out):
 out = []; flatten(path, out); sys.stdout.write("".join(out))
 PY
 
+{ printf '%s\n' "$WORK/gen3.o"; cat "$WORK/flat.elisa"; } >"$WORK/gen3.request"
 rc=0
-{ ( { printf '%s\n' "$WORK/gen3.o"; cat "$WORK/flat.elisa"; } | "$GEN2" >"$WORK/gen3.log" 2>&1 ) || rc=$?; } 2>/dev/null
+run_guarded_request "$GEN2" "$WORK/gen3.request" "$WORK/gen3.log" || rc=$?
 
 [ "$rc" -eq "$BASELINE_GEN3_RC" ] \
   || fail "stage B exit $rc, baseline $BASELINE_GEN3_RC — bootstrap closure BROKE. Re-diagnose (lldb bt on the gen3 input); do not just re-baseline."
@@ -131,8 +168,9 @@ clang -Wl,-dead_strip -o "$WORK/elisac-stage1-gen3" "$WORK/gen3.o" "$RUNTIME_OBJ
       -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" >"$WORK/gen3.link.log" 2>&1 \
   || fail "gen3 object did not link (see $WORK/gen3.link.log)"
 
+{ printf '%s\n' "$WORK/gen4.o"; cat "$WORK/flat.elisa"; } >"$WORK/gen4.request"
 rc4=0
-{ ( { printf '%s\n' "$WORK/gen4.o"; cat "$WORK/flat.elisa"; } | "$WORK/elisac-stage1-gen3" >"$WORK/gen4.log" 2>&1 ) || rc4=$?; } 2>/dev/null
+run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/gen4.request" "$WORK/gen4.log" || rc4=$?
 [ "$rc4" -eq 0 ] || fail "gen3 could not compile the compiler (exit $rc4) — gen2 and gen3 disagree"
 cmp -s "$WORK/gen3.o" "$WORK/gen4.o" \
   || fail "gen3.o != gen4.o — the compiler does not reproduce itself; gen2 and gen3 emit differently"

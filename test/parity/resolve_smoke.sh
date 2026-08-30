@@ -198,7 +198,6 @@ int main(int argc, char **argv) {
     size_t n = 0; while (src[n]) n++;
     uint64_t unresolved = 0;
     resolve_smoke_export((uint8_t *)src, n, &unresolved);
-
     /* Diagnostics-layer position check: the checker must report the UndefinedName
        diagnostic at the right source line. `missing` is undefined on line 2. */
     const char *dsrc = "def f(a: int) -> int:\n    return missing\n";
