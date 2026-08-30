@@ -269,12 +269,29 @@ extend Backend:
                                                 declare_local(local_scope, sms_as_name, sms_whole_slot, sms_scrut_type)
                                             return emit_statements_scoped(stmt_match_arms[0].body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                                         return EmitStatus.Declined
+                    # `catch fallible_call(...):` has an optional SUCCESS payload in the source
+                    # type, but its statement-level Match is governed by the ERROR ABI, not by
+                    # optional-tag matching. Detect that shape before the optional fast paths:
+                    # otherwise the optional emitter tries to emit the fallible call as an
+                    # ordinary optional expression, declines, and the real catch emitter below
+                    # is never reached. This was exposed by generic dict helpers because their
+                    # `T&? error[RuntimeError]` success type is exactly a niche optional.
+                    stmt_match_is_error_call: mutable bool = false
+                    match stmt_match_scrutinee:
+                        Expr.Call(stmt_error_callee, stmt_error_args, stmt_error_arg_names, stmt_error_line):
+                            match stmt_error_callee:
+                                Expr.Ident(stmt_error_name, stmt_error_name_line):
+                                    stmt_match_is_error_call <- error_callee_is(fns, generics, stmt_error_name)
+                                _:
+                                    pass
+                        _:
+                            pass
                     # `match OPT: null: … binding: …` — a match whose scrutinee is an OPTIONAL value.
                     # Two arms: a `null` (or `_`) arm and a BINDING arm that binds the payload. Lowered
                     # like `if OPT is v:` but as a match: test the tag (field 0), branch to the binding
                     # arm (bind v = payload) or the null arm. IndexMap's put/find use exactly this.
                     match_opt_type: ValueType = expression_type(stmt_match_scrutinee, local_scope, fns, structs, generics)
-                    if match_opt_type.kind == TypeKind.Optional and stmt_match_arms.count == 2:
+                    if match_opt_type.kind == TypeKind.Optional and stmt_match_arms.count == 2 and not stmt_match_is_error_call:
                         mo_payload_type: ValueType = optional_payload_of(match_opt_type, structs)
                         mo_null_arm_index: mutable i64 = -1
                         mo_bind_arm_index: mutable i64 = -1
@@ -324,6 +341,54 @@ extend Backend:
                                             pass
                                 _:
                                     pass
+                    # Optional payload matches may omit an explicit `null` arm. This is common for
+                    # AST inspection: `Return(value: Expr?)` is matched as
+                    # `Expr.Call(...): ... / _ : ...`, where both arms describe the PRESENT Expr
+                    # payload and absence simply falls through. Unwrap that outer carrier, then
+                    # re-enter the ordinary matcher over a synthetic payload local. Stage0 does
+                    # this optional boundary before its packed-node matcher; treating the Optional
+                    # as the packed enum itself made every nested AST inspection silently decline.
+                    if match_opt_type.kind == TypeKind.Optional and stmt_match_arms.count >= 1 and not stmt_match_is_error_call:
+                        if emit_expression(stmt_match_scrutinee, match_opt_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is om_value:
+                            om_present: LLVMValueRef = optional_tag_of(om_value, match_opt_type, structs, ctx, builder)
+                            om_payload_type: ValueType = optional_payload_of(match_opt_type, structs)
+                            EmitStatus.Declined return if om_payload_type.kind == TypeKind.Unmodeled
+                            om_payload: LLVMValueRef = optional_payload_value_of(om_value, match_opt_type, structs, ctx, builder)
+                            om_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            om_present_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, om_function, "match.optional.present")
+                            om_absent_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, om_function, "match.optional.absent")
+                            om_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, om_function, "match.optional.done")
+                            _ = LLVMBuildCondBr(builder, om_present, om_present_block, om_absent_block)
+                            om_null_index: mutable i64 = -1
+                            for om_index in 0..<stmt_match_arms.count |om_null_index, stmt_match_arms|:
+                                if stmt_match_arms[om_index].pattern is Pattern.Literal(om_literal):
+                                    om_null_index <- om_index.i64() if om_literal == "null" and om_null_index < 0
+                            om_payload_arms: mutable darray[MatchArm] = []
+                            for om_index in 0..<stmt_match_arms.count |om_payload_arms, om_null_index, stmt_match_arms|:
+                                om_payload_arms.push(stmt_match_arms[om_index]) if om_index.i64() != om_null_index
+                            LLVMPositionBuilderAtEnd(builder, om_present_block)
+                            if om_payload_arms.count > 0:
+                                om_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(om_payload_type, structs, ctx), "match.optional.payload")
+                                _ = LLVMBuildStore(builder, om_payload, om_slot)
+                                om_mark: usize = scope_mark(local_scope)
+                                declare_local(local_scope, "__match_optional", om_slot, om_payload_type)
+                                om_status: EmitStatus = emit_statement((Stmt.Match((Expr.Ident("__match_optional", stmt_match_line)), om_payload_arms, stmt_match_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                scope_restore(local_scope, om_mark)
+                                EmitStatus.Declined return if om_status == EmitStatus.Declined
+                                branch_if_open(om_status, builder, om_done_block)
+                            else:
+                                _ = LLVMBuildBr(builder, om_done_block)
+                            LLVMPositionBuilderAtEnd(builder, om_absent_block)
+                            if om_null_index >= 0:
+                                om_absent_status: EmitStatus = emit_statements_scoped(stmt_match_arms[om_null_index.usize()].body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                EmitStatus.Declined return if om_absent_status == EmitStatus.Declined
+                                branch_if_open(om_absent_status, builder, om_done_block)
+                            else:
+                                _ = LLVMBuildBr(builder, om_done_block)
+                            LLVMPositionBuilderAtEnd(builder, om_done_block)
+                            return EmitStatus.Open
+                        return EmitStatus.Declined
+
                     # The GENERAL optional match: a literal `null` arm plus any number of arms that
                     # match the PAYLOAD (`null:` / `Expr.Int(value):` / `_:`). The two-arm
                     # null/binding split above stays as it is -- it is the shape the std's index
@@ -333,7 +398,7 @@ extend Backend:
                     # synthetic local and the REMAINING arms are re-entered as an ordinary match on
                     # it. Every payload pattern the match emitter already models therefore works
                     # here unchanged; the same trick the `return match` route uses.
-                    if match_opt_type.kind == TypeKind.Optional and stmt_match_arms.count >= 2:
+                    if match_opt_type.kind == TypeKind.Optional and stmt_match_arms.count >= 2 and not stmt_match_is_error_call:
                         gmo_null_index: mutable i64 = -1
                         for gmo_i in 0..<stmt_match_arms.count |gmo_null_index, stmt_match_arms|:
                             if stmt_match_arms[gmo_i].pattern is Pattern.Literal(gmo_lit):
@@ -387,7 +452,8 @@ extend Backend:
                                     # on this line, never reaching the packed path.
                                     if error_callee_is(fns, generics, smc_name):
                                         smc_value_type: ValueType = error_callee_value_type(smc_name, smc_args, local_scope, fns, structs, generics)
-                                        EmitStatus.Declined return if smc_value_type.kind == TypeKind.Unmodeled
+                                        if smc_value_type.kind == TypeKind.Unmodeled:
+                                            return EmitStatus.Declined
                                         if error_callee_target(smc_name, smc_args, local_scope, fns, structs, generics, m, ctx) is smc_target:
                                             # A VOID-success callee (`-> void error[E]`) still takes the leading
                                             # out pointer under this ABI, but `alloca void` is malformed and
@@ -405,7 +471,8 @@ extend Backend:
                                                 else:
                                                     smc_declined <- true
                                                 smc_arg_index <- smc_arg_index + 1
-                                            EmitStatus.Declined return if smc_declined
+                                            if smc_declined:
+                                                return EmitStatus.Declined
                                             smc_call_args.push(call_site_arena(smc_args, local_scope, runtime)) if error_callee_wants_arena(smc_name, smc_args, local_scope, fns, structs, generics)
                                             smc_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(smc_target)
                                             smc_args_pointer: void& = (&smc_call_args[0]).cast[void&] can Unsafe.PointerCast
@@ -430,7 +497,8 @@ extend Backend:
                                                     declare_local(local_scope, smc_success_binding, smc_out_slot, smc_value_type)
                                             smc_any_open: mutable bool = false
                                             smc_success_status: EmitStatus = emit_statements_scoped(smc_success.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                                            EmitStatus.Declined return if smc_success_status == EmitStatus.Declined
+                                            if smc_success_status == EmitStatus.Declined:
+                                                return EmitStatus.Declined
                                             smc_any_open <- true if smc_success_status == EmitStatus.Open
                                             branch_if_open(smc_success_status, builder, smc_done_block)
 
@@ -487,7 +555,8 @@ extend Backend:
                                                     LLVMPositionBuilderAtEnd(builder, smc_next_block)
                                                     continue
                                                 smc_error_declined <- true
-                                            EmitStatus.Declined return if smc_error_declined
+                                            if smc_error_declined:
+                                                return EmitStatus.Declined
                                             if not smc_saw_catch_all:
                                                 _ = LLVMBuildUnreachable(builder)
                                             LLVMPositionBuilderAtEnd(builder, smc_done_block)

@@ -13,7 +13,7 @@
 # intentionally not maintained) — see the precise glob below.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISAC="${ELISAC:-$HOME/.elisac/elisac}"
+ELISAC="${ELISAC:-${ELISACORE_BIN:-$HOME/.elisac/elisac}}"
 RPT="$ROOT/build/parse_report"
 
 mkdir -p "$ROOT/build"

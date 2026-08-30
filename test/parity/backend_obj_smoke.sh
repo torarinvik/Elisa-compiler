@@ -40,7 +40,10 @@ obj_case() {
     [ -f "$dir/stage1_out.o" ] || { echo "  FAIL obj_$name: no object emitted"; return; }
     [ -s "$dir/stage1_out.bc" ] || { echo "  FAIL obj_$name: no bitcode emitted"; return; }
     "$LLVM_DIS" "$dir/stage1_out.bc" -o /dev/null 2>/dev/null || { echo "  FAIL obj_$name: invalid bitcode emitted"; return; }
-    clang -o "$dir/prog" "$dir/stage1_out.o" "$RUNTIME_OBJ" 2>/dev/null \
+    # The complete runtime object contains optional callback/varargs helpers whose host
+    # symbols are intentionally supplied only by pymodule hosts. Dead-strip unused runtime
+    # sections so a standalone native smoke program links the same way as the normal driver.
+    clang -Wl,-dead_strip -o "$dir/prog" "$dir/stage1_out.o" "$RUNTIME_OBJ" 2>/dev/null \
       || { echo "  FAIL obj_$name: link"; return; }
     RUN "$dir/prog"; local got=$?
     if [ "$got" -ne "$want" ]; then echo "  FAIL obj_$name: got $got want $want"; return; fi
