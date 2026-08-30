@@ -5,6 +5,70 @@
 
 extend Parser:
     public:
+        # Machine arms are intentionally straight-line. Keep the state-machine scans at
+        # the boundary, and put the small decisions needed by their payload-building
+        # helpers behind guards or ordinary helper calls. This is the shape required by
+        # docs/123 §5; putting a nested machine or an `if` directly in an arm is rejected
+        # by the language, rather than being a compiler limitation.
+        def machine_state_field_seen(seen_fields: darray[sview]&, field_name: sview) -> bool:
+            for seen in seen_fields:
+                return true if seen == field_name
+            return false
+
+        def append_machine_state_declarations(declarations: mutable darray[Ast::Stmt]&, seen_fields: mutable darray[sview]&, state: MachineStateAst, start_args: darray[Ast::Expr], resolved_start: sview, line: u32) -> void:
+            machine over declarations for field_index in 0..<state.field_names.count:
+                state Field
+                start Field
+
+                Field, _ if machine_state_field_seen(seen_fields, state.field_names[field_index]):
+                    -> Field
+
+                Field, _ if state.name == resolved_start and field_index < start_args.count:
+                    field_name: sview = state.field_names[field_index]
+                    initializer: Ast::Expr = start_args[field_index]
+                    seen_fields.push(field_name)
+                    declarations.push((Ast::Stmt.VarDecl(field_name, state.field_types[field_index], initializer, Ast::pos_at_line(state.line))))
+                    -> Field
+
+                Field, _:
+                    field_name: sview = state.field_names[field_index]
+                    initializer: Ast::Expr = (Ast::Expr.Ident("zeroed", Ast::pos_at_line(line)))
+                    seen_fields.push(field_name)
+                    declarations.push((Ast::Stmt.VarDecl(field_name, state.field_types[field_index], initializer, Ast::pos_at_line(state.line))))
+                    -> Field
+
+        def append_machine_state_block(state: MachineStateAst, states: darray[MachineStateAst], arms: darray[MachineArmAst], enum_name: sview, mode_var: sview, input_var: sview, line: u32) -> darray[Ast::Stmt]:
+            state_arm_indices: mutable darray[usize] = []
+            for arm_i in 0..<arms.count:
+                state_arm_indices.push(arm_i) if arms[arm_i].state_name == state.name
+            bind_names: mutable darray[sview] = []
+            block: mutable darray[Ast::Stmt] = []
+            for idx_i in 0..<state_arm_indices.count:
+                if arms[state_arm_indices[idx_i]].input_bind != "":
+                    bound: mutable bool = false
+                    for bind_name in bind_names:
+                        bound <- true if bind_name == arms[state_arm_indices[idx_i]].input_bind
+                    if not bound:
+                        bind_names.push(arms[state_arm_indices[idx_i]].input_bind)
+                        block.push((Ast::Stmt.VarDecl(arms[state_arm_indices[idx_i]].input_bind, (Ast::Expr.Invalid), (Ast::Expr.Ident(input_var, Ast::pos_at_line(arms[state_arm_indices[idx_i]].line))), Ast::pos_at_line(arms[state_arm_indices[idx_i]].line))))
+            if state_arm_indices.count > 0:
+                chain: mutable darray[Ast::Stmt] = lower_machine_arm_body(arms[state_arm_indices[state_arm_indices.count - 1]], states, state.field_names, enum_name, mode_var, line)
+                machine over chain while true:
+                    state Fold(remaining: usize)
+                    start Fold(state_arm_indices.count - 1)
+
+                    Fold(remaining), _ if remaining == 0:
+                        break
+
+                    Fold(remaining), _:
+                        arm_index: usize = state_arm_indices[remaining - 1]
+                        arm_condition: Ast::Expr = machine_arm_condition(arms[arm_index], state.field_names, input_var)
+                        arm_body: darray[Ast::Stmt] = lower_machine_arm_body(arms[arm_index], states, state.field_names, enum_name, mode_var, line)
+                        chain <- arm_body if machine_expr_is_invalid(arm_condition) else [(Ast::Stmt.If(arm_condition, arm_body, chain, Ast::pos_at_line(arms[arm_index].line)))]
+                        -> Fold(remaining - 1)
+                block.extend(chain)
+            return block
+
         def machine_statement(parser: lmut Parser) -> Ast::Stmt?:
             rebind machine_token: Token, parser = parser.advance()   # `machine`
             parser, _ <- parser.advance()                            # `over`
@@ -104,11 +168,10 @@ extend Parser:
             # Hoisted payload-less mode enum (drained into top_decls by parse_file).
             variants: mutable darray[Ast::EnumVariant] = []
             variants.extend([Ast::EnumVariant{name: state.name, fields: [], field_names: [], value_expr: (Ast::Expr.Absent)} for state in states])
-            # Plain, payload-less mode enum. This is the canonical machine representation:
-            # stage0 keeps the synthesized enum out of its AST summary and resolves the
-            # ordinary enum member expressions through the normal enum registry. Keeping the
-            # same representation here avoids making machine lowering depend on const-enum
-            # scalarization as a frontend workaround.
+            # Plain, payload-less mode enum. The state tag is a normal enum value, while
+            # payload fields remain scalarized locals. This keeps the synthesized enum in
+            # the ordinary enum registry without routing machine metadata through the
+            # heavier const-enum scalar path.
             parser.pending_decls <- parser.pending_decls.push((Ast::Decl.Enum(enum_name, variants, false, (Ast::Expr.Absent), Ast::pos_at_line(line))))
             # The Decl alone is not enough: the backend registers enums from the FILE
             # METADATA pools (register_enums_from_metadata reads enum_decl_names, never the
@@ -138,52 +201,24 @@ extend Parser:
             resolved_start <- states[0].name if resolved_start == ""
             declarations.push((Ast::Stmt.VarDecl(mode_var, (Ast::Expr.Invalid), (Ast::Expr.Field((Ast::Expr.Ident(enum_name, Ast::pos_at_line(line))), resolved_start, Ast::pos_at_line(line))), Ast::pos_at_line(line))))
             seen_fields: mutable darray[sview] = []
-            for state in states:
-                for field_index in 0..<state.field_names.count:
-                    field_name: sview = state.field_names[field_index]
-                    already: mutable bool = false
-                    for seen in seen_fields:
-                        already <- true if seen == field_name
-                    if not already:
-                        seen_fields.push(field_name)
-                        initializer: mutable Ast::Expr = (Ast::Expr.Ident("zeroed", Ast::pos_at_line(line)))
-                        initializer <- start_args[field_index] if state.name == resolved_start and field_index < start_args.count
-                        declarations.push((Ast::Stmt.VarDecl(field_name, state.field_types[field_index], initializer, Ast::pos_at_line(state.line))))
+            machine over declarations for state in states:
+                state Scan
+                start Scan
+
+                Scan, _:
+                    append_machine_state_declarations(declarations, seen_fields, state, start_args, resolved_start, line)
+                    -> Scan
 
             # Per-state dispatch: bind decls + guarded if-ladder (last arm = else).
             state_blocks: mutable darray[darray[Ast::Stmt]] = []
-            for state in states:
-                state_arm_indices: mutable darray[usize] = []
-                for arm_i in 0..<arms.count:
-                    state_arm_indices.push(arm_i) if arms[arm_i].state_name == state.name
-                block: mutable darray[Ast::Stmt] = []
-                bind_names: mutable darray[sview] = []
-                for idx_i in 0..<state_arm_indices.count:
-                    if arms[state_arm_indices[idx_i]].input_bind != "":
-                        bound: mutable bool = false
-                        for bind_name in bind_names:
-                            bound <- true if bind_name == arms[state_arm_indices[idx_i]].input_bind
-                        if not bound:
-                            bind_names.push(arms[state_arm_indices[idx_i]].input_bind)
-                            block.push((Ast::Stmt.VarDecl(arms[state_arm_indices[idx_i]].input_bind, (Ast::Expr.Invalid), (Ast::Expr.Ident(input_var, Ast::pos_at_line(arms[state_arm_indices[idx_i]].line))), Ast::pos_at_line(arms[state_arm_indices[idx_i]].line))))
-                if state_arm_indices.count > 0:
-                    # Fold arms right-to-left into nested ifs; the final arm is the else.
-                    chain: mutable darray[Ast::Stmt] = lower_machine_arm_body(arms[state_arm_indices[state_arm_indices.count - 1]], states, state.field_names, enum_name, mode_var, line)
-                    machine over chain while true:
-                        state Fold(remaining: usize)
-                        start Fold(state_arm_indices.count - 1)
+            machine over state_blocks for state in states:
+                state Build
+                start Build
 
-                        Fold(remaining), _ if remaining == 0:
-                            break
-
-                        Fold(remaining), _:
-                            arm_index: usize = state_arm_indices[remaining - 1]
-                            arm_condition: Ast::Expr = machine_arm_condition(arms[arm_index], state.field_names, input_var)
-                            arm_body: darray[Ast::Stmt] = lower_machine_arm_body(arms[arm_index], states, state.field_names, enum_name, mode_var, line)
-                            chain <- arm_body if machine_expr_is_invalid(arm_condition) else [(Ast::Stmt.If(arm_condition, arm_body, chain, Ast::pos_at_line(arms[arm_index].line)))]
-                            -> Fold(remaining - 1)
-                    block.extend(chain)
-                state_blocks.push(block)
+                Build, _:
+                    state_block: darray[Ast::Stmt] = append_machine_state_block(state, states, arms, enum_name, mode_var, input_var, line)
+                    state_blocks.push(state_block)
+                    -> Build
 
             # Mode dispatch chain: `if mode == Enum.S0: … else: if mode == Enum.S1: …`,
             # last state as the final else.

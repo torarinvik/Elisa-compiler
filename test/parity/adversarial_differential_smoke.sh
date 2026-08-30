@@ -17,7 +17,7 @@
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "adversarial_differential SKIP: no stage1 binary"; exit 0; }
-[ -x "${ELISACORE_BIN:-$HOME/.elisac/elisac}" ] || { echo "adversarial_differential SKIP: no stage0"; exit 0; }
+[ -x "${ELISACORE_BIN:-$REPO_ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}" ] || { echo "adversarial_differential SKIP: no stage0"; exit 0; }
 [ -f "$ROOT/build/runtime/elisacore_runtime.o" ] || { echo "adversarial_differential SKIP: no runtime object"; exit 0; }
 
 out="$(REPO_ROOT="$ROOT" python3 "$ROOT/test/breadth/adversarial_differential.py" 2>&1)"

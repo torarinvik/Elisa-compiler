@@ -106,17 +106,18 @@ Two guards keep stage1 honest while stage0 still exists:
 1. **Runtime drift guard** — `scripts/check_runtime_drift.sh` diffs the vendored
    `elisacore_std` against Elisa-core's canonical copy and fails on any
    difference. Run in CI. Set `$ELISA_CORE` to your Elisa-core checkout (defaults
-   to the sibling `../../Go projects/Elisa-core`).
+   to the sibling `../../Go projects/structpy-tree` stage0 worktree).
 2. **Lexer parity** — the frontend's token-kind checksum must equal the stage0 Go
    lexer's on a shared corpus; `test/parity/run_all.sh` runs this as a standing gate.
 
 ## Building / checking locally
 
 ```sh
-export ELISA_CORE="/path/to/Elisa-core"          # if not the sibling default
+export ELISA_CORE="$(cd '../../Go projects/structpy-tree' && pwd)"  # local stage0 worktree
+make -C "$ELISA_CORE/compiler" build             # build stage0 locally; installed elisac is untouched
 scripts/check_runtime_drift.sh                    # runtime in sync?
-~/.elisac/elisac -emit semantic test/fixtures/lexer/frontend_lexer.elisa
-~/.elisac/elisac -emit semantic src/parser/parser.elisa
+"$ELISA_CORE/compiler/bin/elisac" -emit semantic test/fixtures/lexer/frontend_lexer.elisa
+"$ELISA_CORE/compiler/bin/elisac" -emit semantic src/parser/parser.elisa
 ```
 
 ## TODO

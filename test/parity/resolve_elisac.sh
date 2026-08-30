@@ -10,8 +10,8 @@
 #
 # Escape hatch: set ELISACORE_BIN to an explicit path to skip the build and use
 # that binary as-is (e.g. to test against a specific/older compiler). Set
-# ELISAC_OUT to change where the fresh build is written (default ~/.elisac/elisac,
-# matching `make build`).
+# ELISAC_OUT to change where the fresh build is written (default is the local
+# compiler/bin/elisac inside ELISA_CORE, matching the worktree-local `make build`).
 #
 # Requires $ELISA_CORE to be set before sourcing.
 : "${ELISA_CORE:?resolve_elisac.sh: ELISA_CORE must be set before sourcing}"
@@ -24,7 +24,7 @@ if [[ -n "${ELISACORE_BIN:-}" ]]; then
 	echo "using pinned elisac: $ELISACORE_BIN (skipping build)" >&2
 else
 	command -v go >/dev/null 2>&1 || { echo "error: missing 'go' (needed to build the latest elisac)" >&2; exit 2; }
-	ELISACORE_BIN="${ELISAC_OUT:-$HOME/.elisac/elisac}"
+	ELISACORE_BIN="${ELISAC_OUT:-$ELISA_CORE/compiler/bin/elisac}"
 	mkdir -p "$(dirname "$ELISACORE_BIN")"
 	echo "building latest elisac from $ELISA_CORE/compiler -> $ELISACORE_BIN" >&2
 	( cd "$ELISA_CORE/compiler" && go build -o "$ELISACORE_BIN" ./src )

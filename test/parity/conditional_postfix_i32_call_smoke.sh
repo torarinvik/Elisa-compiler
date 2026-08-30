@@ -2,7 +2,7 @@
 # Stage0/stage1 runtime parity for a value-if call whose argument narrows from i64 to i32.
 set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
+STAGE0="${ELISACORE_BIN:-$REPO_ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="$REPO_ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$REPO_ROOT/test/repro/conditional_postfix_i32_call.elisa"
 RUNTIME="$REPO_ROOT/build/runtime/elisacore_runtime.o"

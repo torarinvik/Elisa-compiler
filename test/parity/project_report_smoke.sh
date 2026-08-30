@@ -32,7 +32,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-EC="${ELISAC:-$HOME/.elisac/elisac}"
+EC="${ELISAC:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 BUILD="$ROOT/build/project_report"
 rm -rf "$BUILD"
 mkdir -p "$BUILD"

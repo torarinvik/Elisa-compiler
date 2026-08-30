@@ -5,7 +5,8 @@ import base64, subprocess, sys, tempfile, os, pathlib, collections, json
 
 S = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
-STAGE0 = os.path.expanduser("~/.elisac/elisac")
+STAGE0 = os.environ.get("ELISACORE_BIN", os.path.abspath(os.path.join(
+    REPO, "..", "..", "Go projects", "structpy-tree", "compiler", "bin", "elisac")))
 
 gapnames = set()
 for line in open(os.path.join(S, "be_full.txt")):

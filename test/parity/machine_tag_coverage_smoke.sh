@@ -8,7 +8,7 @@
 # checkMachineCoverage.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
 # shellcheck source=/dev/null
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 # shellcheck source=/dev/null

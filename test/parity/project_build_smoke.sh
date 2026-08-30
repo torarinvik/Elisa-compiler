@@ -16,7 +16,7 @@ RUN() { if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"; else "$@";
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-ELISACORE_BIN="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
 [ -x "$BIN" ] || { echo "project_build_smoke SKIP: no stage1 binary at $BIN"; exit 0; }

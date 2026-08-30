@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$ROOT/test/repro/header_dependency_order.elisa"
 WORK="$(mktemp -d)"

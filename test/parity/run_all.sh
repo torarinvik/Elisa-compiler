@@ -11,7 +11,7 @@
 # block-`if` ban is a gate-enforced standard — the compiler's src + std stay at 0 block-`if`s.
 #
 #   Usage:  ELISA_CORE=/path/to/Elisa-core  test/parity/run_all.sh
-#           (ELISA_CORE defaults to ../../Go projects/Elisa-core)
+#           (ELISA_CORE defaults to ../../Go projects/structpy-tree)
 set -uo pipefail
 
 # SELF-INVOCATION: `run_all.sh --exec-one <resultdir> <name> <cmd...>` runs ONE check and
@@ -37,7 +37,7 @@ if [[ "${1:-}" == "--exec-one" ]]; then
 fi
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
 
 # Build every SHARED artifact ONCE, here, and export its path so the checks reuse it.
 #
@@ -51,7 +51,7 @@ export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 # gate run, just once instead of once per check. (parse_report measures at 0.1s and is
 # cached here only for the race, not the time — an earlier 56.7s reading for it was pure
 # contention with a gate running in parallel, and re-measuring idle corrected it.)
-export ELISACORE_BIN="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
+export ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 if [[ -z "${ELISA_GATE_PREBUILT:-}" ]]; then
   echo "prebuilding shared artifacts (stage0, parse_report, easm driver)…" >&2
   ( cd "$ELISA_CORE/compiler" && go build -o "$ELISACORE_BIN" ./src ) || {

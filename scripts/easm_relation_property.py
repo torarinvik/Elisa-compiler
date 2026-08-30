@@ -23,6 +23,12 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+ELISA_CORE = pathlib.Path(
+    os.environ.get("ELISA_CORE", ROOT / "../../Go projects/structpy-tree")
+)
+DEFAULT_ELISAC = os.environ.get(
+    "ELISACORE_BIN", str(ELISA_CORE / "compiler" / "bin" / "elisac")
+)
 REGS = ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"]
 OPS = ["movq", "addq", "subq", "andq", "xorq", "incq", "decq", "xchgq"]
 DRIVER = ROOT / "build" / "easm_verify_stdin"
@@ -183,7 +189,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", type=int, default=40)
     parser.add_argument("--seed", type=int, default=0xE451A)
-    parser.add_argument("--elisac", default=os.path.expanduser("~/.elisac/elisac"))
+    parser.add_argument("--elisac", default=os.path.expanduser(DEFAULT_ELISAC))
     parser.add_argument("--llvm-config", default="/opt/homebrew/opt/llvm/bin/llvm-config")
     args = parser.parse_args()
     if not os.path.isfile(args.elisac) or not os.access(args.elisac, os.X_OK):

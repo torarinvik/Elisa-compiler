@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
 output="$("$ELISACORE_BIN" -emit test "$REPO_ROOT/test/parity/lexer_machine_state_test.elisa" 2>&1)"

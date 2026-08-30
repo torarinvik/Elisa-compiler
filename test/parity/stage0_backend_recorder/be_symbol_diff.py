@@ -33,7 +33,8 @@ import base64, collections, json, os, pathlib, re, subprocess, sys, tempfile
 
 S = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO_ROOT", os.path.abspath(os.path.join(S, "..", "..", "..")))
-S0 = os.path.expanduser("~/.elisac/elisac")
+S0 = os.environ.get("ELISACORE_BIN", os.path.abspath(os.path.join(
+    REPO, "..", "..", "Go projects", "structpy-tree", "compiler", "bin", "elisac")))
 WRAP = os.path.join(REPO, "scripts", "elisac_stage1.sh")
 ORACLE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/be_oracle.tsv"
 ONLY = sys.argv[2] if len(sys.argv) > 2 else None

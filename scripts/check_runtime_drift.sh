@@ -12,7 +12,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDORED="$REPO_ROOT/elisacore_std"
 
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
 CANONICAL="$ELISA_CORE/compiler/runtime/elisacore_std"
 
 if [[ ! -d "$CANONICAL" ]]; then

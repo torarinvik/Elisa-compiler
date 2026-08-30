@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-ELISACORE_BIN=${ELISACORE_BIN:-"$HOME/.elisac/elisac"}
+ELISACORE_BIN=${ELISACORE_BIN:-"$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac"}
 LLVM_CONFIG=${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}
 LLVM_MC=${LLVM_MC:-/opt/homebrew/opt/llvm/bin/llvm-mc}
 CXX=${CXX:-/opt/homebrew/opt/llvm/bin/clang++}

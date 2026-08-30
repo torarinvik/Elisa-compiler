@@ -3,7 +3,7 @@
 # may consume `if` while parsing `-1`; both products must still accept the guard.
 set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
+STAGE0="${ELISACORE_BIN:-$REPO_ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="$REPO_ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$REPO_ROOT/test/repro/signed_return_if_guard.elisa"
 TMP_DIR="$(mktemp -d)"

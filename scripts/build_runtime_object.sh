@@ -8,7 +8,8 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STAGE0_BIN="${ELISACORE_BIN:-${HOME}/.elisac/elisac}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 OUT="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
 [[ -x "$STAGE0_BIN" ]] || {
