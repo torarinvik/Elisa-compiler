@@ -31,7 +31,8 @@ set -uo pipefail
 set +m   # a crashing gen2 is an EXPECTED outcome here; don't let job control narrate it
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-GEN2="$ROOT/build/self_host_gen2/elisac-stage1-gen2"
+GEN2_DIR="${SELF_HOST_GEN2_DIR:-$ROOT/build/self_host_gen2}"
+GEN2="$GEN2_DIR/elisac-stage1-gen2"
 WORK="$ROOT/build/gen3_check"; rm -rf "$WORK"; mkdir -p "$WORK"
 
 # The exit code stage B must produce. 0 = bootstrap closed; anything else is a REGRESSION
@@ -49,7 +50,7 @@ fail() { echo "self_host_gen3_smoke FAIL: $1" >&2; exit 1; }
 if [ -n "$(find "$ROOT/src" -name '*.elisa' -newer "$BIN" -print -quit 2>/dev/null)" ]; then
     fail "seed $BIN is OLDER than src/*.elisa — rebuild it (scripts/elisac_stage1.sh --seed) or this check reports on stale code"
 fi
-bash "$ROOT/scripts/self_host_gen2.sh" >"$WORK/gen2.log" 2>&1 \
+bash "$ROOT/scripts/self_host_gen2.sh" "$GEN2_DIR" >"$WORK/gen2.log" 2>&1 \
   || fail "self_host_gen2.sh did not produce a working gen2 (see $WORK/gen2.log)"
 [ -x "$GEN2" ] || fail "no gen2 binary at $GEN2"
 
