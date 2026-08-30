@@ -162,6 +162,136 @@ extend Parser:
                     return (Ast::Expr.Binary(indexed, TokenKind.Else, fallback, Ast::pos_of_token(token)))
                 return (Ast::Expr.Index(active, start_bound, Ast::pos_of_token(token)))
 
+        # ============================================================
+        # Zero-overhead static effect handlers
+        # ============================================================
+
+        # Handler operation names are synthesized into parser-owned storage. They are ordinary
+        # function names after this point; no handler object, vtable, or continuation is created.
+        def append_handler_name_text(buffer: mutable darray[u8]&, value: sview) -> void:
+            for index in 0..<sview_len(value) |buffer, value|:
+                byte: u8 = sview_at(value, index)
+                buffer.push(95) if byte == 46
+                buffer.push(byte) if byte != 46
+
+        def handler_method_name[@r](parser: mutable Parser& @r, handler: sview, operation: sview) -> sview:
+            parser.handler_name_storage.reserve(parser.tokens.count * 64) if parser.handler_name_storage.count == 0
+            start: usize = parser.handler_name_storage.count
+            append_handler_name_text(parser.handler_name_storage, "__handler__")
+            append_handler_name_text(parser.handler_name_storage, handler)
+            append_handler_name_text(parser.handler_name_storage, "__")
+            append_handler_name_text(parser.handler_name_storage, operation)
+            return sview(&parser.handler_name_storage[start], 0, parser.handler_name_storage.count - start)
+
+        def append_handler_decimal(buffer: mutable darray[u8]&, value: usize) -> void:
+            digits: mutable darray[u8] = []
+            remaining: mutable usize = value
+            if remaining == 0:
+                buffer.push(48)
+            while remaining > 0 |remaining, digits|:
+                digits.push((48 + (remaining % 10)).u8())
+                remaining <- remaining / 10
+            index: mutable usize = digits.count
+            while index > 0 |index, digits, buffer|:
+                index <- index - 1
+                buffer.push(digits[index])
+
+        def next_handler_capture_name[@r](parser: mutable Parser& @r, handler: sview, line: u32) -> sview:
+            parser.handler_name_storage.reserve(parser.tokens.count * 64) if parser.handler_name_storage.count == 0
+            start: usize = parser.handler_name_storage.count
+            append_handler_name_text(parser.handler_name_storage, "__handler_capture__")
+            append_handler_name_text(parser.handler_name_storage, handler)
+            append_handler_name_text(parser.handler_name_storage, "__")
+            append_handler_decimal(parser.handler_name_storage, line.usize())
+            append_handler_name_text(parser.handler_name_storage, "__")
+            append_handler_decimal(parser.handler_name_storage, parser.handler_capture_counter)
+            parser.handler_capture_counter <- parser.handler_capture_counter + 1
+            return sview(&parser.handler_name_storage[start], 0, parser.handler_name_storage.count - start)
+
+        def effect_ref_head(reference: sview) -> sview:
+            start: mutable usize = 0
+            while start < sview_len(reference) and (sview_at(reference, start) == 32 or sview_at(reference, start) == 9):
+                start <- start + 1
+            end: mutable usize = start
+            while end < sview_len(reference):
+                byte: u8 = sview_at(reference, end)
+                break if byte == 91 or byte == 46 or byte == 32 or byte == 9
+                end <- end + 1
+            return reference[start:end]
+
+        def effect_ref_head_matches(reference: sview, owner: sview) -> bool:
+            left: sview = effect_ref_head(reference)
+            right: sview = effect_ref_head(owner)
+            return left == right
+
+        # Generic handler installation is specialization-sensitive. Compare the source spans
+        # by content while ignoring layout whitespace, so `Writer[sview]` cannot handle
+        # `Writer[i64]` merely because both share a family head.
+        def effect_ref_matches(left: sview, right: sview) -> bool:
+            left_index: mutable usize = 0
+            right_index: mutable usize = 0
+            while true |left_index, right_index|:
+                while left_index < sview_len(left) and (sview_at(left, left_index) == 32 or sview_at(left, left_index) == 9):
+                    left_index <- left_index + 1
+                while right_index < sview_len(right) and (sview_at(right, right_index) == 32 or sview_at(right, right_index) == 9):
+                    right_index <- right_index + 1
+                if left_index >= sview_len(left) or right_index >= sview_len(right):
+                    return left_index >= sview_len(left) and right_index >= sview_len(right)
+                return false if sview_at(left, left_index) != sview_at(right, right_index)
+                left_index <- left_index + 1
+                right_index <- right_index + 1
+            return false
+
+        def handler_declares_operation(parser: Parser&, handler: sview, operation: sview) -> bool:
+            for annotation in parser.enum_annotations:
+                true return if annotation.owner == handler and annotation.name == operation and annotation.line == 3900000060
+            return false
+
+        def handler_targets_effect(parser: Parser&, handler: sview, effect_reference: sview) -> bool:
+            for annotation in parser.enum_annotations:
+                true return if annotation.owner == handler and annotation.line == 3900000061 and effect_ref_matches(annotation.name, effect_reference)
+            return false
+
+        def effect_call_owner(expression: Ast::Expr) -> sview:
+            match expression:
+                Ast::Expr.Ident(name, _):
+                    return name
+                Ast::Expr.Scope(_, name, _):
+                    return name
+                _:
+                    return sview("", 0, 0)
+
+        # Rewrite `Effect.operation(args)` while the parser knows the active lexical handler
+        # stack. Missing operations fall through to an enclosing handler for the same abstract
+        # effect, which is compile-time forwarding rather than a runtime search.
+        def rewrite_static_effect_call[@r](parser: mutable Parser& @r, active: Ast::Expr, arguments: darray[Ast::Expr], argument_names: darray[sview], position: Ast::Pos) -> Ast::Expr:
+            original: Ast::Expr = Ast::Expr.Call(active, arguments, argument_names, position)
+            if active is Expr.Field(effect_object, operation, field_position):
+                owner: sview = effect_call_owner(effect_object)
+                return original if owner == "" or parser.active_handler_names.count == 0
+                selected: mutable usize = parser.active_handler_names.count
+                matched: mutable bool = false
+                while selected > 0:
+                    selected <- selected - 1
+                    if effect_ref_head_matches(parser.active_handler_effects[selected], owner) and parser.handler_targets_effect(parser.active_handler_names[selected], parser.active_handler_effects[selected]) and parser.handler_declares_operation(parser.active_handler_names[selected], operation):
+                        matched <- true
+                        break
+                return original if not matched
+                rewritten: mutable darray[Ast::Expr] = []
+                rewritten_names: mutable darray[sview] = []
+                capture_start: usize = parser.active_handler_capture_starts[selected]
+                capture_count: usize = parser.active_handler_capture_counts[selected]
+                for capture_index in 0..<capture_count |rewritten, rewritten_names, parser, capture_start|:
+                    rewritten.push(Ast::Expr.Ident(parser.active_handler_captures[capture_start + capture_index], position))
+                    rewritten_names.push("")
+                for argument_index in 0..<arguments.count |rewritten, rewritten_names, arguments, argument_names|:
+                    rewritten.push(arguments[argument_index])
+                    rewritten_names.push(argument_names[argument_index] if argument_index < argument_names.count else "")
+                selected_handler: sview = parser.active_handler_names[selected]
+                hidden: sview = parser.handler_method_name(selected_handler, operation)
+                return (Ast::Expr.Call(Ast::Expr.Ident(hidden, field_position), rewritten, rewritten_names, position))
+            return original
+
         def postfix_call_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
             parser, _ <- parser.advance()
             argument_items: mutable darray[Ast::Expr] = []
@@ -169,7 +299,8 @@ extend Parser:
             has_arg_forward: mutable bool = false
             saw_explicit_arg: mutable bool = false
             while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser|:
-                is_do_argument: bool = parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon and parser.peek_at(2) == TokenKind.Newline and Lexer::text_or_empty(parser.tokens[parser.position], parser.source) == "do"
+                current_token: Token = parser.tokens[parser.position]
+                is_do_argument: bool = parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon and parser.peek_at(2) == TokenKind.Newline and Lexer::text_or_empty(current_token, parser.source) == "do"
                 if is_do_argument:
                     saw_explicit_arg <- true
                     rebind do_value_opt: Ast::Expr?, parser = parser.expression()
@@ -201,7 +332,7 @@ extend Parser:
                 break if not accepted_comma
             parser, _ <- parser.expect(TokenKind.RParen)
             parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__arg_forward", name: "__arg_forward", line: token.line}) if has_arg_forward
-            return (Ast::Expr.Call(active, argument_items, argument_names, Ast::pos_of_token(token)))
+            return parser.rewrite_static_effect_call(active, argument_items, argument_names, Ast::pos_of_token(token))
 
         def postfix_brace_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
             can ComplexFlow:

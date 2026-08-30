@@ -42,6 +42,70 @@ extend Backend:
                 handled <- false
                 return null
             handled <- true
+            # `items[slot].field` where `items` is a reference to a struct element type.
+            # This shape must be handled before the generic index branches below: those branches
+            # intentionally reserve scalar references for pointer reads, while a struct reference
+            # needs an element address followed by a field GEP. Keeping the complete read here
+            # also makes it independent of the call-expression group, which is important because
+            # this dispatcher owns the outer `Expr.Field` node.
+            match expression:
+                Expr.Field(pointer_field_object, pointer_field_name, pointer_field_line):
+                    match pointer_field_object:
+                        Expr.Index(pointer_field_container, pointer_field_index, pointer_field_index_line):
+                            pointer_field_container_type: ValueType = expression_type(pointer_field_container, local_scope, fns, structs, generics)
+                            if pointer_field_container_type.kind == TypeKind.Ref:
+                                pointer_field_element_type: ValueType = ref_target_of(pointer_field_container_type, structs)
+                                if pointer_field_element_type.kind == TypeKind.Struct:
+                                    pointer_field_position: i64 = field_index_of(structs, pointer_field_element_type.bits.usize(), pointer_field_name)
+                                    if pointer_field_position >= 0:
+                                        if emit_expression(pointer_field_container, pointer_field_container_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_field_base:
+                                            if emit_expression(pointer_field_index, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_field_index_value:
+                                                pointer_field_indices: mutable darray[LLVMValueRef] = [pointer_field_index_value]
+                                                pointer_field_indices_pointer: void& = (&pointer_field_indices[0]).cast[void&] can Unsafe.PointerCast
+                                                pointer_field_element_llvm: LLVMTypeRef = llvm_type_of(pointer_field_element_type, structs, ctx)
+                                                pointer_field_element_address: LLVMValueRef = LLVMBuildGEP2(builder, pointer_field_element_llvm, pointer_field_base, pointer_field_indices_pointer, 1, "pointer.field.elem")
+                                                pointer_field_type: ValueType = structs.field_types[structs.field_start[pointer_field_element_type.bits.usize()] + pointer_field_position.usize()]
+                                                pointer_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pointer_field_element_llvm, pointer_field_element_address, pointer_field_position.u32(), "pointer.field.ptr")
+                                                pointer_field_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(pointer_field_type, structs, ctx), pointer_field_pointer, "pointer.field.value")
+                                                return emit_conversion(pointer_field_value, pointer_field_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != pointer_field_type.kind or expected.bits != pointer_field_type.bits) else pointer_field_value
+                                            return null
+                        _:
+                            pass
+                _:
+                    pass
+            # A field of a struct-valued rvalue (`make_token().kind`) has no local slot
+            # for the ordinary place resolver to address. Spill the returned aggregate,
+            # then read the selected field from that temporary. This is still zero-cost
+            # after the normal LLVM mem2reg/SROA passes, and is required by the compiler's
+            # own parser helpers (`peek` reads `parser.cursor().kind`). Keep it here, before
+            # the specialized index/field paths below, because this dispatcher owns all
+            # `Expr.Field` nodes and can otherwise decline the expression before the call
+            # emitter gets a chance to see it.
+            match expression:
+                Expr.Field(rvalue_struct_object, rvalue_struct_field, rvalue_struct_line):
+                    rvalue_struct_is_temporary: mutable bool = false
+                    match rvalue_struct_object:
+                        Expr.Call(_, _, _, _) | Expr.Index(_, _, _) | Expr.Construct(_, _, _) | Expr.RecordUpdate(_, _, _):
+                            rvalue_struct_is_temporary <- true
+                        _:
+                            pass
+                    if rvalue_struct_is_temporary:
+                        rvalue_struct_type: ValueType = expression_type(rvalue_struct_object, local_scope, fns, structs, generics)
+                        if rvalue_struct_type.kind == TypeKind.Struct:
+                            rvalue_struct_slot: usize = rvalue_struct_type.bits.usize()
+                            rvalue_struct_position: i64 = field_index_of(structs, rvalue_struct_slot, rvalue_struct_field)
+                            if rvalue_struct_position >= 0:
+                                if emit_expression(rvalue_struct_object, rvalue_struct_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_struct_value:
+                                    rvalue_struct_llvm: LLVMTypeRef = llvm_type_of(rvalue_struct_type, structs, ctx)
+                                    rvalue_struct_temp: LLVMValueRef = LLVMBuildAlloca(builder, rvalue_struct_llvm, "field.recv.spill")
+                                    _ = LLVMBuildStore(builder, rvalue_struct_value, rvalue_struct_temp)
+                                    rvalue_struct_field_type: ValueType = structs.field_types[structs.field_start[rvalue_struct_slot] + rvalue_struct_position.usize()]
+                                    rvalue_struct_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, rvalue_struct_llvm, rvalue_struct_temp, rvalue_struct_position.u32(), "field.ptr")
+                                    rvalue_struct_loaded: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(rvalue_struct_field_type, structs, ctx), rvalue_struct_pointer, "field")
+                                    return emit_conversion(rvalue_struct_loaded, rvalue_struct_field_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != rvalue_struct_field_type.kind or expected.bits != rvalue_struct_field_type.bits) else rvalue_struct_loaded
+                                return null
+                _:
+                    pass
             # `table.values` — a NodeTable's backing view. NodeTable is ERASED to that
             # view, so this is the identity on a view-typed receiver. Placed first for the
             # same reason as the store-ordinal branch below.
@@ -408,7 +472,20 @@ extend Backend:
                                 # so changing it would silently move an ABI other code already agrees on.
                                 cast_targets_fn: bool = cast_target.kind == TypeKind.Fn
                                 null return if not type_is_pointer(cast_target) and not cast_wraps_optional and not cast_targets_fn
-                                cast_source_type: ValueType = expression_type(cast_source, local_scope, fns, structs, generics)
+                                cast_source_type: mutable ValueType = expression_type(cast_source, local_scope, fns, structs, generics)
+                                # Integer literals are context-typed by the cast itself. The
+                                # expression typer intentionally leaves a bare literal
+                                # Unmodeled, but C code routinely uses exactly this shape for
+                                # sentinel pointers (`(objtype *)(uintptr_t)0x40`). Give the
+                                # literal the ordinary signed-64 source type so the generic
+                                # integer-to-pointer reinterpret path can lower it with
+                                # inttoptr instead of declining the enclosing assignment.
+                                if cast_source_type.kind == TypeKind.Unmodeled:
+                                    match cast_source:
+                                        Expr.IntLit(cast_integer_text):
+                                            cast_source_type <- ValueType{kind: TypeKind.Signed, bits: 64}
+                                        _:
+                                            pass
                                 # Qualifier-only and otherwise representation-identical
                                 # casts are semantic no-ops. C translation emits these at
                                 # ABI boundaries (`u8&?` to `mutable u8&?`); rejecting
@@ -1037,7 +1114,13 @@ extend Backend:
                                     opt_ref_payload: ValueType = optional_payload_of(array_type, structs)
                                     if opt_ref_payload.kind == TypeKind.Ref:
                                         opt_ref_elem: ValueType = ref_target_of(opt_ref_payload, structs)
-                                        if opt_ref_elem.kind == TypeKind.Signed or opt_ref_elem.kind == TypeKind.Unsigned or opt_ref_elem.kind == TypeKind.Float:
+                                        # A nullable pointer-to-pointer (`T&&?`) is a niche
+                                        # optional whose payload is itself a raw pointer. The
+                                        # outer index therefore reads a pointer-sized element,
+                                        # just like `argv[i]` on `cstr&&`; it must not be forced
+                                        # through the tagged-optional scalar path.
+                                        opt_ref_elem_is_pointer: bool = opt_ref_elem.kind == TypeKind.Ref or opt_ref_elem.kind == TypeKind.CStr or opt_ref_elem.kind == TypeKind.Fn
+                                        if opt_ref_elem.kind == TypeKind.Signed or opt_ref_elem.kind == TypeKind.Unsigned or opt_ref_elem.kind == TypeKind.Float or opt_ref_elem_is_pointer:
                                             opt_ref_aggregate: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(array_type, structs, ctx), array_slot, "opt.ref.aggr")
                                             opt_ref_base: LLVMValueRef = optional_payload_value_of(opt_ref_aggregate, array_type, structs, ctx, builder)
                                             if emit_expression(index_expression, ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is opt_ref_index:
@@ -1048,17 +1131,17 @@ extend Backend:
                                                 opt_ref_value: LLVMValueRef = LLVMBuildLoad2(builder, opt_ref_elem_llvm, opt_ref_elem_ptr, "opt.ref.elem")
                                                 return emit_conversion(opt_ref_value, opt_ref_elem, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != opt_ref_elem.kind or expected.bits != opt_ref_elem.bits) else opt_ref_value
                                             return null
-                                null return if array_type.kind != TypeKind.Array
-                                if emit_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer:
-                                    element_type: ValueType = array_element_of(array_type, structs)
-                                    array_element_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), pointer, "elem")
-                                    # Widen/narrow to the EXPECTED type, exactly as the optional-ref
-                                    # read above does. Without it `text[1]` on a `u8[4]` returned an
-                                    # i8 where the context wanted i64 (`-> char`, or plain `-> i64`),
-                                    # and the return path's type-identity guard declined the whole
-                                    # function -- while the same expression with an explicit `.i64()`
-                                    # compiled fine.
-                                    return emit_conversion(array_element_value, element_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != element_type.kind or expected.bits != element_type.bits) else array_element_value
+                                if array_type.kind == TypeKind.Array:
+                                    if emit_index_address(array_slot, array_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer:
+                                        element_type: ValueType = array_element_of(array_type, structs)
+                                        array_element_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), pointer, "elem")
+                                        # Widen/narrow to the EXPECTED type, exactly as the optional-ref
+                                        # read above does. Without it `text[1]` on a `u8[4]` returned an
+                                        # i8 where the context wanted i64 (`-> char`, or plain `-> i64`),
+                                        # and the return path's type-identity guard declined the whole
+                                        # function -- while the same expression with an explicit `.i64()`
+                                        # compiled fine.
+                                        return emit_conversion(array_element_value, element_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != element_type.kind or expected.bits != element_type.bits) else array_element_value
                             # `xs[i]` where `xs` is a global const ARRAY. The address emitter already
                             # supports this shape for assignments and address-of expressions; mirror
                             # that path here for reads. Without it, a global fixed array (including the
@@ -1072,6 +1155,33 @@ extend Backend:
                                         const_read_element_type: ValueType = array_element_of(const_read_array_type, structs)
                                         const_read_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(const_read_element_type, structs, ctx), const_read_pointer, "const.elem")
                                         return emit_conversion(const_read_value, const_read_element_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != const_read_element_type.kind or expected.bits != const_read_element_type.bits) else const_read_value
+                                return null
+                            # `xs[i]` where `xs` is a mutable global ARRAY. Mutable globals
+                            # are loaded by name in the identifier path, but indexing must use
+                            # their address directly; loading the whole aggregate first would
+                            # lose the lvalue needed for a GEP and made ordinary C tables such
+                            # as `grstarts[idx]` decline in otherwise valid functions.
+                            mutable_read_index: i64 = mutable_global_index_of(structs, array_name)
+                            if mutable_read_index >= 0:
+                                mutable_read_array_type: ValueType = copied_type(structs.mutable_global_types[mutable_read_index.usize()])
+                                if mutable_read_array_type.kind == TypeKind.Array:
+                                    if emit_index_address(structs.mutable_global_handles[mutable_read_index.usize()], mutable_read_array_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is mutable_read_pointer:
+                                        mutable_read_element_type: ValueType = array_element_of(mutable_read_array_type, structs)
+                                        mutable_read_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(mutable_read_element_type, structs, ctx), mutable_read_pointer, "global.elem")
+                                        return emit_conversion(mutable_read_value, mutable_read_element_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != mutable_read_element_type.kind or expected.bits != mutable_read_element_type.bits) else mutable_read_value
+                                return null
+                            # `xs[i]` where `xs` is an external fixed ARRAY. External globals are
+                            # declaration-only in this translation unit, but their LLVM handles still
+                            # point at the correctly typed storage. Use the same address-and-load path
+                            # as mutable project globals so cross-module C tables remain ordinary lvalues.
+                            extern_read_index: i64 = extern_global_index_of(structs, array_name)
+                            if extern_read_index >= 0:
+                                extern_read_array_type: ValueType = copied_type(structs.extern_global_types[extern_read_index.usize()])
+                                if extern_read_array_type.kind == TypeKind.Array:
+                                    if emit_index_address(structs.extern_global_handles[extern_read_index.usize()], extern_read_array_type, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is extern_read_pointer:
+                                        extern_read_element_type: ValueType = array_element_of(extern_read_array_type, structs)
+                                        extern_read_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(extern_read_element_type, structs, ctx), extern_read_pointer, "extern.elem")
+                                        return emit_conversion(extern_read_value, extern_read_element_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != extern_read_element_type.kind or expected.bits != extern_read_element_type.bits) else extern_read_value
                                 return null
                         _:
                             pass

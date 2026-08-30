@@ -138,6 +138,23 @@ extend Backend:
                                 return LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), ptr_arith_base, ptr_arith_indices_pointer, 1, "ptr.arith")
                             return null
                         return null
+                    # C pointers into the same allocation may also be ordered (`p < end`,
+                    # `cursor >= limit`). Elisa references are represented as LLVM pointers;
+                    # compare their raw addresses with the unsigned pointer predicates instead
+                    # of trying to dereference them as numeric values. This is the relational
+                    # counterpart of the identity comparison below and applies equally to a
+                    # plain reference and an optional reference after its payload is extracted.
+                    if binary_operator == TokenKind.Lt or binary_operator == TokenKind.LtEq or binary_operator == TokenKind.Gt or binary_operator == TokenKind.GtEq:
+                        ref_order_left_type: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                        ref_order_right_type: ValueType = expression_type(binary_right, local_scope, fns, structs, generics)
+                        if ref_eq_is_pointer_like(ref_order_left_type, structs) and ref_eq_is_pointer_like(ref_order_right_type, structs):
+                            if ref_eq_pointer_value(binary_left, ref_order_left_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ref_order_left_pointer:
+                                if ref_eq_pointer_value(binary_right, ref_order_right_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ref_order_right_pointer:
+                                    ref_order_value: LLVMValueRef = LLVMBuildICmp(builder, int_predicate_of(binary_operator), ref_order_left_pointer, ref_order_right_pointer, "refcmp.order")
+                                    ref_order_result: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                                    return emit_conversion(ref_order_value, ref_order_result, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != ref_order_result.kind or expected.bits != ref_order_result.bits) else ref_order_value
+                                return null
+                            return null
                     # `p == q` / `p != q` on two REFERENCES is ADDRESS IDENTITY, not a compare of
                     # the pointees — `arena == &perm_arena` asks whether this IS the permanent
                     # arena. Verified against stage0 rather than assumed, because a ref operand
@@ -156,6 +173,28 @@ extend Backend:
                         # pointer-niche representation. C callback-hook setup
                         # compares these addresses to select a compatible
                         # reallocator; lower that identity comparison directly.
+                        # `null` deliberately has no standalone type, however, so a
+                        # callback guard such as `if callback != null` arrives with one
+                        # Fn operand and one Unmodeled operand. Treat the null side as
+                        # the known callback type for this pointer comparison; passing
+                        # Unmodeled to emit_expression would otherwise decline the
+                        # otherwise ordinary C callback guard.
+                        if left_fn_like and is_null_literal(binary_right):
+                            if emit_expression(binary_left, ref_eq_left_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fn_null_left:
+                                if emit_expression(binary_right, ref_eq_left_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fn_null_right:
+                                    fn_null_value: LLVMValueRef = LLVMBuildICmp(builder, int_predicate_of(binary_operator), fn_null_left, fn_null_right, "fncmp.null")
+                                    fn_null_result: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                                    return emit_conversion(fn_null_value, fn_null_result, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != fn_null_result.kind or expected.bits != fn_null_result.bits) else fn_null_value
+                                return null
+                            return null
+                        if right_fn_like and is_null_literal(binary_left):
+                            if emit_expression(binary_left, ref_eq_right_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fn_null_left:
+                                if emit_expression(binary_right, ref_eq_right_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fn_null_right:
+                                    fn_null_value: LLVMValueRef = LLVMBuildICmp(builder, int_predicate_of(binary_operator), fn_null_left, fn_null_right, "fncmp.null")
+                                    fn_null_result: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                                    return emit_conversion(fn_null_value, fn_null_result, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != fn_null_result.kind or expected.bits != fn_null_result.bits) else fn_null_value
+                                return null
+                            return null
                         if left_fn_like and right_fn_like:
                             if emit_expression(binary_left, ref_eq_left_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fn_eq_left:
                                 if emit_expression(binary_right, ref_eq_right_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fn_eq_right:
@@ -270,8 +309,24 @@ extend Backend:
                     # integer->float conversion this way, it was only the decline check below
                     # standing in the way.
                     int_float_mixed: bool = (left_own.kind == TypeKind.Float and is_integer_type(right_own)) or (right_own.kind == TypeKind.Float and is_integer_type(left_own))
-                    operand_type <- (left_own if left_own.bits > right_own.bits else right_own) if float_mixed_width else (left_own if left_own.kind == TypeKind.Float else right_own) if int_float_mixed else operand_type
-                    if not float_mixed_width and not int_float_mixed and left_own.kind != TypeKind.Unmodeled and right_own.kind != TypeKind.Unmodeled:
+                    literal_float_mixed: bool = arithmetic_tree_contains_float_literal(expression)
+                    # An untyped Elisa float literal is represented as `Unmodeled` by
+                    # expression_type, so it cannot participate in int_float_mixed above.
+                    # Once such a literal occurs anywhere in this transparent arithmetic
+                    # tree, C's usual arithmetic conversions still make the operation f64
+                    # (`i + 1.0`, and nested forms such as `(i * 2) + 1.0`). Select that
+                    # operation type before emitting either operand; otherwise the right
+                    # FloatLit is emitted with the integer context and the whole expression
+                    # declines even though emit_conversion already knows how to lower the
+                    # integer operand to f64.
+                    operand_type <- ValueType{kind: TypeKind.Float, bits: 64} if literal_float_mixed else (left_own if left_own.bits > right_own.bits else right_own) if float_mixed_width else (left_own if left_own.kind == TypeKind.Float else right_own) if int_float_mixed else operand_type
+                    # `expression_type` promotes a transparent arithmetic tree containing a
+                    # float literal to f64 even when one or both typed leaves are integers.
+                    # Do not apply the integer same-width guard to that tree: the integer leaves
+                    # are supposed to be converted to the promoted float type below. Without
+                    # this exception, `((i * 2) + 1) * 3.14159` inferred f64 but immediately
+                    # declined because its left subtree remained i32.
+                    if not float_mixed_width and not int_float_mixed and not literal_float_mixed and left_own.kind != TypeKind.Unmodeled and right_own.kind != TypeKind.Unmodeled:
                         null return if left_own.kind != operand_type.kind or left_own.bits != operand_type.bits
                         null return if not is_integer_type(left_own) and (right_own.kind != operand_type.kind or right_own.bits != operand_type.bits)
                     # A comparison/`is` operator yields `bool` regardless of the OPERAND type, so
