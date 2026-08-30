@@ -1,0 +1,102 @@
+# Stage1 backend — protocol-based square-bracket overloading.
+#
+# Built-in containers keep their existing LLVM lowering. A struct receiver may
+# instead provide `impl Index for T` with `__index__(self: T&, key: K) -> E&`.
+# Reusing the ordinary UFCS call path keeps overload resolution, generic
+# instantiation, and protocol implementations in one place.
+
+extend Backend:
+    private:
+        # The type of a custom index expression, or Unmodeled when the receiver
+        # is not a struct or does not expose a usable __index__ overload. This
+        # deliberately works from the function table instead of constructing a
+        # temporary AST call: type-only helpers do not have an inferred region.
+        def index_overload_type(object: Expr, key: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic]:
+            receiver_type: ValueType = expression_type(object, local_scope, fns, structs, generics)
+            receiver_struct: mutable ValueType = receiver_type
+            receiver_struct <- ref_target_of(receiver_type, structs) if receiver_type.kind == TypeKind.Ref
+            return unmodeled_type() if receiver_struct.kind != TypeKind.Struct
+            key_type: ValueType = expression_type(key, local_scope, fns, structs, generics)
+            for function_index in 0..<fns.names.count |function_index, fns, receiver_type, receiver_struct, key_type, structs, key|:
+                # Protocol implementations may live in a module (`cpp::__index__`),
+                # so owner is not part of this structural probe. The ordinary call
+                # emitter still performs the final owner/overload resolution.
+                continue if fns.names[function_index] != "__index__"
+                continue if fns.param_count[function_index] != 2.usize()
+                declared_receiver: ValueType = fns.param_types[fns.param_start[function_index]]
+                receiver_match: mutable ValueType = declared_receiver
+                receiver_match <- ref_target_of(declared_receiver, structs) if declared_receiver.kind == TypeKind.Ref and receiver_type.kind != TypeKind.Ref
+                continue if receiver_match.kind != receiver_struct.kind or receiver_match.bits != receiver_struct.bits
+                declared_key: ValueType = fns.param_types[fns.param_start[function_index] + 1.usize()]
+                if key_type.kind == TypeKind.Unmodeled:
+                    integer_literal: mutable bool = false
+                    float_literal: mutable bool = false
+                    match key:
+                        Expr.IntLit(index_int_text):
+                            integer_literal <- true
+                        Expr.FloatLit(index_float_text):
+                            float_literal <- true
+                        _:
+                            pass
+                    continue if integer_literal and not (declared_key.kind == TypeKind.Signed or declared_key.kind == TypeKind.Unsigned)
+                    continue if float_literal and declared_key.kind != TypeKind.Float
+                    continue if not integer_literal and not float_literal
+                elif declared_key.kind != key_type.kind or declared_key.bits != key_type.bits:
+                    continue
+                return copied_type(fns.returns[function_index])
+            return unmodeled_type()
+
+
+        # Generic protocol implementations are kept in GenericTable rather than FnTable.
+        # Resolve the concrete return type for the address/place paths without making those
+        # paths know anything about a particular library type. The ordinary UFCS emitter still
+        # owns the actual call and body instantiation.
+        def index_overload_generic_type(object: Expr, key: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            key_arguments: darray[Expr] = [key]
+            for generic_slot in 0..<generics.names.count |generic_slot, generics, object, key_arguments, local_scope, fns, structs|:
+                continue if generics.names[generic_slot] != "__index__"
+                inferred: darray[ValueType] = infer_generic_args_ufcs(generic_slot, object, key_arguments, local_scope, fns, structs, generics)
+                continue if inferred.count != generics.param_count[generic_slot]
+                resolved: ValueType = generic_return_type_at(generic_slot, inferred, generics, structs)
+                return resolved if resolved.kind != TypeKind.Unmodeled
+            return unmodeled_type()
+
+
+        def emit_expression_index_overload(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.Index(indexed_object, index_expression, index_line):
+                    receiver_type: ValueType = expression_type(indexed_object, local_scope, fns, structs, generics)
+                    receiver_struct: mutable ValueType = receiver_type
+                    receiver_struct <- ref_target_of(receiver_type, structs) if receiver_type.kind == TypeKind.Ref
+                    if receiver_struct.kind == TypeKind.Struct:
+                        # Let ordinary call resolution decide whether a generic or
+                        # module-owned implementation exists. A direct function-table
+                        # scan cannot see an uninstantiated `impl[K,V]` member yet.
+                        # Built-in indexing remains the fallback when this speculative
+                        # call declines.
+                        overload_type: mutable ValueType = index_overload_generic_type(indexed_object, index_expression, local_scope, fns, structs, generics)
+                        overload_type <- index_overload_type(indexed_object, index_expression, local_scope, fns, structs, generics) if overload_type.kind == TypeKind.Unmodeled
+                        return null if overload_type.kind == TypeKind.Unmodeled
+                        region scratch(4096):
+                            overload_call: Expr = Expr.Call(Expr.Field(indexed_object, "__index__", index_line), [index_expression], [""], index_line)
+                            # Ask the ordinary call emitter for the declared reference
+                            # type. This keeps the result as an address here; the index
+                            # wrapper owns the one value-context load below. Passing the
+                            # caller's value type would make some call paths load first,
+                            # while others returned the raw pointer, producing either a
+                            # double load or an integer-to-pointer store.
+                            if emit_expression(overload_call, overload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is overload_value:
+                                if overload_type.kind == TypeKind.Ref and expected.kind != TypeKind.Ref and expected.kind != TypeKind.CStr:
+                                    element_type: ValueType = ref_target_of(overload_type, structs)
+                                    if element_type.kind != TypeKind.Struct:
+                                        handled <- true
+                                        return LLVMBuildLoad2(builder, llvm_type_of(element_type, structs, ctx), overload_value, "index.overload.value")
+                                # We explicitly requested the reference return above;
+                                # the value-context load, when needed, is handled by
+                                # this wrapper exactly once.
+                                handled <- true
+                                return overload_value
+                _:
+                    pass
+            handled <- false
+            return null
