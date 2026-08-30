@@ -87,6 +87,134 @@ extend Parser:
                 return (Ast::Stmt.Block("expect", [], "", expect_lowered, Ast::pos_of_token(expect_token)))
 
 
+        # A handler installation has a richer header than an ordinary permission grant. Keep
+        # `Effect[T] with Handler(capture)` as one effect reference and parse the capture
+        # expressions before the block body so the body parser can perform direct-call rewriting.
+        def can_handler_clause_ahead(parser: Parser&) -> bool:
+            false return if parser.peek() != TokenKind.Ident
+            scan: mutable usize = 1
+            depth: mutable int = 0
+            while parser.peek_at(scan) != TokenKind.Eof |parser, scan, depth|:
+                kind: TokenKind = parser.peek_at(scan)
+                return true if depth == 0 and kind == TokenKind.With
+                break if depth == 0 and (kind == TokenKind.Colon or kind == TokenKind.Newline)
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace
+                depth <- depth - 1 if depth > 0 and (kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace)
+                scan <- scan + 1
+            return false
+
+        def consume_can_handler_clause(parser: lmut Parser, clause: mutable darray[sview]&, effect_name: mutable sview&, handler_name: mutable sview&, arguments: mutable darray[Ast::Expr]&) -> bool:
+            false return if not parser.can_handler_clause_ahead()
+            # `prefixed_block_statement` is entered with the contextual `can` token still
+            # under the cursor. The effect span begins after that marker, not at `can`.
+            leading_can_token: Token = parser.cursor()
+            parser, _ <- parser.advance() if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(leading_can_token, parser.source) == "can"
+            effect_start_token: Token = parser.cursor()
+            effect_name <- Lexer::text_or_empty(effect_start_token, parser.source)
+            effect_start: usize = effect_start_token.start.usize()
+            effect_end: mutable usize = effect_start
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof |parser, depth, effect_end|:
+                kind: TokenKind = parser.peek()
+                break if depth == 0 and kind == TokenKind.With
+                break if depth == 0 and (kind == TokenKind.Colon or kind == TokenKind.Newline)
+                current: Token = parser.cursor()
+                effect_end <- current.start.usize() + current.length.usize()
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace
+                depth <- depth - 1 if depth > 0 and (kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace)
+                parser, _ <- parser.advance()
+            effect_ref: sview = parser.span_view(effect_start, effect_end)
+            clause.push(effect_ref) if effect_end > effect_start
+            # Preserve the installation's handler identity in the side table. The compact
+            # stage1 statement node intentionally remains the ordinary Block shape; semantic
+            # validation uses this source-location-independent record instead.
+            parser, _ <- parser.expect(TokenKind.With)
+            rebind handler_ident: Token, parser = parser.expect(TokenKind.Ident)
+            handler_name <- Lexer::text_or_empty(handler_ident, parser.source)
+            installed_handler_value: sview = Lexer::text_or_empty(handler_ident, parser.source)
+            # The first annotation records the handler after `with` is consumed. Keeping all
+            # annotation fields immutable avoids storing a view typed as a mutable reference.
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__effect_install", name: installed_handler_value, line: effect_start_token.line})
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__effect_install_effect", name: effect_ref, line: effect_start_token.line})
+            # Installing a static handler also installs the concrete permissions used
+            # by its operation methods. Keep the abstract grant in the clause, then add
+            # only concrete method requirements so the normal coverage pass sees the
+            # handler as an authority adapter rather than a runtime effect object.
+            for handler_annotation in parser.enum_annotations |clause, handler_name|:
+                continue if handler_annotation.owner != handler_name or handler_annotation.line != 3900000087
+                realization: sview = handler_effect_via(handler_annotation.name)
+                if realization != "":
+                    clause.push(realization)
+                else:
+                    is_abstract: bool = any effect_annotation in parser.enum_annotations where effect_annotation.owner == "__effect_decl" and effect_annotation.name == handler_effect_family(handler_annotation.name)
+                    clause.push(handler_annotation.name) if not is_abstract
+            if parser.peek() == TokenKind.LParen:
+                parser, _ <- parser.advance()
+                while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser, arguments|:
+                    rebind argument_opt: Ast::Expr?, parser = parser.expression()
+                    arguments.push(argument) if argument_opt is argument
+                    rebind accepted_comma: bool, parser = parser.accept(TokenKind.Comma)
+                    break if not accepted_comma
+                parser, _ <- parser.expect(TokenKind.RParen)
+            return true
+
+        # Rebuild statements with handler operation calls normalized. This is the statement
+        # counterpart to rewrite_handler_expression; the AST is value-shaped, so each nested
+        # body is rebuilt into the same ordinary Stmt variants rather than introducing a runtime
+        # handler node.
+        def rewrite_handler_statements(parser: lmut Parser, statements: darray[Ast::Stmt], effect_name: sview, handler_name: sview, captures: darray[Ast::Expr]) -> darray[Ast::Stmt]:
+            can Memory.Allocate, Abort.Panic:
+                rewritten: mutable darray[Ast::Stmt] = []
+                for statement in statements |rewritten, parser|:
+                    match statement:
+                        Stmt.Expr(expression, statement_pos):
+                            rebind rewritten_expression: Ast::Expr, parser = parser.rewrite_handler_expression(expression, effect_name, handler_name, captures)
+                            rewritten.push(Ast::Stmt.Expr(rewritten_expression, statement_pos))
+                        Stmt.VarDecl(name, type_expression, value, statement_pos):
+                            rebind rewritten_type: Ast::Expr, parser = parser.rewrite_handler_expression(type_expression, effect_name, handler_name, captures)
+                            rebind rewritten_value: Ast::Expr, parser = parser.rewrite_handler_expression(value, effect_name, handler_name, captures)
+                            rewritten.push(Ast::Stmt.VarDecl(name, rewritten_type, rewritten_value, statement_pos))
+                        Stmt.Assign(target, operator, value, statement_pos):
+                            rebind rewritten_target: Ast::Expr, parser = parser.rewrite_handler_expression(target, effect_name, handler_name, captures)
+                            rebind rewritten_value: Ast::Expr, parser = parser.rewrite_handler_expression(value, effect_name, handler_name, captures)
+                            rewritten.push(Ast::Stmt.Assign(rewritten_target, operator, rewritten_value, statement_pos))
+                        Stmt.If(condition, then_body, else_body, statement_pos):
+                            rebind rewritten_condition: Ast::Expr, parser = parser.rewrite_handler_expression(condition, effect_name, handler_name, captures)
+                            rebind rewritten_then: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(then_body, effect_name, handler_name, captures)
+                            rebind rewritten_else: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(else_body, effect_name, handler_name, captures)
+                            rewritten.push(Ast::Stmt.If(rewritten_condition, rewritten_then, rewritten_else, statement_pos))
+                        Stmt.While(condition, body, statement_pos):
+                            rebind rewritten_condition: Ast::Expr, parser = parser.rewrite_handler_expression(condition, effect_name, handler_name, captures)
+                            rebind rewritten_body: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(body, effect_name, handler_name, captures)
+                            rewritten.push(Ast::Stmt.While(rewritten_condition, rewritten_body, statement_pos))
+                        Stmt.For(bind, variables, iterable, body, statement_pos):
+                            rebind rewritten_iterable: Ast::Expr, parser = parser.rewrite_handler_expression(iterable, effect_name, handler_name, captures)
+                            rebind rewritten_body: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(body, effect_name, handler_name, captures)
+                            rewritten.push(Ast::Stmt.For(bind, variables, rewritten_iterable, rewritten_body, statement_pos))
+                        Stmt.Block(kind, clause, binding, body, statement_pos):
+                            rebind rewritten_body: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(body, effect_name, handler_name, captures)
+                            rewritten.push(Ast::Stmt.Block(kind, clause, binding, rewritten_body, statement_pos))
+                        Stmt.Return(value, statement_pos):
+                            if value is returned_value:
+                                rebind rewritten_value: Ast::Expr, parser = parser.rewrite_handler_expression(returned_value, effect_name, handler_name, captures)
+                                rewritten.push(Ast::Stmt.Return(rewritten_value, statement_pos))
+                            else:
+                                rewritten.push(statement)
+                        Stmt.Match(scrutinee, arms, statement_pos):
+                            rebind rewritten_scrutinee: Ast::Expr, parser = parser.rewrite_handler_expression(scrutinee, effect_name, handler_name, captures)
+                            rewritten_arms: mutable darray[Ast::MatchArm] = []
+                            for arm in arms |rewritten_arms, parser|:
+                                rebind rewritten_guard: Ast::Expr, parser = parser.rewrite_handler_expression(arm.guard, effect_name, handler_name, captures)
+                                rebind rewritten_body: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(arm.body, effect_name, handler_name, captures)
+                                rewritten_arms.push(Ast::MatchArm{pattern: arm.pattern, body: rewritten_body, guard: rewritten_guard})
+                            rewritten.push(Ast::Stmt.Match(rewritten_scrutinee, rewritten_arms, statement_pos))
+                        Stmt.Contract(kind, expression, statement_pos):
+                            rebind rewritten_expression: Ast::Expr, parser = parser.rewrite_handler_expression(expression, effect_name, handler_name, captures)
+                            rewritten.push(Ast::Stmt.Contract(kind, rewritten_expression, statement_pos))
+                        _:
+                            rewritten.push(statement)
+                return rewritten
+
         def prefixed_block_statement(parser: lmut Parser) -> Ast::Stmt?:
             line: u32 = parser.cursor().line
 
@@ -132,9 +260,16 @@ extend Parser:
             # (`region scratch(…):`). The leading clause keyword and the arm binding are
             # already captured above, so skip identifiers at position 0.
             clause: mutable darray[sview] = []
+            installed_effect: mutable sview = ""
+            installed_handler: mutable sview = ""
+            installed_arguments: mutable darray[Ast::Expr] = []
+            is_handler_install: mutable bool = false
+            if block_kind == "can":
+                rebind consumed_handler_clause: bool, parser = parser.consume_can_handler_clause(clause, installed_effect, installed_handler, installed_arguments)
+                is_handler_install <- consumed_handler_clause
             region_capacity_start: mutable usize = 0
             pool_capacity_start: mutable usize = 0
-            while parser.peek() != TokenKind.Eof |parser, depth: int = 0, first: bool = true|:
+            while not is_handler_install and parser.peek() != TokenKind.Eof |parser, depth: int = 0, first: bool = true|:
                 kind: TokenKind = parser.peek()
                 match kind:
                     TokenKind.LParen | TokenKind.LBracket:
@@ -203,7 +338,51 @@ extend Parser:
             is_complex_flow: bool = block_kind == "can" and any grant in clause where grant == "ComplexFlow"
             saved_complex_flow: bool = parser.in_complex_flow
             parser.in_complex_flow <- parser.in_complex_flow or is_complex_flow
-            rebind body: darray[Ast::Stmt], parser = parser.parse_block()
+            saved_effect_name: sview = parser.active_effect_name
+            saved_handler_name: sview = parser.active_handler_name
+            installed_effect_value: sview = clause[0] if is_handler_install and clause.count > 0 else ""
+            # Materialize handler captures as ordinary block locals before the
+            # handler context becomes active. Every operation call then receives
+            # an identifier, so a capture expression is evaluated exactly once
+            # per installation rather than once per operation.
+            handler_capture_bindings: mutable darray[Ast::Stmt] = []
+            handler_capture_arguments: mutable darray[Ast::Expr] = []
+            if is_handler_install:
+                for installed_argument in installed_arguments |parser, handler_capture_bindings, handler_capture_arguments|:
+                    rebind capture_name: sview, parser = parser.handler_capture_name(installed_handler, line)
+                    handler_capture_bindings.push(Ast::Stmt.VarDecl(capture_name, (Ast::Expr.Invalid), installed_argument, Ast::pos_at_line(line)))
+                    handler_capture_arguments.push(Ast::Expr.Ident(capture_name, Ast::pos_at_line(line)))
+            parser.active_effect_name <- installed_effect_value if is_handler_install
+            parser.active_handler_name <- installed_handler if is_handler_install
+            saved_handler_argument_start: usize = parser.active_handler_argument_start
+            saved_handler_argument_count: usize = parser.active_handler_argument_count
+            installed_handler_argument_start: usize = parser.active_handler_arguments.count
+            parser.active_handler_arguments <- parser.active_handler_arguments.extend(handler_capture_arguments) if is_handler_install
+            parser.active_handler_argument_start <- installed_handler_argument_start if is_handler_install
+            parser.active_handler_argument_count <- handler_capture_arguments.count if is_handler_install
+            rebind parsed_body: darray[Ast::Stmt], parser = parser.parse_block()
+            body: mutable darray[Ast::Stmt] = parsed_body
+            if is_handler_install:
+                rebind normalized_body: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(body, installed_effect_value, installed_handler, handler_capture_arguments)
+                body <- normalized_body
+                # If the inner handler is partial, a second normalization pass
+                # resolves still-abstract operations against the enclosing
+                # handler. This is compile-time forwarding: the final AST has
+                # one direct hidden call and no runtime handler chain.
+                if saved_handler_name != "" and saved_effect_name != "":
+                    fallback_arguments: mutable darray[Ast::Expr] = []
+                    fallback_index: mutable usize = saved_handler_argument_start
+                    fallback_end: usize = fallback_index + saved_handler_argument_count
+                    while fallback_index < fallback_end |parser, fallback_index, fallback_arguments|:
+                        fallback_arguments.push(parser.active_handler_arguments[fallback_index])
+                        fallback_index <- fallback_index + 1.usize()
+                    rebind forwarded_body: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(body, saved_effect_name, saved_handler_name, fallback_arguments)
+                    body <- forwarded_body
+                body <- handler_capture_bindings.extend(body) if handler_capture_bindings.count > 0.usize()
+            parser.active_effect_name <- saved_effect_name
+            parser.active_handler_name <- saved_handler_name
+            parser.active_handler_argument_start <- saved_handler_argument_start
+            parser.active_handler_argument_count <- saved_handler_argument_count
             parser.in_complex_flow <- saved_complex_flow
             parser.active_pool_depth <- parser.active_pool_depth - 1 if pool_scope
             return (Ast::Stmt.Block(block_kind, clause, binding, body, Ast::pos_at_line(line)))
