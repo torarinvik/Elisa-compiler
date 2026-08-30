@@ -11,7 +11,7 @@ pass/fail ratchet.
 
 ## 1. Apply the recorder to stage0
 
-From the stage0 checkout (`$ELISA_CORE`, default `../../Go projects/Elisa-core`):
+From the local stage0 worktree (`$ELISA_CORE`, default `../../Go projects/structpy-tree`):
 
 ```bash
 git apply /path/to/recorder.patch

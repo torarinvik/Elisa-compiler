@@ -25,7 +25,7 @@
 #
 # The FAST oracle for any future divergence is parse_report built by BOTH compilers, diffed
 # per file (<1s each, no gen2 needed) — it is what localised all of the above:
-#   REPO_ROOT=$PWD ELISACORE_BIN=~/.elisac/elisac bash test/parity/build_parse_report.sh
+#   REPO_ROOT=$PWD ELISACORE_BIN="../../Go projects/structpy-tree/compiler/bin/elisac" bash test/parity/build_parse_report.sh
 #   bash scripts/elisac_stage1.sh -o /tmp/pr.o test/breadth/parse_report.elisa
 #   clang -Wl,-dead_strip -o /tmp/pr_s1 /tmp/pr.o build/runtime/elisacore_runtime.o
 #   ./build/parse_report < F.elisa ; /tmp/pr_s1 < F.elisa

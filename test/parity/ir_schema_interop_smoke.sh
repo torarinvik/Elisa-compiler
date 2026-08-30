@@ -15,8 +15,8 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
-EC="${ELISAC:-$HOME/.elisac/elisac}"
+CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+EC="${ELISAC:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 BUILD="$ROOT/build/ir_interop"
 mkdir -p "$BUILD"
 

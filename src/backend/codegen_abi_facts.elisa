@@ -866,12 +866,12 @@ extend Backend:
                 return ast_value_needs_arena(return_value_type, structs) or return_value_type.kind == TypeKind.DArray or is_growable_container_struct(return_value_type, structs) or (return_value_type.kind == TypeKind.Struct and struct_contains_darray(return_value_type, structs))
 
 
-        # Stage0's internal ABI returns genuinely large aggregates through a hidden leading
-        # destination pointer. This is deliberately a size rule, not a kind-only shortcut:
-        # small structs (including the runtime's ordinary three-word headers) remain first-class
-        # values, while compiler state such as Ast.File and Backend.StructTable uses sret.
-        # Keep the threshold identical to stage0's aggregateMemoryClassThresholdBytes.
-        def value_type_uses_sret(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # Stage0's internal ABI passes genuinely large aggregates through memory. The same
+        # size predicate drives both directions: a return gets a hidden sret destination and
+        # an explicit parameter becomes a pointer (with byval on targets that use it). Keeping
+        # this as one fact prevents a generic specialization from agreeing on its return ABI
+        # while disagreeing on one of its bound aggregate parameters.
+        def value_type_uses_indirect_aggregate(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             aggregate: bool = value_type.kind == TypeKind.Struct or value_type.kind == TypeKind.Array or value_type.kind == TypeKind.PayloadEnum or value_type.kind == TypeKind.Optional
             return false if not aggregate
             # Do not duplicate LLVM's aggregate layout in the ABI decision. The handwritten
@@ -884,6 +884,25 @@ extend Backend:
             # ConstantInt accessor.
             aggregate_type: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
             return LLVMABISizeOfType(structs.target_data, aggregate_type) >= 1024.u64()
+
+
+        # Large source-level aggregate returns use a hidden leading destination pointer and
+        # LLVM `void` return. Keep the public helper named after that one-way ABI fact because
+        # callers use it specifically when deciding whether to materialize a result slot.
+        def value_type_uses_sret(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return value_type_uses_indirect_aggregate(value_type, structs, ctx)
+
+
+        # Materialize the pointer operand required by the internal memory-class aggregate ABI.
+        # The source expression still produces a first-class aggregate; only the call boundary
+        # changes representation. The alloca is intentionally at the current insertion point,
+        # matching stage0's caller-side byval copy and keeping this helper valid in branch arms.
+        def materialize_indirect_aggregate_argument(value: LLVMValueRef, value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            indirect: bool = value_type_uses_indirect_aggregate(value_type, structs, ctx)
+            return value if not indirect
+            slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(value_type, structs, ctx), "byval.arg")
+            _ = LLVMBuildStore(builder, value, slot)
+            return slot
 
 
             # The recursive AST hierarchy is a compiler-internal packed value. Stage0 threads
@@ -1165,9 +1184,18 @@ extend Backend:
                         match indexed_darray:
                             Expr.Ident(indexed_optional_name, indexed_optional_line):
                                 indexed_optional_type: mutable ValueType = lookup_type(local_scope, indexed_optional_name)
-                                indexed_optional_type <- optional_payload_of(indexed_optional_type, structs) if indexed_optional_type.kind == TypeKind.Optional
-                                indexed_optional_type <- ref_target_of(indexed_optional_type, structs) if indexed_optional_type.kind == TypeKind.Ref
-                                indexed_optional_type return if indexed_optional_type.kind == TypeKind.DArray
+                                # `found[0]` is also the source spelling for unwrapping an
+                                # optional reference. Only apply that special case to an
+                                # OPTIONAL binding: for an ordinary `darray[darray[T]]`, the
+                                # expression `xs[0]` is a real index and its darray type is the
+                                # ELEMENT of `xs`, not `xs` itself. Returning the outer darray
+                                # here made the emitter load a darray value where the nested
+                                # index expected an i64 element, so `xs[0][0]` declined at the
+                                # return type check.
+                                if indexed_optional_type.kind == TypeKind.Optional:
+                                    indexed_optional_type <- optional_payload_of(indexed_optional_type, structs)
+                                    indexed_optional_type <- ref_target_of(indexed_optional_type, structs) if indexed_optional_type.kind == TypeKind.Ref
+                                    indexed_optional_type return if indexed_optional_type.kind == TypeKind.DArray
                             _:
                                 pass
                         indexed_element_type: ValueType = struct_chain_type(object, local_scope, structs)
@@ -1189,6 +1217,11 @@ extend Backend:
                 match object:
                     Expr.Field(darray_inner, darray_field, darray_field_line):
                         inner_type: mutable ValueType = struct_chain_type(darray_inner, local_scope, structs)
+                        # struct_chain_type has no function table and therefore cannot see
+                        # through a call result. A darray field of a returned struct is still
+                        # an ordinary inline header; use the full typer before resolving its
+                        # address so expressions such as make_file().errors.count work.
+                        inner_type <- expression_type(darray_inner, local_scope, fns, structs, generics) if inner_type.kind == TypeKind.Unmodeled
                         inner_type <- ref_target_of(inner_type, structs) if inner_type.kind == TypeKind.Ref
                         if inner_type.kind == TypeKind.Optional:
                             inner_payload: ValueType = optional_payload_of(inner_type, structs)
@@ -2012,6 +2045,11 @@ extend Backend:
             # yielding — had no type to emit the returned value at. Defaulted, so a partial
             # Runtime literal stays valid.
             fn_return_type: mutable ValueType = unmodeled_type()
+            # A source-level `void main` is still void in the Elisa type system, but the
+            # externally visible C entry point must return an explicit i32 status. Keeping
+            # this ABI fact in the per-function runtime lets every return path (including
+            # `return helper()` and fall-through) emit the same deterministic zero value.
+            main_returns_status: mutable bool
             debug_active: mutable bool
             trace_enabled: mutable bool
 

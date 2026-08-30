@@ -34,7 +34,12 @@ close here. Prefer the parity smokes for them.
 import itertools, os, subprocess, sys, tempfile, hashlib
 
 ROOT = os.environ["REPO_ROOT"]
-S0 = os.path.expanduser("~/.elisac/elisac")
+ELISA_CORE = os.environ.get(
+    "ELISA_CORE", os.path.join(ROOT, "..", "..", "Go projects", "structpy-tree")
+)
+S0 = os.path.expanduser(
+    os.environ.get("ELISACORE_BIN", os.path.join(ELISA_CORE, "compiler", "bin", "elisac"))
+)
 WRAP = os.path.join(ROOT, "scripts/elisac_stage1.sh")
 RT = os.path.join(ROOT, "build/runtime/elisacore_runtime.o")
 STD = os.path.join(ROOT, "elisacore_std/elisacore_runtime.elisa")

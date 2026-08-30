@@ -13,7 +13,7 @@ RUN() { if command -v timeout >/dev/null 2>&1; then timeout 15 "$@"; else "$@"; 
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 
 [ -x "$ELISACORE_BIN" ] || { echo "thread_real_smoke SKIP: no elisac"; exit 0; }

@@ -13,7 +13,8 @@
 # intentionally not maintained) — see the precise glob below.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISAC="${ELISAC:-$HOME/.elisac/elisac}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+ELISAC="${ELISAC:-${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}}"
 RPT="$ROOT/build/parse_report"
 
 mkdir -p "$ROOT/build"

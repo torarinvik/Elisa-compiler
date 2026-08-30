@@ -2,7 +2,7 @@
 # Stage0/stage1 parity for a postfix numeric cast whose receiver is a value-if.
 set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$HOME/.elisac/elisac}"
+STAGE0="${ELISACORE_BIN:-$REPO_ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="$REPO_ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$REPO_ROOT/test/repro/conditional_postfix_float_cast.elisa"
 TMP_DIR="$(mktemp -d)"

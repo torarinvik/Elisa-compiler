@@ -72,10 +72,16 @@ extend Backend:
             # types in `fns`. Null when the signature is outside the modeled subset.
             #
             # Signature types are REAL now: any modeled scalar width/signedness, not just i64.
-        def declare_function(declaration: Decl, owner: sview, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def function_is_variadic(annotations: darray[Ast::EnumAnnotation]&, line: u32) -> bool can[Abort.Panic]:
+            for annotation in annotations |line|:
+                true return if annotation.owner == "__variadic" and annotation.line == line
+            return false
+
+
+        def declare_function(declaration: Decl, owner: sview, error_lines: darray[u32]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 return match declaration:
-                    Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line): declare_function_impl(function_name, params, return_type_opt, body, effects, decorators, line.line, owner, error_lines, annotation_args, fns, structs, generics, m, ctx)
+                    Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line): declare_function_impl(function_name, params, return_type_opt, body, effects, decorators, line.line, owner, function_is_variadic(annotations, line.line), error_lines, annotation_args, fns, structs, generics, m, ctx)
                     _: zeroed
 
 
@@ -106,7 +112,11 @@ extend Backend:
         def declared_parameter_llvm_types(declared_param_types: darray[ValueType], arena_count: usize, wants_store: bool, sret_return: bool, structs: mutable StructTable&, ctx: LLVMContextRef) -> darray[LLVMTypeRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             llvm_param_types: mutable darray[LLVMTypeRef] = []
             llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if sret_return
-            llvm_param_types.extend([llvm_type_of(declared_param_type, structs, ctx) for declared_param_type in declared_param_types])
+            for declared_param_type in declared_param_types |llvm_param_types, structs, ctx|:
+                if value_type_uses_indirect_aggregate(declared_param_type, structs, ctx):
+                    llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0))
+                else:
+                    llvm_param_types.push(llvm_type_of(declared_param_type, structs, ctx))
             if wants_store:
                 ast_store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: 0}
                 llvm_param_types.push(llvm_type_of(ast_store_type, structs, ctx))
@@ -115,12 +125,12 @@ extend Backend:
             return llvm_param_types
 
 
-        def add_declared_function_with_params(fn_name: cstr, params_pointer: void&?, total_params: u32, llvm_return: LLVMTypeRef, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            fn_type: LLVMTypeRef = LLVMFunctionType(llvm_return, params_pointer, total_params, 0)
+        def add_declared_function_with_params(fn_name: cstr, params_pointer: void&?, total_params: u32, variadic: bool, llvm_return: LLVMTypeRef, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fn_type: LLVMTypeRef = LLVMFunctionType(llvm_return, params_pointer, total_params, 1 if variadic else 0)
             return LLVMAddFunction(m, fn_name, fn_type)
 
 
-        def build_declared_function(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, overload_count: i64, force_ast_store: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def build_declared_function(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, overload_count: i64, force_ast_store: bool, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             name_storage: mutable darray[u8] = []
             # A method declared inside `impl I for C:` is emitted as `__impl__I__C__method`,
             # which is what stage0 names it. Only the EMITTED SYMBOL changes: the FnTable
@@ -151,6 +161,12 @@ extend Backend:
             llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
             llvm_return <- LLVMInt32TypeInContext(ctx) if is_error_fn
             llvm_return <- LLVMVoidTypeInContext(ctx) if sret_return
+            # `main` is a C ABI entry point even when its Elisa return type is `void`.
+            # A C process entry point must return an integer status; leaving it as LLVM
+            # `void` makes crt0 observe an arbitrary register value, which surfaced as
+            # stage1-only exit-code drift under optimization. The FnTable remains `void`
+            # so source-level calls and type checking keep Elisa semantics.
+            llvm_return <- LLVMInt32TypeInContext(ctx) if owner == "" and function_name == "main" and return_value_type.kind == TypeKind.Void and not is_error_fn and not sret_return
             # A set with a PAYLOAD-carrying variant returns the `%ErrSet__E` struct instead of
             # the bare i32 code — stage0's ABI, measured. A fieldless set keeps the i32, which
             # is every error set in this compiler's own source, so self-hosting is untouched.
@@ -161,14 +177,19 @@ extend Backend:
             params_pointer: mutable void&? = null
             if llvm_param_types.count > 0:
                 params_pointer <- (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
-            handle: LLVMValueRef = add_declared_function_with_params(fn_name, params_pointer, llvm_param_types.count.u32(), llvm_return, m, ctx)
+            handle: LLVMValueRef = add_declared_function_with_params(fn_name, params_pointer, llvm_param_types.count.u32(), variadic, llvm_return, m, ctx)
             apply_function_decorators(handle, decorators, annotation_args, true, ctx)
             add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx) if sret_return
+            declared_param_base: u32 = (1 if is_error_fn else 0) + (1 if sret_return else 0)
+            for declared_param_index in 0..<declared_param_types.count |declared_param_base, declared_param_types, structs, ctx, handle|:
+                declared_param_type: ValueType = declared_param_types[declared_param_index]
+                if value_type_uses_indirect_aggregate(declared_param_type, structs, ctx):
+                    add_type_parameter_attribute(handle, declared_param_base + declared_param_index.u32() + 1, "byval", llvm_type_of(declared_param_type, structs, ctx), ctx)
             apply_noalias_parameter_attributes(handle, params, 1 + (1 if is_error_fn else 0) + (1 if sret_return else 0), structs, ctx)
             return handle
 
 
-        def declare_function_from_types(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, force_ast_store: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_function_from_types(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, force_ast_store: bool, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 overload_count: mutable i64 = 0
                 for oi in 0..<fns.names.count |oi, fns, owner, function_name, overload_count|:
@@ -180,7 +201,7 @@ extend Backend:
                 signature_arena_slots <- signature_arena_slots + 1.usize() if error_set_payload_needs_arena(structs, declaration_error_set_name)
                 arena_count: usize = frontend_arena_count(owner, function_name, signature_arena_slots, wants_store)
                 is_error_fn: bool = line_is_error_returning(error_lines, line)
-                handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, overload_count, force_ast_store, error_lines, annotation_args, structs, m, ctx)
+                handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, overload_count, force_ast_store, variadic, error_lines, annotation_args, structs, m, ctx)
                 fns.names <- fns.names.push(function_name)
                 fns.lines <- fns.lines.push(line)
                 fns.owners <- fns.owners.push(owner)
@@ -189,7 +210,7 @@ extend Backend:
                 fns.needs_store <- fns.needs_store.push(wants_store)
                 fns.is_error <- fns.is_error.push(is_error_fn)
                 fns.returns_nullable <- fns.returns_nullable.push(false)
-                fns.is_variadic <- fns.is_variadic.push(false)
+                fns.is_variadic <- fns.is_variadic.push(variadic)
                 fns.handles <- fns.handles.push(handle)
                 fns.returns <- fns.returns.push(return_value_type)
                 fns.param_start <- fns.param_start.push(fns.param_types.count)
@@ -204,7 +225,7 @@ extend Backend:
                 return handle
 
 
-        def declare_function_impl(function_name: sview, params: darray[ParamDecl], return_type_opt: Expr?, body: darray[Stmt], effects: darray[sview], decorators: darray[Ast::Annotation], line: u32, owner: sview, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_function_impl(function_name: sview, params: darray[ParamDecl], return_type_opt: Expr?, body: darray[Stmt], effects: darray[sview], decorators: darray[Ast::Annotation], line: u32, owner: sview, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if true:
                 # The owning module, for the whole of this SIGNATURE's resolution. Set here as
                 # well as in emit_function_body: a module member's return and parameter types
@@ -244,7 +265,7 @@ extend Backend:
                     # resolves nothing further from a bare name, and leaving it set past the
                     # return would carry this module into the next declaration.
                     structs.current_owner <- declared_owner_saved
-                    return declare_function_from_types(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, statements_mention_ast_store_call(body, structs), error_lines, annotation_args, fns, structs, m, ctx)
+                    return declare_function_from_types(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, statements_mention_ast_store_call(body, structs), variadic, error_lines, annotation_args, fns, structs, m, ctx)
 
                 structs.current_owner <- declared_owner_saved
                 return null
@@ -817,6 +838,7 @@ extend Backend:
                 # `return` from inside an expression (a terminating `catch` arm) has a type to
                 # emit the returned value at.
                 local_runtime.fn_return_type <- copied_type(return_value_type)
+                local_runtime.main_returns_status <- owner == "" and function_name == "main" and return_value_type.kind == TypeKind.Void and not fn_is_error and not sret_return
                 # The hidden-parameter ABI is whatever the DECLARATION built the LLVM function
                 # type with — read it back rather than recomputing it.
                 #
@@ -847,7 +869,7 @@ extend Backend:
                 # an `arena_free` dependency just because the old bootstrap emitter wrapped
                 # every function uniformly.
                 needs_auto_region: mutable bool = auto_region_statements_need_arena(body, fns, structs, generics)
-                local_packed_store_root: i64 = auto_region_statements_packed_store_root(body, structs)
+                local_packed_store_root: i64 = auto_region_statements_packed_store_root(body, fns, structs)
                 # A hidden AST store normally arrives with its own arena in the store
                 # value. Store-aware helpers therefore do not acquire a carrier merely
                 # because their ABI carries a store; actual packed constructors and the
@@ -970,7 +992,10 @@ extend Backend:
                     source_parameter_index: u32 = parameter_index - leading_param_offset
                     name_storage: mutable darray[u8] = []
                     slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(parameter_type, structs, ctx), sview_to_cstr(parameter.name, name_storage))
-                    _ = LLVMBuildStore(builder, LLVMGetParam(fn, parameter_index), slot)
+                    parameter_value: mutable LLVMValueRef = LLVMGetParam(fn, parameter_index)
+                    if value_type_uses_indirect_aggregate(parameter_type, structs, ctx):
+                        parameter_value <- LLVMBuildLoad2(builder, llvm_type_of(parameter_type, structs, ctx), parameter_value, "byval.param")
+                    _ = LLVMBuildStore(builder, parameter_value, slot)
                     declare_local(local_scope, parameter.name, slot, parameter_type)
                     has_parameter_region: bool = function_region_row >= 0 and fns.param_start[function_region_row.usize()] + source_parameter_index.usize() < fns.param_region_slots.count and fns.param_region_slots[fns.param_start[function_region_row.usize()] + source_parameter_index.usize()]
                     if has_parameter_region:
@@ -1007,7 +1032,7 @@ extend Backend:
                     false return if not emit_deferred_actions(local_scope, false, fns, structs, generics, local_runtime, m, ctx, builder)
                     emit_region_free(local_runtime, builder)
                     # A `void error[E]` fn that runs off the end succeeds — return the 0 code.
-                    if fn_is_error:
+                    if fn_is_error or local_runtime.main_returns_status:
                         _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0))
                     else:
                         _ = LLVMBuildRetVoid(builder)

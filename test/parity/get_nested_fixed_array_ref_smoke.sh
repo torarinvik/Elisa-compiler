@@ -3,7 +3,7 @@
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 FIX="$ROOT/test/repro/get_nested_array_ref.elisa"
 

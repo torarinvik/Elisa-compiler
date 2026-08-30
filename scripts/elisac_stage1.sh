@@ -23,7 +23,11 @@ ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
 fi
-STAGE0_BIN="${ELISACORE_BIN:-${HOME}/.elisac/elisac}"
+# Never silently seed stage1 with the installed compiler. Callers can pin a
+# particular local stage0 with ELISACORE_BIN; otherwise use the compiler/bin
+# artifact in the selected ELISA_CORE source tree.
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 # Include expansion is a host-side Python step. Resolve the same interpreter selected by
 # `PYTHON_BIN` (including a command name such as `python3.14`) before any emit mode runs so
 # custom toolchains are honored consistently by the wrapper and its recursive invocations.
@@ -157,7 +161,7 @@ terminate_guarded_pid() {
 }
 
 seed_build() {
-  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output
+  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object
   # The EXIT trap runs after this function's locals have gone out of scope under
   # `set -u`; retain the private lock path in a function-external variable so a
   # successful high-memory seed always releases its lock without an unbound-var exit.
@@ -222,10 +226,19 @@ seed_build() {
   # to the final path and publish it with one same-filesystem rename after the complete image is
   # ready.
   seed_output="${BIN}.tmp.$$"
+  # The stage0 compiler also writes a large object. Publish that object atomically too:
+  # a concurrent stage1 invocation must never observe a truncated object while the guarded
+  # seed is still running. Keeping the temporary name private also makes an RSS-guarded
+  # termination recoverable without leaving a misleading apparently-valid artifact.
+  seed_object="$ROOT/build/elisac_stage1.o.tmp.$$"
   ELISA_SEED_OUTPUT="$seed_output"
+  ELISA_SEED_OBJECT="$seed_object"
   cleanup_seed_lock() {
     if [[ -n "${ELISA_SEED_OUTPUT:-}" ]]; then
       rm -f "$ELISA_SEED_OUTPUT"
+    fi
+    if [[ -n "${ELISA_SEED_OBJECT:-}" ]]; then
+      rm -f "$ELISA_SEED_OBJECT"
     fi
     rm -f "$ELISA_SEED_LOCK_DIR/pid"
     rmdir "$ELISA_SEED_LOCK_DIR" 2>/dev/null || true
@@ -258,7 +271,7 @@ seed_build() {
       exit 2
       ;;
   esac
-  "$STAGE0_BIN" -emit obj "$seed_opt_level" -o "$ROOT/build/elisac_stage1.o" "$ROOT/src/driver/elisac.elisa" &
+  "$STAGE0_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
   seed_pid=$!
   seed_peak_rss_kb=0
   while kill -0 "$seed_pid" 2>/dev/null; do
@@ -291,8 +304,9 @@ seed_build() {
   # the compiler itself and are provided only when linking an executable/runtime
   # consumer.  Dead-strip those sections here, matching the other self-host
   # product links, instead of requiring unrelated host runtime symbols.
-  "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$seed_output" "$ROOT/build/elisac_stage1.o" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
+  "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$seed_output" "$seed_object" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
   mv -f "$seed_output" "$BIN"
+  mv -f "$seed_object" "$ROOT/build/elisac_stage1.o"
   ELISA_SEED_OUTPUT=""
   echo "seed: wrote $BIN" >&2
 }

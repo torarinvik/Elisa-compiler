@@ -542,18 +542,26 @@ extend Backend:
                     if return_type_opt is return_type:
                         return_value_type <- annotation_value_type(return_type, structs)
                     llvm_params: mutable darray[LLVMTypeRef] = []
+                    resolved_param_types: mutable darray[ValueType] = []
                     declined: mutable bool = false
-                    for parameter in params |llvm_params, declined, structs, ctx|:
+                    for parameter in params |llvm_params, resolved_param_types, declined, structs, ctx|:
                         parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
+                        resolved_param_types.push(copied_type(parameter_type))
                         if parameter_type.kind == TypeKind.Unmodeled:
                             declined <- true
+                        elif value_type_uses_indirect_aggregate(parameter_type, structs, ctx):
+                            llvm_params.push(LLVMPointerTypeInContext(ctx, 0))
                         else:
                             llvm_params.push(llvm_type_of(parameter_type, structs, ctx))
 
                     # The arena/error ABI must match emit_function_body's param layout for the
                     # instantiation body: `[out-param if error], <declared params>, [arena if
-                    # the signature grows a container]`, and an error fn returns i32.
+                    # the signature grows a container]`, and an error fn returns i32. Large
+                    # aggregate results use the same leading sret slot as ordinary functions;
+                    # omitting it here leaves the handle with an aggregate return type while
+                    # emit_function_body treats param 0 as the destination and returns void.
                     instantiation_is_error: bool = generics.is_error[slot]
+                    instantiation_sret: bool = not instantiation_is_error and value_type_uses_sret(return_value_type, structs, ctx)
                     instantiation_needs_arena: bool = signature_needs_arena(params, return_value_type, structs)
                     pop_type_bindings(structs, bound)
                     null return if declined or return_value_type.kind == TypeKind.Unmodeled
@@ -563,8 +571,10 @@ extend Backend:
                     mangled: cstr = mangled_name_multi_into(base, type_args, mangled_slot_suffix, structs, name_storage)
                     llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
                     llvm_return <- LLVMInt32TypeInContext(ctx) if instantiation_is_error
+                    llvm_return <- LLVMVoidTypeInContext(ctx) if instantiation_sret
                     full_params: mutable darray[LLVMTypeRef] = []
                     full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_is_error
+                    full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_sret
                     full_params.extend(llvm_params)
                     full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_needs_arena
                     fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
@@ -572,6 +582,12 @@ extend Backend:
                         params_pointer: void& = (&full_params[0]).cast[void&] can Unsafe.PointerCast
                         fn_type <- LLVMFunctionType(llvm_return, params_pointer, full_params.count.u32(), 0)
                     handle: LLVMValueRef = LLVMAddFunction(m, mangled, fn_type)
+                    add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx) if instantiation_sret
+                    inst_param_base: u32 = (1 if instantiation_is_error else 0) + (1 if instantiation_sret else 0)
+                    for inst_param_index in 0..<resolved_param_types.count |inst_param_base, resolved_param_types, structs, ctx, handle|:
+                        inst_param_type: ValueType = resolved_param_types[inst_param_index]
+                        if value_type_uses_indirect_aggregate(inst_param_type, structs, ctx):
+                            add_type_parameter_attribute(handle, inst_param_base + inst_param_index.u32() + 1, "byval", llvm_type_of(inst_param_type, structs, ctx), ctx)
 
                     inst_arg_start: usize = generics.inst_args.count
                     for argument in type_args |generics|:
@@ -627,8 +643,15 @@ extend Backend:
 
             # The IR name for a call's result. A VOID call must be UNNAMED — LLVM rejects
             # "instructions returning void cannot have a name".
-        def call_result_name(return_type: ValueType) -> cstr:
-            return "" if return_type.kind == TypeKind.Void else "call"
+        def call_result_name(return_type: ValueType, sret_return: bool) -> cstr:
+            # A large aggregate is lowered as `void (ptr sret, ...)`, even though the
+            # source-level return type is the aggregate. Passing "call" to LLVMBuildCall2
+            # in that case creates a named void instruction. LLVM's textual printer emits
+            # invalid IR (`%call = call void ...`), while the object path can silently assign
+            # a different ABI register layout between compiler generations. Keep this rule
+            # next to the source-level void rule so every call emitter uses the ABI return
+            # shape rather than guessing from ValueType alone.
+            return "" if sret_return or return_type.kind == TypeKind.Void else "call"
 
         # Emit a call to a generic function, instantiating on first use.
         # Whether a generic INSTANTIATION threads an arena — the same predicate
