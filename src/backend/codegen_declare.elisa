@@ -148,7 +148,14 @@ extend Backend:
             impl_symbol: mutable bool = impl_member_symbol(structs, function_name, line, impl_storage)
             impl_symbol <- constructor_symbol(structs, function_name, return_value_type, line, impl_storage) if not impl_symbol
             impl_storage.push(0) if impl_symbol
-            fn_name: cstr = (&impl_storage[0]).cast[cstr] can Unsafe.PointerCast if impl_symbol else declared_function_name(owner, function_name, overload_count, params.count, name_storage)
+            # Keep the two name paths as an explicit branch. The stage1 bootstrap emitter
+            # historically dropped the call-valued `else` arm of a conditional initializer,
+            # which passed a null name to LLVMAddFunction in gen2 for ordinary functions.
+            fn_name: mutable cstr = ""
+            if impl_symbol:
+                fn_name <- (&impl_storage[0]).cast[cstr] can Unsafe.PointerCast
+            else:
+                fn_name <- declared_function_name(owner, function_name, overload_count, params.count, name_storage)
             wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store or params_include_packed_ast(declared_param_types, structs)
             is_error_fn: bool = line_is_error_returning(error_lines, line)
             sret_return: bool = not is_error_fn and value_type_uses_sret(return_value_type, structs, ctx)
@@ -334,6 +341,16 @@ extend Backend:
                     16 return if ctype == "pthread_once_t"
             return -1
 
+
+        # Typed non-call externs retain only a bare head in Decl.Extern. Resolve the full
+        # annotation captured by the parser when one is available, so generic containers and
+        # nested fixed arrays get the same ValueType as an ordinary declaration.
+        def extern_global_value_type(name: sview, names: darray[sview]&, expressions: darray[Expr]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<names.count |name, expressions, structs|:
+                if names[index] == name and index < expressions.count:
+                    return annotation_value_type(expressions[index], structs)
+            return unmodeled_type()
+
         # EARLY pass: register the `[size x i8]` alias for every inline-storage `@c_opaque` extern
         # BEFORE struct bodies resolve (set_struct_bodies_from_metadata), so a struct FIELD of the
         # opaque type gets its real size, not the 8-byte handle. Without this the alias is only
@@ -486,7 +503,7 @@ extend Backend:
             return ValueType{kind: TypeKind.Struct, bits: found_index.u32()}
 
 
-        def declare_extern(declaration: Decl, extern_params: darray[ExternParam]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, return_is_pointer: bool, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def declare_extern(declaration: Decl, extern_params: darray[ExternParam]&, extern_global_type_names: darray[sview]&, extern_global_type_exprs: darray[Expr]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, return_is_pointer: bool, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
                 # `export pymodule NAME:` is a frontend-only export contract. Its declaration
                 # node is deliberately an Extern for AST compatibility, but it must not become
@@ -525,6 +542,8 @@ extend Backend:
                     export_global_target: sview = export_global_target_of(annotations, extern_name)
                     true return if export_global_target != ""
                     global_type: mutable ValueType = scalar_type_of_name(return_type_name)
+                    full_global_type: ValueType = extern_global_value_type(extern_name, extern_global_type_names, extern_global_type_exprs, structs)
+                    global_type <- full_global_type if full_global_type.kind != TypeKind.Unmodeled
                     global_type <- ValueType{kind: TypeKind.CStr, bits: 0} if return_type_name == "cstr"
                     # Typed non-call externs retain only the bare head in the compact
                     # declaration (`extern stderr: void&` becomes `void`). A bare `void`
@@ -650,6 +669,26 @@ extend Backend:
                         if param_value_type.kind == TypeKind.Unmodeled:
                             opaque_alias: i64 = alias_index_of(structs, param_name)
                             param_value_type <- copied_type(structs.alias_types[opaque_alias.usize()]) if opaque_alias >= 0 else param_value_type
+                        # A C callback parameter is recorded by the compact extern scanner as
+                        # the head `fn`; its full signature lives in the source only, and the
+                        # LLVM ABI still needs a pointer-shaped function value. An extern may
+                        # also use a named `type Callback = fn(...) -> R` alias. Resolve both
+                        # before treating the parameter as unsupported. A generic Fn is enough
+                        # at this boundary: LLVM represents every function value as `ptr`, while
+                        # direct calls use the argument expression's own signature.
+                        if param_value_type.kind == TypeKind.Unmodeled and param_name == "fn":
+                            param_value_type <- ValueType{kind: TypeKind.Fn, bits: 0}
+                        # The compact extern scanner also preserves a complete function-type
+                        # expression when available. Resolve it through the same fn pool used by
+                        # ordinary typed parameters so nested reference ABI facts (for example
+                        # `fn(Item&) -> void`) reach call-site argument coercion.
+                        extern_fn_type_line: u32 = extern_params[param_start.usize() + offset].fn_type_line
+                        if extern_fn_type_line > 0:
+                            resolved_extern_fn_type: ValueType = annotation_lambda_value_type(extern_fn_type_line.i64(), extern_params[param_start.usize() + offset].fn_type_param_count.usize(), structs)
+                            param_value_type <- resolved_extern_fn_type if resolved_extern_fn_type.kind == TypeKind.Fn
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            callback_alias: i64 = alias_index_of(structs, param_name)
+                            param_value_type <- copied_type(structs.alias_types[callback_alias.usize()]) if callback_alias >= 0
                         # A CONST ENUM parameter denotes its backing scalar — the same rule
                         # annotation_value_type applies for an ORDINARY function, which is
                         # why `def w(fd: FD)` resolved and `extern w(fd: FD)` did not. That
@@ -803,6 +842,8 @@ extend Backend:
         # Emit the body of an already-declared function. False = declined.
         def emit_function_body(declaration: Decl, owner: sview, fn: LLVMValueRef, error_lines: darray[u32]&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                structs.decline_line <- 0
+                structs.decline_kind <- ""
                 # Record the owning module for the whole of this body's emission, so a bare
                 # sibling call inside `module M:` can resolve to M's own member. Set on every
                 # function, "" included, so it never carries a stale owner from the previous

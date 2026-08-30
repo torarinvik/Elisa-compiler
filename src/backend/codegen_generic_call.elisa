@@ -390,8 +390,14 @@ extend Backend:
                     callee_declared_type <- lookup_type(local_scope, callee_lookup_name)
                 _:
                     pass
+            if callee_declared_type.kind == TypeKind.Optional:
+                optional_callee_payload: ValueType = optional_payload_of(callee_declared_type, structs)
+                callee_declared_type <- optional_callee_payload if optional_callee_payload.kind == TypeKind.Fn
             if callee_declared_type.kind != TypeKind.Fn:
                 callee_declared_type <- expression_type(callee, local_scope, fns, structs, generics)
+            if callee_declared_type.kind == TypeKind.Optional:
+                optional_expression_payload: ValueType = optional_payload_of(callee_declared_type, structs)
+                callee_declared_type <- optional_expression_payload if optional_expression_payload.kind == TypeKind.Fn
             # The result type: the fn value's own DECLARED return type (from its Fn signature)
             # is authoritative and works even in argument position (`f(f(x))`); fall back to the
             # call site's EXPECTED type when the signature carries no return (older Fn{bits:0}).
@@ -399,8 +405,15 @@ extend Backend:
             if callee_declared_type.kind == TypeKind.Fn:
                 declared_return <- fn_return_type_of(callee_declared_type, structs)
             result_type: ValueType = declared_return if declared_return.kind != TypeKind.Unmodeled else expected
-            null return if result_type.kind == TypeKind.Void or result_type.kind == TypeKind.Unmodeled or result_type.kind == TypeKind.Fn
-            return_llvm: LLVMTypeRef = llvm_type_of(result_type, structs, ctx)
+            null return if result_type.kind == TypeKind.Unmodeled or result_type.kind == TypeKind.Fn
+            # A function-valued C callback may return void (`hooks.deallocate(p)`). There is
+            # no result slot to merge in that case, but the raw/closure dispatch still needs a
+            # common continuation so both paths remain valid CFG. Return a private i1 token to
+            # the expression dispatcher solely as a success signal; statement callers discard
+            # it. Value-position void expressions are rejected by the semantic layer, so this
+            # token cannot escape as a language value.
+            is_void_result: bool = result_type.kind == TypeKind.Void
+            return_llvm: LLVMTypeRef = LLVMVoidTypeInContext(ctx) if is_void_result else llvm_type_of(result_type, structs, ctx)
             fn_pointer_opt: LLVMValueRef? = emit_expression(callee, ValueType{kind: TypeKind.Fn, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             fn_pointer: mutable LLVMValueRef = zeroed
             got_fn_pointer: mutable bool = false
@@ -445,7 +458,8 @@ extend Backend:
             # CLOSURE path is unaffected — it always prepends the env, so its arrays are non-empty.
             raw_dummy_type: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
             raw_dummy_value: mutable darray[LLVMValueRef] = [fn_pointer]
-            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, return_llvm, "fnval.result")
+            result_slot: mutable LLVMValueRef = zeroed
+            result_slot <- LLVMBuildAlloca(builder, return_llvm, "fnval.result") if not is_void_result
             fn_integer: LLVMValueRef = LLVMBuildPtrToInt(builder, fn_pointer, int64_type, "fnval.int")
             fn_tag: LLVMValueRef = LLVMBuildAnd(builder, fn_integer, LLVMConstInt(int64_type, 1, 0), "fnval.tag")
             is_closure: LLVMValueRef = LLVMBuildICmp(builder, 33, fn_tag, LLVMConstInt(int64_type, 0, 0), "fnval.is_closure")
@@ -459,8 +473,11 @@ extend Backend:
             raw_types_pointer: void& = (&argument_llvm_types[0]).cast[void&] can Unsafe.PointerCast if argument_count > 0 else (&raw_dummy_type[0]).cast[void&] can Unsafe.PointerCast
             raw_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, raw_types_pointer, argument_count.u32(), 0)
             raw_args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast if argument_count > 0 else (&raw_dummy_value[0]).cast[void&] can Unsafe.PointerCast
-            raw_result: LLVMValueRef = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, argument_count.u32(), "fnval.raw.call")
-            _ = LLVMBuildStore(builder, raw_result, result_slot)
+            if is_void_result:
+                _ = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, argument_count.u32(), "fnval.raw.call")
+            else:
+                raw_result: LLVMValueRef = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, argument_count.u32(), "fnval.raw.call")
+                _ = LLVMBuildStore(builder, raw_result, result_slot)
             _ = LLVMBuildBr(builder, merge_block)
             # CLOSURE: unmask (bit0 is known set here, so `- 1` clears it), load {code, env},
             # and call `code(env, args…)`.
@@ -481,11 +498,14 @@ extend Backend:
             closure_types_pointer: void& = (&closure_arg_types[0]).cast[void&] can Unsafe.PointerCast
             closure_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, closure_types_pointer, (argument_count + 1).u32(), 0)
             closure_args_pointer: void& = (&closure_arg_values[0]).cast[void&] can Unsafe.PointerCast
-            closure_result: LLVMValueRef = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, (argument_count + 1).u32(), "fnval.closure.call")
-            _ = LLVMBuildStore(builder, closure_result, result_slot)
+            if is_void_result:
+                _ = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, (argument_count + 1).u32(), "fnval.closure.call")
+            else:
+                closure_result: LLVMValueRef = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, (argument_count + 1).u32(), "fnval.closure.call")
+                _ = LLVMBuildStore(builder, closure_result, result_slot)
             _ = LLVMBuildBr(builder, merge_block)
             LLVMPositionBuilderAtEnd(builder, merge_block)
-            return LLVMBuildLoad2(builder, return_llvm, result_slot, "fnval.merged")
+            return LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0) if is_void_result else LLVMBuildLoad2(builder, return_llvm, result_slot, "fnval.merged")
 
 
         def emit_dict_method_call(base: sview, full_type_args: darray[ValueType]&, receiver: Expr, arguments: darray[Expr]&, arena_leading: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:

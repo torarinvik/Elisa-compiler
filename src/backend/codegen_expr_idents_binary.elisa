@@ -53,14 +53,31 @@ extend Backend:
                 # global, no load, just the folded value at the const's own type. Checked
                 # only when the name is not a local, so a local still shadows it.
                 if ident_type.kind == TypeKind.Unmodeled:
-                    extern_global_index: i64 = extern_global_index_of(structs, ident_name)
-                    if extern_global_index >= 0:
-                        extern_global_type: ValueType = copied_type(structs.extern_global_types[extern_global_index.usize()])
-                        return LLVMBuildLoad2(builder, llvm_type_of(extern_global_type, structs, ctx), structs.extern_global_handles[extern_global_index.usize()], "extern.global")
+                    # A project may contain both `extern T x` from a header and
+                    # the real `T x` definition from another translation unit.
+                    # The definition is the canonical ABI/type source; looking
+                    # at the extern row first makes incomplete arrays and other
+                    # declaration-only shapes shadow the actual global.
                     mutable_global_index: i64 = mutable_global_index_of(structs, ident_name)
                     if mutable_global_index >= 0:
                         mutable_global_type: ValueType = copied_type(structs.mutable_global_types[mutable_global_index.usize()])
+                        if expected.kind == TypeKind.Ref:
+                            mutable_global_target: ValueType = ref_target_of(expected, structs)
+                            if mutable_global_target.kind == mutable_global_type.kind and mutable_global_target.bits == mutable_global_type.bits:
+                                mutable_global_offsets: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)]
+                                mutable_global_offsets_pointer: void& = (&mutable_global_offsets[0]).cast[void&] can Unsafe.PointerCast
+                                return LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), structs.mutable_global_handles[mutable_global_index.usize()], mutable_global_offsets_pointer, 1, "global.ref")
                         return LLVMBuildLoad2(builder, llvm_type_of(mutable_global_type, structs, ctx), structs.mutable_global_handles[mutable_global_index.usize()], "global")
+                    extern_global_index: i64 = extern_global_index_of(structs, ident_name)
+                    if extern_global_index >= 0:
+                        extern_global_type: ValueType = copied_type(structs.extern_global_types[extern_global_index.usize()])
+                        if expected.kind == TypeKind.Ref:
+                            extern_global_target: ValueType = ref_target_of(expected, structs)
+                            if extern_global_target.kind == extern_global_type.kind and extern_global_target.bits == extern_global_type.bits:
+                                extern_global_offsets: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)]
+                                extern_global_offsets_pointer: void& = (&extern_global_offsets[0]).cast[void&] can Unsafe.PointerCast
+                                return LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), structs.extern_global_handles[extern_global_index.usize()], extern_global_offsets_pointer, 1, "extern.global.ref")
+                        return LLVMBuildLoad2(builder, llvm_type_of(extern_global_type, structs, ctx), structs.extern_global_handles[extern_global_index.usize()], "extern.global")
                     const_index: i64 = const_index_of(structs, ident_name)
                     if const_index >= 0 and structs.const_resolved[const_index.usize()]:
                         const_type: ValueType = copied_type(structs.const_types[const_index.usize()])
@@ -111,6 +128,17 @@ extend Backend:
                         if ref_target.kind == expected.kind and ref_target.bits == expected.bits:
                             ref_pointer: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), slot, "ref.ptr")
                             return LLVMBuildLoad2(builder, llvm_type_of(ref_target, structs, ctx), ref_pointer, "ref.value")
+                        # C expressions routinely read through a pointer into a wider or
+                        # narrower scalar destination (`i32 *p` assigned to `i64`, or a
+                        # `double *` assigned to an integer field).  The old path only
+                        # accepted an exact target type, so the otherwise ordinary load was
+                        # reported as an unmodeled expression.  Load the pointee once and use
+                        # the same numeric conversion used by calls and binary operands.
+                        if is_numeric_type(ref_target) and is_numeric_type(expected):
+                            ref_pointer: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), slot, "ref.ptr")
+                            ref_loaded: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(ref_target, structs, ctx), ref_pointer, "ref.value")
+                            if emit_conversion(ref_loaded, ref_target, expected, structs, ctx, builder) is ref_converted:
+                                return ref_converted
                     # An OPTIONAL-REF local used where its ref PAYLOAD is expected UNWRAPS it:
                     # extract the payload pointer (field 1 of `{i1, ptr}`). The std does this
                     # right after `assert opt != null` (`items: Bucket& = m.items`); presence is
@@ -121,6 +149,12 @@ extend Backend:
                             optional_ref_llvm: LLVMTypeRef = llvm_type_of(ident_type, structs, ctx)
                             optional_ref_loaded: LLVMValueRef = LLVMBuildLoad2(builder, optional_ref_llvm, slot, "unwrap.opt")
                             return optional_payload_value_of(optional_ref_loaded, ident_type, structs, ctx, builder)
+                    # A flow-proven optional function value uses the pointer niche: loading the
+                    # optional already yields the callable pointer, so unwrapping is representation-free.
+                    if ident_type.kind == TypeKind.Optional and expected.kind == TypeKind.Fn:
+                        optional_fn_payload: ValueType = optional_payload_of(ident_type, structs)
+                        if optional_fn_payload.kind == TypeKind.Fn:
+                            return LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "unwrap.opt.fn")
                     # A proven-present optional packed AST handle is likewise passed as its
                     # bare i32 store index when a recursive packed payload expects `Expr`.
                     if ident_type.kind == TypeKind.Optional and expected.kind == TypeKind.PackedEnum:
@@ -141,7 +175,17 @@ extend Backend:
                             return LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "cstr.as.ref")
                         null return if ref_target_of(expected, structs).kind != ident_type.kind
                         return slot
-                    return LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "load")
+                    loaded_ident: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(ident_type, structs, ctx), slot, "load")
+                    # A local identifier is the one expression path that historically returned
+                    # its storage type verbatim.  That made `i32_field <- f64_local` build an
+                    # invalid store while equivalent call/field expressions were converted.
+                    # Keep representation-identical values untouched, but honor a concrete
+                    # numeric destination for ordinary scalar locals.
+                    if expected.kind != TypeKind.Unmodeled and is_numeric_type(ident_type) and is_numeric_type(expected) and (ident_type.kind != expected.kind or ident_type.bits != expected.bits):
+                        if emit_conversion(loaded_ident, ident_type, expected, structs, ctx, builder) is converted_ident:
+                            return converted_ident
+                        return null
+                    return loaded_ident
                 return null
             if expression is Expr.Paren(paren_inner, paren_line):
                 return emit_expression(paren_inner, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
@@ -215,6 +259,17 @@ extend Backend:
                                 # 32 = EQ, 33 = NE.
                                 null_pointer_predicate: i32 = 32 if null_operator == TokenKind.EqEq else 33
                                 return LLVMBuildICmp(builder, null_pointer_predicate, null_pointer_value, LLVMConstNull(null_pointer_llvm), "nullcmp.ptr")
+                            return null
+                        # A callback value is also represented as one opaque LLVM pointer.
+                        # `fn(T) -> U` has no optional tag, so a C-style callback guard such
+                        # as `if callback != null:` belongs to the same raw-pointer family as
+                        # `void& != null`, rather than the tagged Optional branch below.
+                        if null_optional_type.kind == TypeKind.Fn:
+                            if emit_expression(optional_operand, null_optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is null_fn_value:
+                                null_fn_llvm: LLVMTypeRef = llvm_type_of(null_optional_type, structs, ctx)
+                                # 32 = EQ, 33 = NE.
+                                null_fn_predicate: i32 = 32 if null_operator == TokenKind.EqEq else 33
+                                return LLVMBuildICmp(builder, null_fn_predicate, null_fn_value, LLVMConstNull(null_fn_llvm), "nullcmp.fn")
                             return null
                         null return if null_optional_type.kind != TypeKind.Optional
                         if emit_expression(optional_operand, null_optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is null_optional_value:

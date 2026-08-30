@@ -75,19 +75,48 @@ extend Backend:
                                     soa_read_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(soa_read_element, structs, ctx), soa_read_address, "soa.row.value")
                                     return emit_conversion(soa_read_value, soa_read_element, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != soa_read_element.kind or expected.bits != soa_read_element.bits) else soa_read_value
                             return null
+                # `items[slot].state` where `items: Bucket[K, T]&` is a generic pointer local.
+                # The ordinary chain resolver handles the same shape for a direct parameter, but
+                # a monomorphized reference local can arrive here before its slot has acquired
+                # the address metadata that resolver expects. The value is already a pointer;
+                # index it directly, then GEP the selected struct field. This is the same
+                # zero-cost address calculation as the C-style pointer path and is deliberately
+                # limited to struct elements so scalar pointer indexing keeps its existing path.
+                if field_object is Expr.Index(pointer_index_object, pointer_index_expression, pointer_index_line):
+                    pointer_container_type: ValueType = expression_type(pointer_index_object, local_scope, fns, structs, generics)
+                    if pointer_container_type.kind == TypeKind.Ref:
+                        pointer_element_type: ValueType = ref_target_of(pointer_container_type, structs)
+                        if pointer_element_type.kind == TypeKind.Struct:
+                            pointer_field_position: i64 = field_index_of(structs, pointer_element_type.bits.usize(), field_name)
+                            if pointer_field_position >= 0:
+                                if emit_expression(pointer_index_object, pointer_container_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_index_base:
+                                    if emit_expression(pointer_index_expression, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_index_value:
+                                        pointer_index_indices: mutable darray[LLVMValueRef] = [pointer_index_value]
+                                        pointer_index_indices_pointer: void& = (&pointer_index_indices[0]).cast[void&] can Unsafe.PointerCast
+                                        pointer_element_llvm: LLVMTypeRef = llvm_type_of(pointer_element_type, structs, ctx)
+                                        pointer_element_address: LLVMValueRef = LLVMBuildGEP2(builder, pointer_element_llvm, pointer_index_base, pointer_index_indices_pointer, 1, "pointer.index.elem")
+                                        pointer_field_type: ValueType = structs.field_types[structs.field_start[pointer_element_type.bits.usize()] + pointer_field_position.usize()]
+                                        pointer_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pointer_element_llvm, pointer_element_address, pointer_field_position.u32(), "pointer.index.field")
+                                        pointer_field_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(pointer_field_type, structs, ctx), pointer_field_pointer, "pointer.index.field.value")
+                                        return emit_conversion(pointer_field_value, pointer_field_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != pointer_field_type.kind or expected.bits != pointer_field_type.bits) else pointer_field_value
+                                    return null
                 # The receiver may be a bare Ident (`p.x`) OR a nested field access
                 # (`o.i.v`), both addressed by struct_chain_address. Looks through a
                 # reference, so `p.x` works the same for `p: P` and `p: P&`.
+                object_declared_value: ValueType = expression_type(field_object, local_scope, fns, structs, generics)
                 object_type: mutable ValueType = struct_type_of_name(field_object_name, local_scope, structs) if field_object is Expr.Ident(field_object_name, field_object_line) else struct_chain_type(field_object, local_scope, structs)
                 # struct_chain_type intentionally stays side-effect free and has no function
                 # table, so it cannot type a call result. Use the full expression typer as a
                 # fallback; struct_chain_address will spill the call exactly once when the
                 # field read needs an address.
+                object_type <- object_declared_value if object_type.kind == TypeKind.Unmodeled
                 object_type <- expression_type(field_object, local_scope, fns, structs, generics) if object_type.kind == TypeKind.Unmodeled
                 object_type <- ref_target_of(object_type, structs) if object_type.kind == TypeKind.Ref
                 if object_type.kind == TypeKind.Optional:
                     object_payload: ValueType = optional_payload_of(object_type, structs)
-                    object_type <- ref_target_of(object_payload, structs) if object_payload.kind == TypeKind.Ref and ref_is_heap_ref(object_payload, structs)
+                    # Nullable C pointers and Elisa heap references share the same
+                    # pointer-shaped member-access lowering after a null guard.
+                    object_type <- ref_target_of(object_payload, structs) if object_payload.kind == TypeKind.Ref
                 object_type <- arena_user_struct(structs) if object_type.kind == TypeKind.Arena
                 if object_type.kind == TypeKind.Struct:
                     struct_slot: usize = object_type.bits.usize()
@@ -103,6 +132,22 @@ extend Backend:
                         return null
                     position: i64 = field_index_of(structs, struct_slot, field_name)
                     null return if position < 0
+                    # A call/cast returning `T&` is an rvalue pointer, not an
+                    # addressable local chain. Read its field directly from that
+                    # pointer. Translated C commonly spells this as
+                    # `nonnull(optional).field`.
+                    # A function/cast/index result typed `T&` is an rvalue pointer,
+                    # so its field must be read through that pointer. A plain
+                    # identifier such as `self: T&` is different: its field is
+                    # still an addressable chain and a ref-parameter receiver
+                    # must be able to pass `&self.field` to another function.
+                    if object_declared_value.kind == TypeKind.Ref and (field_object is Expr.Call(_, _, _, _) or field_object is Expr.Index(_, _, _)):
+                        if emit_expression(field_object, object_declared_value, local_scope, fns, structs, generics, runtime, m, ctx, builder) is object_rvalue_pointer:
+                            rvalue_field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
+                            rvalue_struct_llvm: LLVMTypeRef = llvm_type_of(object_type, structs, ctx)
+                            rvalue_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, rvalue_struct_llvm, object_rvalue_pointer, position.u32(), "field.rvalue.ptr")
+                            return LLVMBuildLoad2(builder, llvm_type_of(rvalue_field_type, structs, ctx), rvalue_field_pointer, "field.rvalue")
+                        return null
                     if struct_chain_address(field_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is object_address:
                         field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
                         struct_llvm: LLVMTypeRef = llvm_type_of(object_type, structs, ctx)
@@ -143,6 +188,13 @@ extend Backend:
                                 field_optional_llvm: LLVMTypeRef = llvm_type_of(field_type, structs, ctx)
                                 field_optional_loaded: LLVMValueRef = LLVMBuildLoad2(builder, field_optional_llvm, pointer, "field.unwrap.load")
                                 return optional_payload_value_of(field_optional_loaded, field_type, structs, ctx, builder)
+                        # Optional callbacks are pointer-niche optionals. Once flow analysis has
+                        # proved this exact field non-null, its loaded representation is the Fn
+                        # pointer itself and can be used directly by the indirect-call emitter.
+                        if field_type.kind == TypeKind.Optional and expected.kind == TypeKind.Fn:
+                            field_optional_fn: ValueType = optional_payload_of(field_type, structs)
+                            if field_optional_fn.kind == TypeKind.Fn:
+                                return LLVMBuildLoad2(builder, llvm_type_of(field_type, structs, ctx), pointer, "field.unwrap.fn")
                         # A field passed where a REF is expected (`arena_dict_put(a, map.by_key,
                         # …)` with a `mutable dict&` param): pass the field's ADDRESS, not its
                         # loaded value — stage0 auto-addresses an lvalue arg for a ref param.
@@ -356,7 +408,11 @@ extend Backend:
                 for fn_call_label in call_argument_names |fn_call_has_labels|:
                     fn_call_has_labels <- true if fn_call_label != ""
                 if call_callee is Expr.Ident(fn_local_name, fn_local_line):
-                    if lookup_type(local_scope, fn_local_name).kind == TypeKind.Fn:
+                    fn_local_declared: ValueType = lookup_type(local_scope, fn_local_name)
+                    fn_local_callable: mutable bool = fn_local_declared.kind == TypeKind.Fn
+                    if fn_local_declared.kind == TypeKind.Optional:
+                        fn_local_callable <- optional_payload_of(fn_local_declared, structs).kind == TypeKind.Fn
+                    if fn_local_callable:
                         # A labelled call THROUGH the alias. The Fn type has no parameter names,
                         # but the local remembers which function it aliases, so the labels are
                         # resolved against THAT function's parameter names and the arguments are
@@ -385,7 +441,11 @@ extend Backend:
                 # resolved type, so it cannot shadow a UFCS call: a method call's receiver-field
                 # would have to itself be declared `fn(…) -> R` to land here.
                 if call_callee is Expr.Field(fn_field_object, fn_field_name, fn_field_line):
-                    if expression_type(call_callee, local_scope, fns, structs, generics).kind == TypeKind.Fn:
+                    fn_field_declared: ValueType = expression_type(call_callee, local_scope, fns, structs, generics)
+                    fn_field_callable: mutable bool = fn_field_declared.kind == TypeKind.Fn
+                    if fn_field_declared.kind == TypeKind.Optional:
+                        fn_field_callable <- optional_payload_of(fn_field_declared, structs).kind == TypeKind.Fn
+                    if fn_field_callable:
                         # A LABELLED call through a fn-typed field, the same shape the fn-typed
                         # LOCAL above handles: the field's `fn(...)` type has no parameter names,
                         # so the labels are resolved against the aliased function's names and the
@@ -527,6 +587,22 @@ extend Backend:
                         # become a string.
                         if expected.kind == TypeKind.CStr and call_pointee.kind == TypeKind.Unsigned and call_pointee.bits == 8:
                             return call_value
+                        # A C `void*` has no pointee value to load.  It is an opaque
+                        # pointer-shaped result which must stay as the raw pointer until a
+                        # later cast supplies the concrete pointee type.  Trying to lower
+                        # `malloc(...)` as an ordinary reference here passed LLVM's VOID
+                        # type to LLVMBuildLoad2; LLVM then traps in DataLayout while
+                        # computing an ABI alignment.  Keep this generic for every extern
+                        # returning `void*`, not just allocator calls.
+                        if call_pointee.kind == TypeKind.Void:
+                            # Keep the opaque pointer only when the surrounding
+                            # expression is itself pointer-shaped (or has no
+                            # destination context yet).  A scalar/aggregate
+                            # destination cannot consume a `void*` without an
+                            # explicit cast, so decline it instead of allowing
+                            # an LLVM pointer to flow into a non-pointer slot.
+                            return call_value if expected.kind == TypeKind.Unmodeled or expected.kind == TypeKind.Ref or expected.kind == TypeKind.CStr or expected.kind == TypeKind.PyObject or expected.kind == TypeKind.Fn or optional_is_niche(expected, structs)
+                            return null
                         if call_pointee.kind != TypeKind.Struct:
                             return LLVMBuildLoad2(builder, llvm_type_of(call_pointee, structs, ctx), call_value, "call.ref.deref")
                         return null
