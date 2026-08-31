@@ -2261,6 +2261,29 @@ def main() -> i64:
 ELISAEOF
 )" 49
 
+# A semantic-check scope must end with the loop body too. A darray local in an earlier
+# loop must not shadow the scalar binder of a later loop with the same name; the old firm
+# argument checker left both its local-type and typestate channels flat and rejected this
+# valid program before code generation.
+differential loop_binder_after_container_local "$(cat <<ELISAEOF
+include "$ROOT/elisacore_std/elisacore_runtime.elisa"
+
+def take(value: i64) -> i64:
+    return value
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        total: mutable i64 = 0
+        for disks in 3..<5:
+            moves: mutable darray[i64] = []
+            moves.push(disks)
+            total <- total + moves.count.i64()
+        for moves in 1..<3:
+            total <- total + take(moves)
+        return total
+ELISAEOF
+)" 5
+
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2
     exit 1
