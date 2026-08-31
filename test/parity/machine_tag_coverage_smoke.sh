@@ -29,4 +29,8 @@ echo "$out" | grep -qi "missing variant \"Other\"" || fail "missing variant not 
 out=$(printf "$base                Run(out), NC.Digit:\n                    break\n                Run(out), NC.Other:\n                    break\n        return result\n" | "$RPT")
 echo "$out" | grep -qi "closed enum" && fail "tag-complete machine wrongly flagged Tier-2: $out"
 
+# 4. Shorthand enum tags participate in the same coverage record as qualified tags.
+out=$(printf "$base                Run(out), .Digit:\n                    break\n                Run(out), .Other:\n                    break\n        return result\n" | "$RPT")
+echo "$out" | grep -qi "closed enum\|missing variant" && fail "shorthand tag-complete machine flagged Tier-2: $out"
+
 echo "machine tag-coverage smoke OK: wildcard rejected, missing variant flagged, complete passes (docs/125 §9)"
