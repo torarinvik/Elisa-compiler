@@ -342,6 +342,8 @@ out=""
 src=""
 noalias=0
 bounds_check=0
+debug_info=0
+trace_info=0
 opt_level=0
 test_filter=""
 emit_mode="obj"
@@ -408,6 +410,10 @@ while [[ $# -gt 0 ]]; do
       noalias=1; shift ;;
     -fbounds-check)
       bounds_check=1; shift ;;
+    -g|-debug-info)
+      debug_info=1; shift ;;
+    -ftrace|-record-trace)
+      trace_info=1; shift ;;
     # Cross-compilation and linker passthrough. The DRIVER has implemented both for a
     # while (requested_target_triple, and ELISA_STAGE1_LINK read in the c-archive/exe
     # paths) — only this wrapper rejected them, so `-target-triple` and `-link/-L/-l`
@@ -867,6 +873,8 @@ driver_env=()
 # not just the report modes below — otherwise a wrapper-compiled program reports a bare
 # line number while the same file compiled through the CLI names itself.
 driver_env+=("ELISA_STAGE1_SRC=$src")
+[[ "$debug_info" == 1 ]] && driver_env+=("ELISA_STAGE1_DEBUG=1")
+[[ "$trace_info" == 1 ]] && driver_env+=("ELISA_STAGE1_TRACE=1")
 [[ -n "$target_triple" ]] && driver_env+=("ELISA_STAGE1_TRIPLE=$target_triple")
 [[ "$target_triple" == wasm* ]] && driver_env+=("ELISA_STAGE1_WASM=1")
 [[ ${#link_flags[@]} -gt 0 ]] && driver_env+=("ELISA_STAGE1_LINK=${link_flags[*]}")
