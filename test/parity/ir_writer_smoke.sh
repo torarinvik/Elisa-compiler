@@ -26,16 +26,16 @@ ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
 cmp -s "$WORK/source.lowered" "$WORK/stage0.lowered"
 cmp -s "$WORK/source.lowered" "$WORK/stage1.lowered"
 
-# Keep the negative boundary explicit: a decorator is not silently discarded while the
-# stage1 AST remains compact. The command must decline by name until decorator encoding is
-# implemented, rather than emit a weaker extern signature.
+# Keep the negative boundary explicit: an optional return shape is not silently discarded
+# while the stage1 AST remains compact. The command must decline by name rather than emit
+# a weaker extern signature. Decorators themselves are encoded losslessly in the bundle.
 NEGATIVE="$WORK/decorated.elisa"
-printf '%s\n' '@link_name(probe_write)' 'extern probe_write(fd: i32) -> i32' >"$NEGATIVE"
+printf '%s\n' '@link_name(probe_write)' 'extern probe_write(fd: i32) -> i32?' >"$NEGATIVE"
 if ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit ir -o "$WORK/negative.elisair" "$NEGATIVE" >/dev/null 2>"$WORK/negative.err"; then
-    echo "ir writer FAILED: decorated extern was emitted without its decorator" >&2
+    echo "ir writer FAILED: optional extern shape was emitted without its type information" >&2
     exit 1
 fi
-grep -q 'extern decorator' "$WORK/negative.err"
+grep -q 'opaque extern signature shape' "$WORK/negative.err"
 
-echo "ir writer smoke OK: callable extern round-trips; lossy decorator declines"
+echo "ir writer smoke OK: callable extern round-trips; lossy optional shape declines"
