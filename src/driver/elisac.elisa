@@ -1285,6 +1285,16 @@ def emit_ast_line_range(tokens: darray[Lexer::Token]&, line: u32) -> (found: boo
     return (true, start_index, stop_index)
 
 
+# The physical end of a declaration line, including tokens after a depth-0 colon. The AST
+# summary's signature range deliberately stops at that colon, but typed extern globals need the
+# complete type span after it.
+def emit_ast_line_end(tokens: darray[Lexer::Token]&, line: u32, from_index: usize) -> usize can[Abort.Panic]:
+    stop_index: mutable usize = from_index
+    while stop_index < tokens.count and tokens[stop_index].line == line and tokens[stop_index].kind != Lexer::TokenKind.Newline |stop_index, tokens, line|:
+        stop_index <- stop_index + 1
+    return stop_index
+
+
 # ` -> RET` for the def at LINE, rendered from its signature tokens (empty when the def
 # has no arrow). RET ends at the depth-0 `:` or a trailing `can` effects clause.
 def emit_ast_return_segment(buffer: mutable darray[u8]&, tokens: darray[Lexer::Token]&, source: u8&, line: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
@@ -1523,6 +1533,11 @@ def emit_ast_body_declares_container(statements: darray[Ast::Stmt]&, annotations
             if wrap_statement is Stmt.For(wrap_bind, wrap_vars, wrap_iter, wrap_fbody, wrap_for_line):
                 true return if emit_ast_body_declares_container(wrap_fbody, annotations, function_line, struct_names, struct_member_rows, struct_member_starts, struct_member_counts)
             if wrap_statement is Stmt.Block(wrap_kind, wrap_clause, wrap_binding, wrap_bbody, wrap_block_line):
+                # An explicit `region r(...):` already owns the allocation scope. Looking
+                # through it and requesting another synthetic wrapper changed a two-statement
+                # body (`region ...` plus the following statement) into a one-statement body in
+                # the AST summary, and falsely marked region-generic machine code as inferred.
+                continue if wrap_kind == "region"
                 true return if emit_ast_body_declares_container(wrap_bbody, annotations, function_line, struct_names, struct_member_rows, struct_member_starts, struct_member_counts)
             if wrap_statement is Stmt.Match(wrap_scrutinee, wrap_arms, wrap_match_line):
                 for wrap_arm in wrap_arms |annotations, struct_names, struct_member_rows, struct_member_starts, struct_member_counts|:
@@ -1849,18 +1864,97 @@ def emit_ast_inferred_region_params(buffer: mutable darray[u8]&, tokens: darray[
         emit_tokens_push_sview(buffer, "]") if emitted_any
 
 
-    # The `(args)` of a decorator printed above declaration LINE: scan the closest line above
-    # it that starts with `@`, and render its paren span verbatim.
+    # The explicit generic bracket on a function can coexist with an inferred region
+    # parameter: `def append_one[T](out: mutable darray[T]&, ...)` is printed by stage0 as
+    # `def append_one[T, @__rg_out](...)`. The ordinary inferred-region helper above emits a
+    # fresh bracket and therefore cannot insert into an already-emitted `[T]`; this variant
+    # renders the existing bracket up to its close, then appends the body-proven region names
+    # before writing the close. Returning whether an explicit bracket was present keeps the
+    # caller from emitting the ordinary helper a second time.
+def emit_ast_generic_segment_with_inferred(buffer: mutable darray[u8]&, tokens: darray[Lexer::Token]&, source: u8&, line: u32, statements: darray[Ast::Stmt]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+        line_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
+        false return if not line_range.found
+        bracket_index: usize = line_range.start + 2
+        false return if bracket_index >= line_range.stop or tokens[bracket_index].kind != Lexer::TokenKind.LBracket
+        close_index: mutable usize = bracket_index
+        close_depth: mutable i64 = 0
+        closing: mutable bool = true
+        while closing and close_index < line_range.stop |close_index, close_depth, closing, tokens|:
+            close_token: Lexer::Token = tokens[close_index]
+            close_depth <- close_depth + 1 if close_token.kind == Lexer::TokenKind.LBracket
+            close_depth <- close_depth - 1 if close_token.kind == Lexer::TokenKind.RBracket
+            if close_depth == 0:
+                closing <- false
+            else:
+                close_index <- close_index + 1
+        return false if close_index >= line_range.stop or tokens[close_index].kind != Lexer::TokenKind.RBracket
+        explicit_region_param: mutable bool = false
+        for explicit_probe in (bracket_index + 1)..<close_index |explicit_region_param, tokens|:
+            explicit_region_param <- true if tokens[explicit_probe].kind == Lexer::TokenKind.At
+        # Exclude the existing close so inferred names can be inserted before it.
+        emit_ast_render_tokens(buffer, tokens, source, bracket_index, close_index)
+        emit_tokens_push_sview(buffer, "]") if explicit_region_param
+        return true if explicit_region_param
+        emitted_any: mutable bool = false
+        paren_depth: mutable i64 = 0
+        segment_has_container: mutable bool = false
+        segment_has_amp: mutable bool = false
+        segment_name: mutable sview = ""
+        segment_named: mutable bool = false
+        segment_darray: mutable bool = false
+        for param_index in line_range.start..<line_range.stop |paren_depth, segment_has_container, segment_has_amp, segment_name, segment_named, segment_darray, emitted_any, buffer, tokens, source, line, statements|:
+            param_token: Lexer::Token = tokens[param_index]
+            if param_token.kind == Lexer::TokenKind.LParen or param_token.kind == Lexer::TokenKind.LBracket:
+                paren_depth <- paren_depth + 1
+            elif param_token.kind == Lexer::TokenKind.RParen or param_token.kind == Lexer::TokenKind.RBracket:
+                paren_depth <- paren_depth - 1
+                if paren_depth == 0 and segment_has_container and segment_has_amp and segment_named and emit_ast_param_grown_in_body(tokens, source, line, segment_name):
+                    emit_tokens_push_sview(buffer, ", ") if not emitted_any
+                    emit_tokens_push_sview(buffer, "@__rg_")
+                    emit_tokens_push_sview(buffer, segment_name)
+                    emitted_any <- true
+                if paren_depth == 0:
+                    segment_has_container <- false
+                    segment_has_amp <- false
+                    segment_named <- false
+                    segment_darray <- false
+            elif paren_depth >= 1:
+                if param_token.kind == Lexer::TokenKind.Comma and paren_depth == 1:
+                    if segment_has_container and segment_has_amp and segment_named and emit_ast_param_grown_in_body(tokens, source, line, segment_name):
+                        emit_tokens_push_sview(buffer, ", ") if not emitted_any
+                        emit_tokens_push_sview(buffer, "@__rg_")
+                        emit_tokens_push_sview(buffer, segment_name)
+                        emitted_any <- true
+                    segment_has_container <- false
+                    segment_has_amp <- false
+                    segment_named <- false
+                    segment_darray <- false
+                elif param_token.kind == Lexer::TokenKind.Comma and paren_depth >= 2 and segment_darray:
+                    segment_has_container <- false
+                elif param_token.kind == Lexer::TokenKind.Ident:
+                    param_text: sview = Lexer::text_or_empty(param_token, source)
+                    if not segment_named:
+                        segment_name <- param_text
+                        segment_named <- true
+                    if param_text == "darray" or param_text == "dict" or param_text == "set" or param_text == "dstr":
+                        segment_has_container <- true
+                        segment_darray <- param_text == "darray"
+                elif param_token.kind == Lexer::TokenKind.Ampersand:
+                    segment_has_amp <- true
+        emit_tokens_push_sview(buffer, "]")
+        return true
+
+
+    # The `(args)` of a decorator on SOURCE LINE. Annotation.line is the decorator's own
+    # line, so using it directly matters when declarations have multiple stacked decorators:
+    # looking for the closest line above the declaration made every decorator inherit the
+    # arguments of the last one.
 def emit_ast_decorator_args(buffer: mutable darray[u8]&, tokens: darray[Lexer::Token]&, source: u8&, line: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-        best_line: mutable u32 = 0
-        for at_probe in 0..<tokens.count |best_line, tokens, line|:
-            at_token: Lexer::Token = tokens[at_probe]
-            continue if at_token.kind != Lexer::TokenKind.At
-            best_line <- at_token.line if at_token.line < line and at_token.line > best_line
-        return if best_line == 0
-        at_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, best_line)
+        at_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
         return if not at_range.found
+        return if tokens[at_range.start].kind != Lexer::TokenKind.At
         open_index: mutable usize = at_range.start
         open_found: mutable bool = false
         for open_probe in at_range.start..<at_range.stop |open_index, open_found, tokens|:
@@ -1922,11 +2016,22 @@ def emit_ast_const_expr(buffer: mutable darray[u8]&, expression: Ast::Expr, toke
 def emit_ast_decl(buffer: mutable darray[u8]&, declaration: Ast::Decl, level: i64, tokens: darray[Lexer::Token]&, source: u8&, local_annotations: darray[Ast::LocalRegionAnnotation]&, enum_annotations: darray[Ast::EnumAnnotation]&, struct_names: darray[sview]&, struct_member_rows: darray[Ast::StructMember]&, struct_member_starts: darray[usize]&, struct_member_counts: darray[usize]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
         if declaration is Decl.Func(ast_fn_name, ast_fn_params, ast_fn_return, ast_fn_body, ast_fn_effects, ast_fn_decorators, ast_fn_line):
+            # Stage0 includes source decorators in the AST summary. `c_variadic` is a
+            # stage1-only synthesized backend marker; it has no source annotation and stage0
+            # intentionally does not print it.
+            for ast_fn_decorator in ast_fn_decorators |buffer, level, tokens, source, ast_fn_line|:
+                continue if ast_fn_decorator.name == "c_variadic"
+                emit_ast_indent(buffer, level)
+                emit_tokens_push_sview(buffer, "@")
+                emit_tokens_push_sview(buffer, ast_fn_decorator.name)
+                emit_ast_decorator_args(buffer, tokens, source, ast_fn_decorator.line)
+                emit_tokens_push_sview(buffer, "\n")
             emit_ast_indent(buffer, level)
             emit_tokens_push_sview(buffer, "def ")
             emit_tokens_push_sview(buffer, ast_fn_name)
-            emit_ast_generic_segment(buffer, tokens, source, ast_fn_line.line)
-            emit_ast_inferred_region_params(buffer, tokens, source, ast_fn_line.line)
+            has_explicit_generic: bool = emit_ast_generic_segment_with_inferred(buffer, tokens, source, ast_fn_line.line, ast_fn_body)
+            emit_ast_generic_segment(buffer, tokens, source, ast_fn_line.line) if not has_explicit_generic
+            emit_ast_inferred_region_params(buffer, tokens, source, ast_fn_line.line) if not has_explicit_generic
             emit_tokens_push_sview(buffer, "(")
             emit_tokens_push_u64(buffer, ast_fn_params.count.u64())
             emit_tokens_push_sview(buffer, " params)")
@@ -1934,6 +2039,13 @@ def emit_ast_decl(buffer: mutable darray[u8]&, declaration: Ast::Decl, level: i6
                 emit_tokens_push_sview(buffer, " -> bool")
             else:
                 emit_ast_return_segment(buffer, tokens, source, ast_fn_line.line)
+            if ast_fn_effects.count > 0:
+                emit_tokens_push_sview(buffer, " can[")
+                for ast_fn_effect in ast_fn_effects |buffer, ast_fn_effect_index: usize = 0|:
+                    emit_tokens_push_sview(buffer, ", ") if ast_fn_effect_index > 0
+                    emit_tokens_push_sview(buffer, ast_fn_effect)
+                    ast_fn_effect_index <- ast_fn_effect_index + 1
+                emit_tokens_push_sview(buffer, "]")
             emit_tokens_push_sview(buffer, " (")
             wrapped_count: u64 = 1 if emit_ast_body_declares_container(ast_fn_body, local_annotations, ast_fn_line.line, struct_names, struct_member_rows, struct_member_starts, struct_member_counts) else ast_fn_body.count.u64()
             emit_tokens_push_u64(buffer, wrapped_count)
@@ -2034,12 +2146,15 @@ def emit_ast_decl(buffer: mutable darray[u8]&, declaration: Ast::Decl, level: i6
             return
         if declaration is Decl.Extern(ast_ex_name, ast_ex_param_start, ast_ex_arity, ast_ex_variadic, ast_ex_callable, ast_ex_return, ast_ex_decorators, ast_ex_line):
             # `@link_name(sym)` prints on its own line first, exactly as written.
-            for ast_ex_decorator in ast_ex_decorators |buffer, level, tokens, source, ast_ex_line|:
-                emit_ast_indent(buffer, level)
-                emit_tokens_push_sview(buffer, "@")
-                emit_tokens_push_sview(buffer, ast_ex_decorator.name)
-                emit_ast_decorator_args(buffer, tokens, source, ast_ex_line.line)
-                emit_tokens_push_sview(buffer, "\n")
+            # Extern variables carry link-name metadata for codegen, but stage0's AST summary
+            # prints that metadata only for callable extern declarations.
+            if ast_ex_callable:
+                for ast_ex_decorator in ast_ex_decorators |buffer, level, tokens, source, ast_ex_line|:
+                    emit_ast_indent(buffer, level)
+                    emit_tokens_push_sview(buffer, "@")
+                    emit_tokens_push_sview(buffer, ast_ex_decorator.name)
+                    emit_ast_decorator_args(buffer, tokens, source, ast_ex_decorator.line)
+                    emit_tokens_push_sview(buffer, "\n")
             emit_ast_indent(buffer, level)
             export_fn_target: sview = emit_ast_export_fn_target(enum_annotations, ast_ex_name, ast_ex_line.line)
             export_type_alias: sview = emit_ast_export_type_alias(enum_annotations, ast_ex_name, ast_ex_line.line)
@@ -2062,6 +2177,18 @@ def emit_ast_decl(buffer: mutable darray[u8]&, declaration: Ast::Decl, level: i6
                 emit_tokens_push_sview(buffer, "\n")
                 return
             if not ast_ex_callable:
+                # A typed global is a value declaration, not an opaque type. Decl.Extern keeps
+                # only the type head for compact semantic metadata, so recover the complete type
+                # from the source tokens after the depth-0 colon.
+                extern_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, ast_ex_line.line)
+                if ast_ex_return != "" and extern_range.found and extern_range.stop < tokens.count and tokens[extern_range.stop].kind == Lexer::TokenKind.Colon:
+                    emit_tokens_push_sview(buffer, "extern ")
+                    emit_tokens_push_sview(buffer, ast_ex_name)
+                    emit_tokens_push_sview(buffer, ": ")
+                    extern_type_stop: usize = emit_ast_line_end(tokens, ast_ex_line.line, extern_range.stop + 1)
+                    emit_ast_render_tokens(buffer, tokens, source, extern_range.stop + 1, extern_type_stop)
+                    emit_tokens_push_sview(buffer, "\n")
+                    return
                 # A bare `extern TypeName` is an opaque TYPE declaration.
                 emit_tokens_push_sview(buffer, "extern type ")
                 emit_tokens_push_sview(buffer, ast_ex_name)
@@ -2639,11 +2766,20 @@ def emit_iface_decl(buffer: mutable darray[u8]&, declaration: Ast::Decl, level: 
                     buffer.push(32)
                 emit_tokens_push_sview(buffer, "@")
                 emit_tokens_push_sview(buffer, if_ex_decorator.name)
-                emit_ast_decorator_args(buffer, tokens, source, if_ex_line.line)
+                emit_ast_decorator_args(buffer, tokens, source, if_ex_decorator.line)
                 emit_tokens_push_sview(buffer, "\n")
             for extern_space in 0..<indent |buffer|:
                 buffer.push(32)
             emit_iface_render_tokens(buffer, tokens, source, ex_range.start, ex_range.stop)
+            # `emit_ast_line_range` stops at the depth-0 colon because that is the natural
+            # boundary for callable signatures. A typed extern global continues with its full
+            # ABI type after that colon; dropping the suffix made generated interfaces declare
+            # `extern actorat` without a type and caused cross-module consumers to lose the
+            # nested array/reference shape.
+            if not if_ex_callable and if_ex_ret != "" and ex_range.stop < tokens.count and tokens[ex_range.stop].kind == Lexer::TokenKind.Colon:
+                emit_tokens_push_sview(buffer, ": ")
+                extern_type_stop_iface: usize = emit_ast_line_end(tokens, if_ex_line.line, ex_range.stop + 1)
+                emit_iface_render_tokens(buffer, tokens, source, ex_range.stop + 1, extern_type_stop_iface)
             emit_tokens_push_sview(buffer, "\n")
             return
         if declaration is Decl.Module(if_mod_name, if_mod_body, if_mod_line):
