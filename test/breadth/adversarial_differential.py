@@ -34,9 +34,14 @@ close here. Prefer the parity smokes for them.
 import itertools, os, subprocess, sys, tempfile, hashlib
 
 ROOT = os.environ["REPO_ROOT"]
-S0 = os.path.expanduser("~/.elisac/elisac")
+# The smoke wrapper accepts pinned compiler/runtime paths, and the other parity
+# harnesses pass them through the environment. Do the same here: falling back
+# to ~/.elisac/elisac made this tester silently exercise a stale stage0 binary,
+# while a caller's ELISA_RUNTIME_OBJ was ignored altogether.
+S0 = os.environ.get("ELISACORE_BIN", os.path.expanduser("~/.elisac/elisac"))
 WRAP = os.path.join(ROOT, "scripts/elisac_stage1.sh")
-RT = os.path.join(ROOT, "build/runtime/elisacore_runtime.o")
+RT = os.environ.get("ELISA_RUNTIME_OBJ",
+                    os.path.join(ROOT, "build/runtime/elisacore_runtime.o"))
 STD = os.path.join(ROOT, "elisacore_std/elisacore_runtime.elisa")
 ENV = dict(os.environ)
 
