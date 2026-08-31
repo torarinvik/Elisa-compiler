@@ -162,6 +162,11 @@ terminate_guarded_pid() {
 
 seed_build() {
   local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object
+  # A newly-created Git worktree has no ignored build directory yet. Create the
+  # local output roots before taking the per-worktree lock; otherwise `mkdir`
+  # cannot create the nested lock path and every first seed fails as if a stale
+  # lock were present.
+  mkdir -p "$ROOT/bin" "$ROOT/build"
   # The EXIT trap runs after this function's locals have gone out of scope under
   # `set -u`; retain the private lock path in a function-external variable so a
   # successful high-memory seed always releases its lock without an unbound-var exit.
@@ -249,7 +254,6 @@ seed_build() {
   }
   trap cleanup_seed_lock EXIT INT TERM HUP
   libdir="$("$LLVM_CONFIG" --libdir)"
-  mkdir -p "$ROOT/bin" "$ROOT/build"
   if [[ ! -x "$STAGE0_BIN" ]]; then
     echo "seed requires stage0 elisac at ELISACORE_BIN=$STAGE0_BIN" >&2
     exit 2
