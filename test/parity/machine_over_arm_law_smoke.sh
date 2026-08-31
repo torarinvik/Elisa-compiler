@@ -19,7 +19,7 @@ echo "$out" | grep -q "^P 0$" || fail "legal straight-line arm flagged: $out"
 
 # 1b. LEGAL: compound assignment is also a straight-line mutation and must use the same
 # driven-resource validation as `<-`, rather than being silently skipped by stage1.
-out=$(printf 'def scan(lexer: mutable Lexer&) -> i64:\n    total: i64 = 0\n    machine over lexer.current_char() while not lexer.is_end():\n        state Run\n        start Run\n        Run, .Digit:\n            total += 1\n            -> Run\n    return total\n' | "$RPT")
+out=$(printf 'def scan(lexer: mutable Lexer&) -> i64:\n    machine over lexer.current_char() while not lexer.is_end():\n        state Run\n        start Run\n        Run, .Digit:\n            lexer += 1\n            -> Run\n    return 0\n' | "$RPT")
 echo "$out" | grep -q "^P 0$" || fail "legal compound assignment arm flagged: $out"
 
 # 1c. LEGAL: a multi-subscript assignment target is still rooted in the driven value. Stage1
