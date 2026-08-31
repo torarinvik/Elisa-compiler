@@ -41,9 +41,16 @@ S0 = os.path.expanduser(
     os.environ.get("ELISACORE_BIN", os.path.join(ELISA_CORE, "compiler", "bin", "elisac"))
 )
 WRAP = os.path.join(ROOT, "scripts/elisac_stage1.sh")
-RT = os.path.join(ROOT, "build/runtime/elisacore_runtime.o")
+RT = os.environ.get("ELISA_RUNTIME_OBJ",
+                    os.path.join(ROOT, "build/runtime/elisacore_runtime.o"))
 STD = os.path.join(ROOT, "elisacore_std/elisacore_runtime.elisa")
 ENV = dict(os.environ)
+# The stage0 selector is needed by this Python oracle, but it must not leak into the stage1
+# wrapper. Stage1 is the implementation under test; inheriting ELISACORE_BIN/ELISA_CORE can
+# accidentally re-enter bootstrap selection or make a local product depend on the oracle.
+STAGE1_ENV = dict(ENV)
+for _selector in ("ELISACORE_BIN", "ELISA_CORE", "REPO_ROOT"):
+    STAGE1_ENV.pop(_selector, None)
 
 def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -60,9 +67,9 @@ def build_and_run(src_path, work, tag):
     if tag == "s0":
         r = run([S0, "-emit", "obj", "-o", obj, src_path], timeout=90)
     elif tag == "s1O2":
-        r = run(["bash", WRAP, "-O2", "-o", obj, src_path], env=ENV, timeout=180)
+        r = run(["bash", WRAP, "-O2", "-o", obj, src_path], env=STAGE1_ENV, timeout=180)
     else:
-        r = run(["bash", WRAP, "-o", obj, src_path], env=ENV, timeout=90)
+        r = run(["bash", WRAP, "-o", obj, src_path], env=STAGE1_ENV, timeout=90)
     if r.returncode != 0:
         return (False, None)
     # Same three link recipes the differential corpus uses, in the same order.
@@ -2718,9 +2725,8 @@ def gen_generic_operator_no_bound():
     parameter (`def bump[T](a: T, b: T): a + b`, no `[T: Interface]` clause). stage0
     checks a generic function's body once, against only what its declared bound
     guarantees -- an unbound T supports nothing, so this is rejected at DECLARATION
-    time regardless of any call site. stage1 had no such check and accepted it,
-    deferring entirely to per-instantiation codegen -- a genuine PERMISSIVE divergence
-    (stage1 was a strict superset of valid programs, never a wrong answer). See
+    time regardless of any call site. The stage1 declaration-time guard now mirrors this
+    rule, including operators nested in value expressions and augmented assignments. See
     generic-operator-bound-checking-gap.md for the full writeup, including a real false
     positive found and fixed during staging: a REF parameter (`items: T&`, a C-buffer
     pointer) used in pointer arithmetic (`items + index`) is unrelated to whatever T's
@@ -2735,6 +2741,20 @@ def main() -> i64:
     x: mutable i64 = 5
     bump(&x, 10)
     return x
+""")
+    yield ("generic_operator_no_bound_nested_expression_rejected", """
+def pack[T](a: T, b: T) -> darray[T]:
+    return [a + b]
+
+def main() -> i64:
+    return 0
+""")
+    yield ("generic_operator_no_bound_compound_rejected", """
+def bump_compound[T](a: mutable T, b: T) -> void:
+    a += b
+
+def main() -> i64:
+    return 0
 """)
     yield ("generic_operator_bound_satisfied_accepted", """
 protocol Add:

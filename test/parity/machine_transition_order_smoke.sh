@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# A machine transition installs all successor payloads as one transition. The
+# arguments must therefore be evaluated before any scalarized payload slot is
+# overwritten: Run(a, b) -> Check(b, a) is a swap, not Run(b, b).
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+SOURCE="$ROOT/test/fixtures/machine_transition/swap.elisa"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+
+[[ -x "$STAGE0" ]] || { echo "machine transition order smoke SKIP: no stage0"; exit 0; }
+[[ -x "$STAGE1" ]] || { echo "machine transition order smoke SKIP: no stage1"; exit 0; }
+[[ -f "$RUNTIME" ]] || { echo "machine transition order smoke SKIP: no runtime object"; exit 0; }
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-machine-transition.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+
+for optimization in O0 O2; do
+    "$STAGE0" -emit obj "-$optimization" -o "$WORK/stage0-$optimization.o" "$SOURCE" >/dev/null
+    clang -Wl,-dead_strip -o "$WORK/stage0-$optimization" "$WORK/stage0-$optimization.o" "$RUNTIME"
+
+    ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
+      bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/stage1-$optimization.o" "$SOURCE" >/dev/null
+    clang -Wl,-dead_strip -o "$WORK/stage1-$optimization" "$WORK/stage1-$optimization.o" "$RUNTIME"
+
+    set +e
+    "$WORK/stage0-$optimization"; stage0_rc=$?
+    "$WORK/stage1-$optimization"; stage1_rc=$?
+    set -e
+
+    [[ "$stage0_rc" -eq 201 ]] || { echo "machine transition order smoke FAIL ($optimization): stage0 returned $stage0_rc, expected 201" >&2; exit 1; }
+    [[ "$stage1_rc" -eq 201 ]] || { echo "machine transition order smoke FAIL ($optimization): stage1 returned $stage1_rc, expected 201" >&2; exit 1; }
+done
+echo "machine transition order smoke OK: stage0/stage1 preserve parallel payload evaluation at O0/O2 (201)"

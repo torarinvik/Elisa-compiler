@@ -38,6 +38,18 @@ fi
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$REPO_ROOT/build/runtime/elisacore_runtime.o}"
+export ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ"
+
+[[ -x "$STAGE1_BIN" ]] || {
+  echo "error: stage1 product missing at $STAGE1_BIN (run scripts/elisac_stage1.sh --seed)" >&2
+  exit 2
+}
+[[ -f "$RUNTIME_OBJ" ]] || {
+  echo "error: stage1 runtime object missing at $RUNTIME_OBJ (run scripts/build_runtime_object.sh)" >&2
+  exit 2
+}
 
 # Build every SHARED artifact ONCE, here, and export its path so the checks reuse it.
 #
@@ -56,13 +68,15 @@ if [[ -z "${ELISA_GATE_PREBUILT:-}" ]]; then
   echo "prebuilding shared artifacts (stage0, parse_report, easm driver)…" >&2
   ( cd "$ELISA_CORE/compiler" && go build -o "$ELISACORE_BIN" ./src ) || {
     echo "error: could not build stage0" >&2; exit 2; }
-  # Both of these are FRESHNESS-GUARDED at their own build sites; priming them here means
-  # every check in the pool below finds them current and skips, so no two checks ever race
-  # on the same output path. This is the precondition for running checks concurrently.
-  if ! "$ELISACORE_BIN" -emit obj -O2 -permissive -o "$REPO_ROOT/build/parse_report.o" \
-        "$REPO_ROOT/test/breadth/parse_report.elisa" >/dev/null 2>&1 \
-     || ! clang -O2 "$REPO_ROOT/build/parse_report.o" -o "$REPO_ROOT/build/parse_report" >/dev/null 2>&1; then
-    echo "error: could not prebuild parse_report — workers would each rebuild it and race" >&2
+  # The shared reporter is a STAGE1 artifact; using stage0 here would make every semantic
+  # check below test the oracle instead of the product. build_parse_report.sh owns the same
+  # freshness/atomic-publish logic used by the workers, so priming it here keeps the checks
+  # race-free without silently replacing stage1 with stage0.
+  if ! (
+    export REPO_ROOT ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ"
+    source "$REPO_ROOT/test/parity/build_parse_report.sh"
+  ); then
+    echo "error: could not prebuild stage1 parse_report — workers would each rebuild it and race" >&2
     exit 2
   fi
   bash "$REPO_ROOT/test/parity/easm_project_driver_smoke.sh" >/dev/null 2>&1 || true

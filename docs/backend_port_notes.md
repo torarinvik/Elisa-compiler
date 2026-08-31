@@ -1,5 +1,16 @@
 # stage1 backend port — scoping notes
 
+> **Current-audit note (2026-08-31):** This document contains historical investigations as
+> well as the live ledger. Several old blockers below have since landed: generic
+> monomorphization, error-union return/catch lowering, nested variant matching, darray and
+> fixed-array composition, and state-machine lowering. In particular, `machine over` must not
+> be replaced with ordinary loops: the current parser keeps the machine and uses a helper for
+> the bit-group member body so temporary AST values are not captured in an unstable transition.
+> The local stage1 product lowers `test/breadth/emit_native.elisa` without dropping
+> `parse_bit_group_members`, and `test/parity/state_machine_parser_selfhost_smoke.sh` guards it.
+> Treat the sections below as evidence and root-cause notes; verify their status against the
+> current parity gate before reopening any item.
+
 ## What the remaining work actually depends on
 
 Measured, not estimated. stage0's backend is 54,417 lines / 156 files of cgo.
@@ -894,11 +905,11 @@ straightforward.
    darray header sits inline) -- and route the 3 op dispatch sites through them. Same move as
    struct_chain_address (which already does exactly this for struct fields).
 
-2. **Nested fixed arrays** (`i64[2][2]`, `m[i][j]`). The array intern already rejects an Array
-   ELEMENT (codegen.elisa:228, `element.kind == TypeKind.Array`). Lift it the way the
-   darray-of-struct Struct decline was lifted, and let the Index chain (struct_chain_address's
-   Index case) compose for `m[i][j]`. Element stride is already handled (element_stride does
-   Array via LLVMSizeOf).
+2. ~~**Nested fixed arrays** (`i64[2][2]`, `m[i][j]`).~~ **CLOSED.** The old note described a
+   pre-existing array-intern rejection that is no longer present. Recursive array interning,
+   LLVM layout, chained indexing, and writes are covered by
+   `test/repro/nested_fixed_array_access.elisa` and execute with the same result under the
+   local stage0 and stage1 compilers.
 
 Everything else probed (struct==, global struct const, `flags`) is a stage0 REJECT, i.e.
 stage1 correctly declines it too.

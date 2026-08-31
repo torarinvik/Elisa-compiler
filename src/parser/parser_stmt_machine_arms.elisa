@@ -5,6 +5,11 @@
 
 extend Parser:
     public:
+        def append_machine_state_refinement(field_types: mutable darray[Ast::Expr]&, refinement: Ast::Expr?, where_token: Token) -> void:
+            if refinement is predicate and field_types.count > 0:
+                base: Ast::Expr = field_types[field_types.count - 1]
+                field_types[field_types.count - 1] <- (Ast::Expr.Refinement(base, predicate, Ast::pos_of_token(where_token)))
+
         def parse_machine_state_decl(parser: lmut Parser) -> MachineStateAst:
             parser, _ <- parser.advance()   # `state`
             rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
@@ -44,8 +49,10 @@ extend Parser:
                         -> Refinement
 
                     Refinement, _ if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(parser.tokens[parser.position], parser.source) == "where":
+                        where_token: Token = parser.tokens[parser.position]
                         parser.position <- parser.position + 1
-                        rebind ignored_refinement: Ast::Expr?, parser = parser.expression()
+                        rebind refinement: Ast::Expr?, parser = parser.expression()
+                        append_machine_state_refinement(field_types, refinement, where_token)
                         -> Separator
 
                     Refinement, _:
@@ -228,6 +235,7 @@ extend Parser:
             has_transition: mutable bool = false
             target: mutable sview = ""
             target_line: mutable u32 = state_token.line
+            target_offset: mutable u32 = state_token.start
             transition_args: mutable darray[Ast::Expr] = []
             saw_decision: mutable bool = false
             machine over parser.position while true:
@@ -238,7 +246,7 @@ extend Parser:
                     break
 
                 Scan, _:
-                    parser <- parser.consume_machine_arm_body_item(body, has_transition, target, target_line, transition_args, saw_decision, state_token)
+                    parser <- parser.consume_machine_arm_body_item(body, has_transition, target, target_line, target_offset, transition_args, saw_decision, state_token)
                     -> Scan
             parser, _ <- parser.expect(TokenKind.Dedent)
 
@@ -256,7 +264,9 @@ extend Parser:
                 has_transition: has_transition,
                 target: target,
                 target_line: target_line,
+                target_offset: target_offset,
                 transition_args: transition_args,
+                transition_temp_names: [],
                 line: state_token.line
             }
 
@@ -264,9 +274,11 @@ extend Parser:
         # decisions hidden in a helper. Transition metadata travels as state payload,
         # so an arm cannot accidentally update the target without also setting the
         # decision and source-line facts.
-        def consume_machine_arm_body_item(parser: lmut Parser, body: mutable darray[Ast::Stmt]&, has_transition: mutable bool&, target: mutable sview&, target_line: mutable u32&, transition_args: mutable darray[Ast::Expr]&, saw_decision: mutable bool&, state_token: Token) -> void:
+        def consume_machine_arm_body_item(parser: lmut Parser, body: mutable darray[Ast::Stmt]&, has_transition: mutable bool&, target: mutable sview&, target_line: mutable u32&, target_offset: mutable u32&, transition_args: mutable darray[Ast::Expr]&, saw_decision: mutable bool&, state_token: Token) -> void:
             parser <- parser.skip_newlines()
             return if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
+            decision_token: Token = parser.cursor()
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, decision_token) if saw_decision == true
             match parser.peek():
                 TokenKind.Arrow:
                     rebind arrow_token: Token, parser = parser.advance()
@@ -275,6 +287,7 @@ extend Parser:
                     saw_decision <- true
                     target <- Lexer::text_or_empty(target_token, parser.source)
                     target_line <- arrow_token.line
+                    target_offset <- target_token.start
                     rebind accepted_args: bool, parser = parser.accept(TokenKind.LParen)
                     if accepted_args:
                         rebind parsed_args: darray[Ast::Expr], parser = parser.parse_machine_call_arguments()
@@ -284,8 +297,6 @@ extend Parser:
                     parser, _ <- parser.accept(TokenKind.Newline)
                 _:
                     body_head_token: Token = parser.cursor()
-                    saw_decision_value: bool = saw_decision
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, body_head_token) if saw_decision_value
                     rebind stmt_opt: Ast::Stmt?, parser = parser.statement()
                     if stmt_opt is body_statement:
                         parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, body_head_token) if machine_over_arm_stmt_illegal(body_statement)
@@ -301,14 +312,296 @@ extend Parser:
                 Ast::Stmt.Break(label, line): true
                 _: false
 
-        def machine_assignment_root(statement: Ast::Stmt) -> sview:
+        # Assignment targets have a narrower root grammar than arbitrary expressions: only
+        # identifiers, fields, single/multi-indexes, and parentheses are lvalues. Keep calls
+        # out of this helper so an invalid `call(...) <- value` cannot be mistaken for a driven
+        # resource.
+        def machine_assignment_expr_root(expression: Ast::Expr) -> sview:
+            return match expression:
+                Ast::Expr.Ident(name, _): name
+                Ast::Expr.Field(object, _, _): machine_assignment_expr_root(object)
+                Ast::Expr.Index(object, _, _): machine_assignment_expr_root(object)
+                Ast::Expr.IndexN(object, _, _): machine_assignment_expr_root(object)
+                Ast::Expr.Paren(inner, _): machine_assignment_expr_root(inner)
+                _:
+                    ""
+
+        def collect_machine_statement_calls(statement: Ast::Stmt, over_roots: darray[sview], mutated_roots: mutable darray[sview]&) -> void:
+            match statement:
+                Ast::Stmt.Expr(expression, _):
+                    machine_collect_call_roots(expression, over_roots, mutated_roots)
+                Ast::Stmt.VarDecl(_, _, value, _):
+                    machine_collect_call_roots(value, over_roots, mutated_roots)
+                Ast::Stmt.Assign(target, _, value, _):
+                    machine_collect_call_roots(target, over_roots, mutated_roots)
+                    machine_collect_call_roots(value, over_roots, mutated_roots)
+                Ast::Stmt.Return(value, _):
+                    if value is returned:
+                        machine_collect_call_roots(returned, over_roots, mutated_roots)
+                Ast::Stmt.Block(_, _, _, body, _):
+                    for nested in body |over_roots, mutated_roots|:
+                        collect_machine_statement_calls(nested, over_roots, mutated_roots)
+                _:
+                    pass
+
+        # The state dispatch body has the current state's payload locals in scope. An
+        # alias, input binder, or ordinary arm-local with a destination-field spelling
+        # would hide the state slot while the transition is being emitted. Keep this
+        # predicate structural so the repair applies equally to payload aliases and
+        # declarations nested in a transparent clause block.
+        def machine_state_statement_declares_any_name(statement: Ast::Stmt, field_names: darray[sview]) -> bool:
             return match statement:
-                Ast::Stmt.Assign(target, operator, value, line): machine_over_root(target)
-                _: ""
+                Ast::Stmt.VarDecl(name, type_expression, value, pos): any field_name in field_names where field_name == name
+                Ast::Stmt.Block(kind, clause, binding, body, pos): machine_state_declares_any_name(body, field_names)
+                _: false
+
+        def machine_state_declares_any_name(statements: darray[Ast::Stmt]&, field_names: darray[sview]) -> bool:
+            found: mutable bool = false
+            machine over found for statement in statements:
+                state {Scan, Done}
+                start Scan
+
+                Scan, _ if machine_state_statement_declares_any_name(statement, field_names):
+                    found <- true
+                    -> Done
+
+                Scan, _:
+                    -> Scan
+
+                Done, _:
+                    -> Done
+            return found
+
+        def machine_arm_payload_shadows_target(arm: MachineArmAst&, source_fields: darray[sview], target_state: MachineStateAst) -> bool:
+            shadowed: mutable bool = false
+            machine over shadowed for index in 0..<arm.payloads.count:
+                state {Payload, Done}
+                start Payload
+
+                Payload, _ if index >= source_fields.count:
+                    -> Done
+
+                Payload, _ if machine_arm_payload_shadows_target_at(arm, source_fields, target_state, index):
+                    shadowed <- true
+                    -> Done
+
+                Payload, _:
+                    -> Payload
+
+                Done, _:
+                    -> Done
+            return shadowed
+
+        def machine_arm_payload_shadows_target_at(arm: MachineArmAst&, source_fields: darray[sview], target_state: MachineStateAst, payload_index: usize) -> bool:
+            bind_name: sview = arm.payloads[payload_index].bind
+            return bind_name != "" and bind_name != source_fields[payload_index] and any field_name in target_state.field_names where field_name == bind_name
+
+        def machine_arm_shadows_transition_target(arm: MachineArmAst&, source_fields: darray[sview], states: darray[MachineStateAst]) -> bool:
+            false return if not arm.has_transition
+            shadowed: mutable bool = false
+            machine over shadowed for target_state in states:
+                state {Scan, Done}
+                start Scan
+
+                Scan, _ if target_state.name != arm.target:
+                    -> Scan
+
+                Scan, _ if arm.input_bind != "" and any field_name in target_state.field_names where field_name == arm.input_bind:
+                    shadowed <- true
+                    -> Done
+
+                Scan, _ if machine_arm_payload_shadows_target(arm, source_fields, target_state):
+                    shadowed <- true
+                    -> Done
+
+                Scan, _ if machine_state_declares_any_name(arm.body, target_state.field_names):
+                    shadowed <- true
+                    -> Done
+
+                Scan, _:
+                    -> Done
+
+                Done, _:
+                    -> Done
+            return shadowed
+
+        def append_machine_transition_temp_declarations_for_state(declarations: mutable darray[Ast::Stmt]&, arm: MachineArmAst&, target_state: MachineStateAst) -> void:
+            machine over declarations for argument_index in 0..<arm.transition_args.count:
+                state Scan
+                start Scan
+
+                Scan, _ if argument_index >= target_state.field_types.count:
+                    -> Scan
+
+                Scan, _:
+                    temp_type: Ast::Expr = (Ast::Expr.Unary(TokenKind.Mutable, target_state.field_types[argument_index], Ast::pos_at_line(arm.target_line)))
+                    declarations.push((Ast::Stmt.VarDecl(arm.transition_temp_names[argument_index], temp_type, (Ast::Expr.Ident("zeroed", Ast::pos_at_line(arm.target_line))), Ast::pos_at_line(arm.target_line))))
+                    -> Scan
+
+        def append_machine_transition_temp_declarations(declarations: mutable darray[Ast::Stmt]&, arm: MachineArmAst&, states: darray[MachineStateAst]) -> void:
+            machine over declarations for target_state in states:
+                state Scan
+                start Scan
+
+                Scan, _ if not arm.has_transition or target_state.name != arm.target:
+                    -> Scan
+
+                Scan, _:
+                    append_machine_transition_temp_declarations_for_state(declarations, arm, target_state)
+                    -> Scan
+
+        # Validate mutations in source order, including transparent wrapper blocks. Stage0 keeps
+        # arm-local declarations in an arm-wide set while traversing `can`/wrapper bodies; doing
+        # the same here avoids both rejecting a local that shadows a mutable parameter and
+        # missing a foreign assignment nested inside a wrapper.
+        def validate_machine_arm_mutations(parser: lmut Parser, statements: darray[Ast::Stmt], payloads: darray[MachinePayloadPat], local_names: mutable darray[sview]&, over_roots: darray[sview], mutated_roots: mutable darray[sview]&, token: Token) -> void:
+            for statement in statements |parser, local_names|:
+                collect_machine_statement_calls(statement, over_roots, mutated_roots)
+                match statement:
+                    Ast::Stmt.VarDecl(name, _, _, _):
+                        local_names.push(name)
+                    Ast::Stmt.Assign(target, _, _, _):
+                        root: sview = machine_assignment_expr_root(target)
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if root == ""
+                        if root != "":
+                            for payload in payloads |parser|:
+                                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if payload.bind != "" and root == payload.bind
+                            local: bool = any local_name in local_names where local_name == root
+                            driven: bool = any driven_name in over_roots where driven_name == root
+                            machine_add_root(mutated_roots, root) if not local and driven
+                            # A machine arm may mutate only an arm-local declaration or a
+                            # root that appears in `over`/`while`. Do not narrow this to
+                            # mutable parameters: outer locals and globals are foreign too.
+                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not local and not driven
+                    Ast::Stmt.Block(_, _, _, body, _):
+                        parser <- parser.validate_machine_arm_mutations(body, payloads, local_names, over_roots, mutated_roots, token)
+                    _:
+                        pass
+
+        # State payloads are scalarized into one local per field name. Reject duplicate state
+        # names, repeated fields, and cross-state type disagreement before that scalarization;
+        # otherwise a later state could silently inherit the first state's type.
+        def machine_type_expression_equal(first: Ast::Expr, second: Ast::Expr) -> bool:
+            match first:
+                Ast::Expr.IntLit(first_value):
+                    match second:
+                        Ast::Expr.IntLit(second_value):
+                            return first_value == second_value
+                        _:
+                            return false
+                Ast::Expr.FloatLit(first_text):
+                    match second:
+                        Ast::Expr.FloatLit(second_text):
+                            return first_text == second_text
+                        _:
+                            return false
+                Ast::Expr.StringLit(first_text):
+                    match second:
+                        Ast::Expr.StringLit(second_text):
+                            return first_text == second_text
+                        _:
+                            return false
+                Ast::Expr.CharLit(first_text):
+                    match second:
+                        Ast::Expr.CharLit(second_text):
+                            return first_text == second_text
+                        _:
+                            return false
+                Ast::Expr.BoolLit(first_value):
+                    match second:
+                        Ast::Expr.BoolLit(second_value):
+                            return first_value == second_value
+                        _:
+                            return false
+                Ast::Expr.Ident(first_name, _):
+                    match second:
+                        Ast::Expr.Ident(second_name, _):
+                            return first_name == second_name
+                        _:
+                            return false
+                Ast::Expr.Scope(first_base, first_name, _):
+                    match second:
+                        Ast::Expr.Scope(second_base, second_name, _):
+                            return first_name == second_name and machine_type_expression_equal(first_base, second_base)
+                        _:
+                            return false
+                Ast::Expr.Index(first_object, first_index, _):
+                    match second:
+                        Ast::Expr.Index(second_object, second_index, _):
+                            return machine_type_expression_equal(first_object, second_object) and machine_type_expression_equal(first_index, second_index)
+                        _:
+                            return false
+                Ast::Expr.IndexN(first_object, first_arguments, _):
+                    match second:
+                        Ast::Expr.IndexN(second_object, second_arguments, _):
+                            return false if first_arguments.count != second_arguments.count or not machine_type_expression_equal(first_object, second_object)
+                            for index in 0..<first_arguments.count:
+                                return false if not machine_type_expression_equal(first_arguments[index], second_arguments[index])
+                            return true
+                        _:
+                            return false
+                Ast::Expr.Binary(first_left, first_operator, first_right, _):
+                    match second:
+                        Ast::Expr.Binary(second_left, second_operator, second_right, _):
+                            return first_operator == second_operator and machine_type_expression_equal(first_left, second_left) and machine_type_expression_equal(first_right, second_right)
+                        _:
+                            return false
+                Ast::Expr.Unary(first_operator, first_operand, _):
+                    match second:
+                        Ast::Expr.Unary(second_operator, second_operand, _):
+                            return first_operator == second_operator and machine_type_expression_equal(first_operand, second_operand)
+                        _:
+                            return false
+                Ast::Expr.Paren(first_inner, _):
+                    match second:
+                        Ast::Expr.Paren(second_inner, _):
+                            return machine_type_expression_equal(first_inner, second_inner)
+                        _:
+                            return false
+                Ast::Expr.Array(first_elements, _):
+                    match second:
+                        Ast::Expr.Array(second_elements, _):
+                            return false if first_elements.count != second_elements.count
+                            for index in 0..<first_elements.count:
+                                return false if not machine_type_expression_equal(first_elements[index], second_elements[index])
+                            return true
+                        _:
+                            return false
+                Ast::Expr.Tuple(first_elements, _):
+                    match second:
+                        Ast::Expr.Tuple(second_elements, _):
+                            return false if first_elements.count != second_elements.count
+                            for index in 0..<first_elements.count:
+                                return false if not machine_type_expression_equal(first_elements[index], second_elements[index])
+                            return true
+                        _:
+                            return false
+                Ast::Expr.Refinement(first_base, first_predicate, _):
+                    match second:
+                        Ast::Expr.Refinement(second_base, second_predicate, _):
+                            return machine_type_expression_equal(first_base, second_base) and machine_type_expression_equal(first_predicate, second_predicate)
+                        _:
+                            return false
+                _:
+                    return false
+
+        def validate_machine_state_declarations(parser: lmut Parser, states: darray[MachineStateAst], token: Token) -> void:
+            for state_index in 0..<states.count |parser|:
+                for previous_state_index in 0..<state_index |parser|:
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if states[state_index].name == states[previous_state_index].name
+                for field_index in 0..<states[state_index].field_names.count |parser|:
+                    for previous_field_index in 0..<field_index |parser|:
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if states[state_index].field_names[field_index] == states[state_index].field_names[previous_field_index]
+                    for previous_state_index in 0..<state_index |parser|:
+                        for previous_field_index in 0..<states[previous_state_index].field_names.count |parser|:
+                            if states[state_index].field_names[field_index] == states[previous_state_index].field_names[previous_field_index]:
+                                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not machine_type_expression_equal(states[state_index].field_types[field_index], states[previous_state_index].field_types[previous_field_index])
 
         def validate_machine_transitions(parser: lmut Parser, states: darray[MachineStateAst], arms: darray[MachineArmAst], start_state: sview, start_args: darray[Ast::Expr], input_expression: Ast::Expr, token: Token) -> void:
-            over_root: sview = machine_over_root(input_expression)
+            parser <- parser.validate_machine_state_declarations(states, token)
             start_found: mutable bool = start_state == ""
+            if start_state == "" and states.count > 0:
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if start_args.count != states[0].field_names.count
             for state in states |parser, start_found|:
                 if state.name == start_state:
                     start_found <- true
@@ -321,20 +614,22 @@ extend Parser:
                         target_found <- true
                         parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if arm.transition_args.count != state.field_names.count
                 parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not target_found
-                for statement in arm.body |parser|:
-                    root: sview = machine_assignment_root(statement)
-                    if root != "":
-                        for payload in arm.payloads |parser|:
-                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if payload.bind != "" and root == payload.bind
-                        for param in parser.mutable_param_names |parser|:
-                            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if root == param and root != over_root
 
         # Lower one arm: payload-pattern conds AND input conds AND guard; body plus the
         # transition's payload assigns + mode rebind. Payload assignments are retained even
         # when both identifiers have the same spelling: an arm-local may shadow the state
         # slot, in which case `-> Next(value)` must copy that local into Next.value.
-        def lower_machine_arm_body(arm: MachineArmAst&, states: darray[MachineStateAst], state_fields: darray[sview], enum_name: sview, mode_var: sview, line: u32) -> darray[Ast::Stmt]:
+        def lower_machine_arm_body(arm: MachineArmAst&, states: darray[MachineStateAst], state_fields: darray[sview], enum_name: sview, mode_var: sview, input_var: sview, line: u32) -> darray[Ast::Stmt]:
             lowered: mutable darray[Ast::Stmt] = []
+            # Compute this from the source arm before aliases are materialized. The
+            # result is reused by the transition emitter below; passing the fact avoids
+            # asking a lowered AST to recover lexical binding identity.
+            transition_target_shadows: bool = machine_arm_shadows_transition_target(arm, state_fields, states)
+            if arm.input_bind != "":
+                # Keep the input binder local to the selected arm body. Its guard
+                # receives a separate expression-block binding below, so sibling
+                # arms cannot observe this name.
+                lowered.push((Ast::Stmt.VarDecl(arm.input_bind, (Ast::Expr.Invalid), (Ast::Expr.Ident(input_var, Ast::pos_at_line(arm.line))), Ast::pos_at_line(arm.line))))
             # Payload bind aliases (bind name != field name).
             machine over lowered for index in 0..<arm.payloads.count:
                 state Scan
@@ -366,12 +661,40 @@ extend Parser:
                     -> Scan
 
                 Scan, _:
-                    append_machine_transition_for_state(lowered, arm, target_state, enum_name, mode_var)
+                    append_machine_transition_for_target(lowered, arm, target_state, transition_target_shadows, enum_name, mode_var)
                     -> Scan
             lowered.push((Ast::Stmt.Expr((Ast::Expr.Invalid), Ast::pos_at_line(line)))) if lowered.count == 0
             return lowered
 
+        def append_machine_transition_for_target[@r](lowered: mutable darray[Ast::Stmt]& @r, arm: MachineArmAst&, target_state: MachineStateAst, transition_target_shadows: bool, enum_name: sview, mode_var: sview) -> void:
+            if transition_target_shadows:
+                captured: mutable darray[Ast::Stmt] @r = []
+                captured.extend(lowered)
+                values: mutable darray[Ast::Expr] @r = []
+                machine over values for argument_index in 0..<arm.transition_args.count:
+                    state Capture
+                    start Capture
+
+                    Capture, _:
+                        append_machine_transition_capture(captured, values, arm, argument_index)
+                        -> Capture
+                lowered <- [(Ast::Stmt.Block("can", [], "", captured, Ast::pos_at_line(arm.line)))]
+                append_machine_transition_for_values(lowered, arm, target_state, enum_name, mode_var, values)
+                return
+            append_machine_transition_for_state(lowered, arm, target_state, enum_name, mode_var)
+
+        def append_machine_transition_capture(captured: mutable darray[Ast::Stmt]&, values: mutable darray[Ast::Expr]&, arm: MachineArmAst&, argument_index: usize) -> void:
+            captured.push((Ast::Stmt.Assign((Ast::Expr.Ident(arm.transition_temp_names[argument_index], Ast::pos_at_line(arm.target_line))), TokenKind.LArrow, arm.transition_args[argument_index], Ast::pos_at_line(arm.target_line))))
+            values.push((Ast::Expr.Ident(arm.transition_temp_names[argument_index], Ast::pos_at_line(arm.target_line))))
+
         def append_machine_transition_for_state(lowered: mutable darray[Ast::Stmt]&, arm: MachineArmAst&, target_state: MachineStateAst, enum_name: sview, mode_var: sview) -> void:
+            machine over lowered for argument_index in 0..<arm.transition_args.count:
+                state Capture
+                start Capture
+
+                Capture, _:
+                    lowered.push((Ast::Stmt.VarDecl(arm.transition_temp_names[argument_index], (Ast::Expr.Invalid), arm.transition_args[argument_index], Ast::pos_at_line(arm.target_line))))
+                    -> Capture
             machine over lowered for index in 0..<target_state.field_names.count:
                 state Scan
                 start Scan
@@ -380,7 +703,20 @@ extend Parser:
                     -> Scan
 
                 Scan, _:
-                    lowered.push((Ast::Stmt.Assign((Ast::Expr.Ident(target_state.field_names[index], Ast::pos_at_line(arm.target_line))), TokenKind.LArrow, arm.transition_args[index], Ast::pos_at_line(arm.target_line))))
+                    lowered.push((Ast::Stmt.Assign((Ast::Expr.Ident(target_state.field_names[index], Ast::pos_at_line(arm.target_line))), TokenKind.LArrow, (Ast::Expr.Ident(arm.transition_temp_names[index], Ast::pos_at_line(arm.target_line))), Ast::pos_at_line(arm.target_line))))
+                    -> Scan
+            lowered.push((Ast::Stmt.Assign((Ast::Expr.Ident(mode_var, Ast::pos_at_line(arm.target_line))), TokenKind.LArrow, (Ast::Expr.Field((Ast::Expr.Ident(enum_name, Ast::pos_at_line(arm.target_line))), arm.target, Ast::pos_at_line(arm.target_line))), Ast::pos_at_line(arm.target_line)))) if arm.target != arm.state_name
+
+        def append_machine_transition_for_values(lowered: mutable darray[Ast::Stmt]&, arm: MachineArmAst&, target_state: MachineStateAst, enum_name: sview, mode_var: sview, values: darray[Ast::Expr]) -> void:
+            machine over lowered for index in 0..<target_state.field_names.count:
+                state Scan
+                start Scan
+
+                Scan, _ if index >= values.count:
+                    -> Scan
+
+                Scan, _:
+                    lowered.push((Ast::Stmt.Assign((Ast::Expr.Ident(target_state.field_names[index], Ast::pos_at_line(arm.target_line))), TokenKind.LArrow, values[index], Ast::pos_at_line(arm.target_line))))
                     -> Scan
             lowered.push((Ast::Stmt.Assign((Ast::Expr.Ident(mode_var, Ast::pos_at_line(arm.target_line))), TokenKind.LArrow, (Ast::Expr.Field((Ast::Expr.Ident(enum_name, Ast::pos_at_line(arm.target_line))), arm.target, Ast::pos_at_line(arm.target_line))), Ast::pos_at_line(arm.target_line)))) if arm.target != arm.state_name
 
@@ -408,7 +744,10 @@ extend Parser:
                 input_condition: mutable Ast::Expr = (Ast::Expr.Invalid)
                 append_machine_input_condition(input_condition, arm, input_var)
                 condition <- input_condition if machine_expr_is_invalid(condition) else (Ast::Expr.Binary(condition, TokenKind.And, input_condition, Ast::pos_at_line(arm.line)))
-            condition <- (arm.guard if machine_expr_is_invalid(condition) else (Ast::Expr.Binary(condition, TokenKind.And, arm.guard, Ast::pos_at_line(arm.line)))) if not machine_expr_is_invalid(arm.guard)
+            guard: mutable Ast::Expr = arm.guard
+            if arm.input_bind != "" and not machine_expr_is_invalid(guard):
+                guard <- (Ast::Expr.Block([(Ast::Stmt.VarDecl(arm.input_bind, (Ast::Expr.Invalid), (Ast::Expr.Ident(input_var, Ast::pos_at_line(arm.line))), Ast::pos_at_line(arm.line)))], guard, [], Ast::pos_at_line(arm.line)))
+            condition <- (guard if machine_expr_is_invalid(condition) else (Ast::Expr.Binary(condition, TokenKind.And, guard, Ast::pos_at_line(arm.line)))) if not machine_expr_is_invalid(guard)
             return condition
 
         def append_machine_input_condition(input_condition: mutable Ast::Expr&, arm: MachineArmAst&, input_var: sview) -> void:
@@ -440,7 +779,7 @@ extend Parser:
 
 
         def machine_payload_condition(pat: MachinePayloadPat, state_field: sview, line: u32) -> Ast::Expr:
-            return (Ast::Expr.Binary((Ast::Expr.Ident(state_field, Ast::pos_at_line(line))), TokenKind.EqEq, pat.condition, Ast::pos_at_line(line))) if machine_expr_is_literal(pat.condition) else pat.condition
+            return (Ast::Expr.Binary((Ast::Expr.Ident(state_field, Ast::pos_at_line(line))), TokenKind.EqEq, pat.condition, Ast::pos_at_line(line))) if machine_expr_is_literal(pat.condition) or not machine_expr_mentions_ident(pat.condition, state_field) else pat.condition
 
         def combine_machine_condition(existing: Ast::Expr, next: Ast::Expr, operator: TokenKind, line: u32) -> Ast::Expr:
             return next if machine_expr_is_invalid(existing) else (Ast::Expr.Binary(existing, operator, next, Ast::pos_at_line(line)))
@@ -463,12 +802,17 @@ extend Parser:
         def machine_arm_irrefutable(arm: MachineArmAst&) -> bool:
             return arm.input_wild and machine_expr_is_invalid(arm.guard) and machine_payloads_unconditional(arm)
 
-        # An open-domain (char/int) input literal — a state carrying one can never be
-        # exhaustive without a final `_`, and the parser proves it without types.
+        # An open-domain (char/int/float/bool/string) input literal — a state carrying one can
+        # never be exhaustive without a final `_`, and the parser proves it without types.
         def machine_expr_open_domain(expression: Ast::Expr) -> bool:
             return match expression:
                 Ast::Expr.IntLit(value): true
+                Ast::Expr.FloatLit(text): true
                 Ast::Expr.CharLit(text): true
+                Ast::Expr.BoolLit(value): true
+                Ast::Expr.StringLit(text): true
+                Ast::Expr.Unary(operator, operand, _): machine_expr_open_domain(operand)
+                Ast::Expr.Paren(inner, _): machine_expr_open_domain(inner)
                 _: false
 
         def machine_arm_open_domain(arm: MachineArmAst&) -> bool:
@@ -476,12 +820,18 @@ extend Parser:
 
         # Exact literal equality for the per-state duplicate-input check (0-FP: fires only
         # when the SAME literal is handled twice, never on possibly-overlapping forms).
-        def machine_literal_equal(a: Ast::Expr, b: Ast::Expr) -> bool:
+        def machine_literal_equal_core(a: Ast::Expr, b: Ast::Expr) -> bool:
             match a:
                 Ast::Expr.IntLit(a_value):
                     match b:
                         Ast::Expr.IntLit(b_value):
                             return a_value == b_value
+                        _:
+                            return false
+                Ast::Expr.FloatLit(a_text):
+                    match b:
+                        Ast::Expr.FloatLit(b_text):
+                            return when_text_equal(a_text, b_text)
                         _:
                             return false
                 Ast::Expr.CharLit(a_text):
@@ -502,9 +852,48 @@ extend Parser:
                             return a_value == b_value
                         _:
                             return false
+                Ast::Expr.Field(a_object, a_field, _):
+                    match b:
+                        Ast::Expr.Field(b_object, b_field, _):
+                            return a_field == b_field and machine_type_expression_equal(a_object, b_object)
+                        _:
+                            return false
+                Ast::Expr.ShorthandMember(a_parts, _):
+                    match b:
+                        Ast::Expr.ShorthandMember(b_parts, _):
+                            return false if a_parts.count != b_parts.count
+                            for index in 0..<a_parts.count:
+                                return false if a_parts[index] != b_parts[index]
+                            return true
+                        _:
+                            return false
+                Ast::Expr.Unary(a_operator, a_operand, _):
+                    match b:
+                        Ast::Expr.Unary(b_operator, b_operand, _):
+                            return a_operator == b_operator and machine_literal_equal_core(a_operand, b_operand)
+                        _:
+                            return false
+                Ast::Expr.Paren(a_inner, _):
+                    return match b:
+                        Ast::Expr.Paren(b_inner, _): machine_literal_equal_core(a_inner, b_inner)
+                        _: false
                 _:
                     return false
             return false
+
+        # Grouping parentheses do not change a literal's identity. Strip them before the
+        # exact duplicate check so `(1.0)` and `1.0` (and the corresponding negative forms)
+        # cannot evade the same unreachable-arm diagnostic.
+        def machine_literal_equal(a: Ast::Expr, b: Ast::Expr) -> bool:
+            match a:
+                Ast::Expr.Paren(inner, _):
+                    return machine_literal_equal(inner, b)
+                _:
+                    match b:
+                        Ast::Expr.Paren(inner, _):
+                            return machine_literal_equal(a, inner)
+                        _:
+                            return machine_literal_equal_core(a, b)
 
         # Per declared state: no arms is an error; an irrefutable arm before the last makes
         # the rest unreachable; an open-domain state with no irrefutable arm cannot be
@@ -550,7 +939,7 @@ extend Parser:
                 state_index <- state_index + 1
 
         # docs/125 §9 Tier-2: the classifier function name of a `machine over` input, or "" when
-        # the input is not a bare free-function call (a method-call / char input is open-domain,
+        # the input is not a bare free-function call (a method-call / literal input is open-domain,
         # already handled by the parser's per-state coverage check).
         def machine_input_callee(expression: Ast::Expr) -> sview:
             match expression:
@@ -559,12 +948,15 @@ extend Parser:
                 _:
                     return ""
 
-        # The variant name of a `Enum.Variant` tag input (a Field expr), or "" for a literal /
-        # range / non-tag input.
+        # The variant name of an enum tag input: either `Enum.Variant` (Field) or `.Variant`
+        # (ShorthandMember), or "" for a literal/range/non-tag input.
         def machine_arm_variant_tag(expression: Ast::Expr) -> sview:
             match expression:
                 Ast::Expr.Field(object, field, field_line):
                     return field
+                Ast::Expr.ShorthandMember(parts, _):
+                    return parts[parts.count - 1] if parts.count > 0
+                    return ""
                 _:
                     return ""
 
