@@ -106,10 +106,10 @@ def mark() -> None:
 
 def flatten(p: pathlib.Path, out: list[str], stack: list[pathlib.Path]) -> None:
     ap = p.resolve()
-    if ap in seen:
-        return
     if ap in stack:
         raise SystemExit(f"cyclic include: {ap}")
+    if ap in seen:
+        return
     seen.add(ap)
     stack.append(ap)
     text = p.read_text(encoding="utf-8")
