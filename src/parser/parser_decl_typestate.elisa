@@ -4,6 +4,31 @@
 
 extend Parser:
     private:
+        # Generated typestate declarations must retain their synthesized function names after
+        # parsing. Keep them in the parser-owned name pool, the same way handler rewrites retain
+        # their generated operation names. The pool is deliberately shared: a single reserved
+        # allocation keeps all returned sviews stable while the file is adopted by the driver.
+        def typestate_constructor_name[@r](parser: mutable Parser& @r, type_name: sview) -> sview:
+            parser.handler_name_storage.reserve(parser.tokens.count * 64) if parser.handler_name_storage.count == 0
+            start: usize = parser.handler_name_storage.count
+            append_handler_name_text(parser.handler_name_storage, "__typestate_")
+            append_handler_name_text(parser.handler_name_storage, type_name)
+            append_handler_name_text(parser.handler_name_storage, "_new")
+            return sview(&parser.handler_name_storage[start], 0, parser.handler_name_storage.count - start)
+
+        def typestate_initial_state(parser: Parser&, owner: sview) -> sview:
+            for annotation in parser.enum_annotations |owner|:
+                return annotation.name if annotation.owner == owner and annotation.line == 3900000054
+            return sview("", 0, 0)
+
+        def typestate_state_index(states: darray[sview]&, wanted: sview) -> i64:
+            for index in 0..<states.count:
+                return index.i64() if states[index] == wanted
+            return -1
+
+        def typestate_state_type(type_name: sview, state_name: sview, pos: Ast::Pos) -> Ast::Expr:
+            return (Ast::Expr.Index((Ast::Expr.Ident(type_name, pos)), (Ast::Expr.Ident(state_name, pos)), pos))
+
         def count_typestate_transition_params(parser: lmut Parser) -> usize:
             machine over parser.position while true:
                 state Scan(depth: int, count: usize, saw_param: bool)
@@ -32,16 +57,16 @@ extend Parser:
                     -> Scan(depth, count, true)
             return 0
 
-        def typestate_name_exists(names: darray[sview], candidate: sview) -> bool:
+        def typestate_name_exists(parser: Parser&, owner: sview, candidate: sview) -> bool:
             index: mutable usize = 0
             machine over index while true:
                 state Scan
                 start Scan
 
-                Scan, _ if index >= names.count:
+                Scan, _ if index >= parser.enum_annotations.count:
                     return false
 
-                Scan, _ if names[index] == candidate:
+                Scan, _ if parser.enum_annotations[index].owner == owner and parser.enum_annotations[index].name == candidate and parser.enum_annotations[index].line == 3900000054:
                     return true
 
                 Scan, _:
@@ -49,65 +74,97 @@ extend Parser:
                     -> Scan
             return false
 
+        # Parse the state list in a value-returning helper. Keeping this scan separate from the
+        # declaration loop is important: a nested loop's local darray accumulator is not a stable
+        # way to feed later validation in the self-hosted parser.
+        def parse_typestate_states(parser: lmut Parser, owner: sview) -> darray[sview]:
+            parser, _ <- parser.expect(TokenKind.Colon)
+            states: mutable darray[sview] = []
+            while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, states|:
+                if parser.peek() == TokenKind.Ident:
+                    rebind state_token: Token, parser = parser.advance()
+                    state_name: sview = Lexer::text_or_empty(state_token, parser.source)
+                    states.push(state_name)
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: owner, name: state_name, line: 3900000054})
+                else:
+                    parser.position <- parser.position + 1
+            return states
+
+        # Parse one ordinary field from the legacy typestate body. The first implementation of
+        # this declaration form retained only the states/transitions and discarded fields, which
+        # made a `linear typestate` semantically visible but impossible to lower: every concrete
+        # `T[State]` instance looked like an empty generic and stage1 declined the whole function.
+        # Keep the field in the normal StructMember representation so the generic backend can
+        # instantiate the same runtime layout as stage0. The richer struct-only clauses (bit
+        # groups, guest overlays, and defaults) remain handled by struct_member_block; typestate
+        # fields use the ordinary name/colon/type subset shared by the stage0 sugar.
+        def parse_typestate_field(parser: lmut Parser) -> Ast::StructMember?:
+            can Abort.Panic, Memory.Allocate:
+                rebind field_name: Token, parser = parser.expect(TokenKind.Ident)
+                rebind optional_field: bool, parser = parser.accept(TokenKind.Question)
+                parser, _ <- parser.expect(TokenKind.Colon)
+                previous_type_context: bool = parser.in_type_annotation
+                parser.in_type_annotation <- true
+                rebind field_type_opt: Ast::Expr?, parser = parser.expression()
+                parser.in_type_annotation <- previous_type_context
+                if field_type_opt is field_type:
+                    rebind refined_type: Ast::Expr, parser = parser.parse_refinement_suffix(field_type)
+                    parser <- parser.record_error_union(field_name.line, "__field_error_union") if parser.peek() == TokenKind.Error
+                    return (Ast::StructMember{name: Lexer::text_or_empty(field_name, parser.source), type_expression: refined_type, omittable: optional_field, is_ghost: false, has_default: false, default_value: (Ast::Expr.Invalid), region: sview("", 0, 0), bit_group_kind: sview("", 0, 0), bit_group_members: []})
+                return null
+
         # Parse the legacy typestate declaration sugar and expose its state-bearing
         # aggregate plus transition functions through existing stage1 AST nodes.
         def typestate_declaration(parser: lmut Parser, is_linear: bool) -> Ast::Decl?:
             parser, _ <- parser.advance() if is_linear                 # `linear`
             rebind token: Token, parser = parser.advance()             # `typestate`
             rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
+            # The state argument is compile-time only, but it is still a real generic parameter
+            # for the backend: `HostBytes[Live]` and `HostBytes[Released]` must each materialize
+            # the same field-bearing LLVM aggregate with the state marker erased from layout.
+            parser <- parser.record_struct_generic_param(token.line, "state")
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(name_token, parser.source), name: "__aggregate_state", line: token.line})
             parser, _ <- parser.expect(TokenKind.Colon)
             parser, _ <- parser.expect(TokenKind.Newline)
             parser, _ <- parser.expect(TokenKind.Indent)
             states: mutable darray[sview] = []
-            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, states|:
+            fields: mutable darray[Ast::StructMember] = []
+            generated_transition_decls: mutable darray[Ast::Decl] = []
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, states, fields|:
                 parser <- parser.skip_newlines()
                 break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
                 line_head: Token = parser.cursor()
                 head_text: sview = Lexer::text_or_empty(line_head, parser.source)
                 if head_text == "states":
                     parser, _ <- parser.advance()
-                    parser, _ <- parser.expect(TokenKind.Colon)
-                    machine over parser.position while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
-                        state Scan
-                        start Scan
-
-                        Scan, _ if parser.peek() == TokenKind.Ident:
-                            rebind state_token: Token, parser = parser.advance()
-                            states.push(Lexer::text_or_empty(state_token, parser.source))
-                            -> Scan
-
-                        Scan, _:
-                            parser.position <- parser.position + 1
-                            -> Scan
+                    rebind parsed_states: darray[sview], parser = parser.parse_typestate_states(Lexer::text_or_empty(name_token, parser.source))
+                    states <- parsed_states
                 elif head_text == "terminal":
                     parser, _ <- parser.advance()
                     parser, _ <- parser.expect(TokenKind.Colon)
                     rebind terminal_token: Token, parser = parser.expect(TokenKind.Ident)
                     terminal_name: sview = Lexer::text_or_empty(terminal_token, parser.source)
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, terminal_token) if not typestate_name_exists(states, terminal_name)
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, terminal_token) if not parser.typestate_name_exists(Lexer::text_or_empty(name_token, parser.source), terminal_name)
                     # Retain (typestate -> terminal state) for the scope-exit conformance check
                     # (the state model is otherwise discarded — the decl returns a memberless struct).
                     parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(name_token, parser.source), name: terminal_name, line: 3900000004})
                 elif head_text == "transition":
                     parser, _ <- parser.advance()
                     rebind transition_name: Token, parser = parser.expect(TokenKind.Ident)
-                    # Count the declared transition parameters so the synthesized function
-                    # gets the right arity: a transition is called with the typestate subject
-                    # as the first argument plus its declared params (`connect(c, addr)` for
-                    # `transition connect(addr: i64): …`). Count depth-0 commas + 1.
-                    declared_param_count: mutable usize = 0
-                    saw_transition_param: mutable bool = false
+                    # Preserve the declared parameter types, not only their count. The subject
+                    # is synthesized below as `mutable T[From]&`; the remaining parameters use
+                    # the ordinary function parameter grammar, so transitions participate in
+                    # the same ABI/type checking as every other function.
+                    declared_params: mutable darray[Ast::ParamDecl] = []
                     rebind has_transition_params: bool, parser = parser.accept(TokenKind.LParen)
                     if has_transition_params:
-                        declared_param_count <- parser.count_typestate_transition_params()
-                        saw_transition_param <- declared_param_count > 0
-                        parser, _ <- parser.expect(TokenKind.RParen)
+                        rebind _variadic: bool, parser = parser.parse_param_list(declared_params, transition_name.line)
                     parser, _ <- parser.expect(TokenKind.Colon)
                     rebind source_state: Token, parser = parser.expect(TokenKind.Ident)
                     parser, _ <- parser.expect(TokenKind.Arrow)
                     rebind target_state: Token, parser = parser.expect(TokenKind.Ident)
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, source_state) if not typestate_name_exists(states, Lexer::text_or_empty(source_state, parser.source))
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, target_state) if not typestate_name_exists(states, Lexer::text_or_empty(target_state, parser.source))
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, source_state) if not parser.typestate_name_exists(Lexer::text_or_empty(name_token, parser.source), Lexer::text_or_empty(source_state, parser.source))
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, target_state) if not parser.typestate_name_exists(Lexer::text_or_empty(name_token, parser.source), Lexer::text_or_empty(target_state, parser.source))
                     # Retain (transition -> target state) so scope-exit can compute a subject's
                     # final state by replaying its transition calls.
                     parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(transition_name, parser.source), name: Lexer::text_or_empty(target_state, parser.source), line: 3900000005})
@@ -118,22 +175,33 @@ extend Parser:
                     rebind has_other_target: bool, parser = parser.accept(TokenKind.Pipe)
                     if has_other_target:
                         rebind other_target: Token, parser = parser.expect(TokenKind.Ident)
-                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, other_target) if not typestate_name_exists(states, Lexer::text_or_empty(other_target, parser.source))
-                    # Subject param + one per declared transition param, so the arity check
-                    # accepts `redeem(t)` / `connect(c, addr)`. Types are placeholders — the
-                    # frontend only needs the count for call-arity parity.
-                    transition_params: mutable darray[Ast::ParamDecl] = []
-                    machine over transition_params for _ in 0..<(declared_param_count + 1):
-                        state Add
-                        start Add
-
-                        Add, _:
-                            transition_params.push(Ast::ParamDecl{name: "", type_expression: (Ast::Expr.Invalid), is_mutable: false, has_default: false, default_value: (Ast::Expr.Invalid)})
-                            -> Add
-                    no_body: darray[Ast::Stmt] = []
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, other_target) if not parser.typestate_name_exists(Lexer::text_or_empty(name_token, parser.source), Lexer::text_or_empty(other_target, parser.source))
+                    transition_position: Ast::Pos = Ast::pos_of_token(transition_name)
+                    subject_type: Ast::Expr = typestate_state_type(Lexer::text_or_empty(name_token, parser.source), Lexer::text_or_empty(source_state, parser.source), transition_position)
+                    # The source spelling generated by stage0 is `mutable T[From]&`, which
+                    # is represented as a mutable qualifier around the reference. Keeping
+                    # both markers matters: `T[From]&` is intentionally readonly, while a
+                    # transition must write the runtime discriminant.
+                    subject_ref_type: Ast::Expr = Ast::Expr.Unary(TokenKind.Ampersand, subject_type, transition_position)
+                    subject_param_type: Ast::Expr = Ast::Expr.Unary(TokenKind.Mutable, subject_ref_type, transition_position)
+                    transition_params: mutable darray[Ast::ParamDecl] = [Ast::ParamDecl{name: "self", type_expression: subject_param_type, is_mutable: true, has_default: false, default_value: (Ast::Expr.Invalid)}]
+                    transition_params.extend(declared_params)
+                    no_body: mutable darray[Ast::Stmt] = []
+                    target_index: i64 = typestate_state_index(states, Lexer::text_or_empty(target_state, parser.source))
+                    if target_index >= 0:
+                        transition_body: mutable darray[Ast::Stmt] = []
+                        transition_target: Ast::Expr = Ast::Expr.Field((Ast::Expr.Ident("self", transition_position)), "__typestate", transition_position)
+                        transition_value: Ast::Expr = Ast::Expr.IntLit(target_index)
+                        transition_body.push(Ast::Stmt.Assign(transition_target, TokenKind.LArrow, transition_value, transition_position))
+                        no_body <- transition_body
                     no_effects: darray[sview] = []
                     no_decorators: darray[Ast::Annotation] = []
-                    parser.pending_decls <- parser.pending_decls.push((Ast::Decl.Func(Lexer::text_or_empty(transition_name, parser.source), transition_params, null, no_body, no_effects, no_decorators, Ast::pos_of_token(transition_name))))
+                    parser.typestate_postconditions <- parser.typestate_postconditions.push(Ast::TypestatePostcondition{function_name: Lexer::text_or_empty(transition_name, parser.source), parameter_name: "self", state: Lexer::text_or_empty(target_state, parser.source), position: 0, line: transition_name.line})
+                    generated_transition_decls.push((Ast::Decl.Func(Lexer::text_or_empty(transition_name, parser.source), transition_params, null, no_body, no_effects, no_decorators, Ast::pos_of_token(transition_name))))
+                else:
+                    rebind field_opt: Ast::StructMember?, parser = parser.parse_typestate_field()
+                    if field_opt is field:
+                        fields.push(field)
                 machine over parser.position while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
                     state Skip
                     start Skip
@@ -143,10 +211,35 @@ extend Parser:
                         -> Skip
                 parser, _ <- parser.accept(TokenKind.Newline)
             parser, _ <- parser.expect(TokenKind.Dedent)
-            no_members: darray[Ast::StructMember] = []
+            initial_state: sview = parser.typestate_initial_state(Lexer::text_or_empty(name_token, parser.source))
+            if initial_state != "":
+                type_position: Ast::Pos = Ast::pos_of_token(name_token)
+                typed_type: Ast::Expr = typestate_state_type(Lexer::text_or_empty(name_token, parser.source), initial_state, type_position)
+                constructor_params: mutable darray[Ast::ParamDecl] = []
+                constructor_fields: mutable darray[Ast::FieldInit] = []
+                for field in fields |constructor_params, constructor_fields|:
+                    constructor_params.push(Ast::ParamDecl{name: field.name, type_expression: field.type_expression, is_mutable: false, has_default: false, default_value: (Ast::Expr.Invalid)})
+                    constructor_fields.push(Ast::FieldInit{name: field.name, value: Ast::Expr.Ident(field.name, type_position)})
+                constructor_fields.push(Ast::FieldInit{name: "__typestate", value: Ast::Expr.IntLit(0)})
+                constructor_body: darray[Ast::Stmt] = [Ast::Stmt.Return(Ast::Expr.Construct(typed_type, constructor_fields, type_position), type_position)]
+                constructor_name: sview = parser.typestate_constructor_name(Lexer::text_or_empty(name_token, parser.source))
+                # The constructor shares the typestate declaration's source position, which is
+                # also the key used for the phantom `state` generic. Mark it explicitly so the
+                # backend does not mistake this synthesized ordinary function for a generic
+                # template and skip its declaration/body passes.
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: constructor_name, name: "__typestate_generated", line: type_position.line})
+                parser.pending_decls <- parser.pending_decls.push((Ast::Decl.Func(constructor_name, constructor_params, typed_type, constructor_body, [], [], type_position)))
+                # Keep the runtime discriminant in the aggregate, matching stage0's
+                # typestate lowering. The state generic remains phantom for ABI naming, while
+                # this field lets transition functions update the concrete value at runtime.
+                fields.push(Ast::StructMember{name: "__typestate", type_expression: Ast::Expr.Unary(TokenKind.Mutable, Ast::Expr.Ident("i64", type_position), type_position), omittable: false, is_ghost: false, has_default: false, default_value: (Ast::Expr.Invalid), region: sview("", 0, 0), bit_group_kind: sview("", 0, 0), bit_group_members: []})
+            for generated_transition_decl in generated_transition_decls:
+                parser.pending_decls <- parser.pending_decls.push(generated_transition_decl)
             no_invariants: darray[Ast::Expr] = []
             affinity: sview = "linear" if is_linear else ""
-            return (Ast::Decl.Struct(Lexer::text_or_empty(name_token, parser.source), no_members, affinity, true, true, no_invariants, Ast::pos_of_token(token)))
+            declaration: Ast::Decl = Ast::Decl.Struct(Lexer::text_or_empty(name_token, parser.source), fields, affinity, true, true, no_invariants, Ast::pos_of_token(token))
+            parser <- parser.record_generic_struct_metadata(declaration, Lexer::text_or_empty(name_token, parser.source), token.line)
+            return declaration
 
         # Named contract declaration; structurally a function whose body consists of
         # contract statements. This keeps its symbol and parameter scope available.
