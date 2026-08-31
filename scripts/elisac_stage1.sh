@@ -23,11 +23,10 @@ ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
 fi
-# Never silently seed stage1 with the installed compiler. Callers can pin a
-# particular local stage0 with ELISACORE_BIN; otherwise use the compiler/bin
-# artifact in the selected ELISA_CORE source tree.
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
-STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
+# Use the sibling stage0 worktree by default. This keeps stage1 self-hosting and
+# ordinary wrapper invocations independent from any installed `elisac`; callers
+# can still select an explicit compiler with ELISACORE_BIN.
+STAGE0_BIN="${ELISACORE_BIN:-$ROOT/../stage0/compiler/bin/elisac-local}"
 # Include expansion is a host-side Python step. Resolve the same interpreter selected by
 # `PYTHON_BIN` (including a command name such as `python3.14`) before any emit mode runs so
 # custom toolchains are honored consistently by the wrapper and its recursive invocations.
