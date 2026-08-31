@@ -1,13 +1,13 @@
 extend Parser:
     public:
-        # docs/125 §5 — `machine from START [decreases M]:` state-machine EXPRESSION.
+        # docs/125 §5 — `machine from START [|header|] [decreases M]:` state-machine EXPRESSION.
         # Port of stage0's MachineFromExpr. Stage1 is a frontend (no codegen), so this
         # desugars — entirely in the parser — to a value `Expr.Block` that RESOLVES:
-        #   result/done/mode locals + `while not done: <mode if-chain>`, yielding result.
+        #   header locals + result/done/mode locals + `while not done: <mode if-chain>`, yielding result.
         # States are the variants of an EXISTING enum, so `mode` reuses that enum and no
-        # enum is synthesized (unlike `machine over`). Per the machine-port philosophy the
-        # graph refusals (R2/R3/R4) are NOT re-emitted — stage0 owns them; the parse is
-        # structural. `next State` -> `mode <- Enum.State`; `done VALUE` ->
+        # enum is synthesized (unlike `machine over`). The parser enforces the graph facts it
+        # can establish syntactically; stage0 repeats the type-resolved graph checks. `next State`
+        # -> `mode <- Enum.State`; `done VALUE` ->
         # `result <- VALUE; done <- true`.
 
         struct MachineFromTermAst:
@@ -23,7 +23,8 @@ extend Parser:
             bindings: darray[sview]  # payload field bindings from `State(a, b):` (empty when none)
             body: darray[Ast::Stmt]
             terminators: darray[MachineFromTermAst]
-            out_edges: darray[sview]  # R5 declared out-edge set `-> {A, B}` (empty when omitted)
+            out_edges: darray[sview]  # R5 declared out-edge set `-> {A, B}`
+            has_out_edges: bool       # distinguishes explicit `-> {}` from an omitted clause
             line: u32
 
         # `machine from …`: recognized when the ident `from` immediately follows `machine`.
@@ -32,17 +33,20 @@ extend Parser:
             next_token: Token = parser.tokens[parser.position + 1]
             return next_token.kind == TokenKind.Ident and Lexer::text_or_empty(next_token, parser.source) == "from"
 
-        # Parse `Enum.State` (or a bare `State`); returns the variant name. When an expected
-        # enum is known, validate an explicit prefix before discarding it — the AST keeps only
-        # the variant name, so postponing this check would make a foreign qualifier invisible.
-        def parse_machine_from_variant(parser: lmut Parser, expected_enum: sview) -> sview:
+        # Parse `Enum.State` (or a bare `State`) and return the variant name. The AST keeps only
+        # that name, so validate an explicit prefix before discarding it.
+        def parse_machine_from_variant_for(parser: lmut Parser, expected_enum: sview) -> sview:
+            prefix_token: Token = parser.cursor()
             rebind first: Token, parser = parser.expect(TokenKind.Ident)
             first_text: sview = Lexer::text_or_empty(first, parser.source)
             rebind accepted_dot: bool, parser = parser.accept(TokenKind.Dot)
             first_text return if not accepted_dot
-            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, first) if expected_enum != "" and first_text != expected_enum
+            parser <- parser.validate_machine_from_enum_prefix(first_text, expected_enum, prefix_token)
             rebind second: Token, parser = parser.expect(TokenKind.Ident)
             return Lexer::text_or_empty(second, parser.source)
+
+        def validate_machine_from_enum_prefix(parser: lmut Parser, actual: sview, expected: sview, token: Token) -> void:
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if actual != "" and expected != "" and actual != expected
 
         # `.State` tail of a dotted state reference: the second ident when `dotted`, the
         # bare first name otherwise.
@@ -58,10 +62,11 @@ extend Parser:
             # Start state `Enum.State`: capture both the enum (for `mode`'s member exprs)
             # and the entry variant.
             rebind start_first: Token, parser = parser.expect(TokenKind.Ident)
-            start_enum: sview = Lexer::text_or_empty(start_first, parser.source)
+            start_name: sview = Lexer::text_or_empty(start_first, parser.source)
             rebind start_dotted: bool, parser = parser.accept(TokenKind.Dot)
-            rebind start_state: sview, parser = parser.parse_machine_from_dotted_tail(start_dotted, start_enum)
+            start_enum: sview = start_name if start_dotted else sview("", 0, 0)
             parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, start_first) if not start_dotted
+            rebind start_state: sview, parser = parser.parse_machine_from_dotted_tail(start_dotted, start_name)
             rebind machine_result: Ast::Expr?, parser = parser.machine_from_tail(start_enum, start_state, machine_token)
             return machine_result
 
@@ -70,10 +75,32 @@ extend Parser:
             # Optional entry-state payload `machine from Once.Only(seed)` (docs/125 §5).
             rebind start_args: darray[Ast::Expr], parser = parser.parse_machine_from_call_args()
 
-            # Optional `decreases MEASURE` — consumed and evaluated (so its names resolve),
-            # then discarded (the desugar loop doesn't need it; stage0 owns the check).
-            decreases_names: mutable darray[sview] = []
-            rebind has_decreases: bool, parser = parser.skip_machine_from_decreases(decreases_names)
+            # Optional machine header pipe. It is deliberately detected directly rather than
+            # through loop_header_at(): `decreases` may follow the closing pipe, whereas the
+            # loop lookahead only recognizes headers followed immediately by `:` or `->`.
+            header_declarations: mutable darray[Ast::Stmt] = []
+            header_captures: mutable darray[sview] = []
+            header_yield: mutable Ast::Expr = (Ast::Expr.Invalid)
+            header_has_yield: mutable bool = false
+            if parser.peek() == TokenKind.Pipe:
+                header_yield, parser <- parser.parse_loop_header(header_declarations, header_captures, header_has_yield)
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor()) if header_has_yield
+
+            # Optional `decreases MEASURE` — retain the expression in the generated loop so
+            # stage1's ordinary termination checks see the same contract stage0 analyzes.
+            # Presence is tracked separately from the expression: a malformed measure still
+            # counts as declared for the cycle check, while the Invalid AST is not emitted as
+            # a second bogus contract.
+            decreases_token: Token = parser.cursor()
+            has_decreases: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(decreases_token, parser.source) == "decreases"
+            rebind decreases: Ast::Expr, parser = parser.skip_machine_from_decreases()
+
+            # Keep all synthesized locals in this machine's private namespace. The parser-owned
+            # source-position generator makes two machine-from expressions in one function
+            # disjoint and keeps stage0/stage1 names stable.
+            result_var: sview = parser.machine_generated_name("__mf_result_", machine_token.start)
+            done_var: sview = parser.machine_generated_name("__mf_done_", machine_token.start)
+            mode_var: sview = parser.machine_generated_name("__mf_mode_", machine_token.start)
 
             parser, _ <- parser.expect(TokenKind.Colon)
             parser, _ <- parser.expect(TokenKind.Newline)
@@ -101,10 +128,11 @@ extend Parser:
                     -> Scan
             parser, _ <- parser.expect(TokenKind.Dedent)
 
+            parser <- parser.check_machine_from_coverage(machine_arms, start_enum, machine_token)
             parser <- parser.check_machine_from_reachability(machine_arms, start_state, machine_token)
             parser <- parser.check_machine_from_decisions(machine_arms, machine_token)
             parser <- parser.check_machine_from_termination(machine_arms, has_decreases, machine_token)
-            return (build_machine_from_block(start_enum, start_state, start_args, machine_arms, decreases_names, machine_token.line))
+            return (build_machine_from_block(start_enum, start_state, start_args, machine_arms, header_declarations, header_captures, decreases, result_var, done_var, mode_var, machine_token.line))
 
         def start_machine_ahead(parser: Parser&) -> bool:
             return parser.position + 1 < parser.tokens.count and parser.peek_at(1) == TokenKind.Ident
@@ -119,9 +147,10 @@ extend Parser:
             parser.pending_state_decls <- parser.pending_state_decls.truncate(0)
             parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, start_token) if states.count == 0
 
-            machine_index: usize = parser.machine_count
-            parser.machine_count <- parser.machine_count + 1
-            enum_name: sview = parser.machine_generated_name("__MachineMode_", machine_index)
+            # Name the synthesized enum from source position, not a mutable per-file counter.
+            # Counter-based names changed when an unrelated machine was inserted earlier in
+            # the file and could collide with another parser entry path.
+            enum_name: sview = parser.machine_generated_name("__MachineMode_", start_token.start)
             variants: mutable darray[Ast::EnumVariant] = []
             variants.extend([Ast::EnumVariant{name: state.name, fields: state.field_types, field_names: state.field_names, value_expr: (Ast::Expr.Absent)} for state in states])
             # The bootstrap compiler scalarizes payload-less local state enums. The
@@ -181,23 +210,68 @@ extend Parser:
                     check_index <- check_index + 1
                 return result
 
-        # An arm whose every `next`/`done` terminator is guarded can fall through the arm without
-        # deciding ("machine arm A can complete without a transition — its final next/done must be
-        # unguarded"). An unguarded terminator (guard Absent) is the mandatory catch-all decision.
+        # Every declared state needs exactly one arm. The parser can know the enum's variants
+        # when its metadata has already been recorded (including the synthesized local-state
+        # enum); if an explicit enum is parsed later, stage0 repeats the check after resolution.
+        def check_machine_from_coverage(parser: lmut Parser, machine_arms: darray[MachineFromArmS], enum_name: sview, token: Token) -> void:
+            # Duplicate arms are always decidable from the syntax, even when enum metadata is
+            # not available yet.
+            for arm_index in 0..<machine_arms.count:
+                for previous_index in 0..<arm_index:
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if machine_arms[arm_index].state == machine_arms[previous_index].state
+
+            # Regular payload-less/const enums and payload enums use separate flat metadata
+            # pools. Check only a matching pool row; an enum declared later is intentionally
+            # left for the semantic analyzer rather than being rejected by source order.
+            for enum_index in 0..<parser.enum_decl_names.count:
+                if parser.enum_decl_names[enum_index] == enum_name:
+                    return if enum_index >= parser.enum_decl_variant_starts.count or enum_index >= parser.enum_decl_variant_counts.count
+                    variant_start: usize = parser.enum_decl_variant_starts[enum_index]
+                    variant_count: usize = parser.enum_decl_variant_counts[enum_index]
+                    variant_names: mutable darray[sview] = []
+                    variant_names.extend(parser.enum_decl_variant_names)
+                    parser <- parser.check_machine_from_variant_rows(machine_arms, variant_names, variant_start, variant_count, token)
+                    return
+            for enum_index in 0..<parser.payload_enum_names.count:
+                if parser.payload_enum_names[enum_index] == enum_name:
+                    return if enum_index >= parser.payload_enum_variant_starts.count or enum_index >= parser.payload_enum_variant_counts.count
+                    variant_start: usize = parser.payload_enum_variant_starts[enum_index]
+                    variant_count: usize = parser.payload_enum_variant_counts[enum_index]
+                    variant_names: mutable darray[sview] = []
+                    variant_names.extend(parser.payload_enum_variant_names)
+                    parser <- parser.check_machine_from_variant_rows(machine_arms, variant_names, variant_start, variant_count, token)
+                    return
+
+        def check_machine_from_variant_rows(parser: lmut Parser, machine_arms: darray[MachineFromArmS], variant_names: darray[sview], variant_start: usize, variant_count: usize, token: Token) -> void:
+            return if variant_start > variant_names.count or variant_count > variant_names.count - variant_start
+            for variant_index in 0..<variant_count:
+                state_name: sview = variant_names[variant_start + variant_index]
+                has_arm: bool = any arm in machine_arms where arm.state == state_name
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not has_arm
+
+        # Every arm needs a decision, and its FINAL `next`/`done` must be unguarded. An unguarded
+        # earlier terminator does not make later guarded terminators safe: stage0 rejects that
+        # shape because the final path can still fall through without deciding.
         def check_machine_from_decisions(parser: lmut Parser, machine_arms: darray[MachineFromArmS], token: Token) -> void:
             can Memory.Allocate, Abort.Panic:
                 for arm in machine_arms |parser| -> parser:
-                    unguarded_exists: mutable bool = false
-                    for terminator in arm.terminators |unguarded_exists|:
-                        is_unguarded: bool = match terminator.guard:
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if arm.terminators.count == 0
+                    if arm.terminators.count > 0:
+                        last: MachineFromTermAst = arm.terminators[arm.terminators.count - 1]
+                        final_unguarded: bool = match last.guard:
                             Ast::Expr.Absent: true
                             _: false
-                        unguarded_exists <- true if is_unguarded
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if arm.terminators.count > 0 and not unguarded_exists
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if not final_unguarded
+                        if arm.terminators.count > 1:
+                            for terminator_index in 0..<(arm.terminators.count - 1):
+                                earlier_unguarded: bool = match arm.terminators[terminator_index].guard:
+                                    Ast::Expr.Absent: true
+                                    _: false
+                                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if earlier_unguarded
                     # R5: a `next TARGET` must be in the arm's declared out-edge set (when declared).
                     for transition in arm.terminators |parser| -> parser:
                         declared: bool = any edge in arm.out_edges where edge == transition.target
-                        undeclared: bool = arm.out_edges.count > 0 and not transition.is_done and transition.target != "" and not declared
+                        undeclared: bool = arm.has_out_edges and not transition.is_done and transition.target != "" and not declared
                         parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if undeclared
 
         # A state whose arm is not reachable from the start state via any `next` terminator is dead
@@ -277,43 +351,34 @@ extend Parser:
             parser, _ <- parser.expect(TokenKind.RParen)
             return names
 
-        # Optional `decreases MEASURE` after the start state — consumed and evaluated (so
-        # its names resolve), then discarded (stage0 owns the termination check).
-        # `decreases MEASURE` names the machine's working variable(s): the desugared value
-        # block mutates them each step (`n <- n - 1`), so they must be captured — otherwise
-        # the E4 value-block-mutation check flags an outer-binding write stage0 permits.
-        # Records the measure's identifier names into `names` and reports presence.
-        def skip_machine_from_decreases(parser: lmut Parser, names: mutable darray[sview]&) -> bool:
+        # Optional `decreases MEASURE` after the start state. Preserve the parsed expression
+        # for the loop-body contract; the machine graph check separately tracks whether the
+        # clause was present. A bare bool measure keeps the existing precise stage1 diagnostic
+        # while complex measures flow to the ordinary termination analysis.
+        def skip_machine_from_decreases(parser: lmut Parser) -> Ast::Expr:
             decreases_token: Token = parser.cursor()
-            false return if parser.peek() != TokenKind.Ident or Lexer::text_or_empty(decreases_token, parser.source) != "decreases"
+            (Ast::Expr.Invalid) return if parser.peek() != TokenKind.Ident or Lexer::text_or_empty(decreases_token, parser.source) != "decreases"
             parser, _ <- parser.advance()
             measure_start: usize = parser.position
             rebind measure: Ast::Expr?, parser = parser.expression()
             if measure is measure_expr:
-                scan: mutable usize = measure_start
-                while scan < parser.position |parser, scan, names|:
-                    token: Token = parser.tokens[scan]
-                    previous_is_dot: bool = scan > measure_start and parser.tokens[scan - 1].kind == TokenKind.Dot
-                    next_is_call: bool = scan + 1 < parser.position and parser.tokens[scan + 1].kind == TokenKind.LParen
-                    names.push(Lexer::text_or_empty(token, parser.source)) if token.kind == TokenKind.Ident and not previous_is_dot and not next_is_call
-                    scan <- scan + 1
-                # A machine `decreases` measure must be integer-typed. The desugared block
-                # discards the measure expression, so record a BARE-IDENT measure (owner) at
-                # the machine line for the semantic type-check (`decreases flag` where `flag`
-                # is a bool param). Complex measures are left to stage0's prover.
+                # A machine `decreases` measure must be integer-typed. Keep the existing
+                # focused bool-parameter diagnostic for the subset that can be resolved from
+                # parser metadata; the full expression is now also present in the loop AST.
                 if parser.position == measure_start + 1 and parser.tokens[measure_start].kind == TokenKind.Ident:
                     measure_name: sview = Lexer::text_or_empty(parser.tokens[measure_start], parser.source)
                     parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: measure_name, name: "__machine_decreases_measure", line: decreases_token.line})
-            return true
+                return measure_expr
+            return (Ast::Expr.Invalid)
 
         # Optional R5 out-edge contract `-> {A, B}` after an arm header. Stage0 owns the R5
         # enforcement; stage1 only consumes the clause so the arm reaches its block colon.
-        def capture_machine_from_declared_out(parser: lmut Parser, expected_enum: sview, out_edges: mutable darray[sview]&) -> void:
+        def capture_machine_from_declared_out(parser: lmut Parser, out_edges: mutable darray[sview]&, expected_enum: sview) -> void:
             return if parser.peek() != TokenKind.Arrow
             parser, _ <- parser.advance()   # ->
             parser, _ <- parser.expect(TokenKind.LBrace)
             while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof |parser, out_edges|:
-                rebind edge_name: sview, parser = parser.parse_machine_from_variant(expected_enum)
+                rebind edge_name: sview, parser = parser.parse_machine_from_variant_for(expected_enum)
                 out_edges.push(edge_name)
                 break if not parser.accept(TokenKind.Comma)
             parser, _ <- parser.expect(TokenKind.RBrace)
@@ -349,27 +414,32 @@ extend Parser:
 
         def parse_machine_from_arm(parser: lmut Parser, expected_enum: sview) -> MachineFromArmS:
             arm_token: Token = parser.cursor()
-            rebind state: sview, parser = parser.parse_machine_from_variant(expected_enum)
+            rebind state: sview, parser = parser.parse_machine_from_variant_for(expected_enum)
             # Optional payload bindings `State(a, b):` and R5 out-edge contract `-> {…}`.
             rebind bindings: darray[sview], parser = parser.parse_machine_from_bindings()
             out_edges: mutable darray[sview] = []
-            parser <- parser.capture_machine_from_declared_out(expected_enum, out_edges)
+            has_out_edges: bool = parser.peek() == TokenKind.Arrow
+            parser <- parser.capture_machine_from_declared_out(out_edges, expected_enum)
             parser, _ <- parser.expect(TokenKind.Colon)
             parser, _ <- parser.expect(TokenKind.Newline)
             parser, _ <- parser.expect(TokenKind.Indent)
 
             body: mutable darray[Ast::Stmt] = []
             terminators: mutable darray[MachineFromTermAst] = []
-            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, body, terminators|:
+            saw_terminator: mutable bool = false
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, body, terminators, saw_terminator|:
                 parser <- parser.skip_newlines()
                 break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
                 head_token: Token = parser.cursor()
                 head: sview = Lexer::text_or_empty(head_token, parser.source)
                 head_is_terminator: bool = parser.peek() == TokenKind.Arrow or parser.peek() == TokenKind.FatArrow or (parser.peek() == TokenKind.Ident and (head == "next" or head == "done"))
-                parser <- parser.parse_machine_from_arm_terminator(expected_enum, terminators) if head_is_terminator
+                if head_is_terminator:
+                    parser <- parser.parse_machine_from_arm_terminator(terminators, expected_enum)
+                    saw_terminator <- true
                 continue if head_is_terminator
                 rebind stmt_opt: Ast::Stmt?, parser = parser.statement()
                 if stmt_opt is body_statement:
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, head_token) if saw_terminator
                     # R1: flag a branch/escape in the arm body (see machine_from_arm_stmt_illegal).
                     # Keep the statement in the structural parse so downstream shape is intact.
                     parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, head_token) if machine_from_arm_stmt_illegal(body_statement)
@@ -380,10 +450,10 @@ extend Parser:
                     parser, _ <- parser.advance()   # error recovery: never spin
             parser, _ <- parser.expect(TokenKind.Dedent)
 
-            return MachineFromArmS{state: state, bindings: bindings, body: body, terminators: terminators, out_edges: out_edges, line: arm_token.line}
+            return MachineFromArmS{state: state, bindings: bindings, body: body, terminators: terminators, out_edges: out_edges, has_out_edges: has_out_edges, line: arm_token.line}
 
         # A canonical `->`/`=>` line (or compatible `next`/`done` alias).
-        def parse_machine_from_arm_terminator(parser: lmut Parser, expected_enum: sview, terminators: mutable darray[MachineFromTermAst]&) -> void:
+        def parse_machine_from_arm_terminator(parser: lmut Parser, terminators: mutable darray[MachineFromTermAst]&, expected_enum: sview) -> void:
             rebind term: MachineFromTermAst, parser = parser.parse_machine_from_terminator(expected_enum)
             terminators.push(term)
 
@@ -394,7 +464,7 @@ extend Parser:
             if is_result:
                 rebind done_term: MachineFromTermAst, parser = parser.parse_machine_from_done_terminator(keyword_token.line)
                 return done_term
-            rebind next_term: MachineFromTermAst, parser = parser.parse_machine_from_next_terminator(expected_enum, keyword_token.line)
+            rebind next_term: MachineFromTermAst, parser = parser.parse_machine_from_next_terminator(keyword_token.line, expected_enum)
             return next_term
 
         # `done VALUE [if COND]`. The value ends at a top-level `if` guard; the lenient
@@ -421,8 +491,8 @@ extend Parser:
 
         # `next State[(args)] [if COND]` — the successor state, its payload-construction
         # args, and an optional trailing guard.
-        def parse_machine_from_next_terminator(parser: lmut Parser, expected_enum: sview, line: u32) -> MachineFromTermAst:
-            rebind target: sview, parser = parser.parse_machine_from_variant(expected_enum)
+        def parse_machine_from_next_terminator(parser: lmut Parser, line: u32, expected_enum: sview) -> MachineFromTermAst:
+            rebind target: sview, parser = parser.parse_machine_from_variant_for(expected_enum)
             # `next Num.Exponent(was_fraction)` constructs the successor's payload.
             rebind next_args: darray[Ast::Expr], parser = parser.parse_machine_from_call_args()
             rebind guard: Ast::Expr, parser = parser.parse_machine_from_next_guard()
@@ -445,12 +515,12 @@ extend Parser:
         # body reading a payload resolves. Payload-free states use a bare `mode is Enum.State`
         # test. Every arm is conditional (innermost else is empty) so each arm's `is` binds in
         # its own branch; stage0 owns exhaustiveness, the stage1 parse stays structural.
-        def build_machine_from_block(start_enum: sview, start_state: sview, start_args: darray[Ast::Expr], machine_arms: darray[MachineFromArmS], decreases_names: darray[sview], line: u32) -> Ast::Expr:
-            result_var: sview = "__mf_result"
-            done_var: sview = "__mf_done"
-            mode_var: sview = "__mf_mode"
+        def build_machine_from_block(start_enum: sview, start_state: sview, start_args: darray[Ast::Expr], machine_arms: darray[MachineFromArmS], header_declarations: darray[Ast::Stmt], header_captures: darray[sview], decreases: Ast::Expr, result_var: sview, done_var: sview, mode_var: sview, line: u32) -> Ast::Expr:
 
-            declarations: mutable darray[Ast::Stmt] = []
+            # Header accumulators are machine-private locals, so they must precede the mode
+            # locals and the loop in the same value-block scope. Their initializers may be
+            # referenced by both the decreases measure and every arm.
+            declarations: mutable darray[Ast::Stmt] = [declaration for declaration in header_declarations]
             # The result carrier is intentionally context-typed by the backend from the value
             # block's expected type. `zeroed` is only an initialization seed; every machine arm
             # assigns the carrier before the block yields it. Keeping the language's zero value
@@ -477,7 +547,7 @@ extend Parser:
                 block.extend(chained)
                 state_blocks.push(block)
 
-        # Mode dispatch built right-to-left: `if mode is S0(..): b0 else: (if mode is S1(..):
+            # Mode dispatch built right-to-left: `if mode is S0(..): b0 else: (if mode is S1(..):
             # b1 else: …)`, innermost else empty.
             dispatch: mutable darray[Ast::Stmt] = []
             state_index: mutable usize = machine_arms.count
@@ -489,7 +559,13 @@ extend Parser:
                 state_index <- state_index - 1
 
             loop_condition: Ast::Expr = (Ast::Expr.Unary(TokenKind.Not, (Ast::Expr.Ident(done_var, Ast::pos_at_line(line))), Ast::pos_at_line(line)))
-            declarations.push((Ast::Stmt.While(loop_condition, dispatch, Ast::pos_at_line(line))))
+            loop_body: mutable darray[Ast::Stmt] = []
+            # Keep the machine-level termination obligation attached to the generated loop.
+            # This lets stage1's normal decreases walkers inspect the same AST shape that
+            # stage0's analyzer constructs, including the measure's actual expression.
+            loop_body.push((Ast::Stmt.Contract("decreases", decreases, Ast::pos_at_line(line)))) if not machine_expr_is_invalid(decreases)
+            loop_body.extend(dispatch)
+            declarations.push((Ast::Stmt.While(loop_condition, loop_body, Ast::pos_at_line(line))))
 
             # A machine-from expression is a value block, so every outer binding it
             # mutates must be an explicit block capture. This is especially important
@@ -498,12 +574,21 @@ extend Parser:
             # Locals declared by an arm stay internal and are not captures.
             assigned: mutable darray[sview] = []
             declared: mutable darray[sview] = []
+            header_local_names: mutable darray[sview] = []
+            for declaration in header_declarations |header_local_names|:
+                match declaration:
+                    Ast::Stmt.VarDecl(name, _, _, _):
+                        header_local_names.push(name)
+                    _:
+                        pass
             for arm in machine_arms |assigned, declared|:
                 gather_machine_assigned_idents(arm.body, assigned)
                 gather_machine_declared_idents(arm.body, declared)
             captures: mutable darray[sview] = []
             for assigned_name in assigned |captures|:
-                captures.push(assigned_name) if not (any declared_name in declared where declared_name == assigned_name) and not (any existing in captures where existing == assigned_name)
+                captures.push(assigned_name) if not (any declared_name in declared where declared_name == assigned_name) and not (any header_name in header_local_names where header_name == assigned_name) and not (any existing in captures where existing == assigned_name)
+            for header_capture in header_captures |captures|:
+                captures.push(header_capture) if not (any existing in captures where existing == header_capture)
             return (Ast::Expr.Block(declarations, (Ast::Expr.Ident(result_var, Ast::pos_at_line(line))), captures, Ast::pos_at_line(line)))
 
         # Collect the root identifiers assigned (`x <- …` / `x = …`) anywhere in a body.

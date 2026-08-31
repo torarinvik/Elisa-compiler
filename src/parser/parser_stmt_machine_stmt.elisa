@@ -15,6 +15,19 @@ extend Parser:
                 return true if seen == field_name
             return false
 
+        def machine_state_storage_type(field_type: Ast::Expr, line: u32) -> Ast::Expr:
+            match field_type:
+                Ast::Expr.Unary(TokenKind.Mutable, operand, pos):
+                    return field_type
+                _:
+                    return (Ast::Expr.Unary(TokenKind.Mutable, field_type, Ast::pos_at_line(line)))
+
+        # The storage-type wrapper allocates a fresh Unary node. Build the declaration in a
+        # helper that receives the container by mutable reference so the node lives in the
+        # declarations region, not the machine arm's per-iteration scratch region.
+        def append_machine_state_field_declaration(declarations: mutable darray[Ast::Stmt]&, field_name: sview, field_type: Ast::Expr, initializer: Ast::Expr, line: u32) -> void:
+            declarations.push((Ast::Stmt.VarDecl(field_name, machine_state_storage_type(field_type, line), initializer, Ast::pos_at_line(line))))
+
         def append_machine_state_declarations(declarations: mutable darray[Ast::Stmt]&, seen_fields: mutable darray[sview]&, state: MachineStateAst, start_args: darray[Ast::Expr], resolved_start: sview, line: u32) -> void:
             machine over declarations for field_index in 0..<state.field_names.count:
                 state Field
@@ -27,28 +40,20 @@ extend Parser:
                     field_name: sview = state.field_names[field_index]
                     initializer: Ast::Expr = start_args[field_index]
                     seen_fields.push(field_name)
-                    declarations.push((Ast::Stmt.VarDecl(field_name, state.field_types[field_index], initializer, Ast::pos_at_line(state.line))))
+                    append_machine_state_field_declaration(declarations, field_name, state.field_types[field_index], initializer, state.line)
                     -> Field
 
                 Field, _:
                     field_name: sview = state.field_names[field_index]
                     initializer: Ast::Expr = (Ast::Expr.Ident("zeroed", Ast::pos_at_line(line)))
                     seen_fields.push(field_name)
-                    declarations.push((Ast::Stmt.VarDecl(field_name, state.field_types[field_index], initializer, Ast::pos_at_line(state.line))))
+                    append_machine_state_field_declaration(declarations, field_name, state.field_types[field_index], initializer, state.line)
                     -> Field
 
         def append_machine_state_block(state: MachineStateAst, states: darray[MachineStateAst], arms: darray[MachineArmAst], enum_name: sview, mode_var: sview, input_var: sview, line: u32) -> darray[Ast::Stmt]:
             state_arm_indices: mutable darray[usize] = []
-            machine over state_arm_indices for arm_i in 0..<arms.count:
-                state Scan
-                start Scan
-
-                Scan, _ if arms[arm_i].state_name != state.name:
-                    -> Scan
-
-                Scan, _:
-                    state_arm_indices.push(arm_i)
-                    -> Scan
+            for arm_i in 0..<arms.count:
+                state_arm_indices.push(arm_i) if arms[arm_i].state_name == state.name
             block: mutable darray[Ast::Stmt] = []
             if state_arm_indices.count > 0:
                 machine over block for state_arm_index in state_arm_indices:
@@ -61,10 +66,16 @@ extend Parser:
                     Scan, _:
                         append_machine_transition_temp_declarations(block, arms[state_arm_index], states)
                         -> Scan
-                chain: mutable darray[Ast::Stmt] = lower_machine_arm_body(arms[state_arm_indices[state_arm_indices.count - 1]], states, state.field_names, enum_name, mode_var, input_var, line)
+                last_index: usize = state_arm_indices.count - 1
+                last_arm: MachineArmAst = arms[state_arm_indices[last_index]]
+                chain: mutable darray[Ast::Stmt] = lower_machine_arm_body(last_arm, states, state.field_names, enum_name, mode_var, input_var, line)
+                last_condition: Ast::Expr = machine_arm_condition(last_arm, state.field_names, input_var)
+                if not machine_expr_is_invalid(last_condition):
+                    fallback: darray[Ast::Stmt] = [(Ast::Stmt.Break("", Ast::pos_at_line(last_arm.line)))]
+                    chain <- [(Ast::Stmt.If(last_condition, chain, fallback, Ast::pos_at_line(last_arm.line)))]
                 machine over chain while true:
                     state Fold(remaining: usize)
-                    start Fold(state_arm_indices.count - 1)
+                    start Fold(last_index)
 
                     Fold(remaining), _ if remaining == 0:
                         break
@@ -180,17 +191,19 @@ extend Parser:
 
             # docs/123 §5 per-state coverage refusals (stage1-owned; see check_machine_coverage).
             parser <- parser.check_machine_coverage(states, arms, machine_token)
-            parser <- parser.validate_machine_transitions(states, arms, start_state, start_args, input_expression, condition, machine_token)
+            # Stage0 owns machine mutation/refusal diagnostics before this self-hosted
+            # parser runs. Stage1 keeps the structural state/arity checks here; repeating
+            # the full driven-root analysis rejected valid compiler machines after include
+            # flattening because their enclosing mutable-root context is no longer intact.
+            parser <- parser.validate_machine_transitions(states, arms, start_state, start_args, input_expression, machine_token)
 
             # docs/125 §9 Tier-2: record per-state {classifier, tags, wildcard} rows for the
             # semantic closed-enum totality check (the parser can't see the classifier's type).
             parser <- parser.record_machine_coverage(arms, input_expression, line)
 
-            machine_index: usize = parser.machine_count
-            parser.machine_count <- parser.machine_count + 1
-            enum_name: sview = parser.machine_generated_name("__MachineMode_", machine_index)
-            mode_var: sview = parser.machine_generated_name("__machine_mode_", machine_index)
-            input_var: sview = parser.machine_generated_name("__machine_input_", machine_index)
+            enum_name: sview = parser.machine_generated_name("__MachineMode_", machine_token.start)
+            mode_var: sview = parser.machine_generated_name("__machine_mode_", machine_token.start)
+            input_var: sview = parser.machine_generated_name("__machine_input_", machine_token.start)
 
             # Hoisted payload-less mode enum (drained into top_decls by parse_file).
             variants: mutable darray[Ast::EnumVariant] = []
@@ -236,7 +249,9 @@ extend Parser:
                     append_machine_state_declarations(declarations, seen_fields, state, start_args, resolved_start, line)
                     -> Scan
 
-            # Per-state dispatch: arm-local input binders + guarded if-ladder (last arm = else).
+            # Per-state dispatch: guarded if-ladder. The final arm is only an
+            # `else` when it is genuinely irrefutable; a tagged or payload-conditional
+            # final arm must retain its condition so it cannot execute the wrong transition.
             state_blocks: mutable darray[darray[Ast::Stmt]] = []
             machine over state_blocks for state in states:
                 state Build
@@ -271,6 +286,8 @@ extend Parser:
             if has_for_driver and states.count == 1 and arms.count == 1 and states[0].field_names.count == 0 and arms[0].state_name == states[0].name and machine_arm_irrefutable(arms[0]) and arms[0].has_transition and arms[0].target == states[0].name and arms[0].transition_args.count == 0:
                 declarations <- []
                 if arms[0].input_bind != "":
+                    # The ordinary match path declares input_var before dispatch.
+                    # Preserve it in the zero-state fast path when the arm body names it.
                     loop_body <- [(Ast::Stmt.VarDecl(input_var, (Ast::Expr.Invalid), input_expression, Ast::pos_at_line(line)))]
                 else:
                     loop_body <- [(Ast::Stmt.Expr(input_expression, Ast::pos_at_line(line)))]
