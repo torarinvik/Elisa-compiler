@@ -1113,11 +1113,29 @@ extend Backend:
             fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
             # A VOID call must be unnamed: "instructions returning void cannot have a name".
             result_name: cstr = call_result_name(call_return_type, sret_return)
-            # Hand the callee OUR region when its signature threads one: the container
-            # it grows is ours, so its backing must come from a region that outlives
-            # the call. Stage0 orders hidden arguments as explicit values, packed store,
-            # then the independent caller-region slots.
+            # Hand the callee the ambient/output region when its signature has one. Stage0
+            # puts that owner before the packed store only for a caller-visible return; the
+            # hidden slots for directly-grown parameters and forwarded-only parameters then
+            # follow the store in two partitions. The returned value and the store are both
+            # aggregates at the LLVM level, so an ordering error remains verifier-valid while
+            # shifting every later operand.
             call_threaded_arena: mutable LLVMValueRef = call_site_arena(arguments, local_scope, runtime)
+            ambient_region_slot: bool = arena_count > 0 and fns.ambient_regions[fn_index.usize()]
+            if ambient_region_slot:
+                # A returned aggregate must be built in the current function's caller-owned
+                # ambient region when one exists. Prefer that over the private scratch carrier:
+                # `absolute_path -> path_clean` otherwise returned a darray backed by the
+                # scratch arena and then freed that arena on return, leaving the caller with a
+                # dangling pointer. Scratch remains the correct fallback for a non-threaded
+                # caller whose result is consumed locally.
+                if not llvm_value_is_null(runtime.caller_arena):
+                    call_threaded_arena <- runtime.caller_arena
+                elif caller_storage_arena_for(runtime, runtime.active_initializer_name) is initializer_arena:
+                    call_threaded_arena <- initializer_arena
+                elif not llvm_value_is_null(runtime.scratch_arena):
+                    call_threaded_arena <- runtime.scratch_arena
+                elif not llvm_value_is_null(runtime.arena):
+                    call_threaded_arena <- runtime.arena
             # The implicit ACTIVE-STORE argument. When the CALL SITE is outside any
             # `in store:` block there is no active store, and `runtime.active_store` is
             # `zeroed` -- which pushed a bare `ptr null` where the callee declares a
@@ -1135,6 +1153,8 @@ extend Backend:
             # recovered (for example a raw pointer expression with no named local root).
             if llvm_value_is_null(call_threaded_arena) and not llvm_value_is_null(runtime.arena):
                 call_threaded_arena <- runtime.arena
+            if ambient_region_slot:
+                argument_values.push(call_threaded_arena)
             if wants_store:
                 call_store: mutable LLVMValueRef = runtime.active_store
                 if runtime.active_store_enum < 0:
@@ -1146,15 +1166,14 @@ extend Backend:
                             call_store <- store_argument_value
                 null return if call_store == zeroed
                 argument_values.push(call_store)
-            # Hidden region slots are independent. Map each slot-bearing explicit parameter
-            # back to the source argument so a forwarded reference preserves its owner arena;
-            # use the ambient call arena only for a return/explicit region slot or an omitted
-            # defaulted argument. Passing one arena to every slot is ABI-compatible at the
-            # type level but corrupts the compiler's multi-table walkers at runtime.
-            direct_arena_slot: mutable usize = 0
-            for parameter_position in 0..<fixed_arguments |argument_values, direct_arena_slot, arena_count, fns, fn_index, structs, has_receiver, receiver, arguments, argument_names, local_scope, runtime, call_threaded_arena|:
-                parameter_type: ValueType = copied_type(fns.param_types[fns.param_start[fn_index.usize()] + parameter_position])
-                continue if not function_parameter_has_region(fns, fn_index, parameter_position)
+            # Hidden region slots are ordered by ownership role, not source-parameter order:
+            # direct growth slots first, then forwarded-only slots. The earlier source-order
+            # loop made `capture_machine_from_declared_out(parser, out_edges, store, ...)`
+            # exchange the parser arena and the output-table arena. Both are `ptr`, so LLVM
+            # accepted the call and the failure appeared later as corrupted parser state.
+            hidden_region_slot: mutable usize = 0
+            for parameter_position in 0..<fixed_arguments |argument_values, hidden_region_slot, fns, fn_index, has_receiver, receiver, arguments, argument_names, local_scope, runtime, call_threaded_arena|:
+                continue if not function_parameter_is_direct_region(fns, fn_index, parameter_position)
                 direct_arena: mutable LLVMValueRef = call_threaded_arena
                 if has_receiver and parameter_position == 0:
                     direct_arena <- growth_arena_for(receiver, local_scope, runtime)
@@ -1164,10 +1183,24 @@ extend Backend:
                     if source_index >= 0 and source_index.usize() < arguments.count:
                         direct_arena <- growth_arena_for(arguments[source_index.usize()], local_scope, runtime)
                 argument_values.push(direct_arena)
-                direct_arena_slot <- direct_arena_slot + 1
-            while direct_arena_slot < arena_count |argument_values, direct_arena_slot, call_threaded_arena|:
+                hidden_region_slot <- hidden_region_slot + 1
+            for parameter_position in 0..<fixed_arguments |argument_values, hidden_region_slot, fns, fn_index, has_receiver, receiver, arguments, argument_names, local_scope, runtime, call_threaded_arena|:
+                continue if not function_parameter_has_region(fns, fn_index, parameter_position)
+                continue if function_parameter_is_direct_region(fns, fn_index, parameter_position)
+                forwarded_arena: mutable LLVMValueRef = call_threaded_arena
+                if has_receiver and parameter_position == 0:
+                    forwarded_arena <- growth_arena_for(receiver, local_scope, runtime)
+                else:
+                    source_first_position: usize = 1 if has_receiver else 0
+                    source_index: i64 = named_argument_index(argument_names, fns.param_names, fns.param_start[fn_index.usize()], fixed_arguments, source_first_position, parameter_position)
+                    if source_index >= 0 and source_index.usize() < arguments.count:
+                        forwarded_arena <- growth_arena_for(arguments[source_index.usize()], local_scope, runtime)
+                argument_values.push(forwarded_arena)
+                hidden_region_slot <- hidden_region_slot + 1
+            hidden_region_count: usize = arena_count - (1 if ambient_region_slot else 0)
+            while hidden_region_slot < hidden_region_count |argument_values, hidden_region_slot, hidden_region_count, call_threaded_arena|:
                 argument_values.push(call_threaded_arena)
-                direct_arena_slot <- direct_arena_slot + 1
+                hidden_region_slot <- hidden_region_slot + 1
             # A VOID value is not a value: `f(g())` where `g` returns void built a call whose
             # operand is `void <badref>`, which the verifier rejects and which crashed the
             # object path inside LLVM's DataLayout rather than producing a diagnostic. One
