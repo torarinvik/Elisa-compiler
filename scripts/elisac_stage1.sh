@@ -172,7 +172,7 @@ seed_build() {
   # Create the lock's parent before taking the lock. A fresh checkout has no build/
   # directory yet; treating a failed mkdir as a stale lock there makes the very first
   # seed fail before it can create its own build outputs.
-  mkdir -p "$ROOT/build"
+  mkdir -p "$ROOT/bin" "$ROOT/build"
   ELISA_SEED_LOCK_DIR="$ROOT/build/.elisac-stage1-seed.lock"
   seed_lock="$ELISA_SEED_LOCK_DIR"
   if ! mkdir "$seed_lock" 2>/dev/null; then

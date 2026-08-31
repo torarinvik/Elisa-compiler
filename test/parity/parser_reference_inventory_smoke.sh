@@ -29,14 +29,23 @@ rg -n '^func Test[^ (]+' "$PARSER_DIR" --glob '*_test.go' -o \
 cut -f1 "$ORACLE" | sed 's#/.*##' | sort -u > "$WORK/recorded.txt"
 comm -23 "$WORK/all.txt" "$WORK/recorded.txt" > "$WORK/unrecorded.txt"
 
-# These tests do not parse source: one constructs an AST manually for the unparser,
-# one constructs a machine arm directly, and one feeds a token stream directly to
-# the permission-reference estimator. Every other parser-package test must hit the
-# recorder.
+# These tests do not parse source: some construct ASTs/machine arms directly and the
+# rest exercise parser helper functions over synthetic trees or token streams. Every
+# other parser-package test must hit the recorder. Keep this explicit: a newly added
+# source-parsing test must not silently disappear from the differential denominator.
 printf '%s\n' \
     TestEstimateCommaSeparatedCountStopsAtColon \
     TestFormatCallWithDoExprBlockArg \
+    TestMachineCallInAssignmentTargetDrivesCapture \
+    TestMachineCallInCompoundAssignmentsDrivesCapture \
+    TestMachineCallInGetRecoveryDrivesCapture \
+    TestMachineCallInLambdaBodyDrivesCapture \
+    TestMachineCallInMatchArmDrivesCapture \
+    TestMachineCallInValueBlockStatementDrivesCapture \
+    TestMachineDrivenRootInGetRecoveryIsCollected \
+    TestMachinePayloadPredicateWalksAggregate \
     TestMachineTransitionCopiesShadowingArmLocal \
+    TestMachineTransitionLeavesArmLocalScopeBeforePayloadStore \
     TestUnbracketedPermissionRefsDoNotEstimateToEOF \
     > "$WORK/non_parser_tests.txt"
 if ! diff -u "$WORK/non_parser_tests.txt" "$WORK/unrecorded.txt" >/dev/null; then
@@ -47,4 +56,4 @@ fi
 
 recorded_test_count="$(wc -l < "$WORK/recorded.txt" | tr -d ' ')"
 case_count="$(wc -l < "$ORACLE" | tr -d ' ')"
-echo "parser reference inventory OK: $recorded_test_count/$test_count parsing tests recorded as $case_count cases across $source_count Go files (4 non-source-parser tests)" >&2
+echo "parser reference inventory OK: $recorded_test_count/$test_count parsing tests recorded as $case_count cases across $source_count Go files (13 non-source-parser tests)" >&2
