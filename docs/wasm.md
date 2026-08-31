@@ -7,7 +7,7 @@ module plus the small amount of glue that normally becomes an integration projec
 scripts/elisac_stage1.sh -emit wasm -o build/hello.wasm examples/hello.elisa
 ```
 
-That writes five colocated artifacts:
+That writes five colocated artifacts on the compatibility path:
 
 | File | Purpose |
 | --- | --- |
@@ -105,3 +105,43 @@ builds avoid recompiling unchanged stdlib code. Set `ELISA_WASM_NO_CACHE=1` for 
 The generated manifest is deliberately simple JSON so build systems, the Elisa LSP, and
 future devtools can consume it without parsing JavaScript. The end-to-end contract lives in
 `test/parity/wasm_smoke.sh`.
+
+## WASM components
+
+Component-oriented builds use `--component-type` with `--wasm-only` to produce a component and
+its JSON manifest without generating a JavaScript loader or TypeScript declarations:
+
+```sh
+scripts/elisac_stage1.sh -emit wasm --wasm-only \
+  --component-type /path/to/world.wit \
+  -o build/app.wasm app.elisa
+```
+
+Component mode owns linear memory and exports it as `memory`; it does not use the raw module
+`env.memory` contract. Target SDKs map their WIT export names with `@link_name`:
+
+```elisa
+@link_name("example:window/guest@0.1.0#frame")
+export fn frame(dt: f64) -> void = frame_impl
+```
+
+Host imports additionally declare their WIT interface namespace. The core symbol name and the
+WIT package/interface are separate pieces of metadata:
+
+```elisa
+@wasm_import_module("example:window/host@0.1.0")
+@link_name("now")
+extern host_now() -> f64
+```
+
+The compiler owns the generic component/linker support. Target repositories own their WIT
+bindings and package recipes; they should keep records, lists, variants, options, and results in
+typed source code and isolate canonical ABI adapters at the boundary. No target-specific SDK or
+JavaScript/TypeScript facade belongs in this compiler repository.
+
+Component builds link `elisacore_std/wasm_component_runtime.elisa`, a freestanding
+`cabi_realloc` implementation that grows exported linear memory and reuses the top allocation
+when canonical lowering releases or resizes it. It intentionally does not import the native
+`env` allocator. A target SDK must still bound and validate host-returned pointer/count pairs;
+the compiler does not know the element type or ownership policy of a target's WIT records and
+lists.
