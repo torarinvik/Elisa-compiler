@@ -23,11 +23,10 @@ ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
 fi
-# Never silently seed stage1 with the installed compiler. Callers can pin a
-# particular local stage0 with ELISACORE_BIN; otherwise use the compiler/bin
-# artifact in the selected ELISA_CORE source tree.
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
-STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
+# Use the sibling stage0 worktree by default. This keeps stage1 self-hosting and
+# ordinary wrapper invocations independent from any installed `elisac`; callers
+# can still select an explicit compiler with ELISACORE_BIN.
+STAGE0_BIN="${ELISACORE_BIN:-$ROOT/../stage0/compiler/bin/elisac-local}"
 # Include expansion is a host-side Python step. Resolve the same interpreter selected by
 # `PYTHON_BIN` (including a command name such as `python3.14`) before any emit mode runs so
 # custom toolchains are honored consistently by the wrapper and its recursive invocations.
@@ -106,10 +105,10 @@ def mark() -> None:
 
 def flatten(p: pathlib.Path, out: list[str], stack: list[pathlib.Path]) -> None:
     ap = p.resolve()
-    if ap in seen:
-        return
     if ap in stack:
         raise SystemExit(f"cyclic include: {ap}")
+    if ap in seen:
+        return
     seen.add(ap)
     stack.append(ap)
     text = p.read_text(encoding="utf-8")
@@ -162,6 +161,11 @@ terminate_guarded_pid() {
 
 seed_build() {
   local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object
+  # A newly-created Git worktree has no ignored build directory yet. Create the
+  # local output roots before taking the per-worktree lock; otherwise `mkdir`
+  # cannot create the nested lock path and every first seed fails as if a stale
+  # lock were present.
+  mkdir -p "$ROOT/bin" "$ROOT/build"
   # The EXIT trap runs after this function's locals have gone out of scope under
   # `set -u`; retain the private lock path in a function-external variable so a
   # successful high-memory seed always releases its lock without an unbound-var exit.
@@ -329,7 +333,7 @@ fi
 # flattened driver and grow without bound instead of producing a useful diagnostic.
 # Refuse that state up front: it turns a multi-gigabyte OS kill into a deterministic,
 # actionable error. The escape hatch is intentionally explicit for compiler archaeology.
-stale_stage1_source="$(find "$ROOT/src" -type f -name '*.elisa' -newer "$BIN" -print -quit)"
+stale_stage1_source="$(find "$ROOT/src" "$ROOT/elisacore_std" -type f \( -name '*.elisa' -o -name '*.elisai' \) -newer "$BIN" -print -quit)"
 if [[ -n "$stale_stage1_source" && "${ELISA_ALLOW_STALE_STAGE1:-0}" != 1 ]]; then
   echo "stage1 product binary is stale: $stale_stage1_source is newer than $BIN" >&2
   echo "run: $0 --seed" >&2
