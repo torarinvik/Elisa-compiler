@@ -2718,9 +2718,8 @@ def gen_generic_operator_no_bound():
     parameter (`def bump[T](a: T, b: T): a + b`, no `[T: Interface]` clause). stage0
     checks a generic function's body once, against only what its declared bound
     guarantees -- an unbound T supports nothing, so this is rejected at DECLARATION
-    time regardless of any call site. stage1 had no such check and accepted it,
-    deferring entirely to per-instantiation codegen -- a genuine PERMISSIVE divergence
-    (stage1 was a strict superset of valid programs, never a wrong answer). See
+    time regardless of any call site. The stage1 declaration-time guard now mirrors this
+    rule, including operators nested in value expressions and augmented assignments. See
     generic-operator-bound-checking-gap.md for the full writeup, including a real false
     positive found and fixed during staging: a REF parameter (`items: T&`, a C-buffer
     pointer) used in pointer arithmetic (`items + index`) is unrelated to whatever T's
@@ -2735,6 +2734,20 @@ def main() -> i64:
     x: mutable i64 = 5
     bump(&x, 10)
     return x
+""")
+    yield ("generic_operator_no_bound_nested_expression_rejected", """
+def pack[T](a: T, b: T) -> darray[T]:
+    return [a + b]
+
+def main() -> i64:
+    return 0
+""")
+    yield ("generic_operator_no_bound_compound_rejected", """
+def bump_compound[T](a: mutable T, b: T) -> void:
+    a += b
+
+def main() -> i64:
+    return 0
 """)
     yield ("generic_operator_bound_satisfied_accepted", """
 protocol Add:
