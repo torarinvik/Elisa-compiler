@@ -11,6 +11,19 @@ Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
 > fix preserves the arm's lexical scope while materializing successor stores instead of
 > replacing it with ordinary loops. A fresh local stage1 product was rebuilt from the
 > pinned stage0 compiler on 2026-08-31, and the IR and machine smoke tests pass against it.
+>
+> **State-machine follow-up (2026-08-31):** A second bootstrap regression was found in
+> `parse_bit_group_members`: a multi-state transition captured a temporary optional AST
+> expression and made the stage1 backend decline that function. The repair keeps the outer
+> `machine over parser.position while true` and moves only the per-member parse into a helper,
+> avoiding the unstable transition capture. The rebuilt product now lowers the complete
+> `test/breadth/emit_native.elisa` driver with no `parse_bit_group_members` decline; the
+> dedicated `state_machine_parser_selfhost_smoke.sh` pins this.
+>
+> **Nested fixed arrays (2026-08-31):** The old ledger entry claiming `i64[2][2]` was
+> rejected by array interning was stale. A fresh `i64[2][3]` read/write fixture is accepted
+> by both local stage0 and stage1 at `-O0`, and both linked programs return 44. The existing
+> `backend_native_smoke.sh` nested-array coverage and the new fixture cover the behavior.
 
 **Update, same day** — several items below are now CLOSED, and two were mis-scoped. See
 "Progress" at the end for what changed and what the corrected estimates are.
