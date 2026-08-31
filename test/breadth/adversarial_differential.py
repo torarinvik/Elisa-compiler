@@ -41,7 +41,8 @@ S0 = os.path.expanduser(
     os.environ.get("ELISACORE_BIN", os.path.join(ELISA_CORE, "compiler", "bin", "elisac"))
 )
 WRAP = os.path.join(ROOT, "scripts/elisac_stage1.sh")
-RT = os.path.join(ROOT, "build/runtime/elisacore_runtime.o")
+RT = os.environ.get("ELISA_RUNTIME_OBJ",
+                    os.path.join(ROOT, "build/runtime/elisacore_runtime.o"))
 STD = os.path.join(ROOT, "elisacore_std/elisacore_runtime.elisa")
 ENV = dict(os.environ)
 # The stage0 selector is needed by this Python oracle, but it must not leak into the stage1
