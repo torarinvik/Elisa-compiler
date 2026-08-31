@@ -330,7 +330,7 @@ fi
 # flattened driver and grow without bound instead of producing a useful diagnostic.
 # Refuse that state up front: it turns a multi-gigabyte OS kill into a deterministic,
 # actionable error. The escape hatch is intentionally explicit for compiler archaeology.
-stale_stage1_source="$(find "$ROOT/src" -type f -name '*.elisa' -newer "$BIN" -print -quit)"
+stale_stage1_source="$(find "$ROOT/src" "$ROOT/elisacore_std" -type f \( -name '*.elisa' -o -name '*.elisai' \) -newer "$BIN" -print -quit)"
 if [[ -n "$stale_stage1_source" && "${ELISA_ALLOW_STALE_STAGE1:-0}" != 1 ]]; then
   echo "stage1 product binary is stale: $stale_stage1_source is newer than $BIN" >&2
   echo "run: $0 --seed" >&2
