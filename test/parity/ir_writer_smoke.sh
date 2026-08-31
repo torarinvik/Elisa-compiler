@@ -26,10 +26,23 @@ ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
 cmp -s "$WORK/source.lowered" "$WORK/stage0.lowered"
 cmp -s "$WORK/source.lowered" "$WORK/stage1.lowered"
 
+# A plain decorator is part of the lossless subset: stage0's ExternFuncDecl carries an
+# Annotation list, and stage1 retains both the decorator name and raw argument views.
+DECORATED="$WORK/decorated.elisa"
+printf '%s\n' '@link_name(probe_write)' 'extern probe_write(fd: i32) -> i32' >"$DECORATED"
+"$STAGE0" -emit ir -o "$WORK/decorated.stage0.elisair" "$DECORATED" >/dev/null
+ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit ir -o "$WORK/decorated.stage1.elisair" "$DECORATED" >/dev/null
+"$STAGE0" -emit lowered "$DECORATED" >"$WORK/decorated.source.lowered"
+"$STAGE0" -emit lowered "$WORK/decorated.stage0.elisair" >"$WORK/decorated.stage0.lowered"
+"$STAGE0" -emit lowered "$WORK/decorated.stage1.elisair" >"$WORK/decorated.stage1.lowered"
+cmp -s "$WORK/decorated.source.lowered" "$WORK/decorated.stage0.lowered"
+cmp -s "$WORK/decorated.source.lowered" "$WORK/decorated.stage1.lowered"
+
 # Keep the negative boundary explicit: an optional return shape is not silently discarded
 # while the stage1 AST remains compact. The command must decline by name rather than emit
 # a weaker extern signature. Decorators themselves are encoded losslessly in the bundle.
-NEGATIVE="$WORK/decorated.elisa"
+NEGATIVE="$WORK/optional.elisa"
 printf '%s\n' '@link_name(probe_write)' 'extern probe_write(fd: i32) -> i32?' >"$NEGATIVE"
 if ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit ir -o "$WORK/negative.elisair" "$NEGATIVE" >/dev/null 2>"$WORK/negative.err"; then
