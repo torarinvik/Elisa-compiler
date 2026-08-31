@@ -4,14 +4,13 @@ Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
 
 > **Current-audit note (2026-08-31):** The measurements below are historical and are not
 > the live gap ledger. The `parity-gaps` worktree has since added the missing `-emit ir`
-> writer slice for plain callable externs, with a round-trip regression in
-> `test/parity/ir_writer_smoke.sh`. The richer extern forms remain an intentional refusal
-> until their compact stage1 side tables retain enough structure. The `machine over`
-> lowering remains state-machine lowering; the recent fix preserves the arm's lexical
-> scope while materializing successor stores instead of replacing it with ordinary loops.
-> A fresh product rebuild is still pending because the host killed both stage0 and the
-> self-host rebuild under desktop memory pressure; no result from those kills is counted as
-> a compiler mismatch.
+> writer slice for plain callable externs, with decorators and their raw arguments retained
+> losslessly and a round-trip regression in `test/parity/ir_writer_smoke.sh`. The richer
+> extern forms remain an intentional refusal until their compact stage1 side tables retain
+> enough structure. The `machine over` lowering remains state-machine lowering; the recent
+> fix preserves the arm's lexical scope while materializing successor stores instead of
+> replacing it with ordinary loops. A fresh local stage1 product was rebuilt from the
+> pinned stage0 compiler on 2026-08-31, and the IR and machine smoke tests pass against it.
 
 **Update, same day** — several items below are now CLOSED, and two were mis-scoped. See
 "Progress" at the end for what changed and what the corrected estimates are.
@@ -25,18 +24,18 @@ the real number today is `0` reachable.
 
 ## Part 1 — measured today
 
-### 1.1 Emit modes: 24 of 28 ported
+### 1.1 Emit modes: 24 of 28 fully ported
 
-stage0 advertises 28 `-emit` modes. The stage1 driver implements 24 of them (plus `exe`,
-which stage0 has no equivalent for).
+stage0 advertises 28 `-emit` modes. The stage1 driver fully implements 24 of them (plus
+`exe`, which stage0 has no equivalent for) and has a partial frontend-IR writer.
 
-**Not ported at all — 4:**
+**Not ported at all — 3; partially ported — 1:**
 
 | Mode | What it is | Note |
 |---|---|---|
 | `semantic` | the analyzer's own report | stage1 *runs* a semantic gate but cannot print stage0's report |
 | `facts` | the fact/obligation dump | depends on the same reporting layer |
-| `ir` | stage0's pre-LLVM IR text | stage1 has no equivalent IR stage; this is a representation gap, not a printer gap |
+| `ir` | stage0's frontend-IR bundle | **partly ported** — stage1 writes the lossless closed subset (including plain callable externs); richer AST shapes refuse by name |
 | `serve` | the language-server / `-addr` daemon | no server loop at all; see flags below |
 
 **Ported and byte-identical** on a struct + enum + function fixture: `lowered`, `unsafe`,
@@ -288,7 +287,7 @@ wrapper path (which flattens before the driver runs) is unchanged.
 
 ### Still open
 
-Everything else in Part 1, plus: `-emit semantic`/`facts`/`ir`/`serve`, the four
+Everything else in Part 1, plus: `-emit semantic`/`facts`/`serve`, the four
 compile-and-link subcommands, column spans in diagnostics, and the remaining wrapper
 responsibilities (the wrapper still flattens by default, and still owns linking). The two
 optional-type diagnostics and the namespace-hint call form are scoped in
@@ -381,7 +380,8 @@ Build one fixture per rule and diff against stage0 as each matcher lands; the re
 `project deps`, `build`, `run`, `test`, `bench`, `project abi-lint` all match stage0.
 `project easm-lint` matches for targets without EASM inputs and refuses the rest by name.
 
-**Emit modes: 24 of 28.** Missing `semantic`, `facts`, `ir`, `serve`.
+**Emit modes: 24 of 28 fully, with `ir` partly ported.** Missing `semantic`, `facts`, and
+`serve`.
 
 **Flags:** all accepted except `-addr`, which belongs with `serve`.
 
@@ -397,10 +397,11 @@ wrapper-flattened one.
 Two of the four are not "more effort" — they need something that does not exist yet, and one
 of them is a design decision rather than a port.
 
-- **`-emit ir`** — stage0 prints its pre-LLVM IR. stage1 HAS no intermediate representation:
-  it lowers the AST straight to LLVM. This is not a printer to write, it is a decision about
-  whether stage1 should grow an IR at all. That is the project owner's call, not a porting
-  task.
+- **`-emit ir`** — the frontend-IR bundle is a serialized AST, not a pre-LLVM lowering. The
+  stage1 writer now covers its measured closed subset, including callable externs and
+  decorators, and refuses richer shapes whose compact side tables are lossy. Widening it
+  means extending the exact node mapping and adding source/bundle lowered-output oracles;
+  it does not require a new backend IR.
 - **`-emit semantic` / `facts`** — both dump the FACT SYSTEM (`fact_snapshot`, `fact_exits`,
   `fact_transforms`, `fact_groups`, `fact_blocks`), with column spans in every position.
   `grep -rl fact_snapshot src/` finds nothing: stage1 has no fact model to dump. So these need
