@@ -3,7 +3,8 @@
 #
 # Usage:
 #   elisac_stage1.sh -o out.o source.elisa
-#   elisac_stage1.sh -emit wasm -o demo.wasm source.elisa  # also writes ESM/types/manifest sidecars
+#   elisac_stage1.sh -emit wasm -o demo.wasm source.elisa  # compatibility module plus sidecars
+#   elisac_stage1.sh -emit wasm --wasm-only --component-type app.wit -o app.wasm source.elisa
 #   elisac_stage1.sh --seed          # one-time seed build using stage0 (optional)
 #   elisac_stage1.sh --emit-driver   # only build the product binary (needs seed elisac)
 #
@@ -353,6 +354,9 @@ emit_mode="obj"
 target_triple=""
 wasm_ld=""
 link_flags=()
+component_types=()
+wasm_component_ld=""
+wasm_only=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --python)
@@ -425,6 +429,12 @@ while [[ $# -gt 0 ]]; do
       target_triple="${2:-}"; shift 2 ;;
     --wasm-ld)
       wasm_ld="${2:-}"; shift 2 ;;
+    --wasm-component-ld)
+      wasm_component_ld="${2:-}"; shift 2 ;;
+    --component-type|--wit)
+      component_types+=("${2:-}"); shift 2 ;;
+    --wasm-only)
+      wasm_only=1; shift ;;
     -link)
       link_flags+=("${2:-}"); shift 2 ;;
     -L)
@@ -463,10 +473,10 @@ if [[ -n "$PYTHON_CONFIG_HOST" ]]; then
   export PYTHON_CONFIG="$PYTHON_CONFIG_HOST"
 fi
 
-# WASM is a packaging target, not just another object suffix: it needs a wasm-ld link,
-# imported linear memory, and the generated ESM/TypeScript facade. Keep that orchestration
-# in one dependency-light Python helper so the shell wrapper remains pleasant to use and
-# callers get a complete module with one command.
+# WASM is a packaging target, not just another object suffix: it needs a wasm-ld link
+# (or wasm-component-ld for WIT packages). The default
+# compatibility path may generate a JS facade, while --wasm-only deliberately emits
+# only WASM plus its package manifest for native/component hosts.
 if [[ "$emit_mode" == "wasm" ]]; then
   [[ -n "$src" ]] || { echo "usage: $0 -emit wasm -o out.wasm source.elisa" >&2; exit 2; }
   if [[ -z "$out" ]]; then
@@ -481,6 +491,13 @@ if [[ "$emit_mode" == "wasm" ]]; then
   }
   wasm_command=("$wasm_python" "$ROOT/scripts/wasm_build.py" --root "$ROOT" --compiler "$0" --source "$src" --output "$out" --target "${target_triple:-wasm32-unknown-unknown}")
   [[ -n "$wasm_ld" ]] && wasm_command+=(--wasm-ld "$wasm_ld")
+  [[ -n "$wasm_component_ld" ]] && wasm_command+=(--wasm-component-ld "$wasm_component_ld")
+  if [[ "${#component_types[@]}" -gt 0 ]]; then
+    for component_type in "${component_types[@]}"; do
+      wasm_command+=(--component-type "$component_type")
+    done
+  fi
+  [[ "$wasm_only" == 1 ]] && wasm_command+=(--wasm-only)
   [[ "$noalias" == 1 ]] && wasm_command+=(--compiler-flag=-fnoalias)
   [[ "$bounds_check" == 1 ]] && wasm_command+=(--compiler-flag=-fbounds-check)
   [[ "$opt_level" != 0 ]] && wasm_command+=("--compiler-flag=-O$opt_level")

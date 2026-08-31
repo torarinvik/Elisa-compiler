@@ -40,6 +40,14 @@ class WasmBindingsTests(unittest.TestCase):
         with self.assertRaisesRegex(WasmBuildError, "duplicate WASM export"):
             parse_exports(source)
 
+    def test_link_name_is_preserved_for_wit_component_exports(self) -> None:
+        exports = parse_exports(
+            '@link_name("example:window/guest@0.1.0#start")\n'
+            "export fn start(width: u32, height: u32) -> void = start_impl\n"
+        )
+        self.assertEqual(exports[0]["name"], "start")
+        self.assertEqual(exports[0]["link_name"], "example:window/guest@0.1.0#start")
+
 
 if __name__ == "__main__":
     unittest.main()

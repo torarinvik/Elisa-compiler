@@ -45,6 +45,7 @@ EXPORT_RE = re.compile(
     r"^\s*export\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)"
     r"(?:\s*->\s*([^=]+?))?\s*(?:=\s*([A-Za-z_][A-Za-z0-9_:]*))?\s*$"
 )
+LINK_NAME_RE = re.compile(r'^\s*@link_name\((?:"([^"]*)"|([A-Za-z_][A-Za-z0-9_]*))\)\s*$')
 MAIN_RE = re.compile(
     r"^\s*def\s+main\s*\((.*)\)\s*(?:->\s*([^:]+?))?\s*:\s*$"
 )
@@ -176,7 +177,12 @@ def abi_for_type(type_text: str, function: str, position: str) -> tuple[str, str
 def parse_exports(source: str) -> list[dict[str, Any]]:
     exports: list[dict[str, Any]] = []
     seen: set[str] = set()
+    pending_link_name: str | None = None
     for line_number, line in enumerate(source.splitlines(), 1):
+        link_name_match = LINK_NAME_RE.match(line)
+        if link_name_match:
+            pending_link_name = link_name_match.group(1) or link_name_match.group(2)
+            continue
         match = EXPORT_RE.match(line)
         if match:
             public_name, raw_parameters, raw_return, raw_target = match.groups()
@@ -200,8 +206,13 @@ def parse_exports(source: str) -> list[dict[str, Any]]:
                     "line": line_number,
                 }
             )
+            if pending_link_name is not None:
+                exports[-1]["link_name"] = pending_link_name
+            pending_link_name = None
             seen.add(public_name)
             continue
+        if line.strip() and not line.lstrip().startswith("#"):
+            pending_link_name = None
         main_match = MAIN_RE.match(line)
         if main_match:
             raw_parameters, raw_return = main_match.groups()
@@ -245,6 +256,51 @@ def find_wasm_ld(explicit: str | None) -> str:
         if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
             return candidate
     raise WasmBuildError("WASM linker not found; install LLVM's wasm-ld or set WASM_LD")
+
+
+def find_wasm_component_ld(explicit: str | None) -> str:
+    """Locate the component-producing linker shipped with Rust's WASI target."""
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    env_path = os.environ.get("WASM_COMPONENT_LD")
+    if env_path:
+        candidates.append(Path(env_path))
+    discovered = shutil.which("wasm-component-ld")
+    if discovered:
+        candidates.append(Path(discovered))
+
+    # rustup commonly keeps wasm-component-ld inside the active toolchain but
+    # does not put that directory on PATH. Resolve that installation directly.
+    rustc_candidates: list[str] = []
+    rustc = shutil.which("rustc")
+    if rustc:
+        rustc_candidates.append(rustc)
+    rustup = shutil.which("rustup")
+    if rustup:
+        try:
+            rustup_rustc = subprocess.check_output([rustup, "which", "rustc"], text=True).strip()
+            if rustup_rustc:
+                rustc_candidates.append(rustup_rustc)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for rustc_candidate in rustc_candidates:
+        try:
+            sysroot = Path(subprocess.check_output([rustc_candidate, "--print", "sysroot"], text=True).strip())
+            host_output = subprocess.check_output([rustc_candidate, "-vV"], text=True)
+            host = next((line.split(": ", 1)[1] for line in host_output.splitlines() if line.startswith("host: ")), "")
+            if host:
+                candidates.append(sysroot / "lib" / "rustlib" / host / "bin" / "wasm-component-ld")
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    raise WasmBuildError(
+        "WASM component linker not found; install Rust's wasm32-wasip2 target "
+        "or set WASM_COMPONENT_LD"
+    )
 
 
 def run(command: list[str], label: str, env: dict[str, str]) -> None:
@@ -566,6 +622,7 @@ def build(args: argparse.Namespace) -> None:
         raise WasmBuildError(f"-emit wasm currently targets wasm32 (got {target!r})")
     flat_source = read_flat_source(source)
     exports = parse_exports(flat_source)
+    wasm_only = args.wasm_only or bool(args.component_types)
     module_name = output.name[:-5] if output.name.endswith(".wasm") else output.name
     manifest: dict[str, Any] = {
         "version": 1,
@@ -578,6 +635,14 @@ def build(args: argparse.Namespace) -> None:
         "files": {"wasm": output.name, "loader": f"{module_name}.mjs", "types": f"{module_name}.d.ts", "types_esm": f"{module_name}.d.mts"},
         "generated_by": "elisa -emit wasm",
     }
+    if wasm_only:
+        # A package-facing WASM build must not advertise or emit a JS facade.
+        manifest["files"] = {"wasm": output.name}
+        manifest["generated_by"] = "elisa -emit wasm --wasm-only"
+    if args.component_types:
+        manifest["format"] = "wasm-component"
+        manifest["component_types"] = [str(Path(item).resolve()) for item in args.component_types]
+        manifest["memory"] = {"export_name": "memory", "heap_base_export": "__heap_base"}
     env = os.environ.copy()
     env["ELISA_STAGE1_WASM"] = "1"
     with tempfile.TemporaryDirectory(prefix="elisa-wasm-") as workspace:
@@ -588,9 +653,29 @@ def build(args: argparse.Namespace) -> None:
         compile_command.append(str(source))
         run(compile_command, "WASM object compilation", env)
 
+        component_mode = bool(args.component_types)
         runtime_object: Path | None = None
-        if not re.search(r"^\s*def\s+arena_alloc\s*\(", flat_source, re.MULTILINE):
-            root = Path(args.root).resolve()
+        root = Path(args.root).resolve()
+        if component_mode:
+            # Component canonical ABI lowering needs a freestanding allocator for
+            # strings/lists. The native runtime is intentionally not linked here:
+            # it imports libc-shaped `env` functions and would make the component
+            # depend on a host ABI that WIT does not describe.
+            runtime_source = root / "elisacore_std" / "wasm_component_runtime.elisa"
+            cached_runtime = runtime_cache_path(root, Path(args.compiler), target, runtime_source)
+            if os.environ.get("ELISA_WASM_NO_CACHE"):
+                runtime_object = directory / "component-runtime.o"
+                runtime_command = [args.compiler, "-emit", "obj", "-target-triple", target, "-O0", "-o", str(runtime_object), str(runtime_source)]
+                run(runtime_command, "WASM component runtime compilation", env)
+            else:
+                cached_runtime.parent.mkdir(parents=True, exist_ok=True)
+                if not cached_runtime.is_file():
+                    runtime_candidate = directory / "component-runtime-cache-candidate.o"
+                    runtime_command = [args.compiler, "-emit", "obj", "-target-triple", target, "-O0", "-o", str(runtime_candidate), str(runtime_source)]
+                    run(runtime_command, "WASM component runtime compilation", env)
+                    os.replace(runtime_candidate, cached_runtime)
+                runtime_object = cached_runtime
+        elif not re.search(r"^\s*def\s+arena_alloc\s*\(", flat_source, re.MULTILINE):
             runtime_source = root / "elisacore_std" / "native_runtime_support.elisa"
             cached_runtime = runtime_cache_path(root, Path(args.compiler), target, runtime_source)
             if os.environ.get("ELISA_WASM_NO_CACHE"):
@@ -607,22 +692,37 @@ def build(args: argparse.Namespace) -> None:
                 runtime_object = cached_runtime
         manifest["runtime"] = {
             "mode": "inline" if runtime_object is None else "linked",
-            "allocator": "host-free-list",
+            "allocator": "component-cabi-realloc" if component_mode else "host-free-list",
         }
 
-        linker = find_wasm_ld(args.wasm_ld)
+        linker = find_wasm_component_ld(args.wasm_component_ld) if component_mode else find_wasm_ld(args.wasm_ld)
         wasm_path = directory / output.name
-        link_command = [
-            linker,
+        link_command = [linker]
+        if component_mode:
+            # The Elisa compiler emits a core module. wasm-component-ld embeds
+            # the supplied WIT world and performs the component lift/lower pass.
+            # No JavaScript or TypeScript artifacts are involved in this path.
+            link_command.extend(["--wasi-adapter=none", "--validate-component=true", "--realloc-via-memory-grow"])
+            for component_type in args.component_types:
+                link_command.extend(["--component-type", component_type])
+        link_command.extend([
             "--no-entry",
-            "--import-memory",
+            "--export-memory=memory" if component_mode else "--import-memory",
             f"--initial-memory={manifest['memory_initial_pages'] * 65536}",
             f"--max-memory={manifest['memory_max_pages'] * 65536}",
             "--allow-undefined",
             "--gc-sections",
             "--export=__heap_base",
-        ]
-        link_command.extend(f"--export={item['name']}" for item in exports)
+        ])
+        # Component WIT names contain `:`, `@`, `/`, and `#`, so they cannot be
+        # represented by Elisa's ordinary identifier spelling. An export may
+        # carry `@link_name("...")`; the compiler preserves that spelling in
+        # the object symbol and this host-side link step publishes it verbatim.
+        # Ordinary builds retain the historical public-name behavior.
+        link_names = (item.get("link_name", item["name"]) if component_mode else item["name"] for item in exports)
+        link_command.extend(f"--export={name}" for name in link_names)
+        if component_mode and runtime_object is not None:
+            link_command.append("--export=cabi_realloc")
         link_command.extend(["-o", str(wasm_path), str(object_path)])
         if runtime_object is not None:
             link_command.append(str(runtime_object))
@@ -630,15 +730,18 @@ def build(args: argparse.Namespace) -> None:
         shutil.copyfile(wasm_path, output)
 
     manifest_path = output.with_name(f"{module_name}.json")
-    loader_path = output.with_name(f"{module_name}.mjs")
-    types_path = output.with_name(f"{module_name}.d.ts")
-    esm_types_path = output.with_name(f"{module_name}.d.mts")
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    loader_path.write_text(js_bindings(manifest, module_name), encoding="utf-8")
-    declarations = type_declaration(manifest, module_name)
-    types_path.write_text(declarations, encoding="utf-8")
-    esm_types_path.write_text(declarations, encoding="utf-8")
-    print(f"wasm: wrote {output}, {loader_path}, {types_path}, {esm_types_path}, and {manifest_path}", file=sys.stderr)
+    if wasm_only:
+        print(f"wasm: wrote {output} and {manifest_path}", file=sys.stderr)
+    else:
+        loader_path = output.with_name(f"{module_name}.mjs")
+        types_path = output.with_name(f"{module_name}.d.ts")
+        esm_types_path = output.with_name(f"{module_name}.d.mts")
+        loader_path.write_text(js_bindings(manifest, module_name), encoding="utf-8")
+        declarations = type_declaration(manifest, module_name)
+        types_path.write_text(declarations, encoding="utf-8")
+        esm_types_path.write_text(declarations, encoding="utf-8")
+        print(f"wasm: wrote {output}, {loader_path}, {types_path}, {esm_types_path}, and {manifest_path}", file=sys.stderr)
 
 
 def main() -> int:
@@ -649,6 +752,9 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--target")
     parser.add_argument("--wasm-ld")
+    parser.add_argument("--wasm-component-ld")
+    parser.add_argument("--component-type", dest="component_types", action="append", default=[])
+    parser.add_argument("--wasm-only", action="store_true")
     parser.add_argument("--compiler-flag", dest="compiler_flags", action="append", default=[])
     args = parser.parse_args()
     try:
