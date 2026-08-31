@@ -15,28 +15,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
-source "$REPO_ROOT/test/parity/resolve_elisac.sh"
-command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; exit 2; }
-
 RPT="$REPO_ROOT/build/parse_report"
-mkdir -p "$REPO_ROOT/build"
-
-# Build the test harness. The stage1 frontend builds cleanly (the historical
-# docs/119 E4-mutation parser break is resolved), so a build or link failure is
-# a real regression and must FAIL the gate — never a silent SKIP.
-if ! "$ELISACORE_BIN" -emit obj -O2 -o "$REPO_ROOT/build/parse_report.o" \
-    "$REPO_ROOT/test/breadth/parse_report.elisa" >"$REPO_ROOT/build/parse_report.build.log" 2>&1; then
-  echo "match-pattern smoke FAIL: stage1 parse_report build broke" >&2
-  grep -i "error:" "$REPO_ROOT/build/parse_report.build.log" | head -20 >&2
-  exit 1
-fi
-
-clang -O2 "$REPO_ROOT/build/parse_report.o" -o "$RPT" 2>"$REPO_ROOT/build/parse_report.link.log" || {
-  echo "match-pattern smoke FAIL: clang link failed" >&2
-  cat "$REPO_ROOT/build/parse_report.link.log" >&2
-  exit 1
-}
+source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 fail() { echo "match-pattern smoke FAIL: $1" >&2; exit 1; }
 

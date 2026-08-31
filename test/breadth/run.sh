@@ -13,13 +13,15 @@
 # intentionally not maintained) — see the precise glob below.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
-ELISAC="${ELISAC:-${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}}"
-RPT="$ROOT/build/parse_report"
+STAGE1_BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+RPT="${ELISA_PARSE_REPORT:-$ROOT/build/parse_report}"
 
-mkdir -p "$ROOT/build"
-"$ELISAC" -emit obj -O2 -permissive -o "$ROOT/build/parse_report.o" "$ROOT/test/breadth/parse_report.elisa"
-clang -O2 "$ROOT/build/parse_report.o" -o "$RPT"
+# The breadth sweep is a stage1 product gate. Keep its reporter construction in the
+# shared helper so a standalone invocation and run_all use the same stage1 binary,
+# runtime object, freshness guard, and atomic publication path.
+export REPO_ROOT="$ROOT" ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" ELISA_PARSE_REPORT="$RPT"
+source "$ROOT/test/parity/build_parse_report.sh"
 
 total=0
 files=0

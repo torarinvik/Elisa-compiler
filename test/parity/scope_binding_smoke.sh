@@ -41,7 +41,13 @@ RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -x "$STAGE1" ] || { echo "scope_binding_smoke SKIP: no stage1 seed at $STAGE1"; exit 0; }
 [ -f "$RUNTIME_OBJ" ] || { echo "scope_binding_smoke SKIP: no runtime object at $RUNTIME_OBJ"; exit 0; }
 
-WORK="$(mktemp -d)"
+# macOS's bare `mktemp -d` can silently fall back to the host's short-lived
+# per-process temp directory. This suite compiles 80 cases and that directory
+# may be reclaimed before the later cases run, turning a compiler check into a
+# string of misleading "file not found" failures. Use an explicit template so
+# TMPDIR is honored and callers can choose a stable scratch location.
+WORK_ROOT="${TMPDIR:-/tmp}"
+WORK="$(mktemp -d "$WORK_ROOT/elisa-scope-binding.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 pass=0
 fail=0
@@ -2260,6 +2266,29 @@ def main() -> i64:
         return r + n.value - 40
 ELISAEOF
 )" 49
+
+# A semantic-check scope must end with the loop body too. A darray local in an earlier
+# loop must not shadow the scalar binder of a later loop with the same name; the old firm
+# argument checker left both its local-type and typestate channels flat and rejected this
+# valid program before code generation.
+differential loop_binder_after_container_local "$(cat <<ELISAEOF
+include "$ROOT/elisacore_std/elisacore_runtime.elisa"
+
+def take(value: i64) -> i64:
+    return value
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        total: mutable i64 = 0
+        for disks in 3..<5:
+            moves: mutable darray[i64] = []
+            moves.push(disks)
+            total <- total + moves.count.i64()
+        for moves in 1..<3:
+            total <- total + take(moves)
+        return total
+ELISAEOF
+)" 5
 
 if [ "$fail" -ne 0 ]; then
     echo "scope_binding_smoke FAILED: $pass passed, $fail failed" >&2

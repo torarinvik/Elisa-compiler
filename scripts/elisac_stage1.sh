@@ -164,6 +164,10 @@ seed_build() {
   # The EXIT trap runs after this function's locals have gone out of scope under
   # `set -u`; retain the private lock path in a function-external variable so a
   # successful high-memory seed always releases its lock without an unbound-var exit.
+  # Create the lock's parent before taking the lock. A fresh checkout has no build/
+  # directory yet; treating a failed mkdir as a stale lock there makes the very first
+  # seed fail before it can create its own build outputs.
+  mkdir -p "$ROOT/build"
   ELISA_SEED_LOCK_DIR="$ROOT/build/.elisac-stage1-seed.lock"
   seed_lock="$ELISA_SEED_LOCK_DIR"
   if ! mkdir "$seed_lock" 2>/dev/null; then
