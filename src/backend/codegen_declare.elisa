@@ -130,7 +130,19 @@ extend Backend:
             return LLVMAddFunction(m, fn_name, fn_type)
 
 
-        def build_declared_function(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, overload_count: i64, force_ast_store: bool, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # `@link_name` is useful on a definition as well as an extern. The
+        # source-level function name remains the FnTable key; only the LLVM
+        # symbol spelling changes. This lets a generated C ABI wrapper publish
+        # `foo` while the private implementation uses a collision-free native
+        # name.
+        def function_decorator_link_name(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&, source_name: sview) -> sview can[Abort.Panic]:
+            for decorator in decorators |annotation_args, source_name|:
+                if decorator.name == "link_name" and decorator.arg_count > 0 and decorator.arg_start.usize() < annotation_args.count:
+                    return annotation_args[decorator.arg_start.usize()]
+            return ""
+
+
+        def build_declared_function(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, overload_count: i64, force_ast_store: bool, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, existing_handle: LLVMValueRef?, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             name_storage: mutable darray[u8] = []
             # A method declared inside `impl I for C:` is emitted as `__impl__I__C__method`,
             # which is what stage0 names it. Only the EMITTED SYMBOL changes: the FnTable
@@ -147,7 +159,14 @@ extend Backend:
             if impl_symbol:
                 fn_name <- (&impl_storage[0]).cast[cstr] can Unsafe.PointerCast
             else:
-                fn_name <- declared_function_name(owner, function_name, overload_count, params.count, name_storage)
+                decorated_link_name: sview = function_decorator_link_name(decorators, annotation_args, function_name)
+                if decorated_link_name != "":
+                    for decorated_name_index in 0..<decorated_link_name.len |name_storage, decorated_link_name|:
+                        name_storage.push(sview_at(decorated_link_name, decorated_name_index))
+                    name_storage.push(0)
+                    fn_name <- (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                else:
+                    fn_name <- declared_function_name(owner, function_name, overload_count, params.count, name_storage)
             wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store or params_include_packed_ast(declared_param_types, structs)
             is_error_fn: bool = line_is_error_returning(error_lines, line)
             sret_return: bool = not is_error_fn and value_type_uses_sret(return_value_type, structs, ctx)
@@ -184,7 +203,11 @@ extend Backend:
             params_pointer: mutable void&? = null
             if llvm_param_types.count > 0:
                 params_pointer <- (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
-            handle: LLVMValueRef = add_declared_function_with_params(fn_name, params_pointer, llvm_param_types.count.u32(), variadic, llvm_return, m, ctx)
+            handle: mutable LLVMValueRef = zeroed
+            if existing_handle is prior_handle:
+                handle <- prior_handle
+            else:
+                handle <- add_declared_function_with_params(fn_name, params_pointer, llvm_param_types.count.u32(), variadic, llvm_return, m, ctx)
             apply_function_decorators(handle, decorators, annotation_args, true, ctx)
             add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx) if sret_return
             declared_param_base: u32 = (1 if is_error_fn else 0) + (1 if sret_return else 0)
@@ -194,6 +217,45 @@ extend Backend:
                     add_type_parameter_attribute(handle, declared_param_base + declared_param_index.u32() + 1, "byval", llvm_type_of(declared_param_type, structs, ctx), ctx)
             apply_noalias_parameter_attributes(handle, params, 1 + (1 if is_error_fn else 0) + (1 if sret_return else 0), structs, ctx)
             return handle
+
+
+        # A project include can emit `extern f(...)` in one source module and `def f(...)`
+        # in a later one. C treats those as one declaration/definition pair; Elisa overloads
+        # must still keep genuinely different signatures separate. Match only a prior
+        # callable extern with the complete modeled signature, then let the definition fill
+        # that existing LLVM declaration instead of creating `f.1`.
+        def prior_extern_is_pointer_type(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            true return if value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.Fn
+            if value_type.kind == TypeKind.Optional:
+                optional_payload: ValueType = optional_payload_of(value_type, structs)
+                return optional_payload.kind == TypeKind.Ref
+            return false
+
+
+        def prior_extern_type_matches(prior_type: ValueType, current_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            # C pointers and function pointers all use LLVM's opaque `ptr` ABI. Their
+            # source-side referent IDs can differ when declarations are discovered through
+            # different headers, even when the declarations are the same C symbol. The
+            # definition must still attach to the prior declaration; comparing the referent
+            # table index here would recreate the cross-file `f.1` failure for pointer APIs.
+            true return if prior_extern_is_pointer_type(prior_type, structs) and prior_extern_is_pointer_type(current_type, structs)
+            return prior_type.kind == current_type.kind and prior_type.bits == current_type.bits
+
+
+        def prior_extern_index_of(fns: FnTable&, owner: sview, name: sview, declared_param_types: darray[ValueType], return_value_type: ValueType, variadic: bool, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, declared_param_types, return_value_type, variadic, structs|:
+                continue if not fns.is_extern[index]
+                continue if fns.names[index] != name or fns.owners[index] != owner
+                continue if fns.param_count[index] != declared_param_types.count
+                prior_return: ValueType = fns.returns[index]
+                continue if not prior_extern_type_matches(prior_return, return_value_type, structs)
+                matched: mutable bool = true
+                for parameter_index in 0..<declared_param_types.count |matched, fns, index, declared_param_types|:
+                    prior_param: ValueType = fns.param_types[fns.param_start[index] + parameter_index]
+                    current_param: ValueType = declared_param_types[parameter_index]
+                    matched <- false if not prior_extern_type_matches(prior_param, current_param, structs)
+                return index.i64() if matched
+            return -1
 
 
         def declare_function_from_types(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, force_ast_store: bool, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
@@ -208,7 +270,21 @@ extend Backend:
                 signature_arena_slots <- signature_arena_slots + 1.usize() if error_set_payload_needs_arena(structs, declaration_error_set_name)
                 arena_count: usize = frontend_arena_count(owner, function_name, signature_arena_slots, wants_store)
                 is_error_fn: bool = line_is_error_returning(error_lines, line)
-                handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, overload_count, force_ast_store, variadic, error_lines, annotation_args, structs, m, ctx)
+                decorated_link_name: sview = function_decorator_link_name(decorators, annotation_args, function_name)
+                prior_extern_index: i64 = prior_extern_index_of(fns, owner, function_name, declared_param_types, return_value_type, variadic, structs)
+                existing_handle: mutable LLVMValueRef? = null
+                existing_handle <- fns.handles[prior_extern_index.usize()] if prior_extern_index >= 0
+                # If a preceding project module contributed `extern foo`, its
+                # handle must adopt the implementation spelling before the
+                # definition reuses it. Otherwise the later public `foo`
+                # wrapper collides with that declaration in LLVM's module.
+                if existing_handle is prior_handle and decorated_link_name != "":
+                    decorated_name_storage: mutable darray[u8] = []
+                    for decorated_name_index in 0..<decorated_link_name.len |decorated_name_storage, decorated_link_name|:
+                        decorated_name_storage.push(sview_at(decorated_link_name, decorated_name_index))
+                    decorated_name_cstr: cstr = (&decorated_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    LLVMSetValueName2(existing_handle, decorated_name_cstr, decorated_link_name.len)
+                handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, overload_count, force_ast_store, variadic, error_lines, annotation_args, existing_handle, structs, m, ctx)
                 fns.names <- fns.names.push(function_name)
                 fns.lines <- fns.lines.push(line)
                 fns.owners <- fns.owners.push(owner)
@@ -218,6 +294,7 @@ extend Backend:
                 fns.is_error <- fns.is_error.push(is_error_fn)
                 fns.returns_nullable <- fns.returns_nullable.push(false)
                 fns.is_variadic <- fns.is_variadic.push(variadic)
+                fns.is_extern <- fns.is_extern.push(false)
                 fns.handles <- fns.handles.push(handle)
                 fns.returns <- fns.returns.push(return_value_type)
                 fns.param_start <- fns.param_start.push(fns.param_types.count)
@@ -776,6 +853,7 @@ extend Backend:
                 fns.is_error <- fns.is_error.push(extern_is_error)
                 fns.returns_nullable <- fns.returns_nullable.push(extern_return_is_optional(annotations, extern_name))
                 fns.is_variadic <- fns.is_variadic.push(variadic)
+                fns.is_extern <- fns.is_extern.push(true)
                 fns.handles <- fns.handles.push(handle)
                 fns.returns <- fns.returns.push(return_value_type)
                 fns.param_start <- fns.param_start.push(fns.param_types.count)
@@ -805,6 +883,7 @@ extend Backend:
                     fns.is_error <- fns.is_error.push(false)
                     fns.returns_nullable <- fns.returns_nullable.push(false)
                     fns.is_variadic <- fns.is_variadic.push(false)
+                    fns.is_extern <- fns.is_extern.push(true)
                     fns.handles <- fns.handles.push(shutdown_handle)
                     fns.returns <- fns.returns.push(ValueType{kind: TypeKind.Void, bits: 0})
                     fns.param_start <- fns.param_start.push(fns.param_types.count)

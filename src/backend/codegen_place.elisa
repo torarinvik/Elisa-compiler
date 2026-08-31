@@ -105,6 +105,14 @@ extend Backend:
                         chain_mutable_index: i64 = mutable_global_index_of(structs, chain_name)
                         copied_type(structs.mutable_global_types[chain_mutable_index.usize()]) return if chain_mutable_index >= 0
                         return struct_type_of_name(chain_name, local_scope, structs)
+                    # Parentheses do not change the place represented by an expression.
+                    # Keep them transparent here just as `emit_expression` does. C pointer
+                    # arithmetic commonly arrives as `&(table[0][0])[offset]`; the inner
+                    # array element is parenthesized by the translator, and without this
+                    # unwrap the chain walker cannot recover the array type needed for the
+                    # indexed address.
+                    Expr.Paren(chain_parenthesized, _):
+                        return struct_chain_type(chain_parenthesized, local_scope, structs)
                     _:
                         pass
                 # `elisa_nonnull(pointer).field` is a transparent pointer wrapper emitted by
@@ -295,6 +303,22 @@ extend Backend:
                             rvalue_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(rvalue_type, structs, ctx), "struct.rvalue")
                             _ = LLVMBuildStore(builder, rvalue, rvalue_slot)
                             return rvalue_slot
+                    # A reference-valued call already produces the address needed by a field
+                    # or index place. This includes the generic C-translation shape
+                    # `elisa_nonnull(optional_pointer).field`: the wrapper turns an optional
+                    # reference into a plain reference, but the call result is still an rvalue
+                    # rather than a named local for the structural walker to discover.
+                    if rvalue_type.kind == TypeKind.Ref:
+                        if emit_expression(object, rvalue_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ref_rvalue:
+                            emit_pointer_deref_guard(ref_rvalue, runtime, m, ctx, builder)
+                            return ref_rvalue
+                    if rvalue_type.kind == TypeKind.Optional:
+                        rvalue_payload: ValueType = optional_payload_of(rvalue_type, structs)
+                        if rvalue_payload.kind == TypeKind.Ref:
+                            if emit_expression(object, rvalue_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is optional_rvalue:
+                                optional_pointer: LLVMValueRef = optional_payload_value_of(optional_rvalue, rvalue_type, structs, ctx, builder)
+                                emit_pointer_deref_guard(optional_pointer, runtime, m, ctx, builder)
+                                return optional_pointer
                     return null
                 _:
                     pass
@@ -304,6 +328,37 @@ extend Backend:
                         emit_pointer_deref_guard(base_address, runtime, m, ctx, builder)
                         return base_address
                     return null
+                _:
+                    pass
+            # Address-of is itself a reference-valued rvalue. When it is used as the
+            # receiver of another index, for example
+            # `(&(&nonnull(p)[-1])[-64])[0]`, evaluate the address expression once and
+            # reuse its pointer value as the place base.
+            match object:
+                Expr.Unary(address_operator, address_operand, _):
+                    if address_operator == TokenKind.Ampersand:
+                        address_type: ValueType = expression_type(object, local_scope, fns, structs, generics)
+                        if address_type.kind == TypeKind.Ref:
+                            if emit_expression(object, address_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is address_value:
+                                emit_pointer_deref_guard(address_value, runtime, m, ctx, builder)
+                                return address_value
+                        if address_type.kind == TypeKind.Optional:
+                            address_payload: ValueType = optional_payload_of(address_type, structs)
+                            if address_payload.kind == TypeKind.Ref:
+                                if emit_expression(object, address_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is optional_address_value:
+                                    optional_address_pointer: LLVMValueRef = optional_payload_value_of(optional_address_value, address_type, structs, ctx, builder)
+                                    emit_pointer_deref_guard(optional_address_pointer, runtime, m, ctx, builder)
+                                    return optional_address_pointer
+                        if struct_chain_address(address_operand, local_scope, fns, structs, generics, runtime, m, ctx, builder) is address_place:
+                            return address_place
+                _:
+                    pass
+            # Parenthesized lvalues retain the same address. This is needed for the
+            # translated C idiom `&(table[0][0])[offset]`: the address resolver is
+            # asked to walk the parenthesized inner place while forming the final GEP.
+            match object:
+                Expr.Paren(chain_parenthesized, _):
+                    return struct_chain_address(chain_parenthesized, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 _:
                     pass
             match object:
@@ -434,6 +489,32 @@ extend Backend:
             # than spilling a copy. darray and fixed array use their own index-address paths.
             match object:
                 Expr.Index(indexed_container, index_expr, index_line):
+                    # Prefix `&` binds to the complete postfix expression in the
+                    # translated spelling `&(table[0][0])[offset]`. When the base is
+                    # parenthesized, this is pointer arithmetic over the address of the
+                    # scalar place inside those parentheses, not indexing the fixed array
+                    # that contains it. Handle that structural form before the ordinary
+                    # nested-array walk below.
+                    match indexed_container:
+                        Expr.Paren(pointer_base, _):
+                            pointer_base_type: ValueType = struct_chain_type(pointer_base, local_scope, structs)
+                            if pointer_base_type.kind != TypeKind.Unmodeled and pointer_base_type.kind != TypeKind.Void:
+                                if struct_chain_address(pointer_base, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_base_address:
+                                    if emit_expression(index_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_offset:
+                                        pointer_offset_indices: mutable darray[LLVMValueRef] = [pointer_offset]
+                                        pointer_offset_pointer: void& = (&pointer_offset_indices[0]).cast[void&] can Unsafe.PointerCast
+                                        return LLVMBuildGEP2(builder, llvm_type_of(pointer_base_type, structs, ctx), pointer_base_address, pointer_offset_pointer, 1, "pointer.index.paren.ptr")
+                        Expr.Unary(pointer_operator, pointer_base_operand, _):
+                            if pointer_operator == TokenKind.Ampersand:
+                                pointer_base_type: ValueType = struct_chain_type(pointer_base_operand, local_scope, structs)
+                                if pointer_base_type.kind != TypeKind.Unmodeled and pointer_base_type.kind != TypeKind.Void:
+                                    if struct_chain_address(pointer_base_operand, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_base_address:
+                                        if emit_expression(index_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_offset:
+                                            pointer_offset_indices: mutable darray[LLVMValueRef] = [pointer_offset]
+                                            pointer_offset_pointer: void& = (&pointer_offset_indices[0]).cast[void&] can Unsafe.PointerCast
+                                            return LLVMBuildGEP2(builder, llvm_type_of(pointer_base_type, structs, ctx), pointer_base_address, pointer_offset_pointer, 1, "pointer.index.unary.ptr")
+                        _:
+                            pass
                     # A protocol index returns the element PLACE directly. Resolve it
                     # before the built-in array/darray/view cases below; those cases
                     # intentionally return null for an arbitrary struct receiver.
@@ -614,6 +695,15 @@ extend Backend:
                             return emit_darray_index_address(inner_container_address, inner_container_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                         if inner_container_type.kind == TypeKind.Array:
                             return emit_index_address(inner_container_address, inner_container_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        # C also indexes a pointer produced from a scalar place:
+                        # `&(table[0][0])[offset]`. The base address is already the
+                        # address of one element, so this is a one-index GEP by the
+                        # element stride rather than a fixed-array GEP.
+                        if inner_container_type.kind != TypeKind.Unmodeled and inner_container_type.kind != TypeKind.Void:
+                            if emit_expression(index_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_index:
+                                pointer_indices: mutable darray[LLVMValueRef] = [pointer_index]
+                                pointer_indices_pointer: void& = (&pointer_indices[0]).cast[void&] can Unsafe.PointerCast
+                                return LLVMBuildGEP2(builder, llvm_type_of(inner_container_type, structs, ctx), inner_container_address, pointer_indices_pointer, 1, "pointer.index.ptr")
                         # `b.items[i]` where the FIELD `items` is a ref (`T&`) or optional-ref (`T&?`)
                         # used as a C-style buffer pointer — Deque's `d.items[phys]` (`items: T&?`). The
                         # field slot holds the ref (an optional is {i1, ptr}; take field 1). Load the raw
