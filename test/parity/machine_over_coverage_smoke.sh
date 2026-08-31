@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # docs/123 §5 per-state coverage, stage1-OWNED (docs/125 step 13). A `machine over` state
-# must handle every input: an open-domain (char/int) state needs a final unguarded `_`
+# must handle every input: an open-domain (char/int/float/bool/string) state needs a final `_`
 # arm, an irrefutable arm makes any later arm for that state unreachable, and a state with
 # no arms is an error. All three are parser-decidable (no types), 0-FP, and REFUSED BY
 # STAGE1 (P >= 1). Mirrors stage0's parser/machine.go per-state coverage loop.
@@ -18,6 +18,13 @@ echo "$out" | grep -q "^P 0$" || fail "legal open+wildcard machine flagged: $out
 # 2. ILLEGAL: an open-domain state (`48`) with no `_` wildcard cannot be exhaustive.
 out=$(printf 'def s(lx: mutable Lx&) -> i64:\n    n: i64 = 0\n    machine over lx.cur() while not lx.done():\n        state Run\n        start Run\n        Run, 48:\n            -> Run\n    return n\n' | "$RPT")
 echo "$out" | grep -q "^P 0$" && fail "open-domain state without wildcard NOT refused: $out"
+
+# 2b. The same open-domain rule applies to every literal family, including wrapped unary
+# literals. This stays parser-decidable and prevents stage1 from accepting a partial machine.
+for literal in true '"done"' 1.0 -1; do
+    out=$(printf 'def s(lx: mutable Lx&) -> i64:\n    n: i64 = 0\n    machine over lx.cur() while not lx.done():\n        state Run\n        start Run\n        Run, %s:\n            -> Run\n    return n\n' "$literal" | "$RPT")
+    echo "$out" | grep -q "^P 0$" && fail "open-domain literal %s without wildcard NOT refused: $out"
+done
 
 # 3. ILLEGAL: an arm after an irrefutable (`_`) arm is unreachable.
 out=$(printf 'def s(lx: mutable Lx&) -> i64:\n    n: i64 = 0\n    machine over lx.cur() while not lx.done():\n        state Run\n        start Run\n        Run, _:\n            -> Run\n        Run, 48:\n            -> Run\n    return n\n' | "$RPT")
