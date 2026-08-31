@@ -934,7 +934,7 @@ if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "ifac
   # prints it verbatim and is byte-parity held.
   driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
   [[ -n "$test_filter" ]] && driver_env+=("ELISA_STAGE1_FILTER=$test_filter")
-  if [[ ( "$emit_mode" == "fmt" || "$emit_mode" == "lowered" ) && -s "$flat.map" ]]; then
+  if [[ ( "$emit_mode" == "fmt" || "$emit_mode" == "lowered" || "$emit_mode" == "iface" ) && -s "$flat.map" ]]; then
     driver_env+=("ELISA_STAGE1_OFFSET_MAP=$(cat "$flat.map")")
   fi
   exec > "$out"
