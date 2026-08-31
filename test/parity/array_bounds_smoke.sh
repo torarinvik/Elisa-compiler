@@ -2,9 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
-source "$REPO_ROOT/test/parity/resolve_elisac.sh"
-REPO_ROOT="$REPO_ROOT" ELISACORE_BIN="$ELISACORE_BIN" bash "$REPO_ROOT/test/parity/build_parse_report.sh"
+source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 check_case() {
   local source="$1"

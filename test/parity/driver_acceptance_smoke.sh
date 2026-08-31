@@ -46,6 +46,16 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
+# The stage0 selector belongs only to the oracle invocation. Keep it out of the stage1
+# wrapper's environment so this test cannot accidentally compile with the installed/default
+# compiler or let an oracle-specific path affect the self-hosted product.
+stage1_compile() {
+    env -u ELISACORE_BIN -u ELISA_CORE -u REPO_ROOT \
+        ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}" \
+        ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$REPO_ROOT/build/runtime/elisacore_runtime.o}" \
+        bash "$REPO_ROOT/scripts/elisac_stage1.sh" "$@"
+}
+
 # Compare both drivers over every fixture. $1 is "bare" or "withstd"; echoes the
 # disagreement count and prints one line per disagreement.
 compare_all() {
@@ -58,7 +68,7 @@ compare_all() {
         fi
         "$ELISACORE_BIN" -emit obj -o "$WORK/s0.o" "$probe" >/dev/null 2>&1
         r0=$?
-        bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit obj -o "$WORK/s1.o" "$probe" >/dev/null 2>&1
+        stage1_compile -emit obj -o "$WORK/s1.o" "$probe" >/dev/null 2>&1
         r1=$?
         a0=$([ "$r0" -eq 0 ] && echo accept || echo reject)
         a1=$([ "$r1" -eq 0 ] && echo accept || echo reject)
