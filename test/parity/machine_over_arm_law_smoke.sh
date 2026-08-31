@@ -11,8 +11,10 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "machine-over arm-law smoke FAIL: $1" >&2; exit 1; }
 
-# 1. LEGAL: straight-line body (`total <- total + 1`) + `-> State` transition.
-out=$(printf 'def scan(lexer: mutable Lexer&) -> i64:\n    total: i64 = 0\n    machine over lexer.current_char() while not lexer.is_end():\n        state Run\n        start Run\n        Run, .Digit:\n            total <- total + 1\n            -> Run\n    return total\n' | "$RPT")
+# 1. LEGAL: straight-line body mutating the driven resource + `-> State` transition.
+#    An unrelated outer binding is deliberately not used here: the foreign-mutation law
+#    rejects it, and the stage0 oracle now enforces that rule as well.
+out=$(printf 'def scan(cursor: mutable i64) -> i64:\n    machine over cursor while cursor < 1:\n        state Run\n        start Run\n        Run, _:\n            cursor <- cursor + 1\n            -> Run\n    return cursor\n' | "$RPT")
 echo "$out" | grep -q "^P 0$" || fail "legal straight-line arm flagged: $out"
 
 # 2. ILLEGAL: a hidden `if` in an arm body (the guard belongs in the arm header).

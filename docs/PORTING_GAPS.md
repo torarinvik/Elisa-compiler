@@ -20,6 +20,13 @@ Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
 > `test/breadth/emit_native.elisa` driver with no `parse_bit_group_members` decline; the
 > dedicated `state_machine_parser_selfhost_smoke.sh` pins this.
 >
+> **Machine parser parity follow-up (2026-08-31):** `machine from` now validates explicit
+> enum qualifiers before the compact AST discards them, requires a qualified start state, and
+> applies the stage0 foreign-mutation rule to `machine over` roots (including roots found in
+> the `while` condition and nested driver expressions). These checks preserve the real
+> state-machine lowering; they do not rewrite it as ordinary loops. The parser replay oracle
+> agrees on 440/440 acceptance cases.
+>
 > **Nested fixed arrays (2026-08-31):** The old ledger entry claiming `i64[2][2]` was
 > rejected by array interning was stale. A fresh `i64[2][3]` read/write fixture is accepted
 > by both local stage0 and stage1 at `-O0`, and both linked programs return 44. The existing
