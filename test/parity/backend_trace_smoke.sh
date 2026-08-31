@@ -27,7 +27,7 @@ src=$'def helper(x: i64) -> i64:\n    y: i64 = x + 1\n    return y\n\ndef main()
 printf '%s' "$src" | "$BUILD/emit_trace" > "$BUILD/trace.ll"
 grep -q 'declare void @elisa_trace_record(ptr, i32)' "$BUILD/trace.ll"
 grep -q 'call void @elisa_trace_record' "$BUILD/trace.ll"
-grep -q 'declare void @elisa_trace_record_value(ptr, i32, ptr, i64)' "$BUILD/trace.ll"
+grep -q 'declare void @elisa_trace_record_value(ptr, i32, ptr, i64, i32)' "$BUILD/trace.ll"
 grep -q 'call void @elisa_trace_record_value' "$BUILD/trace.ll"
 grep -q 'declare void @elisa_trace_install_fault_handler()' "$BUILD/trace.ll"
 grep -q 'call void @elisa_trace_install_fault_handler()' "$BUILD/trace.ll"
