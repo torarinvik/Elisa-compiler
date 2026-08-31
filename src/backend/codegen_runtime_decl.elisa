@@ -807,6 +807,102 @@ extend Backend:
             return true
 
 
+        # docs/126 D1 — compiler-inserted `__drop__` calls.
+        #
+        # A drop-typed local registers a deferred action at its declaration. That single
+        # registration is all the control flow this needs: the deferred machinery already
+        # fires on every exit edge — the function epilogue, every `return`,
+        # `break`/`continue`, and block exit — and runs in reverse registration order,
+        # which for declarations is reverse declaration order. Drops inherit correct
+        # placement rather than re-deriving it.
+        #
+        # Move suppression is dynamic, through a one-bit live flag per value. A static
+        # elision would have to trust the affine tracker, which merges consumption across
+        # branches by union: a value moved on one arm of an `if` reads as moved on both,
+        # and eliding there would skip a drop that is still owed. The flag is an entry
+        # alloca with constant stores, so mem2reg folds it and the branch away whenever
+        # the move is unconditional; only a genuinely conditional move pays for a branch.
+        def register_drop_cleanup(var_name: sview, declared_type: ValueType, slot: LLVMValueRef, line: u32, local_scope: mutable Scope&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if declared_type.kind != TypeKind.Struct
+            return if declared_type.bits.usize() >= structs.names.count
+            return if not type_has_drop_hook(structs, structs.names[declared_type.bits.usize()])
+            flag_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+            flag_llvm: LLVMTypeRef = llvm_type_of(flag_type, structs, ctx)
+            # Armed at the declaration itself: the value is live from here. A path that
+            # somehow reaches a cleanup without having run the declaration reads the entry
+            # alloca's zero and does nothing, so the failure mode is a leak, never a
+            # double free.
+            flag: LLVMValueRef = build_entry_alloca(builder, flag_llvm, "drop.live")
+            _ = LLVMBuildStore(builder, LLVMConstInt(flag_llvm, 1, 0), flag)
+            drop_pos: Ast::Pos = Ast::pos_at_line(line)
+            # Synthesized as ordinary AST so the destructor call gets the same overload
+            # resolution and ABI handling as a hand-written one.
+            drop_body: mutable darray[Stmt] = [(Stmt.If((Expr.Ident("__drop_live", drop_pos)), [(Stmt.Expr((Expr.Call((Expr.Ident("__drop__", drop_pos)), [(Expr.Move((Expr.Ident(var_name, drop_pos)), drop_pos))], [], drop_pos)), drop_pos))], [], drop_pos))]
+            drop_mark: usize = local_scope.deferred.count
+            local_scope.deferred <- local_scope.deferred.push(DeferredAction{body: [], names: [], slots: [], types: [], scope_exit: true})
+            local_scope.deferred[drop_mark].body.extend(drop_body)
+            local_scope.deferred[drop_mark].names.extend(local_scope.names)
+            local_scope.deferred[drop_mark].slots.extend(local_scope.slots)
+            local_scope.deferred[drop_mark].types.extend(local_scope.types)
+            # The flag rides along as the action's last captured binding, so the body can
+            # name it without the scope machinery growing a field for it.
+            local_scope.deferred[drop_mark].names.push("__drop_live")
+            local_scope.deferred[drop_mark].slots.push(flag)
+            local_scope.deferred[drop_mark].types.push(flag_type)
+
+
+        # The local a registered drop is responsible for, read back out of the body this
+        # file synthesized. Reading the AST keeps the association in the action itself
+        # rather than in a second table that could fall out of step with it.
+        def drop_action_target_name(action: DeferredAction&) -> sview can[Abort.Panic]:
+            return "" if action.body.count != 1
+            return "" if action.names.count == 0
+            return "" if action.names[action.names.count - 1] != "__drop_live"
+            match action.body[0]:
+                Stmt.If(drop_if_condition, drop_if_then, drop_if_else, drop_if_line):
+                    return "" if drop_if_then.count != 1
+                    match drop_if_then[0]:
+                        Stmt.Expr(drop_call_expression, drop_call_line):
+                            match drop_call_expression:
+                                Expr.Call(drop_callee, drop_arguments, drop_argument_names, drop_call_pos):
+                                    return "" if drop_arguments.count != 1
+                                    match drop_arguments[0]:
+                                        Expr.Move(drop_moved, drop_moved_line):
+                                            match drop_moved:
+                                                Expr.Ident(drop_moved_name, drop_moved_ident_line):
+                                                    return drop_moved_name
+                                                _:
+                                                    return ""
+                                        _:
+                                            return ""
+                                _:
+                                    return ""
+                        _:
+                            return ""
+                _:
+                    return ""
+
+
+        # `move x` hands the obligation to whoever receives the value, so the declaring
+        # scope must not also drop it.
+        def suppress_drop_for_moved_local(local_scope: Scope&, moved: Expr, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            moved_name: mutable sview = ""
+            match moved:
+                Expr.Ident(moved_ident_name, moved_ident_line):
+                    moved_name <- moved_ident_name
+                _:
+                    pass
+            return if moved_name == ""
+            index: mutable i64 = local_scope.deferred.count.i64() - 1
+            while index >= 0 |index, local_scope, moved_name, structs, ctx, builder|:
+                if drop_action_target_name(local_scope.deferred[index.usize()]) == moved_name:
+                    moved_flag_llvm: LLVMTypeRef = llvm_type_of(ValueType{kind: TypeKind.Bool, bits: 1}, structs, ctx)
+                    moved_slots: usize = local_scope.deferred[index.usize()].slots.count
+                    _ = LLVMBuildStore(builder, LLVMConstInt(moved_flag_llvm, 0, 0), local_scope.deferred[index.usize()].slots[moved_slots - 1])
+                    return
+                index <- index - 1
+
+
         # What emitting a statement did to control flow.
         #
         # `Terminated` means the statement ended the block (a `return`, or an `if` whose
