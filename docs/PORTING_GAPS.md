@@ -2,6 +2,17 @@
 
 Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
 
+> **Current-audit note (2026-08-31):** The measurements below are historical and are not
+> the live gap ledger. The `parity-gaps` worktree has since added the missing `-emit ir`
+> writer slice for plain callable externs, with a round-trip regression in
+> `test/parity/ir_writer_smoke.sh`. The richer extern forms remain an intentional refusal
+> until their compact stage1 side tables retain enough structure. The `machine over`
+> lowering remains state-machine lowering; the recent fix preserves the arm's lexical
+> scope while materializing successor stores instead of replacing it with ordinary loops.
+> A fresh product rebuild is still pending because the host killed both stage0 and the
+> self-host rebuild under desktop memory pressure; no result from those kills is counted as
+> a compiler mismatch.
+
 **Update, same day** — several items below are now CLOSED, and two were mis-scoped. See
 "Progress" at the end for what changed and what the corrected estimates are.
 
