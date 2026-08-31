@@ -7,6 +7,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 SOURCE="$ROOT/test/fixtures/machine_transition/shadow.elisa"
 INPUT_BIND_SOURCE="$ROOT/test/fixtures/machine_transition/input_bind.elisa"
+INPUT_BIND_FAST_SOURCE="$ROOT/test/fixtures/machine_transition/input_bind_fast.elisa"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
@@ -48,5 +49,6 @@ run_case() {
 
 run_case "$SOURCE" 2 shadow
 run_case "$INPUT_BIND_SOURCE" 1 input-bind
+run_case "$INPUT_BIND_FAST_SOURCE" 1 input-bind-fast
 
 echo "machine transition scope smoke OK: payload stores and input binders preserve arm scope at O0/O2"
