@@ -105,10 +105,10 @@ def mark() -> None:
 
 def flatten(p: pathlib.Path, out: list[str], stack: list[pathlib.Path]) -> None:
     ap = p.resolve()
-    if ap in seen:
-        return
     if ap in stack:
         raise SystemExit(f"cyclic include: {ap}")
+    if ap in seen:
+        return
     seen.add(ap)
     stack.append(ap)
     text = p.read_text(encoding="utf-8")
@@ -161,6 +161,11 @@ terminate_guarded_pid() {
 
 seed_build() {
   local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object
+  # A newly-created Git worktree has no ignored build directory yet. Create the
+  # local output roots before taking the per-worktree lock; otherwise `mkdir`
+  # cannot create the nested lock path and every first seed fails as if a stale
+  # lock were present.
+  mkdir -p "$ROOT/bin" "$ROOT/build"
   # The EXIT trap runs after this function's locals have gone out of scope under
   # `set -u`; retain the private lock path in a function-external variable so a
   # successful high-memory seed always releases its lock without an unbound-var exit.
@@ -252,7 +257,6 @@ seed_build() {
   }
   trap cleanup_seed_lock EXIT INT TERM HUP
   libdir="$("$LLVM_CONFIG" --libdir)"
-  mkdir -p "$ROOT/bin" "$ROOT/build"
   if [[ ! -x "$STAGE0_BIN" ]]; then
     echo "seed requires stage0 elisac at ELISACORE_BIN=$STAGE0_BIN" >&2
     exit 2
@@ -341,6 +345,8 @@ out=""
 src=""
 noalias=0
 bounds_check=0
+debug_info=0
+trace_info=0
 opt_level=0
 test_filter=""
 emit_mode="obj"
@@ -407,6 +413,10 @@ while [[ $# -gt 0 ]]; do
       noalias=1; shift ;;
     -fbounds-check)
       bounds_check=1; shift ;;
+    -g|-debug-info)
+      debug_info=1; shift ;;
+    -ftrace|-record-trace)
+      trace_info=1; shift ;;
     # Cross-compilation and linker passthrough. The DRIVER has implemented both for a
     # while (requested_target_triple, and ELISA_STAGE1_LINK read in the c-archive/exe
     # paths) — only this wrapper rejected them, so `-target-triple` and `-link/-L/-l`
@@ -866,6 +876,8 @@ driver_env=()
 # not just the report modes below — otherwise a wrapper-compiled program reports a bare
 # line number while the same file compiled through the CLI names itself.
 driver_env+=("ELISA_STAGE1_SRC=$src")
+[[ "$debug_info" == 1 ]] && driver_env+=("ELISA_STAGE1_DEBUG=1")
+[[ "$trace_info" == 1 ]] && driver_env+=("ELISA_STAGE1_TRACE=1")
 [[ -n "$target_triple" ]] && driver_env+=("ELISA_STAGE1_TRIPLE=$target_triple")
 [[ "$target_triple" == wasm* ]] && driver_env+=("ELISA_STAGE1_WASM=1")
 [[ ${#link_flags[@]} -gt 0 ]] && driver_env+=("ELISA_STAGE1_LINK=${link_flags[*]}")
