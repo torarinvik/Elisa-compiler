@@ -539,7 +539,15 @@ esac
 flat="$(mktemp)"
 stage1_request="$(mktemp)"
 trap 'rm -f "$flat" "$flat.map" "$stage1_request"' EXIT
-flatten_includes "$src" "$flat.map" >"$flat"
+# Include-free sources need no python expansion: the flattened unit IS the file.
+# Mutant and corpus programs without includes were paying the ~24ms interpreter
+# spawn per compile for a copy.
+if grep -q '^[[:space:]]*include[[:space:]]' "$src"; then
+  flatten_includes "$src" "$flat.map" >"$flat"
+else
+  cp "$src" "$flat"
+  : > "$flat.map"
+fi
 # `# smt` belongs to the original source header, but include flattening can place that
 # header far beyond the first few lines of the expanded buffer. Detect it here, before the
 # source enters the self-hosted compiler, and pass a one-bit fact through the environment.
@@ -831,6 +839,13 @@ run_stage1_driver_guarded() {
   local driver_pid driver_rss driver_peak=0 driver_rc=0
   local driver_max_rss_kb="${ELISA_STAGE1_MAX_RSS_KB:-4194304}"
   local driver_rss_poll_seconds="${ELISA_STAGE1_RSS_POLL_SECONDS:-0.05}"
+  # The poll BACKS OFF exponentially from 2ms up to the configured interval. A
+  # fixed 50ms first sleep dominated small compiles outright — a differential-
+  # corpus program compiles in ~10ms, and the guard added 50ms of pure wall to
+  # every one of the ~4900 wrapper invocations a full gate makes (~4 minutes of
+  # sleeping per gate). A runaway compile still meets the full-interval poll
+  # within a few iterations, so the guard's protection is unchanged.
+  local driver_poll_now=0.002
   env "${driver_env[@]+${driver_env[@]}}" "$BIN" <"$stage1_request" &
   driver_pid=$!
   while kill -0 "$driver_pid" 2>/dev/null; do
@@ -846,7 +861,8 @@ run_stage1_driver_guarded() {
       terminate_guarded_pid "$driver_pid"
       return 125
     fi
-    sleep "$driver_rss_poll_seconds"
+    sleep "$driver_poll_now"
+    driver_poll_now="$(awk -v now="$driver_poll_now" -v cap="$driver_rss_poll_seconds" 'BEGIN { doubled = now * 2; print (doubled > cap) ? cap : doubled }')"
   done
   wait "$driver_pid" || driver_rc=$?
   return "$driver_rc"
