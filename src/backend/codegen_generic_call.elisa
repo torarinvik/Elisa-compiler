@@ -242,11 +242,14 @@ extend Backend:
             null return if expected.kind != TypeKind.Fn
             return_type: ValueType = fn_return_type_of(expected, structs)
             null return if return_type.kind == TypeKind.Unmodeled
+            lambda_error_family: mutable sview = fn_error_family_of(expected, structs)
+            lambda_error_family <- resolved_error_family(lambda_error_family, structs) if lambda_error_family != ""
+            lambda_is_error: bool = lambda_error_family != ""
             null return if expected.bits.usize() >= structs.fn_pool_param_start.count
             param_span_start: usize = structs.fn_pool_param_start[expected.bits.usize()]
             param_span_count: usize = structs.fn_pool_param_count[expected.bits.usize()]
             null return if param_span_count != lambda_params.count
-            return_llvm: LLVMTypeRef = llvm_type_of(return_type, structs, ctx)
+            return_llvm: LLVMTypeRef = error_set_llvm_type(structs, lambda_error_family, ctx) if lambda_is_error and error_set_has_payload(structs, lambda_error_family) else LLVMInt32TypeInContext(ctx) if lambda_is_error else llvm_type_of(return_type, structs, ctx)
             param_types: mutable darray[ValueType] = []
             param_llvms: mutable darray[LLVMTypeRef] = []
             param_declined: mutable bool = false
@@ -304,10 +307,12 @@ extend Backend:
                     _ = LLVMBuildStore(builder, capture_values[store_probe], store_field)
                     store_probe <- store_probe + 1
             # The LIFTED function `@lambda(ptr env, params…)`. LLVM uniquifies the name.
-            lifted_llvm_types: mutable darray[LLVMTypeRef] = [pointer_type]
+            lifted_llvm_types: mutable darray[LLVMTypeRef] = []
+            lifted_llvm_types.push(pointer_type) if lambda_is_error
+            lifted_llvm_types.push(pointer_type)
             lifted_llvm_types.extend(param_llvms)
             lifted_types_pointer: void& = (&lifted_llvm_types[0]).cast[void&] can Unsafe.PointerCast
-            lifted_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, lifted_types_pointer, (param_span_count + 1).u32(), 0)
+            lifted_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, lifted_types_pointer, lifted_llvm_types.count.u32(), 0)
             lifted_fn: LLVMValueRef = LLVMAddFunction(m, "lambda", lifted_fn_type)
             saved_block: LLVMBasicBlockRef = LLVMGetInsertBlock(builder)
             lifted_entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, lifted_fn, "entry")
@@ -324,9 +329,13 @@ extend Backend:
             lifted_runtime.arena <- lifted_arena_slot
             lifted_runtime.owns_arena <- true
             lifted_runtime.debug_active <- false
+            if lambda_is_error:
+                lifted_runtime.error_out <- LLVMGetParam(lifted_fn, 0)
+                lifted_runtime.in_error_fn <- true
+                lifted_runtime.error_fn_family <- lambda_error_family
             lifted_regions.arenas.push(lifted_arena_slot)
-            # Load each capture from the env param (param 0) into a fresh local.
-            env_param: LLVMValueRef = LLVMGetParam(lifted_fn, 0)
+            # Load each capture from the env param into a fresh local.
+            env_param: LLVMValueRef = LLVMGetParam(lifted_fn, 1 if lambda_is_error else 0)
             load_probe: mutable usize = 0
             while load_probe < capture_names.count |load_probe, env_struct_type, env_param, capture_llvms, capture_names, capture_types, lifted_scope, builder|:
                 load_field: LLVMValueRef = LLVMBuildStructGEP2(builder, env_struct_type, env_param, load_probe.u32(), "lambda.cap.ptr")
@@ -335,17 +344,21 @@ extend Backend:
                 _ = LLVMBuildStore(builder, loaded_capture, capture_slot)
                 declare_local(lifted_scope, capture_names[load_probe], capture_slot, capture_types[load_probe])
                 load_probe <- load_probe + 1
-            # Declare the lambda's own params (LLVM params 1..).
+            # Declare the lambda's own params after the hidden error/env parameters.
             lifted_param_probe: mutable usize = 0
-            while lifted_param_probe < lambda_params.count |lifted_param_probe, lifted_fn, param_llvms, param_types, lambda_params, lifted_scope, builder|:
+            lifted_param_base: u32 = 2 if lambda_is_error else 1
+            while lifted_param_probe < lambda_params.count |lifted_param_probe, lifted_fn, param_llvms, param_types, lambda_params, lifted_scope, builder, lifted_param_base|:
                 lifted_param_slot: LLVMValueRef = LLVMBuildAlloca(builder, param_llvms[lifted_param_probe], "lambda.param")
-                _ = LLVMBuildStore(builder, LLVMGetParam(lifted_fn, (lifted_param_probe + 1).u32()), lifted_param_slot)
+                _ = LLVMBuildStore(builder, LLVMGetParam(lifted_fn, lifted_param_base + lifted_param_probe.u32()), lifted_param_slot)
                 declare_local(lifted_scope, lambda_params[lifted_param_probe], lifted_param_slot, param_types[lifted_param_probe])
                 lifted_param_probe <- lifted_param_probe + 1
             lifted_status: EmitStatus = emit_statements(lambda_body, return_type, lifted_scope, lifted_loops, lifted_regions, fns, structs, generics, lifted_runtime, m, ctx, builder)
             lifted_ok: mutable bool = lifted_status != EmitStatus.Declined
             if lifted_status == EmitStatus.Open:
-                if return_type.kind == TypeKind.Void:
+                if lambda_is_error:
+                    emit_region_free(lifted_runtime, builder)
+                    _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0))
+                elif return_type.kind == TypeKind.Void:
                     emit_region_free(lifted_runtime, builder)
                     _ = LLVMBuildRetVoid(builder)
                 else:
@@ -402,8 +415,12 @@ extend Backend:
             # is authoritative and works even in argument position (`f(f(x))`); fall back to the
             # call site's EXPECTED type when the signature carries no return (older Fn{bits:0}).
             declared_return: mutable ValueType = unmodeled_type()
+            declared_error_family: mutable sview = ""
             if callee_declared_type.kind == TypeKind.Fn:
                 declared_return <- fn_return_type_of(callee_declared_type, structs)
+                declared_error_family <- fn_error_family_of(callee_declared_type, structs)
+                declared_error_family <- resolved_error_family(declared_error_family, structs) if declared_error_family != ""
+                declared_return <- intern_error_union_type(declared_return, declared_error_family, structs) if declared_error_family != ""
             result_type: ValueType = declared_return if declared_return.kind != TypeKind.Unmodeled else expected
             null return if result_type.kind == TypeKind.Unmodeled or result_type.kind == TypeKind.Fn
             # A function-valued C callback may return void (`hooks.deallocate(p)`). There is
@@ -413,7 +430,11 @@ extend Backend:
             # it. Value-position void expressions are rejected by the semantic layer, so this
             # token cannot escape as a language value.
             is_void_result: bool = result_type.kind == TypeKind.Void
-            return_llvm: LLVMTypeRef = LLVMVoidTypeInContext(ctx) if is_void_result else llvm_type_of(result_type, structs, ctx)
+            is_error_result: bool = result_type.kind == TypeKind.ErrorUnion
+            error_payload_type: ValueType = error_union_payload_of(result_type, structs) if is_error_result else unmodeled_type()
+            null return if is_error_result and error_payload_type.kind == TypeKind.Unmodeled
+            error_status_llvm: LLVMTypeRef = error_set_llvm_type(structs, error_union_family_of(result_type, structs), ctx) if is_error_result and error_set_has_payload(structs, error_union_family_of(result_type, structs)) else LLVMInt32TypeInContext(ctx)
+            return_llvm: LLVMTypeRef = error_status_llvm if is_error_result else LLVMVoidTypeInContext(ctx) if is_void_result else llvm_type_of(result_type, structs, ctx)
             fn_pointer_opt: LLVMValueRef? = emit_expression(callee, ValueType{kind: TypeKind.Fn, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             fn_pointer: mutable LLVMValueRef = zeroed
             got_fn_pointer: mutable bool = false
@@ -459,7 +480,9 @@ extend Backend:
             raw_dummy_type: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
             raw_dummy_value: mutable darray[LLVMValueRef] = [fn_pointer]
             result_slot: mutable LLVMValueRef = zeroed
-            result_slot <- LLVMBuildAlloca(builder, return_llvm, "fnval.result") if not is_void_result
+            result_slot <- LLVMBuildAlloca(builder, llvm_type_of(result_type, structs, ctx), "fnval.result") if not is_void_result
+            error_payload_slot: mutable LLVMValueRef = zeroed
+            error_payload_slot <- LLVMBuildAlloca(builder, llvm_type_of(error_payload_type, structs, ctx), "fnval.error.out") if is_error_result
             fn_integer: LLVMValueRef = LLVMBuildPtrToInt(builder, fn_pointer, int64_type, "fnval.int")
             fn_tag: LLVMValueRef = LLVMBuildAnd(builder, fn_integer, LLVMConstInt(int64_type, 1, 0), "fnval.tag")
             is_closure: LLVMValueRef = LLVMBuildICmp(builder, 33, fn_tag, LLVMConstInt(int64_type, 0, 0), "fnval.is_closure")
@@ -470,14 +493,27 @@ extend Backend:
             _ = LLVMBuildCondBr(builder, is_closure, closure_block, raw_block)
             # RAW: call the pointer as an ordinary `return_llvm (args…)` function.
             LLVMPositionBuilderAtEnd(builder, raw_block)
-            raw_types_pointer: void& = (&argument_llvm_types[0]).cast[void&] can Unsafe.PointerCast if argument_count > 0 else (&raw_dummy_type[0]).cast[void&] can Unsafe.PointerCast
-            raw_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, raw_types_pointer, argument_count.u32(), 0)
-            raw_args_pointer: void& = (&argument_values[0]).cast[void&] can Unsafe.PointerCast if argument_count > 0 else (&raw_dummy_value[0]).cast[void&] can Unsafe.PointerCast
+            raw_call_types: mutable darray[LLVMTypeRef] = []
+            raw_call_values: mutable darray[LLVMValueRef] = []
+            raw_call_types.push(pointer_type) if is_error_result
+            raw_call_values.push(error_payload_slot) if is_error_result
+            raw_call_types.extend(argument_llvm_types)
+            raw_call_values.extend(argument_values)
+            raw_count: usize = raw_call_values.count
+            raw_types_pointer: void& = (&raw_call_types[0]).cast[void&] can Unsafe.PointerCast if raw_count > 0 else (&raw_dummy_type[0]).cast[void&] can Unsafe.PointerCast
+            raw_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, raw_types_pointer, raw_count.u32(), 0)
+            raw_args_pointer: void& = (&raw_call_values[0]).cast[void&] can Unsafe.PointerCast if raw_count > 0 else (&raw_dummy_value[0]).cast[void&] can Unsafe.PointerCast
             if is_void_result:
-                _ = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, argument_count.u32(), "fnval.raw.call")
+                _ = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, raw_count.u32(), "")
             else:
-                raw_result: LLVMValueRef = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, argument_count.u32(), "fnval.raw.call")
-                _ = LLVMBuildStore(builder, raw_result, result_slot)
+                raw_result: LLVMValueRef = LLVMBuildCall2(builder, raw_fn_type, fn_pointer, raw_args_pointer, raw_count.u32(), "fnval.raw.call")
+                if is_error_result:
+                    raw_union: mutable LLVMValueRef = LLVMGetUndef(llvm_type_of(result_type, structs, ctx))
+                    raw_union <- LLVMBuildInsertValue(builder, raw_union, raw_result, 0, "fnval.raw.status")
+                    raw_union <- LLVMBuildInsertValue(builder, raw_union, error_payload_slot, 1, "fnval.raw.payload")
+                    _ = LLVMBuildStore(builder, raw_union, result_slot)
+                else:
+                    _ = LLVMBuildStore(builder, raw_result, result_slot)
             _ = LLVMBuildBr(builder, merge_block)
             # CLOSURE: unmask (bit0 is known set here, so `- 1` clears it), load {code, env},
             # and call `code(env, args…)`.
@@ -492,20 +528,30 @@ extend Backend:
             code_pointer: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, code_field_pointer, "fnval.code")
             env_pointer: LLVMValueRef = LLVMBuildLoad2(builder, pointer_type, env_field_pointer, "fnval.env")
             closure_arg_types: mutable darray[LLVMTypeRef] = [pointer_type]
-            closure_arg_types.extend(argument_llvm_types)
             closure_arg_values: mutable darray[LLVMValueRef] = [env_pointer]
+            if is_error_result:
+                closure_arg_types <- [pointer_type, pointer_type]
+                closure_arg_values <- [error_payload_slot, env_pointer]
+            closure_arg_types.extend(argument_llvm_types)
             closure_arg_values.extend(argument_values)
             closure_types_pointer: void& = (&closure_arg_types[0]).cast[void&] can Unsafe.PointerCast
-            closure_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, closure_types_pointer, (argument_count + 1).u32(), 0)
+            closure_count: usize = closure_arg_values.count
+            closure_fn_type: LLVMTypeRef = LLVMFunctionType(return_llvm, closure_types_pointer, closure_count.u32(), 0)
             closure_args_pointer: void& = (&closure_arg_values[0]).cast[void&] can Unsafe.PointerCast
             if is_void_result:
-                _ = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, (argument_count + 1).u32(), "fnval.closure.call")
+                _ = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, closure_count.u32(), "")
             else:
-                closure_result: LLVMValueRef = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, (argument_count + 1).u32(), "fnval.closure.call")
-                _ = LLVMBuildStore(builder, closure_result, result_slot)
+                closure_result: LLVMValueRef = LLVMBuildCall2(builder, closure_fn_type, code_pointer, closure_args_pointer, closure_count.u32(), "fnval.closure.call")
+                if is_error_result:
+                    closure_union: mutable LLVMValueRef = LLVMGetUndef(llvm_type_of(result_type, structs, ctx))
+                    closure_union <- LLVMBuildInsertValue(builder, closure_union, closure_result, 0, "fnval.closure.status")
+                    closure_union <- LLVMBuildInsertValue(builder, closure_union, error_payload_slot, 1, "fnval.closure.payload")
+                    _ = LLVMBuildStore(builder, closure_union, result_slot)
+                else:
+                    _ = LLVMBuildStore(builder, closure_result, result_slot)
             _ = LLVMBuildBr(builder, merge_block)
             LLVMPositionBuilderAtEnd(builder, merge_block)
-            return LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0) if is_void_result else LLVMBuildLoad2(builder, return_llvm, result_slot, "fnval.merged")
+            return LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0) if is_void_result else LLVMBuildLoad2(builder, llvm_type_of(result_type, structs, ctx), result_slot, "fnval.merged")
 
 
         def emit_dict_method_call(base: sview, full_type_args: darray[ValueType]&, receiver: Expr, arguments: darray[Expr]&, arena_leading: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
@@ -857,7 +903,8 @@ extend Backend:
             source_payload_type: ValueType = error_union_payload_of(source_type, structs)
             target_payload_type: ValueType = error_union_payload_of(target_type, structs)
             null return if source_payload_type.kind != target_payload_type.kind or source_payload_type.bits != target_payload_type.bits
-            source_code: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 0, "clone.error.code")
+            source_status: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 0, "clone.error.status")
+            source_code: LLVMValueRef = error_union_code_of(source_value, source_type, structs, ctx, builder)
             source_payload_ptr: LLVMValueRef = LLVMBuildExtractValue(builder, source_value, 1, "clone.error.payload")
             zero_code: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)
             is_success: LLVMValueRef = LLVMBuildICmp(builder, 32, source_code, zero_code, "clone.error.ok")
@@ -879,7 +926,7 @@ extend Backend:
                 destination_payload_ptr: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "clone.error.alloc")
                 _ = LLVMBuildStore(builder, cloned_payload, destination_payload_ptr)
                 success_result: mutable LLVMValueRef = LLVMGetUndef(union_llvm)
-                success_result <- LLVMBuildInsertValue(builder, success_result, zero_code, 0, "clone.error.success.code")
+                success_result <- LLVMBuildInsertValue(builder, success_result, error_union_status_from_code(zero_code, target_type, structs, ctx, builder), 0, "clone.error.success.status")
                 success_result <- LLVMBuildInsertValue(builder, success_result, destination_payload_ptr, 1, "clone.error.success.payload")
                 _ = LLVMBuildStore(builder, success_result, result_slot)
                 _ = LLVMBuildBr(builder, merge_block)
@@ -888,7 +935,7 @@ extend Backend:
 
             LLVMPositionBuilderAtEnd(builder, failure_block)
             failure_result: mutable LLVMValueRef = LLVMGetUndef(union_llvm)
-            failure_result <- LLVMBuildInsertValue(builder, failure_result, source_code, 0, "clone.error.failure.code")
+            failure_result <- LLVMBuildInsertValue(builder, failure_result, source_status, 0, "clone.error.failure.status")
             failure_result <- LLVMBuildInsertValue(builder, failure_result, LLVMConstNull(LLVMPointerTypeInContext(ctx, 0)), 1, "clone.error.failure.payload")
             _ = LLVMBuildStore(builder, failure_result, result_slot)
             _ = LLVMBuildBr(builder, merge_block)
@@ -908,6 +955,7 @@ extend Backend:
             payload_slot: LLVMValueRef = LLVMBuildCall2(builder, runtime.arena_alloc_type, runtime.arena_alloc, alloc_pointer, 2, "error.union.alloc")
             _ = LLVMBuildStore(builder, payload_value, payload_slot)
             result: mutable LLVMValueRef = LLVMGetUndef(llvm_type_of(union_type, structs, ctx))
-            result <- LLVMBuildInsertValue(builder, result, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), 0, "error.union.code")
+            zero_code: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)
+            result <- LLVMBuildInsertValue(builder, result, error_union_status_from_code(zero_code, union_type, structs, ctx, builder), 0, "error.union.status")
             result <- LLVMBuildInsertValue(builder, result, payload_slot, 1, "error.union.payload")
             return result

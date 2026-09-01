@@ -46,6 +46,28 @@ extend Backend:
                 return false
 
 
+        # Whether a call is the single-field payload-enum constructor path guarded by
+        # penum_ctor_labels_match. Multi-field payloads use their tuple lowering and keep
+        # their existing positional handling; ordinary labelled functions are not constructors.
+        def is_penum_single_payload_constructor(callee: Expr, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                match callee:
+                    Expr.Field(constructor_head, constructor_variant, constructor_line):
+                        match constructor_head:
+                            Expr.Ident(constructor_enum, constructor_enum_line):
+                                enum_index: i64 = penum_index_of(structs, constructor_enum)
+                                false return if enum_index < 0
+                                variant_index: i64 = penum_variant_index(structs, enum_index, constructor_variant)
+                                false return if variant_index < 0
+                                variant_slot: usize = structs.penum_variant_start[enum_index.usize()] + variant_index.usize()
+                                return structs.penum_has_payload[variant_slot]
+                            _:
+                                pass
+                    _:
+                        pass
+                return false
+
+
         def packed_variant_index_of_path(path: sview, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
             can Abort.Panic:
                 dot: mutable i64 = -1
@@ -489,13 +511,21 @@ extend Backend:
         # call site needs immediately. The BODY is queued because emitting it needs the
         # builder, which is currently positioned inside the caller.
         def instantiate_generic(base: sview, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return instantiate_generic_with_error_family(base, type_args, "", generics, structs, m, ctx)
+
+
+        # Errorset-aware generic instantiation. The ordinary type tuple and the concrete
+        # error-family selector are independent dimensions: `[T, errorset R]` must not encode
+        # R as a fake runtime type, but two different R bindings still need distinct LLVM
+        # symbols, bodies, and cached handles.
+        def instantiate_generic_with_error_family(base: sview, type_args: darray[ValueType]&, error_family: sview, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 # Direct-name entry (the common case): resolve the FIRST template with this name. For a
                 # unique name that is the only template; an overloaded name is disambiguated only via
                 # instantiate_generic_at (the UFCS path), which selects the slot by receiver type.
                 index: i64 = generic_index_of(generics, base)
                 null return if index < 0
-                return instantiate_generic_at(index.usize(), type_args, generics, structs, m, ctx)
+                return instantiate_generic_at_with_error_family(index.usize(), type_args, error_family, generics, structs, m, ctx)
 
 
             # Number of generic templates sharing `name` (1 for a unique name, >1 for an overload set).
@@ -509,6 +539,10 @@ extend Backend:
         # The instantiation cached for (SLOT, args), or null. Keyed on slot rather than base name so
         # two overloads of the same name with the same type args do not alias to one handle.
         def instantiation_of_slot(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&) -> LLVMValueRef? can[Abort.Panic]:
+            return instantiation_of_slot_with_error_family(generics, slot, type_args, "")
+
+
+        def instantiation_of_slot_with_error_family(generics: GenericTable&, slot: usize, type_args: darray[ValueType]&, error_family: sview) -> LLVMValueRef? can[Abort.Panic]:
             for index in 0..<generics.inst_slots.count |generics, slot, type_args|:
                 continue if generics.inst_slots[index] != slot
                 continue if generics.inst_arg_count[index] != type_args.count
@@ -517,6 +551,7 @@ extend Backend:
                 for k in 0..<type_args.count |generics, matched, astart, type_args|:
                     stored: ValueType = generics.inst_args[astart + k]
                     matched <- false if stored.kind != type_args[k].kind or stored.bits != type_args[k].bits
+                matched <- false if index >= generics.inst_error_families.count or generics.inst_error_families[index] != error_family
                 generics.inst_handles[index] return if matched
             return null
 
@@ -526,9 +561,17 @@ extend Backend:
         # overload-selected slot. The mangled name gets a slot suffix ONLY for overloaded names, so a
         # unique name's instantiation keeps its exact current symbol.
         def instantiate_generic_at(slot: usize, type_args: darray[ValueType]&, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return instantiate_generic_at_with_error_family(slot, type_args, "", generics, structs, m, ctx)
+
+
+        def instantiate_generic_at_with_error_family(slot: usize, type_args: darray[ValueType]&, error_family: sview, generics: mutable GenericTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             null return if slot >= generics.names.count
             base: sview = generics.names[slot]
-            if instantiation_of_slot(generics, slot, type_args) is already_declared:
+            required_error_param: sview = generic_error_param_at(generics, slot)
+            # An errorset-param template is never allowed to fall back to its unspecialized
+            # base symbol. That was the exact ABI bug this layer fixes.
+            null return if required_error_param != "" and error_family == ""
+            if instantiation_of_slot_with_error_family(generics, slot, type_args, error_family) is already_declared:
                 return already_declared
             # The call must supply exactly one argument per type parameter.
             null return if generics.param_count[slot] != type_args.count
@@ -537,6 +580,7 @@ extend Backend:
                 Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
                     # Bind every K/T for the duration of resolving this signature.
                     bound: usize = push_type_bindings(generics, structs, slot, type_args)
+                    error_bound: usize = push_error_family_binding(generics, structs, slot, error_family)
                     # A MISSING return annotation is `void` (std helpers omit `-> void`).
                     return_value_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
                     if return_type_opt is return_type:
@@ -563,14 +607,23 @@ extend Backend:
                     instantiation_is_error: bool = generics.is_error[slot]
                     instantiation_sret: bool = not instantiation_is_error and value_type_uses_sret(return_value_type, structs, ctx)
                     instantiation_needs_arena: bool = signature_needs_arena(params, return_value_type, structs)
+                    pop_error_family_bindings(structs, error_bound)
                     pop_type_bindings(structs, bound)
                     null return if declined or return_value_type.kind == TypeKind.Unmodeled
 
                     name_storage: mutable darray[u8] = []
                     mangled_slot_suffix: i64 = slot.i64() if generic_slot_count(generics, base) > 1.usize() else -1
                     mangled: cstr = mangled_name_multi_into(base, type_args, mangled_slot_suffix, structs, name_storage)
+                    if error_family != "":
+                        name_storage <- name_storage.truncate(name_storage.count - 1)
+                        for error_prefix_index in 0..<sview_len("__error_") |name_storage|:
+                            name_storage.push(sview_at("__error_", error_prefix_index))
+                        for error_family_index in 0..<sview_len(error_family) |name_storage, error_family|:
+                            name_storage.push(sview_at(error_family, error_family_index))
+                        name_storage.push(0)
                     llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
-                    llvm_return <- LLVMInt32TypeInContext(ctx) if instantiation_is_error
+                    llvm_return <- error_set_llvm_type(structs, error_family, ctx) if instantiation_is_error and error_set_has_payload(structs, error_family)
+                    llvm_return <- LLVMInt32TypeInContext(ctx) if instantiation_is_error and not error_set_has_payload(structs, error_family)
                     llvm_return <- LLVMVoidTypeInContext(ctx) if instantiation_sret
                     full_params: mutable darray[LLVMTypeRef] = []
                     full_params.push(LLVMPointerTypeInContext(ctx, 0)) if instantiation_is_error
@@ -597,6 +650,7 @@ extend Backend:
                     generics.inst_arg_count <- generics.inst_arg_count.push(type_args.count)
                     generics.inst_handles <- generics.inst_handles.push(handle)
                     generics.inst_slots <- generics.inst_slots.push(slot)
+                    generics.inst_error_families <- generics.inst_error_families.push(error_family)
                     # The ABI fact this signature was BUILT with. Call sites read it back rather
                     # than recomputing (see GenericTable.inst_needs_arena).
                     generics.inst_needs_arena <- generics.inst_needs_arena.push(instantiation_needs_arena)
@@ -608,6 +662,7 @@ extend Backend:
                     generics.pending_arg_count <- generics.pending_arg_count.push(type_args.count)
                     generics.pending_handles <- generics.pending_handles.push(handle)
                     generics.pending_slots <- generics.pending_slots.push(slot)
+                    generics.pending_error_families <- generics.pending_error_families.push(error_family)
                     return handle
                 _:
                     pass

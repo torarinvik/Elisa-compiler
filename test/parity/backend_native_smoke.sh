@@ -315,6 +315,32 @@ run_case clone_error_union_success 'error E:\n    X\n\ndef make() -> i64 error[E
 run_case clone_error_union_failure 'error E:\n    X\n\ndef fail() -> i64 error[E]:\n    raise E.X\n\ndef main() -> i64:\n    source: i64 error[E] = fail()\n    copy: i64 error[E] = clone[i64 error[E]](source)\n    return 42\n' 42
 run_case clone_error_union_struct_field 'error E:\n    X\n\nstruct Box:\n    value: i64 error[E]\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef main() -> i64:\n    source: Box = Box{value: make()}\n    copy: Box = clone[Box](source)\n    return 42\n' 42
 run_case error_union_parameter 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef take(value: i64 error[E]) -> i64:\n    return 42\n\ndef main() -> i64:\n    source: i64 error[E] = make()\n    return take(source)\n' 42
+# Forwarding a first-class error-union value from an error-returning function must split the
+# descriptor back into its status and payload. A plain `return value` used to store the whole
+# `{code, payload_ptr}` descriptor through the i64 out-slot and return success, losing the 7.
+run_case error_union_return_forward 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef relay(value: i64 error[E]) -> i64 error[E]:\n    return value\n\ndef main() -> i64:\n    source: i64 error[E] = make()\n    return try relay(source) else 5\n' 7
+run_case error_union_return_forward_failure 'error E:\n    X\n\ndef fail() -> i64 error[E]:\n    raise E.X\n\ndef relay(value: i64 error[E]) -> i64 error[E]:\n    return value\n\ndef main() -> i64:\n    source: i64 error[E] = fail()\n    return try relay(source) else 42\n' 42
+# An errorset-only generic must specialize on the callback's concrete error family, and a
+# fallible function value must keep the hidden payload-out ABI through both raw and closure
+# dispatch. The old stage1 path emitted an unspecialized i64() callback and returned 2.
+run_case errorset_generic_fn_value 'error IoErr:\n    Bad\n\ndef ioOk() -> i64 error[IoErr]:\n    return 7\n\ndef ioFail() -> i64 error[IoErr]:\n    raise IoErr.Bad\n\ndef applyDouble[errorset R](f: fn() -> i64 error[R]) -> i64 error[R]:\n    value: i64 = try f()\n    return value * 2\n\ndef main() -> i64:\n    ok: i64 = try applyDouble(ioOk) else 5\n    bad: i64 = try applyDouble(ioFail) else 9\n    return ok + bad\n' 23
+# The inline lambda spelling erases its error suffix from the compact AST, so its source-line
+# metadata must recover the concrete family before closure lifting. This exercises the tagged
+# closure ABI in addition to the raw named-function callback above.
+run_case errorset_generic_lambda 'error E:\n    X\n\ndef apply[errorset R](f: fn() -> i64 error[R]) -> i64 error[R]:\n    value: i64 = try f()\n    return value * 2\n\ndef main() -> i64:\n    value: i64 = try apply(fn() -> i64 error[E] => 7) else 5\n    return value\n' 14
+# Payload-bearing error sets use a struct status ABI. The first-class callable adapter must
+# keep that struct at the raw/closure call boundary, then normalize field 0 into the ordinary
+# `{code, payload_ptr}` error-union descriptor used by `try`. This covers a named raw callback,
+# a tagged closure, and both success/failure propagation through the errorset generic.
+run_case errorset_payload_fn_value 'error Payload:\n    Bad(code: i64)\n\ndef ok(value: i64) -> i64 error[Payload]:\n    return value\n\ndef bad(value: i64) -> i64 error[Payload]:\n    raise Payload.Bad(value)\n\ndef apply[errorset R](f: fn(i64) -> i64 error[R], value: i64) -> i64 error[R]:\n    result: i64 = try f(value)\n    return result + 1\n\ndef main() -> i64:\n    good: i64 = try apply(ok, 6) else 40\n    failed: i64 = try apply(bad, 6) else 20\n    closed: i64 = try apply(fn(value: i64) -> i64 error[Payload] => value + 2, 6) else 30\n    return good + failed + closed\n' 36
+# A direct payload error call assigned as a first-class union must extract the struct tag before
+# constructing the compact descriptor; inserting the whole `%ErrSet` into its i32 code field is
+# invalid IR and used to be an untested decline.
+run_case errorset_payload_union_value 'error Payload:\n    Bad(code: i64)\n\ndef ok(value: i64) -> i64 error[Payload]:\n    return value\n\ndef main() -> i64:\n    source: i64 error[Payload] = ok(7)\n    return try source else 42\n' 7
+run_case errorset_payload_union_catch 'error Payload:\n    Bad(code: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(9)\n\ndef main() -> i64:\n    source: i64 error[Payload] = bad()\n    return catch source:\n        ok:\n            ok\n        Payload.Bad:\n            42\n' 42
+run_case errorset_payload_call_catch 'error Payload:\n    Bad(code: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(9)\n\ndef main() -> i64:\n    return catch bad():\n        ok:\n            ok\n        Payload.Bad(code):\n            code\n' 9
+run_case errorset_payload_stmt_catch 'error Payload:\n    Bad(code: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(9)\n\ndef main() -> i64:\n    catch bad():\n        ok:\n            return ok\n        Payload.Bad(code):\n            return code\n' 9
+run_case errorset_payload_multi_catch 'error Payload:\n    Bad(left: i64, right: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(7, 5)\n\ndef main() -> i64:\n    return catch bad():\n        ok:\n            ok\n        Payload.Bad(left, right):\n            left + right\n' 12
 # 500 pushes past the 256 initial capacity: this is the arena_realloc GROW path. A push
 # that never grew would pass the smaller cases and fail only here.
 run_case darray_grow      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'  42
@@ -658,6 +684,14 @@ diff_case generic_nested_2t 'def wrap[T](x: T) -> T:\n    return identity(x)\n\n
 diff_case generic_explicit  'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    return identity[i64](42)\n'
 diff_case generic_two_insts 'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    a: u8 = 200\n    b: i64 = 2\n    return identity[u8](a).i64() - identity[i64](b) - 156\n'
 diff_case generic_f64       'def identity[T](x: T) -> T:\n    return x\n\ndef main() -> i64:\n    x: f64 = 42.5\n    return identity(x).i64()\n'
+diff_case errorset_generic_fn_value 'error IoErr:\n    Bad\n\ndef ioOk() -> i64 error[IoErr]:\n    return 7\n\ndef ioFail() -> i64 error[IoErr]:\n    raise IoErr.Bad\n\ndef applyDouble[errorset R](f: fn() -> i64 error[R]) -> i64 error[R]:\n    value: i64 = try f()\n    return value * 2\n\ndef main() -> i64:\n    ok: i64 = try applyDouble(ioOk) else 5\n    bad: i64 = try applyDouble(ioFail) else 9\n    return ok + bad\n'
+diff_case errorset_generic_lambda 'error E:\n    X\n\ndef apply[errorset R](f: fn() -> i64 error[R]) -> i64 error[R]:\n    value: i64 = try f()\n    return value * 2\n\ndef main() -> i64:\n    value: i64 = try apply(fn() -> i64 error[E] => 7) else 5\n    return value\n'
+diff_case errorset_payload_fn_value 'error Payload:\n    Bad(code: i64)\n\ndef ok(value: i64) -> i64 error[Payload]:\n    return value\n\ndef bad(value: i64) -> i64 error[Payload]:\n    raise Payload.Bad(value)\n\ndef apply[errorset R](f: fn(i64) -> i64 error[R], value: i64) -> i64 error[R]:\n    result: i64 = try f(value)\n    return result + 1\n\ndef main() -> i64:\n    good: i64 = try apply(ok, 6) else 40\n    failed: i64 = try apply(bad, 6) else 20\n    closed: i64 = try apply(fn(value: i64) -> i64 error[Payload] => value + 2, 6) else 30\n    return good + failed + closed\n'
+diff_case errorset_payload_union_value 'error Payload:\n    Bad(code: i64)\n\ndef ok(value: i64) -> i64 error[Payload]:\n    return value\n\ndef main() -> i64:\n    source: i64 error[Payload] = ok(7)\n    return try source else 42\n'
+diff_case errorset_payload_union_catch 'error Payload:\n    Bad(code: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(9)\n\ndef main() -> i64:\n    source: i64 error[Payload] = bad()\n    return catch source:\n        ok:\n            ok\n        Payload.Bad:\n            42\n'
+diff_case errorset_payload_call_catch 'error Payload:\n    Bad(code: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(9)\n\ndef main() -> i64:\n    return catch bad():\n        ok:\n            ok\n        Payload.Bad(code):\n            code\n'
+diff_case errorset_payload_stmt_catch 'error Payload:\n    Bad(code: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(9)\n\ndef main() -> i64:\n    catch bad():\n        ok:\n            return ok\n        Payload.Bad(code):\n            return code\n'
+diff_case errorset_payload_multi_catch 'error Payload:\n    Bad(left: i64, right: i64)\n\ndef bad() -> i64 error[Payload]:\n    raise Payload.Bad(7, 5)\n\ndef main() -> i64:\n    return catch bad():\n        ok:\n            ok\n        Payload.Bad(left, right):\n            left + right\n'
 diff_case darray_push  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'
 diff_case darray_grow  'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<500:\n        xs.push(1)\n    total: mutable i64 = 0\n    for j in 0..<500:\n        total <- total + xs[j]\n    return total - 458\n'
 diff_case darray_u8    'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'
@@ -950,6 +984,10 @@ diff_case error_union_success 'error E:\n    X\n\ndef doubler(n: i64) -> i64 err
 diff_case error_union_raise 'error E:\n    X\n    Y\n\ndef fails(n: i64) -> i64 error[E]:\n    raise E.Y\n\ndef main() -> i64:\n    return try fails(5) else 42\n'
 # A u8 success value round-trips through the out-param at its own width.
 diff_case error_union_u8 'error E:\n    X\n\ndef mk(n: u8) -> u8 error[E]:\n    return n\n\ndef main() -> i64:\n    v: u8 = try mk(200) else 0\n    return v.i64() - 158\n'
+# A first-class union parameter can be forwarded as an error-return value. This exercises the
+# split ABI in the error path as well as the existing `try` value extraction in the caller.
+diff_case error_union_return_forward 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef relay(value: i64 error[E]) -> i64 error[E]:\n    return value\n\ndef main() -> i64:\n    source: i64 error[E] = make()\n    return try relay(source) else 5\n'
+diff_case error_union_return_forward_failure 'error E:\n    X\n\ndef fail() -> i64 error[E]:\n    raise E.X\n\ndef relay(value: i64 error[E]) -> i64 error[E]:\n    return value\n\ndef main() -> i64:\n    source: i64 error[E] = fail()\n    return try relay(source) else 42\n'
 # First-class error-union operands, not just direct calls. Stage0 permits `try` and
 # expression `catch` over locals/parameters carrying the descriptor representation.
 run_case error_union_try_local 'error E:\n    X\n\ndef make() -> i64 error[E]:\n    return 7\n\ndef use(value: i64 error[E]) -> i64:\n    return try value else 42\n\ndef main() -> i64:\n    return use(make())\n' 7

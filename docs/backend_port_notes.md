@@ -8,6 +8,11 @@
 > the bit-group member body so temporary AST values are not captured in an unstable transition.
 > The local stage1 product lowers `test/breadth/emit_native.elisa` without dropping
 > `parse_bit_group_members`, and `test/parity/state_machine_parser_selfhost_smoke.sh` guards it.
+> **Error-union follow-up (2026-09-01):** first-class error unions now preserve the complete
+> payload-carrying status, and `try`/`catch` supports direct calls, stored unions, function
+> values, generic errorsets, and single- or multi-field payload bindings. The native parity
+> regressions live in `test/parity/backend_native_smoke.sh`; `errorset_payload_catch_fields.elisa`
+> and `errorset_payload_fn_value.elisa` are standalone repros.
 > Treat the sections below as evidence and root-cause notes; verify their status against the
 > current parity gate before reopening any item.
 
@@ -378,48 +383,18 @@ So: **`f(out_ptr, args…) -> i32 tag`**. The declared type
     catch.dispatch:   ; switch i32 %errunion.code, label %catch.error [ … ]
                       ; per-variant arms become switch cases; `error e:` is the default
 
-### BLOCKED — and NOT on the backend: stage1's AST loses the catch subject
+### LANDED — the catch subject and payload bindings are now modeled
 
-Do not start the implementation below until this is fixed. `Ast::Stmt.Block` is:
+The old AST diagnosis above is historical. The current parser carries `Expr.Catch` for
+expression-position catches, and statement-position catches are lowered through the same
+match representation before backend emission. The backend handles both the split error
+function ABI and first-class `{status, payload_ptr}` values. Payload-bearing status values
+retain the nested error-set payload fields, so a catch can bind `E.Bad(x, y)` without a
+dynamic handler or a resumable continuation.
 
-    Block(kind: sview, clause: darray[sview], binding: sview, body: darray[Stmt], line: u32)
-
-There is **no Expr field**. `catch risky(true):` is parsed by `parse_block_prefix`
-(src/parser/parser_stmt_control.elisa ~238): `block_kind` becomes "catch" and the prefix
-tokens go into `clause` (dotted-name sviews) or are skipped by the `_:` fallthrough. The
-SUBJECT EXPRESSION is discarded — at best the dotted name "risky" survives, with the call
-and its arguments gone. The backend cannot emit a catch because the information is not in
-the tree.
-
-Worse, stage1 also MIS-DIAGNOSES that program (which stage0 compiles and runs):
-
-    P 0
-    D 2
-      L9 top-level integer match arm must use an integer literal or _
-      L9 top-level integer match arm must use an integer literal or _
-
-L9 is the `ok:` success arm — the checker is running catch arms through the INTEGER MATCH
-arm check. A real stage1/stage0 divergence, filed as a task against the frontend.
-
-`try EXPR` (statement form, e.g. collections.elisa:977
-`try arena_dict_reserve(owner, m, target_capacity)`) has the same shape and probably the
-same gap — check it when fixing.
-
-### Implementation order (once the AST carries the subject)
-
-1. `error Bad: Nope` decl -> a table of error sets and their variant CODES. Codes start at
-   1; **0 is reserved for ok**.
-2. `declare_function`: a `-> T error[E]` signature becomes `i32 (ptr, params…)`.
-3. `emit_function_body`: `return v` -> `store v, out; ret i32 0`. `raise E.X` ->
-   `store zero, out; ret i32 <code>`.
-4. Call site: alloca the payload, call, then either rebuild the union (to match stage0) or
-   just branch on the tag directly — the union value is an artifact of stage0's lowering,
-   not something the ABI requires.
-5. `catch` statement: success arm FIRST, then a switch over the code with `error e:` as the
-   default.
-
-Only the single-error-set, non-generic case is needed to start; `collections.elisa` uses
-`error[RuntimeError]` throughout.
+This is intentionally the zero-overhead static path: it emits status comparisons and branch
+chains, plus stack slots only for source-level payload bindings. Resumable or higher-order
+continuation handlers remain outside this layer.
 
 ## Modules — LANDED
 
@@ -835,12 +810,13 @@ so a read-only dict subset looks tempting -- but emit_module declines a module i
 declaration declines, and the allocating half of the file cannot compile. A partial
 collections.elisa is not a thing.
 
-## Error unions (#17) — RETURN+RAISE+TRY-ELSE is portable and TESTABLE; only `catch` is blocked
+## Historical error unions (#17) — ABI investigation and earlier blocker notes
 
-Correction to the earlier "all of #17 is blocked" claim. Only the HANDLER (`catch`) is blocked
-(task_c19cb583: Stmt.Block has no Expr). The return side is fully portable AND behaviourally
-testable without catch, via `try EXPR else FALLBACK` (a non-error fn CAN consume an error
-union this way -- verified: `try risky(200) else 1` falls back to 1, exit 42).
+This section predates the current catch implementation. The return side was first landed
+through `try EXPR else FALLBACK`; the subsequent zero-overhead catch implementation now also
+covers stored error unions, direct calls, generic errorsets, function values, and payload
+bindings. Keep the ABI observations below as provenance, but use the current source and
+`backend_native_smoke.sh` regressions as the live status.
 
 Complete ABI, read from stage0's -emit llvm:
 
@@ -864,18 +840,18 @@ Implementation touch list (all verifiable by exit code via try-else): register e
 fn's line is in error_set_func_lines; emit_function_body's `return` stores-to-out + ret 0;
 a `raise` Call-shape; the `try...else` node in emit_expression; and error-fn call sites.
 
-This does NOT unblock dict: collections.elisa uses `catch` 6x (converting/handling errors),
-and catch is blocked. But it takes #17 from "blocked" to "only the handler is blocked", and
-it is real, differentiable backend work whenever it is picked up.
+This does NOT by itself unblock dict: collections.elisa still needs its multi-file std import
+path and the remaining dict/set expression surface. The catch portion of that dependency is
+now implemented and is no longer a frontend AST blocker.
 
 ## dict/set — the ACCURATE dependency chain (correcting "one AST field away")
 
 I overstated earlier that dict is "one AST field away". It is not. The full chain, verified:
 
-1. `catch`'s subject: `Stmt.Block` needs an Expr field (frontend, task_c19cb583). NOT landed.
-2. `catch` BACKEND codegen: handle an error union by running arms on the error variant.
-   Now plausibly portable given error-union return landed (8108739) -- but untestable until
-   (1), since a catch program can't even be represented.
+1. `catch` subject and backend codegen: LANDED for expression and statement catches, including
+   first-class payload unions and payload binders; see the current-audit note above.
+2. The remaining dict path is independent of catch lowering: it needs the std cross-file
+   import/compilation path and the dict expression shapes.
 3. dict is compiled from `collections.elisa` SOURCE per-program (0 dict symbols in
    elisacore_runtime.o), and that file uses `catch` 6x + `try` 12x + `error[]` 8 sigs. So it
    cannot compile without (1)+(2).
@@ -886,10 +862,8 @@ I overstated earlier that dict is "one AST field away". It is not. The full chai
    insertion is arena_dict_put, which is error[]-returning -- so even reads/writes cross the
    error-union boundary that catch guards).
 
-So dict is: a frontend fix + catch codegen + std cross-file compilation + dict expr shapes.
-The keystone is still (1), but calling it the ONLY thing was wrong. Everything downstream of
-(1) is real backend work that becomes doable -- and testable -- the moment catch can be
-represented. Error-union RETURN (8108739) already removed one layer; catch is the next.
+So dict is: std cross-file compilation + dict expression shapes, with the catch dependency
+now satisfied. The remaining work is not represented by the old AST blocker.
 
 ## Struct-composition gaps still open (found by probing, mapped for fast pickup)
 

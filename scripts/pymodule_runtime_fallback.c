@@ -43,8 +43,8 @@ uint32_t elisa_native_callback_context_result_u32(void *ctx, uint32_t fallback) 
 void elisa_native_callback_context_free(void *ctx) {
     (void)ctx;
 }
-void va_copy(void *destination, void *source) {
-    (void)destination; (void)source;
+void *va_copy(void *source) {
+    return source;
 }
 void va_end(void *argument) {
     (void)argument;

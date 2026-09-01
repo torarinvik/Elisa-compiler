@@ -188,6 +188,7 @@ extend Backend:
                 active_store_enum: -1,
                 error_out: LLVMConstNull(pointer_type),
                 in_error_fn: false,
+                error_fn_family: "",
                 main_returns_status: false,
                 packed_mode: packed_mode,
                 active_store_is_block: false,
@@ -247,6 +248,9 @@ extend Backend:
             # Computed at registration from the file's error-line side table (a template has no
             # `error[E]` node on its Decl — the clause is consumed at parse time).
             is_error: mutable darray[bool]
+            # Optional errorset parameter name, one row per generic template. This is not
+            # an ordinary type argument: it specializes the error family/permission row.
+            error_params: mutable darray[sview]
             # Instantiations, keyed by (base name, type-argument TUPLE). A generic may have
             # more than one type parameter (`arena_dict_put[K, T]`), so the arguments live in
             # a flat pool with a per-instantiation span rather than one ValueType per row.
@@ -260,6 +264,10 @@ extend Backend:
             # unique, so the slot is what distinguishes the two — used to key the cache and to emit
             # the correct BODY (emit_instantiation_body must not re-derive the slot by first-name).
             inst_slots: mutable darray[usize]
+            # Concrete error-family selector for each instantiation. Kept parallel to
+            # inst_slots so two specializations with the same ordinary type arguments but
+            # different error rows never share an LLVM body or symbol.
+            inst_error_families: mutable darray[sview]
             # Whether this instantiation's SIGNATURE trails the caller's arena — RECORDED at
             # declaration rather than recomputed per call site.
             #
@@ -290,10 +298,11 @@ extend Backend:
             # emits generics.decls[this slot] — NOT decls[generic_index_of(base)], which would pick the
             # first overload's body for an overloaded name.
             pending_slots: mutable darray[usize]
+            pending_error_families: mutable darray[sview]
 
 
         def new_generic_table() -> GenericTable can[Abort.Panic, Memory.Allocate]:
-            return GenericTable{names: [], decls: [], params: [], param_start: [], param_count: [], is_error: [], inst_bases: [], inst_args: [], inst_arg_start: [], inst_arg_count: [], inst_handles: [], inst_slots: [], inst_needs_arena: [], pending_bases: [], pending_args: [], pending_arg_start: [], pending_arg_count: [], pending_handles: [], pending_slots: []}
+            return GenericTable{names: [], decls: [], params: [], param_start: [], param_count: [], is_error: [], error_params: [], inst_bases: [], inst_args: [], inst_arg_start: [], inst_arg_count: [], inst_handles: [], inst_slots: [], inst_error_families: [], inst_needs_arena: [], pending_bases: [], pending_args: [], pending_arg_start: [], pending_arg_count: [], pending_handles: [], pending_slots: [], pending_error_families: []}
 
 
         # Push one type-parameter binding per (param name, type arg) for template `slot`, so
@@ -315,6 +324,32 @@ extend Backend:
             for _drop in 0..<count |structs|:
                 structs.binding_names <- structs.binding_names.truncate(structs.binding_names.count - 1)
                 structs.binding_types <- structs.binding_types.truncate(structs.binding_types.count - 1)
+
+
+        # Bind an `errorset R` parameter for the duration of resolving a generic signature or
+        # body. Error families are source selectors/permissions rather than ValueTypes, so they
+        # deliberately live outside the ordinary type binding stack.
+        def push_error_family_binding(generics: GenericTable&, structs: mutable StructTable&, slot: usize, family: sview) -> usize can[Abort.Panic, Memory.Allocate]:
+            return 0 if slot >= generics.error_params.count or generics.error_params[slot] == "" or family == ""
+            structs.error_binding_names <- structs.error_binding_names.push(generics.error_params[slot])
+            structs.error_binding_families <- structs.error_binding_families.push(family)
+            return 1
+
+
+        def pop_error_family_bindings(structs: mutable StructTable&, count: usize) -> void can[Abort.Panic, Memory.Allocate]:
+            for _drop in 0..<count |structs|:
+                structs.error_binding_names <- structs.error_binding_names.truncate(structs.error_binding_names.count - 1)
+                structs.error_binding_families <- structs.error_binding_families.truncate(structs.error_binding_families.count - 1)
+
+
+        # Resolve an error-family selector through the current generic binding stack. A plain
+        # selector is returned unchanged; a bound selector such as R becomes IoErr.
+        def resolved_error_family(family: sview, structs: StructTable&) -> sview can[Abort.Panic]:
+            count: usize = structs.error_binding_names.count
+            for offset in 0..<count |family, structs, count|:
+                index: usize = count - 1.usize() - offset
+                structs.error_binding_families[index] return if structs.error_binding_names[index] == family
+            return family
 
 
         # The position of type-parameter `name` in template `slot`, or -1. Used by inference
@@ -573,6 +608,69 @@ extend Backend:
             for index in 0..<generics.names.count |generics, name|:
                 index.i64() return if generics.names[index] == name
             return -1
+
+
+        # The errorset parameter of generic template `slot`, or empty for a monomorphic
+        # error family. It is intentionally not part of GenericTable.param_count: callers
+        # never pass an error set as a runtime/type value.
+        def generic_error_param_at(generics: GenericTable&, slot: usize) -> sview can[Abort.Panic]:
+            return generics.error_params[slot] if slot < generics.error_params.count
+            return ""
+
+
+        def fn_error_family_of(fn_type: ValueType, structs: StructTable&) -> sview can[Abort.Panic]:
+            return structs.fn_pool_error_families[fn_type.bits.usize()] if fn_type.kind == TypeKind.Fn and fn_type.bits.usize() < structs.fn_pool_error_families.count
+            return ""
+
+
+        # The concrete error family carried by a callable expression. A bare function name
+        # is not itself a ValueType in the compact backend, so recover its declared family
+        # from FnTable; a local/function field already carries it in the Fn side-pool.
+        def concrete_error_family_of(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> sview can[Abort.Panic, Memory.Allocate]:
+            actual: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+            if actual.kind == TypeKind.ErrorUnion:
+                return error_union_family_of(actual, structs)
+            if actual.kind == TypeKind.Fn:
+                actual_family: sview = fn_error_family_of(actual, structs)
+                return actual_family if actual_family != ""
+            match expression:
+                Expr.Lambda(lambda_params, lambda_body, lambda_line):
+                    lambda_family: sview = fn_error_family_at(lambda_line.line, structs)
+                    return lambda_family if lambda_family != ""
+                Expr.Ident(callable_name, callable_line):
+                    callable_index: i64 = function_index_of(fns, "", callable_name)
+                    if callable_index >= 0 and fns.is_error[callable_index.usize()]:
+                        return line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, fns.lines[callable_index.usize()])
+                _:
+                    pass
+            return ""
+
+
+        # Infer the concrete family for an `errorset R` generic from an argument whose
+        # declared parameter mentions R. This is the errorset analogue of infer_generic_args:
+        # ordinary type bindings remain in the returned darray, while the family is kept as a
+        # source selector for specialization and ABI construction.
+        def infer_generic_error_family(slot: usize, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> sview can[Abort.Panic, Memory.Allocate]:
+            wanted_family: sview = generic_error_param_at(generics, slot)
+            return "" if wanted_family == ""
+            match generics.decls[slot]:
+                Decl.Func(error_generic_name, error_generic_params, error_generic_return, error_generic_body, error_generic_effects, error_generic_decorators, error_generic_line):
+                    limit: usize = error_generic_params.count if error_generic_params.count < arguments.count else arguments.count
+                    for position in 0..<limit |wanted_family, arguments, local_scope, fns, structs, generics|:
+                        pattern: ValueType = parameter_value_type(error_generic_params[position].type_expression, structs)
+                        pattern_family: mutable sview = ""
+                        pattern_family <- error_union_family_of(pattern, structs) if pattern.kind == TypeKind.ErrorUnion
+                        if pattern.kind == TypeKind.Fn:
+                            pattern_family <- fn_error_family_of(pattern, structs)
+                            pattern_return: ValueType = fn_return_type_of(pattern, structs)
+                            if pattern_family == "":
+                                pattern_family <- error_union_family_of(pattern_return, structs) if pattern_return.kind == TypeKind.ErrorUnion
+                        if pattern_family == wanted_family:
+                            actual_family: sview = concrete_error_family_of(arguments[position], local_scope, fns, structs, generics)
+                            return actual_family if actual_family != ""
+                _:
+                    pass
+            return ""
 
 
         # The already-declared instantiation for (base, type-argument tuple), or null.

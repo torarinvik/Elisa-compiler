@@ -545,6 +545,18 @@ extend Backend:
                             if darray_address_of_expr(indexed_container, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_darray_header:
                                 return emit_darray_index_address(rvalue_darray_header, rvalue_element_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                             return null
+                        # A borrowed fixed-array reference points at the ARRAY object, not at
+                        # its first element. The generic one-index GEP below is therefore
+                        # wrong: `getelementptr [N x T], ptr %base, i64 i` advances by a
+                        # whole array for each index. Use the ordinary fixed-array helper,
+                        # which emits the required `{0, i}` indexing. This path is reached
+                        # before the identifier-specific branch below for `pts[i]`, so leaving
+                        # it generic silently corrupted field-chain reads, writes, and address
+                        # comparisons for `pts: T[N]&`.
+                        if rvalue_element_type.kind == TypeKind.Array:
+                            if emit_expression(indexed_container, rvalue_container_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_array_base:
+                                return emit_index_address(rvalue_array_base, rvalue_element_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                            return null
                         rvalue_pointer <- rvalue_element_type.kind != TypeKind.Unmodeled
                     elif rvalue_container_type.kind == TypeKind.CStr:
                         rvalue_element_type <- ValueType{kind: TypeKind.Unsigned, bits: 8}
@@ -695,23 +707,24 @@ extend Backend:
                             return emit_darray_index_address(inner_container_address, inner_container_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                         if inner_container_type.kind == TypeKind.Array:
                             return emit_index_address(inner_container_address, inner_container_type, index_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder)
-                        # C also indexes a pointer produced from a scalar place:
-                        # `&(table[0][0])[offset]`. The base address is already the
-                        # address of one element, so this is a one-index GEP by the
-                        # element stride rather than a fixed-array GEP.
-                        if inner_container_type.kind != TypeKind.Unmodeled and inner_container_type.kind != TypeKind.Void:
-                            if emit_expression(index_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_index:
-                                pointer_indices: mutable darray[LLVMValueRef] = [pointer_index]
-                                pointer_indices_pointer: void& = (&pointer_indices[0]).cast[void&] can Unsafe.PointerCast
-                                return LLVMBuildGEP2(builder, llvm_type_of(inner_container_type, structs, ctx), inner_container_address, pointer_indices_pointer, 1, "pointer.index.ptr")
-                        # `b.items[i]` where the FIELD `items` is a ref (`T&`) or optional-ref (`T&?`)
-                        # used as a C-style buffer pointer — Deque's `d.items[phys]` (`items: T&?`). The
-                        # field slot holds the ref (an optional is {i1, ptr}; take field 1). Load the raw
-                        # pointer, then GEP by index at the element stride.
-                        field_ref_payload: mutable ValueType = inner_container_type
-                        field_ref_is_optional: bool = inner_container_type.kind == TypeKind.Optional
-                        field_ref_payload <- optional_payload_of(inner_container_type, structs) if field_ref_is_optional
-                        if field_ref_payload.kind == TypeKind.Ref:
+                        # A field such as `d.items` is itself a pointer-valued place. Its
+                        # address is the address of the FIELD SLOT, not the address of the
+                        # backing element buffer. Keep this case ahead of the generic pointer
+                        # fallback below: otherwise `d.items[i] <- value` GEPs from the slot
+                        # using the pointer type and stores through adjacent struct fields,
+                        # which is the stage1-only Deque corruption/segfault.
+                        field_ref_container: mutable bool = false
+                        match indexed_container:
+                            Expr.Field(field_ref_object, field_ref_name, field_ref_line):
+                                field_ref_payload_probe: mutable ValueType = inner_container_type
+                                field_ref_payload_probe <- optional_payload_of(field_ref_payload_probe, structs) if field_ref_payload_probe.kind == TypeKind.Optional
+                                field_ref_container <- field_ref_payload_probe.kind == TypeKind.Ref
+                            _:
+                                pass
+                        if field_ref_container:
+                            field_ref_payload: mutable ValueType = inner_container_type
+                            field_ref_is_optional: bool = field_ref_payload.kind == TypeKind.Optional
+                            field_ref_payload <- optional_payload_of(field_ref_payload, structs) if field_ref_is_optional
                             field_ref_elem: ValueType = ref_target_of(field_ref_payload, structs)
                             null return if field_ref_elem.kind == TypeKind.Unmodeled
                             field_ref_raw: mutable LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), inner_container_address, "field.ref.ptr")
@@ -725,6 +738,15 @@ extend Backend:
                                 field_ref_gep_pointer: void& = (&field_ref_gep_indices[0]).cast[void&] can Unsafe.PointerCast
                                 return LLVMBuildGEP2(builder, field_ref_elem_llvm, field_ref_raw, field_ref_gep_pointer, 1, "field.ref.elem.ptr")
                             return null
+                        # C also indexes a pointer produced from a scalar place:
+                        # `&(table[0][0])[offset]`. The base address is already the
+                        # address of one element, so this is a one-index GEP by the
+                        # element stride rather than a fixed-array GEP.
+                        if not field_ref_container and inner_container_type.kind != TypeKind.Unmodeled and inner_container_type.kind != TypeKind.Void:
+                            if emit_expression(index_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pointer_index:
+                                pointer_indices: mutable darray[LLVMValueRef] = [pointer_index]
+                                pointer_indices_pointer: void& = (&pointer_indices[0]).cast[void&] can Unsafe.PointerCast
+                                return LLVMBuildGEP2(builder, llvm_type_of(inner_container_type, structs, ctx), inner_container_address, pointer_indices_pointer, 1, "pointer.index.ptr")
                     return null
                 _:
                     pass
@@ -895,7 +917,7 @@ extend Backend:
             null return if catch_arms.count < 1
             payload_type: ValueType = error_union_payload_of(value_type, structs)
             null return if payload_type.kind == TypeKind.Unmodeled
-            union_code: LLVMValueRef = LLVMBuildExtractValue(builder, union_value, 0, "catch.union.code")
+            union_code: LLVMValueRef = error_union_code_of(union_value, value_type, structs, ctx, builder)
             function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
             value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.value")
             dispatch_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.dispatch")
@@ -956,9 +978,6 @@ extend Backend:
                                 declined <- true
                             continue
                         Pattern.Variant(error_path, error_fields):
-                            if error_fields.count != 0:
-                                declined <- true
-                                continue
                             ordinal: mutable i64 = penum_variant_index_of_path(error_path, structs)
                             if ordinal < 0:
                                 ordinal <- ordinal_of_dotted_path(error_path, structs)
@@ -970,10 +989,42 @@ extend Backend:
                             hit: LLVMValueRef = LLVMBuildICmp(builder, 32, union_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), (ordinal + 1).u64(), 0), "catch.union.cmp")
                             _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
                             LLVMPositionBuilderAtEnd(builder, arm_block)
+                            union_arm_mark: usize = scope_mark(local_scope)
+                            if error_fields.count > 0:
+                                error_family: sview = resolved_error_family(error_union_family_of(value_type, structs), structs)
+                                error_set_index: i64 = penum_index_of(structs, error_family)
+                                if error_set_index < 0 or ordinal >= structs.penum_variant_count[error_set_index.usize()].i64():
+                                    declined <- true
+                                else:
+                                    error_variant_start: usize = structs.penum_variant_start[error_set_index.usize()]
+                                    error_variant_slot: usize = error_variant_start + ordinal.usize()
+                                    error_field_count: usize = structs.penum_field_type_count[error_variant_slot]
+                                    if error_fields.count != error_field_count:
+                                        declined <- true
+                                    else:
+                                        error_field_base: usize = error_set_variant_field_base(structs, error_set_index, ordinal.usize())
+                                        error_status_value: LLVMValueRef = LLVMBuildExtractValue(builder, union_value, 0, "catch.union.status")
+                                        error_field_index: mutable usize = 0
+                                        for error_field in error_fields |error_field_index, error_field_base, error_status_value, error_set_index, error_variant_slot, structs, local_scope, ctx, builder|:
+                                            match error_field:
+                                                Pattern.Wildcard:
+                                                    pass
+                                                Pattern.Binding(error_binding):
+                                                    error_type: ValueType = copied_type(structs.penum_field_types[structs.penum_field_type_start[error_variant_slot] + error_field_index])
+                                                    error_value: LLVMValueRef = LLVMBuildExtractValue(builder, error_status_value, (error_field_base + error_field_index).u32(), "catch.union.payload")
+                                                    error_storage: mutable darray[u8] = []
+                                                    error_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(error_type, structs, ctx), sview_to_cstr(error_binding, error_storage))
+                                                    _ = LLVMBuildStore(builder, error_value, error_slot)
+                                                    declare_local(local_scope, error_binding, error_slot, error_type)
+                                                _:
+                                                    declined <- true
+                                            error_field_index <- error_field_index + 1
                             if emit_expression(error_expression, payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is arm_result:
+                                scope_restore(local_scope, union_arm_mark)
                                 _ = LLVMBuildStore(builder, arm_result, result_slot)
                                 _ = LLVMBuildBr(builder, done_block)
                             else:
+                                scope_restore(local_scope, union_arm_mark)
                                 declined <- true
                             LLVMPositionBuilderAtEnd(builder, next_block)
                             continue

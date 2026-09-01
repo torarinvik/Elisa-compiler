@@ -787,9 +787,11 @@ PY
   # import time with `_elisa_native_callback_call_i32_voidp` missing.
   pymodule_needs_callback_fallback="$pymodule_runtime_auto"
   pymodule_host_nm="${ELISA_LLVM_NM:-$LLVM_BIN_DIR/llvm-nm}"
-  if [[ "$pymodule_needs_callback_fallback" != 1 && -x "$pymodule_host_nm" ]] && \
-      "$pymodule_host_nm" -u "$runtime_obj" 2>/dev/null | grep -q 'elisa_native_callback_'; then
-    pymodule_needs_callback_fallback=1
+  if [[ "$pymodule_needs_callback_fallback" != 1 && -x "$pymodule_host_nm" ]]; then
+    pymodule_unresolved_symbols="$("$pymodule_host_nm" -u "$runtime_obj" 2>/dev/null || true)"
+    if [[ "$pymodule_unresolved_symbols" == *elisa_native_callback_* ]]; then
+      pymodule_needs_callback_fallback=1
+    fi
   fi
   if [[ "$pymodule_needs_callback_fallback" == 1 ]]; then
     # The complete runtime also carries optional native-callback and varargs hooks whose
@@ -932,7 +934,7 @@ if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "ifac
   # prints it verbatim and is byte-parity held.
   driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
   [[ -n "$test_filter" ]] && driver_env+=("ELISA_STAGE1_FILTER=$test_filter")
-  if [[ ( "$emit_mode" == "fmt" || "$emit_mode" == "lowered" ) && -s "$flat.map" ]]; then
+  if [[ ( "$emit_mode" == "fmt" || "$emit_mode" == "lowered" || "$emit_mode" == "iface" ) && -s "$flat.map" ]]; then
     driver_env+=("ELISA_STAGE1_OFFSET_MAP=$(cat "$flat.map")")
   fi
   exec > "$out"
@@ -957,7 +959,30 @@ if [[ -n "$link_out" ]]; then
     rm -f "$out"
     exit 2
   }
-  "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$link_out" "$out" "$runtime_obj" || { rm -f "$out"; exit 1; }
-  rm -f "$out"
+  runtime_link_inputs=("$out" "$runtime_obj")
+  runtime_callback_fallback_obj=""
+  runtime_nm_tool="${ELISA_LLVM_NM:-$LLVM_BIN_DIR/llvm-nm}"
+  # The runtime deliberately leaves optional native callback hooks unresolved so a host
+  # embedding Elisa can provide them. Ordinary executables have no host callback provider,
+  # however, and must receive the documented no-op/fallback implementations just like the
+  # pymodule-so path above; otherwise a simple project `run` fails at the final link with an
+  # unrelated `_elisa_native_callback_call_i32_voidp` symbol error.
+  runtime_unresolved_symbols=""
+  if [[ -x "$runtime_nm_tool" ]]; then
+    runtime_unresolved_symbols="$("$runtime_nm_tool" -u "$runtime_obj" 2>/dev/null || true)"
+  fi
+  if [[ "$runtime_unresolved_symbols" == *elisa_native_callback_* ]]; then
+    runtime_callback_fallback_obj="$out.native-callback.o"
+    "$ELISA_CLANG_TOOL" -c -fPIC -fno-builtin -O2 -o "$runtime_callback_fallback_obj" "$ROOT/scripts/pymodule_runtime_fallback.c" || {
+      rm -f "$out" "$runtime_callback_fallback_obj"
+      exit 1
+    }
+    runtime_link_inputs+=("$runtime_callback_fallback_obj")
+  fi
+  "$ELISA_CLANG_TOOL" -fno-builtin -Wl,-dead_strip -o "$link_out" "${runtime_link_inputs[@]}" || {
+    rm -f "$out" "$runtime_callback_fallback_obj"
+    exit 1
+  }
+  rm -f "$out" "$runtime_callback_fallback_obj"
 fi
 exit "$compile_rc"
