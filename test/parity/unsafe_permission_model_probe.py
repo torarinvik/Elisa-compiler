@@ -17,7 +17,7 @@ over-claims invents capabilities a function does not need; a model that under-cl
 them. For an audit whose output is a SAFETY claim, both are wrong, and under-claiming is the
 worse direction — which is why the mode is not shipped on a partial model.
 
-Last run (2026-08-14): **exact=40 partial=0, MISSED=0, EXTRA=0** — complete on the corpus.
+Last run (2026-09-01): **exact=83 partial=0, MISSED=0, EXTRA=0** — complete on the corpus.
 
     python3 test/parity/unsafe_permission_model_probe.py
 
@@ -48,6 +48,7 @@ Rule 4's carve-out was found from a single counterexample (region_param_arena.el
 EXTRA at zero and add carve-outs, never widen the rule to chase a MISS.
 """
 import collections
+import os
 import pathlib
 import re
 import subprocess
@@ -95,13 +96,37 @@ def reconstruct(text):
                 cur = None
                 continue
             bodies[cur].append(line)
-            declared[cur] |= set(re.findall(r"Unsafe\.\w+", line))
+    # Stage0 keeps grants made inside `trusted` blocks in the separate `trusted:` report;
+    # they are not ordinary requirements of the containing function. Preserve non-trusted
+    # in-body `can`/grant facts, but do not confuse a trusted grant with a required fact.
+    for func, body in bodies.items():
+        trusted_indent = None
+        for line in body:
+            code = line.split("#")[0]
+            if not code.strip():
+                continue
+            indent = len(code) - len(code.lstrip())
+            if trusted_indent is not None:
+                if indent > trusted_indent:
+                    continue
+                trusted_indent = None
+            if re.match(r"^\s*trusted(?:\s|\[|:)", code):
+                trusted_indent = indent
+                continue
+            declared[func] |= set(re.findall(r"Unsafe\.\w+", code))
     # TYPE-DIRECTED unchecked-index rule: a bare subscript (no `get`, no `else` fallback)
     # on a RUNTIME-LENGTH container is unproven by construction, because its length is never
     # statically known. A fixed `array[T, N]` is excluded — stage0 proves a constant index in
     # range. Names are collected from `x: ... darray[...]` declarations and parameters.
     for func, body in bodies.items():
         text_body = "\n".join(body)
+        function_text = header_of.get(func, "") + "\n" + text_body
+        # A state machine over a mutable nested dynamic array retains the source container
+        # across lowered states. Stage0 exposes that retained borrow as Unsafe.Alias on the
+        # machine-containing function (and ordinary call propagation handles its callers).
+        # Keep this shape-specific: a machine over scalar storage does not require Alias.
+        if re.search(r"\bmachine\s+over\b", text_body) and re.search(r"\bdarray\s*\[\s*darray\s*\[", function_text):
+            declared[func].add("Unsafe.Alias")
         runtime_len = set(re.findall(r"([A-Za-z_]\w*)\s*:[^=\n]*\bdarray\s*\[", text_body))
         runtime_len |= set(re.findall(r"([A-Za-z_]\w*)\s*:[^,)\n]*\bdarray\s*\[", header_of.get(func, "")))
         # `for i in 0..<xs.count` PROVES `xs[i]` in range against the container's own length.
@@ -112,8 +137,19 @@ def reconstruct(text):
             m = re.search(r"for\s+([A-Za-z_]\w*)\s+in\s+0\s*\.\.<\s*([A-Za-z_]\w*)\.count", line)
             if m:
                 bounded[m.group(2)].add(m.group(1))
+        trusted_indent = None
         for line in body:
             code = line.split("#")[0]
+            if not code.strip():
+                continue
+            indent = len(code) - len(code.lstrip())
+            if trusted_indent is not None:
+                if indent > trusted_indent:
+                    continue
+                trusted_indent = None
+            if re.match(r"^\s*trusted(?:\s|\[|:)", code):
+                trusted_indent = indent
+                continue
             # Only an INDEX FALLBACK (`xs[i] else v`) makes a subscript checked. A ternary
             # `a if c else b` on the same line does not — skipping on a bare `else` lost
             # sv_j/sv_k/two_darrays_sview_eq. stage1's AST settles this exactly: Expr.Index
@@ -130,10 +166,28 @@ def reconstruct(text):
                 if index is not None and index in bounded.get(container, set()):
                     continue
                 declared[func].add("Unsafe.UncheckedIndex")
+    def untrusted_body_lines(body):
+        lines, trusted_indent = [], None
+        for line in body:
+            code = line.split("#")[0]
+            if not code.strip():
+                continue
+            indent = len(code) - len(code.lstrip())
+            if trusted_indent is not None:
+                if indent > trusted_indent:
+                    continue
+                trusted_indent = None
+            if re.match(r"^\s*trusted(?:\s|\[|:)", code):
+                trusted_indent = indent
+                continue
+            lines.append(code)
+        return lines
+
     perms = {name: set(caps) for name, caps in declared.items()}
     for name in bodies:
         perms.setdefault(name, set())
-    calls = {f: set(re.findall(r"([A-Za-z_]\w*)\s*\(", "\n".join(b))) for f, b in bodies.items()}
+    calls = {f: set(re.findall(r"([A-Za-z_]\w*)\s*\(", "\n".join(untrusted_body_lines(b))))
+             for f, b in bodies.items()}
     changed = True
     while changed:
         changed = False

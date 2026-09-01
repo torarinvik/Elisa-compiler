@@ -185,6 +185,7 @@ HEAVY_FIRST=(
   "$REPO_ROOT/test/parity/differential_corpus.sh"
   "$REPO_ROOT/test/parity/driver_acceptance_smoke.sh"
   "$REPO_ROOT/test/parity/backend_native_smoke.sh"
+  "$REPO_ROOT/test/parity/extern_view_abi_smoke.sh"
   "$REPO_ROOT/test/parity/self_host_gen3_smoke.sh"
   "$REPO_ROOT/test/parity/scope_binding_smoke.sh"
   "$REPO_ROOT/test/parity/resolve_smoke.sh"
