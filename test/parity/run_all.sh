@@ -32,31 +32,50 @@ set -uo pipefail
 # measured one. ELISA_GATE_NO_CACHE=1 bypasses; the cache lives in build/ and is ignored.
 gate_cache_key() {
   # $1 = the check's script path (first word of the command). Portable md5 via python.
+  #
+  # The three binaries are keyed by CONTENT HASH, not mtime: several checks rebuild
+  # the runtime object mid-gate with byte-identical output, and an mtime key then
+  # rotates under every entry written earlier in the same run — the first full-gate
+  # cache produced ZERO hits on its own immediate re-run because of exactly that.
+  # The parent computes the combined hash once per gate (ELISA_GATE_BINS_HASH);
+  # a standalone exec-one without it falls back to hashing the binaries itself.
   local script="$1" root="$2"
   python3 - "$script" "$root" <<'KEYEOF'
 import hashlib, os, sys
 h = hashlib.sha256()
 script, root = sys.argv[1], sys.argv[2]
-for f in (script,
-          os.path.join(root, "bin/elisac-stage1"),
-          os.environ.get("ELISACORE_BIN", ""),
-          os.path.join(root, "build/runtime/elisacore_runtime.o")):
+bins = os.environ.get("ELISA_GATE_BINS_HASH", "")
+if bins:
+    h.update(bins.encode())
+else:
+    for f in (os.path.join(root, "bin/elisac-stage1"),
+              os.environ.get("ELISACORE_BIN", ""),
+              os.path.join(root, "build/runtime/elisacore_runtime.o")):
+        try:
+            h.update(hashlib.sha256(open(f, "rb").read()).digest())
+        except OSError:
+            h.update(f.encode()); h.update(b"missing")
+for f in (script,):
     try:
         st = os.stat(f)
         h.update(f.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
     except OSError:
         h.update(f.encode()); h.update(b"missing")
-for top in ("test", "scripts", "elisacore_std"):
-    base = os.path.join(root, top)
-    for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-        for name in sorted(filenames):
-            fp = os.path.join(dirpath, name)
-            try:
-                st = os.stat(fp)
-            except OSError:
-                continue
-            h.update(fp.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
+tree = os.environ.get("ELISA_GATE_TREE_HASH", "")
+if tree:
+    h.update(tree.encode())
+else:
+    for top in ("test", "scripts", "elisacore_std"):
+        base = os.path.join(root, top)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for name in sorted(filenames):
+                fp = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                h.update(fp.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
 print(h.hexdigest())
 KEYEOF
 }
@@ -165,10 +184,21 @@ gate_jobs_by_memory() {
     local free_kb="" gb
     case "$(uname -s)" in
         Darwin)
-            # Free + inactive: inactive pages are reclaimable without swapping.
-            free_kb="$(vm_stat 2>/dev/null | awk -v ps="$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)" '
-                /Pages free/ {f=$3} /Pages inactive/ {i=$3}
-                END {gsub(/\./,"",f); gsub(/\./,"",i); if (f=="") exit 1; print int((f+i)*ps/1024)}')" || free_kb=""
+            # memory_pressure's free percentage, not vm_stat: free+inactive pages
+            # badly UNDERSTATE reclaimable memory on macOS (compressed memory and
+            # file cache are invisible to them) — this pool once picked 3 workers
+            # while the system reported 66% of 24GB free. The kernel's own pressure
+            # figure already accounts for everything reclaimable.
+            local free_pct total_bytes
+            free_pct="$(memory_pressure -Q 2>/dev/null | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print int($2)}')"
+            total_bytes="$(sysctl -n hw.memsize 2>/dev/null)"
+            if [[ -n "$free_pct" && -n "$total_bytes" ]]; then
+                free_kb=$(( total_bytes / 1024 * free_pct / 100 ))
+            else
+                free_kb="$(vm_stat 2>/dev/null | awk -v ps="$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)" '
+                    /Pages free/ {f=$3} /Pages inactive/ {i=$3}
+                    END {gsub(/\./,"",f); gsub(/\./,"",i); if (f=="") exit 1; print int((f+i)*ps/1024)}')" || free_kb=""
+            fi
             ;;
         Linux)
             free_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)"
@@ -184,6 +214,45 @@ gate_jobs_by_memory() {
     echo "$n"
 }
 GATE_JOBS="${ELISA_GATE_JOBS:-$(gate_jobs_by_memory)}"
+
+# The tree hash is taken ONCE here, pre-dispatch, on a quiesced tree — checks that
+# create and delete scratch files inside test/ mid-run otherwise make every
+# per-check walk observe a different transient state, and no key ever matches
+# across runs (v6: 0 cache hits on a byte-identical tree).
+export ELISA_GATE_TREE_HASH="$(python3 - "$REPO_ROOT" <<'TREEEOF'
+import hashlib, os, sys
+h = hashlib.sha256()
+root = sys.argv[1]
+for top in ("test", "scripts", "elisacore_std"):
+    base = os.path.join(root, top)
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for name in sorted(filenames):
+            fp = os.path.join(dirpath, name)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            h.update(fp.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
+print(h.hexdigest())
+TREEEOF
+)"
+
+# One content hash of the three product binaries for the whole run — see gate_cache_key.
+export ELISA_GATE_BINS_HASH="$(python3 - "$REPO_ROOT" <<'BINSEOF'
+import hashlib, os, sys
+h = hashlib.sha256()
+root = sys.argv[1]
+for f in (os.path.join(root, "bin/elisac-stage1"),
+          os.environ.get("ELISACORE_BIN", ""),
+          os.path.join(root, "build/runtime/elisacore_runtime.o")):
+    try:
+        h.update(hashlib.sha256(open(f, "rb").read()).digest())
+    except OSError:
+        h.update(f.encode()); h.update(b"missing")
+print(h.hexdigest())
+BINSEOF
+)"
 
 # ---------------------------------------------------------------- PROFILES
 # The full gate is ~11 minutes. That is the right cost before a COMMIT and the wrong cost
