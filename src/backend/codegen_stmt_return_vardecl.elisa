@@ -6,6 +6,76 @@
 
 extend Backend:
     private:
+        # A no-`else` `try` is represented by the semantic layer as the bare
+        # error call. That is sufficient when the call is the whole initializer
+        # or return operand, where the paths below have loop/region context. It
+        # used to decline when the same call appeared directly inside another
+        # call's argument list (`outer(try inner())`): emit_expression has no
+        # control-flow context, so emit_direct_call could not propagate the
+        # inner status and the enclosing function was reported as an unresolved
+        # declaration. Materialize one such argument in a typed synthetic
+        # local, then re-emit the outer statement through the normal path.
+        #
+        # Return values: 1 = rewritten, 0 = no direct nested try, -1 = a
+        # nested form was found but could not be emitted. More than one nested
+        # argument is declined until the synthetic-name allocator can preserve
+        # each independent value; silently reusing a local would be unsound.
+        def materialize_nested_try_argument(expression: Expr, rewritten: mutable Expr&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            outer_callee: mutable Expr = Expr.Invalid
+            outer_arguments: mutable darray[Expr] = []
+            outer_names: mutable darray[sview] = []
+            outer_line: mutable u32 = 0
+            match expression:
+                Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
+                    outer_callee <- call_callee
+                    outer_arguments <- call_arguments
+                    outer_names <- call_argument_names
+                    outer_line <- call_line.line
+                _:
+                    return 0
+            nested_index: mutable i64 = -1
+            nested_count: mutable u32 = 0
+            for candidate_index in 0..<outer_arguments.count |nested_index, nested_count, outer_arguments, fns, generics|:
+                match outer_arguments[candidate_index]:
+                    Expr.Call(candidate_callee, _, _, _):
+                        match candidate_callee:
+                            Expr.Ident(candidate_name, candidate_name_line):
+                                if error_callee_is(fns, generics, candidate_name):
+                                    nested_index <- candidate_index.i64()
+                                    nested_count <- nested_count + 1
+                            _:
+                                pass
+                    _:
+                        pass
+            return -1 if nested_count > 1
+            return 0 if nested_index < 0
+            nested_expression: Expr = outer_arguments[nested_index.usize()]
+            match nested_expression:
+                Expr.Call(nested_callee, nested_arguments, _, nested_line):
+                    match nested_callee:
+                        Expr.Ident(nested_name, nested_name_line):
+                            nested_value_type: ValueType = error_callee_value_type(nested_name, nested_arguments, local_scope, fns, structs, generics)
+                            return -1 if nested_value_type.kind == TypeKind.Unmodeled or nested_value_type.kind == TypeKind.Void
+                            nested_no_recovery: darray[Stmt] = []
+                            if emit_propagating_try_value(nested_name, nested_arguments, nested_no_recovery, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) is nested_value:
+                                nested_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(nested_value_type, structs, ctx), "__nested_try_arg")
+                                _ = LLVMBuildStore(builder, nested_value, nested_slot)
+                                declare_local(local_scope, "__nested_try_arg", nested_slot, nested_value_type)
+                                rewritten_arguments: mutable darray[Expr] = []
+                                rewrite_index: mutable usize = 0
+                                for argument in outer_arguments |rewritten_arguments, nested_index, nested_line, rewrite_index|:
+                                    rewritten_arguments.push(Expr.Ident("__nested_try_arg", nested_line)) if rewrite_index.i64() == nested_index
+                                    rewritten_arguments.push(argument) if rewrite_index.i64() != nested_index
+                                    rewrite_index <- rewrite_index + 1
+                                rewritten <- Expr.Call(outer_callee, rewritten_arguments, outer_names, Ast::pos_at_line(outer_line))
+                                return 1
+                            return -1
+                        _:
+                            pass
+                _:
+                    pass
+            return -1
+
         # Large internal aggregates use a leading sret destination and a void LLVM return.
         # Return sites are centralized here because returns can be introduced by ordinary
         # return, await/try lowering, optional propagation, and match rewrites.
@@ -22,6 +92,10 @@ extend Backend:
             handled <- true
             if statement is Stmt.Return(return_value_opt, return_line):
                 if return_value_opt is return_value:
+                    nested_return_value: mutable Expr = return_value
+                    nested_return_status: i64 = materialize_nested_try_argument(return_value, nested_return_value, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                    EmitStatus.Declined return if nested_return_status < 0
+                    return emit_statement((Stmt.Return(nested_return_value, return_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) if nested_return_status == 1
                     # `await task` may arrive here as a value-transparent block after the
                     # semantic expression walkers. Lower it directly in return position as a
                     # fallback to the ordinary expression emitter, preserving the task value
@@ -398,6 +472,11 @@ extend Backend:
                         _ = discarded_var_value
                         return EmitStatus.Open
                     return EmitStatus.Declined
+                nested_var_value: mutable Expr = var_value
+                nested_var_status: i64 = materialize_nested_try_argument(var_value, nested_var_value, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                EmitStatus.Declined return if nested_var_status < 0
+                if nested_var_status == 1:
+                    return emit_statement((Stmt.VarDecl(var_name, var_type, nested_var_value, var_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                 # `x: T = get OPT` — MONADIC UNWRAP of an optional. Present → bind the payload to
                 # `x`; absent → PROPAGATE None: return a null optional from THIS function (which must
                 # itself return an optional). The `get X else BODY` form runs BODY on absent instead.
