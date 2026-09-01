@@ -25,6 +25,18 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
+# A 124 from `timeout` is retried with a wider budget before it is believed. Every one of
+# these fixtures finishes in well under a second; on a loaded host a single 10s expiry
+# reported "-O0 exit 42, -O2 exit 124" for sixteen fixtures at once — the exact signature
+# of "optimisation changed the answer", fabricated by scheduling. A binary that genuinely
+# spins expires at 30s too and still fails.
+RUN_TIMED() {
+    local status
+    timeout 10 "$@" >/dev/null 2>&1 </dev/null; status=$?
+    if [ "$status" -eq 124 ]; then timeout 30 "$@" >/dev/null 2>&1 </dev/null; status=$?; fi
+    return $status
+}
+
 checked=0
 failed=0
 for src in "$ROOT"/test/repro/*.elisa; do
@@ -35,7 +47,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
         continue    # a decline is the corpus's business, not this smoke's
     fi
     "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o0" "$WORK/$name.o0.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || continue
-    timeout 10 "$WORK/$name.o0" >/dev/null 2>&1 </dev/null; rc0=$?
+    RUN_TIMED "$WORK/$name.o0"; rc0=$?
     [ "$rc0" -eq 124 ] && continue
     # -O2 through the pass pipeline
     if ! bash "$ROOT/scripts/elisac_stage1.sh" -O2 -o "$WORK/$name.o2.o" "$src" >/dev/null 2>&1; then
@@ -43,7 +55,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
         failed=$((failed + 1)); continue
     fi
     "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o2" "$WORK/$name.o2.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O2 link"; failed=$((failed + 1)); continue; }
-    timeout 10 "$WORK/$name.o2" >/dev/null 2>&1 </dev/null; rc2=$?
+    RUN_TIMED "$WORK/$name.o2"; rc2=$?
     checked=$((checked + 1))
     if [ "$rc0" != "$rc2" ]; then
         echo "  FAIL $name: -O0 exit $rc0, -O2 exit $rc2"
@@ -60,7 +72,7 @@ for src in "$ROOT"/test/repro/*.elisa; do
         failed=$((failed + 1)); continue
     fi
     "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o3" "$WORK/$name.o3.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -O3 link"; failed=$((failed + 1)); continue; }
-    timeout 10 "$WORK/$name.o3" >/dev/null 2>&1 </dev/null; rc3=$?
+    RUN_TIMED "$WORK/$name.o3"; rc3=$?
     if [ "$rc0" != "$rc3" ]; then
         echo "  FAIL $name: -O0 exit $rc0, -O3 exit $rc3"
         failed=$((failed + 1))
@@ -82,7 +94,7 @@ fi
 # the object-path build the loop above already validated.
 EXE_SRC="$ROOT/test/repro/region_statement_form.elisa"
 if bash "$ROOT/scripts/elisac_stage1.sh" -emit exe -o "$WORK/exe_probe" "$EXE_SRC" >/dev/null 2>&1; then
-    timeout 10 "$WORK/exe_probe" >/dev/null 2>&1 </dev/null; exe_rc=$?
+    RUN_TIMED "$WORK/exe_probe"; exe_rc=$?
     if [ "$exe_rc" != 42 ]; then
         echo "  FAIL -emit exe: exit $exe_rc, want 42"
         failed=$((failed + 1))

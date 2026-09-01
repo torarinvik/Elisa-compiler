@@ -25,7 +25,12 @@ static elif ELISA_TARGET_OS_POSIX:
 static else:
     const ARENA_BACKEND: int = ARENA_BACKEND_LIBC_MALLOC
 
-const ARENA_REGION_DEFAULT_CAPACITY: usize = 8 * 1024
+# 128Ki slots = 1 MiB of payload on 64-bit (was 8Ki slots / 64 KiB). A driver-sized
+# compile chained THOUSANDS of 64 KiB regions, and both the per-allocation free-block
+# chain walk and the mmap count scale with region count. Anonymous mmap pages are
+# committed on first touch, so idle capacity in the tail region costs address space,
+# not RSS. Matches REGION_CACHE_MAX_SLOTS so default regions stay cacheable.
+const ARENA_REGION_DEFAULT_CAPACITY: usize = 128 * 1024
 const ARENA_WASM_PAGE_SIZE: usize = 64 * 1024
 
 # Per-region strategy stored in Arena.strategy (the surface `region r(N) using <strategy>`).
@@ -107,6 +112,10 @@ struct ArenaMark:
 # itself does not use them for regions.
 extern malloc(size: usize) -> mutable heap void&? can[Memory.Allocate]
 extern free(ptr: heap void&) can[Memory.Release]
+# Used by the region cache to restore fresh-mmap zeroing when parking a region.
+extern memset(dest: mutable void&, val: int, n: usize) -> mutable void&
+# Used by arena_realloc's relocation copy.
+extern memcpy(dest: mutable void&, src: void&, n: usize) -> mutable void&
 
 static if ARENA_BACKEND == ARENA_BACKEND_LINUX_MMAP:
     const ELISA_ARENA_PROT_READ = 0x1
@@ -303,9 +312,55 @@ def sfree[T](ptr: heap T&) -> heap T!:
 # Region allocation / freeing
 # ------------------------------------------------------------
 
+# A single-slot cache of the most recently freed mmap-backed region. Sampling the -O2
+# compiler showed 15.5% of ALL cpu inside mmap/munmap: ordinary backend helpers each
+# spin up a scratch region and tear it down again, so the same-sized block is unmapped
+# and re-mapped thousands of times per compile. The slot holds ONE parked region;
+# new_region_with_owner reuses it when its capacity suffices, and free_region parks
+# instead of unmapping when the slot is empty and the region is not oversized (so a
+# giant block is never pinned). Plain global, unsynchronized — the same posture as
+# perm_arena, which is likewise mutated on every permanent allocation; a thread-local
+# pool is the documented end state for ARENA_STRATEGY_SCRATCH and can subsume this.
+# Both cache fields live in ONE struct-typed global accessed through a reference —
+# the perm_arena pattern. stage0 attaches Unsafe.MutableGlobal to a function's
+# required effects on DIRECT scalar-global access (warning every ungranted caller
+# transitively: 113 across the runtime), while stage1 warns at the access site in
+# strict mode (4 diagnostics); struct-global-by-reference is the one shape both
+# analyzers accept silently, and it is what every existing runtime global uses.
+struct ArenaRegionCache:
+    slot: mutable heap Region&?
+    # Process-wide count of spans sitting on region free lists; see
+    # arena_take_free_block_chain.
+    reclaimed_spans: mutable usize
+
+global mutable __elisa_region_cache: ArenaRegionCache = ArenaRegionCache{slot: null, reclaimed_spans: 0}
+
+# Largest region the cache will park, in SLOTS (uintptr-sized): 128Ki slots = 1 MiB of
+# payload on 64-bit. Scratch regions are far smaller; anything bigger is unmapped as
+# before so RSS never pins a large one-off block.
+const REGION_CACHE_MAX_SLOTS: usize = 131072
+
+
 def new_region_with_owner(capacity: usize, owner_tag: uintptr) -> mutable heap Region&:
     can Memory.Allocate, Abort.Panic:
         size_bytes: usize = size_of(Region) + size_of(uintptr) * capacity
+
+        # Reuse the parked region when it is big enough — its own (possibly larger)
+        # capacity is kept, exactly as if the caller had asked for that size.
+        static if ARENA_BACKEND == ARENA_BACKEND_LINUX_MMAP:
+            reuse_cache: mutable ArenaRegionCache& = &__elisa_region_cache
+            if reuse_cache.slot is cached and cached.capacity >= capacity:
+                reuse_cache.slot <- null
+                cached.next <- null
+                cached.count <- 0
+                cached.owner_tag <- owner_tag
+                cached.owner_next <- null
+                cached.global_index <- 0
+                cached.committed <- 0
+                cached.free_list <- null
+                return cached
+        static else:
+            pass
 
         static if ARENA_BACKEND == ARENA_BACKEND_LIBC_MALLOC:
             raw: mutable heap void&? = null
@@ -477,10 +532,24 @@ def new_region_backend(capacity: usize, strategy: int) -> mutable heap Region&:
 @internal
 def arena_take_free_block(r: mutable heap Region&, need_slots: usize) -> mutable heap void&?:
     header_slots: usize = (size_of(ArenaFreeBlock) + size_of(uintptr) - 1) / size_of(uintptr)
+    # FIRST-FIT WITH A BOUNDED PROBE. The exhaustive walk made every allocation
+    # O(live free blocks): a compiler-sized run reclaims thousands of darray backings
+    # into this list, and sampling stage1 compiling its own driver put ~35% of ALL
+    # cpu inside this walk (arena_take_free_block + _chain + reclaim, plus the
+    # mmap/munmap churn it drives). Reuse is a best-effort memory optimisation, not a
+    # correctness contract: after the probe budget the caller simply bump-allocates,
+    # and the unvisited blocks stay listed for later requests. Insertion is LIFO, so
+    # the bounded probe still sees the most recently freed — cache-warm and, in the
+    # grow-in-place realloc pattern that dominates, right-sized — blocks first.
+    probes_left: mutable usize = 32
     previous: mutable heap ArenaFreeBlock&? = null
     current: mutable heap ArenaFreeBlock&? = r.free_list
-    while current != null:
+    while current != null and probes_left > 0:
+        probes_left <- probes_left - 1
         if current.slots >= need_slots:
+            trusted Unsafe.MutableGlobal:
+                take_cache: mutable ArenaRegionCache& = &__elisa_region_cache
+                take_cache.reclaimed_spans <- take_cache.reclaimed_spans - 1 if take_cache.reclaimed_spans > 0
             block: mutable heap ArenaFreeBlock& = current
             remainder: usize = current.slots - need_slots
             if remainder >= header_slots:
@@ -504,8 +573,18 @@ def arena_take_free_block(r: mutable heap Region&, need_slots: usize) -> mutable
         current <- current.next
     return null
 
+# The reclaimed-span count is a HINT with the same unsynchronized posture as
+# perm_arena: a racy read can only cost one skipped reuse or one wasted walk,
+# never correctness. arena_alloc consults it before walking the region chain —
+# the common bump-only arena never reclaims, yet paid an O(regions) walk on
+# EVERY allocation (~18% of product cpu, led by AST node construction).
+
+
 @internal
 def arena_take_free_block_chain(a: mutable Arena&, need_slots: usize) -> mutable heap void&?:
+    trusted Unsafe.MutableGlobal:
+        cache: ArenaRegionCache& = &__elisa_region_cache
+        return null if cache.reclaimed_spans == 0
     cursor: mutable heap Region&? = a.begin
     while cursor != null:
         # Reclaimed spans are safe to reuse even in an adopted block: the owner tag
@@ -533,6 +612,8 @@ def arena_reclaim_allocation(a: mutable Arena&, oldptr: mutable void&, old_slots
                 block.slots <- old_slots
                 block.next <- cursor.free_list
                 cursor.free_list as & <- block
+                reclaim_cache: mutable ArenaRegionCache& = &__elisa_region_cache
+                reclaim_cache.reclaimed_spans <- reclaim_cache.reclaimed_spans + 1
                 return
         cursor <- cursor.next
 
@@ -543,6 +624,24 @@ def free_region(r: heap Region&):
                 free(arena_heap_void_from_region(r))
 
         static elif ARENA_BACKEND == ARENA_BACKEND_LINUX_MMAP:
+            # Park instead of unmapping when the slot is free and the region is small
+            # enough to be worth keeping — see __elisa_region_cache above.
+            #
+            # The used span is ZEROED before parking. A fresh anonymous mmap is
+            # kernel-zeroed, and handing back a dirty recycled region broke that
+            # accidental-but-relied-upon contract (one corpus program changed its
+            # answer). r.count bounds everything ever bumped in this region, and
+            # free-listed spans live inside it, so zeroing [0, count) restores
+            # bit-for-bit fresh-region semantics at memset cost instead of
+            # munmap+mmap+page-fault cost.
+            park_cache: mutable ArenaRegionCache& = &__elisa_region_cache
+            if park_cache.slot == null and r.capacity <= REGION_CACHE_MAX_SLOTS:
+                trusted [Unsafe.PointerCast, Unsafe.RawExtern]:
+                    used_bytes: usize = r.count * size_of(uintptr)
+                    if used_bytes > 0:
+                        _ = memset(arena_heap_u8_from_region_data(r).cast[mutable void&], 0, used_bytes)
+                    park_cache.slot <- r.cast[mutable heap Region&]
+                return
             size_bytes: usize = size_of(Region) + size_of(uintptr) * r.capacity
             ret: mutable int = 0
             trusted Unsafe.RawExtern:
@@ -705,12 +804,14 @@ def arena_realloc(a: mutable Arena&, oldptr: mutable void&, oldsz: usize, newsz:
             panic("reserve_commit/fixed array cannot grow in place: not the tail allocation")
 
         newptr: heap void& = arena_alloc(a, newsz)
-        newptr_bytes: heap u8& = arena_heap_u8_from_void(newptr)
-        oldptr_bytes: u8& = arena_u8_from_void(oldptr)
 
-        trusted Unsafe.UncheckedIndex:
-            for i in 0..<oldsz:
-                newptr_bytes[i] <- oldptr_bytes[i]
+        # memcpy, not a byte loop. Every darray relocation lands here, and the
+        # element-per-iteration copy moved one byte per loop trip — megabytes per
+        # compile through the geometric-growth steps, and unvectorized in the -O0
+        # builds the self-host fixpoint gate runs. The regions never overlap (newptr
+        # is a fresh allocation), so plain memcpy is the exact same operation.
+        trusted [Unsafe.PointerCast, Unsafe.RawExtern]:
+            _ = memcpy(arena_heap_void_from_mutable(newptr).cast[mutable void&], arena_u8_from_void(oldptr).cast[void&], oldsz)
 
         arena_reclaim_allocation(a, oldptr, old_slots)
 

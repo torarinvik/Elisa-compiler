@@ -16,7 +16,11 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
-EC="${ELISAC:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+# Resolve the stage0 compiler the same way every other check does. This hardcoded a
+# structpy-tree path and honoured neither ELISACORE_BIN nor the CORE selected just above,
+# so in any worktree whose stage0 lives elsewhere the check failed instantly with
+# "No such file or directory" — a configuration miss wearing the costume of a real failure.
+EC="${ELISAC:-${ELISACORE_BIN:-$CORE/compiler/bin/elisac}}"
 BUILD="$ROOT/build/ir_interop"
 mkdir -p "$BUILD"
 
