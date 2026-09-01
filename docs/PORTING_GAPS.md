@@ -36,6 +36,12 @@ Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
 > payload-bearing status values through direct calls, stored unions, generic errorsets, and
 > function values. Expression and statement catches bind single- and multi-field payloads;
 > native regressions are in `test/parity/backend_native_smoke.sh`.
+>
+> **Nested variant patterns (2026-09-01):** The previously listed `Expr.Leaf(Token.Ident)`
+> gap is closed. Payloadless nested variants, nested payload binders, packed-store nested
+> payload decoding, and nested or-pattern bindings now agree between stage0 and stage1 at
+> `-O0` and `-O2`; the adversarial differential generators provide independent behavioral
+> coverage.
 
 **Update, same day** — several items below are now CLOSED, and two were mis-scoped. See
 "Progress" at the end for what changed and what the corrected estimates are.
@@ -181,8 +187,10 @@ These are decisions, not oversights. Re-opening one means re-litigating the reas
 
 ### 2.2 Known-real but unfixed
 
-- **Nested variant sub-pattern** — `Expr.Leaf(Token.Ident)`, single-field nested pattern.
-  Scoped, not fixed; the declining emitter is identified.
+- ~~**Nested variant sub-pattern** — `Expr.Leaf(Token.Ident)`, single-field nested pattern.~~
+  **CLOSED (2026-09-01):** payloadless and payload-binding nested variants, packed-store
+  nested decoding, and nested or-pattern bindings all execute with matching results under
+  stage0 and stage1 at `-O0` and `-O2`.
 - **Chain-resolver Optional asymmetry** — the type half handles a Ref-to-Optional pointee,
   the address half does not. Real, but **no reachable fixture was ever found** — do not
   "fix" it blind.
