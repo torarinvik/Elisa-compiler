@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile-time regression guard: stage1 compiling its OWN 117k-line source.
+"""Compile-time regression guard: stage1 compiling its own large source unit.
 
 Nothing measured compile time before this. That is not a theoretical gap — a change that made
 `sview(base, start, end)` clamp against `strlen` put a full-source scan in the lexer's
@@ -8,14 +8,17 @@ differential corpus reporting "2 declines exceeds baseline 1", because a timeout
 a DECLINE. A slowdown looked like an acceptance regression.
 
 What it records is a RATIO, not seconds: stage1 compiling its own source, over `clang -O2` on
-a fixed C file that never changes with this repository. The gate runs six checks at a time, so
+a fixed C file that never changes with this repository. The baseline is refreshed when the
+compiler source grows materially or the host's clang toolchain changes; the gate runs six checks
+at a time, so
 an absolute number measured there is worthless — a past session built a whole optimisation plan
 on timings that were 500x distorted by exactly that. Even CPU time is not immune (measured 15.4s
 idle and 26.8s while the gate ran, a 1.7x swing), so the yardstick has to be inside the same
 run. Contention scales both terms and cancels.
 
 Threshold is deliberately loose — this is a guard against a 2x-class regression, not a
-benchmark. Ratio variance on an idle machine is about +/-4%. Under load the ratio FALLS (clang
+benchmark. Re-record the fixture only after verifying an optimized stage1 seed on a quiet host.
+Under load the ratio FALLS (clang
 suffers more from contention than stage1 does: measured 36.5 idle, 25.9 with four competing
 compiles), so a busy machine can only MASK a regression here, never invent one. That is the
 direction a gate check should fail in.
