@@ -31,6 +31,11 @@ Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
 > rejected by array interning was stale. A fresh `i64[2][3]` read/write fixture is accepted
 > by both local stage0 and stage1 at `-O0`, and both linked programs return 44. The existing
 > `backend_native_smoke.sh` nested-array coverage and the new fixture cover the behavior.
+>
+> **Payload error unions (2026-09-01):** The zero-overhead error-union path now preserves
+> payload-bearing status values through direct calls, stored unions, generic errorsets, and
+> function values. Expression and statement catches bind single- and multi-field payloads;
+> native regressions are in `test/parity/backend_native_smoke.sh`.
 
 **Update, same day** — several items below are now CLOSED, and two were mis-scoped. See
 "Progress" at the end for what changed and what the corrected estimates are.
