@@ -8,6 +8,10 @@
 > the bit-group member body so temporary AST values are not captured in an unstable transition.
 > The local stage1 product lowers `test/breadth/emit_native.elisa` without dropping
 > `parse_bit_group_members`, and `test/parity/state_machine_parser_selfhost_smoke.sh` guards it.
+> **Extern/iterator follow-up (2026-09-01):** the compact extern side table now retains applied
+> container element names, so `view[T]` and `darray[T]` parameters use their normal by-value ABI;
+> mutable array-like iteration binds the element address over stage0's iterator copy. The focused
+> ABI regression is `test/parity/extern_view_abi_smoke.sh`.
 > **Error-union follow-up (2026-09-01):** first-class error unions now preserve the complete
 > payload-carrying status, and `try`/`catch` supports direct calls, stored unions, function
 > values, generic errorsets, and single- or multi-field payload bindings. The native parity

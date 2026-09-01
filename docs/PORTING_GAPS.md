@@ -42,6 +42,14 @@ Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
 > payload decoding, and nested or-pattern bindings now agree between stage0 and stage1 at
 > `-O0` and `-O2`; the adversarial differential generators provide independent behavioral
 > coverage.
+>
+> **Backend oracle follow-up (2026-09-01):** A fresh oracle generated from the current
+> stage0 backend suites contains 341 unique lowered sources. Stage1 lowers 331; the remaining
+> 10 are all stage0-CLI-unreachable internal `StringView`/ghost-erasure fixtures. The only
+> reachable gap in the prior 27-case replay was fixed: compact extern metadata now retains
+> applied container element names, so `extern f(v: view[T])` lowers its `%DynArrayView` ABI;
+> `for mutable item in array` now uses a direct element pointer over stage0's iterator copy.
+> The focused checks are `test/parity/extern_view_abi_smoke.sh` and the full backend replay.
 
 **Update, same day** — several items below are now CLOSED, and two were mis-scoped. See
 "Progress" at the end for what changed and what the corrected estimates are.
@@ -49,7 +57,7 @@ Measured 2026-08-17 against `~/.elisac/elisac` and `bin/elisac-stage1`.
 Everything in **Part 1** was re-measured today. **Part 2** is carried from earlier sessions
 and is marked accordingly — treat those numbers as needing a re-measure before you act on
 them. The distinction matters: the backend-corpus figure in the old notes was `119 gaps`, and
-the real number today is `0` reachable.
+the current backend-oracle number is `0` reachable.
 
 ---
 
@@ -148,14 +156,15 @@ message text, not the span.
 
 ### 1.6 Backend feature corpus: no reachable gaps left
 
-Replayed all 285 unique sources that stage0's own `src/backend` + `test/backend` suites
-lower (recovered from `/tmp/be_oracle.tsv`):
+Replayed all 341 unique sources that stage0's own `src/backend` + `test/backend` suites
+lower (recovered from the current `/tmp/be_oracle-current.tsv`):
 
-- **275 compile under stage1**, 10 fail (3 rejections, 7 declines).
+- **331 compile under stage1**, 10 fail.
 - **All 10 are rejected by stage0's own CLI too.** They are in-process-only shapes reaching
-  internal carrier types (`StringView`, ghost erasure) that user code cannot spell.
+  internal carrier types (`StringView`, ghost erasure) or erased contract nodes that user code
+  cannot spell.
 
-So this oracle is **exhausted**: 275/275 of the CLI-reachable corpus. Earlier notes said
+So this oracle is **exhausted**: 331/331 of the CLI-reachable corpus. Earlier notes said
 "119 real gaps" — that is now closed. The remaining 10 should not be "fixed"; they are not
 reachable.
 
@@ -191,6 +200,11 @@ These are decisions, not oversights. Re-opening one means re-litigating the reas
   **CLOSED (2026-09-01):** payloadless and payload-binding nested variants, packed-store
   nested decoding, and nested or-pattern bindings all execute with matching results under
   stage0 and stage1 at `-O0` and `-O2`.
+- ~~**Applied extern view parameter / mutable fixed-array iteration** — compact extern metadata
+  used to discard `view[T]`'s element and the loop backend rejected `for mutable item`.~~
+  **CLOSED (2026-09-01):** extern `view[T]`/`darray[T]` parameters resolve to their interned
+  by-value ABI; mutable array-like iteration binds a direct element address while preserving
+  stage0's iterator-copy semantics.
 - **Chain-resolver Optional asymmetry** — the type half handles a Ref-to-Optional pointee,
   the address half does not. Real, but **no reachable fixture was ever found** — do not
   "fix" it blind.
