@@ -104,6 +104,13 @@ extend Backend:
             for row in 0..<file.generic_param_lines.count |file, line|:
                 continue if file.generic_param_lines[row] >= 2147483648
                 true return if file.generic_param_lines[row] == line
+            # An `errorset R` parameter is intentionally absent from the ordinary generic
+            # rows: it is an effect-family selector, not a runtime/type argument. It still
+            # makes the declaration a template and must be kept out of the monomorphic
+            # declaration/body passes, or the unspecialized function can win overload lookup
+            # and be emitted with the wrong ABI.
+            for annotation in file.enum_annotations |line|:
+                true return if annotation.owner == "__errorset_param" and annotation.line == line
             return false
 
 
@@ -205,6 +212,48 @@ extend Backend:
             return EmitStatus.Declined
 
 
+        # `try f(args)` where `f` is a function-valued local/parameter. Function values use
+        # the tagged raw/closure representation, so this cannot reuse the named-callee helper
+        # above. `emit_fn_value_call` deliberately returns a first-class error union; split it
+        # here at the propagation boundary, copying the failure payload into this function's
+        # error slot and returning the status. The success path returns the payload value to
+        # the enclosing variable/return emitter. No handler object or dynamic allocation is
+        # introduced: this is the same two-way CFG and hidden out-slot ABI as a direct call.
+        def emit_propagating_fn_value_try(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fn_value_type: mutable ValueType = expression_type(callee, local_scope, fns, structs, generics)
+            fn_value_type <- optional_payload_of(fn_value_type, structs) if fn_value_type.kind == TypeKind.Optional and optional_payload_of(fn_value_type, structs).kind == TypeKind.Fn
+            null return if fn_value_type.kind != TypeKind.Fn
+            fn_result_payload_type: ValueType = fn_return_type_of(fn_value_type, structs)
+            fn_error_family: sview = fn_error_family_of(fn_value_type, structs)
+            null return if fn_error_family == ""
+            fn_result_type: ValueType = intern_error_union_type(fn_result_payload_type, fn_error_family, structs)
+            fn_payload_type: ValueType = error_union_payload_of(fn_result_type, structs)
+            null return if fn_payload_type.kind == TypeKind.Unmodeled or not runtime.in_error_fn
+            if emit_fn_value_call(callee, arguments, fn_result_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is fn_union_value:
+                fn_code: LLVMValueRef = LLVMBuildExtractValue(builder, fn_union_value, 0, "fn.try.code")
+                fn_payload_pointer: LLVMValueRef = LLVMBuildExtractValue(builder, fn_union_value, 1, "fn.try.payload.ptr")
+                fn_payload_llvm: LLVMTypeRef = llvm_type_of(fn_payload_type, structs, ctx)
+                fn_code_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, fn_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "fn.try.ok")
+                fn_enclosing: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                fn_success_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn_enclosing, "fn.try.success")
+                fn_failure_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn_enclosing, "fn.try.failure")
+                fn_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn_enclosing, "fn.try.done")
+                fn_result_slot: LLVMValueRef = LLVMBuildAlloca(builder, fn_payload_llvm, "fn.try.result")
+                _ = LLVMBuildCondBr(builder, fn_code_ok, fn_success_block, fn_failure_block)
+                LLVMPositionBuilderAtEnd(builder, fn_failure_block)
+                emit_region_unwind(regions, runtime, builder)
+                fn_failed_payload: LLVMValueRef = LLVMBuildLoad2(builder, fn_payload_llvm, fn_payload_pointer, "fn.try.failure.payload")
+                _ = LLVMBuildStore(builder, fn_failed_payload, runtime.error_out)
+                _ = LLVMBuildRet(builder, fn_code)
+                LLVMPositionBuilderAtEnd(builder, fn_success_block)
+                fn_success_payload: LLVMValueRef = LLVMBuildLoad2(builder, fn_payload_llvm, fn_payload_pointer, "fn.try.success.payload")
+                _ = LLVMBuildStore(builder, fn_success_payload, fn_result_slot)
+                _ = LLVMBuildBr(builder, fn_done_block)
+                LLVMPositionBuilderAtEnd(builder, fn_done_block)
+                return LLVMBuildLoad2(builder, fn_payload_llvm, fn_result_slot, "fn.try.value")
+            return null
+
+
         # Emit an error-returning call as a first-class `T error[E]` descriptor rather than
         # consuming it with `try`. This is selected when the destination local explicitly has
         # an error-union type; the existing split status/out-payload call ABI remains unchanged.
@@ -290,12 +339,14 @@ extend Backend:
                     te_is_generic: bool = te_generic_slot >= 0
                     if te_is_generic and not te_explicit:
                         te_inferred: darray[ValueType] = infer_generic_args(te_generic_slot.usize(), te_args, local_scope, fns, structs, generics)
-                        null return if te_inferred.count == 0
+                        null return if te_inferred.count != generics.param_count[te_generic_slot.usize()]
                         te_type_args.extend([copied_type(te_inferred_arg) for te_inferred_arg in te_inferred])
                     te_plain_error: bool = function_is_error(fns, "", te_name)
                     te_generic_error: mutable bool = false
                     if te_is_generic:
                         te_generic_error <- generics.is_error[te_generic_slot.usize()]
+                    te_error_family: sview = infer_generic_error_family(te_generic_slot.usize(), te_args, local_scope, fns, structs, generics) if te_generic_error else ""
+                    null return if te_generic_error and generic_error_param_at(generics, te_generic_slot.usize()) != "" and te_error_family == ""
                     null return if not te_plain_error and not te_generic_error
                     te_payload: mutable ValueType = unmodeled_type()
                     if te_generic_error:
@@ -305,7 +356,7 @@ extend Backend:
                     null return if te_payload.kind == TypeKind.Unmodeled or te_payload.kind == TypeKind.Void
                     te_target_opt: mutable LLVMValueRef? = null
                     if te_generic_error:
-                        te_target_opt <- instantiate_generic(te_name, te_type_args, generics, structs, m, ctx)
+                        te_target_opt <- instantiate_generic_with_error_family(te_name, te_type_args, te_error_family, generics, structs, m, ctx)
                     else:
                         te_target_opt <- lookup_function(fns, "", te_name)
                     if te_target_opt is te_target:
@@ -382,7 +433,9 @@ extend Backend:
             expected_payload: ValueType = error_union_payload_of(expected, structs)
             null return if payload_type.kind == TypeKind.Unmodeled
             null return if payload_type.kind != expected_payload.kind or payload_type.bits != expected_payload.bits
-            if instantiate_generic(base, type_args, generics, structs, m, ctx) is generic_target:
+            explicit_error_family: sview = infer_generic_error_family(generic_slot.usize(), arguments, local_scope, fns, structs, generics)
+            null return if generic_error_param_at(generics, generic_slot.usize()) != "" and explicit_error_family == ""
+            if instantiate_generic_with_error_family(base, type_args, explicit_error_family, generics, structs, m, ctx) is generic_target:
                 generic_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(payload_type, structs, ctx), "error.union.generic.out")
                 generic_call_args: mutable darray[LLVMValueRef] = [generic_out_slot]
                 generic_declined: mutable bool = false
@@ -456,7 +509,9 @@ extend Backend:
             gtry_type: ValueType = generic_return_type(base, type_args, generics, structs)
             null return if gtry_type.kind == TypeKind.Unmodeled
             null return if wants_value and gtry_type.kind == TypeKind.Void
-            if instantiate_generic(base, type_args, generics, structs, m, ctx) is gtry_target:
+            explicit_error_family: sview = infer_generic_error_family(gtry_slot.usize(), arguments, local_scope, fns, structs, generics)
+            null return if generic_error_param_at(generics, gtry_slot.usize()) != "" and explicit_error_family == ""
+            if instantiate_generic_with_error_family(base, type_args, explicit_error_family, generics, structs, m, ctx) is gtry_target:
                 # A VOID-success instantiation still writes an i64 0 on `raise`, so the
                 # out-slot needs a real allocation even when nothing reads it.
                 gtry_out_llvm: LLVMTypeRef = LLVMInt64TypeInContext(ctx) if gtry_type.kind == TypeKind.Void else llvm_type_of(gtry_type, structs, ctx)
@@ -563,12 +618,14 @@ extend Backend:
                 inferred_slot1 <- copied_type(inferred[1]) if inferred.count > 1.usize()
                 inferred_slot2 <- copied_type(inferred[2]) if inferred.count > 2.usize()
                 inferred_slot3 <- copied_type(inferred[3]) if inferred.count > 3.usize()
-            unmodeled_type() return if inferred_count == 0 or inferred_count > 4.usize()
+            unmodeled_type() return if inferred_count > 4.usize() or inferred_count != generics.param_count[generic_index.usize()]
             inferred_args: mutable darray[ValueType] = []
             inferred_args.push(inferred_slot0) if inferred_count > 0.usize()
             inferred_args.push(inferred_slot1) if inferred_count > 1.usize()
             inferred_args.push(inferred_slot2) if inferred_count > 2.usize()
             inferred_args.push(inferred_slot3) if inferred_count > 3.usize()
+            inferred_error_family: sview = infer_generic_error_family(generic_index.usize(), arguments, local_scope, fns, structs, generics)
+            unmodeled_type() return if generic_error_param_at(generics, generic_index.usize()) != "" and inferred_error_family == ""
             return generic_return_type(name, inferred_args, generics, structs)
 
 
@@ -590,13 +647,15 @@ extend Backend:
                 inferred_slot1 <- copied_type(inferred[1]) if inferred.count > 1.usize()
                 inferred_slot2 <- copied_type(inferred[2]) if inferred.count > 2.usize()
                 inferred_slot3 <- copied_type(inferred[3]) if inferred.count > 3.usize()
-            null return if inferred_count == 0 or inferred_count > 4.usize()
+            null return if inferred_count > 4.usize() or inferred_count != generics.param_count[generic_index.usize()]
             inferred_args: mutable darray[ValueType] = []
             inferred_args.push(inferred_slot0) if inferred_count > 0.usize()
             inferred_args.push(inferred_slot1) if inferred_count > 1.usize()
             inferred_args.push(inferred_slot2) if inferred_count > 2.usize()
             inferred_args.push(inferred_slot3) if inferred_count > 3.usize()
-            return instantiate_generic(name, inferred_args, generics, structs, m, ctx)
+            inferred_error_family: sview = infer_generic_error_family(generic_index.usize(), arguments, local_scope, fns, structs, generics)
+            null return if generic_error_param_at(generics, generic_index.usize()) != "" and inferred_error_family == ""
+            return instantiate_generic_with_error_family(name, inferred_args, inferred_error_family, generics, structs, m, ctx)
 
 
         # Whether the error callee `name` trails the caller's arena — the SAME question
@@ -627,12 +686,14 @@ extend Backend:
                 inferred_slot1 <- copied_type(inferred[1]) if inferred.count > 1.usize()
                 inferred_slot2 <- copied_type(inferred[2]) if inferred.count > 2.usize()
                 inferred_slot3 <- copied_type(inferred[3]) if inferred.count > 3.usize()
-            false return if inferred_count == 0 or inferred_count > 4.usize()
+            false return if inferred_count > 4.usize() or inferred_count != generics.param_count[generic_index.usize()]
             inferred_args: mutable darray[ValueType] = []
             inferred_args.push(inferred_slot0) if inferred_count > 0.usize()
             inferred_args.push(inferred_slot1) if inferred_count > 1.usize()
             inferred_args.push(inferred_slot2) if inferred_count > 2.usize()
             inferred_args.push(inferred_slot3) if inferred_count > 3.usize()
+            inferred_error_family: sview = infer_generic_error_family(generic_index.usize(), arguments, local_scope, fns, structs, generics)
+            false return if generic_error_param_at(generics, generic_index.usize()) != "" and inferred_error_family == ""
             return instantiation_wants_arena(name, inferred_args, generics, structs)
 
 
@@ -653,12 +714,14 @@ extend Backend:
                 inferred_slot1 <- copied_type(inferred[1]) if inferred.count > 1.usize()
                 inferred_slot2 <- copied_type(inferred[2]) if inferred.count > 2.usize()
                 inferred_slot3 <- copied_type(inferred[3]) if inferred.count > 3.usize()
-            unmodeled_type() return if inferred_count == 0 or inferred_count > 4.usize()
+            unmodeled_type() return if inferred_count > 4.usize() or inferred_count != generics.param_count[generic_index.usize()]
             inferred_args: mutable darray[ValueType] = []
             inferred_args.push(inferred_slot0) if inferred_count > 0.usize()
             inferred_args.push(inferred_slot1) if inferred_count > 1.usize()
             inferred_args.push(inferred_slot2) if inferred_count > 2.usize()
             inferred_args.push(inferred_slot3) if inferred_count > 3.usize()
+            inferred_error_family: sview = infer_generic_error_family(generic_index.usize(), arguments, local_scope, fns, structs, generics)
+            unmodeled_type() return if generic_error_param_at(generics, generic_index.usize()) != "" and inferred_error_family == ""
             return instantiation_param_type(name, inferred_args, position, generics, structs)
 
 
@@ -720,6 +783,9 @@ extend Backend:
                 for generic_index in 0..<file.generic_func_decls.count |generic_index, generics, file|:
                     function_name: sview = file.generic_func_decl_names[generic_index]
                     line: u32 = file.generic_func_decl_lines[generic_index]
+                    error_param: mutable sview = ""
+                    for annotation in file.enum_annotations |error_param, line|:
+                        error_param <- annotation.name if error_param == "" and annotation.owner == "__errorset_param" and annotation.line == line
                     start: usize = generics.params.count
                     for row in 0..<file.generic_param_lines.count |generics, file, line|:
                         # High bit set => a BOUND row (`[T: Ord]`), not a type parameter.
@@ -727,12 +793,15 @@ extend Backend:
                         continue if file.generic_param_lines[row] != line
                         generics.params <- generics.params.push(file.generic_param_names[row])
                     added: usize = generics.params.count - start
-                    continue if added == 0
+                    # An errorset-only generic such as `f[errorset R](...)` has no ordinary
+                    # type arguments, but it is still a real template and must be registered.
+                    continue if added == 0 and error_param == ""
                     generics.names <- generics.names.push(function_name)
                     generics.decls <- generics.decls.push(file.generic_func_decls[generic_index])
                     generics.param_start <- generics.param_start.push(start)
                     generics.param_count <- generics.param_count.push(added)
                     generics.is_error <- generics.is_error.push(line_is_error_returning(file.error_set_func_lines, line))
+                    generics.error_params <- generics.error_params.push(error_param)
 
 
             # The source-level spelling a type contributes to a mangled name. Must agree with
