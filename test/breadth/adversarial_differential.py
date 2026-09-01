@@ -56,34 +56,58 @@ def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                           stdin=subprocess.DEVNULL, **kw)
 
-def build_and_run(src_path, work, tag):
-    """Compile+link+run with one compiler. Returns (ok, exit_code).
+# The outcome of one compile+link+run attempt. These used to be a single `False`, which
+# collapsed four different events — the compiler REFUSED the program, the link failed, the
+# compile timed out, the program timed out — into one. A machine under memory pressure
+# therefore manufactured DECLINE and PERMISSIVE rows for programs BOTH compilers accept and
+# run correctly, and those buckets are ratcheted at zero, so load turned into a red gate
+# pointing at an acceptance gap that did not exist. A timeout is not a decline.
+OK, DECLINED, LINK_FAILED, TIMEOUT = "ok", "declined", "link", "timeout"
 
-    `s1O2` is stage1 through the real `default<O2>` pass pipeline. Optimisation must never
-    change an answer, and a miscompile that only appears optimised is invisible to every
-    other check here — the module datalayout bug was exactly that shape."""
+
+def _attempt(src_path, work, tag, run_timeout):
     obj = os.path.join(work, f"{tag}.o")
     exe = os.path.join(work, tag)
-    if tag == "s0":
-        r = run([S0, "-emit", "obj", "-o", obj, src_path], timeout=90)
-    elif tag == "s1O2":
-        r = run(["bash", WRAP, "-O2", "-o", obj, src_path], env=STAGE1_ENV, timeout=180)
-    else:
-        r = run(["bash", WRAP, "-o", obj, src_path], env=STAGE1_ENV, timeout=90)
+    try:
+        if tag == "s0":
+            r = run([S0, "-emit", "obj", "-o", obj, src_path], timeout=90)
+        elif tag == "s1O2":
+            r = run(["bash", WRAP, "-O2", "-o", obj, src_path], env=STAGE1_ENV, timeout=180)
+        else:
+            r = run(["bash", WRAP, "-o", obj, src_path], env=STAGE1_ENV, timeout=90)
+    except subprocess.TimeoutExpired:
+        return (TIMEOUT, None)
     if r.returncode != 0:
-        return (False, None)
+        return (DECLINED, None)
     # Same three link recipes the differential corpus uses, in the same order.
     for extra in ([RT], [], [RT, "-L/opt/homebrew/opt/llvm/lib", "-lLLVM"]):
         if run(["clang", "-Wl,-dead_strip", "-o", exe, obj] + extra).returncode == 0:
             break
     else:
-        return (False, None)
+        return (LINK_FAILED, None)
     try:
         p = subprocess.run([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           stdin=subprocess.DEVNULL, timeout=10)
-        return (True, p.returncode)
+                           stdin=subprocess.DEVNULL, timeout=run_timeout)
+        return (OK, p.returncode)
     except subprocess.TimeoutExpired:
-        return (False, None)
+        return (TIMEOUT, None)
+
+
+def build_and_run(src_path, work, tag):
+    """Compile+link+run with one compiler. Returns (status, exit_code).
+
+    `s1O2` is stage1 through the real `default<O2>` pass pipeline. Optimisation must never
+    change an answer, and a miscompile that only appears optimised is invisible to every
+    other check here — the module datalayout bug was exactly that shape.
+
+    A timeout is RETRIED with a wider budget before it is believed. A genuine runaway loop
+    never terminates, so it times out again and is still caught; a host that is swapping
+    times out once and then behaves. Without the retry the gate reports whatever else the
+    machine happened to be doing."""
+    status, rc = _attempt(src_path, work, tag, 10)
+    if status == TIMEOUT:
+        status, rc = _attempt(src_path, work, tag, 30)
+    return (status, rc)
 
 # ---------------------------------------------------------------- generators
 # Each yields (name, source). `main` must return a value the two compilers can disagree on:
@@ -7156,7 +7180,7 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
 
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
-    results = {"MATCH": [], "MISMATCH": [], "O2_MISMATCH": [], "O2_DECLINE": [], "DECLINE": [], "PERMISSIVE": [], "SKIP": []}
+    results = {"MATCH": [], "MISMATCH": [], "O2_MISMATCH": [], "O2_DECLINE": [], "DECLINE": [], "PERMISSIVE": [], "TIMEOUT": [], "SKIP": []}
     work = tempfile.mkdtemp()
     progs = []
     for g in GENERATORS:
@@ -7168,15 +7192,20 @@ def main():
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "p.elisa")
         open(path, "w").write(src.lstrip("\n"))
-        ok0, rc0 = build_and_run(path, d, "s0")
-        if not ok0:
+        st0, rc0 = build_and_run(path, d, "s0")
+        if st0 == TIMEOUT:
+            # The ORACLE timed out. That says nothing about stage1 — exactly the reasoning
+            # applied to a crashing oracle below. Treating it as "stage0 rejects it" is what
+            # invented PERMISSIVE rows for programs stage0 accepts perfectly well.
+            results["SKIP"].append((name, None, None)); continue
+        if st0 != OK:
             # stage0 REFUSED it. If stage1 builds and runs the same program, stage1 is more
             # PERMISSIVE than the reference compiler — a real divergence, and one no census
             # here can otherwise see: the decline census counts what stage1 REFUSES, never
             # what it wrongly ACCEPTS. Reported separately from SKIP so the two are not
             # conflated; a genuinely malformed generator program lands in SKIP.
-            ok1p, _ = build_and_run(path, d, "s1")
-            results["PERMISSIVE" if ok1p else "SKIP"].append((name, None, None))
+            st1p, _ = build_and_run(path, d, "s1")
+            results["PERMISSIVE" if st1p == OK else "SKIP"].append((name, None, None))
             continue
         # A CRASHING oracle cannot arbitrate. differential_corpus skips a stage0 timeout for
         # the same reason; a negative code is a signal (observed: -11 SIGSEGV on a program
@@ -7184,22 +7213,26 @@ def main():
         # gate that cries wolf trains the next REAL wrong answer to be waved through.
         if rc0 is not None and rc0 < 0:
             results["SKIP"].append((name, rc0, None)); continue
-        ok1, rc1 = build_and_run(path, d, "s1")
-        if not ok1:
+        st1, rc1 = build_and_run(path, d, "s1")
+        if st1 == TIMEOUT:
+            results["TIMEOUT"].append((name, rc0, None)); continue
+        if st1 != OK:
             results["DECLINE"].append((name, rc0, None)); continue
         if rc0 != rc1:
             results["MISMATCH"].append((name, rc0, rc1))
             continue
         # Optimisation must not change the answer. Only checked once the -O0 answer already
         # agrees, so a row here always means "the pipeline changed a CORRECT answer".
-        ok2, rc2 = build_and_run(path, d, "s1O2")
-        if not ok2:
+        st2, rc2 = build_and_run(path, d, "s1O2")
+        if st2 == TIMEOUT:
+            results["TIMEOUT"].append((name, rc1, None))
+        elif st2 != OK:
             results["O2_DECLINE"].append((name, rc1, None))
         elif rc2 != rc1:
             results["O2_MISMATCH"].append((name, rc1, rc2))
         else:
             results["MATCH"].append((name, rc0, rc1))
-    for k in ("MISMATCH", "O2_MISMATCH", "O2_DECLINE", "DECLINE", "PERMISSIVE", "SKIP", "MATCH"):
+    for k in ("MISMATCH", "O2_MISMATCH", "O2_DECLINE", "DECLINE", "PERMISSIVE", "TIMEOUT", "SKIP", "MATCH"):
         for name, rc0, rc1 in results[k]:
             if k == "MATCH":
                 continue
@@ -7210,6 +7243,7 @@ def main():
           f"{len(results['O2_MISMATCH'])} O2_MISMATCH, {len(results['O2_DECLINE'])} O2_DECLINE, "
           f"{len(results['DECLINE'])} declined, "
           f"{len(results['PERMISSIVE'])} PERMISSIVE (stage0 rejects, stage1 builds), "
+          f"{len(results['TIMEOUT'])} TIMEOUT, "
           f"{len(results['SKIP'])} skipped")
     print(f"work dir: {work}")
     # RATCHET. All three of these are at zero and must stay there:
@@ -7219,7 +7253,11 @@ def main():
     # SKIP is not ratcheted: it means the ORACLE could not arbitrate (stage0 rejects the
     # program, or crashes on it), which says nothing about stage1. Keep those few honest by
     # fixing the generator program rather than by tolerating the skip.
-    return 1 if results["MISMATCH"] or results["O2_MISMATCH"] or results["O2_DECLINE"] or results["DECLINE"] or results["PERMISSIVE"] else 0
+    # TIMEOUT is ratcheted too: a program that will not finish twice, with a widened budget,
+    # is a runaway loop until proven otherwise. It is a SEPARATE bucket only so the report
+    # names what happened — "timed out" sends you to the host or to a hang, "declined" sent
+    # you hunting an acceptance gap that was never there.
+    return 1 if results["MISMATCH"] or results["O2_MISMATCH"] or results["O2_DECLINE"] or results["DECLINE"] or results["PERMISSIVE"] or results["TIMEOUT"] else 0
 
 def gen_packed_forward_declared_payload_enum():
     """A packed enum whose payload field names a packed enum declared LATER in the file.

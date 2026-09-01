@@ -16,8 +16,19 @@
 # Every compiled binary runs under a TIMEOUT. A wrong loop does not fail, it HANGS, and an
 # untimed gate hangs with it (observed: a stage0-compiled `while` spun at 100% CPU
 # forever). A timeout turns that into an ordinary failure.
+#
+# The timeout is RETRIED with a wider budget before it is believed. These programs finish in
+# milliseconds, so a 10s expiry means either a runaway loop -- which never finishes, and so
+# expires again -- or a host that was busy enough to stretch a 300ms program past ten
+# seconds. That second case is real: on a swapping machine this gate reported a DIFFERENT
+# set of "runaway loop" cases on every run, including ones where the STAGE0 binary was the
+# one that timed out. Retrying costs 30s on a genuine hang and removes the false positives.
 RUN() {
-    if command -v timeout >/dev/null 2>&1; then timeout 10 "$@"; else "$@"; fi
+    local status
+    if ! command -v timeout >/dev/null 2>&1; then "$@"; return $?; fi
+    timeout 10 "$@"; status=$?
+    if [ "$status" -eq 124 ]; then timeout 30 "$@"; status=$?; fi
+    return $status
 }
 set -u
 # A MISSPELLED or not-yet-defined check helper is `command not found` -- which bash reports
