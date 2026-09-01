@@ -32,6 +32,12 @@ REGRESSIONS = [
     ("void_call_into_return", "def compute()\n\ndef f() -> i64:\n    return compute()\n"),
     ("void_call_into_push", "def compute()\n\ndef f() -> void:\n    xs: mutable darray[i64] = []\n    xs.push(compute())\n"),
     ("malformed_signature_then_call", "def compute() -rn 5\n\ndef f() -> void:\n    x: i64 = compute()\n"),
+    # Non-IDENTIFIER junk after the def name: the signature-tail guard only caught Ident
+    # heads, so `def f 9 -> 3` was consumed whole by parse_signature_clauses with no
+    # diagnostic, became a phantom declaration-only `f`, and the later genuine `def f`
+    # made a duplicate whose call site crashed the backend (found by the random sweep as
+    # stepped_range_for.elisa#2).
+    ("junk_signature_then_duplicate", "def g() -> i64:\n    return 1\ndef f 9 -> 3\ndef f() -> i64:\n    return 2\ndef main() -> i64:\n    return g() + f()\n"),
     # Not a crash — INVALID IR that the object path tolerated: `ret ptr` from an `-> i64`
     # function. stage0 says "return type expects i64, got fn(i64) -> i64".
     ("fn_value_returned_as_scalar", "def apply(f: fn(i64) -> i64, n: i64) -> i64:\n    return f\n"),
