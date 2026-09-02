@@ -484,6 +484,52 @@ extend Backend:
         # ABI, emit the public symbol as a thin LLVM wrapper around the internal function.
         # Aggregate C ABI lowering is intentionally left to the dedicated export/header path;
         # declining here is safer than silently using the language ABI for a C boundary.
+        # `export fn foo(...) = foo`: the public name is the implementation's own. DIRECT
+        # when the implementation's lowered type already is the export ABI type (scalars,
+        # pointers): no wrapper, the implementation keeps `foo`, and goes external at the
+        # end of emission. Otherwise the declaration's own `foo.export` handle receives
+        # the wrapper body, the implementation is renamed `foo.impl`, and the wrapper takes
+        # `foo`. Mirrors stage0's isDirectlyExportedFunction / sameNameExportNeedsWrapper.
+        def emit_same_name_export(export_name: sview, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            impl_index: mutable i64 = -1
+            wrapper_index: mutable i64 = -1
+            for index in 0..<fns.names.count |impl_index, wrapper_index, fns, export_name|:
+                continue if fns.names[index] != export_name or fns.owners[index] != ""
+                if fns.is_extern[index]:
+                    wrapper_index <- index.i64() if wrapper_index < 0
+                else:
+                    impl_index <- index.i64() if impl_index < 0
+            false return if impl_index < 0 or wrapper_index < 0
+            false return if fns.is_error[impl_index.usize()] or fns.needs_arena[impl_index.usize()]
+            false return if fns.param_count[impl_index.usize()] != fns.param_count[wrapper_index.usize()]
+            impl: LLVMValueRef = fns.handles[impl_index.usize()]
+            wrapper: LLVMValueRef = fns.handles[wrapper_index.usize()]
+            if LLVMGlobalGetValueType(impl) == LLVMGlobalGetValueType(wrapper):
+                structs.direct_export_names.push(export_name)
+                structs.direct_export_handles.push(impl)
+                LLVMSetLinkage(impl, 0)
+                return true
+            false return if not emit_export_wrapper_to(export_name, impl, false, wrapper, fns, structs, runtime, m, ctx, builder)
+            impl_name_storage: mutable darray[u8] = []
+            for impl_name_index in 0..<sview_len(export_name) |impl_name_storage, export_name|:
+                impl_name_storage.push(sview_at(export_name, impl_name_index))
+            impl_name_storage.push(46)
+            impl_name_storage.push(105)
+            impl_name_storage.push(109)
+            impl_name_storage.push(112)
+            impl_name_storage.push(108)
+            impl_name_storage.push(0)
+            impl_name_cstr: cstr = (&impl_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            LLVMSetValueName2(impl, impl_name_cstr, export_name.len + 5)
+            wrapper_name_storage: mutable darray[u8] = []
+            for wrapper_name_index in 0..<sview_len(export_name) |wrapper_name_storage, export_name|:
+                wrapper_name_storage.push(sview_at(export_name, wrapper_name_index))
+            wrapper_name_storage.push(0)
+            wrapper_name_cstr: cstr = (&wrapper_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            LLVMSetValueName2(wrapper, wrapper_name_cstr, export_name.len)
+            LLVMSetLinkage(wrapper, 0)
+            return true
+
         def emit_export_wrapper(export_name: sview, target_name: sview, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             wrapper_index: i64 = function_index_of(fns, "", export_name)
             # An export declaration carries only the source target name. When
@@ -510,8 +556,22 @@ extend Backend:
             LLVMPositionBuilderAtEnd(builder, entry)
             argument_count: usize = fns.param_count[wrapper_index.usize()]
             arguments: mutable darray[LLVMValueRef] = []
-            for position in 0..<argument_count |arguments, fn|:
-                arguments.push(LLVMGetParam(fn, position.u32()))
+            for position in 0..<argument_count |arguments, fn, wrapper_index, fns, structs, ctx, builder|:
+                export_param: LLVMValueRef = LLVMGetParam(fn, position.u32())
+                # An aggregate that crossed the C ABI as an integer (declare_extern) is
+                # spilled and read back as the struct -- or handed over by pointer when
+                # the implementation takes it indirectly.
+                export_declared: ValueType = copied_type(fns.param_types[fns.param_start[wrapper_index.usize()] + position])
+                export_param_bytes: u64 = payload_type_byte_size(export_declared, structs) if export_declared.kind == TypeKind.Struct else 0
+                if export_param_bytes > 0 and export_param_bytes <= 8 and LLVMTypeOf(export_param) != llvm_type_of(export_declared, structs, ctx):
+                    export_param_slot: LLVMValueRef = LLVMBuildAlloca(builder, LLVMTypeOf(export_param), "export.arg.slot")
+                    _ = LLVMBuildStore(builder, export_param, export_param_slot)
+                    if value_type_uses_indirect_aggregate(export_declared, structs, ctx):
+                        arguments.push(export_param_slot)
+                    else:
+                        arguments.push(LLVMBuildLoad2(builder, llvm_type_of(export_declared, structs, ctx), export_param_slot, "export.arg"))
+                else:
+                    arguments.push(export_param)
             # `export fn axpy(...) = axpy_impl` where the TARGET threads an implicit arena
             # (any signature carrying a container does). The exported symbol keeps stage0's
             # declared ABI — four parameters, no arena — so the wrapper opens its own auto
@@ -544,7 +604,26 @@ extend Backend:
             if fns.returns[wrapper_index.usize()].kind == TypeKind.Void:
                 _ = LLVMBuildRetVoid(builder)
             else:
-                _ = LLVMBuildRet(builder, call_result)
+                # A struct result that the export returns as an integer: spill the
+                # implementation's value and read it back at the integer width. An
+                # implementation returning through sret is not handled; decline.
+                export_return_declared: ValueType = copied_type(fns.returns[wrapper_index.usize()])
+                export_return_bytes: u64 = payload_type_byte_size(export_return_declared, structs) if export_return_declared.kind == TypeKind.Struct else 0
+                if export_return_bytes > 0 and export_return_bytes <= 8:
+                    false return if value_type_uses_sret(export_return_declared, structs, ctx)
+                    export_return_int: mutable LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                    export_return_int <- LLVMInt32TypeInContext(ctx) if export_return_bytes == 4
+                    export_return_int <- LLVMInt16TypeInContext(ctx) if export_return_bytes == 2
+                    export_return_int <- LLVMInt8TypeInContext(ctx) if export_return_bytes == 1
+                    if export_return_bytes == 8 or export_return_bytes == 4 or export_return_bytes == 2 or export_return_bytes == 1:
+                        export_return_slot: LLVMValueRef = LLVMBuildAlloca(builder, export_return_int, "export.ret.slot")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(export_return_int), export_return_slot)
+                        _ = LLVMBuildStore(builder, call_result, export_return_slot)
+                        _ = LLVMBuildRet(builder, LLVMBuildLoad2(builder, export_return_int, export_return_slot, "export.ret"))
+                    else:
+                        _ = LLVMBuildRet(builder, call_result)
+                else:
+                    _ = LLVMBuildRet(builder, call_result)
             return true
 
         # Emit the body of one queued instantiation, with its type parameter BOUND for the
