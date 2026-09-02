@@ -77,4 +77,4 @@ if find "$WORK" -maxdepth 1 -type f \( -name '*.mjs' -o -name '*.d.ts' -o -name 
     exit 1
 fi
 
-echo "wasm component runtime smoke OK: canonical strings, lists, options, results, records, and scalar returns componentize with freestanding cabi_realloc and no JS/TS artifacts"
+echo "wasm component runtime smoke OK: canonical strings, lists, options, results, records, dynamic containers, and scalar returns componentize with freestanding allocation and no JS/TS artifacts"
