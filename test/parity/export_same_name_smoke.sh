@@ -5,7 +5,6 @@
 # same-name type/global register nothing new. This is the executable counterpart
 # to export_same_name_parity_smoke.sh.
 set -euo pipefail
-
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../wasm-sdk-stage0/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
@@ -21,12 +20,13 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 cat > "$WORK/caller.c" <<'C'
 #include <stdio.h>
 #include "mod.h"
-
 int main(void) {
     Vec2 v = { 20, 22 };
     int ok = 1;
     ok &= add(1, 2) == 3;
     ok &= vec2_sum(v) == 42;
+    ok &= mul(6, 7) == 42;
+    ok &= MAGIC == 1337;
     ok &= uses_internally() == 1344;
     Vec2 m = make_vec2(5, 6);
     ok &= m.x == 5 && m.y == 6;
@@ -55,7 +55,7 @@ run_one() {
         status=1
         return
     fi
-    for symbol in _add _vec2_sum _uses_internally _make_vec2; do
+    for symbol in _add _vec2_sum _mul _uses_internally _make_vec2; do
         nm "$dir/mod.o" | grep -q " T $symbol\$" || {
             echo "same-name export C smoke FAIL [$label]: $symbol is not external"
             nm "$dir/mod.o" | grep -i "$symbol" || true
