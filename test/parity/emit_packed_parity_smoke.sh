@@ -71,11 +71,13 @@ def main() -> i64:
 EOF
 bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit packed -o "$WORK/c1" "$WORK/commons.elisa" >/dev/null 2>&1 || {
     echo "FAILED packed-commons: stage1 emitted nothing"; differ=$((differ + 1)); }
-# 2 commons + widest payload 2 words => 8 + 16 + 16 = 40
+# The typed row is `{i32 tag, u32, i64, [2 x i64]}`. LLVM aligns the i64
+# common and payload to eight bytes, so its ABI size is 32 (not the old
+# hardcoded-i64 size of 40).
 check_line() {
     grep -Fqx "$1" "$WORK/c1" || { echo "FAILED packed-commons: missing line: $1"; differ=$((differ + 1)); }
 }
-check_line "  row bytes: 40"
+check_line "  row bytes: 32"
 check_line "  common prefix words: 2"
 check_line "  side-table common words: 0"
 check_line "    - t: u32 inline row_field=1"

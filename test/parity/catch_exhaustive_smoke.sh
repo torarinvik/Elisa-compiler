@@ -15,6 +15,9 @@ printf '%s\n' "$missing" | grep -q "non-exhaustive catch over \"FileError\"; mis
 complete=$(printf '%s%s' "$prefix" $'        NotFound:\n            1\n        Busy:\n            2\n' | "$RPT")
 printf '%s\n' "$complete" | grep -q '^D 0$'
 
+qualified=$(printf '%s%s' "$prefix" $'        FileError.NotFound:\n            1\n        FileError.Busy:\n            2\n' | "$RPT")
+printf '%s\n' "$qualified" | grep -q '^D 0$'
+
 fallback=$(printf '%s%s' "$prefix" $'        error e:\n            0\n' | "$RPT")
 printf '%s\n' "$fallback" | grep -q '^D 0$'
 
