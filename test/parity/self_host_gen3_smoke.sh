@@ -33,7 +33,35 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 GEN2_DIR="${SELF_HOST_GEN2_DIR:-$ROOT/build/self_host_gen2}"
 GEN2="$GEN2_DIR/elisac-stage1-gen2"
-WORK="$ROOT/build/gen3_check"; rm -rf "$WORK"; mkdir -p "$WORK"
+WORK="$ROOT/build/gen3_check"
+
+# EXCLUSIVE, because every leg of this check shares mutable state under build/ with
+# anything else that drives this worktree: $BIN (which `scripts/elisac_stage1.sh --seed`
+# rewrites in place), $GEN2_DIR, and $WORK. A second smoke, or an elisa-ui build calling
+# this worktree's elisac_stage1.sh, can therefore swap the compiler out from under a
+# run in flight -- gen2 then gets built by one binary and gen3 by another, and stage C
+# reports `gen3.o != gen4.o` for a divergence that does not exist. That false failure
+# has already been chased once as if it were a miscompile; take the lock instead.
+SMOKE_LOCK="$ROOT/build/.self_host_gen3.lock"
+mkdir -p "$ROOT/build"
+if ! mkdir "$SMOKE_LOCK" 2>/dev/null; then
+    lock_pid=""
+    [ -f "$SMOKE_LOCK/pid" ] && lock_pid="$(<"$SMOKE_LOCK/pid")"
+    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+        echo "self_host_gen3_smoke FAIL: another run holds $SMOKE_LOCK (pid $lock_pid); a concurrent run corrupts this check" >&2
+        exit 1
+    fi
+    # Only the recorded owner being gone makes the lock stale; reclaim just this directory.
+    rm -f "$SMOKE_LOCK/pid"
+    rmdir "$SMOKE_LOCK" 2>/dev/null && mkdir "$SMOKE_LOCK" 2>/dev/null || {
+        echo "self_host_gen3_smoke FAIL: could not acquire $SMOKE_LOCK" >&2
+        exit 1
+    }
+fi
+echo "$$" >"$SMOKE_LOCK/pid"
+trap 'rm -f "$SMOKE_LOCK/pid"; rmdir "$SMOKE_LOCK" 2>/dev/null || true' EXIT INT TERM HUP
+
+rm -rf "$WORK"; mkdir -p "$WORK"
 
 # The exit code stage B must produce. 0 = bootstrap closed; anything else is a REGRESSION
 # and must be investigated, not silently re-baselined.
