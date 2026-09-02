@@ -142,8 +142,10 @@ JavaScript/TypeScript facade belongs in this compiler repository.
 Component builds link `elisacore_std/wasm_component_runtime.elisa`, a freestanding
 `cabi_realloc` implementation that grows exported linear memory and reuses the top allocation
 when canonical lowering releases or resizes it. It intentionally does not import the native
-`env` allocator. The same runtime supplies the normal `arena_alloc` and `arena_realloc` ABI used
-by Elisa `darray` values, so component guests can construct dynamic local lists without a native
-allocator import. A target SDK must still bound and validate host-returned pointer/count pairs;
-the compiler does not know the element type or ownership policy of a target's WIT records and
-lists.
+`env` allocator. The same runtime supplies the normal `arena_alloc`, `arena_realloc`, and
+`arena_free` ABI used by Elisa `darray` values, so component guests can construct dynamic local
+lists without a native allocator import. Owned Elisa arenas use reusable linear-memory chunks;
+their chunks return to a component-local free list on every generated return/error unwind, while
+the independent CABI allocator remains protected from reuse. A target SDK must still bound and
+validate host-returned pointer/count pairs; the compiler does not know the element type or
+ownership policy of a target's WIT records and lists.
