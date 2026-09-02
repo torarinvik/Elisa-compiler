@@ -653,18 +653,163 @@ extend Backend:
         def packed_or_ast_enum_names(file: Ast::File&, names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
             names.extend(file.packed_enum_names)
             for annotation in file.enum_annotations |names|:
-                include_owner: bool = annotation.name == "__ast_refinement" or annotation.name == "__recursive_field" or annotation.name == "__aos" or annotation.line == 3900000008
+                # An `is` edge alone no longer means the store: only a store-backed
+                # hierarchy (see hierarchy_is_store_backed) registers as packed.
+                edge_is_store: bool = annotation.line == 3900000008 and hierarchy_is_store_backed(file, annotation.owner)
+                mark_is_store: bool = (annotation.name == "__ast_refinement" or annotation.name == "__aos") and hierarchy_is_store_backed(file, annotation.owner)
+                include_owner: bool = annotation.name == "__recursive_field" or mark_is_store or edge_is_store
                 if include_owner:
                     already_owner: mutable bool = false
                     for existing_owner in names |already_owner, annotation|:
                         already_owner <- true if existing_owner == annotation.owner
                     names.push(annotation.owner) if not already_owner and annotation.owner != ""
-                if annotation.line == 3900000008:
+                if edge_is_store:
                     already_parent: mutable bool = false
                     for existing_parent in names |already_parent, annotation|:
                         already_parent <- true if existing_parent == annotation.name
                     names.push(annotation.name) if not already_parent and annotation.name != ""
 
+
+
+        # ---- Hierarchy representation (parity with stage0) ----
+        #
+        # stage0 lowers a sealed hierarchy INLINE -- an ordinary `{i32 tag, payload}`
+        # tagged union sized for the widest leaf, tags numbered in pre-order across the
+        # whole tree -- unless it is STORE-backed: the root is a `packed enum`, a member
+        # is recursive, or the root declares `common:` fields. Only then do values become
+        # handles into a region-backed AoS store. stage1 used to put EVERY `is` edge on
+        # the store, so an event-kind taxonomy allocated a row per value (measured: an
+        # unbounded leak on the component's monotonic heap).
+
+        def hierarchy_parent_in_file(file: Ast::File&, name: sview) -> sview can[Abort.Panic]:
+            for annotation in file.enum_annotations |name|:
+                annotation.name return if annotation.line == 3900000008 and annotation.owner == name
+            return ""
+
+        def hierarchy_root_in_file(file: Ast::File&, name: sview) -> sview can[Abort.Panic]:
+            cursor: mutable sview = name
+            steps: mutable usize = 0
+            while steps < file.enum_annotations.count |cursor, steps, file|:
+                parent: sview = hierarchy_parent_in_file(file, cursor)
+                break if parent == ""
+                cursor <- parent
+                steps <- steps + 1
+            return cursor
+
+        def hierarchy_has_children_in_file(file: Ast::File&, name: sview) -> bool can[Abort.Panic]:
+            for annotation in file.enum_annotations |name|:
+                true return if annotation.line == 3900000008 and annotation.name == name
+            return false
+
+        # Whether ONE member, on its own, forces its hierarchy onto the store: the `packed`
+        # keyword, a recursive member, or the compiler's own AST. That is stage0's rule.
+        #
+        # `__ast_refinement` and `__aos` do NOT belong here, however store-ish they read.
+        # The parser stamps both on EVERY user hierarchy (record_recursive_enum promotes
+        # any `is Parent` clause), so counting them made this predicate constantly true,
+        # which made hierarchy_is_store_backed constantly true, which left the inline path
+        # unreachable and every inline hierarchy declined by the backend. The distinct
+        # `__compiler_ast_refinement` mark is the one that means the compiler's own AST.
+        def enum_forces_store(file: Ast::File&, name: sview) -> bool can[Abort.Panic]:
+            for packed_name in file.packed_enum_names |name|:
+                true return if packed_name == name
+            for annotation in file.enum_annotations |name|:
+                continue if annotation.owner != name
+                true return if annotation.name == "__recursive_field" or annotation.name == "__compiler_ast_refinement"
+            for common_index in 0..<file.enum_common_owners.count |file, name|:
+                true return if file.enum_common_owners[common_index] == name and common_index < file.enum_common_counts.count and file.enum_common_counts[common_index] > 0
+            return false
+
+        # Whether the hierarchy that `name` belongs to is store-backed: any member
+        # forces it (the root, or any refinement anywhere in the tree).
+        def hierarchy_is_store_backed(file: Ast::File&, name: sview) -> bool can[Abort.Panic]:
+            root: sview = hierarchy_root_in_file(file, name)
+            true return if enum_forces_store(file, root)
+            for annotation in file.enum_annotations |file, root|:
+                continue if annotation.line != 3900000008
+                continue if hierarchy_root_in_file(file, annotation.owner) != root
+                true return if enum_forces_store(file, annotation.owner)
+            return false
+
+        # Register an INLINE hierarchy as ONE payload enum under its root: every member's
+        # leaves in pre-order (a node's own variants, then each refinement's subtree, in
+        # declaration order -- stage0's assignHierarchyEnumTags), so the tag of a leaf is
+        # its position in that walk. Each refinement becomes a type ALIAS of the root, so a
+        # `MouseEvent` value and an `Event` value are the same LLVM type and the upcast is a
+        # typed no-op, exactly as docs/77 promises.
+        def register_inline_hierarchy(file: Ast::File&, root: sview, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return if penum_index_of(structs, root) >= 0
+                members: mutable darray[sview] = []
+                collect_hierarchy_members_preorder(file, root, members)
+                start: usize = structs.penum_variants.count
+                flat_start: usize = structs.penum_field_types.count
+                declined: mutable bool = false
+                widest: mutable u32 = 0
+                for member in members |file, structs, declined, widest|:
+                    continue if declined
+                    member_slot: mutable i64 = -1
+                    for enum_index in 0..<file.payload_enum_names.count |member_slot, file, member|:
+                        member_slot <- enum_index.i64() if file.payload_enum_names[enum_index] == member
+                    rows_before: usize = structs.penum_variants.count
+                    if member_slot < 0:
+                        # A member whose variants ALL lack a payload (often the root) is not in
+                        # the payload-enum metadata at all; its leaves come from the plain
+                        # declaration tables and register as payload-less rows, so they keep
+                        # their pre-order tag positions.
+                        register_inline_payloadless_member(file, member, structs)
+                        for _ in rows_before..<structs.penum_variants.count |structs, member|:
+                            structs.penum_variant_owners <- structs.penum_variant_owners.push(member)
+                        continue
+                    continue if file.payload_enum_is_const[member_slot.usize()]
+                    register_payload_variant_rows_flat(file.payload_enum_variant_names, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.payload_enum_variant_field_counts, file.payload_enum_variant_starts[member_slot.usize()], file.payload_enum_variant_counts[member_slot.usize()], is_declared_error_set(structs, member), declined, widest, structs)
+                    for _ in rows_before..<structs.penum_variants.count |structs, member|:
+                        structs.penum_variant_owners <- structs.penum_variant_owners.push(member)
+                if declined:
+                    while structs.penum_variants.count > start |structs|:
+                        _ = structs.penum_variants.pop()
+                        _ = structs.penum_variant_owners.pop()
+                        _ = structs.penum_payloads.pop()
+                        _ = structs.penum_has_payload.pop()
+                        _ = structs.penum_field_names.pop()
+                        _ = structs.penum_field_type_start.pop()
+                        _ = structs.penum_field_type_count.pop()
+                    while structs.penum_field_types.count > flat_start |structs|:
+                        _ = structs.penum_field_types.pop()
+                        _ = structs.penum_field_flat_names.pop()
+                    return
+                root_index: usize = structs.penum_names.count
+                structs.penum_names <- structs.penum_names.push(root)
+                structs.penum_variant_start <- structs.penum_variant_start.push(start)
+                structs.penum_variant_count <- structs.penum_variant_count.push(structs.penum_variants.count - start)
+                structs.penum_payload_words <- structs.penum_payload_words.push(widest)
+                for member in members |structs, root, root_index|:
+                    continue if member == root
+                    continue if alias_index_of(structs, member) >= 0
+                    structs.alias_names <- structs.alias_names.push(member)
+                    structs.alias_types <- structs.alias_types.push(ValueType{kind: TypeKind.PayloadEnum, bits: root_index.u32()})
+
+
+        def register_inline_payloadless_member(file: Ast::File&, member: sview, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for decl_index in 0..<file.enum_decl_names.count |file, member, structs|:
+                continue if file.enum_decl_names[decl_index] != member
+                continue if file.enum_decl_is_const[decl_index]
+                variant_start: usize = file.enum_decl_variant_starts[decl_index]
+                variant_count: usize = file.enum_decl_variant_counts[decl_index]
+                for variant_index in 0..<variant_count |file, structs, variant_start|:
+                    structs.penum_field_type_start <- structs.penum_field_type_start.push(structs.penum_field_types.count)
+                    structs.penum_field_type_count <- structs.penum_field_type_count.push(0)
+                    structs.penum_variants <- structs.penum_variants.push(file.enum_decl_variant_names[variant_start + variant_index])
+                    structs.penum_payloads <- structs.penum_payloads.push(unmodeled_type())
+                    structs.penum_has_payload <- structs.penum_has_payload.push(false)
+                    structs.penum_field_names <- structs.penum_field_names.push("")
+                return
+
+        def collect_hierarchy_members_preorder(file: Ast::File&, node: sview, out: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            out.push(node)
+            for annotation in file.enum_annotations |file, node, out|:
+                continue if annotation.line != 3900000008 or annotation.name != node
+                collect_hierarchy_members_preorder(file, annotation.owner, out)
 
         # Reserve a variant-less PLACEHOLDER row for a packed enum name, so a payload field
         # referring to it resolves even before its own declaration is registered.
@@ -809,11 +954,28 @@ extend Backend:
             while index < structs.penum_names.count |index, structs, name|:
                 index.i64() return if structs.penum_names[index] == name
                 index <- index + 1
+            # A refinement of an INLINE hierarchy is an alias of its root's payload enum.
+            alias_slot: i64 = alias_index_of(structs, name)
+            if alias_slot >= 0:
+                aliased: ValueType = structs.alias_types[alias_slot.usize()]
+                aliased.bits.i64() return if aliased.kind == TypeKind.PayloadEnum
             return -1
 
 
         # A variant's TAG is its index within its own enum's span, matching stage0, where the
         # tag compare is `icmp eq i32 %tag, <declaration ordinal>`. -1 when unknown.
+        # `Owner.V` inside a payload enum's span: the row DECLARED by `owner` (a refinement
+        # of an inline hierarchy, or the enum itself) named `variant_name`. Falls back to a
+        # name-only match, which is what a plain enum needs and what the old lookup did.
+        def penum_variant_index_owned(structs: StructTable&, enum_index: i64, owner: sview, variant_name: sview) -> i64 can[Abort.Panic]:
+            start: usize = structs.penum_variant_start[enum_index.usize()]
+            count: usize = structs.penum_variant_count[enum_index.usize()]
+            for offset in 0..<count |structs, start, owner, variant_name|:
+                slot: usize = start + offset
+                continue if structs.penum_variants[slot] != variant_name
+                offset.i64() return if slot >= structs.penum_variant_owners.count or structs.penum_variant_owners[slot] == owner
+            return penum_variant_index(structs, enum_index, variant_name)
+
         def penum_variant_index(structs: StructTable&, enum_index: i64, variant_name: sview) -> i64 can[Abort.Panic]:
             start: usize = structs.penum_variant_start[enum_index.usize()]
             count: usize = structs.penum_variant_count[enum_index.usize()]
@@ -993,10 +1155,13 @@ extend Backend:
                         declined: mutable bool = false
                         widest: mutable u32 = 0
                         register_payload_variant_rows(variants, is_declared_error_set(structs, enum_name), declined, widest, structs)
+                        for _ in start..<structs.penum_variants.count |structs, enum_name|:
+                            structs.penum_variant_owners <- structs.penum_variant_owners.push(enum_name)
                         if declined:
                             # Unregister: leave no half-built enum behind for a use site to find.
                             while structs.penum_variants.count > start |structs|:
                                 _ = structs.penum_variants.pop()
+                                _ = structs.penum_variant_owners.pop()
                                 _ = structs.penum_payloads.pop()
                                 _ = structs.penum_has_payload.pop()
                                 _ = structs.penum_field_names.pop()
@@ -1023,9 +1188,12 @@ extend Backend:
                 declined: mutable bool = false
                 widest: mutable u32 = 0
                 register_payload_variant_rows_flat(variant_names, variant_fields, variant_field_names, variant_field_starts, variant_field_counts, variant_start, variant_count, is_declared_error_set(structs, enum_name), declined, widest, structs)
+                for _ in start..<structs.penum_variants.count |structs, enum_name|:
+                    structs.penum_variant_owners <- structs.penum_variant_owners.push(enum_name)
                 if declined:
                     while structs.penum_variants.count > start |structs|:
                         _ = structs.penum_variants.pop()
+                        _ = structs.penum_variant_owners.pop()
                         _ = structs.penum_payloads.pop()
                         _ = structs.penum_has_payload.pop()
                         _ = structs.penum_field_names.pop()
@@ -1054,6 +1222,16 @@ extend Backend:
             # as the enum count, and the loop stops the first round that registers nothing.
         def register_payload_enums_from_metadata(file: Ast::File&, packed_names: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                # INLINE hierarchies first, driven by the ENUM DECLARATIONS rather than by
+                # the payload metadata: a hierarchy whose members all lack payloads (an
+                # event-kind taxonomy) appears in no payload table at all, so registering
+                # from that table alone left it unregistered and every use declined.
+                for decl_index in 0..<file.enum_decl_names.count |file, structs|:
+                    decl_name: sview = file.enum_decl_names[decl_index]
+                    continue if file.enum_decl_is_const[decl_index]
+                    continue if hierarchy_parent_in_file(file, decl_name) == "" and not hierarchy_has_children_in_file(file, decl_name)
+                    continue if hierarchy_is_store_backed(file, decl_name)
+                    register_inline_hierarchy(file, hierarchy_root_in_file(file, decl_name), structs)
                 round_index: mutable usize = 0
                 registered: mutable usize = 0
                 progressed: mutable bool = true
@@ -1061,6 +1239,13 @@ extend Backend:
                     round_index <- round_index + 1
                     for enum_index in 0..<file.payload_enum_names.count |file, packed_names, structs|:
                         continue if penum_index_of(structs, file.payload_enum_names[enum_index]) >= 0
+                        member_name: sview = file.payload_enum_names[enum_index]
+                        # An INLINE hierarchy registers ONCE, from its root; a refinement
+                        # is an alias of the root and never a payload enum of its own.
+                        in_hierarchy: bool = hierarchy_parent_in_file(file, member_name) != "" or hierarchy_has_children_in_file(file, member_name)
+                        if in_hierarchy and not hierarchy_is_store_backed(file, member_name):
+                            register_inline_hierarchy(file, hierarchy_root_in_file(file, member_name), structs)
+                            continue
                         register_payload_enum_decl_flat(file.payload_enum_names[enum_index], file.payload_enum_variant_names, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.payload_enum_variant_field_counts, file.payload_enum_variant_starts[enum_index], file.payload_enum_variant_counts[enum_index], file.payload_enum_is_const[enum_index], packed_names, structs)
                     progressed <- structs.penum_names.count > registered
                     registered <- structs.penum_names.count
@@ -1156,6 +1341,12 @@ extend Backend:
                 for packed_name in enums_packed_or_ast |is_packed, enum_name|:
                     is_packed <- true if packed_name == enum_name
                 continue if is_packed
+                # A member of an INLINE hierarchy is never a plain ordinal enum, even when
+                # its own variants carry no payload: the whole tree is ONE tagged union
+                # sized for its widest leaf, registered by register_inline_hierarchy. A
+                # payload-less root that landed here became an i32 while its refinements
+                # were the union, and a widening `y: Event = mouse` crashed.
+                continue if hierarchy_parent_in_file(file, enum_name) != "" or hierarchy_has_children_in_file(file, enum_name)
                 backing: mutable ValueType = ValueType{kind: TypeKind.Signed, bits: 32}
                 if file.enum_decl_is_const[enum_index]:
                     backing <- resolve_type_head(file.enum_decl_storage_heads[enum_index], structs)
