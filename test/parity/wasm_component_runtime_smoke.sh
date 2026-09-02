@@ -35,6 +35,10 @@ build_fixture \
     "$ROOT/test/fixtures/wasm/component_host_surface.wit" \
     "$ROOT/test/fixtures/wasm/component_host_surface.elisa" \
     host-surface
+build_fixture \
+    "$ROOT/test/fixtures/wasm/component_arena_reuse.wit" \
+    "$ROOT/test/fixtures/wasm/component_arena_reuse.elisa" \
+    arena-reuse
 
 # Keep stage0's component ABI path covered as well.  This is optional so the
 # normal stage1 smoke remains runnable from a checkout that has not built a
@@ -70,6 +74,10 @@ if [[ -n "$STAGE0" && -x "$STAGE0" ]]; then
         "$ROOT/test/fixtures/wasm/component_host_surface.wit" \
         "$ROOT/test/fixtures/wasm/component_host_surface.elisa" \
         host-surface
+    build_stage0_fixture \
+        "$ROOT/test/fixtures/wasm/component_arena_reuse.wit" \
+        "$ROOT/test/fixtures/wasm/component_arena_reuse.elisa" \
+        arena-reuse
 fi
 
 if find "$WORK" -maxdepth 1 -type f \( -name '*.mjs' -o -name '*.d.ts' -o -name '*.d.mts' \) -print -quit | grep -q .; then
@@ -77,4 +85,4 @@ if find "$WORK" -maxdepth 1 -type f \( -name '*.mjs' -o -name '*.d.ts' -o -name 
     exit 1
 fi
 
-echo "wasm component runtime smoke OK: canonical strings, lists, options, results, records, dynamic containers, and scalar returns componentize with freestanding allocation and no JS/TS artifacts"
+echo "wasm component runtime smoke OK: canonical strings, lists, options, results, records, dynamic containers, scalar returns, and repeated arena lifetimes componentize with freestanding allocation and no JS/TS artifacts"
