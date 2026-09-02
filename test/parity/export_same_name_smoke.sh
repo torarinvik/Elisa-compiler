@@ -24,6 +24,9 @@ export fn add(a: i32, b: i32) -> i32 = add
 def vec2_sum(v: Vec2) -> i32:
     return v.x + v.y
 export fn vec2_sum(v: Vec2) -> i32 = vec2_sum
+def make_vec2(x: i32, y: i32) -> Vec2:
+    return Vec2{x: x, y: y}
+export fn make_vec2(x: i32, y: i32) -> Vec2 = make_vec2
 def mul_impl(a: i32, b: i32) -> i32:
     return a * b
 export fn mul(a: i32, b: i32) -> i32 = mul_impl
@@ -43,6 +46,9 @@ int main(void) {
     ok &= mul(6, 7) == 42;
     ok &= MAGIC == 1337;
     ok &= uses_internally() == 1344;
+    Vec2 m = make_vec2(5, 6);
+    ok &= m.x == 5 && m.y == 6;
+    ok &= vec2_sum(make_vec2(8, 9)) == 17;
     printf("%s\n", ok ? "ALL OK" : "FAILED");
     return ok ? 0 : 1;
 }
@@ -53,10 +59,10 @@ run_one() {
   local dir="$BUILD/$label"; mkdir -p "$dir"
   if ! "$@" -emit obj -O0 -o "$dir/mod.o" "$BUILD/mod.elisa" >"$dir/obj.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: compile"; head -3 "$dir/obj.log"; status=1; return; fi
   if ! "$@" -emit header -o "$dir/mod.h" "$BUILD/mod.elisa" >"$dir/hdr.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: header"; head -3 "$dir/hdr.log"; status=1; return; fi
-  for sym in _add _vec2_sum _mul _uses_internally; do
+  for sym in _add _vec2_sum _mul _uses_internally _make_vec2; do
     nm "$dir/mod.o" | grep -q " T $sym\$" || { echo "export_same_name_smoke FAIL [$label]: $sym is not an external symbol"; nm "$dir/mod.o" | grep -i "$sym" || true; status=1; return; }
   done
-  if ! clang -I"$dir" -o "$dir/caller" "$BUILD/caller.c" "$dir/mod.o" "$RUNTIME" >"$dir/link.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: link"; head -5 "$dir/link.log"; status=1; return; fi
+  if ! clang -Wl,-dead_strip -I"$dir" -o "$dir/caller" "$BUILD/caller.c" "$dir/mod.o" "$RUNTIME" >"$dir/link.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: link"; head -5 "$dir/link.log"; status=1; return; fi
   out="$("$dir/caller" || true)"
   if [ "$out" != "ALL OK" ]; then echo "export_same_name_smoke FAIL [$label]: C caller says: $out"; status=1; return; fi
   echo "export_same_name_smoke OK [$label]: ALL OK from C"
