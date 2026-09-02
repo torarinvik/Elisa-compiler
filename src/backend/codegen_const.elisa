@@ -605,6 +605,11 @@ extend Backend:
         def packed_profile_mode(annotations: darray[Ast::EnumAnnotation]&) -> i32 can[Abort.Panic]:
             for annotation in annotations:
                 2 return if annotation.name == "__aos" and annotation.line == 3900000042
+                # Recursive values and sealed hierarchies need stable rows because a child
+                # value is consumed through its root type. stage0 selects canonical AoS for
+                # these automatically; leaving them in variant-sparse mode loses the root row
+                # ABI before codegen can reason about the hierarchy.
+                2 return if annotation.name == "__recursive_field" or annotation.name == "__ast_refinement"
                 if annotation.line == 3900000041:
                     1 return if annotation.name == "retained_reads"
                     2 return if annotation.name == "build_heavy"
@@ -622,15 +627,11 @@ extend Backend:
         def packed_is_ast_root_row(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
             false return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
             false return if structs.packed_variant_count[enum_index.usize()] != 0.usize()
-            name: sview = structs.packed_names[enum_index.usize()]
-            true return if name == "Node"
-            # ...or any other reserved variant-less row that something REFINES — the SHAPE of
-            # a sealed root (docs/77 writes one as `enum Root: pass`), not its name. Both
-            # conditions are load-bearing: requiring zero variants keeps an ordinary user
-            # packed enum out of this predicate (conflating the two once gave a user enum the
-            # AST's 132-byte row, so its store had the wrong stride and every payload read
-            # back as 0), and requiring a refinement keeps a plain memberless enum out.
-            return packed_name_is_hierarchy_root(structs, name)
+            # Generic user hierarchies use the same zero-variant placeholder shape, but their
+            # rows are dynamically sized. Only the parser's dedicated compiler-AST marker may
+            # select the historical Node row; testing the generic hierarchy marker here made
+            # every user root look like the compiler's 132-byte AST store.
+            return packed_is_ast_refinement(structs, enum_index)
 
 
         def packed_is_ast_root(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
@@ -654,6 +655,18 @@ extend Backend:
             return structs.packed_variant_count[enum_index.usize()] > 0.usize()
 
 
+        # Whether this packed enum uses the measured dynamic AoS row shape. Unlike
+        # packed_is_ast_root, this includes a flat recursive enum (`Tree`) and every member of
+        # a user sealed hierarchy. Compiler AST rows retain the historical 32-slot floor, while
+        # user rows are sized from their actual widest payload.
+        def packed_is_dynamic_aos_enum(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            name: sview = structs.packed_names[enum_index.usize()]
+            for dynamic_name in structs.aos_dynamic_names |name|:
+                true return if dynamic_name == name
+            return false
+
+
         # The name at the top of `name`'s `is` chain — itself when it has no parent. The step
         # budget is the edge count: a well-formed hierarchy is a tree, so a longer walk means
         # a cycle from malformed input and must terminate rather than hang.
@@ -671,15 +684,42 @@ extend Backend:
                 return cursor
 
 
+        # The tag space of a sealed hierarchy is shared by all refinements. A child enum's
+        # local variant ordinal therefore starts after every earlier declaration in the same
+        # hierarchy; treating it as a standalone packed enum makes `Button.Push` collide with
+        # `Control.Label` (both become tag 0) and is invisible until a match crosses that edge.
+        # Flat packed enums retain their local zero-based tags.
+        def packed_hierarchy_tag_base(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
+            return 0 if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            own_name: sview = structs.packed_names[enum_index.usize()]
+            root_name: sview = packed_hierarchy_root_name(structs, own_name)
+            is_hierarchy: bool = root_name != own_name or packed_name_is_hierarchy_root(structs, own_name)
+            return 0 if not is_hierarchy
+            base: mutable i64 = 0
+            for prior in 0..<enum_index.usize() |base, structs, root_name|:
+                prior_root: sview = packed_hierarchy_root_name(structs, structs.packed_names[prior])
+                base <- base + structs.packed_variant_count[prior].i64() if prior_root == root_name
+            return base
+
+
         # The packed-enum index of the store that owns `enum_index` — the root of its sealed
         # hierarchy. This resolved to the literal name "Node" before, which is why a user
         # hierarchy type-checked and then declined in the backend: its root is not called
         # Node, so the lookup returned -1 and every store query failed.
         def packed_root_index_of(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
             can Abort.Panic:
-                enum_index return if not packed_is_ast_refinement(structs, enum_index)
+                enum_index return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
                 own_name: sview = structs.packed_names[enum_index.usize()]
                 root_name: sview = packed_hierarchy_root_name(structs, own_name)
+                # User hierarchies are generic packed/AoS values, not compiler-AST
+                # refinements, but their descendants still share the root's store.
+                if root_name != own_name:
+                    hierarchy_root_index: i64 = packed_index_of(structs, root_name)
+                    hierarchy_root_index return if hierarchy_root_index >= 0
+                # A flat recursive enum has no variant-less hierarchy anchor, but it still owns
+                # a store: its self-referential handles cannot be indexed into a compiler AST
+                # store (and there is no Node fallback in a user program).
+                enum_index return if packed_is_dynamic_aos_enum(structs, enum_index) and root_name == own_name
                 # Trust the edge walk only when it actually resolves a hierarchy: either it
                 # MOVED (this enum has a parent) or this enum is itself a root something
                 # refines. The auxiliary StructTables (the C-header and debug paths build
@@ -687,10 +727,10 @@ extend Backend:
                 # which for `Expr` is a REGISTERED packed name, so trusting it silently made
                 # Expr its own store root instead of Node and broke the gen3 fixpoint. The
                 # compiler's own AST must keep resolving to Node in exactly that case.
-                if root_name != own_name or packed_name_is_hierarchy_root(structs, own_name):
+                if packed_is_ast_refinement(structs, enum_index) and (root_name != own_name or packed_name_is_hierarchy_root(structs, own_name)):
                     hierarchy_root_index: i64 = packed_index_of(structs, root_name)
                     hierarchy_root_index return if hierarchy_root_index >= 0
-                return packed_index_of(structs, "Node")
+                return enum_index
 
 
             # Two packed variant slots have the SAME payload FIELD layout — identical field count and
@@ -742,12 +782,9 @@ extend Backend:
             can Abort.Panic:
                 start: usize = structs.packed_variant_start[enum_index.usize()]
                 count: usize = structs.packed_variant_count[enum_index.usize()]
+                packed_tag_base: i64 = packed_hierarchy_tag_base(structs, enum_index)
                 offset: mutable usize = 0
                 while offset < count |offset, structs, start, variant_name|:
-                    packed_tag_base: mutable i64 = 0
-                    if packed_is_ast_refinement(structs, enum_index):
-                        for prior_enum in 0..<enum_index.usize() |packed_tag_base, structs|:
-                            packed_tag_base <- packed_tag_base + structs.packed_variant_count[prior_enum].i64() if packed_is_ast_refinement(structs, prior_enum.i64())
                     (packed_tag_base + offset.i64()) return if structs.packed_variants[start + offset] == variant_name
                     offset <- offset + 1
                 return -1
@@ -858,11 +895,34 @@ extend Backend:
                 return widest
 
 
+        # The user AoS row's payload slots: the widest variant across the whole hierarchy. A
+        # root row must be large enough for every descendant, since values flow through the
+        # root handle and constructors/matches use one shared store.
+        def packed_dynamic_aos_row_slots(structs: mutable StructTable&, enum_index: i64) -> u32 can[Abort.Panic]:
+            can Abort.Panic:
+                1 return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+                root_name: sview = packed_hierarchy_root_name(structs, structs.packed_names[enum_index.usize()])
+                widest: mutable u32 = 1
+                for candidate in 0..<structs.packed_names.count |widest, structs, root_name|:
+                    candidate_name: sview = structs.packed_names[candidate]
+                    continue if packed_hierarchy_root_name(structs, candidate_name) != root_name
+                    variant_start: usize = structs.packed_variant_start[candidate]
+                    variant_count: usize = structs.packed_variant_count[candidate]
+                    for variant_offset in 0..<variant_count |widest, structs, variant_start|:
+                        slots: u32 = packed_variant_row_slots(structs, variant_start + variant_offset)
+                        widest <- slots if slots > widest
+                return widest
+
+
         # The ROW LAYOUT `{i32 tag, [N x i64] payload}` — what a row contains, as distinct
         # from the handle (an i32 index) that names it.
         def packed_row_llvm_type(structs: mutable StructTable&, enum_index: i64, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if packed_is_ast_root_row(structs, packed_root_index_of(structs, enum_index)):
                 row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt32TypeInContext(ctx), packed_ast_row_slots(structs))]
+                row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, row_pointer, 2, 0)
+            if packed_is_dynamic_aos_enum(structs, enum_index):
+                row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt32TypeInContext(ctx), packed_dynamic_aos_row_slots(structs, enum_index))]
                 row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
                 return LLVMStructTypeInContext(ctx, row_pointer, 2, 0)
             words: u32 = structs.packed_payload_words[enum_index.usize()]
@@ -877,6 +937,129 @@ extend Backend:
             return LLVMStructTypeInContext(ctx, row_pointer, (2 + commons), 0)
 
 
+        # Dynamic AoS rows use the canonical stage0 representation `{i32, [N x i32]}`.
+        # The payload array is a raw byte carrier, so typed Elisa values must cross it through
+        # a temporary and four-byte loads/stores; loading an `i64` directly from the array
+        # would overrun a one-word row and is invalid for f32 or handle payloads.
+        def packed_dynamic_row_payload_words(structs: mutable StructTable&, enum_index: i64, row: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, name: cstr) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            row_type: LLVMTypeRef = packed_row_llvm_type(structs, enum_index, ctx)
+            array_type: LLVMTypeRef = LLVMArrayType(LLVMInt32TypeInContext(ctx), packed_dynamic_aos_row_slots(structs, enum_index))
+            field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, row_type, row, 1, name)
+            indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)]
+            indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMBuildGEP2(builder, array_type, field_pointer, indices_pointer, 2, name)
+
+
+        def packed_dynamic_row_store_value(value: LLVMValueRef, value_type: ValueType, slots: u32, structs: mutable StructTable&, enum_index: i64, row: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if slots == 0
+            temp: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(value_type, structs, ctx), "packed.raw.store.temp")
+            _ = LLVMBuildStore(builder, value, temp)
+            i32_pointer: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            source: LLVMValueRef = LLVMBuildBitCast(builder, temp, i32_pointer, "packed.raw.store.source")
+            destination: LLVMValueRef = packed_dynamic_row_payload_words(structs, enum_index, row, ctx, builder, "packed.raw.store.payload")
+            for word_index in 0..<slots.usize() |source, destination, word_index, ctx, builder|:
+                index: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), word_index.u64(), 0)
+                source_indices: mutable darray[LLVMValueRef] = [index]
+                source_pointer: void& = (&source_indices[0]).cast[void&] can Unsafe.PointerCast
+                source_word_pointer: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt32TypeInContext(ctx), source, source_pointer, 1, "packed.raw.store.word")
+                source_word: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), source_word_pointer, "packed.raw.store.word.value")
+                destination_indices: mutable darray[LLVMValueRef] = [index]
+                destination_pointer: void& = (&destination_indices[0]).cast[void&] can Unsafe.PointerCast
+                destination_word_pointer: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt32TypeInContext(ctx), destination, destination_pointer, 1, "packed.raw.store.destination")
+                _ = LLVMBuildStore(builder, source_word, destination_word_pointer)
+            return true
+
+
+        def packed_raw_words_store_value(value: LLVMValueRef, value_type: ValueType, slots: u32, destination: LLVMValueRef, word_offset: u32, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if slots == 0
+            value_llvm_type: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            value_bytes: u64 = LLVMABISizeOfType(structs.target_data, value_llvm_type)
+            word_bytes: u64 = target_pointer_bits().u64() / 8
+            return false if value_bytes == 0 or word_bytes == 0 or value_bytes > slots.u64() * word_bytes
+            temp: LLVMValueRef = LLVMBuildAlloca(builder, value_llvm_type, "packed.raw.side.store.temp")
+            _ = LLVMBuildStore(builder, value, temp)
+            byte_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+            byte_pointer: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            source: LLVMValueRef = LLVMBuildBitCast(builder, temp, byte_pointer, "packed.raw.side.store.source")
+            destination_bytes: LLVMValueRef = LLVMBuildBitCast(builder, destination, byte_pointer, "packed.raw.side.store.destination")
+            destination_index: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), (word_offset.u64() * word_bytes), 0)
+            destination_indices: mutable darray[LLVMValueRef] = [destination_index]
+            destination_pointer: void& = (&destination_indices[0]).cast[void&] can Unsafe.PointerCast
+            destination_at_offset: LLVMValueRef = LLVMBuildGEP2(builder, byte_type, destination_bytes, destination_pointer, 1, "packed.raw.side.store.destination")
+            _ = LLVMBuildMemCpy(builder, destination_at_offset, 1, source, 1, LLVMConstInt(LLVMInt64TypeInContext(ctx), value_bytes, 0))
+            return true
+
+
+        def packed_raw_words_load_value(value_type: ValueType, slots: u32, source: LLVMValueRef, word_offset: u32, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if slots == 0
+            value_llvm_type: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            value_bytes: u64 = LLVMABISizeOfType(structs.target_data, value_llvm_type)
+            word_bytes: u64 = target_pointer_bits().u64() / 8
+            return null if value_bytes == 0 or word_bytes == 0 or value_bytes > slots.u64() * word_bytes
+            temp: LLVMValueRef = LLVMBuildAlloca(builder, value_llvm_type, "packed.raw.side.load.temp")
+            byte_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+            byte_pointer: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            source_bytes: LLVMValueRef = LLVMBuildBitCast(builder, source, byte_pointer, "packed.raw.side.load.source")
+            destination: LLVMValueRef = LLVMBuildBitCast(builder, temp, byte_pointer, "packed.raw.side.load.destination")
+            source_index: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), (word_offset.u64() * word_bytes), 0)
+            source_indices: mutable darray[LLVMValueRef] = [source_index]
+            source_pointer: void& = (&source_indices[0]).cast[void&] can Unsafe.PointerCast
+            source_at_offset: LLVMValueRef = LLVMBuildGEP2(builder, byte_type, source_bytes, source_pointer, 1, "packed.raw.side.load.source")
+            _ = LLVMBuildMemCpy(builder, destination, 1, source_at_offset, 1, LLVMConstInt(LLVMInt64TypeInContext(ctx), value_bytes, 0))
+            return LLVMBuildLoad2(builder, value_llvm_type, temp, "packed.raw.side.load.value")
+
+
+        # Common fields of dynamic AoS rows live in the canonical side table rather than in
+        # the `{tag, [u32]}` row. Reconstruct the source value through a temporary so f32,
+        # string-view and aggregate common fields retain their actual ABI representation.
+        def packed_side_table_load_value(value_type: ValueType, slots: u32, state: LLVMValueRef, handle: LLVMValueRef, word_offset: u32, runtime: Runtime&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if slots == 0
+            value_llvm_type: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            value_bytes: u64 = LLVMABISizeOfType(structs.target_data, value_llvm_type)
+            word_bytes: u64 = target_pointer_bits().u64() / 8
+            return null if value_bytes == 0 or word_bytes == 0 or value_bytes > slots.u64() * word_bytes
+            temp: LLVMValueRef = LLVMBuildAlloca(builder, value_llvm_type, "packed.side.load.temp")
+            byte_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+            byte_pointer: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            destination: LLVMValueRef = LLVMBuildBitCast(builder, temp, byte_pointer, "packed.side.load.destination")
+            for word_index in 0..<slots.usize() |state, handle, word_index, word_offset, destination, runtime, ctx, builder, value_bytes, word_bytes, byte_type|:
+                side_offset: LLVMValueRef = LLVMConstInt(runtime_size_llvm_type(ctx), (word_offset + word_index.u32()).u64(), 0)
+                side_args: mutable darray[LLVMValueRef] = [state, handle, side_offset]
+                side_args_pointer: void& = (&side_args[0]).cast[void&] can Unsafe.PointerCast
+                side_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_side_word_type, runtime.packed_read_side_word, side_args_pointer, 3, "packed.side.load.word")
+                side_word_temp: LLVMValueRef = LLVMBuildAlloca(builder, runtime_size_llvm_type(ctx), "packed.side.load.word.temp")
+                _ = LLVMBuildStore(builder, side_word, side_word_temp)
+                destination_index: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), word_index.u64() * word_bytes, 0)
+                destination_indices: mutable darray[LLVMValueRef] = [destination_index]
+                destination_pointer: void& = (&destination_indices[0]).cast[void&] can Unsafe.PointerCast
+                destination_word_pointer: LLVMValueRef = LLVMBuildGEP2(builder, byte_type, destination, destination_pointer, 1, "packed.side.load.destination.word")
+                remaining: mutable u64 = 0
+                remaining <- value_bytes - word_index.u64() * word_bytes if value_bytes > word_index.u64() * word_bytes
+                chunk: u64 = word_bytes if remaining > word_bytes else remaining
+                if chunk > 0:
+                    _ = LLVMBuildMemCpy(builder, destination_word_pointer, 1, LLVMBuildBitCast(builder, side_word_temp, byte_pointer, "packed.side.load.word.bytes"), 1, LLVMConstInt(LLVMInt64TypeInContext(ctx), chunk, 0))
+            return LLVMBuildLoad2(builder, value_llvm_type, temp, "packed.side.load.value")
+
+
+        def packed_dynamic_row_load_value(value_type: ValueType, slots: u32, structs: mutable StructTable&, enum_index: i64, row: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if slots == 0
+            temp: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(value_type, structs, ctx), "packed.raw.load.temp")
+            i32_pointer: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            destination: LLVMValueRef = LLVMBuildBitCast(builder, temp, i32_pointer, "packed.raw.load.destination")
+            source: LLVMValueRef = packed_dynamic_row_payload_words(structs, enum_index, row, ctx, builder, "packed.raw.load.payload")
+            for word_index in 0..<slots.usize() |source, destination, word_index, ctx, builder|:
+                index: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), word_index.u64(), 0)
+                indices: mutable darray[LLVMValueRef] = [index]
+                indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                source_word_pointer: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt32TypeInContext(ctx), source, indices_pointer, 1, "packed.raw.load.word")
+                source_word: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), source_word_pointer, "packed.raw.load.word.value")
+                destination_indices: mutable darray[LLVMValueRef] = [index]
+                destination_pointer: void& = (&destination_indices[0]).cast[void&] can Unsafe.PointerCast
+                destination_word_pointer: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt32TypeInContext(ctx), destination, destination_pointer, 1, "packed.raw.load.destination")
+                _ = LLVMBuildStore(builder, source_word, destination_word_pointer)
+            return LLVMBuildLoad2(builder, llvm_type_of(value_type, structs, ctx), temp, "packed.raw.load.value")
+
+
         # A store row's size in bytes: the `{i32, [N x i64]}` handle laid out at i64
         # alignment, so the tag's 4 bytes pad to 8. stage0 passes 16 for a one-word payload
         # (`state_new_variant_sparse(ptr %owner, i64 16)`), which this reproduces.
@@ -884,6 +1067,7 @@ extend Backend:
             can Abort.Panic:
                 # 4 (u32 tag) + 4 per u32 payload slot — 132 while the row was [32 x i32].
                 (4 + 4 * packed_ast_row_slots(structs).i64()) return if packed_is_ast_root_row(structs, packed_root_index_of(structs, enum_index))
+                (4 + 4 * packed_dynamic_aos_row_slots(structs, enum_index).i64()) return if packed_is_dynamic_aos_enum(structs, enum_index)
                 # 8 (tag, padded to i64 alignment) + 8 per common + 8 per payload word. stage0
                 # passes 16 with no commons and 24 with one — both reproduced.
                 return 8 + 8 * structs.packed_common_counts[enum_index.usize()].i64() + 8 * structs.packed_payload_words[enum_index.usize()].i64()

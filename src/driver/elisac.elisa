@@ -2499,15 +2499,32 @@ def emit_iface_body_lines(buffer: mutable darray[u8]&, tokens: darray[Lexer::Tok
     can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
         line_start: mutable usize = start_index
         cursor: mutable usize = start_index
-        while cursor <= stop_index |line_start, cursor, buffer, tokens, source, indent, stop_index|:
+        after_common: mutable bool = false
+        while cursor <= stop_index |line_start, cursor, buffer, tokens, source, indent, stop_index, after_common|:
             at_break: bool = cursor == stop_index or tokens[cursor].kind == Lexer::TokenKind.Newline
             if at_break:
                 has_content: mutable bool = false
+                first_content: mutable usize = line_start
                 for content_probe in line_start..<cursor |has_content, tokens|:
                     content_kind: Lexer::TokenKind = tokens[content_probe].kind
-                    has_content <- true if content_kind != Lexer::TokenKind.Newline and content_kind != Lexer::TokenKind.Indent and content_kind != Lexer::TokenKind.Dedent
-                if has_content:
-                    for indent_space in 0..<indent |buffer|:
+                    if content_kind != Lexer::TokenKind.Newline and content_kind != Lexer::TokenKind.Indent and content_kind != Lexer::TokenKind.Dedent:
+                        first_content <- content_probe if not has_content
+                        has_content <- true
+                skip_common_pass: bool = has_content and after_common and Lexer::text_or_empty(tokens[first_content], source) == "pass"
+                if has_content and Lexer::text_or_empty(tokens[first_content], source) == "common":
+                    after_common <- true
+                if has_content and not skip_common_pass:
+                    # Use the source column of the first content token. Indent/Dedent tokens
+                    # are synthetic and are not consistently placed on the same side of a
+                    # nested line by the self-hosted lexer; counting them produced one-line
+                    # indentation shifts in `common:` enum bodies.
+                    source_column: mutable i64 = 0
+                    source_probe: mutable u32 = tokens[first_content].start
+                    while source_probe > 0 |source_column, source_probe, source|:
+                        break if source[source_probe.usize() - 1] == 10
+                        source_column <- source_column + 1
+                        source_probe <- source_probe - 1
+                    for indent_space in 0..<source_column |buffer|:
                         buffer.push(32)
                     emit_iface_render_tokens(buffer, tokens, source, line_start, cursor)
                     emit_tokens_push_sview(buffer, "\n")
@@ -2834,6 +2851,30 @@ def emit_iface_static_scope(buffer: mutable darray[u8]&, declaration: Ast::Decl,
                 emit_iface_decl(buffer, static_child, level + 1, tokens, source, enum_annotations)
 
 
+def emit_iface_enum_is_packed(name: sview, enum_annotations: darray[Ast::EnumAnnotation]&) -> bool can[Abort.Panic]:
+    for annotation in enum_annotations |name|:
+        continue if annotation.owner != name and annotation.name != name
+        true return if annotation.name == "__declared_packed" or annotation.name == "__recursive_field" or annotation.name == "__ast_refinement" or annotation.name == "__aos" or annotation.line == 3900000008
+    return false
+
+
+def emit_iface_packed_block_decl(buffer: mutable darray[u8]&, tokens: darray[Lexer::Token]&, source: u8&, line: u32, indent: i64, needs_packed: bool) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+        header_range: (found: bool, start: usize, stop: usize) = emit_ast_line_range(tokens, line)
+        return if not header_range.found
+        for header_space in 0..<indent |buffer|:
+            buffer.push(32)
+        source_already_packed: mutable bool = false
+        for header_index in header_range.start..<header_range.stop |source_already_packed, tokens, source|:
+            source_already_packed <- true if Lexer::text_or_empty(tokens[header_index], source) == "packed"
+        emit_tokens_push_sview(buffer, "packed ") if needs_packed and not source_already_packed
+        emit_iface_render_tokens(buffer, tokens, source, header_range.start, header_range.stop)
+        emit_tokens_push_sview(buffer, ":\n")
+        body_range: (found: bool, start: usize, stop: usize) = emit_iface_body_range(tokens, header_range.stop + 1)
+        return if not body_range.found
+        emit_iface_body_lines(buffer, tokens, source, body_range.start, body_range.stop, indent + 4)
+
+
 def emit_iface_decl(buffer: mutable darray[u8]&, declaration: Ast::Decl, level: i64, tokens: darray[Lexer::Token]&, source: u8&, enum_annotations: darray[Ast::EnumAnnotation]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
         indent: i64 = level * 4
@@ -2855,7 +2896,7 @@ def emit_iface_decl(buffer: mutable darray[u8]&, declaration: Ast::Decl, level: 
             if emit_iface_is_machine_enum(if_en_name):
                 emit_iface_machine_enum(buffer, if_en_name, if_en_variants, indent)
                 return
-            emit_iface_block_decl(buffer, tokens, source, if_en_line.line, indent)
+            emit_iface_packed_block_decl(buffer, tokens, source, if_en_line.line, indent, emit_iface_enum_is_packed(if_en_name, enum_annotations))
             return
         if declaration is Decl.Const(if_c_name, if_c_type, if_c_value, if_c_mutable, if_c_line):
             for const_space in 0..<indent |buffer|:
@@ -4271,10 +4312,13 @@ def emit_c_archive(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&,
     guard.push(0)
     header_ctx: LLVMContextRef = LLVMContextCreate()
     header_module: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_archive_header", header_ctx)
+    header_triple_storage: mutable darray[u8] = []
+    header_machine: LLVMTargetMachineRef = Backend::configure_module_target_for(header_module, requested_target_triple(&header_triple_storage))
+    header_target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(header_machine)
     # The cast is its OWN statement: an inline `.cast[T] can Effect` inside an argument list
     # does not parse in this dialect.
     guard_cstr: cstr = (&guard[0]).cast[cstr] can Unsafe.PointerCast
-    header_bytes: darray[u8] = Backend::generate_c_header_for_file(file, header_module, header_ctx, sview(guard_cstr, 0, guard.count - 1))
+    header_bytes: darray[u8] = Backend::generate_c_header_for_file(file, header_module, header_ctx, sview(guard_cstr, 0, guard.count - 1), header_target_data)
     if header_bytes.count == 0:
         message: mutable darray[u8] = []
         emit_tokens_push_sview(&message, "error: -emit c-archive: an exported type has no C ABI representation\n")
@@ -5452,7 +5496,10 @@ def emit_header_report(file: Ast::File&) -> i64 can[Abort.Panic, Memory.Allocate
     guard.push(0)
     ctx: LLVMContextRef = LLVMContextCreate()
     module_handle: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_header", ctx)
-    header: darray[u8] = Backend::generate_c_header_for_file(file, module_handle, ctx, sview((&guard[0]).cast[cstr], 0, guard.count - 1))
+    triple_storage: mutable darray[u8] = []
+    machine: LLVMTargetMachineRef = Backend::configure_module_target_for(module_handle, requested_target_triple(&triple_storage))
+    target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(machine)
+    header: darray[u8] = Backend::generate_c_header_for_file(file, module_handle, ctx, sview((&guard[0]).cast[cstr], 0, guard.count - 1), target_data)
     # An UNSUPPORTED exported type makes the generator answer empty rather than publish
     # declarations that disagree with the object ABI. Fail loudly: a partial header
     # compiles against the wrong ABI, which is worse than no header.
@@ -21134,7 +21181,10 @@ def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic
     if emit_mode_is("packed"):
         packed_ctx: LLVMContextRef = LLVMContextCreate()
         packed_module: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_packed", packed_ctx)
-        packed_report: darray[u8] = Backend::generate_packed_report(file, packed_module, packed_ctx)
+        packed_triple_storage: mutable darray[u8] = []
+        packed_machine: LLVMTargetMachineRef = Backend::configure_module_target_for(packed_module, requested_target_triple(&packed_triple_storage))
+        packed_target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(packed_machine)
+        packed_report: darray[u8] = Backend::generate_packed_report(file, packed_module, packed_ctx, packed_target_data)
         packed_body: mutable darray[u8] = []
         for packed_index in 0..<packed_report.count |packed_body, packed_report|:
             packed_body.push(packed_report[packed_index]) if packed_report[packed_index] != 0
