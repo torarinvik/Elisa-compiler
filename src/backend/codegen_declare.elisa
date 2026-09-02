@@ -567,6 +567,14 @@ extend Backend:
 
 
         def declare_export_global_alias(alias_name: sview, target_name: sview, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # `export global G as G`: nothing new -- an alias to itself came out as a
+            # bogus `G.1`. The global simply stays external under its own name.
+            if alias_name == target_name:
+                same_global_index: i64 = mutable_global_index_of(structs, target_name)
+                LLVMSetLinkage(structs.mutable_global_handles[same_global_index.usize()], 0) if same_global_index >= 0
+                same_const_index: i64 = const_index_of(structs, target_name)
+                LLVMSetLinkage(structs.const_globals[same_const_index.usize()], 0) if same_global_index < 0 and same_const_index >= 0 and structs.const_global_ok[same_const_index.usize()]
+                return true
             target: mutable LLVMValueRef = zeroed
             target_type: mutable ValueType = unmodeled_type()
             mutable_index: i64 = mutable_global_index_of(structs, target_name)
@@ -678,6 +686,13 @@ extend Backend:
                 for pymodule_annotation in annotations |extern_name|:
                     true return if pymodule_annotation.owner == extern_name and pymodule_annotation.name == "__export_pymodule"
                 linker_name: sview = extern_link_name(decorators, annotation_args, extern_name)
+                # An `export fn` declaration, and whether its public name IS its
+                # implementation's name. The latter must own a handle of its own:
+                # declare_or_get_named would hand it the implementation's, and the
+                # wrapper body would then be emitted into the implementation.
+                extern_export_target: sview = export_target_of(annotations, extern_name)
+                extern_is_export: bool = extern_export_target != ""
+                extern_same_name_export: bool = extern_is_export and extern_export_target == extern_name
                 # `extern name: T` (a typed non-call extern) is a GLOBAL, not a function.
                 if not callable:
                     # `export type T as Public` is represented by the parser as a
@@ -894,10 +909,35 @@ extend Backend:
                             extern_element: ValueType = extern_element_value_type(extern_params[param_start.usize() + offset].element_type_name, annotations, structs)
                             if extern_element.kind != TypeKind.Unmodeled:
                                 param_value_type <- intern_view_type(extern_element, structs) if param_name == "view" else intern_darray_type(extern_element, structs)
+                        # A plain (non-generic) struct by its own name -- `export type Vec2 as
+                        # Vec2` or simply a `layout(c)` struct. Only generic instantiation
+                        # aliases resolved before, so a struct parameter fell through to
+                        # `declined` and the whole export was DROPPED with the object still
+                        # written.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            plain_struct_index: i64 = struct_index_of(structs, param_name)
+                            param_value_type <- ValueType{kind: TypeKind.Struct, bits: plain_struct_index.u32()} if plain_struct_index >= 0
                         if param_value_type.kind == TypeKind.Unmodeled:
                             declined <- true
                         else:
-                            extern_param_types.push(llvm_type_of(param_value_type, structs, ctx))
+                            # C ABI: an aggregate of 1/2/4/8 bytes crosses an export boundary
+                            # as the integer of that width (stage0's exportABILowering); the
+                            # wrapper coerces it back. Other sizes keep the struct lowering.
+                            export_aggregate_bytes: u64 = payload_type_byte_size(param_value_type, structs) if extern_is_export and param_value_type.kind == TypeKind.Struct else 0
+                            # Parity with stage0's exportABILowering: an aggregate wider than 8
+                            # bytes is not supported at an export boundary. Decline (the unit then
+                            # fails loudly) rather than accept it by pointer, which stage0 rejects.
+                            declined <- true if export_aggregate_bytes > 8
+                            if export_aggregate_bytes == 8:
+                                extern_param_types.push(LLVMInt64TypeInContext(ctx))
+                            elif export_aggregate_bytes == 4:
+                                extern_param_types.push(LLVMInt32TypeInContext(ctx))
+                            elif export_aggregate_bytes == 2:
+                                extern_param_types.push(LLVMInt16TypeInContext(ctx))
+                            elif export_aggregate_bytes == 1:
+                                extern_param_types.push(LLVMInt8TypeInContext(ctx))
+                            else:
+                                extern_param_types.push(llvm_type_of(param_value_type, structs, ctx))
                             declared_param_types.push(param_value_type)
                 false return if declined
 
@@ -925,7 +965,19 @@ extend Backend:
                     extern_error_params.extend(extern_param_types)
                     extern_param_types <- extern_error_params
                 extern_abi_arity: u32 = arity + (1 if extern_is_error else 0)
-                llvm_return: LLVMTypeRef = LLVMInt32TypeInContext(ctx) if extern_is_error else llvm_type_of(return_value_type, structs, ctx)
+                # An export's aggregate RETURN crosses the C ABI as the integer of its width
+                # (1/2/4/8 bytes), like a parameter; wider is declined as stage0 does. The
+                # wrapper packs the implementation's struct result into it.
+                export_return_bytes: u64 = payload_type_byte_size(return_value_type, structs) if extern_is_export and return_value_type.kind == TypeKind.Struct else 0
+                # Wider than 8 bytes is not supported at an export boundary (stage0 rejects
+                # it too); refuse the declaration here, before it is registered, so the
+                # export branch records it as declined and the unit fails loudly.
+                false return if export_return_bytes > 8
+                llvm_return: mutable LLVMTypeRef = LLVMInt32TypeInContext(ctx) if extern_is_error else llvm_type_of(return_value_type, structs, ctx)
+                llvm_return <- LLVMInt64TypeInContext(ctx) if export_return_bytes == 8
+                llvm_return <- LLVMInt32TypeInContext(ctx) if export_return_bytes == 4
+                llvm_return <- LLVMInt16TypeInContext(ctx) if export_return_bytes == 2
+                llvm_return <- LLVMInt8TypeInContext(ctx) if export_return_bytes == 1
                 fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
                 if extern_abi_arity != 0:
                     extern_pointer: void& = (&extern_param_types[0]).cast[void&] can Unsafe.PointerCast
@@ -959,7 +1011,26 @@ extend Backend:
                     # Differing signatures are fine — every call site passes its own type to
                     # LLVMBuildCall2, which is exactly how C treats mismatched prototypes for
                     # one symbol, and stage0 links the same program.
-                    handle <- declare_or_get_named(m, extern_cstr, fn_type)
+                    if extern_same_name_export:
+                        # `<name>.export`: the export declaration's OWN handle. It either
+                        # receives the wrapper body and is renamed to the public name, or
+                        # stays an unreferenced declaration when the implementation is
+                        # exported directly (dropped by the object writer).
+                        export_handle_storage: mutable darray[u8] = []
+                        for export_name_index in 0..<sview_len(extern_name) |export_handle_storage, extern_name|:
+                            export_handle_storage.push(sview_at(extern_name, export_name_index))
+                        export_handle_storage.push(46)
+                        export_handle_storage.push(101)
+                        export_handle_storage.push(120)
+                        export_handle_storage.push(112)
+                        export_handle_storage.push(111)
+                        export_handle_storage.push(114)
+                        export_handle_storage.push(116)
+                        export_handle_storage.push(0)
+                        export_handle_cstr: cstr = (&export_handle_storage[0]).cast[cstr] can Unsafe.PointerCast
+                        handle <- LLVMAddFunction(m, export_handle_cstr, fn_type)
+                    else:
+                        handle <- declare_or_get_named(m, extern_cstr, fn_type)
                 apply_function_decorators(handle, decorators, annotation_args, false, ctx)
                 wasm_import_module: sview = function_decorator_wasm_import_module(decorators, annotation_args, extern_name)
                 add_function_string_attribute(handle, "wasm-import-module", wasm_import_module, ctx) if wasm_import_module != ""
