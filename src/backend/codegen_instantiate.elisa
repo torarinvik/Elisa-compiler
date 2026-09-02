@@ -556,27 +556,43 @@ extend Backend:
             LLVMPositionBuilderAtEnd(builder, entry)
             argument_count: usize = fns.param_count[wrapper_index.usize()]
             arguments: mutable darray[LLVMValueRef] = []
-            for position in 0..<argument_count |arguments, fn, wrapper_index, fns, structs, ctx, builder|:
-                export_param: LLVMValueRef = LLVMGetParam(fn, position.u32())
-                # An aggregate that crossed the C ABI as an integer (declare_extern) is
-                # spilled and read back as the struct -- or handed over by pointer when
-                # the implementation takes it indirectly.
+            # Each exported parameter arrives in its C ABI form (cabi_classify_arg) and is
+            # rebuilt as the value the implementation takes: register parts are spilled
+            # into an aligned slot and read back as the struct (or the slot itself is
+            # handed over when the implementation takes the aggregate indirectly); an
+            # indirect parameter is loaded through the incoming pointer.
+            export_ret_declared: ValueType = copied_type(fns.returns[wrapper_index.usize()])
+            export_ret_plan: CabiRetPlan = cabi_classify_ret(export_ret_declared, structs, ctx) if cabi_is_aggregate(export_ret_declared) else CabiRetPlan{direct: true, sret: false, ret_type: LLVMVoidTypeInContext(ctx), value_type: LLVMVoidTypeInContext(ctx)}
+            llvm_param_cursor: mutable u32 = 1 if export_ret_plan.sret else 0
+            for position in 0..<argument_count |arguments, fn, wrapper_index, fns, structs, ctx, builder, llvm_param_cursor|:
                 export_declared: ValueType = copied_type(fns.param_types[fns.param_start[wrapper_index.usize()] + position])
-                export_param_bytes: u64 = payload_type_byte_size(export_declared, structs) if export_declared.kind == TypeKind.Struct else 0
-                if export_param_bytes > 0 and export_param_bytes <= 8 and LLVMTypeOf(export_param) != llvm_type_of(export_declared, structs, ctx):
-                    export_param_slot: LLVMValueRef = LLVMBuildAlloca(builder, LLVMTypeOf(export_param), "export.arg.slot")
-                    _ = LLVMBuildStore(builder, export_param, export_param_slot)
-                    if value_type_uses_indirect_aggregate(export_declared, structs, ctx):
-                        arguments.push(export_param_slot)
+                export_is_aggregate: bool = cabi_is_aggregate(export_declared)
+                if export_is_aggregate == false:
+                    arguments.push(LLVMGetParam(fn, llvm_param_cursor))
+                    llvm_param_cursor <- llvm_param_cursor + 1
+                    continue
+                export_plan: CabiArgPlan = cabi_classify_arg(export_declared, structs, ctx)
+                export_impl_indirect: bool = value_type_uses_indirect_aggregate(export_declared, structs, ctx)
+                if export_plan.direct:
+                    export_bytes: mutable u64 = LLVMABISizeOfType(structs.target_data, export_plan.value_type)
+                    for export_part_index in 0..<export_plan.parts.count |export_bytes, export_plan, structs|:
+                        export_part_end: u64 = export_plan.offsets[export_part_index] + LLVMABISizeOfType(structs.target_data, export_plan.parts[export_part_index])
+                        export_bytes <- export_part_end if export_part_end > export_bytes
+                    export_slot: LLVMValueRef = cabi_slot(export_bytes, ctx, builder)
+                    for export_store_index in 0..<export_plan.parts.count |export_plan, export_slot, fn, llvm_param_cursor, ctx, builder|:
+                        _ = LLVMBuildStore(builder, LLVMGetParam(fn, llvm_param_cursor), cabi_ptr_at(export_slot, export_plan.offsets[export_store_index], ctx, builder))
+                        llvm_param_cursor <- llvm_param_cursor + 1
+                    if export_impl_indirect:
+                        arguments.push(export_slot)
                     else:
-                        arguments.push(LLVMBuildLoad2(builder, llvm_type_of(export_declared, structs, ctx), export_param_slot, "export.arg"))
+                        arguments.push(LLVMBuildLoad2(builder, export_plan.value_type, export_slot, "export.arg"))
                 else:
-                    arguments.push(export_param)
-            # `export fn axpy(...) = axpy_impl` where the TARGET threads an implicit arena
-            # (any signature carrying a container does). The exported symbol keeps stage0's
-            # declared ABI — four parameters, no arena — so the wrapper opens its own auto
-            # region, passes it as the trailing argument and releases it after the call.
-            # Without this the whole forwarder declined whenever the target allocated.
+                    export_incoming: LLVMValueRef = LLVMGetParam(fn, llvm_param_cursor)
+                    llvm_param_cursor <- llvm_param_cursor + 1
+                    if export_impl_indirect:
+                        arguments.push(export_incoming)
+                    else:
+                        arguments.push(LLVMBuildLoad2(builder, export_plan.value_type, export_incoming, "export.arg"))
             export_arena_slot: mutable LLVMValueRef = zeroed
             export_threads_arena: bool = target_needs_arena
             if export_threads_arena:
@@ -603,27 +619,21 @@ extend Backend:
                 _ = LLVMBuildCall2(builder, runtime.arena_free_type, runtime.arena_free, export_free_pointer, 1, "")
             if fns.returns[wrapper_index.usize()].kind == TypeKind.Void:
                 _ = LLVMBuildRetVoid(builder)
+            elif export_ret_plan.sret:
+                # The implementation's struct result is stored through the leading sret
+                # pointer; the wrapper returns nothing.
+                _ = LLVMBuildStore(builder, call_result, LLVMGetParam(fn, 0))
+                _ = LLVMBuildRetVoid(builder)
+            elif cabi_is_aggregate(export_ret_declared) and export_ret_plan.ret_type != export_ret_plan.value_type:
+                # Spill the struct and read it back at the ABI return type.
+                export_ret_bytes: mutable u64 = LLVMABISizeOfType(structs.target_data, export_ret_plan.value_type)
+                export_ret_abi_bytes: u64 = LLVMABISizeOfType(structs.target_data, export_ret_plan.ret_type)
+                export_ret_bytes <- export_ret_abi_bytes if export_ret_abi_bytes > export_ret_bytes
+                export_ret_slot: LLVMValueRef = cabi_slot(export_ret_bytes, ctx, builder)
+                _ = LLVMBuildStore(builder, call_result, export_ret_slot)
+                _ = LLVMBuildRet(builder, LLVMBuildLoad2(builder, export_ret_plan.ret_type, export_ret_slot, "export.ret"))
             else:
-                # A struct result that the export returns as an integer: spill the
-                # implementation's value and read it back at the integer width. An
-                # implementation returning through sret is not handled; decline.
-                export_return_declared: ValueType = copied_type(fns.returns[wrapper_index.usize()])
-                export_return_bytes: u64 = payload_type_byte_size(export_return_declared, structs) if export_return_declared.kind == TypeKind.Struct else 0
-                if export_return_bytes > 0 and export_return_bytes <= 8:
-                    false return if value_type_uses_sret(export_return_declared, structs, ctx)
-                    export_return_int: mutable LLVMTypeRef = LLVMInt64TypeInContext(ctx)
-                    export_return_int <- LLVMInt32TypeInContext(ctx) if export_return_bytes == 4
-                    export_return_int <- LLVMInt16TypeInContext(ctx) if export_return_bytes == 2
-                    export_return_int <- LLVMInt8TypeInContext(ctx) if export_return_bytes == 1
-                    if export_return_bytes == 8 or export_return_bytes == 4 or export_return_bytes == 2 or export_return_bytes == 1:
-                        export_return_slot: LLVMValueRef = LLVMBuildAlloca(builder, export_return_int, "export.ret.slot")
-                        _ = LLVMBuildStore(builder, LLVMConstNull(export_return_int), export_return_slot)
-                        _ = LLVMBuildStore(builder, call_result, export_return_slot)
-                        _ = LLVMBuildRet(builder, LLVMBuildLoad2(builder, export_return_int, export_return_slot, "export.ret"))
-                    else:
-                        _ = LLVMBuildRet(builder, call_result)
-                else:
-                    _ = LLVMBuildRet(builder, call_result)
+                _ = LLVMBuildRet(builder, call_result)
             return true
 
         # Emit the body of one queued instantiation, with its type parameter BOUND for the
