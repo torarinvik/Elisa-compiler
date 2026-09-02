@@ -566,6 +566,201 @@ extend Backend:
             return ""
 
 
+        # ---- The C ABI at an export boundary, per target. Mirror of stage0's
+        # llvm_export_cabi.go, pinned against clang for the same struct shapes:
+        #   arm64  HFA (1..4 leaves of one float type): [N x float] in, the struct
+        #          out; other aggregates <= 8 bytes i64 in / iN out at exact width;
+        #          9..16 [2 x i64]; > 16 a pointer to a caller copy in, sret out.
+        #   x86-64 <= 16: each eightbyte INTEGER (iN of the bytes used) or SSE
+        #          (float, <2 x float>, double); two eightbytes = two params / {a,b}.
+        #          > 16: byval / sret.
+        #   wasm32 a lone scalar leaf is that scalar; else byval / sret.
+        # Classification walks the LOWERED LLVM struct (element kinds + offsets).
+        struct CabiLeaf:
+            offset: u64
+            size: u64
+            kind: i32
+
+        struct CabiArgPlan:
+            direct: bool
+            byval: bool
+            aggregate: bool
+            parts: darray[LLVMTypeRef]
+            offsets: darray[u64]
+            value_type: LLVMTypeRef
+
+        struct CabiRetPlan:
+            direct: bool
+            sret: bool
+            ret_type: LLVMTypeRef
+            value_type: LLVMTypeRef
+
+        def cabi_target() -> i32 can[Abort.Panic]:
+            2 return if target_triple_is_wasm()
+            1 return if getenv("ELISA_STAGE1_X86_64") is x86_target
+            return 0
+
+        def cabi_is_aggregate(value_type: ValueType) -> bool:
+            return value_type.kind == TypeKind.Struct or value_type.kind == TypeKind.Array
+
+        def cabi_flatten(ty: LLVMTypeRef, base: u64, leaves: mutable darray[CabiLeaf]&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            kind: u32 = LLVMGetTypeKind(ty)
+            if kind == 10:
+                element_count: u32 = LLVMCountStructElementTypes(ty)
+                for element_index in 0..<element_count.usize() |ty, base, leaves, structs|:
+                    element: LLVMTypeRef = LLVMStructGetTypeAtIndex(ty, element_index.u32())
+                    element_offset: u64 = LLVMOffsetOfElement(structs.target_data, ty, element_index.u32())
+                    element_ok: bool = cabi_flatten(element, base + element_offset, leaves, structs)
+                    false return if element_ok == false
+                return true
+            if kind == 11:
+                array_element: LLVMTypeRef = LLVMGetElementType(ty)
+                array_count: u64 = LLVMGetArrayLength2(ty)
+                array_stride: u64 = LLVMABISizeOfType(structs.target_data, array_element)
+                for array_index in 0..<array_count.usize() |array_element, base, array_stride, leaves, structs|:
+                    array_ok: bool = cabi_flatten(array_element, base + array_index.u64() * array_stride, leaves, structs)
+                    false return if array_ok == false
+                return true
+            if kind == 2:
+                leaves.push(CabiLeaf{offset: base, size: 4, kind: 1})
+                return true
+            if kind == 3:
+                leaves.push(CabiLeaf{offset: base, size: 8, kind: 2})
+                return true
+            if kind == 8 or kind == 12:
+                leaves.push(CabiLeaf{offset: base, size: LLVMABISizeOfType(structs.target_data, ty), kind: 0})
+                return true
+            return false
+
+        def cabi_leaf_type(leaf: CabiLeaf, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
+            LLVMFloatTypeInContext(ctx) return if leaf.kind == 1
+            LLVMDoubleTypeInContext(ctx) return if leaf.kind == 2
+            return LLVMIntTypeInContext(ctx, (leaf.size * 8).u32())
+
+        # 1..4 leaves of one float kind, contiguous: the count, else 0.
+        def cabi_hfa_count(leaves: darray[CabiLeaf]&) -> usize can[Abort.Panic]:
+            0 return if leaves.count == 0 or leaves.count > 4
+            leaf_kind: i32 = leaves[0].kind
+            0 return if leaf_kind == 0
+            for leaf_index in 0..<leaves.count |leaves, leaf_kind|:
+                0 return if leaves[leaf_index].kind != leaf_kind or leaves[leaf_index].offset != leaf_index.u64() * leaves[leaf_index].size
+            return leaves.count
+
+        # x86-64 SysV: the ABI type of eightbyte `eb`, or null when no leaf lands in it.
+        def cabi_x86_eightbyte(leaves: darray[CabiLeaf]&, size: u64, eb: u64, ctx: LLVMContextRef, found: mutable bool&) -> LLVMTypeRef can[Abort.Panic]:
+            lo: u64 = eb * 8
+            hi: u64 = lo + 8
+            ints: mutable i32 = 0
+            f32s: mutable i32 = 0
+            f64s: mutable i32 = 0
+            for leaf_index in 0..<leaves.count |leaves, lo, hi, ints, f32s, f64s|:
+                continue if leaves[leaf_index].offset >= hi or leaves[leaf_index].offset + leaves[leaf_index].size <= lo
+                ints <- ints + 1 if leaves[leaf_index].kind == 0
+                f32s <- f32s + 1 if leaves[leaf_index].kind == 1
+                f64s <- f64s + 1 if leaves[leaf_index].kind == 2
+            found <- ints + f32s + f64s > 0
+            any_leaf: bool = ints + f32s + f64s > 0
+            LLVMInt64TypeInContext(ctx) return if not any_leaf
+            if ints > 0:
+                used: u64 = (size - lo) if size - lo < 8 else 8
+                return LLVMIntTypeInContext(ctx, (used * 8).u32())
+            LLVMDoubleTypeInContext(ctx) return if f64s > 0
+            LLVMVectorType(LLVMFloatTypeInContext(ctx), 2) return if f32s >= 2
+            return LLVMFloatTypeInContext(ctx)
+
+        def cabi_classify_arg(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> CabiArgPlan can[Abort.Panic, Memory.Allocate]:
+            llvm_value: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            scalar_parts: darray[LLVMTypeRef] = [llvm_value]
+            scalar_offsets: darray[u64] = [0]
+            arg_is_aggregate: bool = cabi_is_aggregate(value_type)
+            CabiArgPlan{direct: true, byval: false, aggregate: false, parts: scalar_parts, offsets: scalar_offsets, value_type: llvm_value} return if not arg_is_aggregate
+            size: u64 = LLVMABISizeOfType(structs.target_data, llvm_value)
+            CabiArgPlan{direct: true, byval: false, aggregate: true, parts: scalar_parts, offsets: scalar_offsets, value_type: llvm_value} return if size == 0
+            leaves: mutable darray[CabiLeaf] = []
+            flat_ok: bool = cabi_flatten(llvm_value, 0, leaves, structs)
+            no_parts: darray[LLVMTypeRef] = []
+            no_offsets: darray[u64] = []
+            CabiArgPlan{direct: false, byval: true, aggregate: true, parts: no_parts, offsets: no_offsets, value_type: llvm_value} return if flat_ok == false
+            target: i32 = cabi_target()
+            if target == 2:
+                if leaves.count == 1:
+                    wasm_parts: darray[LLVMTypeRef] = [cabi_leaf_type(leaves[0], ctx)]
+                    wasm_offsets: darray[u64] = [leaves[0].offset]
+                    return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: wasm_parts, offsets: wasm_offsets, value_type: llvm_value}
+                return CabiArgPlan{direct: false, byval: true, aggregate: true, parts: no_parts, offsets: no_offsets, value_type: llvm_value}
+            if target == 0:
+                hfa: usize = cabi_hfa_count(leaves)
+                if hfa > 0:
+                    hfa_parts: darray[LLVMTypeRef] = [LLVMArrayType(cabi_leaf_type(leaves[0], ctx), hfa.u32())]
+                    return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: hfa_parts, offsets: scalar_offsets, value_type: llvm_value}
+                if size <= 8:
+                    i64_parts: darray[LLVMTypeRef] = [LLVMInt64TypeInContext(ctx)]
+                    return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: i64_parts, offsets: scalar_offsets, value_type: llvm_value}
+                if size <= 16:
+                    pair_parts: darray[LLVMTypeRef] = [LLVMArrayType(LLVMInt64TypeInContext(ctx), 2)]
+                    return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: pair_parts, offsets: scalar_offsets, value_type: llvm_value}
+                return CabiArgPlan{direct: false, byval: false, aggregate: true, parts: no_parts, offsets: no_offsets, value_type: llvm_value}
+            # x86-64 SysV
+            CabiArgPlan{direct: false, byval: true, aggregate: true, parts: no_parts, offsets: no_offsets, value_type: llvm_value} return if size > 16
+            x86_parts: mutable darray[LLVMTypeRef] = []
+            x86_offsets: mutable darray[u64] = []
+            eb: mutable u64 = 0
+            while eb * 8 < size |eb, x86_parts, x86_offsets, leaves, size, ctx|:
+                eb_found: mutable bool = false
+                eb_type: LLVMTypeRef = cabi_x86_eightbyte(leaves, size, eb, ctx, eb_found)
+                if eb_found:
+                    x86_parts.push(eb_type)
+                    x86_offsets.push(eb * 8)
+                eb <- eb + 1
+            if x86_parts.count == 0:
+                x86_parts.push(LLVMIntTypeInContext(ctx, (size * 8).u32()))
+                x86_offsets.push(0)
+            return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: x86_parts, offsets: x86_offsets, value_type: llvm_value}
+
+        def cabi_classify_ret(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> CabiRetPlan can[Abort.Panic, Memory.Allocate]:
+            llvm_value: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            ret_is_aggregate: bool = cabi_is_aggregate(value_type)
+            CabiRetPlan{direct: true, sret: false, ret_type: llvm_value, value_type: llvm_value} return if not ret_is_aggregate
+            size: u64 = LLVMABISizeOfType(structs.target_data, llvm_value)
+            CabiRetPlan{direct: true, sret: false, ret_type: llvm_value, value_type: llvm_value} return if size == 0
+            leaves: mutable darray[CabiLeaf] = []
+            flat_ok: bool = cabi_flatten(llvm_value, 0, leaves, structs)
+            CabiRetPlan{direct: false, sret: true, ret_type: llvm_value, value_type: llvm_value} return if flat_ok == false
+            target: i32 = cabi_target()
+            if target == 2:
+                CabiRetPlan{direct: true, sret: false, ret_type: cabi_leaf_type(leaves[0], ctx), value_type: llvm_value} return if leaves.count == 1
+                return CabiRetPlan{direct: false, sret: true, ret_type: llvm_value, value_type: llvm_value}
+            if target == 0:
+                CabiRetPlan{direct: true, sret: false, ret_type: llvm_value, value_type: llvm_value} return if cabi_hfa_count(leaves) > 0
+                CabiRetPlan{direct: true, sret: false, ret_type: LLVMIntTypeInContext(ctx, (size * 8).u32()), value_type: llvm_value} return if size <= 8
+                CabiRetPlan{direct: true, sret: false, ret_type: LLVMArrayType(LLVMInt64TypeInContext(ctx), 2), value_type: llvm_value} return if size <= 16
+                return CabiRetPlan{direct: false, sret: true, ret_type: llvm_value, value_type: llvm_value}
+            CabiRetPlan{direct: false, sret: true, ret_type: llvm_value, value_type: llvm_value} return if size > 16
+            ret_parts: mutable darray[LLVMTypeRef] = []
+            ret_eb: mutable u64 = 0
+            while ret_eb * 8 < size |ret_eb, ret_parts, leaves, size, ctx|:
+                ret_found: mutable bool = false
+                ret_part: LLVMTypeRef = cabi_x86_eightbyte(leaves, size, ret_eb, ctx, ret_found)
+                ret_parts.push(ret_part) if ret_found
+                ret_eb <- ret_eb + 1
+            CabiRetPlan{direct: true, sret: false, ret_type: LLVMIntTypeInContext(ctx, (size * 8).u32()), value_type: llvm_value} return if ret_parts.count == 0
+            CabiRetPlan{direct: true, sret: false, ret_type: ret_parts[0], value_type: llvm_value} return if ret_parts.count == 1
+            ret_parts_pointer: void& = (&ret_parts[0]).cast[void&] can Unsafe.PointerCast
+            return CabiRetPlan{direct: true, sret: false, ret_type: LLVMStructTypeInContext(ctx, ret_parts_pointer, ret_parts.count.u32(), 0), value_type: llvm_value}
+
+        # An 8-byte-aligned spill slot covering `bytes`, as an i64 array.
+        def cabi_slot(bytes: u64, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic]:
+            words: u64 = (bytes + 7) / 8
+            slot: LLVMValueRef = LLVMBuildAlloca(builder, LLVMArrayType(LLVMInt64TypeInContext(ctx), (words if words > 0 else 1).u32()), "export.abi.slot")
+            LLVMSetAlignment(slot, 8)
+            return slot
+
+        def cabi_ptr_at(base: LLVMValueRef, offset: u64, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Unsafe.PointerCast]:
+            base return if offset == 0
+            index_values: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), offset, 0)]
+            index_pointer: void& = (&index_values[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), base, index_pointer, 1, "export.abi.part")
+
         def declare_export_global_alias(alias_name: sview, target_name: sview, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # `export global G as G`: nothing new -- an alias to itself came out as a
             # bogus `G.1`. The global simply stays external under its own name.
@@ -920,22 +1115,15 @@ extend Backend:
                         if param_value_type.kind == TypeKind.Unmodeled:
                             declined <- true
                         else:
-                            # C ABI: an aggregate of 1/2/4/8 bytes crosses an export boundary
-                            # as the integer of that width (stage0's exportABILowering); the
-                            # wrapper coerces it back. Other sizes keep the struct lowering.
-                            export_aggregate_bytes: u64 = payload_type_byte_size(param_value_type, structs) if extern_is_export and param_value_type.kind == TypeKind.Struct else 0
-                            # Parity with stage0's exportABILowering: an aggregate wider than 8
-                            # bytes is not supported at an export boundary. Decline (the unit then
-                            # fails loudly) rather than accept it by pointer, which stage0 rejects.
-                            declined <- true if export_aggregate_bytes > 8
-                            if export_aggregate_bytes == 8:
-                                extern_param_types.push(LLVMInt64TypeInContext(ctx))
-                            elif export_aggregate_bytes == 4:
-                                extern_param_types.push(LLVMInt32TypeInContext(ctx))
-                            elif export_aggregate_bytes == 2:
-                                extern_param_types.push(LLVMInt16TypeInContext(ctx))
-                            elif export_aggregate_bytes == 1:
-                                extern_param_types.push(LLVMInt8TypeInContext(ctx))
+                            # An exported aggregate crosses the boundary in the target's C ABI
+                            # form (cabi_classify_arg): one or two register parts, or a pointer.
+                            if extern_is_export and cabi_is_aggregate(param_value_type):
+                                export_arg_plan: CabiArgPlan = cabi_classify_arg(param_value_type, structs, ctx)
+                                if export_arg_plan.direct:
+                                    for export_arg_part in export_arg_plan.parts |extern_param_types|:
+                                        extern_param_types.push(export_arg_part)
+                                else:
+                                    extern_param_types.push(LLVMPointerTypeInContext(ctx, 0))
                             else:
                                 extern_param_types.push(llvm_type_of(param_value_type, structs, ctx))
                             declared_param_types.push(param_value_type)
@@ -968,20 +1156,28 @@ extend Backend:
                 # An export's aggregate RETURN crosses the C ABI as the integer of its width
                 # (1/2/4/8 bytes), like a parameter; wider is declined as stage0 does. The
                 # wrapper packs the implementation's struct result into it.
-                export_return_bytes: u64 = payload_type_byte_size(return_value_type, structs) if extern_is_export and return_value_type.kind == TypeKind.Struct else 0
-                # Wider than 8 bytes is not supported at an export boundary (stage0 rejects
-                # it too); refuse the declaration here, before it is registered, so the
-                # export branch records it as declined and the unit fails loudly.
-                false return if export_return_bytes > 8
+                # An exported aggregate RETURN takes the target's C ABI form: a register
+                # type, or sret through a leading pointer parameter.
                 llvm_return: mutable LLVMTypeRef = LLVMInt32TypeInContext(ctx) if extern_is_error else llvm_type_of(return_value_type, structs, ctx)
-                llvm_return <- LLVMInt64TypeInContext(ctx) if export_return_bytes == 8
-                llvm_return <- LLVMInt32TypeInContext(ctx) if export_return_bytes == 4
-                llvm_return <- LLVMInt16TypeInContext(ctx) if export_return_bytes == 2
-                llvm_return <- LLVMInt8TypeInContext(ctx) if export_return_bytes == 1
+                export_ret_sret: mutable bool = false
+                if extern_is_export and cabi_is_aggregate(return_value_type):
+                    export_ret_plan: CabiRetPlan = cabi_classify_ret(return_value_type, structs, ctx)
+                    llvm_return <- export_ret_plan.ret_type if export_ret_plan.direct
+                    if export_ret_plan.sret:
+                        llvm_return <- LLVMVoidTypeInContext(ctx)
+                        export_ret_sret <- true
+                        sret_params: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+                        sret_params.extend(extern_param_types)
+                        extern_param_types <- sret_params
+                # The LLVM parameter list is the LOWERED list, not the declared arity: an
+                # export's sret pointer is prepended and an x86-64 two-eightbyte aggregate
+                # is two parameters. Building the type from the declared count dropped the
+                # sret parameter (the wrapper then read a parameter that did not exist and
+                # the compiler died at teardown, after writing the object).
                 fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
-                if extern_abi_arity != 0:
+                if extern_param_types.count != 0:
                     extern_pointer: void& = (&extern_param_types[0]).cast[void&] can Unsafe.PointerCast
-                    fn_type <- LLVMFunctionType(llvm_return, extern_pointer, extern_abi_arity, 1 if variadic else 0)
+                    fn_type <- LLVMFunctionType(llvm_return, extern_pointer, extern_param_types.count.u32(), 1 if variadic else 0)
                 intrinsic_name: sview = extern_intrinsic_name(decorators, annotation_args)
                 handle: mutable LLVMValueRef = zeroed
                 if intrinsic_name != "":
@@ -1031,6 +1227,22 @@ extend Backend:
                         handle <- LLVMAddFunction(m, export_handle_cstr, fn_type)
                     else:
                         handle <- declare_or_get_named(m, extern_cstr, fn_type)
+                if extern_is_export:
+                    # sret on the leading pointer; byval on indirect aggregate parameters.
+                    export_attr_position: mutable u32 = 1
+                    if export_ret_sret:
+                        add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx)
+                        export_attr_position <- 2
+                    for export_attr_type in declared_param_types |export_attr_position, structs, ctx, handle|:
+                        if cabi_is_aggregate(export_attr_type):
+                            export_attr_plan: CabiArgPlan = cabi_classify_arg(export_attr_type, structs, ctx)
+                            if export_attr_plan.direct:
+                                export_attr_position <- export_attr_position + export_attr_plan.parts.count.u32()
+                            else:
+                                add_type_parameter_attribute(handle, export_attr_position, "byval", export_attr_plan.value_type, ctx) if export_attr_plan.byval
+                                export_attr_position <- export_attr_position + 1
+                        else:
+                            export_attr_position <- export_attr_position + 1
                 apply_function_decorators(handle, decorators, annotation_args, false, ctx)
                 wasm_import_module: sview = function_decorator_wasm_import_module(decorators, annotation_args, extern_name)
                 add_function_string_attribute(handle, "wasm-import-module", wasm_import_module, ctx) if wasm_import_module != ""
