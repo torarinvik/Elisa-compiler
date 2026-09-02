@@ -33,7 +33,35 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 GEN2_DIR="${SELF_HOST_GEN2_DIR:-$ROOT/build/self_host_gen2}"
 GEN2="$GEN2_DIR/elisac-stage1-gen2"
-WORK="$ROOT/build/gen3_check"; rm -rf "$WORK"; mkdir -p "$WORK"
+WORK="$ROOT/build/gen3_check"
+
+# EXCLUSIVE, because every leg of this check shares mutable state under build/ with
+# anything else that drives this worktree: $BIN (which `scripts/elisac_stage1.sh --seed`
+# rewrites in place), $GEN2_DIR, and $WORK. A second smoke, or an elisa-ui build calling
+# this worktree's elisac_stage1.sh, can therefore swap the compiler out from under a
+# run in flight -- gen2 then gets built by one binary and gen3 by another, and stage C
+# reports `gen3.o != gen4.o` for a divergence that does not exist. That false failure
+# has already been chased once as if it were a miscompile; take the lock instead.
+SMOKE_LOCK="$ROOT/build/.self_host_gen3.lock"
+mkdir -p "$ROOT/build"
+if ! mkdir "$SMOKE_LOCK" 2>/dev/null; then
+    lock_pid=""
+    [ -f "$SMOKE_LOCK/pid" ] && lock_pid="$(<"$SMOKE_LOCK/pid")"
+    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+        echo "self_host_gen3_smoke FAIL: another run holds $SMOKE_LOCK (pid $lock_pid); a concurrent run corrupts this check" >&2
+        exit 1
+    fi
+    # Only the recorded owner being gone makes the lock stale; reclaim just this directory.
+    rm -f "$SMOKE_LOCK/pid"
+    rmdir "$SMOKE_LOCK" 2>/dev/null && mkdir "$SMOKE_LOCK" 2>/dev/null || {
+        echo "self_host_gen3_smoke FAIL: could not acquire $SMOKE_LOCK" >&2
+        exit 1
+    }
+fi
+echo "$$" >"$SMOKE_LOCK/pid"
+trap 'rm -f "$SMOKE_LOCK/pid"; rmdir "$SMOKE_LOCK" 2>/dev/null || true' EXIT INT TERM HUP
+
+rm -rf "$WORK"; mkdir -p "$WORK"
 
 # The exit code stage B must produce. 0 = bootstrap closed; anything else is a REGRESSION
 # and must be investigated, not silently re-baselined.
@@ -172,7 +200,26 @@ clang -Wl,-dead_strip -o "$WORK/elisac-stage1-gen3" "$WORK/gen3.o" "$RUNTIME_OBJ
 rc4=0
 run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/gen4.request" "$WORK/gen4.log" || rc4=$?
 [ "$rc4" -eq 0 ] || fail "gen3 could not compile the compiler (exit $rc4) — gen2 and gen3 disagree"
-cmp -s "$WORK/gen3.o" "$WORK/gen4.o" \
-  || fail "gen3.o != gen4.o — the compiler does not reproduce itself; gen2 and gen3 emit differently"
+# A mismatch here has TWO very different causes and the old message named only one.
+# Either gen2 and gen3 genuinely disagree (a miscompile -- what this gate exists to
+# catch), or a generation was not reproducible on this run, in which case comparing any
+# two objects proves nothing about the compiler. Two mismatches have already been chased
+# as miscompiles without the evidence to tell those apart, so on the failure path only,
+# re-run BOTH generations on the same input and report what was actually observed.
+# Deliberately no verdict: this prints the four sizes and lets the reader judge.
+if ! cmp -s "$WORK/gen3.o" "$WORK/gen4.o"; then
+    echo "self_host_gen3_smoke: gen3.o != gen4.o; re-running both generations to see which one is unstable" >&2
+    { printf '%s\n' "$WORK/gen3.again.o"; cat "$WORK/flat.elisa"; } >"$WORK/again.request"
+    run_guarded_request "$GEN2" "$WORK/again.request" "$WORK/gen3.again.log" || true
+    { printf '%s\n' "$WORK/gen4.again.o"; cat "$WORK/flat.elisa"; } >"$WORK/again4.request"
+    run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/again4.request" "$WORK/gen4.again.log" || true
+    describe() { if [ -s "$1" ]; then printf '%s bytes' "$(wc -c <"$1" | tr -d ' ')"; else printf 'MISSING'; fi; }
+    echo "  gen2 -> gen3.o        $(describe "$WORK/gen3.o")" >&2
+    echo "  gen2 -> gen3.again.o  $(describe "$WORK/gen3.again.o")   (differs from gen3.o => gen2 is not reproducible)" >&2
+    echo "  gen3 -> gen4.o        $(describe "$WORK/gen4.o")" >&2
+    echo "  gen3 -> gen4.again.o  $(describe "$WORK/gen4.again.o")   (differs from gen4.o => gen3 is not reproducible)" >&2
+    echo "  artifacts kept in $WORK" >&2
+    fail "gen3.o != gen4.o — the compiler does not reproduce itself; read the four sizes above before assuming a miscompile"
+fi
 echo "self_host_gen3_smoke stage C OK: gen3.o == gen4.o byte-identical (FIXPOINT)."
 exit 0
