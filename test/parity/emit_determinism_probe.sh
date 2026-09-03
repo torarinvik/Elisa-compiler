@@ -21,9 +21,24 @@
 #   both generations on failure and prints the four sizes, which is how the
 #   unstable generation was identified: gen2 reproduced itself, gen3 did not.
 #
-# NOT yet ruled out: an address-dependent decision (ASLR), an uninitialized read,
-# or a hash order somewhere in the store/arena parameter layout. name_hash is
-# FNV-1a over the name's bytes and is NOT a candidate.
+# WHICH GENERATION FLAKES (measured 2026-09-03, and this is the useful part):
+#
+#   seed  (built by stage0)  stable over 6 runs
+#   gen2  (built by the seed) stable over 18 runs
+#   gen3  (built by gen2)     flaked twice, ~1 in 8
+#
+#   So it is not "stage1-built compilers are flaky" -- gen2 is stage1-built and
+#   stable. Instability appears only at the SECOND stage1-built generation. Since
+#   the fixpoint holds (gen3.o == gen4.o), gen2 and gen3 emit identically, so the
+#   defect is in what gen2 IS: the compiler as emitted by the seed is fine, and
+#   the compiler as emitted by gen2 contains something that reads uninitialised or
+#   out-of-bounds memory. Look for a construct stage1 lowers differently from
+#   stage0 in the compiler's OWN source, leaving a slot unwritten.
+#
+# Also ruled out: a padded environment (7 runs, shifting stack addresses) changed
+# nothing, and the hidden-parameter decision for frontend_parse -- wants_store,
+# arena_count -- was identical across 6 instrumented runs. name_hash is FNV-1a
+# over the name's bytes and is not a candidate.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_DETERMINISM_BIN:-$ROOT/build/gen3_check/elisac-stage1-gen3}"
