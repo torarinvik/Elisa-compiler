@@ -134,5 +134,6 @@ run_negative "handler_target_via_unknown_permission.neg.elisa" 'concrete effect 
 run_negative "permission_member_mismatch.neg.elisa" 'permission "LocalConsole" has no member "Read"'
 run_negative "handler_implementation_access.neg.elisa" 'compiler-generated static effect operation "__handler__H__ping" is private'
 run_negative "handler_capture_arity.neg.elisa" 'effect handler "Sink" requires 1 capture argument(s), got 0'
+run_negative "handler_nested_resume.neg.elisa" 'handler "Bad" operation "ping" is outside the zero-overhead resumable subset'
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"
