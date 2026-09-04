@@ -10,9 +10,10 @@ output="$("$WRAPPER" -emit interpret "$SOURCE" 2>&1)"
 contradictions="$(printf '%s\n' "$output" | grep -c 'preconditions of .* are contradictory' || true)"
 unproven="$(printf '%s\n' "$output" | grep -c 'precondition of .* could not be proven' || true)"
 preservation="$(printf '%s\n' "$output" | grep -c 'invariant is established on entry but could not be proven preserved' || true)"
+refinement="$(printf '%s\n' "$output" | grep -c 'refinement argument' || true)"
 
-if [[ "$contradictions" -ne 2 || "$unproven" -ne 2 || "$preservation" -ne 0 ]]; then
-    printf 'semantic interval endpoint regression: contradictions=%s unproven=%s preservation=%s\n%s\n' "$contradictions" "$unproven" "$preservation" "$output" >&2
+if [[ "$contradictions" -ne 2 || "$unproven" -ne 2 || "$preservation" -ne 0 || "$refinement" -ne 0 ]]; then
+    printf 'semantic interval endpoint regression: contradictions=%s unproven=%s preservation=%s refinement=%s\n%s\n' "$contradictions" "$unproven" "$preservation" "$refinement" "$output" >&2
     exit 1
 fi
 
