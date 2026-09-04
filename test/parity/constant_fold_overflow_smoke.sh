@@ -13,8 +13,8 @@ output="$("$WRAPPER" -emit obj -O0 -o "$WORK/program.o" "$SOURCE" 2>&1)"
 status=$?
 set -e
 
-if [[ "$status" -ge 128 ]]; then
-    printf 'constant-fold overflow regression: compiler trapped with status %s\n%s\n' "$status" "$output" >&2
+if [[ "$status" -ne 0 ]]; then
+    printf 'constant-fold overflow regression: expected a conservative successful compile, got %s\n%s\n' "$status" "$output" >&2
     exit 1
 fi
 if [[ "$output" == *"static assert failed"* ]]; then
