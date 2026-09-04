@@ -56,6 +56,26 @@ class WasmBuildError(RuntimeError):
     pass
 
 
+def memory_pages_from_env(name: str, default: int) -> int:
+    """Read an optional linker memory size without making manifests mandatory.
+
+    Component packages often have a deliberately large static data segment (for
+    example a retained widget tree). Keeping the historical 16-page default is
+    compatible, while allowing a package build script to select a larger initial
+    heap before wasm-component-ld validates the object.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw, 10)
+    except ValueError as error:
+        raise WasmBuildError(f"{name} must be a positive integer page count") from error
+    if value <= 0:
+        raise WasmBuildError(f"{name} must be a positive integer page count")
+    return value
+
+
 def split_top_level(text: str, delimiter: str = ",") -> list[str]:
     result: list[str] = []
     start = 0
@@ -628,8 +648,8 @@ def build(args: argparse.Namespace) -> None:
         "version": 1,
         "module": module_name,
         "target": target,
-        "memory_initial_pages": 16,
-        "memory_max_pages": 32768,
+        "memory_initial_pages": memory_pages_from_env("ELISA_WASM_INITIAL_PAGES", 16),
+        "memory_max_pages": memory_pages_from_env("ELISA_WASM_MAX_PAGES", 32768),
         "memory": {"import_module": "env", "import_name": "memory", "heap_base_export": "__heap_base"},
         "exports": exports,
         "files": {"wasm": output.name, "loader": f"{module_name}.mjs", "types": f"{module_name}.d.ts", "types_esm": f"{module_name}.d.mts"},
