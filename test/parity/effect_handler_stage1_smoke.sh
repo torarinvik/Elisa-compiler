@@ -74,11 +74,13 @@ run_positive "static_handler_via.elisa"
 run_positive "static_handler_generic_explicit.elisa"
 run_positive "handler_via_install.elisa"
 run_positive "handler_via_bare_abstract.elisa"
+run_positive "handler_target_via.elisa"
 run_zero_overhead_ir "static_handler_capture.elisa"
 run_zero_overhead_ir "nested_handler_forwarding.elisa"
 run_zero_overhead_ir "static_handler_generic_explicit.elisa"
 run_zero_overhead_ir "handler_via_install.elisa"
 run_zero_overhead_ir "handler_via_bare_abstract.elisa"
+run_zero_overhead_ir "handler_target_via.elisa"
 
 capture_stem="handler_capture_once"
 "$ROOT/scripts/elisac_stage1.sh" \
@@ -114,6 +116,7 @@ run_negative "forward_partial_handler.neg.elisa" 'abstract effect operation Tick
 run_negative "unknown_abstract_operation_row.neg.elisa" 'effect "Tick" has no operation "pong"'
 run_negative "via_unknown_abstract.neg.elisa" 'abstract effect family "Missing" is not declared'
 run_negative "via_unknown_permission.neg.elisa" 'concrete effect permission "NoSuch.Write" names unknown permission family "NoSuch"'
+run_negative "handler_target_via_unknown_permission.neg.elisa" 'concrete effect permission "NoSuch.Write" names unknown permission family "NoSuch"'
 run_negative "permission_member_mismatch.neg.elisa" 'permission "LocalConsole" has no member "Read"'
 run_negative "handler_implementation_access.neg.elisa" 'compiler-generated static effect operation "__handler__H__ping" is private'
 
