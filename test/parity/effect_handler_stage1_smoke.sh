@@ -123,6 +123,7 @@ run_negative "operation_specialization_arity.neg.elisa" 'abstract effect special
 run_negative "forward_partial_handler.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
 run_negative "unknown_abstract_operation_row.neg.elisa" 'effect "Tick" has no operation "pong"'
 run_negative "unknown_abstract_operation_call.neg.elisa" 'effect "Tick" has no operation "pong"'
+run_negative "duplicate_abstract_operation.neg.elisa" 'effect "Tick" declares operation "ping" more than once'
 run_negative "via_unknown_abstract.neg.elisa" 'abstract effect family "Missing" is not declared'
 run_negative "via_unknown_permission.neg.elisa" 'concrete effect permission "NoSuch.Write" names unknown permission family "NoSuch"'
 run_negative "handler_target_via_unknown_permission.neg.elisa" 'concrete effect permission "NoSuch.Write" names unknown permission family "NoSuch"'
