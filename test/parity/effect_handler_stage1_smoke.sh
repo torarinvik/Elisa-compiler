@@ -122,5 +122,6 @@ run_negative "via_unknown_permission.neg.elisa" 'concrete effect permission "NoS
 run_negative "handler_target_via_unknown_permission.neg.elisa" 'concrete effect permission "NoSuch.Write" names unknown permission family "NoSuch"'
 run_negative "permission_member_mismatch.neg.elisa" 'permission "LocalConsole" has no member "Read"'
 run_negative "handler_implementation_access.neg.elisa" 'compiler-generated static effect operation "__handler__H__ping" is private'
+run_negative "handler_capture_arity.neg.elisa" 'effect handler "Sink" requires 1 capture argument(s), got 0'
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"
