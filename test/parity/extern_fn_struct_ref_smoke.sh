@@ -5,7 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
-STAGE0="${ELISA_STAGE0_BIN:-$HOME/.elisac/elisac}"
+STAGE0="${ELISA_STAGE0_BIN:-$HOME/.elisac/elisac-stage0}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
