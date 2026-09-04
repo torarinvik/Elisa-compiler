@@ -165,6 +165,43 @@ extend Backend:
             if callee is Expr.Field(protocol_head, protocol_method, protocol_method_line):
                 if protocol_head is Expr.Ident(protocol_parameter, protocol_parameter_line):
                     if bound_type_of(structs, protocol_parameter).kind != TypeKind.Unmodeled:
+                        # Resolve through the BOUND TYPE first. The impl tables already say
+                        # which conformance a receiver has, so two impls of ONE protocol stop
+                        # being ambiguous: `impl_member_types` names the receiver and
+                        # `impl_member_lines` gives that member's own line, which keys the
+                        # exact FnTable row.
+                        #
+                        # Before this, two impls whose methods share a signature made
+                        # overload_match_count return 2, both fallbacks below declined, and
+                        # EVERY instantiation failed -- so a protocol supported exactly one
+                        # implementation per unit, which defeats the point of having one.
+                        # elisa-ui only escaped it because its two Painters and two Controls
+                        # never share a compilation unit.
+                        # Matched by TYPE, not by source spelling, and dispatched only on a
+                        # UNIQUE match. That is what keeps the char/i64 guard intact without
+                        # weakening it: `impl Str for char` and `impl Str for int` resolve to
+                        # the same ValueType here, so they both match, the count is 2, and
+                        # this falls through to the fallbacks exactly as before. Two impls
+                        # over genuinely distinct types -- two structs, or bool and cstr --
+                        # match once and dispatch.
+                        protocol_bound: ValueType = bound_type_of(structs, protocol_parameter)
+                        protocol_row: mutable i64 = -1
+                        protocol_hits: mutable i64 = 0
+                        for protocol_impl_index in 0..<structs.impl_member_lines.count |protocol_row, protocol_hits, protocol_bound, protocol_method, structs, fns|:
+                            # Only protocol conformances: an EXTENSION impl records an empty
+                            # interface, and its methods are not protocol members.
+                            continue if structs.impl_member_ifaces[protocol_impl_index] == ""
+                            protocol_receiver_name: sview = structs.impl_member_types[protocol_impl_index]
+                            protocol_receiver_struct: i64 = struct_index_of(structs, protocol_receiver_name)
+                            protocol_receiver_type: ValueType = ValueType{kind: TypeKind.Struct, bits: protocol_receiver_struct.u64()} if protocol_receiver_struct >= 0 else scalar_type_of_name(protocol_receiver_name)
+                            continue if protocol_receiver_type.kind == TypeKind.Unmodeled
+                            continue if protocol_receiver_type.kind != protocol_bound.kind or protocol_receiver_type.bits != protocol_bound.bits
+                            protocol_candidate: i64 = function_index_of_line(fns, "", protocol_method, structs.impl_member_lines[protocol_impl_index])
+                            continue if protocol_candidate < 0
+                            protocol_hits <- protocol_hits + 1
+                            protocol_row <- protocol_candidate
+                        if protocol_hits == 1:
+                            return emit_direct_call_indexed(protocol_row, callee, false, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                         if structs.impl_concrete_names.count == 1.usize() and function_index_of(fns, "", protocol_method) >= 0:
                             return emit_call((Expr.Ident(protocol_method, protocol_method_line)), arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                         if overload_match_count(fns, "", protocol_method, arguments, local_scope, structs, generics) == 1:
@@ -200,10 +237,33 @@ extend Backend:
                     null return if generic_index_of(generics, explicit_name) < 0
                     explicit_args: mutable darray[ValueType] = [explicit_type]
                     return emit_generic_call(explicit_name, explicit_args, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # `M::f[i64](x)` — the same template reached through a module. A generic is
+                # registered under its BARE name (parser_types_function records no owner for
+                # one), so the MEMBER name is what resolves it. Without this the callee is a
+                # Scope rather than an Ident, nothing matched, and every call to a generic
+                # declared inside `module M:` was declined -- which is why a protocol driver
+                # could not live in a module at all.
+                if generic_callee is Expr.Scope(scoped_head, scoped_name, scoped_line):
+                    scoped_type: ValueType = annotation_value_type(generic_argument, structs)
+                    null return if scoped_type.kind == TypeKind.Unmodeled
+                    null return if generic_index_of(generics, scoped_name) < 0
+                    scoped_args: mutable darray[ValueType] = [scoped_type]
+                    return emit_generic_call(scoped_name, scoped_args, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 return null
             # `f[K, V](x)` — EXPLICIT multi-argument type application. The callee is an
             # IndexN whose bracket holds the type arguments.
             if callee is Expr.IndexN(multi_generic_callee, multi_generic_args, multi_generic_line):
+                # `M::f[K, V](x)`: same rule as the single-argument form above.
+                if multi_generic_callee is Expr.Scope(multi_scoped_head, multi_scoped_name, multi_scoped_line):
+                    if generic_index_of(generics, multi_scoped_name) >= 0:
+                        multi_scoped_args: mutable darray[ValueType] = []
+                        multi_scoped_declined: mutable bool = false
+                        for scoped_type_argument in multi_generic_args |multi_scoped_args, multi_scoped_declined, structs|:
+                            scoped_resolved: ValueType = annotation_value_type(scoped_type_argument, structs)
+                            multi_scoped_declined <- true if scoped_resolved.kind == TypeKind.Unmodeled
+                            multi_scoped_args.push(scoped_resolved)
+                        null return if multi_scoped_declined
+                        return emit_generic_call(multi_scoped_name, multi_scoped_args, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                 if multi_generic_callee is Expr.Ident(multi_name, multi_name_line):
                     null return if generic_index_of(generics, multi_name) < 0
                     multi_type_args: mutable darray[ValueType] = []
@@ -999,6 +1059,21 @@ extend Backend:
             # distinct from Expr.Field, so a qualified call is never confused with UFCS.
             if callee is Expr.Scope(scope_head, scope_name, scope_line):
                 if scope_head is Expr.Ident(module_name, module_name_line):
+                    # A generic reached through its module, with the type arguments INFERRED
+                    # from the call: `M::f(x)`. Same bare-name rule as the bracketed forms,
+                    # and checked before the direct call because a direct call has no
+                    # template to instantiate and would decline.
+                    # NOT gated on exact_overload_exists, unlike the bare-name path above: a
+                    # generic declared inside a module is ALSO recorded in the function
+                    # table under that module, so the overload probe always succeeds and
+                    # would skip the template every time. The generic table is the
+                    # narrower fact here -- a name is in it only if it really is one.
+                    if generic_index_of(generics, scope_name) >= 0:
+                        if arguments.count > 0:
+                            scope_generic_slot: usize = generic_index_of(generics, scope_name).usize()
+                            scope_inferred_args: darray[ValueType] = infer_generic_args(scope_generic_slot, arguments, local_scope, fns, structs, generics)
+                            if scope_inferred_args.count > 0:
+                                return emit_generic_call(scope_name, scope_inferred_args, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                     # `using Mod as M` makes `M::f` mean `Mod::f`; the name is unchanged when
                     # it is not an alias, so this is a no-op for an ordinary qualified call.
                     return emit_direct_call(module_alias_target(module_name, structs), scope_name, callee, false, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
@@ -1030,12 +1105,39 @@ extend Backend:
             # TYPE-matched overload first: several may share this arity, and taking the
             # first was a silent wrong answer (see overload_index_for_args). Only consulted
             # for a call with no receiver, where `arguments` IS the full argument list.
+            # A UFCS call resolves over the SAME full list, receiver first: `c.area()` with
+            # `impl Shape for Circle` and `impl Shape for Square` both declaring a one-param
+            # `area` used to skip the typed pass and take the first arity match, so every
+            # receiver dispatched to whichever impl was declared first (the differential
+            # case ufcs_overload_by_receiver). Only the protocol-through-bound-type path was
+            # typed; a value receiver is the common spelling and was not.
             fn_index: mutable i64 = -1
-            if not has_receiver:
+            if has_receiver:
+                receiver_first: mutable darray[Expr] = [receiver]
+                for ufcs_argument in arguments |receiver_first|:
+                    receiver_first.push(ufcs_argument)
+                fn_index <- overload_index_for_args(fns, callee_owner, callee_name, receiver_first, local_scope, structs, generics)
+            else:
                 fn_index <- overload_index_for_args(fns, callee_owner, callee_name, arguments, local_scope, structs, generics)
             fn_index <- function_index_of_arity(fns, callee_owner, callee_name, total_arguments) if fn_index < 0
             fn_index <- function_index_of(fns, callee_owner, callee_name) if fn_index < 0
             null return if fn_index < 0
+            return emit_direct_call_indexed(fn_index, receiver, has_receiver, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+
+
+        # Emit a call to an ALREADY-RESOLVED FnTable row.
+        #
+        # Split out of emit_direct_call, whose body below this point uses neither the
+        # owner nor the name -- only the resolved index. A caller that already knows
+        # exactly which row it wants can say so instead of re-resolving by name.
+        #
+        # Protocol dispatch is the case that needs it: two impls of one protocol give
+        # two same-named rows, and name resolution is RIGHT to refuse them (taking the
+        # first made `print(42)` print "*" once, because char and i64 are one ValueType
+        # here). The bound type says which impl is meant, so the caller resolves the
+        # row and hands it over.
+        def emit_direct_call_indexed(fn_index: i64, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, argument_names: darray[sview]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            total_arguments: usize = arguments.count + 1 if has_receiver else arguments.count
             target: LLVMValueRef = fns.handles[fn_index.usize()]
             # LLVMCountParams counts the implicit trailing ARENA too, so the arity check
             # must expect it — otherwise every call to an arena-threading function

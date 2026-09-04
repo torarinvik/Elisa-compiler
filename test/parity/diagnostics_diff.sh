@@ -32,17 +32,18 @@ normalize() {
 # known gap that gets fixed without being removed from this list fails the gate, so the list
 # cannot quietly outlive the divergence (see the stale-gate lesson in the project notes).
 #
-#   1. The CALL form of the namespace hint. stage1 raises the diagnostic from the Ident walk,
-#      which has no member name, so it renders the placeholder `M::member`; the plain field
-#      form already matches. Needs the member threaded from the Call/Field arm.
-#   2/3. An OPTIONAL type renders without its `?`. InferType carries kind+name only, and an
-#      optional interns under the name "optional" with the payload in a side list, so the
-#      payload spelling never reaches the message. Needs InferType to carry it.
-KNOWN_DIVERGENCES=(
-    '"M" is a namespace; write M::geti(...) (`.` accesses value members, `::` accesses namespaces)'
-    'variable "y" expects i64, got i64?'
-    'while condition must be bool, got i64?'
-)
+# EMPTY, and that is the point: stage1 now reproduces every stage0 diagnostic in the corpus
+# byte-for-byte. Three entries lived here and all three are fixed:
+#   - the CALL form of the namespace hint rendered the placeholder `M::member`, because it was
+#     raised from the bare-Ident walk which has no member name; it is now raised from the Call
+#     arm, where the callee's Field node names the member.
+#   - two OPTIONAL spellings dropped the `?` (`got i64` for `got i64?`). Both raise sites had a
+#     comment asserting stage0 elides the wrapper; stage0 does not. `actual` now keeps the
+#     optional family and `detail` carries the base, which is the channel NonBoolCondition
+#     already used, so one convention renders both.
+# Keep the mechanism: adding a genuinely-unfixed message here documents it AND fails the day it
+# starts agreeing, so the list can never outlive the divergence it describes.
+KNOWN_DIVERGENCES=()
 known_hit=()
 
 stage1_messages() {
@@ -80,7 +81,7 @@ $s1
 EOF
         if [ "$found" -eq 0 ]; then
             is_known=0
-            for known in "${KNOWN_DIVERGENCES[@]}"; do
+            for known in ${KNOWN_DIVERGENCES+"${KNOWN_DIVERGENCES[@]}"}; do
                 [ "$known" = "$expected" ] && is_known=1
             done
             if [ "$is_known" -eq 1 ]; then
@@ -103,7 +104,7 @@ fi
 
 # A KNOWN divergence that stopped diverging must be removed from the list, or the list stops
 # describing reality and the next reader trusts it.
-for known in "${KNOWN_DIVERGENCES[@]}"; do
+for known in ${KNOWN_DIVERGENCES+"${KNOWN_DIVERGENCES[@]}"}; do
     still=0
     for hit in ${known_hit+"${known_hit[@]}"}; do
         [ "$hit" = "$known" ] && still=1
