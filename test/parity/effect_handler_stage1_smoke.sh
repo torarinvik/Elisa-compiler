@@ -124,6 +124,7 @@ run_negative "unhandled_effect.neg.elisa" 'abstract effect operation Tick.ping r
 run_negative "handler_signature_mismatch.neg.elisa" 'handler "Bad" operation "ping" does not match the abstract operation signature'
 run_negative "abstract_operation_value.neg.elisa" 'abstract effect operation Tick.ping cannot be used as a value'
 run_negative "handler_specialization_call_mismatch.neg.elisa" 'abstract effect operation Writer[sview].write does not match the active handler specialization'
+run_negative "handler_qualified_namespace_mismatch.neg.elisa" 'abstract effect operation A::Tick.ping does not match the active handler specialization; runtime effect dispatch is unavailable in the zero-overhead effect subset'
 run_negative "handler_specialization_arity.neg.elisa" 'handler "Sink" has invalid specialization of abstract effect "Writer": expected 1 type argument(s), got 2'
 run_negative "operation_specialization_arity.neg.elisa" 'abstract effect specialization Writer expects 1 type argument(s), got 2'
 run_negative "forward_partial_handler.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
