@@ -73,10 +73,12 @@ run_positive "nested_handler_forwarding.elisa"
 run_positive "static_handler_via.elisa"
 run_positive "static_handler_generic_explicit.elisa"
 run_positive "handler_via_install.elisa"
+run_positive "handler_via_bare_abstract.elisa"
 run_zero_overhead_ir "static_handler_capture.elisa"
 run_zero_overhead_ir "nested_handler_forwarding.elisa"
 run_zero_overhead_ir "static_handler_generic_explicit.elisa"
 run_zero_overhead_ir "handler_via_install.elisa"
+run_zero_overhead_ir "handler_via_bare_abstract.elisa"
 
 capture_stem="handler_capture_once"
 "$ROOT/scripts/elisac_stage1.sh" \
