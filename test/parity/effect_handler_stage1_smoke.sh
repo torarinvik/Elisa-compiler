@@ -125,6 +125,7 @@ run_negative "unknown_abstract_operation_row.neg.elisa" 'effect "Tick" has no op
 run_negative "unknown_abstract_operation_call.neg.elisa" 'effect "Tick" has no operation "pong"'
 run_negative "operation_effect_row.neg.elisa" 'abstract effect row "Tick.ping" names operation "ping"; effect rows must name the family "Tick"'
 run_negative "handler_operation_target_row.neg.elisa" 'abstract effect row "Tick.ping" names operation "ping"; effect rows must name the family "Tick"'
+run_negative "via_operation_effect_row.neg.elisa" 'abstract effect row "Tick.ping via Console.Write" names operation "ping"; effect rows must name the family "Tick"'
 run_negative "duplicate_abstract_operation.neg.elisa" 'effect "Tick" declares operation "ping" more than once'
 run_negative "duplicate_handler_operation.neg.elisa" 'effect handler "Bad" declares operation "ping" more than once'
 run_negative "via_unknown_abstract.neg.elisa" 'abstract effect family "Missing" is not declared'
