@@ -2,11 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../wasm-sdk-stage0/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 FIXTURE="$ROOT/test/repro/export_same_name.elisa"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-same-name-parity.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+
+[[ -x "$STAGE0" ]] || { echo "same-name export parity SKIP: no stage0 at $STAGE0"; exit 0; }
+[[ -x "$STAGE1" ]] || { echo "same-name export parity SKIP: no stage1 at $STAGE1"; exit 0; }
 
 "$STAGE0" -emit llvm -o "$WORK/stage0.ll" "$FIXTURE"
 "$STAGE1" -emit llvm -o "$WORK/stage1.ll" "$FIXTURE"
@@ -31,9 +34,9 @@ done
 if command -v opt >/dev/null 2>&1; then
     opt -passes=verify "$WORK/stage0.ll" -disable-output
     opt -passes=verify "$WORK/stage1.ll" -disable-output
-elif [ -x /opt/homebrew/opt/llvm/bin/opt ]; then
+elif [[ -x /opt/homebrew/opt/llvm/bin/opt ]]; then
     /opt/homebrew/opt/llvm/bin/opt -passes=verify "$WORK/stage0.ll" -disable-output
     /opt/homebrew/opt/llvm/bin/opt -passes=verify "$WORK/stage1.ll" -disable-output
 fi
 
-echo "same-name export parity OK"
+echo "same-name export LLVM parity OK"
