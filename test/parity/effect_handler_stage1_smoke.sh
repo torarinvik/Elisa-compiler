@@ -78,12 +78,37 @@ run_zero_overhead_ir "nested_handler_forwarding.elisa"
 run_zero_overhead_ir "static_handler_generic_explicit.elisa"
 run_zero_overhead_ir "handler_via_install.elisa"
 
+capture_stem="handler_capture_once"
+"$ROOT/scripts/elisac_stage1.sh" \
+    -emit llvm \
+    -target-triple wasm32-unknown-unknown \
+    -o "$WORK/$capture_stem.ll" \
+    "$ROOT/test/fixtures/effects/$capture_stem.elisa" \
+    >"$WORK/$capture_stem-llvm.log" 2>&1
+[[ "$(grep -Ec 'call i64 @make_capture\(' "$WORK/$capture_stem.ll")" == "1" ]] || {
+    echo "expected handler capture expression to be evaluated once" >&2
+    sed -n '1,160p' "$WORK/$capture_stem.ll" >&2
+    exit 1
+}
+[[ "$(grep -Ec 'call void @__handler__TickHandler__ping' "$WORK/$capture_stem.ll")" == "2" ]] || {
+    echo "expected both operations to call the hidden handler directly" >&2
+    sed -n '1,160p' "$WORK/$capture_stem.ll" >&2
+    exit 1
+}
+if grep -Eiq 'effect(_|\.)?(handler|dispatch|install)|continuation|resume' "$WORK/$capture_stem.ll"; then
+    echo "found runtime effect machinery in zero-overhead LLVM for $capture_stem.elisa" >&2
+    exit 1
+fi
+
 run_negative "mismatched_handler.neg.elisa" 'effect handler "Wrong" realizes "Other"'
 run_negative "missing_operation.neg.elisa" 'effect "Tick" has no operation "pong"'
 run_negative "unhandled_effect.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
 run_negative "handler_signature_mismatch.neg.elisa" 'handler "Bad" operation "ping" does not match the abstract operation signature'
 run_negative "abstract_operation_value.neg.elisa" 'abstract effect operation Tick.ping cannot be used as a value'
 run_negative "handler_specialization_call_mismatch.neg.elisa" 'abstract effect operation Writer[sview].write does not match the active handler specialization'
+run_negative "handler_specialization_arity.neg.elisa" 'handler "Sink" has invalid specialization of abstract effect "Writer": expected 1 type argument(s), got 2'
+run_negative "operation_specialization_arity.neg.elisa" 'abstract effect specialization Writer expects 1 type argument(s), got 2'
+run_negative "via_unknown_abstract.neg.elisa" 'abstract effect family "Missing" is not declared'
 run_negative "via_unknown_permission.neg.elisa" 'concrete effect permission "NoSuch.Write" names unknown permission family "NoSuch"'
 run_negative "permission_member_mismatch.neg.elisa" 'permission "LocalConsole" has no member "Read"'
 run_negative "handler_implementation_access.neg.elisa" 'compiler-generated static effect operation "__handler__H__ping" is private'
