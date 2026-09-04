@@ -5,7 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
-STAGE0="${ELISA_STAGE0_BIN:-$HOME/.elisac/elisac}"
+STAGE0="${ELISA_STAGE0_BIN:-$HOME/.elisac/elisac-stage0}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
@@ -24,8 +24,11 @@ printf '%s\n' \
     'int register_callback(void *handler, int count) { return handler != 0 && count == 1 ? 0 : 1; }' \
     'int register_callback_pair(void *handler) { return handler != 0 ? 0 : 1; }' \
     | "$CLANG" -x c -c -o "$WORK/stub.o" -
-"$CLANG" -o "$WORK/stage0" "$WORK/stage0.o" "$WORK/stub.o" "$RUNTIME_OBJ"
-"$CLANG" -o "$WORK/stage1" "$WORK/stage1.o" "$WORK/stub.o" "$RUNTIME_OBJ"
+# -dead_strip, as every other smoke links the runtime object: its unreferenced
+# native-callback shims name symbols no program here defines, and without the
+# strip the link fails on them before the test runs at all.
+"$CLANG" -Wl,-dead_strip -o "$WORK/stage0" "$WORK/stage0.o" "$WORK/stub.o" "$RUNTIME_OBJ"
+"$CLANG" -Wl,-dead_strip -o "$WORK/stage1" "$WORK/stage1.o" "$WORK/stub.o" "$RUNTIME_OBJ"
 
 set +e
 "$WORK/stage0"
