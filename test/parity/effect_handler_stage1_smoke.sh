@@ -81,5 +81,6 @@ run_negative "missing_operation.neg.elisa" 'effect "Tick" has no operation "pong
 run_negative "unhandled_effect.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
 run_negative "handler_signature_mismatch.neg.elisa" 'handler "Bad" operation "ping" does not match the abstract operation signature'
 run_negative "abstract_operation_value.neg.elisa" 'abstract effect operation Tick.ping cannot be used as a value'
+run_negative "handler_specialization_call_mismatch.neg.elisa" 'abstract effect operation Writer[sview].write does not match the active handler specialization'
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"
