@@ -82,5 +82,7 @@ run_negative "unhandled_effect.neg.elisa" 'abstract effect operation Tick.ping r
 run_negative "handler_signature_mismatch.neg.elisa" 'handler "Bad" operation "ping" does not match the abstract operation signature'
 run_negative "abstract_operation_value.neg.elisa" 'abstract effect operation Tick.ping cannot be used as a value'
 run_negative "handler_specialization_call_mismatch.neg.elisa" 'abstract effect operation Writer[sview].write does not match the active handler specialization'
+run_negative "via_unknown_permission.neg.elisa" 'concrete effect permission "NoSuch.Write" names unknown permission family "NoSuch"'
+run_negative "permission_member_mismatch.neg.elisa" 'permission "LocalConsole" has no member "Read"'
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"
