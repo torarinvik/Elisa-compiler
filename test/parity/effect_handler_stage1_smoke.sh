@@ -88,6 +88,7 @@ run_zero_overhead_ir "static_handler_capture.elisa"
 run_zero_overhead_ir "static_handler_scope_named.elisa"
 run_zero_overhead_ir "static_handler_qualified.elisa"
 run_zero_overhead_ir "static_handler_qualified_generic.elisa"
+run_zero_overhead_ir "handler_default_capture.elisa"
 run_zero_overhead_ir "nested_handler_forwarding.elisa"
 run_zero_overhead_ir "nested_handler_capture_forwarding.elisa"
 run_zero_overhead_ir "static_handler_generic_explicit.elisa"
@@ -115,6 +116,22 @@ capture_stem="handler_capture_once"
 }
 if grep -Eiq 'effect(_|\.)?(handler|dispatch|install)|continuation|resume' "$WORK/$capture_stem.ll"; then
     echo "found runtime effect machinery in zero-overhead LLVM for $capture_stem.elisa" >&2
+    exit 1
+fi
+
+default_capture_stem="handler_default_capture"
+[[ "$(grep -Ec 'store i64 7' "$WORK/$default_capture_stem.ll")" == "1" ]] || {
+    echo "expected an omitted handler capture default to be evaluated once" >&2
+    sed -n '1,120p' "$WORK/$default_capture_stem.ll" >&2
+    exit 1
+}
+[[ "$(grep -Ec 'call void @__handler__Sink__ping' "$WORK/$default_capture_stem.ll")" == "2" ]] || {
+    echo "expected both operations to reuse the materialized default capture" >&2
+    sed -n '1,120p' "$WORK/$default_capture_stem.ll" >&2
+    exit 1
+}
+if grep -Eiq 'effect(_|\\.)?(handler|dispatch|install)|continuation|resume' "$WORK/$default_capture_stem.ll"; then
+    echo "found runtime effect machinery in zero-overhead LLVM for $default_capture_stem.elisa" >&2
     exit 1
 fi
 
