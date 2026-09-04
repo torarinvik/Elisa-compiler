@@ -22,6 +22,31 @@ extend Backend:
         #
         # A bare numeric literal matches its whole numeric family, since `f(5)` types as
         # Unmodeled: an int literal has no type of its own and adopts its context.
+        # The type a receiver-method cast NAMES when it is not a builtin scalar: a packed
+        # (hierarchy) or payload enum. Used to recognise `x.Event()` as a `__cast__` hook
+        # call rather than a UFCS call to a function named `Event`.
+        def cast_hook_target_type(name: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            packed_target: i64 = packed_index_of(structs, name)
+            ValueType{kind: TypeKind.PackedEnum, bits: packed_target.u32()} return if packed_target >= 0
+            payload_target: i64 = penum_index_of(structs, name)
+            ValueType{kind: TypeKind.PayloadEnum, bits: payload_target.u32()} return if payload_target >= 0
+            return unmodeled_type()
+
+        # The index of a visible `__cast__(source) -> target` overload, or -1. The pair is
+        # EXACT on both ends, which is stage0's rule: an untyped literal must be given a
+        # type first (`5.i32().Event()`), and a hook is never picked by return type alone.
+        def cast_hook_index(fns: FnTable&, source: ValueType, target: ValueType) -> i64 can[Abort.Panic]:
+            return -1 if source.kind == TypeKind.Unmodeled or target.kind == TypeKind.Unmodeled
+            for index in 0..<fns.names.count |fns, source, target|:
+                continue if fns.names[index] != "__cast__"
+                continue if fns.param_count[index] != 1
+                declared: ValueType = fns.param_types[fns.param_start[index]]
+                continue if declared.kind != source.kind or declared.bits != source.bits
+                returned: ValueType = fns.returns[index]
+                continue if returned.kind != target.kind or returned.bits != target.bits
+                return index.i64()
+            return -1
+
         def overload_index_for_args(fns: FnTable&, owner: sview, name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, structs: mutable StructTable&, generics: mutable GenericTable&) -> i64 can[Abort.Panic, Memory.Allocate] :
             can Abort.Panic:
                 for index in 0..<fns.names.count |fns, owner, name, arguments, local_scope, structs, generics|:
@@ -473,6 +498,15 @@ extend Backend:
 
         def bind_is_slot(local_scope: mutable Scope&, structs: mutable StructTable&, name: sview, value_type: ValueType, slot_type: LLVMTypeRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
             if cond_bind_slot_of(structs, name, slot_type) is shared_slot:
+                # The SLOT is shared across every bind of this name -- that is the point,
+                # and it is what makes the binding survive the match. The NAME still has to
+                # be declared again here: the first bind's declare_local went into a scope
+                # that has since closed, so a second `if x is held:` left `held` resolving
+                # to nothing and the body was emitted against an Unmodeled type. A write
+                # through it then declined (`held.pressed <- v` on a packed common), while
+                # the same code with a different binder name compiled -- which is what made
+                # this look like a per-arm problem rather than a per-name one.
+                declare_local(local_scope, name, shared_slot, value_type)
                 return shared_slot
             storage: mutable darray[u8] = []
             slot: LLVMValueRef = build_entry_alloca(builder, slot_type, sview_to_cstr(name, storage))
@@ -965,13 +999,18 @@ extend Backend:
                     ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.CStr and field_name == "len"
                     # An arena CARRIER's fields read the user-declared `struct Arena`.
                     object_type <- arena_user_struct(structs) if object_type.kind == TypeKind.Arena
-                    # A packed enum's COMMON field is an i64 word in the node's record, the same
-                    # shape the field emitter reads back. Typing it here is what lets a BARE
+                    # A packed enum's COMMON field uses its declared source type. The field
+                    # emitter reads dynamic AoS commons from the side table and inline commons
+                    # from the row, so typing it here is what lets a BARE
                     # `return node.span` through: the return path types the expression first,
                     # so an Unmodeled answer declined the whole function even though the
                     # emitter could serve the read (`node.span + 0` compiled, `node.span` did not).
                     if object_type.kind == TypeKind.PackedEnum and object_type.bits.usize() < structs.packed_names.count:
-                        ValueType{kind: TypeKind.Signed, bits: 64} return if packed_common_index_of(structs.packed_names[object_type.bits.usize()], field_name, structs) >= 0
+                        packed_common_index: i64 = packed_common_index_of(structs.packed_names[object_type.bits.usize()], field_name, structs)
+                        if packed_common_index >= 0:
+                            packed_common_type: ValueType = packed_common_type_at(structs, structs.packed_names[object_type.bits.usize()], packed_common_index.u32())
+                            return packed_common_type if packed_common_type.kind != TypeKind.Unmodeled
+                            return ValueType{kind: TypeKind.Signed, bits: 64}
                     # `xs.count` is a usize-shaped i64.
                     ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "count"
                     # `.capacity` is the header's third field, the same i64 shape as `.count`.
@@ -1119,6 +1158,10 @@ extend Backend:
                                 Expr.Ident(ctor_enum_name, ctor_enum_line):
                                     ctor_index: i64 = penum_index_of(structs, ctor_enum_name)
                                     ValueType{kind: TypeKind.PayloadEnum, bits: ctor_index.u32()} return if ctor_index >= 0
+                                # Module-qualified head: `UiCore::Command.Clear(...)`.
+                                Expr.Scope(ctor_scope_head, ctor_scoped_enum_name, ctor_scope_line):
+                                    scoped_ctor_index: i64 = penum_index_of(structs, ctor_scoped_enum_name)
+                                    ValueType{kind: TypeKind.PayloadEnum, bits: scoped_ctor_index.u32()} return if scoped_ctor_index >= 0
                                 _:
                                     pass
                             # `T.tag_of(v)` — STATIC protocol dispatch through a BOUND type parameter

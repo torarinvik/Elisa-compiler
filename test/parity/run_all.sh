@@ -18,14 +18,96 @@ set -uo pipefail
 # records its outcome. This exists because the worker pool below is xargs, which cannot call
 # a bash function — so the script re-enters itself per check. Each worker writes its own
 # result file, so nothing is shared and no output interleaves.
+# ---------------------------------------------------------------- RESULT CACHE
+# A check whose INPUTS have not changed cannot have changed its answer, and most gate
+# invocations during iteration re-verify a product identical to the last green run. The
+# cache key covers everything a check can read: its own script, the stage1 product, the
+# stage0 oracle, the runtime object, and a stat-walk of test/ + scripts/ (so editing any
+# fixture or helper invalidates every check — conservative, but never wrong).
+#
+# ONLY SUCCESSES ARE CACHED. A failure re-runs every time: the common painful case is
+# re-running the full gate after fixing one red check, and with this cache that run
+# re-executes exactly the previously-failing checks and green-stamps the rest from cache.
+# A cached row is printed as "ok  (cached)" so a stamped run is never mistaken for a
+# measured one. ELISA_GATE_NO_CACHE=1 bypasses; the cache lives in build/ and is ignored.
+gate_cache_key() {
+  # $1 = the check's script path (first word of the command). Portable md5 via python.
+  #
+  # The three binaries are keyed by CONTENT HASH, not mtime: several checks rebuild
+  # the runtime object mid-gate with byte-identical output, and an mtime key then
+  # rotates under every entry written earlier in the same run — the first full-gate
+  # cache produced ZERO hits on its own immediate re-run because of exactly that.
+  # The parent computes the combined hash once per gate (ELISA_GATE_BINS_HASH);
+  # a standalone exec-one without it falls back to hashing the binaries itself.
+  local script="$1" root="$2"
+  python3 - "$script" "$root" <<'KEYEOF'
+import hashlib, os, sys
+h = hashlib.sha256()
+script, root = sys.argv[1], sys.argv[2]
+bins = os.environ.get("ELISA_GATE_BINS_HASH", "")
+if bins:
+    h.update(bins.encode())
+else:
+    for f in (os.path.join(root, "bin/elisac-stage1"),
+              os.environ.get("ELISACORE_BIN", ""),
+              os.path.join(root, "build/runtime/elisacore_runtime.o")):
+        try:
+            h.update(hashlib.sha256(open(f, "rb").read()).digest())
+        except OSError:
+            h.update(f.encode()); h.update(b"missing")
+for f in (script,):
+    try:
+        st = os.stat(f)
+        h.update(f.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
+    except OSError:
+        h.update(f.encode()); h.update(b"missing")
+tree = os.environ.get("ELISA_GATE_TREE_HASH", "")
+if tree:
+    h.update(tree.encode())
+else:
+    for top in ("test", "scripts", "elisacore_std"):
+        base = os.path.join(root, top)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for name in sorted(filenames):
+                fp = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                h.update(fp.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
+print(h.hexdigest())
+KEYEOF
+}
+
 if [[ "${1:-}" == "--exec-one" ]]; then
   shift
   _rd="$1"; shift
   _name="$1"; shift
   _log="$_rd/$$.log"
+  _root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+  _cachedir="$_root/build/.gate-cache"
+  _key=""
+  if [[ "${ELISA_GATE_NO_CACHE:-0}" != 1 ]]; then
+    _key="$(gate_cache_key "$1" "$_root" 2>/dev/null)" || _key=""
+  fi
+  _cachefile=""
+  if [[ -n "$_key" ]]; then
+    _cachefile="$_cachedir/$(printf '%s' "$_name" | tr -c 'A-Za-z0-9_.-' '_')"
+    if [[ -f "$_cachefile" ]] && [[ "$(<"$_cachefile")" == "$_key" ]]; then
+      printf 'ok\t0\t%s\n' "$_name" > "$_rd/$(printf '%s' "$_name" | tr -c 'A-Za-z0-9_.-' '_').result"
+      printf '  %-4s %4ds  %s (cached)\n' "ok" 0 "$_name"
+      exit 0
+    fi
+  fi
   _t0=$SECONDS
   if bash "$@" >"$_log" 2>&1; then _st=ok; else _st=FAIL; fi
   _el=$((SECONDS - _t0))
+  if [[ "$_st" == ok && -n "$_cachefile" ]]; then
+    mkdir -p "$_cachedir" && printf '%s' "$_key" > "$_cachefile"
+  elif [[ -n "$_cachefile" ]]; then
+    rm -f "$_cachefile"
+  fi
   { printf '%s\t%s\t%s\n' "$_st" "$_el" "$_name"
     [[ "$_st" == FAIL ]] && tail -3 "$_log" | sed 's/^/       /'
   } > "$_rd/$(printf '%s' "$_name" | tr -c 'A-Za-z0-9_.-' '_').result"
@@ -88,7 +170,89 @@ fi
 # serial total was 1398s against a 23:18 wall, i.e. already ~83% busy on one core's worth of
 # scheduling. Override with ELISA_GATE_JOBS=1 to get the old serial behaviour when debugging
 # a check that is sensitive to load.
-GATE_JOBS="${ELISA_GATE_JOBS:-6}"
+#
+# MEMORY, not cores, is the binding constraint. A stage1 compile peaks in the GBs (the seed
+# guard's ceiling is 4 GB), so six at once wants more RAM than this box has once a browser
+# and two editors are resident. When it does not get it the host swaps, and the checks that
+# time programs DO NOT FAIL HONESTLY: backend_native_smoke reported trivial programs as
+# "runaway loop?" — including ones where the STAGE0 binary was the one that expired — and
+# the adversarial oracle reported acceptance gaps for programs both compilers accept. Both
+# now retry a timeout before believing it, but the cheaper fix is not to oversubscribe:
+# scale the pool by FREE memory, so a busy desktop runs a narrower, honest gate instead of a
+# wide, flaky one. ELISA_GATE_JOBS still overrides for a machine known to be quiet.
+gate_jobs_by_memory() {
+    local free_kb="" gb
+    case "$(uname -s)" in
+        Darwin)
+            # memory_pressure's free percentage, not vm_stat: free+inactive pages
+            # badly UNDERSTATE reclaimable memory on macOS (compressed memory and
+            # file cache are invisible to them) — this pool once picked 3 workers
+            # while the system reported 66% of 24GB free. The kernel's own pressure
+            # figure already accounts for everything reclaimable.
+            local free_pct total_bytes
+            free_pct="$(memory_pressure -Q 2>/dev/null | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print int($2)}')"
+            total_bytes="$(sysctl -n hw.memsize 2>/dev/null)"
+            if [[ -n "$free_pct" && -n "$total_bytes" ]]; then
+                free_kb=$(( total_bytes / 1024 * free_pct / 100 ))
+            else
+                free_kb="$(vm_stat 2>/dev/null | awk -v ps="$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)" '
+                    /Pages free/ {f=$3} /Pages inactive/ {i=$3}
+                    END {gsub(/\./,"",f); gsub(/\./,"",i); if (f=="") exit 1; print int((f+i)*ps/1024)}')" || free_kb=""
+            fi
+            ;;
+        Linux)
+            free_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)"
+            ;;
+    esac
+    # Unknown host: keep the historical default rather than guessing.
+    [[ -z "$free_kb" ]] && { echo 6; return; }
+    gb=$((free_kb / 1048576))
+    # ~3 GB of headroom per concurrent check, floor of 2 so a loaded box still finishes.
+    local n=$((gb / 3))
+    (( n < 2 )) && n=2
+    (( n > 6 )) && n=6
+    echo "$n"
+}
+GATE_JOBS="${ELISA_GATE_JOBS:-$(gate_jobs_by_memory)}"
+
+# The tree hash is taken ONCE here, pre-dispatch, on a quiesced tree — checks that
+# create and delete scratch files inside test/ mid-run otherwise make every
+# per-check walk observe a different transient state, and no key ever matches
+# across runs (v6: 0 cache hits on a byte-identical tree).
+export ELISA_GATE_TREE_HASH="$(python3 - "$REPO_ROOT" <<'TREEEOF'
+import hashlib, os, sys
+h = hashlib.sha256()
+root = sys.argv[1]
+for top in ("test", "scripts", "elisacore_std"):
+    base = os.path.join(root, top)
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for name in sorted(filenames):
+            fp = os.path.join(dirpath, name)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            h.update(fp.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
+print(h.hexdigest())
+TREEEOF
+)"
+
+# One content hash of the three product binaries for the whole run — see gate_cache_key.
+export ELISA_GATE_BINS_HASH="$(python3 - "$REPO_ROOT" <<'BINSEOF'
+import hashlib, os, sys
+h = hashlib.sha256()
+root = sys.argv[1]
+for f in (os.path.join(root, "bin/elisac-stage1"),
+          os.environ.get("ELISACORE_BIN", ""),
+          os.path.join(root, "build/runtime/elisacore_runtime.o")):
+    try:
+        h.update(hashlib.sha256(open(f, "rb").read()).digest())
+    except OSError:
+        h.update(f.encode()); h.update(b"missing")
+print(h.hexdigest())
+BINSEOF
+)"
 
 # ---------------------------------------------------------------- PROFILES
 # The full gate is ~11 minutes. That is the right cost before a COMMIT and the wrong cost
@@ -185,6 +349,7 @@ HEAVY_FIRST=(
   "$REPO_ROOT/test/parity/differential_corpus.sh"
   "$REPO_ROOT/test/parity/driver_acceptance_smoke.sh"
   "$REPO_ROOT/test/parity/backend_native_smoke.sh"
+  "$REPO_ROOT/test/parity/extern_view_abi_smoke.sh"
   "$REPO_ROOT/test/parity/self_host_gen3_smoke.sh"
   "$REPO_ROOT/test/parity/scope_binding_smoke.sh"
   "$REPO_ROOT/test/parity/resolve_smoke.sh"

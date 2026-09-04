@@ -266,7 +266,8 @@ extend Backend:
         # so a future ABI change cannot leave six of seven sites behind.
         def error_success_return_value(structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             success_code: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)
-            success_set: sview = line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, runtime.error_fn_line)
+            success_set: mutable sview = runtime.error_fn_family if runtime.error_fn_family != "" else line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, runtime.error_fn_line)
+            success_set <- resolved_error_family(success_set, structs)
             success_code return if not error_set_has_payload(structs, success_set)
             # A zeroinitializer rather than insertvalue-into-undef: field 0 is the tag and 0 IS
             # success, and the catch path reads no other field on the success branch. It also
@@ -285,7 +286,7 @@ extend Backend:
             index: i64 = function_index_of(fns, owner, name)
             false return if index < 0
             false return if not fns.is_error[index.usize()]
-            return error_set_has_payload(structs, line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, fns.lines[index.usize()]))
+            return error_set_has_payload(structs, resolved_error_family(line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, fns.lines[index.usize()]), structs))
 
 
         # The error SET NAME declared at `line` (`-> i64 error[BackendError]` -> "BackendError"),
@@ -811,7 +812,12 @@ extend Backend:
                     for parameter_index in 0..<params.count |flags, structs, start, row|:
                         flags.push(structs.region_fact_params[start + parameter_index])
                     return
-                region_flags_for_function(params, body, line, structs, flags)
+                # No recorded fact for this signature: infer from the body, which is what
+                # the comment on signature_arena_count says reference-parameter slots come
+                # from. This CALLED ITSELF with identical arguments -- an infinite recursion
+                # that only stayed hidden because a fact row is normally found. Reaching it
+                # blew the stack instead of falling back.
+                body_region_parameter_flags(params, body, structs, flags)
 
 
         def region_fact_row_from_params(params: darray[ParamDecl]&, line: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
@@ -1096,7 +1102,18 @@ extend Backend:
                             pass
                 return false
 
-        def function_needs_ast_store(owner: sview, name: sview) -> bool can[Abort.Panic]:
+        # `module Parser:` and `module Backend:` are the COMPILER'S OWN, and every member of
+        # them threads the hidden AST store. Matching on the bare name alone claimed any
+        # user module called `Backend` as well: its functions were declared with a store
+        # parameter nothing passes, so every call to one declined -- a program was broken by
+        # its choice of module name, with no diagnostic naming the collision.
+        #
+        # `structs.ast_refinement_names` is filled only from `__compiler_ast_refinement`,
+        # which the parser stamps solely on the sealed `Node` hierarchy (is_builtin_ast_node).
+        # It is therefore the exact test for "this program IS the compiler", and gating the
+        # name match on it leaves the compiler's own build unchanged.
+        def function_needs_ast_store(owner: sview, name: sview, structs: StructTable&) -> bool can[Abort.Panic]:
+            false return if structs.ast_refinement_names.count == 0
             if owner == "Parser" or owner == "Backend":
                 return true
             if name == "frontend_parser_parse_file" or name == "frontend_parse":
@@ -1114,7 +1131,14 @@ extend Backend:
                 if value_type.kind == TypeKind.PackedEnum:
                     enum_index: i64 = value_type.bits.i64()
                     root: i64 = packed_root_index_of(structs, enum_index)
-                    true return if root >= 0 and (packed_is_ast_root_row(structs, root) or packed_is_ast_refinement(structs, enum_index))
+                    true return if root >= 0 and (packed_is_ast_root_row(structs, root) or packed_is_dynamic_aos_enum(structs, enum_index) or packed_is_ast_refinement(structs, enum_index))
+                    # Any packed/AoS enum in a signature needs the store threaded for the same
+                    # reason the AST does: the value is a u32 handle into the CALLER's store,
+                    # so the callee cannot create one of its own — a locally created store
+                    # would index the handle into empty memory. stage0 lowers exactly this
+                    # (`kind(i32 handle, %Tree__Store)`); stage1 previously recognized only the
+                    # compiler AST marker after generic user hierarchies were separated from it.
+                    true return if packed_is_ast_root(structs, enum_index)
                 if value_type.kind == TypeKind.DArray:
                     return type_is_or_contains_packed_ast(darray_element_of(value_type, structs), depth + 1, structs)
                 if value_type.kind == TypeKind.Ref:
@@ -1997,6 +2021,8 @@ extend Backend:
             # than open-coded, which is why porting it is declaring these and calling them.
             packed_state_new: LLVMValueRef
             packed_state_new_type: LLVMTypeRef
+            packed_state_new_side: LLVMValueRef
+            packed_state_new_side_type: LLVMTypeRef
             packed_alloc: LLVMValueRef
             packed_alloc_type: LLVMTypeRef
             packed_alloc_result_type: LLVMTypeRef
@@ -2006,6 +2032,10 @@ extend Backend:
             packed_read_word_type: LLVMTypeRef
             packed_record_prefix: LLVMValueRef
             packed_record_prefix_type: LLVMTypeRef
+            packed_record_side_words: LLVMValueRef
+            packed_record_side_words_type: LLVMTypeRef
+            packed_read_side_word: LLVMValueRef
+            packed_read_side_word_type: LLVMTypeRef
             # The store an `in store:` block made ACTIVE, and which packed enum it stores
             # (-1 = none). Threaded on Runtime for the same reason `arena` is: a packed
             # constructor names no store, it uses whichever one is in scope. stage0 is
@@ -2065,6 +2095,10 @@ extend Backend:
             # The enclosing error function's declaration LINE, so `raise` can look up WHICH
             # error set it must build. Meaningful only while in_error_fn.
             error_fn_line: mutable u32 = 0
+            # First-class fallible lambdas do not have a declaration line in the function
+            # table. Carry their concrete error-family selector directly so their `raise`
+            # and implicit-success returns use the same ABI as named error functions.
+            error_fn_family: mutable sview = ""
             # The enclosing function's declared RETURN type. The expression emitters have no
             # statement context (no loops/regions/return_type), so a form that has to emit a
             # `return` from inside an expression — a `catch` arm that terminates rather than
@@ -2095,6 +2129,9 @@ extend Backend:
             read_tag: LLVMTypeRef
             read_word: LLVMTypeRef
             record_prefix: LLVMTypeRef
+            state_new_side: LLVMTypeRef
+            record_side_words: LLVMTypeRef
+            read_side_word: LLVMTypeRef
             streq: LLVMTypeRef
             sview: LLVMTypeRef
             sview_eq: LLVMTypeRef
@@ -2116,3 +2153,6 @@ extend Backend:
             read_tag: LLVMTypeRef
             read_word: LLVMTypeRef
             record_prefix: LLVMTypeRef
+            state_new_side: LLVMTypeRef
+            record_side_words: LLVMTypeRef
+            read_side_word: LLVMTypeRef

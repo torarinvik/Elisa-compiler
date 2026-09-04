@@ -31,6 +31,7 @@ MC_SOURCE = r'''
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/TargetSelect.h"
 #include <cstdio>
 #include <memory>
@@ -38,10 +39,11 @@ MC_SOURCE = r'''
 using namespace llvm;
 int main() {
   LLVMInitializeX86TargetInfo(); LLVMInitializeX86TargetMC();
-  std::string error; const Target *target = TargetRegistry::lookupTarget("x86_64-apple-darwin", error);
+  Triple triple("x86_64-apple-darwin");
+  std::string error; const Target *target = TargetRegistry::lookupTarget(triple, error);
   if (!target) return 2;
   std::unique_ptr<MCInstrInfo> instructions(target->createMCInstrInfo());
-  std::unique_ptr<MCRegisterInfo> registers(target->createMCRegInfo("x86_64-apple-darwin"));
+  std::unique_ptr<MCRegisterInfo> registers(target->createMCRegInfo(triple));
   if (!instructions || !registers) return 3;
   for (unsigned i = 0; i < instructions->getNumOpcodes(); ++i) {
     const MCInstrDesc &desc = instructions->get(i);

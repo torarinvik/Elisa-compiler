@@ -136,6 +136,61 @@ extend Backend:
             return qualified_name_cstr(owner, function_name, name_storage)
 
 
+        # The store a BODY should treat as active: the root of the first packed enum in the
+        # function's recorded signature. A user packed enum's value is a u32 handle into the
+        # CALLER's store, so the body has to name that type's root — and a flat recursive
+        # enum has no variant-less root row at all, which is why the program-root helper
+        # below answers -1 for it. Falls back to the program root (the AST's `Node`) when a
+        # signature mentions no packed type directly.
+        # A parameter's packed-enum type, seen through `?` and `&`. An optional handle is
+        # exactly the shape a linked-tree walker takes, and a bare `&` is how a reader
+        # borrows one, so neither may hide the hierarchy the body reads commons from.
+        def parameter_packed_enum_type(declared: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            inner: mutable ValueType = copied_type(declared)
+            inner <- optional_payload_of(inner, structs) if inner.kind == TypeKind.Optional
+            inner <- copied_type(structs.ref_targets[inner.bits.usize()]) if inner.kind == TypeKind.Ref and inner.bits.usize() < structs.ref_targets.count
+            return inner
+
+
+        def body_store_root_index(declaration: Decl, fns: FnTable&, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                name: sview = function_name_of(declaration)
+                line: u32 = function_line_of(declaration)
+                for index in 0..<fns.names.count |fns, name, line, structs|:
+                    continue if fns.names[index] != name or fns.lines[index] != line
+                    start: usize = fns.param_start[index]
+                    for offset in 0..<fns.param_count[index] |fns, structs, start|:
+                        # Through `?` and `&`: a body that only READS a packed value it was
+                        # handed (`def f(w: Widget?)` then `if w is node: node.pressed`) still
+                        # needs the root index recorded, or the common-read path's ambient-store
+                        # gate never opens and the read declines -- even though the hidden store
+                        # parameter it would have used is right there. The same code with the
+                        # value in a LOCAL compiled, which is what made this look like a
+                        # parameter-vs-local difference rather than a missing unwrap.
+                        param_type: ValueType = parameter_packed_enum_type(fns.param_types[start + offset], structs)
+                        continue if param_type.kind != TypeKind.PackedEnum
+                        param_root: i64 = packed_root_index_of(structs, param_type.bits.i64())
+                        param_root return if param_root >= 0
+                    signature_return: ValueType = fns.returns[index]
+                    if signature_return.kind == TypeKind.PackedEnum:
+                        return_root: i64 = packed_root_index_of(structs, signature_return.bits.i64())
+                        return_root return if return_root >= 0
+                return program_hierarchy_root_index(structs)
+
+
+        # The program's sealed hierarchy root — the reserved variant-less row every
+        # refinement shares. The AST's root is `Node`; a user program has exactly one such
+        # row per hierarchy, and `main` creates the store for it.
+        def program_hierarchy_root_index(structs: StructTable&) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                ast_root: i64 = packed_index_of(structs, "Node")
+                ast_root return if packed_is_ast_root_row(structs, ast_root)
+                for enum_index in 0..<structs.packed_names.count |structs|:
+                    true_index: i64 = enum_index.i64()
+                    true_index return if packed_is_ast_root_row(structs, true_index)
+                return -1
+
+
         def declared_parameter_llvm_types(declared_param_types: darray[ValueType], arena_count: usize, wants_store: bool, sret_return: bool, structs: mutable StructTable&, ctx: LLVMContextRef) -> darray[LLVMTypeRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             llvm_param_types: mutable darray[LLVMTypeRef] = []
             llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if sret_return
@@ -206,10 +261,10 @@ extend Backend:
                     fn_name <- (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
                 else:
                     fn_name <- declared_function_name(owner, function_name, overload_count, params.count, name_storage)
-            wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store or params_include_packed_ast(declared_param_types, structs)
+            wants_store: bool = function_needs_ast_store(owner, function_name, structs) or force_ast_store or params_include_packed_ast(declared_param_types, structs) or type_is_or_contains_packed_ast(return_value_type, 0, structs)
             is_error_fn: bool = line_is_error_returning(error_lines, line)
             sret_return: bool = not is_error_fn and value_type_uses_sret(return_value_type, structs, ctx)
-            error_set_name: sview = line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, line) if is_error_fn else ""
+            error_set_name: sview = resolved_error_family(line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, line), structs) if is_error_fn else ""
             # Parser/Lexer functions construct opaque AST handles whose nested side
             # tables are not visible in the source signature. Keep their allocations
             # in the caller's region just like an explicit darray return.
@@ -302,7 +357,7 @@ extend Backend:
                 overload_count: mutable i64 = 0
                 for oi in 0..<fns.names.count |oi, fns, owner, function_name, overload_count|:
                     overload_count <- overload_count + 1 if fns.names[oi] == function_name and fns.owners[oi] == owner
-                wants_store: bool = function_needs_ast_store(owner, function_name) or force_ast_store or params_include_packed_ast(declared_param_types, structs)
+                wants_store: bool = function_needs_ast_store(owner, function_name, structs) or force_ast_store or params_include_packed_ast(declared_param_types, structs) or type_is_or_contains_packed_ast(return_value_type, 0, structs)
                 declaration_error_set_name: sview = line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, line) if line_is_error_returning(error_lines, line) else ""
                 signature_arena_slots: mutable usize = signature_arena_count(params, return_value_type, body, line, structs)
                 signature_arena_slots <- 0.usize() if generic_helper_uses_explicit_allocator(function_name)
@@ -528,7 +583,210 @@ extend Backend:
             return ""
 
 
+        # ---- The C ABI at an export boundary, per target. Mirror of stage0's
+        # llvm_export_cabi.go, pinned against clang for the same struct shapes:
+        #   arm64  HFA (1..4 leaves of one float type): [N x float] in, the struct
+        #          out; other aggregates <= 8 bytes i64 in / iN out at exact width;
+        #          9..16 [2 x i64]; > 16 a pointer to a caller copy in, sret out.
+        #   x86-64 <= 16: each eightbyte INTEGER (iN of the bytes used) or SSE
+        #          (float, <2 x float>, double); two eightbytes = two params / {a,b}.
+        #          > 16: byval / sret.
+        #   wasm32 a lone scalar leaf is that scalar; else byval / sret.
+        # Classification walks the LOWERED LLVM struct (element kinds + offsets).
+        struct CabiLeaf:
+            offset: u64
+            size: u64
+            kind: i32
+
+        struct CabiArgPlan:
+            direct: bool
+            byval: bool
+            aggregate: bool
+            parts: darray[LLVMTypeRef]
+            offsets: darray[u64]
+            value_type: LLVMTypeRef
+
+        struct CabiRetPlan:
+            direct: bool
+            sret: bool
+            ret_type: LLVMTypeRef
+            value_type: LLVMTypeRef
+
+        def cabi_target() -> i32 can[Abort.Panic]:
+            2 return if target_triple_is_wasm()
+            1 return if getenv("ELISA_STAGE1_X86_64") is x86_target
+            return 0
+
+        def cabi_is_aggregate(value_type: ValueType) -> bool:
+            return value_type.kind == TypeKind.Struct or value_type.kind == TypeKind.Array
+
+        def cabi_flatten(ty: LLVMTypeRef, base: u64, leaves: mutable darray[CabiLeaf]&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            kind: u32 = LLVMGetTypeKind(ty)
+            if kind == 10:
+                element_count: u32 = LLVMCountStructElementTypes(ty)
+                for element_index in 0..<element_count.usize() |ty, base, leaves, structs|:
+                    element: LLVMTypeRef = LLVMStructGetTypeAtIndex(ty, element_index.u32())
+                    element_offset: u64 = LLVMOffsetOfElement(structs.target_data, ty, element_index.u32())
+                    element_ok: bool = cabi_flatten(element, base + element_offset, leaves, structs)
+                    false return if element_ok == false
+                return true
+            if kind == 11:
+                array_element: LLVMTypeRef = LLVMGetElementType(ty)
+                array_count: u64 = LLVMGetArrayLength2(ty)
+                array_stride: u64 = LLVMABISizeOfType(structs.target_data, array_element)
+                for array_index in 0..<array_count.usize() |array_element, base, array_stride, leaves, structs|:
+                    array_ok: bool = cabi_flatten(array_element, base + array_index.u64() * array_stride, leaves, structs)
+                    false return if array_ok == false
+                return true
+            if kind == 2:
+                leaves.push(CabiLeaf{offset: base, size: 4, kind: 1})
+                return true
+            if kind == 3:
+                leaves.push(CabiLeaf{offset: base, size: 8, kind: 2})
+                return true
+            if kind == 8 or kind == 12:
+                leaves.push(CabiLeaf{offset: base, size: LLVMABISizeOfType(structs.target_data, ty), kind: 0})
+                return true
+            return false
+
+        def cabi_leaf_type(leaf: CabiLeaf, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic]:
+            LLVMFloatTypeInContext(ctx) return if leaf.kind == 1
+            LLVMDoubleTypeInContext(ctx) return if leaf.kind == 2
+            return LLVMIntTypeInContext(ctx, (leaf.size * 8).u32())
+
+        # 1..4 leaves of one float kind, contiguous: the count, else 0.
+        def cabi_hfa_count(leaves: darray[CabiLeaf]&) -> usize can[Abort.Panic]:
+            0 return if leaves.count == 0 or leaves.count > 4
+            leaf_kind: i32 = leaves[0].kind
+            0 return if leaf_kind == 0
+            for leaf_index in 0..<leaves.count |leaves, leaf_kind|:
+                0 return if leaves[leaf_index].kind != leaf_kind or leaves[leaf_index].offset != leaf_index.u64() * leaves[leaf_index].size
+            return leaves.count
+
+        # x86-64 SysV: the ABI type of eightbyte `eb`, or null when no leaf lands in it.
+        def cabi_x86_eightbyte(leaves: darray[CabiLeaf]&, size: u64, eb: u64, ctx: LLVMContextRef, found: mutable bool&) -> LLVMTypeRef can[Abort.Panic]:
+            lo: u64 = eb * 8
+            hi: u64 = lo + 8
+            ints: mutable i32 = 0
+            f32s: mutable i32 = 0
+            f64s: mutable i32 = 0
+            for leaf_index in 0..<leaves.count |leaves, lo, hi, ints, f32s, f64s|:
+                continue if leaves[leaf_index].offset >= hi or leaves[leaf_index].offset + leaves[leaf_index].size <= lo
+                ints <- ints + 1 if leaves[leaf_index].kind == 0
+                f32s <- f32s + 1 if leaves[leaf_index].kind == 1
+                f64s <- f64s + 1 if leaves[leaf_index].kind == 2
+            found <- ints + f32s + f64s > 0
+            any_leaf: bool = ints + f32s + f64s > 0
+            LLVMInt64TypeInContext(ctx) return if not any_leaf
+            if ints > 0:
+                used: u64 = (size - lo) if size - lo < 8 else 8
+                return LLVMIntTypeInContext(ctx, (used * 8).u32())
+            LLVMDoubleTypeInContext(ctx) return if f64s > 0
+            LLVMVectorType(LLVMFloatTypeInContext(ctx), 2) return if f32s >= 2
+            return LLVMFloatTypeInContext(ctx)
+
+        def cabi_classify_arg(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> CabiArgPlan can[Abort.Panic, Memory.Allocate]:
+            llvm_value: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            scalar_parts: darray[LLVMTypeRef] = [llvm_value]
+            scalar_offsets: darray[u64] = [0]
+            arg_is_aggregate: bool = cabi_is_aggregate(value_type)
+            CabiArgPlan{direct: true, byval: false, aggregate: false, parts: scalar_parts, offsets: scalar_offsets, value_type: llvm_value} return if not arg_is_aggregate
+            size: u64 = LLVMABISizeOfType(structs.target_data, llvm_value)
+            CabiArgPlan{direct: true, byval: false, aggregate: true, parts: scalar_parts, offsets: scalar_offsets, value_type: llvm_value} return if size == 0
+            leaves: mutable darray[CabiLeaf] = []
+            flat_ok: bool = cabi_flatten(llvm_value, 0, leaves, structs)
+            no_parts: darray[LLVMTypeRef] = []
+            no_offsets: darray[u64] = []
+            CabiArgPlan{direct: false, byval: true, aggregate: true, parts: no_parts, offsets: no_offsets, value_type: llvm_value} return if flat_ok == false
+            target: i32 = cabi_target()
+            if target == 2:
+                if leaves.count == 1:
+                    wasm_parts: darray[LLVMTypeRef] = [cabi_leaf_type(leaves[0], ctx)]
+                    wasm_offsets: darray[u64] = [leaves[0].offset]
+                    return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: wasm_parts, offsets: wasm_offsets, value_type: llvm_value}
+                return CabiArgPlan{direct: false, byval: true, aggregate: true, parts: no_parts, offsets: no_offsets, value_type: llvm_value}
+            if target == 0:
+                hfa: usize = cabi_hfa_count(leaves)
+                if hfa > 0:
+                    hfa_parts: darray[LLVMTypeRef] = [LLVMArrayType(cabi_leaf_type(leaves[0], ctx), hfa.u32())]
+                    return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: hfa_parts, offsets: scalar_offsets, value_type: llvm_value}
+                if size <= 8:
+                    i64_parts: darray[LLVMTypeRef] = [LLVMInt64TypeInContext(ctx)]
+                    return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: i64_parts, offsets: scalar_offsets, value_type: llvm_value}
+                if size <= 16:
+                    pair_parts: darray[LLVMTypeRef] = [LLVMArrayType(LLVMInt64TypeInContext(ctx), 2)]
+                    return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: pair_parts, offsets: scalar_offsets, value_type: llvm_value}
+                return CabiArgPlan{direct: false, byval: false, aggregate: true, parts: no_parts, offsets: no_offsets, value_type: llvm_value}
+            # x86-64 SysV
+            CabiArgPlan{direct: false, byval: true, aggregate: true, parts: no_parts, offsets: no_offsets, value_type: llvm_value} return if size > 16
+            x86_parts: mutable darray[LLVMTypeRef] = []
+            x86_offsets: mutable darray[u64] = []
+            eb: mutable u64 = 0
+            while eb * 8 < size |eb, x86_parts, x86_offsets, leaves, size, ctx|:
+                eb_found: mutable bool = false
+                eb_type: LLVMTypeRef = cabi_x86_eightbyte(leaves, size, eb, ctx, eb_found)
+                if eb_found:
+                    x86_parts.push(eb_type)
+                    x86_offsets.push(eb * 8)
+                eb <- eb + 1
+            if x86_parts.count == 0:
+                x86_parts.push(LLVMIntTypeInContext(ctx, (size * 8).u32()))
+                x86_offsets.push(0)
+            return CabiArgPlan{direct: true, byval: false, aggregate: true, parts: x86_parts, offsets: x86_offsets, value_type: llvm_value}
+
+        def cabi_classify_ret(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> CabiRetPlan can[Abort.Panic, Memory.Allocate]:
+            llvm_value: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            ret_is_aggregate: bool = cabi_is_aggregate(value_type)
+            CabiRetPlan{direct: true, sret: false, ret_type: llvm_value, value_type: llvm_value} return if not ret_is_aggregate
+            size: u64 = LLVMABISizeOfType(structs.target_data, llvm_value)
+            CabiRetPlan{direct: true, sret: false, ret_type: llvm_value, value_type: llvm_value} return if size == 0
+            leaves: mutable darray[CabiLeaf] = []
+            flat_ok: bool = cabi_flatten(llvm_value, 0, leaves, structs)
+            CabiRetPlan{direct: false, sret: true, ret_type: llvm_value, value_type: llvm_value} return if flat_ok == false
+            target: i32 = cabi_target()
+            if target == 2:
+                CabiRetPlan{direct: true, sret: false, ret_type: cabi_leaf_type(leaves[0], ctx), value_type: llvm_value} return if leaves.count == 1
+                return CabiRetPlan{direct: false, sret: true, ret_type: llvm_value, value_type: llvm_value}
+            if target == 0:
+                CabiRetPlan{direct: true, sret: false, ret_type: llvm_value, value_type: llvm_value} return if cabi_hfa_count(leaves) > 0
+                CabiRetPlan{direct: true, sret: false, ret_type: LLVMIntTypeInContext(ctx, (size * 8).u32()), value_type: llvm_value} return if size <= 8
+                CabiRetPlan{direct: true, sret: false, ret_type: LLVMArrayType(LLVMInt64TypeInContext(ctx), 2), value_type: llvm_value} return if size <= 16
+                return CabiRetPlan{direct: false, sret: true, ret_type: llvm_value, value_type: llvm_value}
+            CabiRetPlan{direct: false, sret: true, ret_type: llvm_value, value_type: llvm_value} return if size > 16
+            ret_parts: mutable darray[LLVMTypeRef] = []
+            ret_eb: mutable u64 = 0
+            while ret_eb * 8 < size |ret_eb, ret_parts, leaves, size, ctx|:
+                ret_found: mutable bool = false
+                ret_part: LLVMTypeRef = cabi_x86_eightbyte(leaves, size, ret_eb, ctx, ret_found)
+                ret_parts.push(ret_part) if ret_found
+                ret_eb <- ret_eb + 1
+            CabiRetPlan{direct: true, sret: false, ret_type: LLVMIntTypeInContext(ctx, (size * 8).u32()), value_type: llvm_value} return if ret_parts.count == 0
+            CabiRetPlan{direct: true, sret: false, ret_type: ret_parts[0], value_type: llvm_value} return if ret_parts.count == 1
+            ret_parts_pointer: void& = (&ret_parts[0]).cast[void&] can Unsafe.PointerCast
+            return CabiRetPlan{direct: true, sret: false, ret_type: LLVMStructTypeInContext(ctx, ret_parts_pointer, ret_parts.count.u32(), 0), value_type: llvm_value}
+
+        # An 8-byte-aligned spill slot covering `bytes`, as an i64 array.
+        def cabi_slot(bytes: u64, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic]:
+            words: u64 = (bytes + 7) / 8
+            slot: LLVMValueRef = LLVMBuildAlloca(builder, LLVMArrayType(LLVMInt64TypeInContext(ctx), (words if words > 0 else 1).u32()), "export.abi.slot")
+            LLVMSetAlignment(slot, 8)
+            return slot
+
+        def cabi_ptr_at(base: LLVMValueRef, offset: u64, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Unsafe.PointerCast]:
+            base return if offset == 0
+            index_values: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), offset, 0)]
+            index_pointer: void& = (&index_values[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), base, index_pointer, 1, "export.abi.part")
+
         def declare_export_global_alias(alias_name: sview, target_name: sview, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # `export global G as G`: nothing new -- an alias to itself came out as a
+            # bogus `G.1`. The global simply stays external under its own name.
+            if alias_name == target_name:
+                same_global_index: i64 = mutable_global_index_of(structs, target_name)
+                LLVMSetLinkage(structs.mutable_global_handles[same_global_index.usize()], 0) if same_global_index >= 0
+                same_const_index: i64 = const_index_of(structs, target_name)
+                LLVMSetLinkage(structs.const_globals[same_const_index.usize()], 0) if same_global_index < 0 and same_const_index >= 0 and structs.const_global_ok[same_const_index.usize()]
+                return true
             target: mutable LLVMValueRef = zeroed
             target_type: mutable ValueType = unmodeled_type()
             mutable_index: i64 = mutable_global_index_of(structs, target_name)
@@ -569,7 +827,10 @@ extend Backend:
         def materialize_export_global_aliases(annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 for annotation in annotations |structs, m, ctx|:
-                    continue if annotation.name == "__export_global"
+                    # `export global MAGIC as MAGIC` names the implementation itself. The
+                    # target is already the public symbol; adding an alias named MAGIC would
+                    # produce the spurious `@MAGIC.1` self-alias seen only in Stage1.
+                    continue if annotation.name == "__export_global" or annotation.owner == annotation.name
                     if mutable_global_index_of(structs, annotation.name) >= 0 or const_index_of(structs, annotation.name) >= 0:
                         _ = declare_export_global_alias(annotation.owner, annotation.name, structs, m, ctx)
 
@@ -608,6 +869,26 @@ extend Backend:
             return ValueType{kind: TypeKind.Struct, bits: found_index.u32()}
 
 
+        # Resolve the element retained by the compact extern scanner. This is intentionally
+        # name-based and small: the scanner only records the first application argument, while
+        # ordinary declarations retain a full Expr. It covers the scalar/nominal names that can
+        # cross the C boundary and lets `view[T]`/`darray[T]` use their normal interned ABI.
+        def extern_element_value_type(element_name: sview, annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            bound_element: ValueType = bound_type_of(structs, element_name)
+            return bound_element if bound_element.kind != TypeKind.Unmodeled
+            named_element: mutable ValueType = scalar_type_of_name(element_name)
+            named_element <- ValueType{kind: TypeKind.CStr, bits: 1} if named_element.kind == TypeKind.Unmodeled and llvm_opaque_handle_name(element_name)
+            if named_element.kind == TypeKind.Unmodeled:
+                element_struct: i64 = struct_index_of(structs, element_name)
+                named_element <- ValueType{kind: TypeKind.Struct, bits: element_struct.u32()} if element_struct >= 0
+            if named_element.kind == TypeKind.Unmodeled:
+                element_enum: i64 = enum_index_of(structs, element_name)
+                named_element <- copied_type(structs.enum_backings[element_enum.usize()]) if element_enum >= 0
+            if named_element.kind == TypeKind.Unmodeled:
+                named_element <- export_alias_value_type(annotations, structs, element_name)
+            return named_element
+
+
         def declare_extern(declaration: Decl, extern_params: darray[ExternParam]&, extern_global_type_names: darray[sview]&, extern_global_type_exprs: darray[Expr]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, return_is_pointer: bool, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
                 # `export pymodule NAME:` is a frontend-only export contract. Its declaration
@@ -617,6 +898,13 @@ extend Backend:
                 for pymodule_annotation in annotations |extern_name|:
                     true return if pymodule_annotation.owner == extern_name and pymodule_annotation.name == "__export_pymodule"
                 linker_name: sview = extern_link_name(decorators, annotation_args, extern_name)
+                # An `export fn` declaration, and whether its public name IS its
+                # implementation's name. The latter must own a handle of its own:
+                # declare_or_get_named would hand it the implementation's, and the
+                # wrapper body would then be emitted into the implementation.
+                extern_export_target: sview = export_target_of(annotations, extern_name)
+                extern_is_export: bool = extern_export_target != ""
+                extern_same_name_export: bool = extern_is_export and extern_export_target == extern_name
                 # `extern name: T` (a typed non-call extern) is a GLOBAL, not a function.
                 if not callable:
                     # `export type T as Public` is represented by the parser as a
@@ -824,10 +1112,37 @@ extend Backend:
                         # `export type Vec[i32] as Vec2i` — see export_alias_value_type.
                         if param_value_type.kind == TypeKind.Unmodeled:
                             param_value_type <- export_alias_value_type(annotations, structs, param_name)
+                        # Applied container parameters arrive in the compact extern side table
+                        # as a head plus its first argument. Resolve that pair before declining:
+                        # stage0 passes `view[T]` by value as `%DynArrayView`, not as an opaque
+                        # bare name. The missing element was why extern view parameters declined
+                        # while the identical ordinary signatures worked.
+                        if param_value_type.kind == TypeKind.Unmodeled and (param_name == "view" or param_name == "darray"):
+                            extern_element: ValueType = extern_element_value_type(extern_params[param_start.usize() + offset].element_type_name, annotations, structs)
+                            if extern_element.kind != TypeKind.Unmodeled:
+                                param_value_type <- intern_view_type(extern_element, structs) if param_name == "view" else intern_darray_type(extern_element, structs)
+                        # A plain (non-generic) struct by its own name -- `export type Vec2 as
+                        # Vec2` or simply a `layout(c)` struct. Only generic instantiation
+                        # aliases resolved before, so a struct parameter fell through to
+                        # `declined` and the whole export was DROPPED with the object still
+                        # written.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            plain_struct_index: i64 = struct_index_of(structs, param_name)
+                            param_value_type <- ValueType{kind: TypeKind.Struct, bits: plain_struct_index.u32()} if plain_struct_index >= 0
                         if param_value_type.kind == TypeKind.Unmodeled:
                             declined <- true
                         else:
-                            extern_param_types.push(llvm_type_of(param_value_type, structs, ctx))
+                            # An exported aggregate crosses the boundary in the target's C ABI
+                            # form (cabi_classify_arg): one or two register parts, or a pointer.
+                            if extern_is_export and cabi_is_aggregate(param_value_type):
+                                export_arg_plan: CabiArgPlan = cabi_classify_arg(param_value_type, structs, ctx)
+                                if export_arg_plan.direct:
+                                    for export_arg_part in export_arg_plan.parts |extern_param_types|:
+                                        extern_param_types.push(export_arg_part)
+                                else:
+                                    extern_param_types.push(LLVMPointerTypeInContext(ctx, 0))
+                            else:
+                                extern_param_types.push(llvm_type_of(param_value_type, structs, ctx))
                             declared_param_types.push(param_value_type)
                 false return if declined
 
@@ -855,11 +1170,31 @@ extend Backend:
                     extern_error_params.extend(extern_param_types)
                     extern_param_types <- extern_error_params
                 extern_abi_arity: u32 = arity + (1 if extern_is_error else 0)
-                llvm_return: LLVMTypeRef = LLVMInt32TypeInContext(ctx) if extern_is_error else llvm_type_of(return_value_type, structs, ctx)
+                # An export's aggregate RETURN crosses the C ABI as the integer of its width
+                # (1/2/4/8 bytes), like a parameter; wider is declined as stage0 does. The
+                # wrapper packs the implementation's struct result into it.
+                # An exported aggregate RETURN takes the target's C ABI form: a register
+                # type, or sret through a leading pointer parameter.
+                llvm_return: mutable LLVMTypeRef = LLVMInt32TypeInContext(ctx) if extern_is_error else llvm_type_of(return_value_type, structs, ctx)
+                export_ret_sret: mutable bool = false
+                if extern_is_export and cabi_is_aggregate(return_value_type):
+                    export_ret_plan: CabiRetPlan = cabi_classify_ret(return_value_type, structs, ctx)
+                    llvm_return <- export_ret_plan.ret_type if export_ret_plan.direct
+                    if export_ret_plan.sret:
+                        llvm_return <- LLVMVoidTypeInContext(ctx)
+                        export_ret_sret <- true
+                        sret_params: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+                        sret_params.extend(extern_param_types)
+                        extern_param_types <- sret_params
+                # The LLVM parameter list is the LOWERED list, not the declared arity: an
+                # export's sret pointer is prepended and an x86-64 two-eightbyte aggregate
+                # is two parameters. Building the type from the declared count dropped the
+                # sret parameter (the wrapper then read a parameter that did not exist and
+                # the compiler died at teardown, after writing the object).
                 fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
-                if extern_abi_arity != 0:
+                if extern_param_types.count != 0:
                     extern_pointer: void& = (&extern_param_types[0]).cast[void&] can Unsafe.PointerCast
-                    fn_type <- LLVMFunctionType(llvm_return, extern_pointer, extern_abi_arity, 1 if variadic else 0)
+                    fn_type <- LLVMFunctionType(llvm_return, extern_pointer, extern_param_types.count.u32(), 1 if variadic else 0)
                 intrinsic_name: sview = extern_intrinsic_name(decorators, annotation_args)
                 handle: mutable LLVMValueRef = zeroed
                 if intrinsic_name != "":
@@ -889,7 +1224,42 @@ extend Backend:
                     # Differing signatures are fine — every call site passes its own type to
                     # LLVMBuildCall2, which is exactly how C treats mismatched prototypes for
                     # one symbol, and stage0 links the same program.
-                    handle <- declare_or_get_named(m, extern_cstr, fn_type)
+                    if extern_same_name_export:
+                        # `<name>.export`: the export declaration's OWN handle. It either
+                        # receives the wrapper body and is renamed to the public name, or
+                        # stays an unreferenced declaration when the implementation is
+                        # exported directly (dropped by the object writer).
+                        export_handle_storage: mutable darray[u8] = []
+                        for export_name_index in 0..<sview_len(extern_name) |export_handle_storage, extern_name|:
+                            export_handle_storage.push(sview_at(extern_name, export_name_index))
+                        export_handle_storage.push(46)
+                        export_handle_storage.push(101)
+                        export_handle_storage.push(120)
+                        export_handle_storage.push(112)
+                        export_handle_storage.push(111)
+                        export_handle_storage.push(114)
+                        export_handle_storage.push(116)
+                        export_handle_storage.push(0)
+                        export_handle_cstr: cstr = (&export_handle_storage[0]).cast[cstr] can Unsafe.PointerCast
+                        handle <- LLVMAddFunction(m, export_handle_cstr, fn_type)
+                    else:
+                        handle <- declare_or_get_named(m, extern_cstr, fn_type)
+                if extern_is_export:
+                    # sret on the leading pointer; byval on indirect aggregate parameters.
+                    export_attr_position: mutable u32 = 1
+                    if export_ret_sret:
+                        add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx)
+                        export_attr_position <- 2
+                    for export_attr_type in declared_param_types |export_attr_position, structs, ctx, handle|:
+                        if cabi_is_aggregate(export_attr_type):
+                            export_attr_plan: CabiArgPlan = cabi_classify_arg(export_attr_type, structs, ctx)
+                            if export_attr_plan.direct:
+                                export_attr_position <- export_attr_position + export_attr_plan.parts.count.u32()
+                            else:
+                                add_type_parameter_attribute(handle, export_attr_position, "byval", export_attr_plan.value_type, ctx) if export_attr_plan.byval
+                                export_attr_position <- export_attr_position + 1
+                        else:
+                            export_attr_position <- export_attr_position + 1
                 apply_function_decorators(handle, decorators, annotation_args, false, ctx)
                 wasm_import_module: sview = function_decorator_wasm_import_module(decorators, annotation_args, extern_name)
                 add_function_string_attribute(handle, "wasm-import-module", wasm_import_module, ctx) if wasm_import_module != ""
@@ -1012,6 +1382,7 @@ extend Backend:
                     local_runtime.error_out <- LLVMGetParam(fn, 0)
                     local_runtime.in_error_fn <- true
                     local_runtime.error_fn_line <- function_line_of(declaration)
+                    local_runtime.error_fn_family <- resolved_error_family(line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, function_line_of(declaration)), structs)
                 # The body's declared return type, so an expression emitter that must emit a
                 # `return` from inside an expression (a terminating `catch` arm) has a type to
                 # emit the returned value at.
@@ -1107,7 +1478,12 @@ extend Backend:
                     # The AST hierarchy is a single compiler-internal store rooted at
                     # `Node`. Use the actual registered root index so constructors and
                     # matches in Parser/Backend bodies can validate the hidden store ABI.
-                    local_runtime.active_store_enum <- packed_index_of(structs, "Node")
+                    # The store belongs to the hierarchy this signature actually mentions,
+                    # not to a hierarchy named "Node". For the compiler's own AST the two
+                    # are the same; for a user hierarchy (a widget tree) the root is its own
+                    # declaration, and hardcoding Node handed the body the wrong store index
+                    # so every match over the value declined.
+                    local_runtime.active_store_enum <- body_store_root_index(declaration, fns, structs)
                     local_runtime.active_store_is_block <- true
                 elif local_packed_store_root >= 0:
                     # User packed/recursive enums use an implicit store owned by the
@@ -1118,8 +1494,20 @@ extend Backend:
                     # bare `new Enum.V(...)` constructions and matches in this region.
                     local_packed_row_bytes: i64 = packed_row_bytes(structs, local_packed_store_root)
                     local_packed_state_args: mutable darray[LLVMValueRef] = [local_runtime.arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), local_packed_row_bytes.u64(), 0)]
+                    # Sized by the COMMON count, not the side-table word count: counting
+                    # only side-table commons (8713592c) broke the gen3 fixpoint, because
+                    # the compiler's own stores keep every common in the side chunk whatever
+                    # the storage mode says. An all-inline user hierarchy therefore carries
+                    # an unused side word per common; memory only, never read.
+                    local_packed_side_words: u32 = packed_aos_common_count(structs, local_packed_store_root) if local_runtime.packed_mode == 2 else 0
+                    local_packed_state_fn: mutable LLVMValueRef = local_runtime.packed_state_new
+                    local_packed_state_type: mutable LLVMTypeRef = local_runtime.packed_state_new_type
+                    if local_packed_side_words > 0:
+                        local_packed_state_args.push(LLVMConstInt(LLVMInt64TypeInContext(ctx), local_packed_side_words.u64(), 0))
+                        local_packed_state_fn <- local_runtime.packed_state_new_side
+                        local_packed_state_type <- local_runtime.packed_state_new_side_type
                     local_packed_state_pointer: void& = (&local_packed_state_args[0]).cast[void&] can Unsafe.PointerCast
-                    local_packed_state: LLVMValueRef = LLVMBuildCall2(builder, local_runtime.packed_state_new_type, local_runtime.packed_state_new, local_packed_state_pointer, 2, "local.packed.store.state")
+                    local_packed_state: LLVMValueRef = LLVMBuildCall2(builder, local_packed_state_type, local_packed_state_fn, local_packed_state_pointer, local_packed_state_args.count.u32(), "local.packed.store.state")
                     local_packed_store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: local_packed_store_root.u32()}
                     local_packed_store_llvm: LLVMTypeRef = llvm_type_of(local_packed_store_type, structs, ctx)
                     local_packed_with_arena: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetUndef(local_packed_store_llvm), local_runtime.arena, 0, "local.packed.store.arena")
@@ -1139,13 +1527,24 @@ extend Backend:
                 # variant-less header). A program that declares its own `packed enum Node:`
                 # got a free active store here, so its constructor emitted where stage0
                 # rejects it ("requires an active in Node.Store: scope").
-                if owner == "" and function_name == "main" and needs_auto_region and packed_is_ast_root_row(structs, packed_index_of(structs, "Node")):
-                    root_index: i64 = packed_index_of(structs, "Node")
+                # ...for the program's sealed hierarchy root, whichever it is. Keyed on the
+                # reserved variant-less root ROW rather than the name "Node" so a user
+                # hierarchy's `main` creates the one store its whole tree shares.
+                entry_root_index: i64 = program_hierarchy_root_index(structs)
+                if owner == "" and function_name == "main" and needs_auto_region and packed_is_ast_root_row(structs, entry_root_index):
+                    root_index: i64 = entry_root_index
                     false return if root_index < 0
                     row_bytes: i64 = packed_row_bytes(structs, root_index)
                     state_args: mutable darray[LLVMValueRef] = [local_runtime.arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), row_bytes.u64(), 0)]
+                    side_words: u32 = packed_aos_common_count(structs, root_index) if local_runtime.packed_mode == 2 else 0
+                    state_fn: mutable LLVMValueRef = local_runtime.packed_state_new
+                    state_type: mutable LLVMTypeRef = local_runtime.packed_state_new_type
+                    if side_words > 0:
+                        state_args.push(LLVMConstInt(LLVMInt64TypeInContext(ctx), side_words.u64(), 0))
+                        state_fn <- local_runtime.packed_state_new_side
+                        state_type <- local_runtime.packed_state_new_side_type
                     state_pointer: void& = (&state_args[0]).cast[void&] can Unsafe.PointerCast
-                    state: LLVMValueRef = LLVMBuildCall2(builder, local_runtime.packed_state_new_type, local_runtime.packed_state_new, state_pointer, 2, "main.packed.store.state")
+                    state: LLVMValueRef = LLVMBuildCall2(builder, state_type, state_fn, state_pointer, state_args.count.u32(), "main.packed.store.state")
                     store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: root_index.u32()}
                     store_llvm: LLVMTypeRef = llvm_type_of(store_type, structs, ctx)
                     with_arena: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetUndef(store_llvm), local_runtime.arena, 0, "main.packed.store.arena")
@@ -1175,6 +1574,19 @@ extend Backend:
                         parameter_value <- LLVMBuildLoad2(builder, llvm_type_of(parameter_type, structs, ctx), parameter_value, "byval.param")
                     _ = LLVMBuildStore(builder, parameter_value, slot)
                     declare_local(local_scope, parameter.name, slot, parameter_type)
+                    # A BY-VALUE parameter carries the obligation its caller handed over:
+                    # `consume(move t)` suppresses the caller's drop, so the callee owes the
+                    # one release. Registering only locals leaked every moved-in value.
+                    # register_drop_cleanup is a no-op for anything but a struct with a
+                    # `__drop__` hook, so references and scalars are unaffected. The
+                    # parameter already has its own alloca above, so the drop zeroes this
+                    # frame's slot and never reaches back into the caller's.
+                    #
+                    # EXCEPT inside a destructor: `__drop__` IS its receiver's death, so
+                    # arming a cleanup for `self` there recurses until the stack dies
+                    # (stage0's isOwnDropReceiver guard). A destructor takes only its
+                    # receiver, so skipping the whole body is the same rule.
+                    register_drop_cleanup(parameter.name, parameter_type, slot, line.line, local_scope, structs, ctx, builder) if function_name != "__drop__"
                     has_parameter_region: bool = function_region_row >= 0 and fns.param_start[function_region_row.usize()] + source_parameter_index.usize() < fns.param_region_slots.count and fns.param_region_slots[fns.param_start[function_region_row.usize()] + source_parameter_index.usize()]
                     if has_parameter_region:
                         mark_last_local_parameter_arena(local_scope, parameter_arena_index)

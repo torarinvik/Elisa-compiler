@@ -40,7 +40,16 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 # A program that loops forever is a FAILURE, not a hang: bound every run. Compilation is
 # bounded too — a backend that diverges would otherwise stall the gate.
-RUN() { timeout 10 "$@" >/dev/null 2>&1 </dev/null; }
+# A 124 is retried with a wider budget before it is believed: on a loaded host a paging
+# stall can hold a fresh process in dyld past ten seconds, and a 124 on ONE side of the
+# comparison fabricates a MISMATCH (observed: 3 mismatches in one run, 8 in the next, for
+# an identical product). A genuine runaway expires both times and still fails.
+RUN() {
+    timeout 10 "$@" >/dev/null 2>&1 </dev/null
+    local status=$?
+    if [ "$status" -eq 124 ]; then timeout 30 "$@" >/dev/null 2>&1 </dev/null; status=$?; fi
+    return $status
+}
 COMPILE_TIMEOUT=60
 
 # Link an object into a runnable program. THREE recipes, tried in order, because the plain
@@ -116,9 +125,18 @@ CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 #
 # A repro that declines is a FILED BUG, not a regression. The ratchet's job is to
 # catch regressions in ordinary programs; repros are tracked by their own files.
+# `*.xfail.elisa` is EXCLUDED for the same reason as repro/, and it is the same mistake in a
+# different costume. test/differential/cases/ names a case `*.xfail.elisa` when the
+# divergence is already known, documented in the file's own header, and not yet fixed --
+# the sibling runner (test/differential/run_differential.sh) reports it as XFAIL and fails
+# the day it starts AGREEING, so the gap stays visible without a red suite. This gate scans
+# the same directory with its own ratchet, so an xfail landed here as an unexplained
+# MISMATCH: two harnesses over one corpus, disagreeing about what a known gap means. A
+# documented divergence is a filed bug, not a regression.
 find "${CORPUS_DIRS[@]}" -name '*.elisa' -print0 2>/dev/null \
   | xargs -0 grep -l '^def main' 2>/dev/null \
   | grep -v '/repro/' \
+  | grep -v '\.xfail\.elisa$' \
   | sort > "$WORK/programs.txt"
 
 # Read the list on FD 3, and give every child /dev/null for stdin. Reading it on plain

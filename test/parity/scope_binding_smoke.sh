@@ -26,9 +26,16 @@
 #      miscompiling it. Every option is compared and the results OR'd.
 #
 # Every compiled binary runs under a timeout: a scope bug can produce a spinning loop
-# rather than a wrong answer, and an untimed gate hangs with it.
+# rather than a wrong answer, and an untimed gate hangs with it. The expiry is RETRIED with
+# a wider budget before it is believed — these fixtures finish in milliseconds, and on a
+# loaded host a single 10s expiry reported a 124 as a scope divergence (a wrong answer that
+# vanished on the standalone re-run). A genuine spin expires both times and still fails.
 RUN() {
-    if command -v timeout >/dev/null 2>&1; then timeout 10 "$@"; else "$@"; fi
+    local status
+    if ! command -v timeout >/dev/null 2>&1; then "$@"; return $?; fi
+    timeout 10 "$@"; status=$?
+    if [ "$status" -eq 124 ]; then timeout 30 "$@"; status=$?; fi
+    return $status
 }
 set -u
 

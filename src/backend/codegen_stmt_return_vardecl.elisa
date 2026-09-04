@@ -6,6 +6,81 @@
 
 extend Backend:
     private:
+        # A no-`else` `try` is represented by the semantic layer as the bare
+        # error call. That is sufficient when the call is the whole initializer
+        # or return operand, where the paths below have loop/region context. It
+        # used to decline when the same call appeared directly inside another
+        # call's argument list (`outer(try inner())`): emit_expression has no
+        # control-flow context, so emit_direct_call could not propagate the
+        # inner status and the enclosing function was reported as an unresolved
+        # declaration. Materialize one such argument in a typed synthetic
+        # local, then re-emit the outer statement through the normal path.
+        #
+        # Return values: 1 = rewritten, 0 = no direct nested try, -1 = a
+        # nested form was found but could not be emitted. More than one nested
+        # argument is declined until the synthetic-name allocator can preserve
+        # each independent value; silently reusing a local would be unsound.
+        def materialize_nested_try_argument(expression: Expr, rewritten: mutable Expr&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A first-class error union is also a valid call argument. Only an
+            # error-returning function may use the bare-call representation for
+            # a no-recovery `try`; a non-error caller must preserve `make()` as
+            # the union value passed to `use(make())`.
+            return 0 if not runtime.in_error_fn
+            outer_callee: mutable Expr = Expr.Invalid
+            outer_arguments: mutable darray[Expr] = []
+            outer_names: mutable darray[sview] = []
+            outer_line: mutable u32 = 0
+            match expression:
+                Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
+                    outer_callee <- call_callee
+                    outer_arguments <- call_arguments
+                    outer_names <- call_argument_names
+                    outer_line <- call_line.line
+                _:
+                    return 0
+            nested_index: mutable i64 = -1
+            nested_count: mutable u32 = 0
+            for candidate_index in 0..<outer_arguments.count |nested_index, nested_count, outer_arguments, fns, generics|:
+                match outer_arguments[candidate_index]:
+                    Expr.Call(candidate_callee, _, _, _):
+                        match candidate_callee:
+                            Expr.Ident(candidate_name, candidate_name_line):
+                                if error_callee_is(fns, generics, candidate_name):
+                                    nested_index <- candidate_index.i64()
+                                    nested_count <- nested_count + 1
+                            _:
+                                pass
+                    _:
+                        pass
+            return -1 if nested_count > 1
+            return 0 if nested_index < 0
+            nested_expression: Expr = outer_arguments[nested_index.usize()]
+            match nested_expression:
+                Expr.Call(nested_callee, nested_arguments, _, nested_line):
+                    match nested_callee:
+                        Expr.Ident(nested_name, nested_name_line):
+                            nested_value_type: ValueType = error_callee_value_type(nested_name, nested_arguments, local_scope, fns, structs, generics)
+                            return -1 if nested_value_type.kind == TypeKind.Unmodeled or nested_value_type.kind == TypeKind.Void
+                            nested_no_recovery: darray[Stmt] = []
+                            if emit_propagating_try_value(nested_name, nested_arguments, nested_no_recovery, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) is nested_value:
+                                nested_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(nested_value_type, structs, ctx), "__nested_try_arg")
+                                _ = LLVMBuildStore(builder, nested_value, nested_slot)
+                                declare_local(local_scope, "__nested_try_arg", nested_slot, nested_value_type)
+                                rewritten_arguments: mutable darray[Expr] = []
+                                rewrite_index: mutable usize = 0
+                                for argument in outer_arguments |rewritten_arguments, nested_index, nested_line, rewrite_index|:
+                                    rewritten_arguments.push(Expr.Ident("__nested_try_arg", nested_line)) if rewrite_index.i64() == nested_index
+                                    rewritten_arguments.push(argument) if rewrite_index.i64() != nested_index
+                                    rewrite_index <- rewrite_index + 1
+                                rewritten <- Expr.Call(outer_callee, rewritten_arguments, outer_names, Ast::pos_at_line(outer_line))
+                                return 1
+                            return -1
+                        _:
+                            pass
+                _:
+                    pass
+            return -1
+
         # Large internal aggregates use a leading sret destination and a void LLVM return.
         # Return sites are centralized here because returns can be introduced by ordinary
         # return, await/try lowering, optional propagation, and match rewrites.
@@ -22,6 +97,10 @@ extend Backend:
             handled <- true
             if statement is Stmt.Return(return_value_opt, return_line):
                 if return_value_opt is return_value:
+                    nested_return_value: mutable Expr = return_value
+                    nested_return_status: i64 = materialize_nested_try_argument(return_value, nested_return_value, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                    EmitStatus.Declined return if nested_return_status < 0
+                    return emit_statement((Stmt.Return(nested_return_value, return_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) if nested_return_status == 1
                     # `await task` may arrive here as a value-transparent block after the
                     # semantic expression walkers. Lower it directly in return position as a
                     # fallback to the ordinary expression emitter, preserving the task value
@@ -289,6 +368,30 @@ extend Backend:
                         rg_status: EmitStatus = emit_statement((Stmt.VarDecl("__return_get", Expr.Invalid, return_value, rg_get_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                         EmitStatus.Declined return if rg_status != EmitStatus.Open
                         return_operand <- Expr.Ident("__return_get", return_line)
+                    # `return value` in an error-returning function can forward a first-class
+                    # non-void `T error[E]` value. The ordinary return emitter asks for the
+                    # function's success payload type (`T`), so passing that expected type to
+                    # an ErrorUnion expression used to make the identifier path load the whole
+                    # `{code, payload_ptr}` descriptor and store it through the `T` out-slot;
+                    # stage1 then returned success without ever copying the payload. Stage0
+                    # extracts the descriptor code and loads the payload before completing the
+                    # split error-return ABI. Keep this path before the ordinary coercion so
+                    # the descriptor is emitted with its own type.
+                    if runtime.in_error_fn:
+                        forwarded_type: ValueType = expression_type(return_operand, local_scope, fns, structs, generics)
+                        if forwarded_type.kind == TypeKind.ErrorUnion:
+                            forwarded_payload_type: ValueType = error_union_payload_of(forwarded_type, structs)
+                            if forwarded_payload_type.kind == return_type.kind and forwarded_payload_type.bits == return_type.bits:
+                                if emit_expression(return_operand, forwarded_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is forwarded_union:
+                                    forwarded_status: LLVMValueRef = LLVMBuildExtractValue(builder, forwarded_union, 0, "return.error.status")
+                                    forwarded_payload_ptr: LLVMValueRef = LLVMBuildExtractValue(builder, forwarded_union, 1, "return.error.payload.ptr")
+                                    forwarded_payload: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(return_type, structs, ctx), forwarded_payload_ptr, "return.error.payload")
+                                    EmitStatus.Declined return if not emit_ensure_checks(forwarded_payload, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                    EmitStatus.Declined return if not emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder)
+                                    emit_region_unwind(regions, runtime, builder)
+                                    _ = LLVMBuildStore(builder, forwarded_payload, runtime.error_out)
+                                    _ = LLVMBuildRet(builder, forwarded_status)
+                                    return EmitStatus.Terminated
                     emitted: LLVMValueRef? = emit_expression_coerced(return_operand, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                     if emitted is return_constant:
                         # `return helper()` where `helper` is `-> void`, from a `-> void`
@@ -374,6 +477,11 @@ extend Backend:
                         _ = discarded_var_value
                         return EmitStatus.Open
                     return EmitStatus.Declined
+                nested_var_value: mutable Expr = var_value
+                nested_var_status: i64 = materialize_nested_try_argument(var_value, nested_var_value, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                EmitStatus.Declined return if nested_var_status < 0
+                if nested_var_status == 1:
+                    return emit_statement((Stmt.VarDecl(var_name, var_type, nested_var_value, var_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                 # `x: T = get OPT` — MONADIC UNWRAP of an optional. Present → bind the payload to
                 # `x`; absent → PROPAGATE None: return a null optional from THIS function (which must
                 # itself return an optional). The `get X else BODY` form runs BODY on absent instead.
@@ -604,6 +712,16 @@ extend Backend:
                                 return EmitStatus.Declined
                         _:
                             pass
+                    # The callee may be a function-valued local/parameter (`f`) rather than a
+                    # named error function. Its `try` was erased by the parser just like the
+                    # named form, so give the tagged function-value propagation path the same
+                    # opportunity before treating the RHS as an ordinary call.
+                    if emit_propagating_fn_value_try(try_var_callee, try_var_args, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) is try_fn_value:
+                        try_fn_storage: mutable darray[u8] = []
+                        try_fn_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(declared_type, structs, ctx), sview_to_cstr(var_name, try_fn_storage))
+                        _ = LLVMBuildStore(builder, try_fn_value, try_fn_slot)
+                        declare_local(local_scope, var_name, try_fn_slot, declared_type)
+                        return EmitStatus.Open
                 # Assigning an OPTIONAL value to a NON-optional local is a type error stage0
                 # rejects ("variable expects T, got T?"); DECLINE rather than silently unwrap.
                 # Also stops a miscompile: stage1's parser erases the control-flow else of
@@ -730,6 +848,7 @@ extend Backend:
                     _ = LLVMBuildStore(builder, initial, slot)
                     emit_trace_value(var_name, var_line.line, initial, declared_type, runtime, ctx, builder)
                     declare_local(local_scope, var_name, slot, declared_type)
+                    register_drop_cleanup(var_name, declared_type, slot, var_line.line, local_scope, structs, ctx, builder)
                     # Remember the pin so LATER growth (`xs.push(...)`) reallocates from the
                     # same region the initial allocation came from -- see growth_arena_for.
                     mark_last_local_arena(local_scope, pinned_arena) if pinned_ok

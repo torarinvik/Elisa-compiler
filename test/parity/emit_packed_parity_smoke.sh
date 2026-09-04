@@ -71,7 +71,9 @@ def main() -> i64:
 EOF
 bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit packed -o "$WORK/c1" "$WORK/commons.elisa" >/dev/null 2>&1 || {
     echo "FAILED packed-commons: stage1 emitted nothing"; differ=$((differ + 1)); }
-# 2 commons + widest payload 2 words => 8 + 16 + 16 = 40
+# The typed row is `{i32 tag, pad[4], u32, pad[4], i64, [2 x i64]}`. Each
+# common occupies one word-aligned slot so the legacy packed runtime can read
+# it by word while the compiler preserves its declared type.
 check_line() {
     grep -Fqx "$1" "$WORK/c1" || { echo "FAILED packed-commons: missing line: $1"; differ=$((differ + 1)); }
 }

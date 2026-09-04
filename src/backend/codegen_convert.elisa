@@ -161,6 +161,7 @@ extend Backend:
                 error_out: runtime.error_out,
                 in_error_fn: runtime.in_error_fn,
                 error_fn_line: runtime.error_fn_line,
+                error_fn_family: runtime.error_fn_family,
                 fn_return_type: copied_type(runtime.fn_return_type),
                 main_returns_status: runtime.main_returns_status,
                 streq: runtime.streq,
@@ -188,6 +189,8 @@ extend Backend:
                 disjoint_element_indices: runtime.disjoint_element_indices,
                 packed_state_new: runtime.packed_state_new,
                 packed_state_new_type: runtime.packed_state_new_type,
+                packed_state_new_side: runtime.packed_state_new_side,
+                packed_state_new_side_type: runtime.packed_state_new_side_type,
                 packed_alloc: runtime.packed_alloc,
                 packed_alloc_type: runtime.packed_alloc_type,
                 packed_alloc_result_type: runtime.packed_alloc_result_type,
@@ -197,6 +200,10 @@ extend Backend:
                 packed_read_word_type: runtime.packed_read_word_type,
                 packed_record_prefix: runtime.packed_record_prefix,
                 packed_record_prefix_type: runtime.packed_record_prefix_type,
+                packed_record_side_words: runtime.packed_record_side_words,
+                packed_record_side_words_type: runtime.packed_record_side_words_type,
+                packed_read_side_word: runtime.packed_read_side_word,
+                packed_read_side_word_type: runtime.packed_read_side_word_type,
                 active_store_is_block: runtime.active_store_is_block, packed_mode: runtime.packed_mode,
                 new_region_backend: runtime.new_region_backend,
                 new_region_backend_type: runtime.new_region_backend_type,
@@ -757,10 +764,70 @@ extend Backend:
             return null
 
 
+        # The generic template slot whose first parameter is the requested parallel source
+        # view. `par_map_collect` is overloaded for Slice[T] and ReadView[T], so a name-only
+        # lookup would always choose the writable Slice overload and reject an immutable
+        # darray reference. Slot selection here mirrors the ordinary UFCS overload path.
+        def parallel_map_collect_slot(view_name: sview, generics: GenericTable&) -> i64 can[Abort.Panic]:
+            for slot in 0..<generics.names.count:
+                continue if generics.names[slot] != "par_map_collect"
+                match generics.decls[slot]:
+                    Decl.Func(_, parallel_params, _, _, _, _, _):
+                        continue if parallel_params.count == 0
+                        match parallel_params[0].type_expression:
+                            Expr.IndexN(parallel_head, _, _):
+                                if parallel_head is Expr.Ident(parallel_type_name, _):
+                                    return slot.i64() if parallel_type_name == view_name
+                            Expr.Index(parallel_head_legacy, _, _):
+                                if parallel_head_legacy is Expr.Ident(parallel_legacy_name, _):
+                                    return slot.i64() if parallel_legacy_name == view_name
+                            Expr.Ident(parallel_bare_name, _):
+                                return slot.i64() if parallel_bare_name == view_name
+                            _:
+                                pass
+                    _:
+                        pass
+            return -1
+
+
+        # `[value for item in source by par]` lowers to the existing structured-parallel
+        # collector. An owned darray is borrowed as a writable Slice because the collector
+        # only writes its newly allocated output; an already-borrowed darray is passed through
+        # ReadView so an immutable reference never gains write permission. The UFCS emitter
+        # is used with an explicit template slot because the two overloads share one source name.
+        def emit_parallel_comprehension(comprehension_var: sview, iterable: Expr, body: Expr, comprehension_line: u32, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if expected.kind != TypeKind.DArray
+            source_type: ValueType = iterable_darray_type(iterable, local_scope, fns, structs, generics)
+            null return if source_type.kind != TypeKind.DArray
+            source_element: ValueType = darray_element_of(source_type, structs)
+            output_element: ValueType = darray_element_of(expected, structs)
+            null return if source_element.kind == TypeKind.Unmodeled or output_element.kind == TypeKind.Unmodeled
+            source_view_name: mutable sview = "Slice"
+            source_view: mutable Expr = (Expr.Call(Expr.Ident("slice", Ast::pos_at_line(comprehension_line)), [Expr.Unary(TokenKind.Ampersand, iterable, Ast::pos_at_line(comprehension_line))], [""], Ast::pos_at_line(comprehension_line)))
+            raw_source_type: ValueType = expression_type(iterable, local_scope, fns, structs, generics)
+            if raw_source_type.kind == TypeKind.Ref:
+                source_view_name <- "ReadView"
+                source_view <- (Expr.Call(Expr.Ident("read_view", Ast::pos_at_line(comprehension_line)), [iterable], [""], Ast::pos_at_line(comprehension_line)))
+            slot: i64 = parallel_map_collect_slot(source_view_name, generics)
+            null return if slot < 0
+            lambda_body: darray[Stmt] = [Stmt.Return(body, Ast::pos_at_line(comprehension_line))]
+            transform: Expr = Expr.Lambda([comprehension_var], lambda_body, Ast::pos_at_line(comprehension_line))
+            type_args: darray[ValueType] = [source_element, output_element]
+            ufcs_arguments: mutable darray[Expr] = [transform]
+            return emit_generic_ufcs_call(slot.usize(), type_args, source_view, ufcs_arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+
+
         def emit_comprehension(comprehension_var: sview, iterable: Expr, condition: Expr, body: Expr, comprehension_line: u32, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # A PROJECTION query whose guard the AST cannot carry: emitting the filter without
             # it silently widens the result. Decline the whole query instead.
             null return if query_guard_dropped_at(comprehension_line, structs)
+            # The execution-mode marker is kept in the file-level side table because the
+            # compact Comprehension AST is shared by queries and collection builders.
+            # Parallel maps are handled before the sequential/query dispatch so an explicit
+            # `by par` never silently degrades to a serial loop.
+            if parallel_comprehension_at(comprehension_line.i64(), structs):
+                null return if condition is not Expr.Absent
+                return emit_parallel_comprehension(comprehension_var, iterable, body, comprehension_line, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
             # `any index, item in xs.enumerate() where …` — a MULTI-BINDER query. The
             # Comprehension node carries only the FIRST binder, which for the enumerate form
             # is the INDEX; the element binder is the line-keyed extra. Unwrap the

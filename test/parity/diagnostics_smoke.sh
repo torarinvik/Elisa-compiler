@@ -296,7 +296,7 @@ EXPECTS=(
     "operator requires numeric operands"
     "variable \"n\" expects bool, got i64"
     "darray literal element expects i64, got static u8"
-    "\"M\" is a namespace; write M::member"
+    "\"M\" is a namespace; write M::geti"
     "expression statement has no effect; its result is discarded"
     "argument 1 to \"take\" expects i64, got void"
     "darray literal element expects i64, got void"

@@ -5,6 +5,27 @@
 
 extend Backend:
     private:
+        # Resolve `^target` to the value an arm compares against. A LOCAL wins (its
+        # current value, loaded); otherwise a module-level `const` supplies its folded
+        # value. Both spellings COMPARE — neither binds — which is the whole point of a
+        # pin, and stage0 accepts both. Only the local half existed, in three copies, so
+        # a pin over a `const` declined in every match emitter; elisa-ui's wire decoder is
+        # the motivating case (`match record.kind: ^WIRE_QUIT:` over `const WIRE_*: i32`,
+        # named so the ordinal mapping is stated once). Returns nothing when the name is
+        # neither, which preserves the previous decline rather than guessing a shape.
+        def pin_compare_operand(pin_name: sview, compare_type: LLVMTypeRef, local_scope: mutable Scope&, structs: mutable StructTable&, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if lookup_slot(local_scope, pin_name) is pin_slot:
+                return LLVMBuildLoad2(builder, compare_type, pin_slot, "match.pin")
+            pin_const_index: i64 = const_index_of(structs, pin_name)
+            null return if pin_const_index < 0
+            null return if not structs.const_resolved[pin_const_index.usize()]
+            pin_const_type: ValueType = copied_type(structs.const_types[pin_const_index.usize()])
+            # An integer or bool const inlines; a float/cstr/aggregate const has no
+            # meaningful integer compare against a scalar tag, so it keeps declining.
+            null return if not is_integer_type(pin_const_type) and pin_const_type.kind != TypeKind.Bool
+            return LLVMConstInt(compare_type, structs.const_values[pin_const_index.usize()].u64(), 1)
+
+
         def emit_statement_match_scalar(stmt_match_scrutinee: Expr, stmt_match_arms: darray[MatchArm]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             handled <- true
             # A plain `match SCRUTINEE:` STATEMENT over an integer / const-enum / payload-enum
@@ -225,6 +246,19 @@ extend Backend:
                     sm_or_options: mutable darray[Pattern] = []
                     sm_is_pin: mutable bool = false
                     sm_pin_name: mutable sview = ""
+                    # docs/77 §2 CATEGORY ARM (`InputEvent input:`): dispatch is the docs/81
+                    # range primitive over the category's leaf-tag span, and the binder is the
+                    # same value at the narrowed static type -- a refinement is an alias of its
+                    # root, so that re-bind is a no-op store.
+                    sm_is_category: mutable bool = false
+                    sm_category_lo: mutable i64 = 0
+                    sm_category_count: mutable i64 = 0
+                    sm_category_binder: mutable sview = ""
+                    if sm_penum and sm_arm.pattern is Pattern.TypeBind(sm_category_type, sm_category_bound):
+                        # A PayloadEnum ValueType carries its registry index in `bits`.
+                        if penum_category_tag_range(structs, sm_scrutinee_type.bits.i64(), sm_category_type, sm_category_lo, sm_category_count):
+                            sm_is_category <- true
+                            sm_category_binder <- sm_category_bound
                     # `Shape.Circle(r) as whole:` — docs/122 §5.4 as-binding. The parser only
                     # ever wraps a Variant or Struct pattern in Pattern.As, so unwrapping it
                     # here (Variant is the only shape this scalar-enum arm loop deals with)
@@ -384,7 +418,7 @@ extend Backend:
                         sm_is_pin <- true if not sm_penum
                         sm_pin_name <- sm_pin_binding_name
                     sm_is_default <- true if is_catch_all_pattern(sm_arm.pattern)
-                    sm_declined <- true if not sm_has_value and not sm_is_default and not sm_is_range and not sm_is_or and not sm_is_pin
+                    sm_declined <- true if not sm_has_value and not sm_is_default and not sm_is_range and not sm_is_or and not sm_is_pin and not sm_is_category
                     continue if sm_declined
                     sm_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, sm_function, "smatch.arm")
                     if arm_has_guard(sm_arm.guard) and sm_is_default:
@@ -411,14 +445,21 @@ extend Backend:
                                 sm_hit <- sm_or_hit
                             else:
                                 sm_declined <- true
+                        elif sm_is_category:
+                            # tag - lo <u count. count == 1 folds to equality (a leaf is a
+                            # range of one); lo == 0 skips the subtract.
+                            sm_cat_lo_const: LLVMValueRef = LLVMConstInt(sm_compare_type, sm_category_lo.u64(), 0)
+                            if sm_category_count == 1:
+                                sm_hit <- LLVMBuildICmp(builder, 32, sm_scrutinee, sm_cat_lo_const, "smatch.cat.eq")
+                            else:
+                                sm_cat_rel: LLVMValueRef = LLVMBuildSub(builder, sm_scrutinee, sm_cat_lo_const, "smatch.cat.rel") if sm_category_lo != 0 else sm_scrutinee
+                                sm_hit <- LLVMBuildICmp(builder, 36, sm_cat_rel, LLVMConstInt(sm_compare_type, sm_category_count.u64(), 0), "smatch.cat.range")
                         elif sm_is_pin:
-                            # `^target:` — compare the scrutinee against the already-bound
-                            # local's current value; decline if the name isn't a local (the
-                            # semantic pass should never let that through, but codegen must
-                            # not guess).
-                            if lookup_slot(local_scope, sm_pin_name) is sm_pin_slot:
-                                sm_pin_loaded: LLVMValueRef = LLVMBuildLoad2(builder, sm_compare_type, sm_pin_slot, "smatch.pin")
-                                sm_hit <- LLVMBuildICmp(builder, 32, sm_scrutinee, sm_pin_loaded, "smatch.pin.eq")
+                            # `^target:` — compare the scrutinee against the pinned name's
+                            # value: an already-bound local's current value, or a `const`'s
+                            # folded one. Declines if it is neither; codegen must not guess.
+                            if pin_compare_operand(sm_pin_name, sm_compare_type, local_scope, structs, builder) is sm_pin_operand:
+                                sm_hit <- LLVMBuildICmp(builder, 32, sm_scrutinee, sm_pin_operand, "smatch.pin.eq")
                             else:
                                 sm_declined <- true
                         else:
@@ -426,6 +467,11 @@ extend Backend:
                         continue if sm_declined
                         _ = LLVMBuildCondBr(builder, sm_hit, sm_arm_block, sm_next_block)
                         LLVMPositionBuilderAtEnd(builder, sm_arm_block)
+                        if sm_is_category and sm_category_binder != "":
+                            sm_cat_bind_storage: mutable darray[u8] = []
+                            sm_cat_bind_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(sm_scrutinee_type, structs, ctx), sview_to_cstr(sm_category_binder, sm_cat_bind_storage))
+                            _ = LLVMBuildStore(builder, sm_scrutinee_raw, sm_cat_bind_slot)
+                            declare_local(local_scope, sm_category_binder, sm_cat_bind_slot, sm_scrutinee_type)
                         # NESTED variant test (`Expr.Leaf(Token.Ident)`). The outer tag has
                         # matched; now load the payload at ITS OWN type and compare that
                         # value against the nested variant's ordinal, falling through to
