@@ -17,6 +17,9 @@ clean() {
 }
 
 clean $'def f(seed: i32) -> i32:\n    region scratch(1024)\n    value: i32& @scratch = new[scratch] seed + 1\n    result: i32 = value[0]\n    destroy scratch\n    return result\n'
+# A line containing `new[r]` does not make the line's declared binding region-owned when the
+# allocation is consumed as a call argument and the call returns a scalar.
+clean $'def read(value: i64&) -> i64:\n    return value\n\ndef f() -> i64 can[Memory.Allocate, Abort.Panic]:\n    region r(1024):\n        result: i64 = read(new[r] 7)\n        return result\n'
 clean $'def f() -> void:\n    region a(1024) using reserve_commit\n    region b(1024) using fixed\n    region c(1024) using chained\n    region d(1024) using scratch\n    destroy a\n    destroy b\n    destroy c\n    destroy d\n'
 out=$(printf 'def f() -> void:\n    region a(1024) using bogus\n    destroy a\n' | "$RPT")
 echo "$out" | grep -q 'unknown region backing "bogus"' || fail "unknown backing strategy was not flagged: $out"
