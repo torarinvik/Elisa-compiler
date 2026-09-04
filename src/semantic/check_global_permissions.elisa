@@ -1,0 +1,366 @@
+# Stage1 semantic — the `Global` permission family (`extend Semantic: private:`).
+#
+# stage0 registers Global{Read, Write} as a builtin family and INFERS it from the body:
+# reading a `global` records Global.Read, storing into one records Global.Write, and a
+# compound store records both. The refs union with whatever the signature declares and
+# propagate to every caller, so a call to a global-touching function warns unless the call
+# site carries a grant. stage0 keeps the requirement behind `-Wglobals` (implied by
+# `-Wstrict`) because demanding the row everywhere would rewrite the `can` row of every
+# existing program that touches a global; `enforce_global_permissions` is that same dial,
+# replayed by the parity harness as a `# globals` header.
+#
+# Five behaviours were pinned against stage0 before this was written, and each is
+# load-bearing here:
+#   - a `const` is NOT a global: reading one carries no effect at all. `collect_mutable_globals`
+#     already collects on Decl.Const's fourth field, which is `is_global`, not `is_mutable`
+#     (see parser_types_aggregate) — so a `const` never enters `globals` and a plain
+#     `global` (no `mutable`) correctly does;
+#   - a `can Global.Read:` block discharges the obligation LOCALLY but still surfaces the
+#     effect to callers, exactly as a `can`-wrapped panic does;
+#   - `trusted` is the firewall, and it is MEMBER-selective: `trusted Global.Read:` around
+#     `hot <- hot + 1` leaves Global.Write required, while `trusted Global:` discharges both
+#     (gp_clause_discharges says what the bracketed spelling can and cannot see);
+#   - a plain store (`hot <- 1`) requires Global.Write ALONE; only a compound store
+#     (`hot += 1`) or a right-hand side that mentions the global adds Global.Read;
+#   - the requirement is TRANSITIVE: a function that merely calls a global-toucher requires
+#     the same refs. That is why each axis is closed over the direct call graph below.
+#
+extend Semantic:
+    private:
+        # A NAME that resolves to a global and is not shadowed by a parameter or local.
+        # Shares `is_ungranted_mutable_global` with the strict-unsafe walk: one shadowing
+        # rule for both families, and `const` excluded by construction of `globals`.
+        def gp_names_global(name: sview, globals: darray[sview]&, locals: darray[sview]&) -> bool:
+            can Abort.Panic:
+                return is_ungranted_mutable_global(name, globals, locals)
+
+        # Whether a `trusted` clause discharges one Global member. Bare `Global` covers both
+        # members; `Global.Read` covers only reads, which is stage0's rule exactly —
+        # `trusted Global.Read:` around `hot <- hot + 1` leaves Global.Write required.
+        #
+        # An EMPTY clause covers everything. That is not a fallback for a missing clause but
+        # for a spelling: the parser collects a block's clause identifiers only at bracket
+        # depth 0, so the BRACKETED form (`trusted [Global.Read]:`) reaches the AST with no
+        # clause at all while `trusted Global.Read:` carries one. Widening the bracketed form
+        # to a blanket firewall is the same convention body_has_untrusted_panic already uses
+        # for every family, and it errs toward silence — the safe direction for an advisory
+        # dial. Collecting inside the bracket is a parser change that would also start
+        # pushing the type argument of `can Writer[sview]:` into that clause, so it is not
+        # one to make from here.
+        def gp_clause_discharges(clause: darray[sview]&, want_write: bool) -> bool:
+            can Abort.Panic:
+                true return if clause.count == 0
+                member: sview = "Global.Write" if want_write else "Global.Read"
+                bare: sview = "Write" if want_write else "Read"
+                for grant in clause:
+                    grant_ref: sview = grant
+                    true return if grant_ref == "Global" or grant_ref == member or grant_ref == bare
+                return false
+
+        # The compound stores: `hot += 1` reads the target before writing it, `hot <- 1`
+        # does not. Mirrors the parser's own isCompoundAssign, which is private to Parser.
+        def gp_is_compound_assign(operator: TokenKind) -> bool:
+            return when operator:
+                TokenKind.PlusEq | TokenKind.MinusEq | TokenKind.StarEq | TokenKind.SlashEq | TokenKind.PercentEq | TokenKind.CaretEq | TokenKind.PipeEq | TokenKind.AmpEq | TokenKind.LShiftEq | TokenKind.RShiftEq | TokenKind.QAssign -> true
+                _ -> false
+
+        # Whether EXPRESSION reads a global anywhere within it. The callee position is
+        # walked too: a `global` holding a function value is read by calling it.
+        def gp_expression_reads(expression: Ast::Expr, globals: darray[sview]&, locals: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, ident_line):
+                        return gp_names_global(name, globals, locals)
+                    Expr.Field(object, field, field_line):
+                        return gp_expression_reads(object, globals, locals)
+                    Expr.Paren(inner, paren_line):
+                        return gp_expression_reads(inner, globals, locals)
+                    Expr.Unary(operator, operand, unary_line):
+                        return gp_expression_reads(operand, globals, locals)
+                    Expr.Binary(left, operator, right, binary_line):
+                        return gp_expression_reads(left, globals, locals) or gp_expression_reads(right, globals, locals)
+                    Expr.Index(object, index_argument, index_line):
+                        return gp_expression_reads(object, globals, locals) or gp_expression_reads(index_argument, globals, locals)
+                    Expr.IndexN(object_n, arguments_n, index_n_line):
+                        true return if gp_expression_reads(object_n, globals, locals)
+                        for argument_n in arguments_n:
+                            true return if gp_expression_reads(argument_n, globals, locals)
+                        return false
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        true return if gp_expression_reads(callee, globals, locals)
+                        for argument in arguments:
+                            true return if gp_expression_reads(argument, globals, locals)
+                        return false
+                    Expr.Array(elements, array_line):
+                        for element in elements:
+                            true return if gp_expression_reads(element, globals, locals)
+                        return false
+                    Expr.Tuple(tuple_elements, tuple_line):
+                        for tuple_element in tuple_elements:
+                            true return if gp_expression_reads(tuple_element, globals, locals)
+                        return false
+                    Expr.SetLit(set_elements, set_line):
+                        for set_element in set_elements:
+                            true return if gp_expression_reads(set_element, globals, locals)
+                        return false
+                    _:
+                        return false
+
+        # The root of an assignment target, looked through `.field`, `[i]` and parens —
+        # `state.count <- 0` stores into the global `state`. stage0's globalStorageRoot.
+        def gp_target_root_is_global(target: Ast::Expr, globals: darray[sview]&, locals: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, ident_line):
+                        return gp_names_global(name, globals, locals)
+                    Expr.Field(object, field, field_line):
+                        return gp_target_root_is_global(object, globals, locals)
+                    Expr.Index(object, index_argument, index_line):
+                        return gp_target_root_is_global(object, globals, locals)
+                    Expr.IndexN(object_n, arguments_n, index_n_line):
+                        return gp_target_root_is_global(object_n, globals, locals)
+                    Expr.Paren(inner, paren_line):
+                        return gp_target_root_is_global(inner, globals, locals)
+                    _:
+                        return false
+
+        # Reads that occur INSIDE an assignment target rather than at its root:
+        # `table[hot] <- 0` writes `table` and reads `hot`. The root itself is a store
+        # location, not a read, which is why it is skipped here.
+        def gp_target_reads(target: Ast::Expr, globals: darray[sview]&, locals: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Index(object, index_argument, index_line):
+                        return gp_expression_reads(index_argument, globals, locals) or gp_target_reads(object, globals, locals)
+                    Expr.IndexN(object_n, arguments_n, index_n_line):
+                        for argument_n in arguments_n:
+                            true return if gp_expression_reads(argument_n, globals, locals)
+                        return gp_target_reads(object_n, globals, locals)
+                    Expr.Field(object_f, field, field_line):
+                        return gp_target_reads(object_f, globals, locals)
+                    Expr.Paren(inner, paren_line):
+                        return gp_target_reads(inner, globals, locals)
+                    _:
+                        return false
+
+        # Whether a body READS a global outside any `trusted` block that covers Global.Read.
+        def gp_body_reads(statements: darray[Ast::Stmt], globals: darray[sview]&, locals: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            true return if gp_expression_reads(expression, globals, locals)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            true return if gp_expression_reads(value, globals, locals)
+                        Stmt.Assign(target, operator, value, line):
+                            true return if gp_expression_reads(value, globals, locals)
+                            true return if gp_is_compound_assign(operator) and gp_target_root_is_global(target, globals, locals)
+                            true return if gp_target_reads(target, globals, locals)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                true return if gp_expression_reads(returned, globals, locals)
+                        Stmt.If(condition, then_body, else_body, line):
+                            true return if gp_expression_reads(condition, globals, locals)
+                            true return if gp_body_reads(then_body, globals, locals)
+                            true return if gp_body_reads(else_body, globals, locals)
+                        Stmt.While(condition, while_body, line):
+                            true return if gp_expression_reads(condition, globals, locals)
+                            true return if gp_body_reads(while_body, globals, locals)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            true return if gp_expression_reads(iterable, globals, locals)
+                            true return if gp_body_reads(for_body, globals, locals)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            block_kind: sview = kind
+                            discharged: bool = block_kind == "trusted" and gp_clause_discharges(clause, false)
+                            true return if not discharged and gp_body_reads(block_body, globals, locals)
+                        Stmt.Match(scrutinee, arms, line):
+                            true return if gp_expression_reads(scrutinee, globals, locals)
+                            for arm in arms:
+                                true return if gp_body_reads(arm.body, globals, locals)
+                        _:
+                            pass
+                return false
+
+        # Whether a body STORES into a global outside any `trusted` block covering Global.Write.
+        def gp_body_writes(statements: darray[Ast::Stmt], globals: darray[sview]&, locals: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            true return if gp_target_root_is_global(target, globals, locals)
+                        Stmt.If(condition, then_body, else_body, line):
+                            true return if gp_body_writes(then_body, globals, locals)
+                            true return if gp_body_writes(else_body, globals, locals)
+                        Stmt.While(condition, while_body, line):
+                            true return if gp_body_writes(while_body, globals, locals)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            true return if gp_body_writes(for_body, globals, locals)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            block_kind: sview = kind
+                            discharged: bool = block_kind == "trusted" and gp_clause_discharges(clause, true)
+                            true return if not discharged and gp_body_writes(block_body, globals, locals)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms:
+                                true return if gp_body_writes(arm.body, globals, locals)
+                        _:
+                            pass
+                return false
+
+        # The functions this body calls DIRECTLY, skipping any `trusted` block that
+        # discharges the axis being collected — a call inside `trusted [Global]:` cannot
+        # make its caller require Global. A `can` block is NOT skipped: it discharges the
+        # call site locally while still surfacing the effect upward.
+        def gp_body_calls(statements: darray[Ast::Stmt], want_write: bool, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            gp_expression_calls(expression, out)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            gp_expression_calls(value, out)
+                        Stmt.Assign(target, operator, value, line):
+                            gp_expression_calls(value, out)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                gp_expression_calls(returned, out)
+                        Stmt.If(condition, then_body, else_body, line):
+                            gp_expression_calls(condition, out)
+                            gp_body_calls(then_body, want_write, out)
+                            gp_body_calls(else_body, want_write, out)
+                        Stmt.While(condition, while_body, line):
+                            gp_expression_calls(condition, out)
+                            gp_body_calls(while_body, want_write, out)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            gp_expression_calls(iterable, out)
+                            gp_body_calls(for_body, want_write, out)
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            block_kind: sview = kind
+                            discharged: bool = block_kind == "trusted" and gp_clause_discharges(clause, want_write)
+                            gp_body_calls(block_body, want_write, out) if not discharged
+                        Stmt.Match(scrutinee, arms, line):
+                            gp_expression_calls(scrutinee, out)
+                            for arm in arms |out|:
+                                gp_body_calls(arm.body, want_write, out)
+                        _:
+                            pass
+
+        # Every direct callee inside an expression. `called_function_name` normalizes a
+        # module-qualified call (`M::f()`) to the declaration registry's key (`f`).
+        def gp_expression_calls(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = called_function_name(expression)
+                        out.push(callee_name) if callee_name != ""
+                        for argument in arguments |out|:
+                            gp_expression_calls(argument, out)
+                    Expr.Binary(left, operator, right, binary_line):
+                        gp_expression_calls(left, out)
+                        gp_expression_calls(right, out)
+                    Expr.Unary(operator, operand, unary_line):
+                        gp_expression_calls(operand, out)
+                    Expr.Paren(inner, paren_line):
+                        gp_expression_calls(inner, out)
+                    Expr.Index(object, index_argument, index_line):
+                        gp_expression_calls(object, out)
+                        gp_expression_calls(index_argument, out)
+                    _:
+                        pass
+
+        # One axis (Read or Write) over the whole declaration tree: the direct fact per
+        # function plus the call edges that can carry it. Modules and scoped blocks are
+        # descended exactly as collect_effect_sources descends them.
+        def gp_axis_facts(declarations: darray[Ast::Decl], globals: darray[sview]&, want_write: bool, out_names: mutable darray[sview]&, out_direct: mutable darray[bool]&, out_from: mutable darray[sview]&, out_to: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out_names, out_direct, out_from, out_to|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            locals: mutable darray[sview] = []
+                            for parameter in parameters |locals|:
+                                locals.push(parameter.name)
+                            collect_local_names(body, locals)
+                            out_names.push(name)
+                            out_direct.push(gp_body_writes(body, globals, locals) if want_write else gp_body_reads(body, globals, locals))
+                            callees: mutable darray[sview] = []
+                            gp_body_calls(body, want_write, callees)
+                            for callee in callees |out_from, out_to|:
+                                out_from.push(name)
+                                out_to.push(callee)
+                        Decl.Module(module_name, module_body, module_line):
+                            gp_axis_facts(module_body, globals, want_write, out_names, out_direct, out_from, out_to)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            gp_axis_facts(scoped_body, globals, want_write, out_names, out_direct, out_from, out_to)
+                        _:
+                            pass
+
+        # The slot of NAME in the collected function list, or -1. Overloads collapse onto
+        # the first slot; the fire site only warns when `direct_function_count` is 1, so a
+        # merged overload can never turn into a diagnostic on its own.
+        def gp_slot_of(names: darray[sview]&, target: sview) -> i64:
+            can Abort.Panic:
+                (-1) return if target == ""
+                while probe < names.count |probe: usize = 0|:
+                    probe.i64() return if names[probe] == target
+                    probe <- probe + 1
+                return (-1)
+
+        # Close one axis over the call graph: a caller of a function that needs the effect
+        # needs it too. Each round sets at least one slot or stops, so `names.count + 1`
+        # rounds is a hard bound on a cyclic graph as well as an acyclic one.
+        def gp_close_axis(names: darray[sview]&, direct: mutable darray[bool]&, edge_from: darray[sview]&, edge_to: darray[sview]&) -> void:
+            can Abort.Panic:
+                changed: mutable bool = true
+                rounds: mutable usize = 0
+                while changed and rounds <= names.count |changed, rounds, direct|:
+                    changed <- false
+                    edge: mutable usize = 0
+                    while edge < edge_from.count |edge, changed, direct|:
+                        caller_slot: i64 = gp_slot_of(names, edge_from[edge])
+                        callee_slot: i64 = gp_slot_of(names, edge_to[edge])
+                        carries: bool = caller_slot >= 0 and callee_slot >= 0 and direct[callee_slot.usize()] and not direct[caller_slot.usize()]
+                        if carries:
+                            direct[caller_slot.usize()] <- true
+                            changed <- true
+                        edge <- edge + 1
+                    rounds <- rounds + 1
+
+        # Register one inferred effect row, keeping the owner/ref arrays parallel and not
+        # duplicating a row the pass already added.
+        def gp_push_source_row(owner: sview, effect_ref: sview, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while probe < table.function_effect_source_owner.count |probe: usize = 0|:
+                    known: bool = table.function_effect_source_owner[probe] == owner and probe < table.function_effect_source_ref.count and table.function_effect_source_ref[probe] == effect_ref
+                    return if known
+                    probe <- probe + 1
+                table.function_effect_source_owner <- table.function_effect_source_owner.push(owner)
+                table.function_effect_source_ref <- table.function_effect_source_ref.push(effect_ref)
+
+        # Infer the Global family for every function in the file. Runs between
+        # collect_effect_sources and check_ungranted_panic, so the rows are in place
+        # before any call site is judged against them.
+        def check_global_permissions(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                globals: mutable darray[sview] = []
+                collect_mutable_globals(file.top_decls, globals)
+                return if globals.count == 0
+
+                read_names: mutable darray[sview] = []
+                read_direct: mutable darray[bool] = []
+                read_from: mutable darray[sview] = []
+                read_to: mutable darray[sview] = []
+                gp_axis_facts(file.top_decls, globals, false, read_names, read_direct, read_from, read_to)
+                gp_close_axis(read_names, read_direct, read_from, read_to)
+
+                write_names: mutable darray[sview] = []
+                write_direct: mutable darray[bool] = []
+                write_from: mutable darray[sview] = []
+                write_to: mutable darray[sview] = []
+                gp_axis_facts(file.top_decls, globals, true, write_names, write_direct, write_from, write_to)
+                gp_close_axis(write_names, write_direct, write_from, write_to)
+
+                while read_slot < read_names.count |read_slot: usize = 0, table| -> table:
+                    table <- gp_push_source_row(read_names[read_slot], "Global.Read", table) if read_direct[read_slot]
+                    read_slot <- read_slot + 1
+                while write_slot < write_names.count |write_slot: usize = 0, table| -> table:
+                    table <- gp_push_source_row(write_names[write_slot], "Global.Write", table) if write_direct[write_slot]
+                    write_slot <- write_slot + 1

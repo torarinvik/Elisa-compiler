@@ -81,6 +81,13 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
         *FlowLintMode:2*) hdr+=$'# flow-strict\n' ;;
         *FlowLintMode:1*) hdr+=$'# flow\n' ;;
     esac
+    # EnforceGlobalPermissions (`-Wglobals`; `-Wstrict` implies it) is its own fingerprint
+    # field, so it replays as its own header rather than riding on `# strict`. Emitted EARLY:
+    # the reporter only scans the first five lines for headers, and a row that enables many
+    # axes at once would otherwise push this one out of the window.
+    case "$opts" in
+        *EnforceGlobalPermissions:true*) hdr+=$'# globals\n' ;;
+    esac
     case "$opts" in
         *EnforceUnsafePermissions:true*|*EnforceStrictProofs:true*) hdr+=$'# strict\n' ;;
     esac
