@@ -68,6 +68,7 @@ run_negative() {
 
 run_positive "static_handler_bare.elisa"
 run_positive "static_handler_capture.elisa"
+run_positive "handler_default_capture.elisa"
 run_positive "handler_tail_resume.elisa"
 run_positive "nested_handler_forwarding.elisa"
 run_positive "nested_handler_capture_forwarding.elisa"
