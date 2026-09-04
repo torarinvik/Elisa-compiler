@@ -71,12 +71,15 @@ run_positive "static_handler_capture.elisa"
 run_positive "handler_tail_resume.elisa"
 run_positive "nested_handler_forwarding.elisa"
 run_positive "static_handler_via.elisa"
+run_positive "static_handler_generic_explicit.elisa"
 run_zero_overhead_ir "static_handler_capture.elisa"
 run_zero_overhead_ir "nested_handler_forwarding.elisa"
+run_zero_overhead_ir "static_handler_generic_explicit.elisa"
 
 run_negative "mismatched_handler.neg.elisa" 'effect handler "Wrong" realizes "Other"'
 run_negative "missing_operation.neg.elisa" 'effect "Tick" has no operation "pong"'
 run_negative "unhandled_effect.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
 run_negative "handler_signature_mismatch.neg.elisa" 'handler "Bad" operation "ping" does not match the abstract operation signature'
+run_negative "abstract_operation_value.neg.elisa" 'abstract effect operation Tick.ping cannot be used as a value'
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"
