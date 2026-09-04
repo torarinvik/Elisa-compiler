@@ -72,9 +72,11 @@ run_positive "handler_tail_resume.elisa"
 run_positive "nested_handler_forwarding.elisa"
 run_positive "static_handler_via.elisa"
 run_positive "static_handler_generic_explicit.elisa"
+run_positive "handler_via_install.elisa"
 run_zero_overhead_ir "static_handler_capture.elisa"
 run_zero_overhead_ir "nested_handler_forwarding.elisa"
 run_zero_overhead_ir "static_handler_generic_explicit.elisa"
+run_zero_overhead_ir "handler_via_install.elisa"
 
 run_negative "mismatched_handler.neg.elisa" 'effect handler "Wrong" realizes "Other"'
 run_negative "missing_operation.neg.elisa" 'effect "Tick" has no operation "pong"'
