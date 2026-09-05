@@ -67,6 +67,17 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 # and must be investigated, not silently re-baselined.
 BASELINE_GEN3_RC="${BASELINE_GEN3_RC:-0}"
 
+# Every self-host probe is bounded independently. A freshly linked Mach-O can
+# become stuck in dyld before the compiler reaches main (for example while a
+# host loader is resolving libLLVM); an unbounded Stage A or Stage D probe would
+# otherwise make the entire bootstrap gate hang with no diagnostic. These are
+# deliberately named policy constants rather than scattered timing literals.
+DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS=30
+DEFAULT_SELF_HOST_PROBE_POLL_SECONDS=0.05
+SELF_HOST_PROBE_TIMEOUT_SECONDS="${SELF_HOST_PROBE_TIMEOUT_SECONDS:-$DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS}"
+SELF_HOST_PROBE_POLL_SECONDS="${SELF_HOST_PROBE_POLL_SECONDS:-$DEFAULT_SELF_HOST_PROBE_POLL_SECONDS}"
+SELF_HOST_PROBE_TIMEOUT_POLLS="${SELF_HOST_PROBE_TIMEOUT_POLLS:-600}"
+
 fail() { echo "self_host_gen3_smoke FAIL: $1" >&2; exit 1; }
 
 terminate_guarded_pid() {
@@ -87,7 +98,7 @@ terminate_guarded_pid() {
 # scripts/elisac_stage1.sh. This is an operational safety boundary, not a semantic fallback:
 # crossing it fails the smoke and leaves the compiler bug visible instead of freezing the host.
 run_guarded_request() {
-    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-4194304}"
+    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-4194304}" polls=0
     "$binary" <"$request" >"$output" 2>&1 &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
@@ -100,7 +111,13 @@ run_guarded_request() {
             terminate_guarded_pid "$pid"
             return 125
         fi
-        sleep "${ELISA_STAGE1_RSS_POLL_SECONDS:-0.05}"
+        polls=$((polls + 1))
+        if [[ "$polls" -ge "$SELF_HOST_PROBE_TIMEOUT_POLLS" ]]; then
+            echo "self_host_gen3_smoke: timeout stopped pid $pid after ${SELF_HOST_PROBE_TIMEOUT_SECONDS}s" >&2
+            terminate_guarded_pid "$pid"
+            return 124
+        fi
+        sleep "$SELF_HOST_PROBE_POLL_SECONDS"
     done
     wait "$pid"
 }
@@ -119,8 +136,14 @@ bash "$ROOT/scripts/self_host_gen2.sh" "$GEN2_DIR" >"$WORK/gen2.log" 2>&1 \
 [ -x "$GEN2" ] || fail "no gen2 binary at $GEN2"
 
 # ---- Stage A: gen2 must still compile the constructs the fixed blockers covered ----
-# gen2 reads "<output path>\n<source>" on stdin.
-run_gen2() { printf '%s\n%b' "$WORK/$1.o" "$2" | "$GEN2" >/dev/null 2>&1; }
+# gen2 reads "<output path>\n<source>" on stdin. Route the request through
+# the same bounded runner as the large self-host requests; this also makes a
+# loader stall an actionable timeout instead of an indefinitely hanging smoke.
+run_gen2() {
+    local request="$WORK/gen2-$1.request" output="$WORK/gen2-$1.log"
+    { printf '%s\n%b' "$WORK/$1.o" "$2"; } >"$request"
+    run_guarded_request "$GEN2" "$request" "$output"
+}
 
 a_pass=0; a_total=0
 guard() {
@@ -258,7 +281,8 @@ det_first=""
 det_run=1
 while [ "$det_run" -le "$det_runs" ]; do
     { printf '%s\n' "$WORK/det.o"; cat "$DET_SRC"; } >"$WORK/det.request"
-    "$WORK/elisac-stage1-gen3" <"$WORK/det.request" >"$WORK/det.log" 2>&1
+    run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/det.request" "$WORK/det.log" \
+        || fail "stage D: gen3 probe timed out or failed on run $det_run (see $WORK/det.log)"
     [ -s "$WORK/det.o" ] || fail "stage D: gen3 wrote no object on run $det_run (see $WORK/det.log)"
     det_sum="$(cksum <"$WORK/det.o" | awk '{print $1}')"
     if [ -z "$det_first" ]; then
