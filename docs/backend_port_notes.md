@@ -869,7 +869,7 @@ I overstated earlier that dict is "one AST field away". It is not. The full chai
 So dict is: std cross-file compilation + dict expression shapes, with the catch dependency
 now satisfied. The remaining work is not represented by the old AST blocker.
 
-## Struct-composition gaps still open (found by probing, mapped for fast pickup)
+## Struct-composition gaps — BOTH CLOSED (kept for the pickup notes)
 
 Both are the SAME shape as the ones already landed -- a receiver resolver that only handles
 a bare Ident, needing the recursive chain form. Neither is blocked on anything; both are
