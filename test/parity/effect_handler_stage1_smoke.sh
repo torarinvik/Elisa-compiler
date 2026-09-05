@@ -19,7 +19,11 @@ run_positive() {
         -target-triple wasm32-unknown-unknown \
         -o "$WORK/$stem.o" \
         "$ROOT/test/fixtures/effects/$fixture" \
-        >"$WORK/$stem.log" 2>&1
+        >"$WORK/$stem.log" 2>&1 || {
+        echo "effect compilation failed for $fixture" >&2
+        sed -n '1,80p' "$WORK/$stem.log" >&2
+        return 1
+    }
     [[ -s "$WORK/$stem.o" ]] || {
         echo "effect handler output is empty for $fixture" >&2
         exit 1
@@ -34,8 +38,12 @@ run_zero_overhead_ir() {
         -target-triple wasm32-unknown-unknown \
         -o "$WORK/$stem.ll" \
         "$ROOT/test/fixtures/effects/$fixture" \
-        >"$WORK/$stem-llvm.log" 2>&1
-    grep -Eq 'call( [^@]*)?@__handler__' "$WORK/$stem.ll" || {
+        >"$WORK/$stem-llvm.log" 2>&1 || {
+        echo "effect LLVM compilation failed for $fixture" >&2
+        sed -n '1,80p' "$WORK/$stem-llvm.log" >&2
+        return 1
+    }
+    grep -Eq 'call( [^@]*)?@([A-Za-z0-9_]+\.)?__handler__' "$WORK/$stem.ll" || {
         echo "expected a direct hidden-handler call in LLVM for $fixture" >&2
         sed -n '1,120p' "$WORK/$stem.ll" >&2
         exit 1
@@ -66,6 +74,75 @@ run_negative() {
     }
 }
 
+# These fixtures return distinct values so a wrong handler/module or swapped capture
+# can no longer pass merely because code generation succeeded.
+run_native_result() {
+    local fixture="$1" expected="$2"
+    local stem="$(basename "$fixture" .elisa)"
+    local clang="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
+    if [[ ! -x "$clang" ]]; then
+        echo "native effect check SKIP: clang unavailable for $fixture"
+        return
+    fi
+    "$ROOT/scripts/elisac_stage1.sh" -emit obj -o "$WORK/$stem-native.o" \
+        "$ROOT/test/fixtures/effects/$fixture" >"$WORK/$stem-native.log" 2>&1
+    "$clang" "$WORK/$stem-native.o" -o "$WORK/$stem-native"
+    local actual=0
+    "$WORK/$stem-native" || actual=$?
+    [[ "$actual" == "$expected" ]] || {
+        echo "wrong effect result for $fixture: expected $expected, got $actual" >&2
+        exit 1
+    }
+}
+
+run_direct_equivalence() {
+    local llvm_diff="${ELISA_LLVM_DIFF:-/opt/homebrew/opt/llvm/bin/llvm-diff}"
+    local stem
+    for stem in helper_equivalence helper_equivalence_manual helper_generic_equivalence helper_generic_equivalence_manual; do
+        "$ROOT/scripts/elisac_stage1.sh" -O2 -emit llvm \
+            -target-triple wasm32-unknown-unknown -o "$WORK/$stem.ll" \
+            "$ROOT/test/fixtures/effects/$stem.elisa" >"$WORK/$stem.log" 2>&1 || {
+            sed -n '1,80p' "$WORK/$stem.log" >&2
+            return 1
+        }
+        grep -Eq '^define .*@calculate\(' "$WORK/$stem.ll" || {
+            echo "missing runtime-input equivalence function in $stem" >&2
+            return 1
+        }
+        "$ROOT/scripts/elisac_stage1.sh" -O2 -emit obj \
+            -target-triple wasm32-unknown-unknown -o "$WORK/$stem-equivalence.o" \
+            "$ROOT/test/fixtures/effects/$stem.elisa"
+        if [[ "$(uname -s)" == Darwin ]]; then
+            "$ROOT/scripts/elisac_stage1.sh" -O2 -emit obj \
+                -o "$WORK/$stem-equivalence-native.o" \
+                "$ROOT/test/fixtures/effects/$stem.elisa"
+        fi
+    done
+    # Compare the entire public functions, including checked-arithmetic control
+    # flow, with SSA-renaming-aware LLVM comparison. Both runtime inputs remain
+    # unknown in calculate; a constant-return test would be a weaker guarantee.
+    if [[ -x "$llvm_diff" ]]; then
+        "$llvm_diff" "$WORK/helper_equivalence.ll" \
+            "$WORK/helper_equivalence_manual.ll" calculate main
+        "$llvm_diff" "$WORK/helper_generic_equivalence.ll" \
+            "$WORK/helper_generic_equivalence_manual.ll" calculate main
+    else
+        echo "optimized LLVM comparison SKIP: llvm-diff unavailable (object comparison still runs)"
+    fi
+    cmp "$WORK/helper_equivalence-equivalence.o" \
+        "$WORK/helper_equivalence_manual-equivalence.o"
+    cmp "$WORK/helper_generic_equivalence-equivalence.o" \
+        "$WORK/helper_generic_equivalence_manual-equivalence.o"
+    # Mach-O objects for these fixtures carry no source-name metadata. Do not
+    # demand byte equality on ELF, where a differing STT_FILE entry is harmless.
+    if [[ "$(uname -s)" == Darwin ]]; then
+        cmp "$WORK/helper_equivalence-equivalence-native.o" \
+            "$WORK/helper_equivalence_manual-equivalence-native.o"
+        cmp "$WORK/helper_generic_equivalence-equivalence-native.o" \
+            "$WORK/helper_generic_equivalence_manual-equivalence-native.o"
+    fi
+}
+
 run_positive "static_handler_bare.elisa"
 run_positive "static_handler_capture.elisa"
 run_positive "static_handler_scope_named.elisa"
@@ -73,6 +150,7 @@ run_positive "static_handler_qualified.elisa"
 run_positive "static_handler_qualified_generic.elisa"
 run_positive "handler_default_capture.elisa"
 run_positive "handler_tail_resume.elisa"
+run_positive "handler_resume_tail.elisa"
 run_positive "nested_handler_forwarding.elisa"
 run_positive "nested_handler_capture_forwarding.elisa"
 run_positive "static_handler_via.elisa"
@@ -80,6 +158,50 @@ run_positive "static_handler_generic_explicit.elisa"
 run_positive "handler_via_install.elisa"
 run_positive "handler_via_bare_abstract.elisa"
 run_positive "handler_target_via.elisa"
+run_positive "effectful_helper.elisa"
+run_positive "effectful_helper_capture.elisa"
+run_positive "effectful_helper_module.elisa"
+run_positive "effectful_helper_generic.elisa"
+run_positive "effectful_helper_generic_capture.elisa"
+run_positive "effectful_helper_generic_module.elisa"
+run_positive "effectful_helper_two_handlers.elisa"
+run_positive "effectful_helper_chain.elisa"
+run_positive "effectful_helper_nested_module.elisa"
+run_positive "effectful_helper_module_sibling.elisa"
+run_positive "module_duplicate_handler_names.elisa"
+run_positive "module_forward_handler.elisa"
+run_positive "module_forward_duplicate_handler_names.elisa"
+run_positive "helper_namespace.elisa"
+run_positive "helper_nested_selection.elisa"
+run_positive "helper_explicit_generic.elisa"
+run_positive "helper_explicit_chain.elisa"
+run_positive "helper_qualified_chain.elisa"
+run_positive "helper_generic_handler_selection.elisa"
+run_positive "helper_generic_phantom_effect.elisa"
+run_positive "helper_generic_effect_inferred.elisa"
+run_positive "helper_generic_const_enum_selection.elisa"
+run_positive "helper_generic_equivalence.elisa"
+run_positive "helper_generic_equivalence_manual.elisa"
+run_positive "helper_defaults.elisa"
+run_positive "helper_sibling_capture.elisa"
+run_positive "helper_multiple_effects.elisa"
+run_positive "helper_module_install.elisa"
+run_positive "helper_nested_capture.elisa"
+run_native_result "helper_namespace.elisa" 22
+run_native_result "helper_explicit_chain.elisa" 31
+run_native_result "helper_qualified_chain.elisa" 47
+run_native_result "helper_multiple_effects.elisa" 33
+run_native_result "helper_nested_capture.elisa" 22
+run_native_result "module_duplicate_handler_names.elisa" 1
+run_native_result "module_forward_handler.elisa" 7
+run_native_result "module_forward_duplicate_handler_names.elisa" 1
+run_native_result "helper_generic_handler_selection.elisa" 17
+run_native_result "helper_generic_phantom_effect.elisa" 34
+run_native_result "helper_generic_effect_inferred.elisa" 42
+run_native_result "helper_generic_const_enum_selection.elisa" 34
+run_native_result "helper_generic_equivalence.elisa" 17
+run_native_result "helper_generic_equivalence_manual.elisa" 17
+run_direct_equivalence
 run_positive "handler_target_via_forward.elisa"
 run_positive "via_grant_covers_both_rows.elisa"
 run_positive "via_grant_bare_block.elisa"
@@ -95,6 +217,57 @@ run_zero_overhead_ir "static_handler_generic_explicit.elisa"
 run_zero_overhead_ir "handler_via_install.elisa"
 run_zero_overhead_ir "handler_via_bare_abstract.elisa"
 run_zero_overhead_ir "handler_target_via.elisa"
+run_zero_overhead_ir "effectful_helper.elisa"
+run_zero_overhead_ir "effectful_helper_capture.elisa"
+run_zero_overhead_ir "effectful_helper_module.elisa"
+run_zero_overhead_ir "effectful_helper_generic.elisa"
+run_zero_overhead_ir "effectful_helper_generic_capture.elisa"
+run_zero_overhead_ir "effectful_helper_generic_module.elisa"
+run_zero_overhead_ir "effectful_helper_two_handlers.elisa"
+run_zero_overhead_ir "effectful_helper_chain.elisa"
+run_zero_overhead_ir "effectful_helper_nested_module.elisa"
+run_zero_overhead_ir "effectful_helper_module_sibling.elisa"
+run_zero_overhead_ir "module_duplicate_handler_names.elisa"
+run_zero_overhead_ir "module_forward_handler.elisa"
+run_zero_overhead_ir "module_forward_duplicate_handler_names.elisa"
+run_zero_overhead_ir "helper_namespace.elisa"
+run_zero_overhead_ir "helper_nested_selection.elisa"
+run_zero_overhead_ir "helper_explicit_generic.elisa"
+run_zero_overhead_ir "helper_explicit_chain.elisa"
+run_zero_overhead_ir "helper_qualified_chain.elisa"
+run_zero_overhead_ir "helper_generic_handler_selection.elisa"
+run_zero_overhead_ir "helper_generic_phantom_effect.elisa"
+run_zero_overhead_ir "helper_generic_effect_inferred.elisa"
+run_zero_overhead_ir "helper_generic_const_enum_selection.elisa"
+run_zero_overhead_ir "helper_defaults.elisa"
+run_zero_overhead_ir "helper_sibling_capture.elisa"
+run_zero_overhead_ir "helper_multiple_effects.elisa"
+run_zero_overhead_ir "helper_module_install.elisa"
+run_zero_overhead_ir "helper_nested_capture.elisa"
+grep -Eq 'call i64 @__effect__emit__Sink__14__at_[0-9]+\(' "$WORK/helper_namespace.ll" || {
+    echo "qualified helper selected the wrong module" >&2
+    exit 1
+}
+grep -Eq 'call void @__effect__emit__Other__12__at_[0-9]+\(' "$WORK/helper_nested_selection.ll" || {
+    echo "nested helper selected the outer handler" >&2
+    exit 1
+}
+grep -Eq 'call void @Util.leaf\(\)' "$WORK/helper_sibling_capture.ll" || {
+    echo "ordinary module sibling received handler captures" >&2
+    exit 1
+}
+grep -A4 'define internal i1 @__effect__ask__[^ ]*__bool(' "$WORK/helper_generic_handler_selection.ll" | grep -Eq 'call i1 @__handler__BoolAnswer__get\(' || {
+    echo "generic bool operation selected the wrong handler" >&2
+    exit 1
+}
+grep -A4 'define internal i64 @__effect__ask__[^ ]*__i64(' "$WORK/helper_generic_handler_selection.ll" | grep -Eq 'call i64 @__handler__IntAnswer__get\(' || {
+    echo "generic i64 operation selected the wrong handler" >&2
+    exit 1
+}
+if grep -Eq 'call .*@emit\(|call .*@ask\(' "$WORK/helper_generic_handler_selection.ll"; then
+    echo "generic effect helper remained as an ordinary call" >&2
+    exit 1
+fi
 run_zero_overhead_ir "handler_target_via_forward.elisa"
 
 capture_stem="handler_capture_once"
@@ -159,5 +332,11 @@ run_negative "permission_member_mismatch.neg.elisa" 'permission "LocalConsole" h
 run_negative "handler_implementation_access.neg.elisa" 'compiler-generated static effect operation "__handler__H__ping" is private'
 run_negative "handler_capture_arity.neg.elisa" 'effect handler "Sink" requires 1 capture argument(s), got 0'
 run_negative "handler_nested_resume.neg.elisa" 'handler "Bad" operation "ping" is outside the zero-overhead resumable subset'
+run_negative "handler_resume_non_tail.neg.elisa" 'handler "Bad" operation "ping" is outside the zero-overhead resumable subset'
+run_negative "handler_resume_nonvoid.neg.elisa" 'handler "Bad" operation "ping" is outside the zero-overhead resumable subset'
+run_negative "effectful_helper_unhandled.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
+run_negative "helper_mixed_unhandled.neg.elisa" 'effectful helper "emit_tick" requires an installed handler for abstract effect "Tick"'
+run_negative "helper_generic_specialization_mismatch.neg.elisa" 'abstract effect specialization mismatch'
+run_negative "helper_clone_private.neg.elisa" 'is private'
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"

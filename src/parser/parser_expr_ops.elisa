@@ -261,26 +261,33 @@ extend Parser:
                 _:
                     return 0.usize()
 
-        # Compare an explicitly indexed effect head with the active abstract row. The
-        # source slice retains both namespace qualification and generic arguments, while
-        # `handler_effect_ref_equal` makes layout inside the brackets insignificant.
-        def handler_effect_indexed_head_matches(parser: Parser&, effect_head: Ast::Expr, active_effect: sview, call_offset: usize) -> bool:
+        # The effect head exactly as written, without the trailing `.operation`. `call_offset` is
+        # the call's opening parenthesis, so the raw slice still carries the operation name. The
+        # split is the last `.` outside brackets, which keeps a dotted namespace and any generic
+        # arguments inside the head.
+        def handler_effect_head_text(parser: Parser&, effect_head: Ast::Expr, call_offset: usize) -> sview:
             head_start: usize = handler_effect_head_start(effect_head)
-            return false if call_offset <= head_start
+            return "" if call_offset <= head_start
             source_before_operation: sview = parser.span_view(head_start, call_offset)
             dot_index: mutable usize = sview_len(source_before_operation)
             depth: mutable int = 0
             cursor: mutable usize = 0
             while cursor < sview_len(source_before_operation) |cursor, dot_index, depth, source_before_operation|:
                 byte: u8 = sview_at(source_before_operation, cursor)
-                if byte == 46 and depth == 0:
-                    dot_index <- cursor
-                    break
+                dot_index <- cursor if byte == 46 and depth == 0
                 depth <- depth + 1 if byte == 91 or byte == 40 or byte == 123
                 depth <- depth - 1 if depth > 0 and (byte == 93 or byte == 41 or byte == 125)
                 cursor <- cursor + 1.usize()
-            return false if dot_index >= sview_len(source_before_operation)
-            return handler_effect_ref_equal(source_before_operation[0:dot_index], handler_effect_abstract(active_effect))
+            return "" if dot_index >= sview_len(source_before_operation)
+            return source_before_operation[0:dot_index]
+
+        # Compare an explicitly indexed effect head with the active abstract row. The
+        # source slice retains both namespace qualification and generic arguments, while
+        # `handler_effect_ref_equal` makes layout inside the brackets insignificant.
+        def handler_effect_indexed_head_matches(parser: Parser&, effect_head: Ast::Expr, active_effect: sview, call_offset: usize) -> bool:
+            source_head: sview = parser.handler_effect_head_text(effect_head, call_offset)
+            return false if source_head == ""
+            return handler_effect_ref_equal(source_head, handler_effect_abstract(active_effect))
 
         # A qualified operation head carries namespace identity in addition to its
         # terminal family. If both the source head and the active row are qualified,
@@ -294,27 +301,27 @@ extend Parser:
             return false
 
         def handler_effect_qualified_head_matches(parser: Parser&, effect_head: Ast::Expr, active_effect: sview, call_offset: usize) -> bool:
-            head_start: usize = handler_effect_head_start(effect_head)
-            return false if call_offset <= head_start
-            source_before_operation: sview = parser.span_view(head_start, call_offset)
-            dot_index: mutable usize = sview_len(source_before_operation)
-            depth: mutable int = 0
-            cursor: mutable usize = 0
-            while cursor < sview_len(source_before_operation) |cursor, dot_index, depth, source_before_operation|:
-                byte: u8 = sview_at(source_before_operation, cursor)
-                if byte == 46 and depth == 0:
-                    dot_index <- cursor
-                    break
-                depth <- depth + 1 if byte == 91 or byte == 40 or byte == 123
-                depth <- depth - 1 if depth > 0 and (byte == 93 or byte == 41 or byte == 125)
-                cursor <- cursor + 1.usize()
-            return false if dot_index >= sview_len(source_before_operation)
-            source_head: sview = source_before_operation[0:dot_index]
+            source_head: sview = parser.handler_effect_head_text(effect_head, call_offset)
+            return false if source_head == ""
             active_head: sview = handler_effect_abstract(active_effect)
             return handler_effect_ref_equal(source_head, active_head) if handler_effect_ref_has_namespace(source_head) and handler_effect_ref_has_namespace(active_head)
             return handler_effect_head_family(effect_head) == handler_effect_family(active_effect)
 
         def handler_effect_head_matches(parser: Parser&, effect_head: Ast::Expr, active_effect: sview, call_offset: usize) -> bool:
+            # Once the installation has resolved to a declaration, the source head must name that
+            # same declaration. This is a necessary condition only: one declaration has many
+            # applications, so generic arguments are still compared structurally below. Without
+            # it, `A::Tick.ping()` would bind to a handler installed for `B::Tick` purely
+            # because both families are spelled `Tick`.
+            if parser.active_effect_identity_id != 0:
+                identity_head: sview = parser.handler_effect_head_text(effect_head, call_offset)
+                if identity_head != "":
+                    requested_identity_id: u32 = parser.effect_identity_for_reference(identity_head, parser.current_module)
+                    return false if requested_identity_id != 0 and requested_identity_id != parser.active_effect_identity_id
+                    # A namespace-qualified head names exactly one declaration. If it does not
+                    # resolve to the installed one, the terminal-family fallback below would
+                    # silently accept another module's effect.
+                    return false if requested_identity_id == 0 and handler_effect_ref_has_namespace(identity_head)
             match effect_head:
                 Expr.Ident(effect_name, effect_name_pos):
                     return effect_name == handler_effect_family(active_effect)
@@ -332,14 +339,32 @@ extend Parser:
         # Generate a parser-owned source name for a handler operation. The generated name is
         # an ordinary Elisa function name; keeping it in a stable reserved buffer means the
         # rewritten AST can safely retain the view after later names are generated.
-        def handler_operation_name[@r](parser: mutable Parser& @r, handler: sview, operation: sview) -> sview:
+        def handler_operation_name_for_identity[@r](parser: mutable Parser& @r, handler: sview, operation: sview, handler_identity_id: u32) -> sview:
             parser.handler_name_storage.reserve(parser.tokens.count * 64) if parser.handler_name_storage.count == 0
             start: usize = parser.handler_name_storage.count
             append_handler_name_text(parser.handler_name_storage, "__handler__")
             append_handler_name_text(parser.handler_name_storage, handler)
+            # Top-level handler names retain their historic compact spelling. Module-local
+            # handlers carry their stable identity, so `A::H` and `B::H` cannot emit the same
+            # LLVM symbol even though their source names are equal.
+            if handler_identity_id != 0 and parser.handler_identity_is_module_local(handler_identity_id):
+                append_handler_name_text(parser.handler_name_storage, "__")
+                append_handler_capture_number(parser.handler_name_storage, handler_identity_id.usize())
             append_handler_name_text(parser.handler_name_storage, "__")
             append_handler_name_text(parser.handler_name_storage, operation)
             return sview(&parser.handler_name_storage[start], 0, parser.handler_name_storage.count - start)
+
+        def handler_operation_name[@r](parser: mutable Parser& @r, handler: sview, operation: sview) -> sview:
+            handler_identity_id: u32 = parser.handler_identity_for_name(handler, parser.current_module)
+            return parser.handler_operation_name_for_identity(handler, operation, handler_identity_id)
+
+        def handler_operation_callee(parser: mutable Parser&, handler: sview, operation: sview, position: Ast::Pos) -> Ast::Expr:
+            handler_identity_id: u32 = parser.handler_identity_for_name(handler, parser.current_module)
+            hidden_name: sview = parser.handler_operation_name_for_identity(handler, operation, handler_identity_id)
+            if handler_identity_id != 0 and parser.handler_identity_is_module_local(handler_identity_id):
+                owner_expression: Ast::Expr = Ast::Expr.Ident(parser.current_module, Ast::pos_at_line(0))
+                return Ast::Expr.Scope(owner_expression, hidden_name, position)
+            return Ast::Expr.Ident(hidden_name, position)
 
         def append_handler_capture_number(buffer: mutable darray[u8]&, value: usize) -> void:
             digits: mutable darray[u8] = []
@@ -377,14 +402,19 @@ extend Parser:
         # shapes before parsing bodies, so an absent operation is never rewritten to a
         # nonexistent hidden function merely because the declaration appears later.
         def handler_declares_operation(parser: Parser&, handler_name: sview, operation: sview) -> bool:
+            handler_identity_id: u32 = parser.handler_identity_for_name(handler_name, parser.current_module)
+            return parser.handler_declares_operation_identity(handler_name, operation, handler_identity_id)
+
+        def handler_declares_operation_identity(parser: Parser&, handler_name: sview, operation: sview, handler_identity_id: u32) -> bool:
             known_handler: mutable bool = false
             for annotation in parser.enum_annotations |known_handler|:
-                known_handler <- true if (annotation.owner == "__handler_decl" or annotation.owner == "__handler_predecl") and annotation.name == handler_name
-                return true if annotation.owner == handler_name and (annotation.line == 3900000083 or annotation.line == 3900000094) and annotation.name == operation
+                known_handler <- true if (annotation.owner == "__handler_decl" or annotation.owner == "__handler_predecl") and annotation.name == handler_name and (handler_identity_id == 0 or annotation.identity_id == handler_identity_id)
+                return true if annotation.owner == handler_name and (annotation.line == 3900000083 or annotation.line == 3900000094) and annotation.name == operation and (handler_identity_id == 0 or annotation.identity_id == handler_identity_id)
             return false
 
         def handler_is_known(parser: Parser&, handler_name: sview) -> bool:
-            return any annotation in parser.enum_annotations where (annotation.owner == "__handler_decl" or annotation.owner == "__handler_predecl") and annotation.name == handler_name
+            handler_identity_id: u32 = parser.handler_identity_for_name(handler_name, parser.current_module)
+            return any annotation in parser.enum_annotations where (annotation.owner == "__handler_decl" or annotation.owner == "__handler_predecl") and annotation.name == handler_name and (handler_identity_id == 0 or annotation.identity_id == handler_identity_id)
 
         # Normalize an effect operation after a block has been parsed. The postfix parser also
         # performs this rewrite while the handler context is active, but keeping this pass at the
@@ -395,10 +425,59 @@ extend Parser:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_pos):
+                        if parser.effect_clone_source_line != 0:
+                            match callee:
+                                Expr.Field(deferred_head, deferred_operation, deferred_position):
+                                    rebind deferred: Ast::Expr?, parser = parser.defer_generic_effect_call(deferred_head, deferred_operation, arguments, argument_names, call_pos, effect_name, handler_name, captures)
+                                    return deferred_call if deferred is deferred_call
+                                Expr.Scope(deferred_scope_head, deferred_scope_operation, deferred_scope_position):
+                                    rebind deferred_scope: Ast::Expr?, parser = parser.defer_generic_effect_call(deferred_scope_head, deferred_scope_operation, arguments, argument_names, call_pos, effect_name, handler_name, captures)
+                                    return deferred_scope_call if deferred_scope is deferred_scope_call
+                                _:
+                                    pass
+                        # An effectful helper is a compile-time template. Once the file-wide
+                        # specialization pass has registered a clone for this active handler,
+                        # rewrite the ordinary helper call to that clone and prepend the
+                        # handler captures. Before that pass the lookup is empty, so normal
+                        # parsing remains unchanged.
+                        effect_template_name: sview = effect_template_callee_name(callee)
+                        if effect_template_name != "":
+                            lexical_owner: sview = parser.effect_clone_active_owner if (any visible_name in parser.effect_clone_visible_names where visible_name == effect_template_name) else ""
+                            source_owner: sview = effect_template_callee_owner(callee, lexical_owner)
+                            specialized_name: sview = parser.effect_clone_for_call(effect_template_name, arguments.count, effect_name, handler_name, source_owner)
+                            if specialized_name != "":
+                                specialized_arguments: mutable darray[Ast::Expr] = []
+                                specialized_names: mutable darray[sview] = []
+                                for capture in parser.effect_context_arguments |specialized_arguments, specialized_names|:
+                                    specialized_arguments.push(capture)
+                                    specialized_names.push("")
+                                specialized_index: mutable usize = 0
+                                while specialized_index < arguments.count |parser, specialized_index, specialized_arguments, specialized_names, argument_names, effect_name, handler_name, captures|:
+                                    rebind specialized_argument: Ast::Expr, parser = parser.rewrite_handler_expression(arguments[specialized_index], effect_name, handler_name, captures)
+                                    specialized_arguments.push(specialized_argument)
+                                    specialized_names.push(argument_names[specialized_index] if specialized_index < argument_names.count else "")
+                                    specialized_index <- specialized_index + 1.usize()
+                                return (Ast::Expr.Call(effect_specialized_callee(callee, specialized_name), specialized_arguments, specialized_names, call_pos))
+                        # Clones from a module are emitted at file scope, but their source body
+                        # still resolves bare sibling calls in that module. Qualify only names
+                        # known to be functions in the active source module; locals and values
+                        # continue through the ordinary rewrite unchanged.
+                        if callee is Expr.Ident(module_sibling_name, module_sibling_pos):
+                            if parser.effect_clone_active_owner != "" and (any visible_name in parser.effect_clone_visible_names where visible_name == module_sibling_name):
+                                qualified_arguments: mutable darray[Ast::Expr] = []
+                                qualified_names: mutable darray[sview] = []
+                                qualified_index: mutable usize = 0
+                                while qualified_index < arguments.count |parser, qualified_index, qualified_arguments, qualified_names, argument_names, effect_name, handler_name, captures|:
+                                    rebind qualified_argument: Ast::Expr, parser = parser.rewrite_handler_expression(arguments[qualified_index], effect_name, handler_name, captures)
+                                    qualified_arguments.push(qualified_argument)
+                                    qualified_names.push(argument_names[qualified_index] if qualified_index < argument_names.count else "")
+                                    qualified_index <- qualified_index + 1.usize()
+                                qualified_owner_expr: Ast::Expr = Ast::Expr.Ident(parser.effect_clone_active_owner, Ast::pos_at_line(0))
+                                qualified_callee: Ast::Expr = Ast::Expr.Scope(qualified_owner_expr, module_sibling_name, module_sibling_pos)
+                                return (Ast::Expr.Call(qualified_callee, qualified_arguments, qualified_names, call_pos))
                         match callee:
                             Expr.Field(effect_head, operation, field_pos):
                                 if parser.handler_effect_head_matches(effect_head, effect_name, call_pos.offset.usize()) and parser.handler_declares_operation(handler_name, operation):
-                                    hidden_name: sview = parser.handler_operation_name(handler_name, operation)
                                     rewritten_arguments: mutable darray[Ast::Expr] = []
                                     rewritten_names: mutable darray[sview] = []
                                     for capture in captures |rewritten_arguments, rewritten_names|:
@@ -414,10 +493,9 @@ extend Parser:
                                     # function is intentionally not a source-level capability:
                                     # semantic validation uses this marker to reject a user who
                                     # tries to spell the lowered name directly.
-                                    return (Ast::Expr.Call(Ast::Expr.Ident(hidden_name, Ast::pos_at_line(0)), rewritten_arguments, rewritten_names, call_pos))
+                                    return (Ast::Expr.Call(parser.handler_operation_callee(handler_name, operation, Ast::pos_at_line(0)), rewritten_arguments, rewritten_names, call_pos))
                             Expr.Scope(effect_head, operation, scope_pos):
                                 if parser.handler_effect_head_matches(effect_head, effect_name, call_pos.offset.usize()) and parser.handler_declares_operation(handler_name, operation):
-                                    hidden_name: sview = parser.handler_operation_name(handler_name, operation)
                                     rewritten_arguments: mutable darray[Ast::Expr] = []
                                     rewritten_names: mutable darray[sview] = []
                                     for capture in captures |rewritten_arguments, rewritten_names|:
@@ -430,7 +508,7 @@ extend Parser:
                                         rewritten_names.push(argument_names[argument_index_scope] if argument_index_scope < argument_names.count else "")
                                         argument_index_scope <- argument_index_scope + 1
                                     # Keep the lowered operation private to the static rewrite.
-                                    return (Ast::Expr.Call(Ast::Expr.Ident(hidden_name, Ast::pos_at_line(0)), rewritten_arguments, rewritten_names, call_pos))
+                                    return (Ast::Expr.Call(parser.handler_operation_callee(handler_name, operation, Ast::pos_at_line(0)), rewritten_arguments, rewritten_names, call_pos))
                             _:
                                 pass
                         rebind rewritten_callee: Ast::Expr, parser = parser.rewrite_handler_expression(callee, effect_name, handler_name, captures)
@@ -614,10 +692,9 @@ extend Parser:
                     Expr.Field(effect_head, operation_name, operation_line):
                         if parser.handler_effect_head_matches(effect_head, parser.active_effect_name, token.start.usize()) and parser.handler_declares_operation(parser.active_handler_name, operation_name):
                             active_handler: sview = parser.active_handler_name
-                            generated_name: sview = parser.handler_operation_name(active_handler, operation_name)
                             # A zero-line position distinguishes this compiler-generated
                             # direct callee from a source reference to the reserved name.
-                            rewritten_active <- Ast::Expr.Ident(generated_name, Ast::pos_at_line(0))
+                            rewritten_active <- parser.handler_operation_callee(active_handler, operation_name, Ast::pos_at_line(0))
                             rewritten_arguments: mutable darray[Ast::Expr] = []
                             rewritten_names: mutable darray[sview] = []
                             handler_argument_index: mutable usize = parser.active_handler_argument_start
@@ -635,8 +712,7 @@ extend Parser:
                     Expr.Scope(effect_head, operation_name, operation_line):
                         if parser.handler_effect_head_matches(effect_head, parser.active_effect_name, token.start.usize()) and parser.handler_declares_operation(parser.active_handler_name, operation_name):
                             active_handler_scope: sview = parser.active_handler_name
-                            generated_name_scope: sview = parser.handler_operation_name(active_handler_scope, operation_name)
-                            rewritten_active <- Ast::Expr.Ident(generated_name_scope, Ast::pos_at_line(0))
+                            rewritten_active <- parser.handler_operation_callee(active_handler_scope, operation_name, Ast::pos_at_line(0))
                             rewritten_arguments_scope: mutable darray[Ast::Expr] = []
                             rewritten_names_scope: mutable darray[sview] = []
                             handler_argument_index_scope: mutable usize = parser.active_handler_argument_start

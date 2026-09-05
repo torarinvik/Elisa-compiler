@@ -1,0 +1,592 @@
+# Stage1 parser — compile-time specialization of effect-polymorphic helpers.
+#
+# A function that declares an abstract effect row is a template, not a function carrying a
+# runtime handler value. At each statically known `can Effect with Handler` installation we
+# make one ordinary clone, prepend the handler captures as ABI parameters, and rewrite the
+# clone's abstract operations to the handler's hidden direct functions. Calls inside the
+# installation are then redirected to that clone. The original template is retained for
+# diagnostics/metadata and filtered from backend emission.
+
+extend Parser:
+    private:
+        def effect_install_parent(parser: Parser&, line: u32) -> u32:
+            for index in 0..<parser.effect_install_lines.count:
+                return parser.effect_install_parents[index] if parser.effect_install_lines[index] == line
+            return 0
+
+        def effect_environment_covers(parser: Parser&, effect_ref: sview, installation: u32) -> bool:
+            current: mutable u32 = installation
+            while current != 0 |current, parser, effect_ref|:
+                return true if effect_template_row_matches(effect_ref, parser.effect_install_effect_at(current))
+                current <- parser.effect_install_parent(current)
+            return false
+
+        def effect_environment_arguments(parser: Parser&, installation: u32) -> darray[Ast::Expr]:
+            result: mutable darray[Ast::Expr] = []
+            current: mutable u32 = installation
+            while current != 0 |current, result, parser|:
+                result.extend(parser.effect_install_captures_at(current))
+                current <- parser.effect_install_parent(current)
+            return result
+
+        def effect_ref_has_bracket(effect_ref: sview) -> bool:
+            for index in 0..<sview_len(effect_ref) |effect_ref|:
+                return true if sview_at(effect_ref, index) == 91
+            return false
+
+        # Bare abstract rows are family-polymorphic (`can[Tick]` can be satisfied by a
+        # `Tick` installation), while an explicitly specialized row must agree with the
+        # installation's specialization. Qualified rows retain namespace identity when both
+        # sides spell it; a bare row remains the ergonomic family-level form.
+        def effect_template_row_matches(template_ref: sview, installed_ref: sview) -> bool:
+            template_abstract: sview = handler_effect_abstract(template_ref)
+            installed_abstract: sview = handler_effect_abstract(installed_ref)
+            if handler_effect_ref_has_namespace(template_abstract) and handler_effect_ref_has_namespace(installed_abstract):
+                return handler_effect_ref_equal(template_abstract, installed_abstract)
+            if effect_ref_has_bracket(template_abstract) or effect_ref_has_bracket(installed_abstract):
+                return handler_effect_ref_equal(template_abstract, installed_abstract)
+            return handler_effect_family(template_abstract) == handler_effect_family(installed_abstract)
+
+        def effect_template_row_is_abstract(parser: Parser&, effect_ref: sview) -> bool:
+            family: sview = handler_effect_family(effect_ref)
+            return any annotation in parser.enum_annotations where annotation.owner == "__effect_decl" and annotation.name == family
+
+        def effect_template_callee_name(callee: Ast::Expr) -> sview:
+            match callee:
+                Expr.Ident(callee_name, callee_pos):
+                    return callee_name
+                Expr.Scope(scope_head, scoped_callee_name, scoped_callee_pos):
+                    # Module qualification is resolved by the ordinary symbol table. The
+                    # static effect pass only needs the terminal declaration name to select
+                    # its already-unique clone; the clone itself is emitted at file scope.
+                    return scoped_callee_name
+                Expr.Index(base, argument, position):
+                    return effect_template_callee_name(base)
+                Expr.IndexN(base, arguments, position):
+                    return effect_template_callee_name(base)
+                _:
+                    return ""
+
+        def effect_template_callee_owner(callee: Ast::Expr, lexical_owner: sview) -> sview:
+            match callee:
+                Expr.Scope(head, name, position):
+                    if head is Expr.Ident(owner, owner_pos):
+                        return owner
+                    return "__unresolved_effect_owner"
+                Expr.Index(base, argument, position):
+                    return effect_template_callee_owner(base, lexical_owner)
+                Expr.IndexN(base, arguments, position):
+                    return effect_template_callee_owner(base, lexical_owner)
+                _:
+                    return lexical_owner
+
+        def effect_specialized_callee(callee: Ast::Expr, name: sview) -> Ast::Expr:
+            match callee:
+                Expr.Index(base, argument, position):
+                    return Expr.Index(Expr.Ident(name, Ast::pos_at_line(0)), argument, position)
+                Expr.IndexN(base, arguments, position):
+                    return Expr.IndexN(Expr.Ident(name, Ast::pos_at_line(0)), arguments, position)
+                _:
+                    return Expr.Ident(name, Ast::pos_at_line(0))
+
+        # A declared abstract row alone does not make a function a template. A helper may
+        # carry an abstract permission in its contract while doing no abstract dispatch at
+        # all (for example a grant-only wrapper that just returns). Only bodies which contain
+        # an abstract operation call, or call another abstract-effect helper, need cloning.
+        def effect_function_has_abstract_row(parser: Parser&, effects: darray[sview]) -> bool:
+            for effect_ref in effects:
+                return true if parser.effect_template_row_is_abstract(effect_ref)
+            return false
+
+        def effect_callee_is_abstract_helper(parser: Parser&, declarations: darray[Ast::Decl]&, callee: Ast::Expr) -> bool:
+            match callee:
+                Expr.Index(base, argument, position):
+                    return parser.effect_callee_is_abstract_helper(declarations, base)
+                Expr.IndexN(base, arguments, position):
+                    return parser.effect_callee_is_abstract_helper(declarations, base)
+                Expr.Scope(owner_expression, member_name, position):
+                    if owner_expression is Expr.Ident(owner_name, owner_position):
+                        for declaration in declarations:
+                            if declaration is Decl.Module(module_name, module_body, module_position):
+                                if module_name == owner_name:
+                                    return parser.effect_callee_is_abstract_helper(module_body, Expr.Ident(member_name, position))
+                            elif declaration is Decl.Scoped(scoped_body, scoped_position):
+                                return true if parser.effect_callee_is_abstract_helper(scoped_body, callee)
+                Expr.Ident(callee_name, callee_pos):
+                    for declaration in declarations:
+                        if declaration is Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            return true if function_name == callee_name and parser.effect_function_has_abstract_row(effects)
+                        elif declaration is Decl.Scoped(scoped_body, scoped_position):
+                            return true if parser.effect_callee_is_abstract_helper(scoped_body, callee)
+                _:
+                    pass
+            return false
+
+        def effect_expression_depends_on_abstract(parser: Parser&, expression: Ast::Expr, declared_effects: darray[sview], declarations: darray[Ast::Decl]&) -> bool:
+            match expression:
+                Expr.Call(callee, arguments, argument_names, call_pos):
+                    if callee is Expr.Field(operation_head, operation_name, operation_pos):
+                        for effect_ref in declared_effects:
+                            return true if parser.effect_template_row_is_abstract(effect_ref) and handler_effect_head_family(operation_head) == handler_effect_family(effect_ref)
+                    if callee is Expr.Scope(operation_head_scope, operation_name_scope, operation_scope_pos):
+                        for effect_ref_scope in declared_effects:
+                            return true if parser.effect_template_row_is_abstract(effect_ref_scope) and handler_effect_head_family(operation_head_scope) == handler_effect_family(effect_ref_scope)
+                    return true if parser.effect_callee_is_abstract_helper(declarations, callee)
+                    return true if parser.effect_expression_depends_on_abstract(callee, declared_effects, declarations)
+                    for argument in arguments:
+                        return true if parser.effect_expression_depends_on_abstract(argument, declared_effects, declarations)
+                    return false
+                Expr.Field(object, field, field_pos):
+                    return parser.effect_expression_depends_on_abstract(object, declared_effects, declarations)
+                Expr.Scope(object_scope, field_scope, field_scope_pos):
+                    return parser.effect_expression_depends_on_abstract(object_scope, declared_effects, declarations)
+                Expr.Index(object_index, index, index_pos):
+                    return parser.effect_expression_depends_on_abstract(object_index, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(index, declared_effects, declarations)
+                Expr.Slice(object_slice, low, high, slice_pos):
+                    return parser.effect_expression_depends_on_abstract(object_slice, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(low, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(high, declared_effects, declarations)
+                Expr.IndexN(object_index_n, arguments_index_n, index_n_pos):
+                    return true if parser.effect_expression_depends_on_abstract(object_index_n, declared_effects, declarations)
+                    for argument_index_n in arguments_index_n:
+                        return true if parser.effect_expression_depends_on_abstract(argument_index_n, declared_effects, declarations)
+                    return false
+                Expr.Binary(left, operator, right, binary_pos):
+                    return parser.effect_expression_depends_on_abstract(left, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(right, declared_effects, declarations)
+                Expr.Unary(operator_unary, operand, unary_pos):
+                    return parser.effect_expression_depends_on_abstract(operand, declared_effects, declarations)
+                Expr.Move(operand_move, move_pos):
+                    return parser.effect_expression_depends_on_abstract(operand_move, declared_effects, declarations)
+                Expr.RegionNew(operand_new, region, new_pos):
+                    return parser.effect_expression_depends_on_abstract(operand_new, declared_effects, declarations)
+                Expr.Paren(inner, paren_pos):
+                    return parser.effect_expression_depends_on_abstract(inner, declared_effects, declarations)
+                Expr.Array(elements, array_pos):
+                    for element in elements:
+                        return true if parser.effect_expression_depends_on_abstract(element, declared_effects, declarations)
+                    return false
+                Expr.Tuple(elements_tuple, tuple_pos):
+                    for element_tuple in elements_tuple:
+                        return true if parser.effect_expression_depends_on_abstract(element_tuple, declared_effects, declarations)
+                    return false
+                Expr.SetLit(elements_set, set_pos):
+                    for element_set in elements_set:
+                        return true if parser.effect_expression_depends_on_abstract(element_set, declared_effects, declarations)
+                    return false
+                Expr.DictLit(entries, dict_pos):
+                    for entry in entries:
+                        return true if parser.effect_expression_depends_on_abstract(entry.key, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(entry.value, declared_effects, declarations)
+                    return false
+                Expr.Construct(type_expression, fields, construct_pos):
+                    return true if parser.effect_expression_depends_on_abstract(type_expression, declared_effects, declarations)
+                    for field in fields:
+                        return true if parser.effect_expression_depends_on_abstract(field.value, declared_effects, declarations)
+                    return false
+                Expr.RecordUpdate(base, fields_update, update_pos):
+                    return true if parser.effect_expression_depends_on_abstract(base, declared_effects, declarations)
+                    for field_update in fields_update:
+                        return true if parser.effect_expression_depends_on_abstract(field_update.value, declared_effects, declarations)
+                    return false
+                Expr.If(condition, then_expression, else_expression, if_pos):
+                    return parser.effect_expression_depends_on_abstract(condition, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(then_expression, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(else_expression, declared_effects, declarations)
+                Expr.Match(scrutinee, arms, match_pos):
+                    return true if parser.effect_expression_depends_on_abstract(scrutinee, declared_effects, declarations)
+                    for arm in arms:
+                        return true if parser.effect_expression_depends_on_abstract(arm.guard, declared_effects, declarations) or parser.effect_statements_depend_on_abstract(arm.body, declared_effects, declarations)
+                    return false
+                Expr.Catch(guarded, arms_catch, catch_pos):
+                    return true if parser.effect_expression_depends_on_abstract(guarded, declared_effects, declarations)
+                    for arm_catch in arms_catch:
+                        return true if parser.effect_expression_depends_on_abstract(arm_catch.guard, declared_effects, declarations) or parser.effect_statements_depend_on_abstract(arm_catch.body, declared_effects, declarations)
+                    return false
+                Expr.Comprehension(variable, iterable, condition_comp, body_comp, comprehension_pos):
+                    return parser.effect_expression_depends_on_abstract(iterable, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(condition_comp, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(body_comp, declared_effects, declarations)
+                Expr.Refinement(base_refinement, predicate, refinement_pos):
+                    return parser.effect_expression_depends_on_abstract(base_refinement, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(predicate, declared_effects, declarations)
+                Expr.GetElse(guarded_get, recovery, get_pos):
+                    return parser.effect_expression_depends_on_abstract(guarded_get, declared_effects, declarations) or parser.effect_statements_depend_on_abstract(recovery, declared_effects, declarations)
+                Expr.Lambda(parameters_lambda, body_lambda, lambda_pos):
+                    return parser.effect_statements_depend_on_abstract(body_lambda, declared_effects, declarations)
+                Expr.Block(statements_block, value, captures, block_pos):
+                    return parser.effect_statements_depend_on_abstract(statements_block, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(value, declared_effects, declarations)
+                _:
+                    return false
+
+        def effect_statements_depend_on_abstract(parser: Parser&, statements: darray[Ast::Stmt], declared_effects: darray[sview], declarations: darray[Ast::Decl]&) -> bool:
+            for statement in statements:
+                match statement:
+                    Stmt.Expr(expression, statement_pos):
+                        return true if parser.effect_expression_depends_on_abstract(expression, declared_effects, declarations)
+                    Stmt.VarDecl(name, type_expression, value, statement_pos):
+                        return true if parser.effect_expression_depends_on_abstract(type_expression, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(value, declared_effects, declarations)
+                    Stmt.Assign(target, operator, value_assign, statement_pos):
+                        return true if parser.effect_expression_depends_on_abstract(target, declared_effects, declarations) or parser.effect_expression_depends_on_abstract(value_assign, declared_effects, declarations)
+                    Stmt.If(condition, then_body, else_body, statement_pos):
+                        return true if parser.effect_expression_depends_on_abstract(condition, declared_effects, declarations) or parser.effect_statements_depend_on_abstract(then_body, declared_effects, declarations) or parser.effect_statements_depend_on_abstract(else_body, declared_effects, declarations)
+                    Stmt.While(condition_while, body_while, statement_while):
+                        return true if parser.effect_expression_depends_on_abstract(condition_while, declared_effects, declarations) or parser.effect_statements_depend_on_abstract(body_while, declared_effects, declarations)
+                    Stmt.For(bind, variables, iterable, body_for, statement_for):
+                        return true if parser.effect_expression_depends_on_abstract(iterable, declared_effects, declarations) or parser.effect_statements_depend_on_abstract(body_for, declared_effects, declarations)
+                    Stmt.Block(kind, clause, binding, body_block, statement_block):
+                        return true if parser.effect_statements_depend_on_abstract(body_block, declared_effects, declarations)
+                    Stmt.Return(value_return, statement_return):
+                        if value_return is returned_expression:
+                            return true if parser.effect_expression_depends_on_abstract(returned_expression, declared_effects, declarations)
+                    Stmt.Match(scrutinee, arms_match, statement_match):
+                        return true if parser.effect_expression_depends_on_abstract(scrutinee, declared_effects, declarations)
+                        for arm_match in arms_match:
+                            return true if parser.effect_expression_depends_on_abstract(arm_match.guard, declared_effects, declarations) or parser.effect_statements_depend_on_abstract(arm_match.body, declared_effects, declarations)
+                    Stmt.Contract(kind_contract, expression_contract, statement_contract):
+                        return true if parser.effect_expression_depends_on_abstract(expression_contract, declared_effects, declarations)
+                    _:
+                        pass
+            return false
+
+        def mark_effect_templates(parser: lmut Parser, declarations: darray[Ast::Decl]&) -> void:
+            for declaration in declarations |parser|:
+                if declaration is Decl.Module(module_name, module_body, module_pos):
+                    parser <- parser.mark_effect_templates(module_body)
+                elif declaration is Decl.Scoped(scoped_body, scoped_pos):
+                    parser <- parser.mark_effect_templates(scoped_body)
+                elif declaration is Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                    has_abstract_effect: mutable bool = false
+                    for effect_ref in effects |parser, has_abstract_effect|:
+                        has_abstract_effect <- true if parser.effect_template_row_is_abstract(effect_ref)
+                    depends_on_abstract: bool = parser.effect_statements_depend_on_abstract(body, effects, declarations) if has_abstract_effect else false
+                    if depends_on_abstract:
+                        if not (any annotation in parser.enum_annotations where annotation.owner == "__effect_template" and annotation.name == function_name and annotation.line == line.line):
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__effect_template", name: function_name, line: line.line})
+                        # Keep the helper's abstract requirements available to semantic
+                        # checking. A helper can have a clone for one installation and still
+                        # be called directly elsewhere in the same file.
+                        for effect_ref in effects |parser, function_name|:
+                            if parser.effect_template_row_is_abstract(effect_ref) and not (any annotation in parser.enum_annotations where annotation.owner == function_name and annotation.line == 3900000100 and annotation.name == handler_effect_abstract(effect_ref)):
+                                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: handler_effect_abstract(effect_ref), line: 3900000100})
+
+        def effect_install_effect_at(parser: Parser&, line: u32) -> sview:
+            for annotation in parser.enum_annotations:
+                return annotation.name if annotation.owner == "__effect_install_effect" and annotation.line == line
+            return ""
+
+        def effect_install_handler_at(parser: Parser&, line: u32) -> sview:
+            for annotation in parser.enum_annotations:
+                return annotation.name if annotation.owner == "__effect_install" and annotation.line == line
+            return ""
+
+        def effect_install_effect_identity_at(parser: Parser&, line: u32) -> u32:
+            for annotation in parser.enum_annotations:
+                return annotation.identity_id if annotation.owner == "__effect_install_effect" and annotation.line == line
+            return 0
+
+        def effect_install_handler_identity_at(parser: Parser&, line: u32) -> u32:
+            for annotation in parser.enum_annotations:
+                return annotation.identity_id if annotation.owner == "__effect_install" and annotation.line == line
+            return 0
+
+        def effect_install_captures_at(parser: Parser&, line: u32) -> darray[Ast::Expr]:
+            captures: mutable darray[Ast::Expr] = []
+            for annotation in parser.enum_annotations |captures|:
+                captures.push(Ast::Expr.Ident(annotation.name, Ast::pos_at_line(0))) if annotation.owner == "__effect_install_capture" and annotation.line == line
+            return captures
+
+        def effect_clone_capture_name[@r](parser: mutable Parser& @r, handler_name: sview, source_line: u32, capture_index: usize) -> sview:
+            parser.handler_name_storage.reserve(parser.tokens.count * 128) if parser.handler_name_storage.count == 0
+            start: usize = parser.handler_name_storage.count
+            append_handler_name_text(parser.handler_name_storage, "__effect_capture__")
+            append_handler_name_text(parser.handler_name_storage, handler_name)
+            append_handler_name_text(parser.handler_name_storage, "__")
+            append_handler_capture_number(parser.handler_name_storage, source_line.usize())
+            append_handler_name_text(parser.handler_name_storage, "__")
+            append_handler_capture_number(parser.handler_name_storage, capture_index)
+            return sview(&parser.handler_name_storage[start], 0, parser.handler_name_storage.count - start)
+
+        def effect_clone_name[@r](parser: mutable Parser& @r, source_name: sview, handler_name: sview, source_line: u32) -> sview:
+            parser.handler_name_storage.reserve(parser.tokens.count * 128) if parser.handler_name_storage.count == 0
+            start: usize = parser.handler_name_storage.count
+            append_handler_name_text(parser.handler_name_storage, "__effect__")
+            append_handler_name_text(parser.handler_name_storage, source_name)
+            append_handler_name_text(parser.handler_name_storage, "__")
+            append_handler_name_text(parser.handler_name_storage, handler_name)
+            append_handler_name_text(parser.handler_name_storage, "__")
+            append_handler_capture_number(parser.handler_name_storage, source_line.usize())
+            append_handler_name_text(parser.handler_name_storage, "__at_")
+            append_handler_capture_number(parser.handler_name_storage, parser.effect_active_install.usize())
+            return sview(&parser.handler_name_storage[start], 0, parser.handler_name_storage.count - start)
+
+        def effect_clone_for_call(parser: Parser&, source_name: sview, argument_count: usize, effect_ref: sview, handler_name: sview, source_owner: sview) -> sview:
+            selected: mutable sview = ""
+            for clone_index in 0..<parser.effect_clone_names.count |parser, source_name, argument_count, effect_ref, handler_name|:
+                continue if parser.effect_clone_sources[clone_index] != source_name
+                continue if parser.effect_clone_owners[clone_index] != source_owner
+                continue if parser.effect_clone_install_lines[clone_index] != parser.effect_active_install
+                continue if argument_count > parser.effect_clone_param_counts[clone_index] or argument_count < parser.effect_clone_required_counts[clone_index]
+                if parser.effect_active_install != 0:
+                    return "" if selected != ""
+                    selected <- parser.effect_clone_names[clone_index]
+            return selected
+
+        def effect_template_decl_at(declarations: darray[Ast::Decl]&, source_name: sview, source_line: u32) -> Ast::Decl?:
+            for declaration in declarations:
+                if declaration is Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                    return declaration if function_name == source_name and line.line == source_line
+                if declaration is Decl.Module(module_name, module_body, module_pos):
+                    if effect_template_decl_at(module_body, source_name, source_line) is nested_decl:
+                        return nested_decl
+                if declaration is Decl.Scoped(scoped_body, scoped_pos):
+                    if effect_template_decl_at(scoped_body, source_name, source_line) is nested_scope_decl:
+                        return nested_scope_decl
+            return null
+
+        # Search nested module/impl declaration bodies while registering one installation.
+        # Handler clones remain file-scope ordinary functions, which keeps their generated
+        # names independent of the source module and lets a qualified call redirect to the
+        # same direct ABI symbol.
+        def effect_register_clone_in_declarations(parser: lmut Parser, declarations: darray[Ast::Decl]&, effect_ref: sview, handler_name: sview, source_owner: sview) -> void:
+            for declaration in declarations |parser, effect_ref, handler_name|:
+                if declaration is Decl.Func(source_name, source_params, source_return, source_body, source_effects, source_decorators, source_line):
+                    continue if not (any template_annotation in parser.enum_annotations where template_annotation.owner == "__effect_template" and template_annotation.name == source_name and template_annotation.line == source_line.line)
+                    environment_complete: mutable bool = true
+                    for required_effect in source_effects |parser, environment_complete|:
+                        environment_complete <- false if parser.effect_template_row_is_abstract(required_effect) and not parser.effect_environment_may_cover(required_effect, parser.effect_active_install, source_line.line)
+                    continue if not environment_complete
+                    for template_effect in source_effects |parser, source_name, source_line, handler_name, effect_ref, source_params|:
+                        if parser.effect_template_row_is_abstract(template_effect):
+                            required_count: mutable usize = source_params.count
+                            while required_count > 0.usize() and source_params[required_count - 1.usize()].has_default |required_count, source_params|:
+                                required_count <- required_count - 1.usize()
+                            parser <- parser.effect_register_clone(source_name, source_line.line, handler_name, effect_ref, source_params.count, source_owner, required_count)
+                            break
+                elif declaration is Decl.Module(module_name, module_body, module_pos):
+                    parser <- parser.effect_register_clone_in_declarations(module_body, effect_ref, handler_name, module_name)
+                elif declaration is Decl.Scoped(scoped_body, scoped_pos):
+                    parser <- parser.effect_register_clone_in_declarations(scoped_body, effect_ref, handler_name, source_owner)
+
+        def effect_register_clone(parser: lmut Parser, source_name: sview, source_line: u32, handler_name: sview, effect_ref: sview, parameter_count: usize, source_owner: sview, required_count: usize) -> void:
+            for clone_index in 0..<parser.effect_clone_names.count |parser, source_name, source_line, handler_name, effect_ref, parameter_count|:
+                continue if parser.effect_clone_install_lines[clone_index] != parser.effect_active_install
+                continue if parser.effect_clone_sources[clone_index] != source_name or parser.effect_clone_source_lines[clone_index] != source_line or parser.effect_clone_handlers[clone_index] != handler_name or parser.effect_clone_param_counts[clone_index] != parameter_count
+                return if effect_template_row_matches(parser.effect_clone_effects[clone_index], effect_ref)
+            clone_name: sview = parser.effect_clone_name(source_name, handler_name, source_line)
+            parser.effect_clone_sources <- parser.effect_clone_sources.push(source_name)
+            parser.effect_clone_source_lines <- parser.effect_clone_source_lines.push(source_line)
+            parser.effect_clone_handlers <- parser.effect_clone_handlers.push(handler_name)
+            parser.effect_clone_effects <- parser.effect_clone_effects.push(effect_ref)
+            parser.effect_clone_names <- parser.effect_clone_names.push(clone_name)
+            parser.effect_clone_param_counts <- parser.effect_clone_param_counts.push(parameter_count)
+            parser.effect_clone_required_counts <- parser.effect_clone_required_counts.push(required_count)
+            parser.effect_clone_install_lines <- parser.effect_clone_install_lines.push(parser.effect_active_install)
+            parser.effect_clone_owners <- parser.effect_clone_owners.push(source_owner)
+            # Semantic validation may skip the abstract source body only when at least one
+            # concrete clone exists. Without this marker an uninstalled helper would be
+            # skipped as a template and fail later as an opaque backend decline.
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__effect_clone", name: source_name, line: source_line})
+            # Generic clones are themselves backend templates. Keep their concrete emitted name
+            # in a separate marker: the ordinary clone marker deliberately points back to the
+            # source helper so semantic checking can decide whether that source body is installed.
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__effect_clone_name", name: clone_name, line: source_line})
+
+        # Register every source-template/installation pair before creating any clone body.
+        # That makes helper-to-helper calls inside a clone resolve in the same pass, including
+        # recursive helpers, without a runtime dispatch fallback.
+        def effect_register_clones(parser: lmut Parser, declarations: darray[Ast::Decl]&) -> void:
+            for install_annotation in parser.enum_annotations |parser, declarations|:
+                continue if install_annotation.owner != "__effect_install"
+                effect_ref: sview = parser.effect_install_effect_at(install_annotation.line)
+                continue if effect_ref == ""
+                handler_name: sview = install_annotation.name
+                parser.effect_active_install <- install_annotation.line
+                parser <- parser.effect_register_clone_in_declarations(declarations, effect_ref, handler_name, "")
+            parser.effect_active_install <- 0
+
+        # Build the explicit capture ABI of a clone. The captures are new formal parameters;
+        # the source installation's capture locals are passed at each redirected call site.
+        def effect_clone_capture_abi(parser: lmut Parser, handler_name: sview, source_line: u32, parameters: mutable darray[Ast::ParamDecl]&, expressions: mutable darray[Ast::Expr]&) -> void:
+            capture_index: mutable usize = 0
+            for owner_index in 0..<parser.handler_capture_owners.count |parser, owner_index, capture_index, handler_name, source_line, parameters, expressions|:
+                continue if parser.handler_capture_owners[owner_index] != handler_name
+                capture: Ast::ParamDecl = parser.handler_capture_params[owner_index]
+                formal_name: sview = parser.effect_clone_capture_name(handler_name, source_line, capture_index)
+                parameters.push(Ast::ParamDecl{name: formal_name, type_expression: capture.type_expression, is_mutable: capture.is_mutable, has_default: false, default_value: (Ast::Expr.Invalid), is_affine: capture.is_affine})
+                expressions.push(Ast::Expr.Ident(formal_name, Ast::pos_at_line(0)))
+                capture_index <- capture_index + 1.usize()
+
+        # Collect the bare function names visible from a module-local source helper. This is a
+        # deliberately narrow lexical fact: only declarations in that module are qualified, so
+        # local variables and unrelated top-level functions retain ordinary name resolution.
+        def effect_collect_owner_function_names(parser: Parser&, declarations: darray[Ast::Decl]&, target_owner: sview, names: mutable darray[sview]&) -> void:
+            for declaration in declarations |names, target_owner|:
+                if declaration is Decl.Module(module_name, module_body, module_pos):
+                    if module_name == target_owner:
+                        for nested in module_body |names|:
+                            if nested is Decl.Func(nested_name, nested_params, nested_return, nested_body, nested_effects, nested_decorators, nested_line):
+                                names.push(nested_name)
+                    else:
+                        parser.effect_collect_owner_function_names(module_body, target_owner, names)
+                elif declaration is Decl.Scoped(scoped_body, scoped_pos):
+                    parser.effect_collect_owner_function_names(scoped_body, target_owner, names)
+
+        def effect_build_clone(parser: lmut Parser, declarations: darray[Ast::Decl]&, clone_index: usize) -> Ast::Decl?:
+            source_name: sview = parser.effect_clone_sources[clone_index]
+            source_line_number: u32 = parser.effect_clone_source_lines[clone_index]
+            clone_effect: sview = parser.effect_clone_effects[clone_index]
+            clone_handler: sview = parser.effect_clone_handlers[clone_index]
+            clone_name: sview = parser.effect_clone_names[clone_index]
+            clone_owner: sview = parser.effect_clone_owners[clone_index] if clone_index < parser.effect_clone_owners.count else ""
+            source: Ast::Decl? = effect_template_decl_at(declarations, source_name, source_line_number)
+            if source is source_decl:
+                if source_decl is Decl.Func(source_name, source_params, source_return, source_body, source_effects, source_decorators, source_line):
+                    clone_parameters: mutable darray[Ast::ParamDecl] = []
+                    clone_captures: mutable darray[Ast::Expr] = []
+                    parser.effect_active_install <- parser.effect_clone_install_lines[clone_index]
+                    parser.effect_clone_source_line <- source_line.line
+                    capture_install: mutable u32 = parser.effect_active_install
+                    while capture_install != 0 |parser, capture_install, clone_parameters, clone_captures|:
+                        capture_handler: sview = parser.effect_install_handler_at(capture_install)
+                        parser <- parser.effect_clone_capture_abi(capture_handler, capture_install, clone_parameters, clone_captures)
+                        capture_install <- parser.effect_install_parent(capture_install)
+                    clone_parameters.extend(source_params)
+                    parser.effect_clone_active_owner <- clone_owner
+                    parser.effect_clone_visible_names <- parser.effect_clone_visible_names.truncate(0)
+                    parser <- parser.effect_collect_owner_function_names(declarations, clone_owner, parser.effect_clone_visible_names)
+                    parser.effect_context_arguments <- parser.effect_context_arguments.truncate(0)
+                    for capture in clone_captures |parser|:
+                        parser.effect_context_arguments <- parser.effect_context_arguments.push(capture)
+                    clone_body: mutable darray[Ast::Stmt] = source_body
+                    current_install: mutable u32 = parser.effect_active_install
+                    capture_offset: mutable usize = 0
+                    while current_install != 0 |parser, current_install, capture_offset, clone_body, clone_captures|:
+                        current_handler: sview = parser.effect_install_handler_at(current_install)
+                        current_effect: sview = parser.effect_install_effect_at(current_install)
+                        current_arguments: mutable darray[Ast::Expr] = []
+                        for capture_owner in parser.handler_capture_owners |capture_offset, current_arguments, clone_captures, current_handler|:
+                            if capture_owner == current_handler:
+                                current_arguments.push(clone_captures[capture_offset])
+                                capture_offset <- capture_offset + 1.usize()
+                        rebind rewritten_body: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(clone_body, current_effect, current_handler, current_arguments)
+                        clone_body <- rewritten_body
+                        current_install <- parser.effect_install_parent(current_install)
+                    parser.effect_clone_active_owner <- ""
+                    parser.effect_clone_visible_names <- parser.effect_clone_visible_names.truncate(0)
+                    residual_effects: mutable darray[sview] = []
+                    for source_effect in source_effects |residual_effects, clone_effect|:
+                        residual_effects.push(source_effect) if not parser.effect_template_row_is_abstract(source_effect)
+                        realization: sview = handler_effect_via(source_effect)
+                        residual_effects.push(realization) if realization != ""
+                    for handler_annotation in parser.enum_annotations |residual_effects, clone_handler, parser|:
+                        permission_install: mutable u32 = parser.effect_active_install
+                        installed_owner: mutable bool = false
+                        while permission_install != 0 |parser, permission_install, installed_owner, handler_annotation|:
+                            installed_owner <- true if parser.effect_install_handler_at(permission_install) == handler_annotation.owner
+                            permission_install <- parser.effect_install_parent(permission_install)
+                        continue if not installed_owner
+                        if handler_annotation.line == 3900000087:
+                            residual_effects.push(handler_annotation.name) if not parser.effect_template_row_is_abstract(handler_annotation.name)
+                        if handler_annotation.line == 3900000084 or handler_annotation.line == 3900000095:
+                            target_effect: sview = handler_effect_via(handler_annotation.name)
+                            residual_effects.push(target_effect) if target_effect != ""
+                    parser.effect_active_install <- 0
+                    parser.effect_clone_source_line <- 0
+                    parser.effect_context_arguments <- parser.effect_context_arguments.truncate(0)
+                    return (Decl.Func(clone_name, clone_parameters, source_return, clone_body, residual_effects, source_decorators, source_line))
+            return null
+
+        def effect_build_clones(parser: lmut Parser, declarations: darray[Ast::Decl]&) -> darray[Ast::Decl]:
+            clones: mutable darray[Ast::Decl] = []
+            for clone_index in 0..<parser.effect_clone_names.count |parser, clone_index, declarations, clones|:
+                rebind clone_opt: Ast::Decl?, parser = parser.effect_build_clone(declarations, clone_index)
+                clones.push(clone) if clone_opt is clone
+            return clones
+
+        # The ordinary handler rewrite already walks every expression and statement shape.
+        # Reuse it for an installation body so helper calls in branches, loops, matches, and
+        # value blocks receive the same direct-clone treatment as a top-level call.
+        def effect_specialize_install_statements(parser: lmut Parser, statements: darray[Ast::Stmt]) -> darray[Ast::Stmt]:
+            rewritten: mutable darray[Ast::Stmt] = []
+            for statement in statements |rewritten, parser|:
+                match statement:
+                    Stmt.Block(kind, clause, binding, body, position):
+                        effect_ref: sview = parser.effect_install_effect_at(position.line)
+                        handler_name: sview = parser.effect_install_handler_at(position.line) if kind == "can" else ""
+                        if handler_name != "" and effect_ref != "":
+                            actual_captures: darray[Ast::Expr] = parser.effect_install_captures_at(position.line)
+                            rebind inner_body: darray[Ast::Stmt], parser = parser.effect_specialize_install_statements(body)
+                            parser.effect_active_install <- position.line
+                            environment_arguments: darray[Ast::Expr] = parser.effect_environment_arguments(position.line)
+                            parser.effect_context_arguments <- parser.effect_context_arguments.truncate(0)
+                            for argument in environment_arguments |parser|:
+                                parser.effect_context_arguments <- parser.effect_context_arguments.push(argument)
+                            rebind specialized_body: darray[Ast::Stmt], parser = parser.rewrite_handler_statements(inner_body, effect_ref, handler_name, actual_captures)
+                            parser.effect_active_install <- 0
+                            parser.effect_context_arguments <- parser.effect_context_arguments.truncate(0)
+                            rewritten.push(Stmt.Block(kind, clause, binding, specialized_body, position))
+                        else:
+                            rebind nested_body: darray[Ast::Stmt], parser = parser.effect_specialize_install_statements(body)
+                            rewritten.push(Stmt.Block(kind, clause, binding, nested_body, position))
+                    Stmt.If(condition, then_body, else_body, position):
+                        rebind specialized_condition: Ast::Expr, parser = parser.rewrite_handler_expression(condition, "", "", [])
+                        rebind specialized_then: darray[Ast::Stmt], parser = parser.effect_specialize_install_statements(then_body)
+                        rebind specialized_else: darray[Ast::Stmt], parser = parser.effect_specialize_install_statements(else_body)
+                        rewritten.push(Stmt.If(specialized_condition, specialized_then, specialized_else, position))
+                    Stmt.While(condition, body, position):
+                        rebind specialized_condition: Ast::Expr, parser = parser.rewrite_handler_expression(condition, "", "", [])
+                        rebind specialized_body: darray[Ast::Stmt], parser = parser.effect_specialize_install_statements(body)
+                        rewritten.push(Stmt.While(specialized_condition, specialized_body, position))
+                    Stmt.For(binding, variables, iterable, body, position):
+                        rebind specialized_iterable: Ast::Expr, parser = parser.rewrite_handler_expression(iterable, "", "", [])
+                        rebind specialized_body: darray[Ast::Stmt], parser = parser.effect_specialize_install_statements(body)
+                        rewritten.push(Stmt.For(binding, variables, specialized_iterable, specialized_body, position))
+                    Stmt.Match(scrutinee, arms, position):
+                        specialized_arms: mutable darray[Ast::MatchArm] = []
+                        for arm in arms |parser, specialized_arms|:
+                            rebind specialized_guard: Ast::Expr, parser = parser.rewrite_handler_expression(arm.guard, "", "", [])
+                            rebind specialized_arm_body: darray[Ast::Stmt], parser = parser.effect_specialize_install_statements(arm.body)
+                            specialized_arms.push(Ast::MatchArm{pattern: arm.pattern, body: specialized_arm_body, guard: specialized_guard})
+                        rebind specialized_scrutinee: Ast::Expr, parser = parser.rewrite_handler_expression(scrutinee, "", "", [])
+                        rewritten.push(Stmt.Match(specialized_scrutinee, specialized_arms, position))
+                    _:
+                        rewritten.push(statement)
+            return rewritten
+
+        # Rebuild one declaration so nested module/scoped declaration arrays stay owned by the
+        # AST value being returned. Pattern-bound nested darrays are immutable views in Elisa;
+        # attempting to pass them to the in-place list mutator would either fail to compile or
+        # require an unsafe escape from the parser's temporary region.
+        def effect_specialize_declaration(parser: lmut Parser, declaration: Ast::Decl) -> Ast::Decl:
+            match declaration:
+                Decl.Module(module_name, module_body, module_pos):
+                    saved_owner: sview = parser.effect_clone_active_owner
+                    saved_visible_count: usize = parser.effect_clone_visible_names.count
+                    parser.effect_clone_active_owner <- module_name
+                    for member in module_body |parser|:
+                        if member is Decl.Func(member_name, member_parameters, member_return, member_body, member_effects, member_decorators, member_position):
+                            parser.effect_clone_visible_names <- parser.effect_clone_visible_names.push(member_name)
+                    specialized_module: mutable darray[Ast::Decl] = []
+                    for nested in module_body |parser, specialized_module|:
+                        rebind specialized_nested: Ast::Decl, parser = parser.effect_specialize_declaration(nested)
+                        specialized_module.push(specialized_nested)
+                    parser.effect_clone_active_owner <- saved_owner
+                    parser.effect_clone_visible_names <- parser.effect_clone_visible_names.truncate(saved_visible_count)
+                    return Decl.Module(module_name, specialized_module, module_pos)
+                Decl.Scoped(scoped_body, scoped_pos):
+                    specialized_scope: mutable darray[Ast::Decl] = []
+                    for nested_scope in scoped_body |parser, specialized_scope|:
+                        rebind specialized_nested_scope: Ast::Decl, parser = parser.effect_specialize_declaration(nested_scope)
+                        specialized_scope.push(specialized_nested_scope)
+                    return Decl.Scoped(specialized_scope, scoped_pos)
+                Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                    rebind specialized_body: darray[Ast::Stmt], parser = parser.effect_specialize_install_statements(body)
+                    return Decl.Func(function_name, parameters, return_type, specialized_body, effects, decorators, line)
+                _:
+                    return declaration
+
+        def effect_specialize_declarations(parser: lmut Parser, declarations: mutable darray[Ast::Decl]&) -> void:
+            for declaration_index in 0..<declarations.count |parser, declarations|:
+                rebind specialized_declaration: Ast::Decl, parser = parser.effect_specialize_declaration(declarations[declaration_index])
+                declarations[declaration_index] <- specialized_declaration
+
+        # One post-parse transaction keeps the order explicit: discover templates, register
+        # the complete clone set, build clones, then redirect calls in ordinary functions.
+        def specialize_effect_templates(parser: lmut Parser, declarations: mutable darray[Ast::Decl]&) -> void:
+            parser <- parser.mark_effect_templates(declarations)
+            parser <- parser.effect_register_clones(declarations)
+            rebind clones: darray[Ast::Decl], parser = parser.effect_build_clones(declarations)
+            parser <- parser.effect_specialize_declarations(declarations)
+            declarations.extend(clones)
