@@ -54,12 +54,11 @@ library's runtime object, gated by `test/parity/self_host_runtime_smoke.sh` — 
 fixpoint cannot see, since every generation otherwise links the stage0-built runtime.
 Track with `scripts/self_host_gen2.sh`. Optional stage0 remains a parity oracle only.
 
-Still open, and the reason self-hosting is not yet complete: the product driver runs
-semantic analysis only under `ELISA_STAGE1_SEMANTIC_GATE=1`. With the gate off it emits
-code without analysing, so it accepts programs stage0 rejects. The gate cannot default to
-on until stage1's semantic layer stops OVER-reporting relative to stage0 on the compiler's
-own source (docs/119 E4 "through a call" over reference parameters is the remaining
-cluster). See `src/driver/elisac.elisa` for the current measurements.
+The semantic gate is ON by default: the driver analyses before it emits and refuses
+programs stage0 refuses (`ELISA_STAGE1_NO_SEMANTIC_GATE=1` turns it off for probes). Parity
+is held by `test/parity/run_all.sh --profile full` (~346 checks), which is the only profile
+a commit may rely on; see `IMPLEMENTATION_PLAN.md` (local, gitignored) for what is still
+open and why.
 
 Built **frontend-first**: lexer → parser → name resolution → typecheck → LLVM
 backend.
