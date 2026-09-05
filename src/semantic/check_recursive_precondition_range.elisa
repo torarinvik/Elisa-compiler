@@ -23,13 +23,15 @@ extend Semantic:
                                 match expression:
                                     Expr.Binary(left, operator, right, binary_line):
                                         if ident_name_of(left) == name:
-                                            literal: (found: bool, value: i64) = where_signed_literal(right)
+                                            literal: (found: bool, value: i64) = fold_const_int(right)
                                             if literal.found:
                                                 candidate: mutable i64 = literal.value
                                                 applies: mutable bool = false
                                                 applies <- true if operator == TokenKind.GtEq
                                                 if operator == TokenKind.Gt:
-                                                    candidate <- literal.value + 1
+                                                    successor: (known: bool, value: i64) = linear_add_safe(literal.value, 1)
+                                                    return (false, 0) if not successor.known
+                                                    candidate <- successor.value
                                                     applies <- true
                                                 if applies and (not found or candidate > value):
                                                     found <- true
@@ -42,7 +44,7 @@ extend Semantic:
 
         # Raise a lower bound past a base-case early-exit guard: a top-level `if name == V: <return/raise>`
         # excludes V, so when the current bound equals V the fall-through bound is V+1.
-        def rpr_basecase_bump(body: darray[Ast::Stmt], name: sview, current: i64) -> i64:
+        def rpr_basecase_bump(body: darray[Ast::Stmt], name: sview, current: i64) -> (known: bool, value: i64):
             can Memory.Allocate, Abort.Panic:
                 bumped: mutable i64 = current
                 for statement in body |bumped, name|:
@@ -51,31 +53,37 @@ extend Semantic:
                             match condition:
                                 Expr.Binary(left, operator, right, binary_line):
                                     if operator == TokenKind.EqEq and ident_name_of(left) == name and statements_end_in_return(then_body):
-                                        guard_value: (found: bool, value: i64) = where_signed_literal(right)
-                                        bumped <- guard_value.value + 1 if guard_value.found and guard_value.value == bumped
+                                        guard_value: (found: bool, value: i64) = fold_const_int(right)
+                                        if guard_value.found and guard_value.value == bumped:
+                                            successor: (known: bool, value: i64) = linear_add_safe(guard_value.value, 1)
+                                            return (false, 0) if not successor.known
+                                            bumped <- successor.value
                                 _:
                                     pass
                         _:
                             pass
-                return bumped
+                return (true, bumped)
 
         # An affine `base ± literal` (or bare `base`) over an identifier: (ok, base, offset).
-        def rpr_affine(expression: Ast::Expr) -> (ok: bool, base: sview, offset: i64):
+        def rpr_affine(expression: Ast::Expr) -> (ok: bool, overflowed: bool, base: sview, offset: i64):
             can Memory.Allocate, Abort.Panic:
                 direct: sview = ident_name_of(expression)
-                (true, direct, 0) return if direct != ""
+                (true, false, direct, 0) return if direct != ""
                 match expression:
                     Expr.Paren(inner, paren_line):
                         return rpr_affine(inner)
                     Expr.Binary(left, operator, right, binary_line):
                         base: sview = ident_name_of(left)
                         if base != "":
-                            literal: (found: bool, value: i64) = where_signed_literal(right)
-                            (true, base, literal.value) return if literal.found and operator == TokenKind.Plus
-                            (true, base, 0 - literal.value) return if literal.found and operator == TokenKind.Minus
-                        return (false, sview("", 0, 0), 0)
+                            literal: (found: bool, value: i64) = fold_const_int(right)
+                            (true, false, base, literal.value) return if literal.found and operator == TokenKind.Plus
+                            if literal.found and operator == TokenKind.Minus:
+                                negated: (known: bool, value: i64) = linear_sub_safe(0, literal.value)
+                                return (true, false, base, negated.value) if negated.known
+                                return (true, true, base, 0)
+                        return (false, false, sview("", 0, 0), 0)
                     _:
-                        return (false, sview("", 0, 0), 0)
+                        return (false, false, sview("", 0, 0), 0)
 
         # The last top-level `return` expression of a body (the fall-through return), else Absent.
         def rpr_tail_return(body: darray[Ast::Stmt]) -> Ast::Expr:
@@ -151,15 +159,19 @@ extend Semantic:
                                     arg_slot: mutable usize = 0
                                     while arg_slot < arg_counts[call_index] and arg_slot < callee_params.count |arg_slot, table| -> table:
                                         argument: Ast::Expr = call_args[arg_starts[call_index] + arg_slot]
-                                        affine: (ok: bool, base: sview, offset: i64) = rpr_affine(argument)
+                                        affine: (ok: bool, overflowed: bool, base: sview, offset: i64) = rpr_affine(argument)
                                         if affine.ok:
                                             caller_lb: (found: bool, value: i64) = rpr_lower_bound(body, affine.base)
                                             callee_param_name: sview = callee_params[arg_slot]
                                             callee_req: (found: bool, value: i64) = rpr_lower_bound(callee_body, callee_param_name)
                                             if caller_lb.found and callee_req.found:
-                                                bumped_lb: i64 = rpr_basecase_bump(body, affine.base, caller_lb.value)
-                                                arg_min: i64 = bumped_lb + affine.offset
-                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: "requires", line: line.line, expected: "", actual: ""}) if arg_min < callee_req.value
+                                                if affine.overflowed:
+                                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: "requires", line: line.line, expected: "", actual: ""})
+                                                else:
+                                                    bumped_lb: (known: bool, value: i64) = rpr_basecase_bump(body, affine.base, caller_lb.value)
+                                                    if bumped_lb.known:
+                                                        arg_min: (known: bool, value: i64) = linear_add_safe(bumped_lb.value, affine.offset)
+                                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PreconditionUnproven, name: "requires", line: line.line, expected: "", actual: ""}) if not arg_min.known or arg_min.value < callee_req.value
                                         arg_slot <- arg_slot + 1
                                 call_index <- call_index + 1
                         Decl.Module(module_name, module_body, module_line):
