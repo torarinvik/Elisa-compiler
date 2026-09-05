@@ -175,7 +175,10 @@ The new decline diagnostic already pays for itself here — the failures self-re
 
 ## Part 2 — carried from earlier work, NOT re-measured
 
-Verify before acting. Each links to the memory note holding the detail.
+> **2026-09-05:** superseded by the local `IMPLEMENTATION_PLAN.md` (§3, §5, §6), which
+> re-measured each item. Notably: nested variant sub-patterns, SoA, the parameter-drop leak
+> and the packed store activation / ADT-ergonomics rejection are all CLOSED. Verify before
+> acting on anything below.
 
 ### 2.1 Deliberate, documented declines
 

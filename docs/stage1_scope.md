@@ -19,33 +19,25 @@ Anything that would let stage1 emit a WRONG answer is in scope regardless of how
 construct is. Anything that is merely a different way to *present* what the compiler already
 computed is not.
 
-## Out of scope — deliberately, not pending
+## What is deliberately NOT claimed (decisions, not debt)
 
-stage0's driver exposes roughly thirty `-emit` modes plus native link/run, a debugger, a REPL
-and an SMT integration. stage1 implements `obj`. The rest are **not stage1 goals**:
+Almost all of stage0's `-emit` surface is now implemented AND gated (`doc`, `iface`, `deps`,
+`header`, `unsafe`, `c-archive`, `interpret`, `test`, `tests`, `test-runner`, `benches`,
+`fixtures`, `packed`, `progress`, `lowered`, `c-bind-check*`, `pymodule*`, `ir` partial) —
+see `docs/PORTING_GAPS.md` for the live per-mode state. What remains out of scope is a short,
+explicit list of *decisions*:
 
-* **Presentation of existing analysis** — `lowered`, `semantic`, `facts`,
-  `packed`, `progress`, `doc`, `fmt`. (`iface` is ALSO implemented — the public-interface
-  rendering, byte-identical including stage0's inferred-region weave, held by
-  `emit_iface_parity_smoke.sh`.) (`deps`/`deps-json` are ALSO implemented —
-  the resolved include closure, byte-identical to stage0 including on the compiler's own
-  111-file graph, held by `emit_deps_parity_smoke.sh`.) These re-render data the
-  compiler already has. Porting them adds no parity signal, and stage0 remains available to
-  produce them. (`tokens` and `ast` ARE now implemented — they are the cross-repo LEXER and
-  PARSER oracles, not mere presentation: byte-identical to stage0's reports, held by
-  `emit_tokens_parity_smoke.sh` / `emit_ast_parity_smoke.sh` in the gate. The ast summary
-  even reproduces stage0's region-inference artifacts — the wrapped stmt count and the
-  inferred `[@__rg_*]` params — so it doubles as a check on those.)
-* **Alternate outputs** — `ir`, `bc`, `header`, `c-archive`, `c-bind-check`. The object path
-  is the one the fixpoint and the corpus exercise. (`llvm` IS now implemented — it prints the
-  same module the object path lowers, so it shares that parity rather than adding a surface.)
-* **Execution and tooling** — `interpret`, `serve`, `test`, `tests`, `test-runner`, `benches`,
-  `fixtures`, the debugger, the REPL. These are a build system and a developer environment,
-  not a compiler. (Native LINK is now `-emit exe` above; `run` stays out — it is `-emit exe`
-  plus executing the result, which the caller can do.)
 * **SMT / Z3.** stage1's proof-adjacent checks are the heuristic semantic rules and are
-  described as such. There is no plan to embed a solver; a program that needs stage0's SMT
-  should be checked by stage0.
+  described as such. A program that needs stage0's SMT should be checked by stage0.
+* **`-Os` / `-Oz`.** Rejected: no size-pipeline parity to hold them to.
+* **A bare `x = v` in an inner scope** is a DECLINE, not stage0's lowering (which compiles
+  into an infinite loop). A loud decline beats reproducing a wrong answer.
+* **Packed `common:` physical row layout.** stage1 gives each inline common its own word;
+  stage0 byte-packs inline commons into the tag's prefix word. Self-consistent on each side, a
+  store never crosses compilers, and `-emit packed` reports each compiler's real layout.
+* **`host_platform_name()` is the constant `"macos"`.** A Linux build must change it.
+* **`-emit semantic` / `facts` / `serve`** are not implemented (a fact system stage1 does
+  not have; a network compile server) — open work, not an exclusion.
 
 If one of these is ever wanted, it is a NEW feature with its own justification — not a parity
 debt.
