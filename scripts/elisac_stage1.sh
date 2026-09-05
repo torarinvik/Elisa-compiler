@@ -24,10 +24,12 @@ ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
 fi
-# Use the sibling stage0 worktree by default. This keeps stage1 self-hosting and
-# ordinary wrapper invocations independent from any installed `elisac`; callers
-# can still select an explicit compiler with ELISACORE_BIN.
-STAGE0_BIN="${ELISACORE_BIN:-$ROOT/../stage0/compiler/bin/elisac-local}"
+# Default to the canonical Elisa-core checkout every parity smoke and the drift guard
+# also assume (`../../Go projects/structpy-tree`). The old `../stage0/.../elisac-local`
+# default named a worktree that no longer exists, so a bare `--seed` failed with
+# "seed requires stage0 elisac" until ELISACORE_BIN was exported by hand. Callers can
+# still select an explicit compiler with ELISACORE_BIN.
+STAGE0_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 # Include expansion is a host-side Python step. Resolve the same interpreter selected by
 # `PYTHON_BIN` (including a command name such as `python3.14`) before any emit mode runs so
 # custom toolchains are honored consistently by the wrapper and its recursive invocations.
