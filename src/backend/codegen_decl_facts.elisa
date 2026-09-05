@@ -199,6 +199,28 @@ extend Backend:
                 return generic_index >= 0 and generics.is_error[generic_index.usize()]
 
 
+        # Resolve the source callee used by the VALUE-shaped error paths. These paths
+        # historically accepted only `try f(...)`, while ordinary call codegen already
+        # understood `M::f(...)` and `A::B::f(...)`. Keeping the owner separate from the
+        # member name lets the rest of the error ABI helpers reuse the existing FnTable
+        # without manufacturing a joined string or weakening module visibility.
+        def error_call_owner_and_name(callee: Expr, fns: FnTable&, structs: StructTable&) -> (ok: bool, owner: sview, name: sview) can[Abort.Panic]:
+            match callee:
+                Expr.Ident(error_ident_name, error_ident_line):
+                    return (function_is_error(fns, "", error_ident_name), "", error_ident_name)
+                Expr.Scope(error_scope_head, error_scope_name, error_scope_line):
+                    if error_scope_head is Expr.Ident(error_module_name, error_module_line):
+                        error_owner: sview = module_alias_target(error_module_name, structs)
+                        return (function_is_error(fns, error_owner, error_scope_name), error_owner, error_scope_name)
+                    if error_scope_head is Expr.Scope(error_nested_head, error_nested_name, error_nested_line):
+                        if error_nested_head is Expr.Ident(error_root_name, error_root_line):
+                            if qualified_owner_of(fns, error_root_name, error_nested_name) is error_qualified_owner:
+                                return (function_is_error(fns, error_qualified_owner, error_scope_name), error_qualified_owner, error_scope_name)
+                _:
+                    pass
+            return (false, "", "")
+
+
         # `try f(args) else void` is the statement-shaped no-op recovery. The semantic
         # checker permits it only when `f` succeeds with `void`; unlike propagating `try`,
         # failure is intentionally swallowed. It still uses the error ABI's leading
@@ -364,9 +386,14 @@ extend Backend:
             match guarded:
                 Expr.Call(te_callee, te_args, te_arg_names, te_call_line):
                     te_name: mutable sview = ""
+                    te_owner: mutable sview = ""
                     te_type_args: mutable darray[ValueType] = []
                     te_explicit: mutable bool = false
                     te_bad_type_arg: mutable bool = false
+                    te_resolution: (ok: bool, owner: sview, name: sview) = error_call_owner_and_name(te_callee, fns, structs)
+                    te_qualified_error: bool = te_resolution.ok
+                    te_owner <- te_resolution.owner
+                    te_name <- te_resolution.name
                     match te_callee:
                         Expr.Ident(te_ident_name, te_ident_line):
                             te_name <- te_ident_name
@@ -406,7 +433,7 @@ extend Backend:
                         te_inferred: darray[ValueType] = infer_generic_args(te_generic_slot.usize(), te_args, local_scope, fns, structs, generics)
                         null return if te_inferred.count != generics.param_count[te_generic_slot.usize()]
                         te_type_args.extend([copied_type(te_inferred_arg) for te_inferred_arg in te_inferred])
-                    te_plain_error: bool = function_is_error(fns, "", te_name)
+                    te_plain_error: bool = te_qualified_error or function_is_error(fns, te_owner, te_name)
                     te_generic_error: mutable bool = false
                     if te_is_generic:
                         te_generic_error <- generics.is_error[te_generic_slot.usize()]
@@ -417,13 +444,13 @@ extend Backend:
                     if te_generic_error:
                         te_payload <- generic_return_type(te_name, te_type_args, generics, structs)
                     else:
-                        te_payload <- lookup_return_type(fns, "", te_name)
+                        te_payload <- lookup_return_type(fns, te_owner, te_name)
                     null return if te_payload.kind == TypeKind.Unmodeled or te_payload.kind == TypeKind.Void
                     te_target_opt: mutable LLVMValueRef? = null
                     if te_generic_error:
                         te_target_opt <- instantiate_generic_with_error_family(te_name, te_type_args, te_error_family, generics, structs, m, ctx)
                     else:
-                        te_target_opt <- lookup_function(fns, "", te_name)
+                        te_target_opt <- lookup_function(fns, te_owner, te_name)
                     if te_target_opt is te_target:
                         te_payload_llvm: LLVMTypeRef = llvm_type_of(te_payload, structs, ctx)
                         te_out_slot: LLVMValueRef = LLVMBuildAlloca(builder, te_payload_llvm, "try.else.out")
@@ -435,7 +462,7 @@ extend Backend:
                             if te_generic_error:
                                 te_wanted <- instantiation_param_type(te_name, te_type_args, te_position, generics, structs)
                             else:
-                                te_wanted <- param_type_of(fns, "", te_name, te_position)
+                                te_wanted <- param_type_of(fns, te_owner, te_name, te_position)
                             if te_wanted.kind == TypeKind.Unmodeled:
                                 te_declined <- true
                             elif emit_expression(te_argument, te_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is te_argument_value:
@@ -453,7 +480,7 @@ extend Backend:
                                     return null
                             te_call_values.push(te_threaded_arena) if instantiation_wants_arena(te_name, te_type_args, generics, structs)
                         else:
-                            te_fn_index: i64 = function_index_of(fns, "", te_name)
+                            te_fn_index: i64 = function_index_of(fns, te_owner, te_name)
                             null return if te_fn_index < 0
                             for _ in 0..<fns.arena_counts[te_fn_index.usize()] |te_call_values, te_threaded_arena|:
                                 te_call_values.push(te_threaded_arena)
@@ -464,7 +491,7 @@ extend Backend:
                         # code is field 0. Comparing the whole struct against `i32 0` is malformed
                         # IR (see the matching note at the catch sites).
                         te_family_is_struct: bool = te_generic_error and error_set_has_payload(structs, resolved_error_family(te_error_family, structs))
-                        te_code: LLVMValueRef = LLVMBuildExtractValue(builder, te_status, 0, "errset.code") if te_family_is_struct or ((not te_generic_error) and function_returns_error_struct(fns, structs, "", te_name)) else te_status
+                        te_code: LLVMValueRef = LLVMBuildExtractValue(builder, te_status, 0, "errset.code") if te_family_is_struct or ((not te_generic_error) and function_returns_error_struct(fns, structs, te_owner, te_name)) else te_status
                         te_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, te_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.else.ok")
                         te_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
                         te_ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, te_function, "try.else.value")
