@@ -71,8 +71,8 @@ fi
 if bash "$ROOT/scripts/elisac_stage1.sh" -emit llvm -o "$WORK/passthrough.ll" "$WORK/passthrough.elisa" >"$WORK/passthrough.ll.log" 2>&1; then
     body=$(sed -n '/^define[^@]*@as_text/,/^}/p' "$WORK/passthrough.ll")
     [ -n "$body" ] || fail "as_text missing from the emitted module"
-    printf '%s\n' "$body" | grep -q 'load i8' && fail "as_text still loads a byte out of the cstr: $body"
-    printf '%s\n' "$body" | grep -qE 'ret ptr %' || fail "as_text does not return the call result: $body"
+    grep -q 'load i8' <<< "$body" && fail "as_text still loads a byte out of the cstr: $body"
+    grep -qE 'ret ptr %' <<< "$body" || fail "as_text does not return the call result: $body"
 else
     fail "-emit llvm on the pass-through fixture failed ($(head -1 "$WORK/passthrough.ll.log"))"
 fi

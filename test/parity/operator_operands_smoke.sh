@@ -14,29 +14,29 @@ fail() { echo "operator-operands smoke FAIL: $1" >&2; exit 1; }
 
 # 1. int operand to a logical `and` MUST be flagged.
 out=$(printf 'def f(n: i64, m: i64) -> bool:\n    return n and m\n' | "$RPT")
-echo "$out" | grep -q "logical operator requires bool operands" || fail "int-to-and not flagged: $out"
+grep -q "logical operator requires bool operands" <<< "$out" || fail "int-to-and not flagged: $out"
 
 # 2. string operand to `+` MUST be flagged as non-numeric.
 out=$(printf 'def f(s: sview, n: i64) -> i64:\n    x: i64 = s + n\n    return x\n' | "$RPT")
-echo "$out" | grep -q "operator requires numeric operands" || fail "string-to-plus not flagged: $out"
+grep -q "operator requires numeric operands" <<< "$out" || fail "string-to-plus not flagged: $out"
 
 # 3. bool operands to `and` must NOT be flagged.
 out=$(printf 'def f(a: bool, b: bool) -> bool:\n    return a and b\n' | "$RPT")
-echo "$out" | grep -q "requires bool operands" && fail "false positive on bool-and: $out"
+grep -q "requires bool operands" <<< "$out" && fail "false positive on bool-and: $out"
 
 # 4. char arithmetic must NOT be flagged (char is numeric-adjacent).
 out=$(printf 'def f(c: char) -> i64:\n    x: i64 = c - c\n    return x\n' | "$RPT")
-echo "$out" | grep -q "requires numeric operands" && fail "false positive on char arithmetic: $out"
+grep -q "requires numeric operands" <<< "$out" && fail "false positive on char arithmetic: $out"
 
 # 5. int arithmetic must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    return n + n\n' | "$RPT")
-echo "$out" | grep -q "requires numeric operands" && fail "false positive on int arithmetic: $out"
+grep -q "requires numeric operands" <<< "$out" && fail "false positive on int arithmetic: $out"
 
 # 6. modulo is integral-only.
 out=$(printf 'def f(value: f64) -> f64:\n    return value %% 2.0\n' | "$RPT")
-echo "$out" | grep -q "operator requires integral operands" || fail "float modulo not flagged: $out"
+grep -q "operator requires integral operands" <<< "$out" || fail "float modulo not flagged: $out"
 out=$(printf 'def f(value: i64) -> i64:\n    return value %% 2\n' | "$RPT")
-echo "$out" | grep -q "operator requires integral operands" && fail "false positive on integer modulo: $out"
+grep -q "operator requires integral operands" <<< "$out" && fail "false positive on integer modulo: $out"
 
 # 7. positional containers require integral indexes.
 # "got f64", not "got float": this assertion used to pin the FAMILY name, which is what
@@ -44,22 +44,22 @@ echo "$out" | grep -q "operator requires integral operands" && fail "false posit
 # Verified against the oracle on this exact program: stage0 prints "index must be
 # integral, got f64".
 out=$(printf 'def f(values: i32[4], idx: f64) -> i32:\n    return values[idx]\n' | "$RPT")
-echo "$out" | grep -q "index must be integral, got f64" || fail "float array index not flagged: $out"
+grep -q "index must be integral, got f64" <<< "$out" || fail "float array index not flagged: $out"
 out=$(printf 'def f(values: i32[4], idx: i64) -> i32:\n    return values[idx]\n' | "$RPT")
-echo "$out" | grep -q "index must be integral" && fail "false positive on integer array index: $out"
+grep -q "index must be integral" <<< "$out" && fail "false positive on integer array index: $out"
 # darray is positional too and was silent here until the index walls were unified.
 out=$(printf 'def f(values: darray[i32], idx: f64) -> i32:\n    return values[idx]\n' | "$RPT")
-echo "$out" | grep -q "index must be integral, got f64" || fail "float darray index not flagged: $out"
+grep -q "index must be integral, got f64" <<< "$out" || fail "float darray index not flagged: $out"
 out=$(printf 'def f(values: darray[i32], idx: sview) -> i32:\n    return values[idx]\n' | "$RPT")
-echo "$out" | grep -q "index must be numeric, got sview" || fail "sview darray index not flagged: $out"
+grep -q "index must be numeric, got sview" <<< "$out" || fail "sview darray index not flagged: $out"
 out=$(printf 'def f(values: darray[i32], idx: i64) -> i32:\n    return values[idx]\n' | "$RPT")
-echo "$out" | grep -qE "index must be (integral|numeric)" && fail "false positive on integer darray index: $out"
+grep -qE "index must be (integral|numeric)" <<< "$out" && fail "false positive on integer darray index: $out"
 
 # 8. literal-zero for-range strides are rejected, nonzero strides are valid.
 out=$(printf 'def f() -> void:\n    for i in 0..<10..0:\n        pass\n' | "$RPT")
-echo "$out" | grep -q "for loop range step cannot be zero" || fail "zero range step not flagged: $out"
+grep -q "for loop range step cannot be zero" <<< "$out" || fail "zero range step not flagged: $out"
 out=$(printf 'def f() -> void:\n    for i in 0..<10..2:\n        pass\n' | "$RPT")
-echo "$out" | grep -q "for loop range step cannot be zero" && fail "false positive on nonzero range step: $out"
+grep -q "for loop range step cannot be zero" <<< "$out" && fail "false positive on nonzero range step: $out"
 
 # 9. 0 FP across frontend + stdlib.
 t=0

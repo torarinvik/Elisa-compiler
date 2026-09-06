@@ -25,7 +25,7 @@ case_count="$(wc -l < "$ORACLE" | tr -d ' ')"
 
 while IFS=$'\t' read -r name expected_errors notices encoded; do
     out="$(printf '%s' "$encoded" | openssl base64 -d -A | "$RPT")"
-    actual_errors="$(printf '%s\n' "$out" | awk '$1 == "P" { print $2; exit }')"
+    actual_errors="$(printf '%s\n' "$out" | awk '$1 == "P" && v == "" { v = $2 } END { print v }')"
     [[ -n "$actual_errors" ]] || actual_errors=999999
     expected_class=0
     actual_class=0

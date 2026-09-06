@@ -10,15 +10,15 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 prefix=$'error FileError:\n    NotFound\n    Busy\nextern read_value(flag: bool) -> i64 error[FileError]\ndef load(flag: bool) -> i64:\n    return catch read_value(flag):\n        value:\n            value\n'
 
 missing=$(printf '%s%s' "$prefix" $'        NotFound:\n            1\n' | "$RPT")
-printf '%s\n' "$missing" | grep -q "non-exhaustive catch over \"FileError\"; missing error \"Busy\""
+grep -q "non-exhaustive catch over \"FileError\"; missing error \"Busy\"" <<< "$missing"
 
 complete=$(printf '%s%s' "$prefix" $'        NotFound:\n            1\n        Busy:\n            2\n' | "$RPT")
-printf '%s\n' "$complete" | grep -q '^D 0$'
+grep -q '^D 0$' <<< "$complete"
 
 qualified=$(printf '%s%s' "$prefix" $'        FileError.NotFound:\n            1\n        FileError.Busy:\n            2\n' | "$RPT")
-printf '%s\n' "$qualified" | grep -q '^D 0$'
+grep -q '^D 0$' <<< "$qualified"
 
 fallback=$(printf '%s%s' "$prefix" $'        error e:\n            0\n' | "$RPT")
-printf '%s\n' "$fallback" | grep -q '^D 0$'
+grep -q '^D 0$' <<< "$fallback"
 
 echo "catch exhaustiveness smoke OK" >&2

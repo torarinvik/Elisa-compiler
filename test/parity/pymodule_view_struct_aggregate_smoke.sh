@@ -14,7 +14,7 @@ if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -f "$ROO
     exit 0
 fi
 
-if nm -u "$ROOT/build/runtime/elisacore_runtime.o" 2>/dev/null | grep -q 'elisa_native_callback_'; then
+if nm -u "$ROOT/build/runtime/elisacore_runtime.o" 2>/dev/null | grep  'elisa_native_callback_' >/dev/null; then
     echo "pymodule view struct aggregate smoke SKIP (runtime callback host unavailable)"
     exit 0
 fi

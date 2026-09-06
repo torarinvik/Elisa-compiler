@@ -15,18 +15,18 @@ fail() { echo "machine-from arm-law smoke FAIL: $1" >&2; exit 1; }
 # 1. LEGAL: a straight-line body (`n <- n - 1` mutation) + guarded/plain `next`/`done`
 #    terminators parses clean.
 out=$(printf 'const enum St of u8:\n    Step\n    Stop\ndef down(x: i64) -> i64:\n    n: mutable i64 = x\n    total: i64 = machine from St.Step decreases n:\n        St.Step:\n            n <- n - 1\n            next St.Stop if n <= 0\n            next St.Step\n        St.Stop:\n            done n\n    return total\n' | "$RPT")
-echo "$out" | grep -q "^P 0$" || fail "legal straight-line body flagged: $out"
+grep -q "^P 0$" <<< "$out" || fail "legal straight-line body flagged: $out"
 
 # 2. ILLEGAL: a hidden `if` in an arm body (should be a guarded `next`/`done` instead).
 out=$(printf 'const enum St of u8:\n    Step\n    Stop\ndef down(x: i64) -> i64:\n    n: mutable i64 = x\n    total: i64 = machine from St.Step decreases n:\n        St.Step:\n            if n > 0:\n                n <- n - 1\n            next St.Stop if n <= 0\n            next St.Step\n        St.Stop:\n            done n\n    return total\n' | "$RPT")
-echo "$out" | grep -q "^P 0$" && fail "hidden if in arm body NOT refused: $out"
+grep -q "^P 0$" <<< "$out" && fail "hidden if in arm body NOT refused: $out"
 
 # 3. ILLEGAL: a `return` escape (resolution is `done`, not a function return).
 out=$(printf 'const enum St of u8:\n    Step\n    Stop\ndef down(x: i64) -> i64:\n    n: mutable i64 = x\n    total: i64 = machine from St.Step decreases n:\n        St.Step:\n            return 0\n        St.Stop:\n            done n\n    return total\n' | "$RPT")
-echo "$out" | grep -q "^P 0$" && fail "return escape in arm body NOT refused: $out"
+grep -q "^P 0$" <<< "$out" && fail "return escape in arm body NOT refused: $out"
 
 # 4. ILLEGAL: a `while` loop hidden in an arm body.
 out=$(printf 'const enum St of u8:\n    Step\n    Stop\ndef down(x: i64) -> i64:\n    n: mutable i64 = x\n    total: i64 = machine from St.Step decreases n:\n        St.Step:\n            while n > 0:\n                n <- n - 1\n            next St.Stop\n        St.Stop:\n            done n\n    return total\n' | "$RPT")
-echo "$out" | grep -q "^P 0$" && fail "hidden while in arm body NOT refused: $out"
+grep -q "^P 0$" <<< "$out" && fail "hidden while in arm body NOT refused: $out"
 
 echo "machine-from arm-law smoke OK: straight-line legal; hidden if/while + return escape refused by stage1"

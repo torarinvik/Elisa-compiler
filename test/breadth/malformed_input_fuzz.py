@@ -70,13 +70,21 @@ def compile_rc(path, work):
     # hang as a failure, which is worse than useless for a harness whose whole job is "never
     # let a hang go undetected" (see the module docstring). -9 mimics a killed-by-signal exit
     # so `abnormal()` (rc < 0 or rc > 2) flags it exactly like a crash would.
-    try:
-        r = subprocess.run(["bash", WRAP, "-o", os.path.join(work, "out.o"), path],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           stdin=subprocess.DEVNULL, timeout=120)
-        return r.returncode
-    except subprocess.TimeoutExpired:
-        return -9
+    #
+    # But an EXPIRED BUDGET is not a crash, and inside the gate this budget is shared with
+    # hundreds of sibling compiles: `deep_left_binary_chain` — a deliberately deep program —
+    # passed 120 s under load and was reported as `CRASH rc=-9`, failing the whole check on a
+    # host where it compiles fine alone. Retry once, much wider, before believing it.
+    budget = int(os.environ.get("ELISA_MALFORMED_TIMEOUT", "120"))
+    for attempt in (budget, budget * int(os.environ.get("ELISA_TIMEOUT_ESCALATE", "6"))):
+        try:
+            r = subprocess.run(["bash", WRAP, "-o", os.path.join(work, "out.o"), path],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               stdin=subprocess.DEVNULL, timeout=attempt)
+            return r.returncode
+        except subprocess.TimeoutExpired:
+            continue
+    return -9
 
 def invalid_ir(path, work):
     """None when the IR is valid or unavailable; the verifier's first line when it is not."""

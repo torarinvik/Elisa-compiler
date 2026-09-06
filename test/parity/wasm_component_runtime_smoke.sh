@@ -80,7 +80,7 @@ if [[ -n "$STAGE0" && -x "$STAGE0" ]]; then
         arena-reuse
 fi
 
-if find "$WORK" -maxdepth 1 -type f \( -name '*.mjs' -o -name '*.d.ts' -o -name '*.d.mts' \) -print -quit | grep -q .; then
+if find "$WORK" -maxdepth 1 -type f \( -name '*.mjs' -o -name '*.d.ts' -o -name '*.d.mts' \) -print -quit | grep  . >/dev/null; then
     echo "wasm_component_runtime_smoke produced a JavaScript/TypeScript artifact" >&2
     exit 1
 fi

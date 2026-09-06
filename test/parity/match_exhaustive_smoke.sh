@@ -19,35 +19,35 @@ E3='enum E:\n    A\n    B\n    C\n\n'
 
 # 1. a match omitting a variant with no catch-all MUST be flagged.
 out=$(printf "${E3}def f(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n        E.B:\n            return 2\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive match over \"E\"; missing variant \"C\"" || fail "missing variant not flagged: $out"
+grep -q "non-exhaustive match over \"E\"; missing variant \"C\"" <<< "$out" || fail "missing variant not flagged: $out"
 
 # 2. an exhaustive match must NOT be flagged.
 out=$(printf "${E3}def g(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n        E.B:\n            return 2\n        E.C:\n            return 3\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive" && fail "false positive on exhaustive match: $out"
+grep -q "non-exhaustive" <<< "$out" && fail "false positive on exhaustive match: $out"
 
 # 3. a wildcard makes it exhaustive.
 out=$(printf "${E3}def h(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n        _:\n            return 0\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive" && fail "false positive on wildcard match: $out"
+grep -q "non-exhaustive" <<< "$out" && fail "false positive on wildcard match: $out"
 
 # 4. an or-pattern covering the rest is exhaustive.
 out=$(printf "${E3}def k(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n        E.B | E.C:\n            return 2\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive" && fail "false positive on or-pattern cover: $out"
+grep -q "non-exhaustive" <<< "$out" && fail "false positive on or-pattern cover: $out"
 
 # 5. an integer (non-enum) match must never be flagged.
 out=$(printf 'def m(n: i64) -> i64:\n    match n:\n        0:\n            return 1\n        1:\n            return 2\n' | "$RPT")
-echo "$out" | grep -q "non-exhaustive" && fail "false positive on integer match: $out"
+grep -q "non-exhaustive" <<< "$out" && fail "false positive on integer match: $out"
 
 # 5b. EXPRESSION-position match/when must be checked too (docs/125 R2 parity with stage0):
 #     `x = match e:` / `return when e:` omitting a variant with no `_` MUST be flagged.
 out=$(printf "${E3}def p(e: E) -> i64:\n    r: i64 = match e:\n        E.A: 1\n        E.B: 2\n    return r\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive match over \"E\"; missing variant \"C\"" || fail "expr-form match not checked: $out"
+grep -q "non-exhaustive match over \"E\"; missing variant \"C\"" <<< "$out" || fail "expr-form match not checked: $out"
 out=$(printf "${E3}def q(e: E) -> i64:\n    r: i64 = when e:\n        E.A: 1\n        E.B: 2\n    return r\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive match over \"E\"; missing variant \"C\"" || fail "expr-form when not checked: $out"
+grep -q "non-exhaustive match over \"E\"; missing variant \"C\"" <<< "$out" || fail "expr-form when not checked: $out"
 out=$(printf "${E3}def r(e: E) -> i64:\n    return when e:\n        E.A: 1\n        E.B: 2\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive match over \"E\"; missing variant \"C\"" || fail "return-position when not checked: $out"
+grep -q "non-exhaustive match over \"E\"; missing variant \"C\"" <<< "$out" || fail "return-position when not checked: $out"
 # 5c. an exhaustive expr-form match/when must STAY SILENT.
 out=$(printf "${E3}def s(e: E) -> i64:\n    r: i64 = when e:\n        E.A: 1\n        E.B: 2\n        E.C: 3\n    return r\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive" && fail "false positive on exhaustive expr-form when: $out"
+grep -q "non-exhaustive" <<< "$out" && fail "false positive on exhaustive expr-form when: $out"
 
 # 5d. OPEN-SCALAR totality (docs/125 R2): a value-producing match/when over an int/char/
 #     string/float domain with no `_` cannot yield a value for every input — MUST be flagged
@@ -58,14 +58,14 @@ echo "$out" | grep -q "non-exhaustive" && fail "false positive on exhaustive exp
 #     carry the rule while the text disagreed with the oracle. There are fixtures now
 #     (when_scalar_total / when_tuple_total), so the text is oracle-checked.
 out=$(printf 'def f(n: i64) -> i64:\n    r: i64 = match n:\n        0: 1\n        1: 2\n    return r\n' | "$RPT")
-echo "$out" | grep -q "add a final _ arm" || fail "open-scalar match without _ not flagged: $out"
+grep -q "add a final _ arm" <<< "$out" || fail "open-scalar match without _ not flagged: $out"
 out=$(printf 'def f(n: i64) -> i64:\n    r: i64 = when n:\n        0: 1\n        1: 2\n    return r\n' | "$RPT")
-echo "$out" | grep -q "add a final _ arm" || fail "open-scalar when without _ not flagged: $out"
+grep -q "add a final _ arm" <<< "$out" || fail "open-scalar when without _ not flagged: $out"
 # 5e. a `_` arm makes it total; a bool (closed) domain needs no `_`.
 out=$(printf 'def f(n: i64) -> i64:\n    r: i64 = when n:\n        0: 1\n        _: 9\n    return r\n' | "$RPT")
-echo "$out" | grep -q "add a final _ arm" && fail "false positive on open-scalar with _: $out"
+grep -q "add a final _ arm" <<< "$out" && fail "false positive on open-scalar with _: $out"
 out=$(printf 'def f(b: bool) -> i64:\n    r: i64 = when b:\n        true: 1\n        false: 2\n    return r\n' | "$RPT")
-echo "$out" | grep -q "add a final _ arm" && fail "false positive on closed bool domain: $out"
+grep -q "add a final _ arm" <<< "$out" && fail "false positive on closed bool domain: $out"
 
 # 6. the whole frontend + stdlib must produce ZERO findings (all compile on stage0 → exhaustive).
 n=0

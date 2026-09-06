@@ -15,7 +15,7 @@ expect_diagnostics() {
     local source="$2"
     local out
     out="$(printf '%b' "$source" | "$RPT")"
-    echo "$out" | grep -q '^D 0$' && fail "$label was accepted: $out"
+    grep -q '^D 0$' <<< "$out" && fail "$label was accepted: $out"
 }
 
 expect_diagnostics "duplicate state" 'def run() -> i64:

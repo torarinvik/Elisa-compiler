@@ -22,12 +22,12 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 } >"$WORK/scale.elisa"
 
 out="$("$RPT" <"$WORK/scale.elisa")"
-echo "$out" | grep -q '^P 0$' || {
+grep -q '^P 0$' <<< "$out" || {
   echo "machine-name scale smoke FAIL: parse errors" >&2
   echo "$out" >&2
   exit 1
 }
-echo "$out" | grep -q '^D 0$' || {
+grep -q '^D 0$' <<< "$out" || {
   echo "machine-name scale smoke FAIL: synthesized names collided above 255" >&2
   echo "$out" >&2
   exit 1

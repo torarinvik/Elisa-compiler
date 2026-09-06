@@ -12,7 +12,7 @@ ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "docs119-forms smoke FAIL: $1" >&2; exit 1; }
-perr() { printf "$1" | "$RPT" | head -1 | awk '{print $2}'; }
+perr() { printf "$1" | "$RPT" | awk 'NR == 1 { print $2 }'; }
 
 # 1. bare block expression parses.
 [ "$(perr 'def f() -> i64:\n    y: i64 =\n        a: i64 = 40\n        a + 2\n    return y\n')" = "0" ] || fail "bare block has parse errors"
@@ -45,12 +45,12 @@ perr() { printf "$1" | "$RPT" | head -1 | awk '{print $2}'; }
 # 7. resolution descends into the new constructs: an undefined identifier in a block/loop-
 #    header body is flagged.
 out=$(printf 'def f(xs: darray[i64]) -> i64:\n    s: i64 =\n        for x in xs |acc = 0| -> acc:\n            acc <- acc + nope\n    return s\n' | "$RPT")
-echo "$out" | grep -q "undefined identifier \"nope\"" || fail "loop-header body not resolved: $out"
+grep -q "undefined identifier \"nope\"" <<< "$out" || fail "loop-header body not resolved: $out"
 
 # 8. zero parse false positives across frontend + stdlib.
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | head -1 | awk '{print $2}')
+  c=$("$RPT" < "$f" 2>/dev/null | awk 'NR == 1 { print $2 }')
   [ -n "$c" ] || fail "parse crash/empty output on $f"
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)

@@ -24,18 +24,18 @@ fail() { echo "region_owner_leak FAILED: $1" >&2; exit 1; }
 
 # An owner nothing ever mentions: MUST be flagged.
 out=$(printf 'def f() -> i64:\n    region scratch\n    return 1\n' | "$RPT")
-echo "$out" | grep -q 'region owner "scratch" must be consumed' \
+grep -q 'region owner "scratch" must be consumed' <<< "$out" \
   || fail "unreferenced region owner not flagged: $out"
 
 # The same owner, referenced: must stay silent.
 out=$(printf 'def g(n: i64) -> i64:\n    region scratch\n    total: i64 = n + scratch\n    return total\n' | "$RPT")
-echo "$out" | grep -q 'region owner' \
+grep -q 'region owner' <<< "$out" \
   && fail "referenced region owner flagged — false positive: $out"
 
 # A function with no owner at all — the early exit. Must stay silent, and must not disturb
 # the other diagnostics the same body produces.
 out=$(printf 'def h(n: i64) -> i64:\n    total: i64 = n * 2\n    return total\n' | "$RPT")
-echo "$out" | grep -q 'region owner' \
+grep -q 'region owner' <<< "$out" \
   && fail "region-owner diagnostic reported for a function with no region: $out"
 
 echo "region_owner_leak OK: unreferenced owner flagged, referenced and owner-free forms silent"

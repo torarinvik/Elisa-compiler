@@ -24,17 +24,17 @@ fail() { echo "function_invariant FAILED: $1" >&2; exit 1; }
 
 # Reads a ghost local: MUST be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    ghost total: i64 = n * 2\n    invariant total >= 0\n    return n\n' | "$RPT")
-echo "$out" | grep -q "invariant could not be proven statically" \
+grep -q "invariant could not be proven statically" <<< "$out" \
   || fail "ghost-reading invariant not flagged: $out"
 
 # The SAME invariant over a real local: must stay silent (stage0 proves these).
 out=$(printf 'def f(n: i64) -> i64:\n    total: i64 = n * 2\n    invariant total >= 0\n    return n\n' | "$RPT")
-echo "$out" | grep -q "invariant could not be proven statically" \
+grep -q "invariant could not be proven statically" <<< "$out" \
   && fail "non-ghost invariant flagged — stage0 proves these, so this is a false positive: $out"
 
 # No `invariant` at all: the cheapest early exit, and it must not change anything.
 out=$(printf 'def f(n: i64) -> i64:\n    ghost total: i64 = n * 2\n    return n\n' | "$RPT")
-echo "$out" | grep -q "invariant could not be proven statically" \
+grep -q "invariant could not be proven statically" <<< "$out" \
   && fail "invariant reported for a function that has none: $out"
 
 echo "function_invariant OK: ghost-reading invariant flagged, real-local and absent forms silent"

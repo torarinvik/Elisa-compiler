@@ -24,40 +24,40 @@ E2='enum E:\n    A\n    B\n\n'
 
 # 1. Unknown variant name: E.C when C is not declared in E.
 out=$(printf "${E2}def f(e: E) -> i64:\n    match e:\n        E.C:\n            return 0\n" | "$RPT")
-echo "$out" | grep -q "has no variant" || fail "unknown variant not flagged: $out"
+grep -q "has no variant" <<< "$out" || fail "unknown variant not flagged: $out"
 
 # 2. Duplicate variant pattern: the second E.A is unreachable.
 out=$(printf "${E2}def f(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n        E.A:\n            return 2\n        E.B:\n            return 3\n" | "$RPT")
-echo "$out" | grep -q "unreachable" && echo "found unreachable (expected)" || fail "duplicate pattern not flagged: $out"
+grep -q "unreachable" <<< "$out" && echo "found unreachable (expected)" || fail "duplicate pattern not flagged: $out"
 
 # 3. Arity mismatch on an enum with no payload — attempting to destructure it.
 out=$(printf "enum E:\n    A\n    B\n\ndef f(e: E) -> i64:\n    match e:\n        E.A(x):\n            return 1\n        E.B:\n            return 2\n" | "$RPT")
-echo "$out" | grep -q "variant\|expects.*arguments" && echo "found variant error (arity or name check)" || fail "arity mismatch not flagged: $out"
+grep -q "variant\|expects.*arguments" <<< "$out" && echo "found variant error (arity or name check)" || fail "arity mismatch not flagged: $out"
 
 # 4. Arity mismatch: a variant declared with 2 fields matched with 1 pattern.
 out=$(printf "enum E:\n    A(i64, i64)\n    B\n\ndef f(e: E) -> i64:\n    match e:\n        E.A(x):\n            return 1\n        E.B:\n            return 2\n" | "$RPT")
-echo "$out" | grep -q "variant\|expects.*arguments" && echo "found variant error (arity check)" || fail "arity mismatch not detected: $out"
+grep -q "variant\|expects.*arguments" <<< "$out" && echo "found variant error (arity check)" || fail "arity mismatch not detected: $out"
 
 # 5. Exhaustiveness: missing variant B.
 out=$(printf "${E2}def f(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive\|missing" || fail "non-exhaustive match not flagged: $out"
+grep -q "non-exhaustive\|missing" <<< "$out" || fail "non-exhaustive match not flagged: $out"
 
 # 6. Exhaustiveness: fully covered, no flag.
 out=$(printf "${E2}def f(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n        E.B:\n            return 2\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive" && fail "false positive on exhaustive match: $out"
+grep -q "non-exhaustive" <<< "$out" && fail "false positive on exhaustive match: $out"
 
 # 7. Exhaustiveness: catch-all makes it exhaustive.
 out=$(printf "${E2}def f(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n        _:\n            return 0\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive" && fail "false positive on wildcard catch-all: $out"
+grep -q "non-exhaustive" <<< "$out" && fail "false positive on wildcard catch-all: $out"
 
 # 8. Exhaustiveness: or-pattern makes it exhaustive.
 out=$(printf "${E2}def f(e: E) -> i64:\n    match e:\n        E.A | E.B:\n            return 1\n" | "$RPT")
-echo "$out" | grep -q "non-exhaustive" && fail "false positive on or-pattern cover: $out"
+grep -q "non-exhaustive" <<< "$out" && fail "false positive on or-pattern cover: $out"
 
 # 9. Sequence matches require a list pattern or wildcard, never an enum variant.
 out=$(printf 'def f(values: view[i32]) -> i64:\n    match values:\n        Token.Region:\n            return 0\n    return 0\n' | "$RPT")
-echo "$out" | grep -q 'unsupported top-level sequence match pattern \*ast.MatchVariantPattern' || fail "sequence variant pattern not flagged: $out"
+grep -q 'unsupported top-level sequence match pattern \*ast.MatchVariantPattern' <<< "$out" || fail "sequence variant pattern not flagged: $out"
 out=$(printf 'def f(values: view[i32]) -> i64:\n    match values:\n        [head, ...tail]:\n            return head\n        _:\n            return 0\n' | "$RPT")
-echo "$out" | grep -q 'unsupported top-level sequence match pattern' && fail "false positive on sequence list pattern: $out"
+grep -q 'unsupported top-level sequence match pattern' <<< "$out" && fail "false positive on sequence list pattern: $out"
 
 echo "match-pattern smoke OK: all checks fire on violations and silent on correct code"

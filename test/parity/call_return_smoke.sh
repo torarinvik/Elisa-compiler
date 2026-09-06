@@ -13,19 +13,19 @@ fail() { echo "call-return smoke FAIL: $1" >&2; exit 1; }
 
 # 1. an int-returning call used as an if-condition MUST flag NonBoolCondition.
 out=$(printf 'def g(n: i64) -> i64:\n    return n\n\ndef f() -> i64:\n    if g(1):\n        return 1\n    return 0\n' | "$RPT")
-echo "$out" | grep -q "if condition must be bool, got i64" || fail "int-returning call-as-condition not flagged: $out"
+grep -q "if condition must be bool, got i64" <<< "$out" || fail "int-returning call-as-condition not flagged: $out"
 
 # 2. an int-returning call as a logical operand MUST flag NonBoolOperand.
 out=$(printf 'def g() -> i64:\n    return 1\n\ndef f() -> bool:\n    return g() and g()\n' | "$RPT")
-echo "$out" | grep -q "logical operator requires bool operands" || fail "int-returning call-as-operand not flagged: $out"
+grep -q "logical operator requires bool operands" <<< "$out" || fail "int-returning call-as-operand not flagged: $out"
 
 # 3. a bool-returning call as a condition must NOT be flagged.
 out=$(printf 'def ok() -> bool:\n    return true\n\ndef f() -> i64:\n    if ok():\n        return 1\n    return 0\n' | "$RPT")
-echo "$out" | grep -q "condition must be bool" && fail "false positive on bool-returning call: $out"
+grep -q "condition must be bool" <<< "$out" && fail "false positive on bool-returning call: $out"
 
 # 4. an OVERLOADED name (ambiguous return type) must NOT be flagged.
 out=$(printf 'def g(n: i64) -> i64:\n    return n\n\ndef g(s: sview) -> bool:\n    return true\n\ndef f() -> i64:\n    if g(1):\n        return 1\n    return 0\n' | "$RPT")
-echo "$out" | grep -q "condition must be bool" && fail "false positive on overloaded call: $out"
+grep -q "condition must be bool" <<< "$out" && fail "false positive on overloaded call: $out"
 
 # 5. reduce_sum requires a numeric callback return, but accepts numeric callbacks.
 out=$(printf 'def positive(value: i64) -> bool:\n    return value > 0\ndef bad(values: darray[i64]) -> i64:\n    return reduce_sum(readonly(values), positive)\n' | "$RPT")

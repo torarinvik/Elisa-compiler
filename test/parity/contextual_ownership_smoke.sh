@@ -12,8 +12,8 @@ fail() { echo "contextual-ownership smoke FAIL: $1" >&2; exit 1; }
 clean() {
     local out
     out="$(printf '%s' "$1" | "$RPT")"
-    echo "$out" | grep -q '^P 0$' || fail "parse error: $out"
-    echo "$out" | grep -q '^D 0$' || fail "semantic diagnostic: $out"
+    grep -q '^P 0$' <<< "$out" || fail "parse error: $out"
+    grep -q '^D 0$' <<< "$out" || fail "semantic diagnostic: $out"
 }
 
 clean $'struct Box:\n    value: int\n\ndef f() -> Box:\n    return new Box(value: 1)\n'

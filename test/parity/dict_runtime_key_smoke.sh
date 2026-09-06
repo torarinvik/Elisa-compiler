@@ -8,9 +8,9 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 float_key=$(printf 'def use(values: dict[f64, i32], key: f64) -> mutable i32&?:\n    return values.get(key)\n' | "$RPT")
-printf '%s\n' "$float_key" | grep -q 'runtime-backed dict keys must be cstr, an integer type, bool, or a const enum'
+grep -q 'runtime-backed dict keys must be cstr, an integer type, bool, or a const enum' <<< "$float_key"
 
 int_key=$(printf 'def use(values: dict[i64, i32], key: i64) -> mutable i32&?:\n    return values.get(key)\n' | "$RPT")
-printf '%s\n' "$int_key" | grep -q '^D 0$'
+grep -q '^D 0$' <<< "$int_key"
 
 echo "dict runtime key smoke OK" >&2

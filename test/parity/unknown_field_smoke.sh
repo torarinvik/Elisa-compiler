@@ -20,61 +20,61 @@ P2='struct Point:\n    x: i64\n    y: i64\n\n'
 
 # 1. a labeled field the struct does not declare MUST be flagged (and name the struct).
 out=$(printf "${P2}def f() -> Point:\n    return Point{x: 1, z: 3}\n" | "$RPT")
-echo "$out" | grep -q "struct literal \"Point\" has no field \"z\"" || fail "unknown field not flagged: $out"
+grep -q "struct literal \"Point\" has no field \"z\"" <<< "$out" || fail "unknown field not flagged: $out"
 
 # 2. an all-valid construction must NOT be flagged.
 out=$(printf "${P2}def g() -> Point:\n    return Point{x: 1, y: 2}\n" | "$RPT")
-echo "$out" | grep -q "has no field" && fail "false positive on valid construction: $out"
+grep -q "has no field" <<< "$out" && fail "false positive on valid construction: $out"
 
 # 3. positional (unlabeled) construction bails (no label to check).
 out=$(printf "${P2}def h() -> Point:\n    return Point{1, 2}\n" | "$RPT")
-echo "$out" | grep -q "has no field" && fail "false positive on positional construction: $out"
+grep -q "has no field" <<< "$out" && fail "false positive on positional construction: $out"
 
 # 4. an unknown/other type name (not a registered struct) bails.
 out=$(printf "def k() -> i64:\n    v = Widget{nope: 1}\n    return 0\n" | "$RPT")
-echo "$out" | grep -q "has no field" && fail "false positive on non-struct type: $out"
+grep -q "has no field" <<< "$out" && fail "false positive on non-struct type: $out"
 
 # 5. a generic/index type expr (Box[i64]{...}) is not a bare identifier -> bails.
 out=$(printf "struct Box:\n    v: i64\n\ndef m() -> i64:\n    b = Box[i64]{bad: 1}\n    return 0\n" | "$RPT")
-echo "$out" | grep -q "has no field" && fail "false positive on generic type expr: $out"
+grep -q "has no field" <<< "$out" && fail "false positive on generic type expr: $out"
 
 # 6. a field label given twice MUST be flagged (DuplicateFieldInit, same code path).
 out=$(printf "${P2}def d() -> Point:\n    return Point{x: 1, x: 2, y: 3}\n" | "$RPT")
-echo "$out" | grep -q "struct literal \"Point\" field \"x\" is specified more than once" || fail "duplicate field label not flagged: $out"
+grep -q "struct literal \"Point\" field \"x\" is specified more than once" <<< "$out" || fail "duplicate field label not flagged: $out"
 
 # 7. a valid all-distinct construction must NOT be flagged as duplicate.
 out=$(printf "${P2}def e() -> Point:\n    return Point{x: 1, y: 2}\n" | "$RPT")
-echo "$out" | grep -q "more than once" && fail "false positive on distinct fields: $out"
+grep -q "more than once" <<< "$out" && fail "false positive on distinct fields: $out"
 
 # 8. a by-label construction omitting a REQUIRED field MUST be flagged (MissingField).
 out=$(printf "${P2}def mf() -> Point:\n    return Point{x: 1}\n" | "$RPT")
-echo "$out" | grep -q "struct literal \"Point\" is missing field \"y\"" || fail "missing required field not flagged: $out"
+grep -q "struct literal \"Point\" is missing field \"y\"" <<< "$out" || fail "missing required field not flagged: $out"
 
 # 9. empty `{}` and positional construction bail (no missing-field report).
 out=$(printf "${P2}def em() -> Point:\n    return Point{}\n" | "$RPT")
-echo "$out" | grep -q "is missing field" && fail "false positive on empty construction: $out"
+grep -q "is missing field" <<< "$out" && fail "false positive on empty construction: $out"
 out=$(printf "${P2}def po() -> Point:\n    return Point{1, 2}\n" | "$RPT")
-echo "$out" | grep -q "is missing field" && fail "false positive on positional construction: $out"
+grep -q "is missing field" <<< "$out" && fail "false positive on positional construction: $out"
 
 # 10. optional (`z?: T`) and defaulted (`w: T = v`) fields are omittable — NOT missing.
 POM='struct Q:\n    x: i64\n    y: i64 = 5\n    z?: i64\n\n'
 out=$(printf "${POM}def op() -> Q:\n    return Q{x: 1}\n" | "$RPT")
-echo "$out" | grep -q "is missing field" && fail "false positive on omittable (default/optional) fields: $out"
+grep -q "is missing field" <<< "$out" && fail "false positive on omittable (default/optional) fields: $out"
 
 # 11. a record update naming an absent field gets the record-update-specific finding.
 out=$(printf "${P2}def ru(point: Point) -> Point:\n    return point{z = 3}\n" | "$RPT")
-echo "$out" | grep -q "record update has no field \"z\"" || fail "unknown record-update field not flagged: $out"
+grep -q "record update has no field \"z\"" <<< "$out" || fail "unknown record-update field not flagged: $out"
 
 # 12. valid record updates stay silent.
 out=$(printf "${P2}def rv(point: Point) -> Point:\n    return point{x = 3}\n" | "$RPT")
-echo "$out" | grep -q "record update has no field" && fail "false positive on valid record update: $out"
+grep -q "record update has no field" <<< "$out" && fail "false positive on valid record update: $out"
 
 # 13. the whole frontend + stdlib must produce ZERO findings for any field check.
 # Anonymous let destructuring preserves selectors separately from binders.
 out=$(printf "${P2}def ld(point: Point) -> i64:\n    let {z} = point\n    return 0\n" | "$RPT")
-echo "$out" | grep -q 'struct "Point" has no field "z"' || fail "unknown let-destructure field not flagged: $out"
+grep -q 'struct "Point" has no field "z"' <<< "$out" || fail "unknown let-destructure field not flagged: $out"
 out=$(printf "${P2}def lr(point: Point) -> i64:\n    let {x: renamed} = point\n    return renamed\n" | "$RPT")
-echo "$out" | grep -q 'has no field "renamed"' && fail "binder was confused with let field selector: $out"
+grep -q 'has no field "renamed"' <<< "$out" && fail "binder was confused with let field selector: $out"
 
 n=0
 while IFS= read -r f; do

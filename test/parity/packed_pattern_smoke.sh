@@ -12,8 +12,8 @@ fail() { echo "packed-pattern smoke FAIL: $1" >&2; exit 1; }
 clean() {
     local out
     out="$(printf '%s' "$1" | "$RPT")"
-    echo "$out" | grep -q '^P 0$' || fail "parse error: $out"
-    echo "$out" | grep -q '^D 0$' || fail "semantic diagnostic: $out"
+    grep -q '^P 0$' <<< "$out" || fail "parse error: $out"
+    grep -q '^D 0$' <<< "$out" || fail "semantic diagnostic: $out"
 }
 
 clean $'packed enum Expr:\n    Int(value: int)\n    Add(left: Expr, right: Expr)\n\ndef left_value(node: Expr, store: Expr.Store[Frozen]) -> int:\n    if node as Expr.Add(Expr.Int(value), rhs):\n        _ = rhs\n        return value\n    return 0\n'
@@ -23,8 +23,8 @@ clean $'packed enum Expr:\n    common:\n        @storage(side_table)\n        sp
 clean $'packed enum Expr:\n    Int(value: int)\n    Add(left: Expr, right: Expr)\n\ndef left(node: Expr, store: Expr.Store[Frozen]) -> Expr:\n    move node in store as Expr.Add(lhs, rhs)\n    _ = rhs\n    return lhs\n'
 
 wrong_store="$(printf '%s' $'packed enum Expr:\n    Int(value: int)\n\npacked enum Token:\n    Ident\n\ndef bad(node: Expr, store: Token.Store[Local]) -> int:\n    move node in store as Expr.Int(value)\n    return value\n' | "$RPT")"
-echo "$wrong_store" | grep -q '^D 1$' || fail "wrong packed Store owner was not rejected exactly once: $wrong_store"
-echo "$wrong_store" | grep -q "requires store type \"Expr.Store\", got Token.Store" || fail "wrong packed Store diagnostic missing: $wrong_store"
+grep -q '^D 1$' <<< "$wrong_store" || fail "wrong packed Store owner was not rejected exactly once: $wrong_store"
+grep -q "requires store type \"Expr.Store\", got Token.Store" <<< "$wrong_store" || fail "wrong packed Store diagnostic missing: $wrong_store"
 
 store_assign=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad(store: Expr.Store[Frozen], node: Expr) -> void:\n    store[0] <- node\n' | "$RPT")
 echo "$store_assign" | grep -Fq 'cannot assign to packed store index result' || fail "packed store index assignment not flagged: $store_assign"
@@ -49,8 +49,8 @@ clean $'packed enum Expr:\n    Int(value: int)\ndef ok(node: Expr.Int) -> int:\n
 clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    can Abort.Panic:\n        expect node as Expr.Int(value):\n            return value\n    return 0\n'
 
 removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> Box:\n    return value as Box\n' | "$RPT")"
-echo "$removed" | grep -q '^P 1$' || fail "removed value cast was accepted: $removed"
-echo "$removed" | grep -q "unexpected token \"as\"" || fail "removed value cast lacks directed error: $removed"
+grep -q '^P 1$' <<< "$removed" || fail "removed value cast was accepted: $removed"
+grep -q "unexpected token \"as\"" <<< "$removed" || fail "removed value cast lacks directed error: $removed"
 
 removed_abi=$(printf '@packed_abi(dense_fixed)\npacked enum Expr:\n    Lit(value: int)\n' | "$RPT")
 echo "$removed_abi" | grep -Fq '@packed_abi on enum "Expr" has been removed' || fail "removed packed ABI annotation not flagged: $removed_abi"
@@ -61,8 +61,8 @@ removed_store_as="$(printf '%s' $'packed enum Expr:\n    Lit(value: int)\n\ndef 
 echo "$removed_store_as" | grep -Eq '^P [1-9][0-9]*$' || fail "removed in-store as binder was accepted: $removed_store_as"
 
 move_arity="$(printf '%s' $'struct Pair:\n    left: mutable i64\n    right: mutable i64\n\ndef bad(pair: Pair) -> void:\n    move pair as Pair(left)\n' | "$RPT")"
-echo "$move_arity" | grep -q '^D 1$' || fail "move struct arity mismatch was not rejected exactly once: $move_arity"
-echo "$move_arity" | grep -q "move-as pattern \"Pair\" expects 2 bindings, got 1" || fail "move struct arity diagnostic missing: $move_arity"
+grep -q '^D 1$' <<< "$move_arity" || fail "move struct arity mismatch was not rejected exactly once: $move_arity"
+grep -q "move-as pattern \"Pair\" expects 2 bindings, got 1" <<< "$move_arity" || fail "move struct arity diagnostic missing: $move_arity"
 
 clean $'struct Pair:\n    left: mutable i64\n    right: mutable i64\n\ndef take(pair: Pair) -> i64:\n    move pair as Pair(left, right)\n    return left + right\n'
 

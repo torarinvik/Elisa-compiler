@@ -20,19 +20,19 @@ fail() { echo "unreachable smoke FAIL: $1" >&2; exit 1; }
 
 # 1. dead code after `return` MUST be flagged.
 out=$(printf 'def f() -> i64:\n    return 1\n    x: i64 = 2\n    return x\n' | "$RPT")
-echo "$out" | grep -q "unreachable code" || fail "dead code after return not flagged: $out"
+grep -q "unreachable code" <<< "$out" || fail "dead code after return not flagged: $out"
 
 # 2. dead code after `break` inside a loop MUST be flagged.
 out=$(printf 'def h() -> void:\n    while true:\n        break\n        y: i64 = 1\n' | "$RPT")
-echo "$out" | grep -q "unreachable code" || fail "dead code after break not flagged: $out"
+grep -q "unreachable code" <<< "$out" || fail "dead code after break not flagged: $out"
 
 # 3. guard-then-fallthrough (if returns, then a real return) must NOT be flagged.
 out=$(printf 'def g(n: i64) -> i64:\n    if n > 0:\n        return n\n    return 0\n' | "$RPT")
-echo "$out" | grep -q "unreachable code" && fail "false positive on guard-then-fallthrough: $out"
+grep -q "unreachable code" <<< "$out" && fail "false positive on guard-then-fallthrough: $out"
 
 # 4. a `return` as the LAST statement must NOT be flagged.
 out=$(printf 'def k() -> i64:\n    x: i64 = 1\n    return x\n' | "$RPT")
-echo "$out" | grep -q "unreachable code" && fail "false positive on trailing return: $out"
+grep -q "unreachable code" <<< "$out" && fail "false positive on trailing return: $out"
 
 # 5. the whole self+stdlib frontend must produce ZERO unreachable-CODE findings (no false positives).
 uc=0
@@ -46,19 +46,19 @@ done < <(find "$REPO_ROOT/src" -name '*.elisa' | grep -v _unused)
 
 # 6. an exact-duplicate variant arm MUST be flagged.
 out=$(printf 'enum E:\n    A\n    B\n\ndef f(e: E) -> i64:\n    match e:\n        E.A:\n            return 1\n        E.A:\n            return 2\n' | "$RPT")
-echo "$out" | grep -q "unreachable because an earlier arm" || fail "duplicate variant arm not flagged: $out"
+grep -q "unreachable because an earlier arm" <<< "$out" || fail "duplicate variant arm not flagged: $out"
 
 # 7. an arm after a `_` wildcard MUST be flagged.
 out=$(printf 'def g(n: i64) -> i64:\n    match n:\n        _:\n            return 0\n        5:\n            return 1\n' | "$RPT")
-echo "$out" | grep -q "unreachable because an earlier arm" || fail "arm after wildcard not flagged: $out"
+grep -q "unreachable because an earlier arm" <<< "$out" || fail "arm after wildcard not flagged: $out"
 
 # 8. SOUNDNESS: variant arms with DIFFERENT refutable payloads (E.A(1) vs E.A(2)) must NOT be flagged.
 out=$(printf 'enum E:\n    A(x: i64)\n\ndef h(e: E) -> i64:\n    match e:\n        E.A(1):\n            return 1\n        E.A(2):\n            return 2\n' | "$RPT")
-echo "$out" | grep -q "unreachable because an earlier arm" && fail "false positive on distinct payload subpatterns: $out"
+grep -q "unreachable because an earlier arm" <<< "$out" && fail "false positive on distinct payload subpatterns: $out"
 
 # 9. SOUNDNESS: a `catch` block (success binding + error-handler arms, same Stmt.Match) must NOT be flagged.
 out=$(printf 'def load(m: mutable i64&) -> void:\n    catch do_load(m):\n        n:\n            return\n        SomeError.Bad:\n            return\n        error e:\n            return\n' | "$RPT")
-echo "$out" | grep -q "unreachable because an earlier arm" && fail "false positive on catch handler arms: $out"
+grep -q "unreachable because an earlier arm" <<< "$out" && fail "false positive on catch handler arms: $out"
 
 # 10. the whole self+stdlib frontend must produce ZERO unreachable-MATCH-ARM findings.
 uma=0

@@ -13,15 +13,15 @@ fail() { echo "field-type smoke FAIL: $1" >&2; exit 1; }
 
 # 1. a struct int field used as an if-condition MUST flag NonBoolCondition.
 out=$(printf 'struct Point:\n    x: i64\n    y: i64\n\ndef f(p: Point) -> i64:\n    if p.x:\n        return 1\n    return 0\n' | "$RPT")
-echo "$out" | grep -q "if condition must be bool, got i64" || fail "int field-as-condition not flagged: $out"
+grep -q "if condition must be bool, got i64" <<< "$out" || fail "int field-as-condition not flagged: $out"
 
 # 2. a struct int field as a logical operand MUST flag NonBoolOperand.
 out=$(printf 'struct Point:\n    x: i64\n\ndef f(p: Point) -> bool:\n    return p.x and p.x\n' | "$RPT")
-echo "$out" | grep -q "logical operator requires bool operands" || fail "int field-as-operand not flagged: $out"
+grep -q "logical operator requires bool operands" <<< "$out" || fail "int field-as-operand not flagged: $out"
 
 # 3. a bool field used as a condition must NOT be flagged.
 out=$(printf 'struct Flags:\n    on: bool\n\ndef f(fl: Flags) -> i64:\n    if fl.on:\n        return 1\n    return 0\n' | "$RPT")
-echo "$out" | grep -q "condition must be bool" && fail "false positive on bool field condition: $out"
+grep -q "condition must be bool" <<< "$out" && fail "false positive on bool field condition: $out"
 
 # 4. 0 FP across frontend + stdlib.
 t=0

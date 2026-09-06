@@ -15,18 +15,18 @@ fail() { echo "ternary-cond smoke FAIL: $1" >&2; exit 1; }
 # a bare LITERAL by its family. This assertion used to pin the family name, which stage1
 # printed and stage0 never did — the smoke was holding the divergence in place.
 out=$(printf 'def f(n: i64) -> i64:\n    x: i64 = 1 if n else 2\n    return x\n' | "$RPT")
-echo "$out" | grep -q "ternary condition must be bool, got i64" || fail "non-bool ternary cond not flagged: $out"
+grep -q "ternary condition must be bool, got i64" <<< "$out" || fail "non-bool ternary cond not flagged: $out"
 # The literal form still reports the FAMILY, matching stage0.
 out=$(printf 'def f() -> i64:\n    x: i64 = 1 if 3 else 2\n    return x\n' | "$RPT")
-echo "$out" | grep -q "ternary condition must be bool, got int" || fail "literal ternary cond not flagged: $out"
+grep -q "ternary condition must be bool, got int" <<< "$out" || fail "literal ternary cond not flagged: $out"
 
 # 2. a bool condition must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    x: i64 = 1 if n > 0 else 2\n    return x\n' | "$RPT")
-echo "$out" | grep -q "ternary condition" && fail "false positive on bool ternary cond: $out"
+grep -q "ternary condition" <<< "$out" && fail "false positive on bool ternary cond: $out"
 
 # 3. chained ternary — inner bool conditions must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    x: i64 = 1 if n > 0 else (2 if n < 0 else 3)\n    return x\n' | "$RPT")
-echo "$out" | grep -q "ternary condition" && fail "false positive on chained bool ternary: $out"
+grep -q "ternary condition" <<< "$out" && fail "false positive on chained bool ternary: $out"
 
 # 4. 0 FP across frontend + stdlib.
 t=0
