@@ -180,6 +180,8 @@ NAMES=(
     field_arg_to_mutable_ref
     ref_arg_value_param
     generic_operator_no_bound
+    parallel_rebind_threaded
+    tuple_destructure_arity
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -326,6 +328,8 @@ EXPECTS=(
     "argument 1 to \"bump\" expects mutable S&, got S"
     "argument 1 to \"sink\" expects C, got mutable C&"
     "operator \"binary\" used on unbound generic type parameter \"T\""
+    "cannot assign (_0: i64, _1: i64) to i64"
+    "tuple destructuring expects 3 bindings, got 2"
 )
 
 total=0

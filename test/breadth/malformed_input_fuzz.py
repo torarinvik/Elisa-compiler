@@ -91,13 +91,27 @@ def invalid_ir(path, work):
     if not os.path.exists(OPT):
         return None
     ll = os.path.join(work, "out.ll")
-    r = subprocess.run(["bash", WRAP, "-emit", "llvm", "-o", ll, path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       stdin=subprocess.DEVNULL, timeout=120)
-    if r.returncode != 0:
+    # Same rule as compile_rc: an expired budget is retried wider, and if it expires again
+    # the IR is simply UNAVAILABLE — not invalid. This call had no guard at all, so under gate
+    # load a slow `-emit llvm` raised TimeoutExpired straight through main() and the whole
+    # check died with a traceback (Mac gate 2026-09-06).
+    budget = int(os.environ.get("ELISA_MALFORMED_TIMEOUT", "120"))
+    r = None
+    for attempt in (budget, budget * int(os.environ.get("ELISA_TIMEOUT_ESCALATE", "6"))):
+        try:
+            r = subprocess.run(["bash", WRAP, "-emit", "llvm", "-o", ll, path],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               stdin=subprocess.DEVNULL, timeout=attempt)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if r is None or r.returncode != 0:
         return None
-    v = subprocess.run([OPT, "-passes=verify", "-disable-output", ll],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+    try:
+        v = subprocess.run([OPT, "-passes=verify", "-disable-output", ll],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=budget)
+    except subprocess.TimeoutExpired:
+        return None
     if v.returncode == 0:
         return None
     lines = v.stderr.decode().splitlines()

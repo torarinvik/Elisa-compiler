@@ -543,6 +543,19 @@ for f in "$resultdir"/*.result; do
   printf '%s\t%s\n' "$el" "$nm" >> "$timings_file"
   if [[ "$st" == ok ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); failed_names+=("$nm"); fi
 done
+# Keep every FAILING check's log where it can still be read after the run. The result dir is
+# a mktemp that macOS may reap, and the summary prints only a tail — twice today a failure was
+# diagnosed only by re-running the check by hand because its log was already gone.
+if [[ $fail -ne 0 ]]; then
+  failure_dir="$REPO_ROOT/build/gate-failures"
+  rm -rf "$failure_dir"; mkdir -p "$failure_dir"
+  for r in "$resultdir"/*.result; do
+    [[ -e "$r" ]] || continue
+    head -1 "$r" | grep -q '^FAIL' || continue
+    cp "$r" "$failure_dir/$(basename "$r" .result).log"
+  done
+  echo "failing check logs: $failure_dir"
+fi
 rm -rf "$resultdir"
 
 rm -f /tmp/stage1_gate.$$.log
@@ -559,19 +572,6 @@ if [[ -n "${ELISA_S0_CACHE_STATS:-}" && -f "$ELISA_S0_CACHE_STATS" ]]; then
   echo "stage0 oracle cache: $(awk -F'\t' '{n[$1]++} END{for (k in n) printf "%s=%s ", k, n[k]}' "$ELISA_S0_CACHE_STATS")"
   echo "  by mode: $(awk -F'\t' '$1!="bypass"{n[$1"/"$2]++} END{for (k in n) printf "%s=%s ", k, n[k]}' "$ELISA_S0_CACHE_STATS")"
   rm -f "$ELISA_S0_CACHE_STATS"
-fi
-# Keep every FAILING check's log where it can still be read after the run. The result dir is
-# a mktemp that macOS may reap, and the summary prints only a tail — twice today a failure was
-# diagnosed only by re-running the check by hand because its log was already gone.
-if [[ $fail -ne 0 ]]; then
-  failure_dir="$REPO_ROOT/build/gate-failures"
-  rm -rf "$failure_dir"; mkdir -p "$failure_dir"
-  for r in "$resultdir"/*.result; do
-    [[ -e "$r" ]] || continue
-    head -1 "$r" | grep -q '^FAIL' || continue
-    cp "$r" "$failure_dir/$(basename "$r" .result).log"
-  done
-  echo "failing check logs: $failure_dir"
 fi
 echo "----------------------------------------"
 if [[ $fail -eq 0 ]]; then
