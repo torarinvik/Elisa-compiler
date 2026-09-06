@@ -72,8 +72,26 @@ INNER
       else echo "$n	running (attempt $(cat "$JOBS/$n.attempt" 2>/dev/null || echo ?))"; fi
     done ;;
   kill)
+    # The WHOLE tree, not the supervisor alone. Killing just the supervisor left a batch's
+    # twelve corpus workers running for ten minutes and starved the seed launched after it
+    # (measured 2026-09-06). macOS has no setsid, so walk the descendants by parent pid.
     name="${1:?job name}"
-    [ -f "$JOBS/$name.pid" ] && kill -TERM "$(cat "$JOBS/$name.pid")" 2>/dev/null
-    echo 130 > "$JOBS/$name.rc"; echo "killed $name" ;;
+    if [ -f "$JOBS/$name.pid" ]; then
+      root_pid="$(cat "$JOBS/$name.pid")"
+      victims="$root_pid"; frontier="$root_pid"
+      while [ -n "$frontier" ]; do
+        next=""
+        for pp in $frontier; do
+          kids="$(ps -axo pid,ppid | awk -v p="$pp" '$2 == p {print $1}')"
+          [ -n "$kids" ] && { victims="$victims $kids"; next="$next $kids"; }
+        done
+        frontier="$next"
+      done
+      kill -TERM $victims 2>/dev/null; /bin/sleep 2; kill -KILL $victims 2>/dev/null
+      echo "killed $name ($(echo $victims | wc -w | tr -d ' ') processes)"
+    else
+      echo "killed $name (no pid file)"
+    fi
+    echo 130 > "$JOBS/$name.rc" ;;
   *) echo "unknown action: $ACTION" >&2; exit 2 ;;
 esac
