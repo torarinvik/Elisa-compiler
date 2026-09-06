@@ -186,11 +186,11 @@ rows="$(wc -l < "$WORK/deduped.tsv" | tr -d ' ')"
 per_chunk=$(( (rows + JOBS - 1) / JOBS )); [[ "$per_chunk" -gt 0 ]] || per_chunk=1
 mkdir -p "$WORK/chunks"
 split -l "$per_chunk" "$WORK/deduped.tsv" "$WORK/chunks/c."
-find "$WORK/chunks" -name 'c.*' -print0 \
+find "$WORK/chunks" -name 'c.??' -print0 \
   | xargs -0 -P "$JOBS" -n 1 env RPT="$RPT" REPO_ROOT="$REPO_ROOT" ELISACORE_BIN="$ELISACORE_BIN" ELISA_CORE="$ELISA_CORE" bash "$0" --chunk "$WORK"
 total=0; mismatches=0
 : > "$WORK/mismatches.tsv"
-for chunk in "$WORK"/chunks/c.*; do
+for chunk in "$WORK"/chunks/c.??; do   # `c.??` only: the side files are c.??.count/.mismatches
     [[ -f "$chunk.count" ]] || { echo "semantic internal diff FAILED: chunk $chunk produced no count (worker died)" >&2; exit 1; }
     IFS=$'\t' read -r ct cm < "$chunk.count"
     total=$((total + ct)); mismatches=$((mismatches + cm))

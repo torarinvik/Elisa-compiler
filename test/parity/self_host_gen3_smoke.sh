@@ -28,6 +28,10 @@
 # Stage B requires gen2 to compile the compiler itself.
 # Stage C requires the FIXPOINT: gen3.o == gen4.o, byte-identical.
 set -uo pipefail
+# Host predicates for products built by a compiler invoked DIRECTLY here (not through the
+# wrapper, which exports the same two flags): see register_target_consts.
+if [[ "$(uname -s)" == "Linux" ]]; then export ELISA_HOST_LINUX=1; fi
+if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
 set +m   # a crashing gen2 is an EXPECTED outcome here; don't let job control narrate it
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"

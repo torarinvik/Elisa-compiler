@@ -4,6 +4,10 @@
 # Requires a seed product binary (scripts/elisac_stage1.sh --seed).
 # Compiles src/driver/elisac.elisa with the stage1 product and links gen2.
 set -euo pipefail
+# Host predicates for products built by a compiler invoked DIRECTLY here (not through the
+# wrapper, which exports the same two flags): see register_target_consts.
+if [[ "$(uname -s)" == "Linux" ]]; then export ELISA_HOST_LINUX=1; fi
+if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:-$ROOT/build/self_host_gen2}"
 mkdir -p "$OUT_DIR"
