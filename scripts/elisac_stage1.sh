@@ -95,77 +95,11 @@ validate_python_toolchain() {
 }
 resolve_python_tools
 
-flatten_includes() {
-  # Writes the flattened source to stdout. When $2 is given, also writes an OFFSET MAP
-  # there: stage0 expands includes into a buffer with `#line <n> <abs path>` directives
-  # spliced in (writeSourceWithIncludesWithOptionsActive), and its synthesized auto-region
-  # names are `__auto_<offset in THAT buffer>`. The map records, at each flat-buffer
-  # offset where the two buffers diverge, the byte DELTA (stage0 offset - flat offset), as
-  # ascending `flatoff:delta` pairs — the driver's fmt adds the covering delta to a token
-  # offset to recover stage0's number. Indented include directives (stage0 re-indents the
-  # spliced lines) are not modeled; this repo's includes are all at column 0.
-  "$PYTHON_HOST" - "$1" "${2:-}" <<'PY'
-import re, pathlib, sys
-path = pathlib.Path(sys.argv[1]).resolve()
-map_path = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
-include_re = re.compile(r'^[ \t]*(?:#\s*)?include[ \t]+"([^"]+)"[ \t]*$')
-seen = set()
-entries: list[tuple[int, int]] = []
-pos = {"flat": 0, "s0": 0}
-
-def directive_len(line_num: int, abs_path: str) -> int:
-    # "#line %d %s\n"
-    return 6 + len(str(line_num)) + 1 + len(abs_path) + 1
-
-def mark() -> None:
-    delta = pos["s0"] - pos["flat"]
-    if entries and entries[-1][0] == pos["flat"]:
-        entries[-1] = (pos["flat"], delta)
-    else:
-        entries.append((pos["flat"], delta))
-
-def flatten(p: pathlib.Path, out: list[str], stack: list[pathlib.Path]) -> None:
-    ap = p.resolve()
-    if ap in stack:
-        raise SystemExit(f"cyclic include: {ap}")
-    if ap in seen:
-        return
-    seen.add(ap)
-    stack.append(ap)
-    text = p.read_text(encoding="utf-8")
-    base = p.parent
-    pos["s0"] += directive_len(1, str(ap))
-    mark()
-    cur_line = 1
-    for line in text.splitlines(keepends=True):
-        m = include_re.match(line.rstrip("\n"))
-        if m:
-            rel = m.group(1)
-            inc = pathlib.Path(rel) if pathlib.Path(rel).is_absolute() else (base / rel)
-            if not inc.exists():
-                raise SystemExit(f"missing include {rel!r} from {p}")
-            s0_before = pos["s0"]
-            flatten(inc, out, stack)
-            # stage0's newline guard: the spliced content must end with '\n'.
-            if pos["s0"] == s0_before or (out and not out[-1].endswith("\n")):
-                pos["s0"] += 1
-            pos["s0"] += directive_len(cur_line + 1, str(ap))
-            mark()
-        else:
-            out.append(line)
-            pos["flat"] += len(line)
-            pos["s0"] += len(line)
-        cur_line += 1
-    stack.pop()
-
-out: list[str] = []
-flatten(path, out, [])
-sys.stdout.write("".join(out))
-if map_path:
-    with open(map_path, "w") as f:
-        f.write(",".join(f"{o}:{d}" for o, d in entries))
-PY
-}
+# Include expansion is the DRIVER's (expand_includes in src/driver/elisac.elisa): it walks
+# the include graph itself, publishes the original-file line map and the stage0 offset map,
+# and decides the `# smt` and trusted-std facts from its own expanded buffer. The Python
+# flattener that lived here counted CHARACTERS where stage0 counts BYTES, so its offset map
+# was wrong on any non-ASCII source (§4.1).
 
 terminate_guarded_pid() {
   local pid="$1" ticks=0
@@ -561,10 +495,8 @@ if [[ "$emit_mode" != "pymodule-so" && "$emit_mode" != "pymodule-pyi" && -z "$ou
   exit 2
 fi
 [[ -f "$src" ]] || { echo "missing source: $src" >&2; exit 2; }
-[[ -x "$PYTHON_HOST" ]] || {
-  echo "stage1 requires python3 for include expansion (set PYTHON_BIN)" >&2
-  exit 2
-}
+# Python is needed only by the pymodule-so and wasm pipelines below, each of which checks
+# for it itself; include expansion is the driver's (§4.1), so an ordinary compile needs none.
 # Keep all Python-facing emitters consistent: explicit manifest, generated C, stub, and
 # complete-extension paths may point into a directory that does not exist yet.
 case "$emit_mode" in
@@ -572,38 +504,8 @@ case "$emit_mode" in
     [[ -z "$out" ]] || mkdir -p "$(dirname -- "$out")" ;;
 esac
 
-flat="$(mktemp)"
 stage1_request="$(mktemp)"
-trap 'rm -f "$flat" "$flat.map" "$stage1_request"' EXIT
-# Include-free sources need no python expansion: the flattened unit IS the file.
-# Mutant and corpus programs without includes were paying the ~24ms interpreter
-# spawn per compile for a copy.
-if grep -q '^[[:space:]]*include[[:space:]]' "$src"; then
-  flatten_includes "$src" "$flat.map" >"$flat"
-else
-  cp "$src" "$flat"
-  : > "$flat.map"
-fi
-# `# smt` belongs to the original source header, but include flattening can place that
-# header far beyond the first few lines of the expanded buffer. Detect it here, before the
-# source enters the self-hosted compiler, and pass a one-bit fact through the environment.
-# This keeps stage1's in-compiler fallback bounded; an 11 MB self-host input must not turn
-# a header check into an O(source-size) loop in every generated compiler.
-if grep -Eq '^[[:space:]]*#[[:space:]]*smt([[:space:]]|$)' "$src"; then
-  export ELISA_STAGE1_SMT=1
-else
-  unset ELISA_STAGE1_SMT
-fi
-# Trusted-stdlib marker: stage0 skips the user-code-only passes (raw-concurrency surface
-# removal, region-tied return) for elisacore_std's OWN sources, deciding per FILE. stage1
-# cannot — flattening concatenates without line directives, so a declaration's origin is gone
-# by the time the driver sees the source. Decide from the FLATTENED UNIT's CONTENT, not the
-# input path: a program that `include`s the std pulls the std's own definitions into the unit
-# and would otherwise be judged as if it had written them. Keying on the path missed exactly
-# that — every corpus program includes the std. See runtime_std_enabled().
-if grep -q 'def arena_alloc(' "$flat" 2>/dev/null; then
-  export ELISA_STAGE1_RUNTIME_STD=1
-fi
+trap 'rm -f "$stage1_request"' EXIT
 # `-emit deps` / `-emit deps-json` are handled by the DRIVER (emit_deps_report in
 # elisac.elisa), like every other emit mode. They used to be computed here in ~30 lines of
 # Python that re-walked the include graph — a second implementation of dependency discovery,
@@ -611,14 +513,13 @@ fi
 # never got to run. Verified identical to stage0 for both formats over a nested include chain
 # before this was deleted.
 
-# `-emit exe`: compile to a temporary object, then link with the runtime object.
+# `-emit exe`: the DRIVER emits the object beside the executable and links it (§4.3:
+# link_executable — runtime object, weak callback fallback, -link flags, dead-strip). The
+# wrapper only checks the runtime object exists, so the failure names the fix rather than
+# surfacing as an undefined `_arena_free` from the host linker.
 runtime_obj="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-link_out=""
 if [[ "$emit_mode" == "exe" ]]; then
   [[ -f "$runtime_obj" ]] || { echo "-emit exe requires the runtime object at $runtime_obj (run scripts/build_runtime_object.sh)" >&2; exit 2; }
-  link_out="$out"
-  out="$(mktemp).o"
-  emit_mode="obj"
 fi
 
 # `-emit pymodule-so` is the host-facing convenience path for the complete Python
@@ -654,7 +555,7 @@ if [[ "$emit_mode" == "pymodule-so" ]]; then
   }
 
   pymodule_work="$(mktemp -d)"
-  trap 'rm -f "$flat" "$flat.map"; rm -rf "$pymodule_work"' EXIT
+  trap 'rm -rf "$pymodule_work"' EXIT
   pymodule_manifest="$pymodule_work/manifest.json"
   pymodule_c="$pymodule_work/module.c"
   pymodule_obj="$pymodule_work/module.o"
@@ -882,7 +783,7 @@ run_stage1_driver_guarded() {
   # sleeping per gate). A runaway compile still meets the full-interval poll
   # within a few iterations, so the guard's protection is unchanged.
   local driver_poll_now=0.002
-  env "${driver_env[@]+${driver_env[@]}}" "$BIN" <"$stage1_request" &
+  env "${driver_env[@]+${driver_env[@]}}" "$BIN" "${driver_args[@]+${driver_args[@]}}" <"$stage1_request" &
   driver_pid=$!
   while kill -0 "$driver_pid" 2>/dev/null; do
     # The compiler can finish between kill(0) and ps(1). Do not let that ordinary
@@ -915,7 +816,7 @@ if [[ "$emit_mode" == "pymodule-pyi" ]]; then
     exit 2
   }
   pymodule_work="$(mktemp -d)"
-  trap 'rm -f "$flat" "$flat.map"; rm -rf "$pymodule_work"' EXIT
+  trap 'rm -rf "$pymodule_work"' EXIT
   pymodule_manifest="$pymodule_work/manifest.json"
   "$0" -emit pymodule -o "$pymodule_manifest" "$src"
   pymodule_module="$("$python_bin" - "$pymodule_manifest" <<'PY'
@@ -955,6 +856,10 @@ driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
 [[ "$emit_mode" == "bc" ]] && driver_env+=("ELISA_STAGE1_EMIT=bc")
+if [[ "$emit_mode" == "exe" ]]; then
+  driver_env+=("ELISA_STAGE1_EMIT=exe" "ELISA_RUNTIME_OBJ=$runtime_obj")
+  [[ -x "$ELISA_CLANG_TOOL" ]] && driver_env+=("ELISA_CLANG=$ELISA_CLANG_TOOL")
+fi
 # `-emit c-archive` writes its OWN files (the archive and three sidecars), so it needs the
 # mode and the source path but must NOT have stdout redirected like a text report.
 if [[ "$emit_mode" == "interpret" ]]; then
@@ -980,21 +885,29 @@ fi
 # `-emit tokens` prints the report on STDOUT (stage0's shape); redirect it to -o. The
 # report names the ORIGINAL source path, which only the wrapper knows.
 if [[ "$emit_mode" == "tokens" || "$emit_mode" == "ast" || "$emit_mode" == "iface" || "$emit_mode" == "fmt" || "$emit_mode" == "doc" || "$emit_mode" == "header" || "$emit_mode" == "pymodule" || "$emit_mode" == "pymodule-c" || "$emit_mode" == "test-runner" || "$emit_mode" == "c-bind-check" || "$emit_mode" == "c-bind-check-json" || "$emit_mode" == "packed" || "$emit_mode" == "unsafe" || "$emit_mode" == "lowered" || "$emit_mode" == "progress" || "$emit_mode" == "deps" || "$emit_mode" == "deps-json" || "$emit_mode" == "ir" ]]; then
-  # `-emit fmt` additionally needs the OFFSET MAP (see flatten_includes): stage0 names
+  # `-emit fmt` additionally needs the OFFSET MAP (the driver publishes it): stage0 names
   # its synthesized auto-regions `__auto_<pos.Offset>` with offsets measured over its
   # directive-bearing expansion. ELISA_STAGE1_SRC stays as given — the tokens report
   # prints it verbatim and is byte-parity held.
   driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_SRC=$src")
   [[ -n "$test_filter" ]] && driver_env+=("ELISA_STAGE1_FILTER=$test_filter")
-  if [[ ( "$emit_mode" == "fmt" || "$emit_mode" == "lowered" || "$emit_mode" == "iface" ) && -s "$flat.map" ]]; then
-    driver_env+=("ELISA_STAGE1_OFFSET_MAP=$(cat "$flat.map")")
-  fi
   exec > "$out"
 fi
-# stdin protocol: output path line, then source. Materialize the request so the compiler can
-# be monitored directly; this is bounded by the already-created flattened source, not an
-# unbounded shell pipe buffer.
-{ printf '%s\n' "$out"; cat "$flat"; } >"$stage1_request"
+# The driver's CLI door: `-o OUT SRC` with the mode and every other option already in the
+# environment (cli_request leaves ELISA_STAGE1_EMIT alone unless `-emit` is given). The driver
+# expands the includes itself. The stdin request stays as an empty file only because the
+# guarded runner redirects from it.
+# The listing/run modes — the ones stage0 refuses `-o` for, which the case above defaulted to
+# /dev/null — must get NO `-o` here: on the CLI door an output path routes a report INTO that
+# file (that is how the redirected report modes work), and `-o /dev/null` routed the whole
+# `-emit tests|benches|fixtures|test` listing into the void (emit_annotated_list and
+# emit_test_run parity, 2026-09-06). Without `-o` the listing is stdout, as it always was.
+if [[ "$out" == /dev/null ]]; then
+  driver_args=("$src")
+else
+  driver_args=(-o "$out" "$src")
+fi
+: >"$stage1_request"
 if [[ "$noalias" == 1 && "$bounds_check" == 1 ]]; then
   driver_env+=("ELISACORE_NOALIAS_MUTABLE_REFS=1" "ELISACORE_FORCE_BOUNDS_CHECK=1")
 elif [[ "$noalias" == 1 ]]; then
@@ -1004,37 +917,4 @@ elif [[ "$bounds_check" == 1 ]]; then
 fi
 run_stage1_driver_guarded
 compile_rc=$?
-if [[ -n "$link_out" ]]; then
-  [[ "$compile_rc" == 0 && -f "$out" ]] || { rm -f "$out"; exit "${compile_rc:-1}"; }
-  [[ -x "$ELISA_CLANG_TOOL" ]] || {
-    echo "-emit exe requires clang compatible with LLVM_CONFIG=$LLVM_CONFIG (set ELISA_CLANG)" >&2
-    rm -f "$out"
-    exit 2
-  }
-  runtime_link_inputs=("$out" "$runtime_obj")
-  runtime_callback_fallback_obj=""
-  runtime_nm_tool="${ELISA_LLVM_NM:-$LLVM_BIN_DIR/llvm-nm}"
-  # The runtime deliberately leaves optional native callback hooks unresolved so a host
-  # embedding Elisa can provide them. Ordinary executables have no host callback provider,
-  # however, and must receive the documented no-op/fallback implementations just like the
-  # pymodule-so path above; otherwise a simple project `run` fails at the final link with an
-  # unrelated `_elisa_native_callback_call_i32_voidp` symbol error.
-  runtime_unresolved_symbols=""
-  if [[ -x "$runtime_nm_tool" ]]; then
-    runtime_unresolved_symbols="$("$runtime_nm_tool" -u "$runtime_obj" 2>/dev/null || true)"
-  fi
-  if [[ "$runtime_unresolved_symbols" == *elisa_native_callback_* ]]; then
-    runtime_callback_fallback_obj="$out.native-callback.o"
-    "$ELISA_CLANG_TOOL" -c -fPIC -fno-builtin -O2 -o "$runtime_callback_fallback_obj" "$ROOT/scripts/pymodule_runtime_fallback.c" || {
-      rm -f "$out" "$runtime_callback_fallback_obj"
-      exit 1
-    }
-    runtime_link_inputs+=("$runtime_callback_fallback_obj")
-  fi
-  "$ELISA_CLANG_TOOL" -fno-builtin -Wl,-dead_strip -o "$link_out" "${runtime_link_inputs[@]}" || {
-    rm -f "$out" "$runtime_callback_fallback_obj"
-    exit 1
-  }
-  rm -f "$out" "$runtime_callback_fallback_obj"
-fi
 exit "$compile_rc"

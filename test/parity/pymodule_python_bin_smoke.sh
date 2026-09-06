@@ -20,10 +20,12 @@ WRAPPER="$WORK/python-wrapper"
 } > "$WRAPPER"
 chmod +x "$WRAPPER"
 
-# The fixture must CONTAIN an include: the wrapper's include-free fast path
-# legitimately skips the python flatten for sources without one, so this check —
-# whose whole point is that PYTHON_BIN selection reaches the flatten step — must
-# hand it a source that actually needs flattening.
+# The fixture CONTAINS an include on purpose. This check used to prove that PYTHON_BIN
+# selection reached the wrapper's python FLATTEN step; that step is gone (§4.1: the driver
+# expands includes itself), so the wrapper spawns no interpreter for a manifest build any
+# more. What still has to hold: an including source produces its manifest through the
+# driver's expansion, and both spellings of the python selection (PYTHON_BIN and --python)
+# are accepted without reaching for a real interpreter. The log may therefore be EMPTY.
 INCLUDING_SOURCE="$WORK/fastmath.elisa"
 {
     printf 'include "%s"\n' "$ROOT/test/repro/pymodule_export.elisa"
@@ -33,7 +35,7 @@ PYTHON_BIN="$WRAPPER" bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule \
     -o "$WORK/manifest.json" \
     "$INCLUDING_SOURCE" >/dev/null
 
-test "$(wc -l < "$LOG" | tr -d ' ')" = 1
+test "$(cat "$LOG" 2>/dev/null | wc -l | tr -d ' ')" -le 1
 grep -Fq '"module": "fastmath"' "$WORK/manifest.json"
 
 : > "$LOG"
@@ -41,7 +43,7 @@ PYTHON_BIN="$REAL_PYTHON_BIN" bash "$ROOT/scripts/elisac_stage1.sh" \
     --python "$WRAPPER" -emit pymodule \
     -o "$WORK/manifest-cli.json" \
     "$INCLUDING_SOURCE" >/dev/null
-test "$(wc -l < "$LOG" | tr -d ' ')" = 1
+test "$(cat "$LOG" 2>/dev/null | wc -l | tr -d ' ')" -le 1
 grep -Fq '"module": "fastmath"' "$WORK/manifest-cli.json"
 
 echo "pymodule PYTHON_BIN smoke OK"
