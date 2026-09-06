@@ -312,7 +312,23 @@ seed_build() {
     fi
     sleep "$seed_rss_poll_seconds"
   done
+  # Collect the child status explicitly instead of letting `set -e` terminate the
+  # wrapper before it can explain why the seed failed. A host kill (for example,
+  # SIGKILL from memory pressure or an external process supervisor) otherwise
+  # leaves only a silent status-1 wrapper failure and no actionable evidence in
+  # the seed log.
+  set +e
   wait "$seed_pid"
+  seed_status=$?
+  set -e
+  if [[ "$seed_status" -ne 0 ]]; then
+    if [[ "$seed_status" -gt 128 ]]; then
+      echo "seed: stage0 compiler terminated with status $seed_status (signal $((seed_status - 128)))" >&2
+    else
+      echo "seed: stage0 compiler failed with status $seed_status" >&2
+    fi
+    exit "$seed_status"
+  fi
   # -stack_size: a deeply left-nested expression (adversarial input, see
   # malformed_input_fuzz.py / the depth guard in codegen_scope.elisa's expression_type)
   # recurses once per AST level through emit_expression. 0x20000000 (512MB) is the max
