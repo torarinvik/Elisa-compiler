@@ -4,6 +4,10 @@
 # Requires a seed product binary (scripts/elisac_stage1.sh --seed).
 # Compiles src/driver/elisac.elisa with the stage1 product and links gen2.
 set -euo pipefail
+# Host predicates for products built by a compiler invoked DIRECTLY here (not through the
+# wrapper, which exports the same two flags): see register_target_consts.
+if [[ "$(uname -s)" == "Linux" ]]; then export ELISA_HOST_LINUX=1; fi
+if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:-$ROOT/build/self_host_gen2}"
 mkdir -p "$OUT_DIR"
@@ -16,7 +20,7 @@ LIBDIR="$("$LLVM_CONFIG" --libdir)"
 [[ -f "$RUNTIME_OBJ" ]] || { echo "missing runtime object $RUNTIME_OBJ (run scripts/build_runtime_object.sh)" >&2; exit 2; }
 unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$BIN"
-export PATH="/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin"
+export PATH="/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin:/usr/local/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
 
 DEFAULT_SELF_HOST_GEN2_MAX_RSS_KB=8388608
 DEFAULT_SELF_HOST_GEN2_POLL_SECONDS=0.05

@@ -43,6 +43,11 @@ else
   done
   STAGE0_BIN="${STAGE0_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 fi
+# Host predicates for the product's `static if ELISA_TARGET_OS_*` / `PLATFORM_*` consts and
+# the project system's platform key (see register_target_consts / host_platform_name). stage0
+# reads runtime.GOOS; the self-hosted compiler reads these flags, exported once here.
+if [[ "$(uname -s)" == "Linux" ]]; then export ELISA_HOST_LINUX=1; fi
+if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
 # Include expansion is a host-side Python step. Resolve the same interpreter selected by
 # `PYTHON_BIN` (including a command name such as `python3.14`) before any emit mode runs so
 # custom toolchains are honored consistently by the wrapper and its recursive invocations.

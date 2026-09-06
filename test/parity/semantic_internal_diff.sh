@@ -21,8 +21,12 @@ set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 SNAPSHOT="$REPO_ROOT/test/fixtures/semantic_internal_oracle.tsv.gz"
 BASELINE_FILE="$REPO_ROOT/test/fixtures/semantic_internal.baseline"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+if [[ "${1:-}" == "--chunk" ]]; then
+    WORK="$2"
+else
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+fi
 
 [[ -f "$SNAPSHOT" ]] || { echo "semantic internal diff FAILED: missing $SNAPSHOT" >&2; exit 1; }
 [[ -f "$BASELINE_FILE" ]] || { echo "semantic internal diff FAILED: missing $BASELINE_FILE" >&2; exit 1; }
@@ -34,6 +38,8 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 ORACLE="$WORK/oracle.tsv"
+# Workers (`--chunk`) share the parent's oracle; only the parent extracts and dedupes it.
+if [[ "${1:-}" != "--chunk" ]]; then
 gunzip -c "$SNAPSHOT" > "$ORACLE"
 
 # Dedupe by (fingerprint, source); keep the MAX diagnostic count per key. stage0
@@ -50,6 +56,7 @@ sort -t$'\t' -k4,4 -k5,5 "$ORACLE" | awk -F'\t' '
     }
     END { flush() }
 ' > "$WORK/deduped.tsv"
+fi
 
 total=0
 mismatches=0
@@ -73,6 +80,15 @@ is_runtime_std() {
     esac
     return 1
 }
+# PARALLEL (Phase T, 2026-09-06): the replay is one `parse_report` process per row and rows
+# are independent, so the deduped oracle is split into ELISA_INTERNAL_JOBS chunks (default =
+# core count) and each chunk is replayed by a re-entry of this script (`--chunk <work>
+# <file>`), which writes `<file>.count` (total<TAB>mismatches) and `<file>.mismatches.tsv`.
+# The parent sums the counts and concatenates the mismatch rows in chunk order, so the
+# report is deterministic. Measured serial: ~2.5 min for 3210 rows.
+replay_chunk() {
+    local total=0 mismatches=0
+    : > "$1.mismatches.tsv"
 while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 overlay_b64; do
     total=$((total + 1))
     opts="$(printf '%s' "$opts_b64" | openssl base64 -d -A)"
@@ -155,9 +171,31 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
     [[ $((parse_errors + diagnostics)) -gt 0 ]] && actual_class=1
     if [[ "$expected_class" != "$actual_class" ]]; then
         mismatches=$((mismatches + 1))
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$fname_b64" "$errors" "$warnings" "$opts_b64" "$src_b64" "$msgs_b64" >> "$WORK/mismatches.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$fname_b64" "$errors" "$warnings" "$opts_b64" "$src_b64" "$msgs_b64" >> "$1.mismatches.tsv"
     fi
-done < "$WORK/deduped.tsv"
+done < "$1"
+    printf '%s\t%s\n' "$total" "$mismatches" > "$1.count"
+}
+
+if [[ "${1:-}" == "--chunk" ]]; then
+    WORK="$2"; replay_chunk "$3"; exit 0
+fi
+
+JOBS="${ELISA_INTERNAL_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+rows="$(wc -l < "$WORK/deduped.tsv" | tr -d ' ')"
+per_chunk=$(( (rows + JOBS - 1) / JOBS )); [[ "$per_chunk" -gt 0 ]] || per_chunk=1
+mkdir -p "$WORK/chunks"
+split -l "$per_chunk" "$WORK/deduped.tsv" "$WORK/chunks/c."
+find "$WORK/chunks" -name 'c.??' -print0 \
+  | xargs -0 -P "$JOBS" -n 1 env RPT="$RPT" REPO_ROOT="$REPO_ROOT" ELISACORE_BIN="$ELISACORE_BIN" ELISA_CORE="$ELISA_CORE" bash "$0" --chunk "$WORK"
+total=0; mismatches=0
+: > "$WORK/mismatches.tsv"
+for chunk in "$WORK"/chunks/c.??; do   # `c.??` only: the side files are c.??.count/.mismatches
+    [[ -f "$chunk.count" ]] || { echo "semantic internal diff FAILED: chunk $chunk produced no count (worker died)" >&2; exit 1; }
+    IFS=$'\t' read -r ct cm < "$chunk.count"
+    total=$((total + ct)); mismatches=$((mismatches + cm))
+    cat "$chunk.mismatches.tsv" >> "$WORK/mismatches.tsv"
+done
 
 # Optional persistent dump for burn-down work (not part of the gate).
 if [[ -n "${ELISA_INTERNAL_MISMATCH_OUT:-}" ]]; then

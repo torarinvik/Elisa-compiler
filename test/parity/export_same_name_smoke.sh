@@ -1,37 +1,41 @@
 #!/usr/bin/env bash
 # Same-name exports must be reachable from C under their own names, with the C
 # ABI, from BOTH compilers: a scalar export is the implementation itself, an
-# aggregate export is a wrapper (implementation renamed `.impl`), and a
-# same-name type/global register nothing new. This is the executable counterpart
-# to export_same_name_parity_smoke.sh.
+# 8-byte aggregate export is a wrapper (implementation renamed `.impl`), a
+# same-name type and global register nothing new. Links a C caller against
+# each compiler's object and the emitted header and runs it.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -n "${ELISACORE_BIN:-}" ]]; then
-    STAGE0="$ELISACORE_BIN"
-else
-    STAGE0=""
-    for stage0_candidate in \
-        "$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac" \
-        "$ROOT/../../../Go projects/structpy-tree/compiler/bin/elisac" \
-        "$ROOT/../wasm-sdk-stage0/compiler/bin/elisac"; do
-        if [[ -x "$stage0_candidate" ]]; then
-            STAGE0="$stage0_candidate"
-            break
-        fi
-    done
-    STAGE0="${STAGE0:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
-fi
-STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-FIXTURE="$ROOT/test/repro/export_same_name.elisa"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-same-name.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
-
-[[ -x "$STAGE0" ]] || { echo "same-name export C smoke SKIP: no stage0 at $STAGE0"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "same-name export C smoke SKIP: no stage1 at $STAGE1"; exit 0; }
-[[ -f "$RUNTIME" ]] || { echo "same-name export C smoke SKIP: no runtime object at $RUNTIME"; exit 0; }
-
-cat > "$WORK/caller.c" <<'C'
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
+[ -x "$ELISACORE_BIN" ] || { echo "export_same_name_smoke SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
+[ -f "$RUNTIME" ] || { echo "export_same_name_smoke SKIP: no runtime object"; exit 0; }
+BUILD="$ROOT/build/export_same_name_smoke"; mkdir -p "$BUILD"
+cat > "$BUILD/mod.elisa" <<'ELISA'
+struct Vec2 layout(c):
+    x: i32
+    y: i32
+export type Vec2 as Vec2
+global MAGIC: i32 = 1337
+export global MAGIC as MAGIC
+def add(a: i32, b: i32) -> i32:
+    return a + b
+export fn add(a: i32, b: i32) -> i32 = add
+def vec2_sum(v: Vec2) -> i32:
+    return v.x + v.y
+export fn vec2_sum(v: Vec2) -> i32 = vec2_sum
+def make_vec2(x: i32, y: i32) -> Vec2:
+    return Vec2{x: x, y: y}
+export fn make_vec2(x: i32, y: i32) -> Vec2 = make_vec2
+def mul_impl(a: i32, b: i32) -> i32:
+    return a * b
+export fn mul(a: i32, b: i32) -> i32 = mul_impl
+def uses_internally() -> i32:
+    v: Vec2 = Vec2{x: 3, y: 4}
+    return add(vec2_sum(v), MAGIC)
+export fn uses_internally() -> i32 = uses_internally
+ELISA
+cat > "$BUILD/caller.c" <<'C'
 #include <stdio.h>
 #include "mod.h"
 int main(void) {
@@ -49,48 +53,20 @@ int main(void) {
     return ok ? 0 : 1;
 }
 C
-
 status=0
 run_one() {
-    local label="$1"
-    shift
-    local dir="$WORK/$label"
-    mkdir -p "$dir"
-
-    if ! "$@" -emit obj -O0 -o "$dir/mod.o" "$FIXTURE" >"$dir/obj.log" 2>&1; then
-        echo "same-name export C smoke FAIL [$label]: compile"
-        head -3 "$dir/obj.log"
-        status=1
-        return
-    fi
-    if ! "$@" -emit header -o "$dir/mod.h" "$FIXTURE" >"$dir/header.log" 2>&1; then
-        echo "same-name export C smoke FAIL [$label]: header"
-        head -3 "$dir/header.log"
-        status=1
-        return
-    fi
-    for symbol in _add _vec2_sum _mul _uses_internally _make_vec2; do
-        nm "$dir/mod.o" | grep -q " T $symbol\$" || {
-            echo "same-name export C smoke FAIL [$label]: $symbol is not external"
-            nm "$dir/mod.o" | grep -i "$symbol" || true
-            status=1
-            return
-        }
-    done
-    if ! clang -Wl,-dead_strip -I"$dir" -o "$dir/caller" "$WORK/caller.c" "$dir/mod.o" "$RUNTIME" >"$dir/link.log" 2>&1; then
-        echo "same-name export C smoke FAIL [$label]: link"
-        head -5 "$dir/link.log"
-        status=1
-        return
-    fi
-    if [[ "$("$dir/caller" || true)" != "ALL OK" ]]; then
-        echo "same-name export C smoke FAIL [$label]: C caller failed"
-        status=1
-        return
-    fi
-    echo "same-name export C smoke OK [$label]: ALL OK from C"
+  local label="$1"; shift
+  local dir="$BUILD/$label"; mkdir -p "$dir"
+  if ! "$@" -emit obj -O0 -o "$dir/mod.o" "$BUILD/mod.elisa" >"$dir/obj.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: compile"; head -3 "$dir/obj.log"; status=1; return; fi
+  if ! "$@" -emit header -o "$dir/mod.h" "$BUILD/mod.elisa" >"$dir/hdr.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: header"; head -3 "$dir/hdr.log"; status=1; return; fi
+  for sym in _add _vec2_sum _mul _uses_internally _make_vec2; do
+    nm "$dir/mod.o" | grep -q " T $sym\$" || { echo "export_same_name_smoke FAIL [$label]: $sym is not an external symbol"; nm "$dir/mod.o" | grep -i "$sym" || true; status=1; return; }
+  done
+  if ! clang -Wl,-dead_strip -I"$dir" -o "$dir/caller" "$BUILD/caller.c" "$dir/mod.o" "$RUNTIME" >"$dir/link.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: link"; head -5 "$dir/link.log"; status=1; return; fi
+  out="$("$dir/caller" || true)"
+  if [ "$out" != "ALL OK" ]; then echo "export_same_name_smoke FAIL [$label]: C caller says: $out"; status=1; return; fi
+  echo "export_same_name_smoke OK [$label]: ALL OK from C"
 }
-
-run_one stage0 "$STAGE0"
-run_one stage1 "$ROOT/scripts/elisac_stage1.sh"
-exit "$status"
+run_one stage0 "$ELISACORE_BIN"
+run_one stage1 bash "$ROOT/scripts/elisac_stage1.sh"
+exit $status

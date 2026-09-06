@@ -45,7 +45,7 @@ stage0_globals() {   # $1 = source file, $2 = "on"|"off"
     # on the same text. The "off" dial has no stage0 side any more; see expect_silent_by_default.
     [ "$2" = "on" ] || return 0
     "$ELISACORE_BIN" -emit semantic "$1" 2>/dev/null \
-        | awk '/^func /{fn=$2; sub(/.*\\./,"",fn)} /required_effects=\[/{
+        | awk '/^func /{fn=$2; sub(/.*\./,"",fn)} /required_effects=\[/{
               s=$0; sub(/.*required_effects=\[/,"",s); sub(/\].*/,"",s);
               n=split(s,parts,/, /); g="";
               for(i=1;i<=n;i++){ if(parts[i] ~ /^Global\./){ g=(g==""?parts[i]:g ", " parts[i]) } }
