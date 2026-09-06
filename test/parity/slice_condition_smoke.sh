@@ -8,12 +8,12 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 string_slice=$(printf 'def bad(text: cstr[row]) -> void:\n    while text[0:1]:\n        pass\n' | "$RPT")
-printf '%s\n' "$string_slice" | grep -q 'while condition must be bool'
+grep -q 'while condition must be bool' <<< "$string_slice"
 
 array_slice=$(printf 'def bad(values: darray[i32]) -> void:\n    if values[0:1]:\n        pass\n' | "$RPT")
-printf '%s\n' "$array_slice" | grep -q 'if condition must be bool'
+grep -q 'if condition must be bool' <<< "$array_slice"
 
 comparison=$(printf 'def ok(text: cstr[row]) -> void:\n    while text[0:1] == "x":\n        pass\n' | "$RPT")
-printf '%s\n' "$comparison" | grep -q '^D 0$'
+grep -q '^D 0$' <<< "$comparison"
 
 echo "slice condition smoke OK" >&2

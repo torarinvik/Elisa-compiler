@@ -15,7 +15,7 @@ if [[ "$status" -gt 1 ]]; then
     printf 'local constant evaluator overflow regression: compiler failed with %s\n%s\n' "$status" "$output" >&2
     exit 1
 fi
-if ! printf '%s\n' "$output" | grep -q 'could not be proven'; then
+if ! grep -q 'could not be proven' <<< "$output"; then
     printf 'local constant evaluator overflow regression: overflow was not kept unresolved\n%s\n' "$output" >&2
     exit 1
 fi

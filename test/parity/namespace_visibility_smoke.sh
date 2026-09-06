@@ -8,12 +8,12 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 without_using=$(printf 'module math:\n    def inc(value: int) -> int:\n        return value + 1\n\ndef run() -> int:\n    return inc(41)\n' | "$RPT")
-printf '%s\n' "$without_using" | grep -q "undefined identifier \"inc\""
+grep -q "undefined identifier \"inc\"" <<< "$without_using"
 
 with_using=$(printf 'module math:\n    def inc(value: int) -> int:\n        return value + 1\n\nusing math\n\ndef run() -> int:\n    return inc(41)\n' | "$RPT")
-printf '%s\n' "$with_using" | grep -q '^D 0$'
+grep -q '^D 0$' <<< "$with_using"
 
 inside_owner=$(printf 'module math:\n    def inc(value: int) -> int:\n        return value + 1\n    def twice(value: int) -> int:\n        return inc(inc(value))\n' | "$RPT")
-printf '%s\n' "$inside_owner" | grep -q '^D 0$'
+grep -q '^D 0$' <<< "$inside_owner"
 
 echo "namespace visibility smoke OK" >&2

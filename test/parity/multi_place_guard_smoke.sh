@@ -12,13 +12,13 @@ fail() { echo "multi-place guard smoke FAIL: $1" >&2; exit 1; }
 
 # 1. Pure value form: both places written iff the guard holds.
 out=$(printf 'def two(x: i64) -> (p: i64, q: i64):\n    return x + 1, x + 2\ndef t1() -> void:\n    a: mutable i64 = 0\n    b: mutable i64 = 0\n    a, b <- two(10) if a == 0\n' | "$RPT")
-echo "$out" | grep -q "^P 0$" || fail "value form had parse errors: $out"
-echo "$out" | grep -q "^D 0$" || fail "value form had diagnostics: $out"
+grep -q "^P 0$" <<< "$out" || fail "value form had parse errors: $out"
+grep -q "^D 0$" <<< "$out" || fail "value form had diagnostics: $out"
 
 # 2. Thread-claim discard form (the parser idiom): `parser, _ <- call() if COND`.
 out=$(printf 'struct P:\n    n: mutable i64\ndef step(p: lmut P) -> i64:\n    p.n <- p.n + 1\n    return p.n\ndef t2(flag: bool) -> void:\n    p: mutable P = P{n: 0}\n    p, _ <- p.step() if flag\n' | "$RPT")
-echo "$out" | grep -q "^P 0$" || fail "thread-claim form had parse errors: $out"
-echo "$out" | grep -q "^D 0$" || fail "thread-claim form had diagnostics: $out"
+grep -q "^P 0$" <<< "$out" || fail "thread-claim form had parse errors: $out"
+grep -q "^D 0$" <<< "$out" || fail "thread-claim form had diagnostics: $out"
 
 # 3. Runtime semantics via stage0 -emit test: skipped guard leaves both places untouched.
 tmp="$(mktemp -t mpguard).elisa"

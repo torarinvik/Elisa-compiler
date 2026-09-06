@@ -14,6 +14,6 @@ pipe=$(printf 'error IoError:\n    NotFound\nextern read_file(path: u8&) -> int 
 printf '%s\n' "$pipe" | grep -Fq 'legacy fallible return syntax `T | ErrorSet` is no longer supported'
 
 valid=$(printf 'def bits(x: int, y: int) -> int:\n    return x | y\n' | "$RPT")
-printf '%s\n' "$valid" | grep -q '^D 0$'
+grep -q '^D 0$' <<< "$valid"
 
 echo "legacy error syntax smoke OK" >&2

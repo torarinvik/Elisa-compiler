@@ -16,15 +16,15 @@ PRELUDE='struct Counter:\n    value: mutable i64\n\ndef combine(a: lmut Counter,
 
 # 1. POSITIVE: the same variable passed to two lmut params must be flagged.
 out=$(printf "${PRELUDE}def use() -> void:\n    c: mutable Counter = Counter{value: 1}\n    combine(c, c)\n" | "$RPT")
-echo "$out" | grep -q "$MSG" || fail "combine(c, c) not flagged: $out"
+grep -q "$MSG" <<< "$out" || fail "combine(c, c) not flagged: $out"
 
 # 2. Distinct variables must stay silent.
 out=$(printf "${PRELUDE}def use() -> void:\n    c: mutable Counter = Counter{value: 1}\n    d: mutable Counter = Counter{value: 2}\n    combine(c, d)\n" | "$RPT")
-echo "$out" | grep -q "$MSG" && fail "false positive on combine(c, d): $out"
+grep -q "$MSG" <<< "$out" && fail "false positive on combine(c, d): $out"
 
 # 3. Disjoint fields of one root do NOT alias — must stay silent.
 out=$(printf 'struct Counter:\n    value: mutable i64\nstruct Pair:\n    a: mutable Counter\n    b: mutable Counter\ndef combine(x: lmut Counter, y: lmut Counter) -> void:\n    x.value <- x.value + y.value\ndef use() -> void:\n    p: mutable Pair = Pair{a: Counter{value: 1}, b: Counter{value: 2}}\n    combine(p.a, p.b)\n' | "$RPT")
-echo "$out" | grep -q "$MSG" && fail "false positive on disjoint fields combine(p.a, p.b): $out"
+grep -q "$MSG" <<< "$out" && fail "false positive on disjoint fields combine(p.a, p.b): $out"
 
 # 4. Zero false positives across the whole frontend + stdlib (heavy real lmut usage).
 t=0

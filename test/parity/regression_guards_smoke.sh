@@ -15,9 +15,9 @@ neg="$REPO_ROOT/test/fixtures/diagnostics/literal_comparison_impossible.neg.elis
 [ -f "$neg" ] || fail "missing literal-comparison negative fixture"
 
 out=$("$RPT" < "$pos")
-echo "$out" | grep -q "comparison is always vacuous" || fail "literal-comparison positive no longer fires: $out"
+grep -q "comparison is always vacuous" <<< "$out" || fail "literal-comparison positive no longer fires: $out"
 out=$("$RPT" < "$neg")
-echo "$out" | grep -q "comparison is always vacuous" && fail "literal-comparison negative false positive: $out"
+grep -q "comparison is always vacuous" <<< "$out" && fail "literal-comparison negative false positive: $out"
 
 bash "$REPO_ROOT/test/parity/machine_from_smoke.sh" >/tmp/stage1_machine_from_regression.$$.log 2>&1 || {
     tail -5 /tmp/stage1_machine_from_regression.$$.log >&2

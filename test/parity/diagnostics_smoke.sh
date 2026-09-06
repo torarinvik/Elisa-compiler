@@ -333,7 +333,7 @@ failed=0
 
 check_parses() {
     local file="$1" out="$2"
-    if ! echo "$out" | grep -qE '^P 0$'; then
+    if ! grep -qE '^P 0$' <<< "$out"; then
         echo "  FAIL $(basename "$file"): fixture failed to parse cleanly (expected 'P 0'):" >&2
         echo "$out" | sed 's/^/    /' >&2
         return 1
@@ -355,7 +355,7 @@ run_case() {
     fi
 
     if [[ "$kind" == "pos" ]]; then
-        if echo "$out" | grep -qF "$expect"; then
+        if grep -qF "$expect" <<< "$out"; then
             echo "  PASS $name.pos (fired: \"$expect\")"
         else
             echo "  FAIL $name.pos: expected diagnostic not found" >&2
@@ -365,7 +365,7 @@ run_case() {
             failed=$((failed + 1))
         fi
     else
-        if echo "$out" | grep -qF "$expect"; then
+        if grep -qF "$expect" <<< "$out"; then
             echo "  FAIL $name.neg: diagnostic fired but must stay silent" >&2
             echo "    forbidden substring: $expect" >&2
             echo "    actual output:" >&2

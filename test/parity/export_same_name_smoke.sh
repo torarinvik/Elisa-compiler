@@ -60,7 +60,7 @@ run_one() {
   if ! "$@" -emit obj -O0 -o "$dir/mod.o" "$BUILD/mod.elisa" >"$dir/obj.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: compile"; head -3 "$dir/obj.log"; status=1; return; fi
   if ! "$@" -emit header -o "$dir/mod.h" "$BUILD/mod.elisa" >"$dir/hdr.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: header"; head -3 "$dir/hdr.log"; status=1; return; fi
   for sym in _add _vec2_sum _mul _uses_internally _make_vec2; do
-    nm "$dir/mod.o" | grep -q " T $sym\$" || { echo "export_same_name_smoke FAIL [$label]: $sym is not an external symbol"; nm "$dir/mod.o" | grep -i "$sym" || true; status=1; return; }
+    nm "$dir/mod.o" | grep  " T $sym\$" >/dev/null || { echo "export_same_name_smoke FAIL [$label]: $sym is not an external symbol"; nm "$dir/mod.o" | grep -i "$sym" || true; status=1; return; }
   done
   if ! clang -Wl,-dead_strip -I"$dir" -o "$dir/caller" "$BUILD/caller.c" "$dir/mod.o" "$RUNTIME" >"$dir/link.log" 2>&1; then echo "export_same_name_smoke FAIL [$label]: link"; head -5 "$dir/link.log"; status=1; return; fi
   out="$("$dir/caller" || true)"

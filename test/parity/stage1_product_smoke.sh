@@ -58,7 +58,7 @@ if [[ "$got" -ne 42 ]]; then
 fi
 
 # Prove we did not invoke stage0 Go elisac during the compile: product binary path.
-if ! file "$BIN" | grep -q 'Mach-O\|ELF'; then
+if ! file "$BIN" | grep  'Mach-O\|ELF' >/dev/null; then
   echo "stage1_product_smoke FAIL: product binary not a native executable" >&2
   exit 1
 fi

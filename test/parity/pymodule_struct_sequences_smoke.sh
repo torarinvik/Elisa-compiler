@@ -16,7 +16,7 @@ fi
 
 # Some checkout-local runtime objects intentionally leave the optional native callback host
 # unresolved.  Do not turn that unrelated linker setup into a false negative for this ABI smoke.
-if nm -u "$ROOT/build/runtime/elisacore_runtime.o" 2>/dev/null | grep -q 'elisa_native_callback_'; then
+if nm -u "$ROOT/build/runtime/elisacore_runtime.o" 2>/dev/null | grep  'elisa_native_callback_' >/dev/null; then
     echo "pymodule struct sequences smoke SKIP (runtime callback host unavailable)"
     exit 0
 fi

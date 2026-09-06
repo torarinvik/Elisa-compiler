@@ -17,37 +17,37 @@ fail() { echo "struct-layout smoke FAIL: $1" >&2; exit 1; }
 
 # 1. An unknown field type MUST be flagged (only lowercase names, to avoid cross-module false positives).
 out=$(printf 'struct Point:\n    x: unknown\n    y: i64\n' | "$RPT")
-echo "$out" | grep -q "L2 .*has unknown type \"unknown\"" || fail "unknown field type not flagged on field line: $out"
+grep -q "L2 .*has unknown type \"unknown\"" <<< "$out" || fail "unknown field type not flagged on field line: $out"
 
 # 2. A directly self-recursive struct MUST be flagged.
 out=$(printf 'struct Node:\n    val: i64\n    next: Node\n' | "$RPT")
-echo "$out" | grep -q "L3 .*directly self-recursive" || fail "direct self-recursion not flagged on field line: $out"
+grep -q "L3 .*directly self-recursive" <<< "$out" || fail "direct self-recursion not flagged on field line: $out"
 
 # 3. A ref-indirected self-reference must NOT be flagged (sound indirection).
 out=$(printf 'struct Node:\n    val: i64\n    next: Node&\n' | "$RPT")
-echo "$out" | grep -q "directly self-recursive" && fail "false positive on ref-indirected self-ref: $out"
+grep -q "directly self-recursive" <<< "$out" && fail "false positive on ref-indirected self-ref: $out"
 
 # 4. An optional self-reference must NOT be flagged (sound indirection).
 out=$(printf 'struct Node:\n    val: i64\n    next: Node?\n' | "$RPT")
-echo "$out" | grep -q "directly self-recursive" && fail "false positive on optional self-ref: $out"
+grep -q "directly self-recursive" <<< "$out" && fail "false positive on optional self-ref: $out"
 
 # 5. Distinct field types must NOT be flagged.
 out=$(printf 'struct Point:\n    x: i64\n    y: i64\n' | "$RPT")
-echo "$out" | grep -q "unknown type" && fail "false positive on i64 field: $out"
-echo "$out" | grep -q "directly self-recursive" && fail "false positive on distinct fields: $out"
+grep -q "unknown type" <<< "$out" && fail "false positive on i64 field: $out"
+grep -q "directly self-recursive" <<< "$out" && fail "false positive on distinct fields: $out"
 
 # 6. Mutual recursion via refs is sound and NOT flagged.
 out=$(printf 'struct A:\n    b: B&\nstruct B:\n    a: A&\n' | "$RPT")
-echo "$out" | grep -q "directly self-recursive" && fail "false positive on mutual ref-recursion: $out"
+grep -q "directly self-recursive" <<< "$out" && fail "false positive on mutual ref-recursion: $out"
 
 # 7. A qualified type in a known module must flag an unknown member type.
 out=$(printf 'module M:\n    struct Good:\n        x: i64\n\nstruct Bad:\n    x: M::Missing\n' | "$RPT")
-echo "$out" | grep -q "has unknown type \"Missing\"" || fail "qualified unknown field type not flagged: $out"
+grep -q "has unknown type \"Missing\"" <<< "$out" || fail "qualified unknown field type not flagged: $out"
 
 # 8. Nested/compound qualified paths remain conservative until nested ownership
 # metadata is modeled; a known nested type must not produce a false positive.
 out=$(printf 'module M::N:\n    struct Good:\n        x: i64\n\nstruct Uses:\n    x: M::N::Good\n' | "$RPT")
-echo "$out" | grep -q "unknown type" && fail "false positive on nested qualified type: $out"
+grep -q "unknown type" <<< "$out" && fail "false positive on nested qualified type: $out"
 
 # 9. 0 FP across frontend + stdlib.
 n=0

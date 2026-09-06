@@ -11,15 +11,15 @@ fail() { echo "match-expr smoke FAIL: $1" >&2; exit 1; }
 E='enum E:\n    A\n    B\n'
 
 # 1. `return match` parses with zero parse errors.
-p=$(printf "${E}def f(e: E) -> i64:\n    return match e:\n        E.A: 1\n        E.B: 2\n" | "$RPT" | head -1 | awk '{print $2}')
+p=$(printf "${E}def f(e: E) -> i64:\n    return match e:\n        E.A: 1\n        E.B: 2\n" | "$RPT" | awk 'NR == 1 { print $2 }')
 [ "$p" = "0" ] || fail "return-match still has parse errors: P=$p"
 
 # 2. `x = match` (assignment position) parses.
-p=$(printf "${E}def f(e: E) -> i64:\n    x: i64 = match e:\n        E.A: 1\n        E.B: 2\n    return x\n" | "$RPT" | head -1 | awk '{print $2}')
+p=$(printf "${E}def f(e: E) -> i64:\n    x: i64 = match e:\n        E.A: 1\n        E.B: 2\n    return x\n" | "$RPT" | awk 'NR == 1 { print $2 }')
 [ "$p" = "0" ] || fail "assign-match still has parse errors: P=$p"
 
 # 3. resolution descends into arms: an undefined identifier in an arm body is flagged.
 out=$(printf "${E}def f(e: E, k: i64) -> i64:\n    return match e:\n        E.A: k\n        E.B: nope\n" | "$RPT")
-echo "$out" | grep -q "undefined identifier \"nope\"" || fail "arm body not resolved: $out"
+grep -q "undefined identifier \"nope\"" <<< "$out" || fail "arm body not resolved: $out"
 
 echo "match-expr smoke OK: return/assign match-expressions parse, arms resolve"

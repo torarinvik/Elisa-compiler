@@ -14,7 +14,7 @@ bad=$(printf '%s\n' \
   '' \
   'def f() -> i64:' \
   '    return M' | "$RPT")
-echo "$bad" | grep -q "is a namespace; write M::member" || fail "namespace used as value was not rejected: $bad"
+grep -q "is a namespace; write M::member" <<< "$bad" || fail "namespace used as value was not rejected: $bad"
 
 good=$(printf '%s\n' \
   'module M:' \
@@ -23,7 +23,7 @@ good=$(printf '%s\n' \
   '' \
   'def f() -> i64:' \
   '    return M::value()' | "$RPT")
-echo "$good" | grep -q '^P 0$' || fail "qualified module call did not parse: $good"
-echo "$good" | grep -q '^D 0$' || fail "qualified module call produced diagnostics: $good"
+grep -q '^P 0$' <<< "$good" || fail "qualified module call did not parse: $good"
+grep -q '^D 0$' <<< "$good" || fail "qualified module call produced diagnostics: $good"
 
 echo "namespace smoke OK: namespace-as-value rejected, :: access accepted"

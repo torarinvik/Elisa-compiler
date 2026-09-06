@@ -216,7 +216,7 @@ one_program() {
         if [ "$s0_rc" != "$s0_rc2" ]; then
             printf 'FLAKY\t%s\t(oracle nondeterministic: stage0 %s/%s)\n' "$name" "$s0_rc" "$s0_rc2"; return 0
         fi
-        if [ "$s1_rc" != "$s1_rc2" ] && printf '%s\n' ${KNOWN_INTERMITTENT[@]+"${KNOWN_INTERMITTENT[@]}"} | grep -qx "$name"; then
+        if [ "$s1_rc" != "$s1_rc2" ] && printf '%s\n' ${KNOWN_INTERMITTENT[@]+"${KNOWN_INTERMITTENT[@]}"} | grep -x "$name" >/dev/null; then
             printf 'INTERMITTENT\t%s\t(stage0 %s, stage1 %s/%s)\n' "$name" "$s0_rc" "$s1_rc" "$s1_rc2"; return 0
         fi
         if [ "$s1_rc" != "$s1_rc2" ]; then

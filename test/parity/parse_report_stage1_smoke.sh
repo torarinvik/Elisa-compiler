@@ -42,15 +42,15 @@ fi
 }
 
 report="$(printf 'def f(n: i64) -> i64:\n    return n + 1\n' | "$WORK/parse_report")"
-printf '%s\n' "$report" | grep -qx 'P 0'
-printf '%s\n' "$report" | grep -qx 'D 0'
+grep -qx 'P 0' <<< "$report"
+grep -qx 'D 0' <<< "$report"
 
 # Trusted runtime units may contain direct calls to effectful libc helpers in low-level
 # implementation code. The stage1-only local-effect walk must honor the same # std boundary
 # as stage0 instead of turning those implementation details into user diagnostics.
 runtime_report="$(printf '# std\nextern write(fd: int, buf: void&, count: usize) -> isize can[Console]\ndef trace() -> void:\n    write(2, zeroed, 0) can Console\n' | "$WORK/parse_report")"
-printf '%s\n' "$runtime_report" | grep -qx 'P 0'
-printf '%s\n' "$runtime_report" | grep -qx 'D 0'
+grep -qx 'P 0' <<< "$runtime_report"
+grep -qx 'D 0' <<< "$runtime_report"
 
 # Enum-variant arms with only binders/wildcards cover their complete constructor. A
 # later arm for that constructor is unreachable, while a guarded first arm remains
@@ -69,8 +69,8 @@ shadow_report="$(printf '%s\n' \
   '        MaybeInt.None:' \
   '            return 0' \
   '    return 0' | "$WORK/parse_report")"
-printf '%s\n' "$shadow_report" | grep -qx 'P 0'
-printf '%s\n' "$shadow_report" | grep -qx 'D 1'
+grep -qx 'P 0' <<< "$shadow_report"
+grep -qx 'D 1' <<< "$shadow_report"
 
 guarded_report="$(printf '%s\n' \
   'enum MaybeInt:' \
@@ -86,8 +86,8 @@ guarded_report="$(printf '%s\n' \
   '        MaybeInt.None:' \
   '            return 0' \
   '    return 0' | "$WORK/parse_report")"
-printf '%s\n' "$guarded_report" | grep -qx 'P 0'
-printf '%s\n' "$guarded_report" | grep -qx 'D 0'
+grep -qx 'P 0' <<< "$guarded_report"
+grep -qx 'D 0' <<< "$guarded_report"
 
 # Layout metadata is numeric metadata, not a source-token index. The guest overlay
 # access below is valid at offset 40 in a 48-byte object and must not inherit a
@@ -98,8 +98,8 @@ overlay_report="$(printf '%s\n' \
   '' \
   'def read(pixel: Pixel) -> u64:' \
   '    return pixel.bytes' | "$WORK/parse_report")"
-printf '%s\n' "$overlay_report" | grep -qx 'P 0'
-printf '%s\n' "$overlay_report" | grep -qx 'D 0'
+grep -qx 'P 0' <<< "$overlay_report"
+grep -qx 'D 0' <<< "$overlay_report"
 
 # Block-form laws must retain their contract AST. In particular, a quantified law
 # should reach the local refinement checker and produce the same unproven-proof
@@ -113,6 +113,6 @@ law_report="$(printf '%s\n' \
   'def check(xs: darray[i64]) -> i64:' \
   '    y: darray[i64] is AllEqualFirst[10] = xs' \
   '    return 0' | "$WORK/parse_report")"
-printf '%s\n' "$law_report" | grep -qx 'P 0'
-printf '%s\n' "$law_report" | grep -qx 'D 1'
+grep -qx 'P 0' <<< "$law_report"
+grep -qx 'D 1' <<< "$law_report"
 echo "parse_report_stage1_smoke OK"

@@ -13,19 +13,19 @@ MSG="is a value conversion, not a reinterpret"
 
 # 1. POSITIVE: different numeric primitives must be flagged.
 out=$(printf 'def f(x: i32) -> u32:\n    return x.cast[u32]\n' | "$RPT")
-echo "$out" | grep -q "$MSG" || fail "numeric->numeric cast not flagged: $out"
+grep -q "$MSG" <<< "$out" || fail "numeric->numeric cast not flagged: $out"
 
 # 2. Same-type `.cast` (identity reinterpret) must stay silent.
 out=$(printf 'def f(x: i32) -> i32:\n    return x.cast[i32]\n' | "$RPT")
-echo "$out" | grep -q "$MSG" && fail "false positive on same-type cast: $out"
+grep -q "$MSG" <<< "$out" && fail "false positive on same-type cast: $out"
 
 # 3. Reference reinterpret must stay silent.
 out=$(printf 'def f(p: i32&) -> i64&:\n    return p.cast[i64&]\n' | "$RPT")
-echo "$out" | grep -q "$MSG" && fail "false positive on ref cast: $out"
+grep -q "$MSG" <<< "$out" && fail "false positive on ref cast: $out"
 
 # 4. Cast to a struct (reinterpret) must stay silent.
 out=$(printf 'struct S:\n    a: i64\ndef f(x: i64) -> S:\n    return x.cast[S]\n' | "$RPT")
-echo "$out" | grep -q "$MSG" && fail "false positive on struct cast: $out"
+grep -q "$MSG" <<< "$out" && fail "false positive on struct cast: $out"
 
 # Removed cast-call and reference-shorthand forms receive directed diagnostics.
 out=$(printf 'def f(x: i64) -> i64:\n    return x.cast[i64]()\n' | "$RPT")

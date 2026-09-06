@@ -161,8 +161,8 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
         }')"
     fi
     out="$({ printf '%s' "$hdr"; if [[ -n "$overlay_src" ]]; then printf '%s\n' "$overlay_src"; fi; printf '%s' "$src_b64" | openssl base64 -d -A; } | "$RPT")"
-    parse_errors="$(printf '%s\n' "$out" | awk '$1 == "P" { print $2; exit }')"
-    diagnostics="$(printf '%s\n' "$out" | awk '$1 == "D" { print $2; exit }')"
+    parse_errors="$(printf '%s\n' "$out" | awk '$1 == "P" && v == "" { v = $2 } END { print v }')"
+    diagnostics="$(printf '%s\n' "$out" | awk '$1 == "D" && v == "" { v = $2 } END { print v }')"
     [[ -n "$parse_errors" ]] || parse_errors=999999
     [[ -n "$diagnostics" ]] || diagnostics=999999
     expected_class=0

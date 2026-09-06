@@ -16,16 +16,16 @@ fail() { echo "duplicate-member smoke FAIL: $1" >&2; exit 1; }
 
 # 1. a repeated struct field MUST be flagged.
 out=$(printf 'struct P:\n    x: i64\n    x: i64\n' | "$RPT")
-echo "$out" | grep -q "duplicate field \"x\" in struct \"P\"" || fail "duplicate field not flagged: $out"
+grep -q "duplicate field \"x\" in struct \"P\"" <<< "$out" || fail "duplicate field not flagged: $out"
 
 # 2. a repeated enum variant MUST be flagged.
 out=$(printf 'enum E:\n    A\n    A\n' | "$RPT")
-echo "$out" | grep -q "duplicate variant \"A\" in enum \"E\"" || fail "duplicate variant not flagged: $out"
+grep -q "duplicate variant \"A\" in enum \"E\"" <<< "$out" || fail "duplicate variant not flagged: $out"
 
 # 3. distinct fields/variants must NOT be flagged.
 out=$(printf 'struct Q:\n    a: i64\n    b: i64\n\nenum F:\n    X\n    Y(v: i64)\n' | "$RPT")
-echo "$out" | grep -q "duplicate field" && fail "false positive on distinct fields: $out"
-echo "$out" | grep -q "duplicate variant" && fail "false positive on distinct variants: $out"
+grep -q "duplicate field" <<< "$out" && fail "false positive on distinct fields: $out"
+grep -q "duplicate variant" <<< "$out" && fail "false positive on distinct variants: $out"
 
 # 4. the whole frontend + stdlib must produce ZERO duplicate-member findings.
 n=0

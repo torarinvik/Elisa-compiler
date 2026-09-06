@@ -61,8 +61,8 @@ while IFS=$'\t' read -r name expected_errors expected_warnings encoded_filename 
     [[ "$name" == TestAnalyzeStrict* ]] && header+=$'# strict\n'
     is_runtime_std "$filename" && header+=$'# std\n'
     out="$({ printf '%s' "$header"; printf '%s' "$encoded_source" | openssl base64 -d -A; } | "$RPT")"
-    parse_errors="$(printf '%s\n' "$out" | awk '$1 == "P" { print $2; exit }')"
-    diagnostics="$(printf '%s\n' "$out" | awk '$1 == "D" { print $2; exit }')"
+    parse_errors="$(printf '%s\n' "$out" | awk '$1 == "P" && v == "" { v = $2 } END { print v }')"
+    diagnostics="$(printf '%s\n' "$out" | awk '$1 == "D" && v == "" { v = $2 } END { print v }')"
     [[ -n "$parse_errors" ]] || parse_errors=999999
     [[ -n "$diagnostics" ]] || diagnostics=999999
     expected_class=0

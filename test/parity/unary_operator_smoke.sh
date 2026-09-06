@@ -12,29 +12,29 @@ fail() { echo "unary-operator smoke FAIL: $1" >&2; exit 1; }
 
 # 1. `not` on an int operand MUST be flagged.
 out=$(printf 'def f(n: i64) -> bool:\n    return not n\n' | "$RPT")
-echo "$out" | grep -q "not operator requires bool operand" || fail "not-on-int not flagged: $out"
+grep -q "not operator requires bool operand" <<< "$out" || fail "not-on-int not flagged: $out"
 
 # 2. unary `-` on a bool operand MUST be flagged.
 out=$(printf 'def f(b: bool) -> i64:\n    x: i64 = -b\n    return x\n' | "$RPT")
 # stage0 says "unary operator requires numeric operand" — SINGULAR, and with "unary".
 # This used to assert the BINARY wording, which stage0 never prints for a unary operator.
-echo "$out" | grep -q "unary operator requires numeric operand" || fail "minus-on-bool not flagged: $out"
+grep -q "unary operator requires numeric operand" <<< "$out" || fail "minus-on-bool not flagged: $out"
 
 # 3. unary `~` on a string operand MUST be flagged.
 out=$(printf 'def f(s: sview) -> i64:\n    x: i64 = ~s\n    return x\n' | "$RPT")
-echo "$out" | grep -q "unary operator requires numeric operand" || fail "tilde-on-string not flagged: $out"
+grep -q "unary operator requires numeric operand" <<< "$out" || fail "tilde-on-string not flagged: $out"
 
 # 4. `not` on bool operand must NOT be flagged.
 out=$(printf 'def f(b: bool) -> bool:\n    return not b\n' | "$RPT")
-echo "$out" | grep -q "not operator requires" && fail "false positive on not-bool: $out"
+grep -q "not operator requires" <<< "$out" && fail "false positive on not-bool: $out"
 
 # 5. unary `-` on int must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    return -n\n' | "$RPT")
-echo "$out" | grep -q "requires numeric operands" && fail "false positive on minus-int: $out"
+grep -q "requires numeric operands" <<< "$out" && fail "false positive on minus-int: $out"
 
 # 6. unary `~` on int must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    return ~n\n' | "$RPT")
-echo "$out" | grep -q "requires numeric operands" && fail "false positive on tilde-int: $out"
+grep -q "requires numeric operands" <<< "$out" && fail "false positive on tilde-int: $out"
 
 # 7. 0 FP across frontend + stdlib.
 t=0
