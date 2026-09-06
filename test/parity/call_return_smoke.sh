@@ -29,9 +29,9 @@ grep -q "condition must be bool" <<< "$out" && fail "false positive on overloade
 
 # 5. reduce_sum requires a numeric callback return, but accepts numeric callbacks.
 out=$(printf 'def positive(value: i64) -> bool:\n    return value > 0\ndef bad(values: darray[i64]) -> i64:\n    return reduce_sum(readonly(values), positive)\n' | "$RPT")
-echo "$out" | grep -Fq 'reduce_sum callback must return a numeric accumulator' || fail "bool reduce_sum callback accepted: $out"
+grep -Fq 'reduce_sum callback must return a numeric accumulator' <<< "$out" || fail "bool reduce_sum callback accepted: $out"
 out=$(printf 'def identity(value: i64) -> i64:\n    return value\ndef ok(values: darray[i64]) -> i64:\n    return reduce_sum(readonly(values), identity)\n' | "$RPT")
-echo "$out" | grep -Fq 'reduce_sum callback must return a numeric accumulator' && fail "numeric reduce_sum callback rejected: $out"
+grep -Fq 'reduce_sum callback must return a numeric accumulator' <<< "$out" && fail "numeric reduce_sum callback rejected: $out"
 
 # 6. 0 FP across frontend + stdlib.
 t=0

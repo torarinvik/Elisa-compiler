@@ -22,10 +22,10 @@ out=$(printf 'enum E:\n    A(i64, i64)\n\ndef f() -> E:\n    return E.A(x: 1, y:
 grep -q "does not declare named payload fields" <<< "$out" || fail "unnamed enum payload accepted named args: $out"
 
 out=$(printf 'enum MaybeInt:\n    Some(int)\ndef unwrap(value: MaybeInt) -> int:\n    match value:\n        MaybeInt.Some(value: inner):\n            return inner\n    return 0\n' | "$RPT")
-echo "$out" | grep -Fq 'match arm "MaybeInt.Some" does not declare named payload fields' || fail "unnamed payload accepted named pattern: $out"
+grep -Fq 'match arm "MaybeInt.Some" does not declare named payload fields' <<< "$out" || fail "unnamed payload accepted named pattern: $out"
 
 out=$(printf 'error BackendError:\n    UnsupportedType(span: i64, code: i32)\ndef fail() -> i64 error[BackendError]:\n    raise BackendError.UnsupportedType("bad".cast[u8&], 7)\n' | "$RPT")
-echo "$out" | grep -Fq 'error constructor argument 1 to "BackendError.UnsupportedType" expects i64' || fail "bad error payload argument accepted: $out"
+grep -Fq 'error constructor argument 1 to "BackendError.UnsupportedType" expects i64' <<< "$out" || fail "bad error payload argument accepted: $out"
 
 # 4. Unknown payload labels are rejected.
 out=$(printf 'enum E:\n    A(x: i64)\n\ndef f() -> E:\n    return E.A(y: 1)\n' | "$RPT")

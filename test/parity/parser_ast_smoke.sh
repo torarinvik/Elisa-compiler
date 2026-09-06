@@ -16,7 +16,7 @@ summary="$(printf '%s\n' "$output" | grep '\[ SUMMARY  \]' | tail -1)"
     echo "parser AST smoke FAILED: test summary was not emitted" >&2
     exit 1
 }
-printf '%s\n' "$summary" | grep -Eq 'failed=0$' || {
+grep -Eq 'failed=0$' <<< "$summary" || {
     echo "parser AST smoke FAILED: $summary" >&2
     exit 1
 }

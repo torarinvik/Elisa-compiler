@@ -89,7 +89,7 @@ run_case() {
     if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>"$exe.linkerr"; then
         sleep 1
         if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>"$exe.linkerr"; then
-            echo "  FAIL $name: link failed: $(head -1 "$exe.linkerr" 2>/dev/null | cut -c1-160)"; return
+            echo "  FAIL $name: link failed: $(head -3 "$exe.linkerr" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"; return
         fi
     fi
     RUN "$exe"
