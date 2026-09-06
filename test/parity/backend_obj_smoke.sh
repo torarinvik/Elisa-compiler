@@ -6,7 +6,8 @@
 # text through llc, which is the right harness for the 241 behavioural checks; this one
 # exists to prove the backend no longer NEEDS llc -- the capability DWARF and -Wperf are
 # blocked on, since both are invisible in IR text and -Wperf's check is post-optimization.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 20 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 20 "$@"; }
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
@@ -18,7 +19,7 @@ LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 [ "$(uname -m)" = "arm64" ] || { echo "backend_obj_smoke SKIP: driver is arm64-only"; exit 0; }
 
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLVM_DIS="$(dirname "$LLVM_CONFIG")/llvm-dis"
+LLVM_DIS="$("$LLVM_CONFIG" --bindir)/llvm-dis"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
 [ -f "$RUNTIME_OBJ" ] || { echo "backend_obj_smoke SKIP: no runtime object"; exit 0; }
@@ -161,7 +162,7 @@ vectorize_case() {
     total=$((total + 1))
     local dir="$BUILD/obj_vectorize"; rm -rf "$dir"; mkdir -p "$dir"
     local src='def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<1000]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n'
-    local opt="$(dirname "$LLVM_CONFIG")/opt"
+    local opt="$("$LLVM_CONFIG" --bindir)/opt"
     [ -x "$opt" ] || { echo "  SKIP obj_vectorize: no opt"; total=$((total - 1)); return; }
     printf '%b' "$src" | RUN "$BUILD/../build/emit_native" > "$dir/in.ll" 2>/dev/null \
       || { echo "  SKIP obj_vectorize: emit_native unavailable"; total=$((total - 1)); return; }

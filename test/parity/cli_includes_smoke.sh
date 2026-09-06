@@ -16,7 +16,8 @@
 #     reported 575 files where stage0 reports 509.
 #
 # The checks below are the two failure modes plus byte-parity of the resulting closure.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 300 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"

@@ -8,12 +8,9 @@ if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ]; then
     exit 0
 fi
 mkdir -p "$ROOT/build"
-if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/emit_native.o" "$ROOT/test/breadth/emit_native.elisa" 2>"$ROOT/build/emit_native_rebuild.log"; then
-    echo "backend_guest_overlay_source_smoke FAILED: emit_native did not compile"
-    exit 1
-fi
-if ! clang -o "$ROOT/build/emit_native" "$ROOT/build/emit_native.o" -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
-    echo "backend_guest_overlay_source_smoke FAILED: link emit_native"
+# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
+if ! REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh"; then
+    echo "backend_guest_overlay_source_smoke FAILED: emit_native did not build"
     exit 1
 fi
 IR="$ROOT/build/guest_overlay_source.ll"

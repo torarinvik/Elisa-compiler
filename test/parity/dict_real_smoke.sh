@@ -10,7 +10,8 @@
 # keeping the std copies would duplicate-symbol at link. (In a real stage1 pipeline the
 # driver's include resolution + a runtime that omits these would handle it; this harness
 # just links the extracted runtime object.)
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 15 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 15 "$@"; }
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,15 +25,13 @@ STD="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}/compiler/runtime/elisa
 command -v python3 >/dev/null 2>&1 || { echo "dict_real_smoke SKIP: no python3"; exit 0; }
 
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLC="$(dirname "$LLVM_CONFIG")/llc"
+LLC="$("$LLVM_CONFIG" --bindir)/llc"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 EMIT="$BUILD/emit_native"
 
 # Reuse the emitter + runtime object the backend smoke builds; build them if absent.
-if [ ! -x "$EMIT" ]; then
-    "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_native.o" "$ROOT/test/breadth/emit_native.elisa" 2>/dev/null \
-        && clang -o "$EMIT" "$BUILD/emit_native.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null
-fi
+# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
+ELISA_EMIT_NATIVE="$EMIT" REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh" >/dev/null 2>&1
 [ -x "$EMIT" ] || { echo "dict_real_smoke FAILED: no emit_native"; exit 1; }
 RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
 if [ ! -f "$RUNTIME_OBJ" ]; then

@@ -18,7 +18,7 @@ ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
 RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/structpy-tree}"
 addr="${SSH_TARGET##* }"; opts="${SSH_TARGET% *}"; [[ "$addr" == "$SSH_TARGET" ]] && opts=""
 rsync -az --exclude .git --exclude 'build/*' --exclude bin -e "ssh $opts" "$ROOT/" "$addr:$RDIR/"
-rsync -az --exclude .git -e "ssh $opts" "$ELISA_CORE/" "$addr:$RCORE/"
+rsync -az --exclude .git --exclude compiler/bin -e "ssh $opts" "$ELISA_CORE/" "$addr:$RCORE/"
 case "$PROFILE" in
   fast) LIST="emit_ast_parity_smoke resolve_smoke diagnostics_smoke diagnostics_diff semantic_internal_diff semantic_acceptance_diff global_permissions_smoke" ;;
   gen3) LIST="self_host_gen3_smoke" ;;

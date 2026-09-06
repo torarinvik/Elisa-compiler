@@ -23,13 +23,8 @@
 # seconds. That second case is real: on a swapping machine this gate reported a DIFFERENT
 # set of "runaway loop" cases on every run, including ones where the STAGE0 binary was the
 # one that timed out. Retrying costs 30s on a genuine hang and removes the false positives.
-RUN() {
-    local status
-    if ! command -v timeout >/dev/null 2>&1; then "$@"; return $?; fi
-    timeout 10 "$@"; status=$?
-    if [ "$status" -eq 124 ]; then timeout 30 "$@"; status=$?; fi
-    return $status
-}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 10 "$@"; }
 set -u
 # A MISSPELLED or not-yet-defined check helper is `command not found` -- which bash reports
 # on stderr and then keeps going, so the check never runs, `total` never increments, and the
@@ -47,16 +42,14 @@ if [ ! -x "$ELISACORE_BIN" ]; then echo "backend_native_smoke SKIP: no elisac at
 if [ ! -x "$LLVM_CONFIG" ]; then echo "backend_native_smoke SKIP: no llvm-config at $LLVM_CONFIG"; exit 0; fi
 
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLC="$(dirname "$LLVM_CONFIG")/llc"
+LLC="$("$LLVM_CONFIG" --bindir)/llc"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
 # 1. Build the stage1 native emitter (itself an Elisa program).
-if ! "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_native.o" "$ROOT/test/breadth/emit_native.elisa" 2>"$BUILD/emit_native.buildlog"; then
-    echo "backend_native_smoke FAILED: could not compile emit_native.elisa"; sed -n '1,10p' "$BUILD/emit_native.buildlog"; exit 1
-fi
-if ! clang -o "$BUILD/emit_native" "$BUILD/emit_native.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>"$BUILD/emit_native.linklog"; then
-    echo "backend_native_smoke FAILED: could not link emit_native"; sed -n '1,10p' "$BUILD/emit_native.linklog"; exit 1
+# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
+if ! ELISA_EMIT_NATIVE="$BUILD/emit_native" REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh"; then
+    echo "backend_native_smoke FAILED: could not build emit_native"; exit 1
 fi
 
 # Extract elisacore_runtime.o from a throwaway c-archive. Emitted programs link against

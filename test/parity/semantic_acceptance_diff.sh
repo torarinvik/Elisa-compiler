@@ -79,7 +79,8 @@ if [[ "${1:-}" == "--chunk" ]]; then
     WORK="$2"; replay_chunk "$3"; exit 0
 fi
 
-JOBS="${ELISA_ACCEPT_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+source "$REPO_ROOT/test/parity/host_jobs.sh"
+JOBS="${ELISA_ACCEPT_JOBS:-$(elisa_host_jobs)}"
 per_chunk=$(( (case_count + JOBS - 1) / JOBS )); [[ "$per_chunk" -gt 0 ]] || per_chunk=1
 mkdir -p "$WORK/chunks"
 split -l "$per_chunk" "$ORACLE" "$WORK/chunks/c."

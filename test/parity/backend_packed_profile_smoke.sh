@@ -19,7 +19,7 @@ printf '%s' "$src" | "$BUILD/driver" > "$BUILD/profile.ll"
 grep -q 'declare ptr @ctx_packed_store_state_new(ptr, i64)' "$BUILD/profile.ll"
 grep -q 'declare.*@ctx_packed_store_alloc_fixed_tagged_index_result' "$BUILD/profile.ll"
 grep -q 'call i64 @ctx_packed_store_read_index_word(ptr .* i32 .* i64 1)' "$BUILD/profile.ll"
-/opt/homebrew/opt/llvm/bin/llc -filetype=obj -o "$BUILD/profile.o" "$BUILD/profile.ll"
+"${LLC:-/opt/homebrew/opt/llvm/bin/llc}" -filetype=obj -o "$BUILD/profile.o" "$BUILD/profile.ll"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 RUNTIME_LINK_INPUTS=("$BUILD/profile.o" "$RUNTIME_OBJ")
 # The native callback and varargs hooks are intentionally unresolved in the shared

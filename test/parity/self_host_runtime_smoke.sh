@@ -22,7 +22,8 @@
 #
 # The program is compiled by STAGE0 on purpose. That isolates the RUNTIME OBJECT as the only
 # stage1-produced input, so a failure here cannot be blamed on program codegen.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 30 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 30 "$@"; }
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

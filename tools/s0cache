@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Memoising wrapper for the stage0 ORACLE (Phase T, 2026-09-06).
+
+Invoked in place of stage0 (run_all.sh / tools/remote_env.sh export ELISACORE_BIN=tools/s0cache
+and ELISA_S0_REAL=<the real binary>). stage0's own build cache serves only SUCCESSFUL
+`-emit obj` builds; the gate spends most of its stage0 CPU elsewhere: the report emitters
+(ast/iface/header/semantic/...), and the hundreds of `.neg` fixtures whose REJECTION (exit 1
+plus diagnostics, after a z3 round) is recomputed on every run. The oracle's answer to an
+unchanged question cannot change, so this caches (rc, stdout, stderr, the -o artifact) keyed on:
+
+  * the stage0 binary's content hash
+  * every argument except the `-o` target
+  * the include-expanded source closure (same grammar as stage0's parseIncludeDirective:
+    `include "x"`, `# include "x"`, `{$i x}` / `{$include x}`, resolved relative to the
+    including file; an unresolvable include makes the call uncacheable)
+  * the stage0-read environment variables that are SET (KEYED_ENV — the exact `os.Getenv`
+    list in the oracle's Go source). v1 keyed on every `ELISA*` variable, which pulled in the
+    harness-side ones: `ELISA_*_PARITY_OUT`, `ELISA_EMIT_NATIVE` and friends hold `mktemp`
+    paths that differ on every run, so a whole harness's entries could never be re-hit.
+
+Only read-only single-input emit modes are cached; anything that links, runs, serves, filters,
+takes include dirs, reads stdin, or sets a BYPASS_ENV variable (one that makes the oracle write
+a side file or print nondeterministic timing) passes straight through.
+
+The key is PATH-INDEPENDENT: closure paths enter it relative to the input's own directory, or
+to REPO_ROOT, so the same probe text written into a hundred different per-worker `mktemp` dirs
+is one entry. stage0 prints the source path in its diagnostics, so a stored entry keeps its
+output with that path replaced by a placeholder and restores the CALLER's path on a hit. The
+same substitution is applied to a textual `-o` artifact; a binary one (obj/bc) is served only
+when it is byte-safe — identical path, path absent, or an equal-length path to patch in place. Only rc 0 and 1 are stored (a
+crash or usage error is never a verdict). ELISA_S0_CACHE=0 bypasses; ELISA_S0_CACHE_DIR
+relocates the store (default ~/.cache/elisa-s0cache). ELISA_S0_CACHE_STATS=<file> appends one
+`hit|miss|bypass` line per call so a gate run can report its hit rate.
+"""
+import hashlib, os, shutil, subprocess, sys, tempfile
+
+SAFE_MODES = {"obj", "llvm", "bc", "ast", "lowered", "semantic", "facts", "unsafe", "progress",
+              "fmt", "doc", "iface", "deps", "deps-json", "ir", "packed", "header", "tokens",
+              "c-bind-check", "c-bind-check-json"}
+PASS_THROUGH_FLAGS = {"-link", "-L", "-l", "-addr", "-filter", "-run", "-I", "-include-dir"}
+BINARY_MODES = {"obj", "bc"}
+# Exactly the variables the oracle reads (`grep -o 'Getenv("ELISA[A-Z_0-9]*")'` in its Go src).
+KEYED_ENV = (
+    "ELISACORE_BUILD_CACHE", "ELISACORE_FAST_MATH", "ELISACORE_FORCE_BOUNDS_CHECK",
+    "ELISACORE_FORCE_CONTRACTS", "ELISACORE_INPROCESS_EMIT", "ELISACORE_NOALIAS_MUTABLE_REFS",
+    "ELISACORE_NO_LINK_BINDING_CHECK", "ELISACORE_NO_OBJCACHE", "ELISACORE_RUNTIME_OBJECT_CACHE",
+    "ELISACORE_SLOW_NATIVE", "ELISACORE_STRICT_FP", "ELISACORE_SUPPRESS_DEPRECATED_WARNINGS",
+    "ELISACORE_TEST_CACHE", "ELISACORE_X64_SEGMENT_RESERVE", "ELISAC_BUILD_CACHE_DIR",
+    "ELISA_AOS_NO_NARROW", "ELISA_DUMP_DEATHTIME", "ELISA_DUMP_REGION_STACKS",
+    "ELISA_EASM_LOCKSTEP_ORACLE", "ELISA_EASM_LOCKSTEP_SYMBOLIC", "ELISA_EASM_LOCKSTEP_SYMBOLIC_Z3",
+    "ELISA_EASM_PRESERVE_PARAMETRIC", "ELISA_EASM_PRESERVE_PARAMETRIC_Z3", "ELISA_LINEAR_MUTATION",
+    "ELISA_NO_AUTO_RESERVE", "ELISA_REGION_DEBUG",
+)
+# Set => the call has a side effect this cache does not capture, or nondeterministic output.
+BYPASS_ENV = (
+    "ELISA_BACKEND_PARITY_OUT", "ELISA_PARSER_PARITY_OUT", "ELISA_SEMANTIC_PARITY_OUT",
+    "ELISA_SEMANTIC_INTERNAL_PARITY_OUT", "ELISACORE_EMIT_LL", "ELISA_KEEP_TEST_BINARY",
+    "ELISACORE_DUMP_MODULE_ON_VERIFY_FAILURE", "ELISACORE_KEEP_TEST_TEMP",
+    "ELISACORE_BUILD_TIMING", "ELISACORE_TEST_TIMING", "ELISACORE_CACHE_DEBUG",
+    "ELISACORE_TEST_CACHE_DEBUG", "ELISACORE_TEST_PHASE_DEBUG",
+)
+IN_MARK, DIR_MARK = b"\x00s0cache:in\x00", b"\x00s0cache:dir\x00"
+
+
+def stat_line(kind, mode="-", why="-"):
+    p = os.environ.get("ELISA_S0_CACHE_STATS")
+    if p:
+        try:
+            with open(p, "a") as f:
+                f.write("%s\t%s\t%s\n" % (kind, mode or "-", why))
+        except OSError:
+            pass
+
+
+def passthrough(real, argv, mode="-", why="-"):
+    stat_line("bypass", mode, why)
+    os.execv(real, [real] + argv)
+
+
+def repo_root():
+    return os.path.abspath(os.environ.get("REPO_ROOT")
+                           or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def key_name(path, base, repo):
+    """A path as it enters the KEY: relative to the input's dir, else to the repo, else itself."""
+    for prefix, tag in ((base, "@in/"), (repo, "@root/")):
+        if prefix and len(prefix) > 1 and (path == prefix or path.startswith(prefix + os.sep)):
+            return tag + os.path.relpath(path, prefix)
+    return path
+
+
+def mask(data, inpath, base):
+    """Replace the caller's source path with placeholders (store); see unmask (serve)."""
+    if len(inpath) > 8:
+        data = data.replace(inpath.encode(), IN_MARK)
+    if len(base) > 8:
+        data = data.replace(base.encode(), DIR_MARK)
+    return data
+
+
+def unmask(data, inpath, base):
+    return data.replace(IN_MARK, inpath.encode()).replace(DIR_MARK, base.encode())
+
+
+def include_closure(root):
+    """Ordered list of (abspath, bytes) for root and its transitive includes, or None."""
+    out, seen, stack = [], set(), [os.path.abspath(root)]
+    while stack:
+        path = stack.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+        out.append((path, data))
+        base = os.path.dirname(path)
+        for raw in data.split(b"\n"):
+            line = raw.strip()
+            if line.startswith(b"#"):
+                line = line[1:].strip()
+            inc = None
+            if line.startswith(b"include "):
+                rest = line[8:].strip()
+                if len(rest) >= 2 and rest[:1] == b'"' and rest[-1:] == b'"':
+                    inc = rest[1:-1]
+                # An UNQUOTED rest is not an include: `parseIncludeDirective` returns false and
+                # the oracle ignores the line. Prose does reach here — a `#` comment is stripped
+                # of its marker first, so `# include flattening, so gen2 …` looks like a
+                # directive. Treating that as uncacheable made 93 of this repo's 1470 sources
+                # (and 352 gate calls) bypass the memo for no reason.
+            elif raw.startswith(b"{$") and raw.endswith(b"}") and len(raw) >= 4:
+                body = raw[2:-1].strip().split(None, 1)
+                if body and body[0].lower() in (b"i", b"include") and len(body) > 1:
+                    arg = body[1].strip()
+                    if len(arg) >= 2 and arg[:1] in (b"'", b'"') and arg[-1:] == arg[:1]:
+                        arg = arg[1:-1]
+                    elif arg.split() != [arg]:
+                        arg = b""  # unquoted WITH whitespace: the oracle rejects it, so skip
+                    inc = arg or None
+            if inc is None:
+                continue
+            try:
+                inc_s = inc.decode()
+            except UnicodeDecodeError:
+                return None
+            target = inc_s if os.path.isabs(inc_s) else os.path.join(base, inc_s)
+            if not os.path.exists(target):
+                return None
+            stack.append(os.path.abspath(target))
+    return out
+
+
+def binary_hash(real):
+    """sha256 of the stage0 binary, memoised by (size, mtime) beside the cache."""
+    st = os.stat(real)
+    root = cache_root()
+    tag = f"{os.path.abspath(real)}|{st.st_size}|{st.st_mtime_ns}"
+    memo = os.path.join(root, "bin." + hashlib.sha256(tag.encode()).hexdigest()[:24])
+    try:
+        with open(memo) as f:
+            return f.read().strip()
+    except OSError:
+        pass
+    h = hashlib.sha256()
+    with open(real, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    os.makedirs(root, exist_ok=True)
+    tmp = memo + f".{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(digest)
+    os.replace(tmp, memo)
+    return digest
+
+
+def cache_root():
+    return os.environ.get("ELISA_S0_CACHE_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"),
+        "elisa-s0cache")
+
+
+def main():
+    real = os.environ.get("ELISA_S0_REAL")
+    if not real or not os.access(real, os.X_OK):
+        sys.stderr.write("s0cache: ELISA_S0_REAL must point at the real stage0 binary\n")
+        sys.exit(2)
+    argv = sys.argv[1:]
+    if os.environ.get("ELISA_S0_CACHE", "1") == "0":
+        passthrough(real, argv)
+    mode, output, inputs, keyed = None, None, [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-emit" and i + 1 < len(argv):
+            mode = argv[i + 1]; keyed += [a, mode]; i += 2; continue
+        if a == "-o" and i + 1 < len(argv):
+            output = argv[i + 1]; i += 2; continue
+        if a in PASS_THROUGH_FLAGS or a.startswith("-l") and len(a) > 2 or a.startswith("-L") and len(a) > 2:
+            passthrough(real, argv)
+        if a.startswith("-"):
+            keyed.append(a); i += 1; continue
+        inputs.append(a); keyed.append("<input>"); i += 1
+    if mode not in SAFE_MODES or len(inputs) != 1 or not inputs[0].endswith(".elisa") or inputs[0] == "-":
+        passthrough(real, argv, mode, "mode" if len(inputs) == 1 else "inputs")
+    for name in BYPASS_ENV:
+        if os.environ.get(name):
+            passthrough(real, argv, mode, "env:" + name)
+    closure = include_closure(inputs[0])
+    if closure is None:
+        passthrough(real, argv, mode, "include")
+    inpath = os.path.abspath(inputs[0])
+    base, repo = os.path.dirname(inpath), repo_root()
+    h = hashlib.sha256()
+    h.update(b"s0cache-v2\0")
+    h.update(binary_hash(real).encode() + b"\0")
+    h.update(("\0".join(keyed) + ("\0-o" if output is not None else "")).encode() + b"\0\0")
+    for name in KEYED_ENV:
+        if name in os.environ:
+            h.update(name.encode() + b"=" + os.environ[name].encode() + b"\0")
+    h.update(b"\0closure\0")
+    for path, data in closure:
+        h.update(key_name(path, base, repo).encode() + b"\0" + str(len(data)).encode() + b"\0")
+        h.update(data)
+    key = h.hexdigest()
+    entry = os.path.join(cache_root(), key[:2], key[2:])
+    rc_file = os.path.join(entry, "rc")
+    if os.path.isfile(rc_file):
+        try:
+            with open(rc_file) as f:
+                rc = int(f.read().strip())
+            with open(os.path.join(entry, "out"), "rb") as f:
+                out = unmask(f.read(), inpath, base)
+            with open(os.path.join(entry, "err"), "rb") as f:
+                err = unmask(f.read(), inpath, base)
+            art, art_path = None, os.path.join(entry, "obj")
+            if output is not None and not os.path.exists(art_path):
+                # A stored REJECTION: the oracle wrote no artifact, so neither do we (and a
+                # stale file from an earlier call must not be left to look like a success).
+                try:
+                    os.unlink(output)
+                except OSError:
+                    pass
+            elif output is not None:
+                with open(art_path, "rb") as f:
+                    art = f.read()
+                if mode in BINARY_MODES:
+                    # A binary artifact may embed the source path (debug info). Serve it only
+                    # when that is byte-safe: no placeholder at all, or a replacement of the
+                    # SAME length so no offset in the container moves.
+                    for m, v in ((IN_MARK, inpath.encode()), (DIR_MARK, base.encode())):
+                        if m in art:
+                            with open(os.path.join(entry, "path"), "rb") as f:
+                                old = f.read().split(b"\n")
+                            orig = old[0] if m == IN_MARK else old[1]
+                            if len(orig) != len(v):
+                                raise ValueError("path length differs")
+                            art = art.replace(m, v)
+                else:
+                    art = unmask(art, inpath, base)
+            if art is not None:
+                with open(output, "wb") as f:
+                    f.write(art)
+            sys.stdout.buffer.write(out)
+            sys.stderr.buffer.write(err)
+            sys.stdout.flush(); sys.stderr.flush()
+            stat_line("hit", mode)
+            sys.exit(rc)
+        except (OSError, ValueError):
+            pass  # a torn entry, or an unpatchable artifact: fall through and recompute
+    stat_line("miss", mode)
+    proc = subprocess.run([real] + argv, stdin=subprocess.DEVNULL, capture_output=True)
+    sys.stdout.buffer.write(proc.stdout); sys.stderr.buffer.write(proc.stderr)
+    sys.stdout.flush(); sys.stderr.flush()
+    have_art = output is not None and os.path.isfile(output)
+    if proc.returncode in (0, 1) and (output is None or not os.path.exists(output)
+                                      or (have_art and os.path.getsize(output) < (64 << 20))):
+        try:
+            os.makedirs(os.path.dirname(entry), exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix="w.", dir=os.path.dirname(entry))
+            with open(os.path.join(tmp, "out"), "wb") as f:
+                f.write(mask(proc.stdout, inpath, base))
+            with open(os.path.join(tmp, "err"), "wb") as f:
+                f.write(mask(proc.stderr, inpath, base))
+            with open(os.path.join(tmp, "path"), "wb") as f:
+                f.write(inpath.encode() + b"\n" + base.encode())
+            if have_art:
+                with open(output, "rb") as f:
+                    produced = f.read()
+                with open(os.path.join(tmp, "obj"), "wb") as f:
+                    f.write(mask(produced, inpath, base))
+            with open(os.path.join(tmp, "rc"), "w") as f:
+                f.write(str(proc.returncode))
+            try:
+                os.rename(tmp, entry)
+            except OSError:
+                shutil.rmtree(tmp, ignore_errors=True)  # a concurrent writer won
+        except OSError:
+            pass
+    sys.exit(proc.returncode)
+
+
+if __name__ == "__main__":
+    main()

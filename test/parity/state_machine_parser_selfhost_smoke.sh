@@ -19,7 +19,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$PRODUCT"
-export PATH="/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin"
+export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
 
 ELISA_DBG_DECLINE=1 bash "$ROOT/scripts/elisac_stage1.sh" -O0 \
   -o "$WORK/emit_native.o" "$ROOT/test/breadth/emit_native.elisa" \
@@ -31,7 +31,7 @@ if grep -q 'DROPPED parse_bit_group_members' "$WORK/build.log"; then
 fi
 
 LIBDIR="$($LLVM_CONFIG --libdir)"
-LLC="$(dirname -- "$LLVM_CONFIG")/llc"
+LLC="$("$LLVM_CONFIG" --bindir)/llc"
 clang -Wl,-dead_strip -o "$WORK/emit_native" "$WORK/emit_native.o" "$RUNTIME" \
   -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
 

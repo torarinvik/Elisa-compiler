@@ -19,7 +19,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
-OPT="$(dirname "$LLVM_CONFIG")/opt"
+OPT="$("$LLVM_CONFIG" --bindir)/opt"
 
 [ -x "$STAGE1" ]   || { echo "llvm_verifier_smoke SKIP: no stage1 seed at $STAGE1"; exit 0; }
 [ -x "$OPT" ]      || { echo "llvm_verifier_smoke SKIP: no llvm opt at $OPT"; exit 0; }

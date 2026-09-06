@@ -8,7 +8,8 @@
 # Deque is in std source (no prelude). The std is concatenated (arena + deque + collections)
 # with `include` lines stripped and the two ctx_hash_* definitions dropped (runtime provides
 # them). Programs must run their allocating body under `can[Memory.Allocate, Abort.Panic]`.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 15 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 15 "$@"; }
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -22,14 +23,12 @@ STD="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}/compiler/runtime/elisa
 command -v python3 >/dev/null 2>&1 || { echo "deque_real_smoke SKIP: no python3"; exit 0; }
 
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLC="$(dirname "$LLVM_CONFIG")/llc"
+LLC="$("$LLVM_CONFIG" --bindir)/llc"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 EMIT="$BUILD/emit_native"
 
-if [ ! -x "$EMIT" ]; then
-    "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_native.o" "$ROOT/test/breadth/emit_native.elisa" 2>/dev/null \
-        && clang -o "$EMIT" "$BUILD/emit_native.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null
-fi
+# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
+ELISA_EMIT_NATIVE="$EMIT" REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh" >/dev/null 2>&1
 [ -x "$EMIT" ] || { echo "deque_real_smoke FAILED: no emit_native"; exit 1; }
 RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
 if [ ! -f "$RUNTIME_OBJ" ]; then

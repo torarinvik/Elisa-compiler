@@ -23,8 +23,8 @@ if command -v opt >/dev/null 2>&1; then
     opt -passes=verify "$WORK/stage0.ll" -disable-output
     opt -passes=verify "$WORK/stage1.ll" -disable-output
 elif [ -x /opt/homebrew/opt/llvm/bin/opt ]; then
-    /opt/homebrew/opt/llvm/bin/opt -passes=verify "$WORK/stage0.ll" -disable-output
-    /opt/homebrew/opt/llvm/bin/opt -passes=verify "$WORK/stage1.ll" -disable-output
+    "${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify "$WORK/stage0.ll" -disable-output
+    "${ELISA_LLVM_OPT:-/opt/homebrew/opt/llvm/bin/opt}" -passes=verify "$WORK/stage1.ll" -disable-output
 fi
 
 echo "optional reference return parity OK"

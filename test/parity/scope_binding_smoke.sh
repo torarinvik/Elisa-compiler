@@ -30,17 +30,12 @@
 # a wider budget before it is believed — these fixtures finish in milliseconds, and on a
 # loaded host a single 10s expiry reported a 124 as a scope divergence (a wrong answer that
 # vanished on the standalone re-run). A genuine spin expires both times and still fails.
-RUN() {
-    local status limit="${ELISA_SCOPE_TIMEOUT:-10}"
-    if ! command -v timeout >/dev/null 2>&1; then "$@"; return $?; fi
-    timeout "$limit" "$@"; status=$?
-    if [ "$status" -eq 124 ]; then timeout 30 "$@"; status=$?; fi
-    return $status
-}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 10 "$@"; }
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
@@ -48,11 +43,12 @@ RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -x "$STAGE1" ] || { echo "scope_binding_smoke SKIP: no stage1 seed at $STAGE1"; exit 0; }
 [ -f "$RUNTIME_OBJ" ] || { echo "scope_binding_smoke SKIP: no runtime object at $RUNTIME_OBJ"; exit 0; }
 
-# macOS may reclaim long-running directories below `/tmp` while this suite is
-# compiling 80 cases. Keep the default scratch parent in the ignored build
-# tree so every case sees the same live directory; callers can override it.
-WORK_ROOT="${ELISA_SCOPE_WORK_ROOT:-$ROOT/build/scope-binding-smoke}"
-mkdir -p "$WORK_ROOT"
+# macOS's bare `mktemp -d` can silently fall back to the host's short-lived
+# per-process temp directory. This suite compiles 80 cases and that directory
+# may be reclaimed before the later cases run, turning a compiler check into a
+# string of misleading "file not found" failures. Use an explicit template so
+# TMPDIR is honored and callers can choose a stable scratch location.
+WORK_ROOT="${TMPDIR:-/tmp}"
 WORK="$(mktemp -d "$WORK_ROOT/elisa-scope-binding.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 pass=0
@@ -61,7 +57,6 @@ fail=0
 # Compile `$2` with BOTH compilers, run both, and require stage1 == stage0 == `$3`.
 differential() {
     local name="$1" src="$2" want="$3"
-    mkdir -p "$WORK"
     printf '%s' "$src" > "$WORK/$name.elisa"
 
     if ! "$ELISACORE_BIN" -emit obj -o "$WORK/$name.s0.o" "$WORK/$name.elisa" >"$WORK/$name.s0.log" 2>&1; then
