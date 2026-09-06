@@ -182,6 +182,8 @@ NAMES=(
     generic_operator_no_bound
     parallel_rebind_threaded
     tuple_destructure_arity
+    region_return_escape
+    region_return_dependency
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -330,6 +332,8 @@ EXPECTS=(
     "operator \"binary\" used on unbound generic type parameter \"T\""
     "cannot assign (_0: i64, _1: i64) to i64"
     "tuple destructuring expects 3 bindings, got 2"
+    "escapes via return; the region is freed at scope exit"
+    "cannot return value: region dependency facts include local region \"r\""
 )
 
 total=0
