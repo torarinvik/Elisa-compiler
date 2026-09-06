@@ -7178,6 +7178,55 @@ GENERATORS += [gen_signedness, gen_string_escapes, gen_const_enum_values,
                gen_mutable_ref_local_rebind, gen_generic_operator_no_bound]
 
 
+def classify_program(item):
+    """One program end to end: returns (bucket, name, rc0, rc1). Runs in a worker process
+    (PARALLEL, Phase T 2026-09-06): programs are independent and each has its own work dir,
+    so the ~387-program sweep fans out over ELISA_ADV_JOBS processes (default: core count)
+    instead of one compile+link+run at a time."""
+    name, src, work = item
+    d = os.path.join(work, name)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "p.elisa")
+    open(path, "w").write(src.lstrip("\n"))
+    st0, rc0 = build_and_run(path, d, "s0")
+    if st0 == TIMEOUT:
+        # The ORACLE timed out. That says nothing about stage1 — exactly the reasoning
+        # applied to a crashing oracle below. Treating it as "stage0 rejects it" is what
+        # invented PERMISSIVE rows for programs stage0 accepts perfectly well.
+        return ("SKIP", name, None, None)
+    if st0 != OK:
+        # stage0 REFUSED it. If stage1 builds and runs the same program, stage1 is more
+        # PERMISSIVE than the reference compiler — a real divergence, and one no census
+        # here can otherwise see: the decline census counts what stage1 REFUSES, never
+        # what it wrongly ACCEPTS. Reported separately from SKIP so the two are not
+        # conflated; a genuinely malformed generator program lands in SKIP.
+        st1p, _ = build_and_run(path, d, "s1")
+        return ("PERMISSIVE" if st1p == OK else "SKIP", name, None, None)
+    # A CRASHING oracle cannot arbitrate. differential_corpus skips a stage0 timeout for
+    # the same reason; a negative code is a signal (observed: -11 SIGSEGV on a program
+    # returning a ref from a value function). Counting it as a mismatch cries wolf, and a
+    # gate that cries wolf trains the next REAL wrong answer to be waved through.
+    if rc0 is not None and rc0 < 0:
+        return ("SKIP", name, rc0, None)
+    st1, rc1 = build_and_run(path, d, "s1")
+    if st1 == TIMEOUT:
+        return ("TIMEOUT", name, rc0, None)
+    if st1 != OK:
+        return ("DECLINE", name, rc0, None)
+    if rc0 != rc1:
+        return ("MISMATCH", name, rc0, rc1)
+    # Optimisation must not change the answer. Only checked once the -O0 answer already
+    # agrees, so a row here always means "the pipeline changed a CORRECT answer".
+    st2, rc2 = build_and_run(path, d, "s1O2")
+    if st2 == TIMEOUT:
+        return ("TIMEOUT", name, rc1, None)
+    if st2 != OK:
+        return ("O2_DECLINE", name, rc1, None)
+    if rc2 != rc1:
+        return ("O2_MISMATCH", name, rc1, rc2)
+    return ("MATCH", name, rc0, rc1)
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     results = {"MATCH": [], "MISMATCH": [], "O2_MISMATCH": [], "O2_DECLINE": [], "DECLINE": [], "PERMISSIVE": [], "TIMEOUT": [], "SKIP": []}
@@ -7187,51 +7236,17 @@ def main():
         if only and only not in g.__name__:
             continue
         progs.extend(g())
-    for name, src in progs:
-        d = os.path.join(work, name)
-        os.makedirs(d, exist_ok=True)
-        path = os.path.join(d, "p.elisa")
-        open(path, "w").write(src.lstrip("\n"))
-        st0, rc0 = build_and_run(path, d, "s0")
-        if st0 == TIMEOUT:
-            # The ORACLE timed out. That says nothing about stage1 — exactly the reasoning
-            # applied to a crashing oracle below. Treating it as "stage0 rejects it" is what
-            # invented PERMISSIVE rows for programs stage0 accepts perfectly well.
-            results["SKIP"].append((name, None, None)); continue
-        if st0 != OK:
-            # stage0 REFUSED it. If stage1 builds and runs the same program, stage1 is more
-            # PERMISSIVE than the reference compiler — a real divergence, and one no census
-            # here can otherwise see: the decline census counts what stage1 REFUSES, never
-            # what it wrongly ACCEPTS. Reported separately from SKIP so the two are not
-            # conflated; a genuinely malformed generator program lands in SKIP.
-            st1p, _ = build_and_run(path, d, "s1")
-            results["PERMISSIVE" if st1p == OK else "SKIP"].append((name, None, None))
-            continue
-        # A CRASHING oracle cannot arbitrate. differential_corpus skips a stage0 timeout for
-        # the same reason; a negative code is a signal (observed: -11 SIGSEGV on a program
-        # returning a ref from a value function). Counting it as a mismatch cries wolf, and a
-        # gate that cries wolf trains the next REAL wrong answer to be waved through.
-        if rc0 is not None and rc0 < 0:
-            results["SKIP"].append((name, rc0, None)); continue
-        st1, rc1 = build_and_run(path, d, "s1")
-        if st1 == TIMEOUT:
-            results["TIMEOUT"].append((name, rc0, None)); continue
-        if st1 != OK:
-            results["DECLINE"].append((name, rc0, None)); continue
-        if rc0 != rc1:
-            results["MISMATCH"].append((name, rc0, rc1))
-            continue
-        # Optimisation must not change the answer. Only checked once the -O0 answer already
-        # agrees, so a row here always means "the pipeline changed a CORRECT answer".
-        st2, rc2 = build_and_run(path, d, "s1O2")
-        if st2 == TIMEOUT:
-            results["TIMEOUT"].append((name, rc1, None))
-        elif st2 != OK:
-            results["O2_DECLINE"].append((name, rc1, None))
-        elif rc2 != rc1:
-            results["O2_MISMATCH"].append((name, rc1, rc2))
-        else:
-            results["MATCH"].append((name, rc0, rc1))
+    import multiprocessing
+    jobs = int(os.environ.get("ELISA_ADV_JOBS", "0") or 0) or (os.cpu_count() or 4)
+    items = [(name, src, work) for name, src in progs]
+    if jobs > 1 and len(items) > 1:
+        with multiprocessing.Pool(processes=jobs) as pool:
+            rows = list(pool.imap_unordered(classify_program, items))
+    else:
+        rows = [classify_program(item) for item in items]
+    # Deterministic report whatever the scheduling: buckets in name order.
+    for bucket, name, rc0, rc1 in sorted(rows, key=lambda r: r[1]):
+        results[bucket].append((name, rc0, rc1))
     for k in ("MISMATCH", "O2_MISMATCH", "O2_DECLINE", "DECLINE", "PERMISSIVE", "TIMEOUT", "SKIP", "MATCH"):
         for name, rc0, rc1 in results[k]:
             if k == "MATCH":

@@ -16,7 +16,7 @@ LIBDIR="$("$LLVM_CONFIG" --libdir)"
 [[ -f "$RUNTIME_OBJ" ]] || { echo "missing runtime object $RUNTIME_OBJ (run scripts/build_runtime_object.sh)" >&2; exit 2; }
 unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$BIN"
-export PATH="/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin"
+export PATH="/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin:/usr/local/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
 
 echo "gen1=$BIN"
 file "$BIN"

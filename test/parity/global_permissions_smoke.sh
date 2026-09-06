@@ -37,22 +37,46 @@ norm() {
 }
 
 stage0_globals() {   # $1 = source file, $2 = "on"|"off"
-    # `set -u` and an EMPTY array do not mix on bash 3.2 (the macOS system shell), where
-    # "${flags[@]}" is an unbound reference rather than zero words. Guard the expansion, or
-    # the default-OFF half of this gate errors out and passes vacuously.
-    local flags=()
-    [ "$2" = "on" ] && flags=(-Wglobals)
-    "$ELISACORE_BIN" ${flags[@]+"${flags[@]}"} -emit semantic "$1" 2>&1 >/dev/null \
-        | grep -E ':[0-9]+:[0-9]+' | grep 'can\[Global' | norm
+    # stage0 no longer ENFORCES Global permissions (its `-Wglobals` dial is gone: "unknown
+    # option", measured 2026-09-05), but it still INFERS them: `-emit semantic` prints, per
+    # function, `required_effects=[Global.Read, Global.Write]`. That inference is the oracle
+    # now. Render it in the shape stage1's `# globals` warnings use — one line per function
+    # that requires anything, `NAME can[Global.Read, Global.Write]` — so both sides compare
+    # on the same text. The "off" dial has no stage0 side any more; see expect_silent_by_default.
+    [ "$2" = "on" ] || return 0
+    "$ELISACORE_BIN" -emit semantic "$1" 2>/dev/null \
+        | awk '/^func /{fn=$2; sub(/.*\./,"",fn)} /required_effects=\[/{
+              s=$0; sub(/.*required_effects=\[/,"",s); sub(/\].*/,"",s);
+              n=split(s,parts,/, /); g="";
+              for(i=1;i<=n;i++){ if(parts[i] ~ /^Global\./){ g=(g==""?parts[i]:g ", " parts[i]) } }
+              if(g!="") print fn " can[" g "]" }' \
+        | sort -u
 }
 
 stage1_globals() {   # $1 = source file, $2 = "on"|"off"
     local src="$WORK/replay.elisa"
     if [ "$2" = "on" ]; then printf '# globals\n' > "$src"; else : > "$src"; fi
     cat "$1" >> "$src"
+    # `call to "bump" requires can[Global] ...; add can[Global.Read, Global.Write] or ...`
+    # (or `add can Global.Read or ...` for a single member). Reduce each warning to
+    # `CALLEE can[members]` — the same shape stage0_globals renders its inference in.
     "$RPT" < "$src" \
         | awk '/^D [0-9]+$/{d=1;next} d && /^  L[0-9]+ /{sub(/^  L[0-9]+ /,"");print}' \
-        | grep 'can\[Global' | norm
+        | grep 'can\[Global' \
+        | sed -E -e 's/.*call to "([A-Za-z_][A-Za-z0-9_.]*)".*add can\[([^]]*)\].*/\1 can[\2]/' \
+                 -e 's/.*call to "([A-Za-z_][A-Za-z0-9_.]*)".*add can ([A-Za-z.]+) .*/\1 can[\2]/' \
+                 -e 's/^[A-Za-z_][A-Za-z0-9_]*\.//' \
+        | sort -u
+}
+
+# stage0's inference names EVERY function that requires Global (an uncalled `main` included);
+# stage1's dial warns per CALL SITE and so names only callees. Compare on the callees stage1
+# reports: for each of those, the two inferred member sets must be identical. A function
+# stage1 failed to warn about is caught by the fixture-specific halves below, not here.
+restrict_to_callees() {   # $1 = stage0 lines, $2 = stage1 lines
+    local names; names="$(printf '%s\n' "$2" | sed -E 's/ can\[.*//' | sort -u)"
+    [ -n "$names" ] || { printf '%s\n' "$1"; return; }
+    printf '%s\n' "$1" | grep -F -w -f <(printf '%s\n' "$names") || true
 }
 
 expect_agree() {     # $1 = case name, $2 = source file
@@ -64,6 +88,7 @@ expect_agree() {     # $1 = case name, $2 = source file
         failed=$((failed + 1))
         return
     fi
+    s0="$(restrict_to_callees "$s0" "$s1")"
     if [ "$s0" != "$s1" ]; then
         printf 'global permissions smoke FAILED: %s\nstage0: %s\nstage1: %s\n' \
             "$1" "${s0//$'\n'/ | }" "${s1//$'\n'/ | }" >&2
@@ -75,6 +100,7 @@ expect_same() {      # $1 = case name, $2 = source file (agreement may be silenc
     local s0 s1
     s0="$(stage0_globals "$2" on)"
     s1="$(stage1_globals "$2" on)"
+    s0="$(restrict_to_callees "$s0" "$s1")"
     if [ "$s0" != "$s1" ]; then
         printf 'global permissions smoke FAILED: %s\nstage0: %s\nstage1: %s\n' \
             "$1" "${s0//$'\n'/ | }" "${s1//$'\n'/ | }" >&2

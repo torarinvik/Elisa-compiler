@@ -13,7 +13,7 @@
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../stage0/compiler/bin/elisac-local}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"
 RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
 CASES="${1:-$ROOT/test/differential/cases}"
@@ -22,8 +22,12 @@ CASES="${1:-$ROOT/test/differential/cases}"
 [[ -x "$ROOT/bin/elisac-stage1" ]] || { echo "no stage1 product; run scripts/elisac_stage1.sh --seed" >&2; exit 2; }
 [[ -f "$RUNTIME" ]] || { echo "no runtime object at $RUNTIME" >&2; exit 2; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-differential.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+if [[ "${1:-}" == "--one" ]]; then
+  WORK="$2"; CASES="$ROOT/test/differential/cases"
+else
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-differential.XXXXXX")"
+  trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+fi
 
 pass=0
 diverged=0
@@ -41,66 +45,73 @@ is_expected_divergence() {
 report_divergence() {
   if is_expected_divergence "$1"; then
     echo "XFAIL $1: $2 (known)"
-    expected_divergences=$((expected_divergences + 1))
   else
     echo "DIVERGE $1: $2"
-    diverged=$((diverged + 1))
   fi
 }
 
-for source in "$CASES"/*.elisa; do
+# ---- one case (worker mode): prints exactly one classified line and exits.
+# PARALLEL (Phase T, 2026-09-06): cases are independent, so they run under `xargs -P`
+# (ELISA_DIFF_JOBS, default = core count) by re-entering this script as
+# `--one <work> <source>`; the parent reduces the per-case lines in sorted order so the
+# report is deterministic whatever the scheduling.
+one_case() {
+  local source="$1" name
   name="$(basename "$source" .elisa)"
-
   # A case stage0 itself rejects is not a stage1 finding; skip rather than
   # reporting a divergence against a baseline that never worked.
   if ! "$STAGE0" -emit obj -O0 -o "$WORK/$name.s0.o" "$source" >"$WORK/$name.s0.log" 2>&1; then
-    echo "SKIP $name (stage0 rejected it)"
-    skipped=$((skipped + 1))
-    continue
+    echo "SKIP $name (stage0 rejected it)"; return 0
   fi
   if ! bash "$STAGE1" -O0 -o "$WORK/$name.s1.o" "$source" >"$WORK/$name.s1.log" 2>&1; then
-    report_divergence "$name" "stage0 compiled it, stage1 did not"
-    continue
+    report_divergence "$name" "stage0 compiled it, stage1 did not"; return 0
   fi
-
   # stage0 bundles the runtime into its object; stage1 links against the
-  # separately built runtime object.
-  # stage0 usually bundles what it needs; a case that pulls in std collections
-  # still wants the runtime object, so fall back to linking it in.
+  # separately built runtime object. A case that pulls in std collections still
+  # wants the runtime object, so fall back to linking it in.
   clang -Wl,-dead_strip -o "$WORK/$name.s0" "$WORK/$name.s0.o" >>"$WORK/$name.s0.log" 2>&1 ||
     clang -Wl,-dead_strip -o "$WORK/$name.s0" "$WORK/$name.s0.o" "$RUNTIME" >>"$WORK/$name.s0.log" 2>&1
   clang -Wl,-dead_strip -o "$WORK/$name.s1" "$WORK/$name.s1.o" "$RUNTIME" >>"$WORK/$name.s1.log" 2>&1
   if [[ ! -x "$WORK/$name.s0" || ! -x "$WORK/$name.s1" ]]; then
-    echo "SKIP $name (link failed on one side)"
-    skipped=$((skipped + 1))
-    continue
+    echo "SKIP $name (link failed on one side)"; return 0
   fi
-
   "$WORK/$name.s0" >"$WORK/$name.s0.out" 2>&1
-  status0=$?
+  local status0=$?
   "$WORK/$name.s1" >"$WORK/$name.s1.out" 2>&1
-  status1=$?
-
+  local status1=$?
   if [[ "$status0" -ne "$status1" ]]; then
-    report_divergence "$name" "stage0 exit=$status0, stage1 exit=$status1"
-    continue
+    report_divergence "$name" "stage0 exit=$status0, stage1 exit=$status1"; return 0
   fi
   if ! diff -q "$WORK/$name.s0.out" "$WORK/$name.s1.out" >/dev/null; then
-    report_divergence "$name" "same exit status, different output"
-    continue
+    report_divergence "$name" "same exit status, different output"; return 0
   fi
   if [[ "$status0" -ne 0 ]]; then
-    echo "SKIP $name (both generations agree on failure exit=$status0)"
-    skipped=$((skipped + 1))
-    continue
+    echo "SKIP $name (both generations agree on failure exit=$status0)"; return 0
   fi
   if is_expected_divergence "$name"; then
-    echo "UNEXPECTED-PASS $name: agrees now; drop the .xfail suffix"
-    unexpected_agreements=$((unexpected_agreements + 1))
-    continue
+    echo "UNEXPECTED-PASS $name: agrees now; drop the .xfail suffix"; return 0
   fi
-  pass=$((pass + 1))
-done
+  echo "PASS $name"
+}
+
+if [[ "${1:-}" == "--one" ]]; then
+  exec </dev/null
+  one_case "$3" > "$(mktemp "$WORK/res/r.XXXXXX")"
+  exit 0
+fi
+
+JOBS="${ELISA_DIFF_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+mkdir -p "$WORK/res"
+find "$CASES" -maxdepth 1 -name '*.elisa' -print0 \
+  | xargs -0 -P "$JOBS" -n 1 env ELISACORE_BIN="$STAGE0" bash "$0" --one "$WORK"
+
+cat "$WORK/res"/r.* 2>/dev/null | sort -k2 > "$WORK/results.txt"
+grep -v '^PASS ' "$WORK/results.txt"
+pass="$(grep -c '^PASS ' "$WORK/results.txt")"
+diverged="$(grep -c '^DIVERGE ' "$WORK/results.txt")"
+expected_divergences="$(grep -c '^XFAIL ' "$WORK/results.txt")"
+skipped="$(grep -c '^SKIP ' "$WORK/results.txt")"
+unexpected_agreements="$(grep -c '^UNEXPECTED-PASS ' "$WORK/results.txt")"
 
 echo "differential: $pass agreed, $diverged diverged, $expected_divergences xfail, $skipped skipped, $unexpected_agreements unexpected-pass"
 [[ "$diverged" -eq 0 && "$unexpected_agreements" -eq 0 ]]

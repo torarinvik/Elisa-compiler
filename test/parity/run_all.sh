@@ -208,9 +208,12 @@ gate_jobs_by_memory() {
     [[ -z "$free_kb" ]] && { echo 6; return; }
     gb=$((free_kb / 1048576))
     # ~3 GB of headroom per concurrent check, floor of 2 so a loaded box still finishes.
-    local n=$((gb / 3))
+    # Ceiling: the core count (Phase T, 2026-09-06 — the old fixed cap of 6 left a 32-core,
+    # 251 GB host running six checks at a time; ELISA_GATE_JOBS still overrides).
+    local n=$((gb / 3)) cores
+    cores="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 6) )"
     (( n < 2 )) && n=2
-    (( n > 6 )) && n=6
+    (( n > cores )) && n=$cores
     echo "$n"
 }
 GATE_JOBS="${ELISA_GATE_JOBS:-$(gate_jobs_by_memory)}"

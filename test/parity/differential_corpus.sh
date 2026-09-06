@@ -20,6 +20,13 @@
 # separately and is expected to fall as backend coverage grows.
 #
 #   Usage: test/parity/differential_corpus.sh [--verbose]
+#
+# PARALLEL (Phase T, 2026-09-06): every program is independent, so the per-program work
+# runs under `xargs -P` (ELISA_CORPUS_JOBS, default = core count). The script re-enters
+# itself as `--one <work> <src>` per program (xargs cannot call a bash function), each
+# worker writes ONE result line into its own file under $WORK/res, and the parent reduces.
+# Nothing is shared between workers but the read-only compilers. Measured: 49 min serial
+# on a 32-core host -> minutes.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -35,8 +42,14 @@ VERBOSE=0
 [ -x "$STAGE1" ]        || { echo "differential_corpus SKIP: no stage1 seed at $STAGE1"; exit 0; }
 [ -f "$RUNTIME_OBJ" ]   || { echo "differential_corpus SKIP: no runtime object"; exit 0; }
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+# Worker mode (`--one <work> <src>`) receives the parent's work dir and must not create or
+# clean one. (`set -u` above: an unset WORK in a worker used to kill it silently.)
+if [[ "${1:-}" == "--one" ]]; then
+    WORK="$2"
+else
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+fi
 
 # A program that loops forever is a FAILURE, not a hang: bound every run. Compilation is
 # bounded too — a backend that diverges would otherwise stall the gate.
@@ -90,11 +103,6 @@ link_program() {
 # (stage0 0/40, stage1 40/40). Worth reaching for first next time.
 KNOWN_INTERMITTENT=()
 
-match=0; mismatch=0; declined=0; skipped=0; intermittent=0
-: > "$WORK/mismatches.txt"
-: > "$WORK/declines.txt"
-: > "$WORK/flaky.txt"
-: > "$WORK/intermittent.txt"
 
 # The corpus: every .elisa in the stage1 tree with a top-level `main`. Excludes build
 # outputs and the vendored runtime (compiled as a unit elsewhere, not as a program).
@@ -125,6 +133,16 @@ CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 #
 # A repro that declines is a FILED BUG, not a regression. The ratchet's job is to
 # catch regressions in ordinary programs; repros are tracked by their own files.
+# A file carrying the header `# corpus: deliberate-decline` is EXCLUDED: it is a program
+# stage0 compiles that stage1 REFUSES on purpose, with its own smoke asserting the refusal
+# (assert_by_min_i64: stage0 proves `0 - MIN_I64 > 0` by wrapping; stage1 declines the
+# overflowing extremum). The marker keeps the reason next to the program.
+#
+# `*.neg.elisa` is EXCLUDED too (2026-09-05). A negative fixture that stage0 ACCEPTS is,
+# by construction, a place where stage1 is deliberately STRICTER (the effect-row `::` rule,
+# for instance) and a dedicated smoke asserts the rejection with its message. Counting it
+# here as a "decline" put three such fixtures on this ratchet the day they were written.
+#
 # `*.xfail.elisa` is EXCLUDED for the same reason as repro/, and it is the same mistake in a
 # different costume. test/differential/cases/ names a case `*.xfail.elisa` when the
 # divergence is already known, documented in the file's own header, and not yet fixed --
@@ -137,96 +155,87 @@ find "${CORPUS_DIRS[@]}" -name '*.elisa' -print0 2>/dev/null \
   | xargs -0 grep -l '^def main' 2>/dev/null \
   | grep -v '/repro/' \
   | grep -v '\.xfail\.elisa$' \
+  | grep -v '\.neg\.elisa$' \
+  | tr '\n' '\0' | xargs -0 grep -L 'corpus: deliberate-decline' 2>/dev/null \
   | sort > "$WORK/programs.txt"
 
-# Read the list on FD 3, and give every child /dev/null for stdin. Reading it on plain
-# stdin loses the corpus: a compiled program that reads input DRAINS the list, and the loop
-# silently stops after one entry (observed: "1 programs" from a 59-program corpus).
-while IFS= read -r src <&3; do
-    [ -n "$src" ] || continue
+# ---- one program (worker mode). Prints exactly one line: KIND<TAB>name<TAB>detail
+one_program() {
+    local src="$1" name work
     name="$(basename "$src" .elisa)"
-
+    # A private work dir per program: two corpus files may share a basename.
+    work="$(mktemp -d "$WORK/p.XXXXXX")"
     # ---- stage0 is the ORACLE. If IT cannot produce a running program, this file is not
     # a parity signal (a fixture meant to fail to compile, a driver needing stdin, ...).
-    if ! timeout "$COMPILE_TIMEOUT" "$ELISACORE_BIN" -emit obj -o "$WORK/$name.s0.o" "$src" >/dev/null 2>&1 </dev/null; then
-        skipped=$((skipped + 1)); continue
+    if ! timeout "$COMPILE_TIMEOUT" "$ELISACORE_BIN" -emit obj -o "$work/s0.o" "$src" >/dev/null 2>&1 </dev/null; then
+        printf 'SKIP\t%s\t\n' "$name"; return 0
     fi
-    if ! link_program "$WORK/$name.s0" "$WORK/$name.s0.o"; then
-        skipped=$((skipped + 1)); continue
-    fi
-    RUN "$WORK/$name.s0"; s0_rc=$?
+    if ! link_program "$work/s0" "$work/s0.o"; then printf 'SKIP\t%s\t\n' "$name"; return 0; fi
+    RUN "$work/s0"; local s0_rc=$?
     # 124 = timeout. An oracle that hangs cannot arbitrate.
-    if [ "$s0_rc" -eq 124 ]; then skipped=$((skipped + 1)); continue; fi
-
+    if [ "$s0_rc" -eq 124 ]; then printf 'SKIP\t%s\t\n' "$name"; return 0; fi
     # ---- stage1. A compile or link failure is the ACCEPTANCE gap, not a wrong answer:
     # a declined function is dropped, so the link fails with an undefined symbol.
     if ! timeout "$COMPILE_TIMEOUT" env ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" \
-            -o "$WORK/$name.s1.o" "$src" >/dev/null 2>&1 </dev/null; then
-        declined=$((declined + 1)); echo "$name (compile)" >> "$WORK/declines.txt"; continue
+            -o "$work/s1.o" "$src" >/dev/null 2>&1 </dev/null; then
+        printf 'DECLINED\t%s\t(compile)\n' "$name"; return 0
     fi
-    if ! link_program "$WORK/$name.s1" "$WORK/$name.s1.o"; then
-        declined=$((declined + 1)); echo "$name (link: a declined function was dropped)" >> "$WORK/declines.txt"; continue
+    if ! link_program "$work/s1" "$work/s1.o"; then
+        printf 'DECLINED\t%s\t(link: a declined function was dropped)\n' "$name"; return 0
     fi
-    RUN "$WORK/$name.s1"; s1_rc=$?
-
-    # A disagreement must REPRODUCE before it counts. Two ways this gate can cry wolf, both
-    # observed or reachable:
-    #   * NONDETERMINISM. The corpus sweeps stage0's own tree, which holds the concurrency
-    #     smokes (pool_stress, threading, par_map, nursery); their exit codes depend on
-    #     scheduling.
-    #   * A STAGE1 TIMEOUT. `s0_rc -eq 124` is skipped above, but 124 from the stage1 run
-    #     was just another exit code — so a program that ran slow under load was reported
-    #     as a silent miscompile.
-    # A "1 program produces a DIFFERENT ANSWER" failure did fire once here and did not
-    # reproduce across five later runs with no compiler change in between. That is worse
-    # than a missing check: MISMATCH is the one thing ratcheted at zero, so a gate that
-    # cries wolf trains the next REAL wrong answer to be waved through as "the flaky one".
-    #
-    # Re-running only on disagreement keeps the happy path at one run per compiler.
+    RUN "$work/s1"; local s1_rc=$?
+    # A disagreement must REPRODUCE before it counts (nondeterministic concurrency smokes in
+    # stage0's tree; a stage1 run that timed out under load). Re-running only on
+    # disagreement keeps the happy path at one run per compiler.
     if [ "$s0_rc" != "$s1_rc" ]; then
-        RUN "$WORK/$name.s0"; s0_rc2=$?
-        RUN "$WORK/$name.s1"; s1_rc2=$?
-        # Only an UNSTABLE ORACLE justifies a skip. An unstable STAGE1 does not: this very
-        # check first reported `easm_lockstep_parse_smoke` as stage0 42/42, stage1 139/42 —
-        # an INTERMITTENT SEGFAULT in stage1-compiled code, which is a worse bug than a
-        # steady wrong answer, not a reason to look away. Classing "stage1 varies" as flaky
-        # would have buried it.
+        RUN "$work/s0"; local s0_rc2=$?
+        RUN "$work/s1"; local s1_rc2=$?
+        # Only an UNSTABLE ORACLE justifies a skip. An unstable STAGE1 is a stage1 defect
+        # (an intermittent segfault is worse than a steady wrong answer, not a reason to
+        # look away): it is reported as a MISMATCH unless triaged in KNOWN_INTERMITTENT.
         if [ "$s0_rc" != "$s0_rc2" ]; then
-            skipped=$((skipped + 1))
-            echo "$name (oracle nondeterministic: stage0 $s0_rc/$s0_rc2)" >> "$WORK/flaky.txt"
-            continue
+            printf 'FLAKY\t%s\t(oracle nondeterministic: stage0 %s/%s)\n' "$name" "$s0_rc" "$s0_rc2"; return 0
         fi
-        # stage1 disagreeing with ITSELF is still a stage1 defect: report the failing run.
-        # KNOWN_INTERMITTENT holds the ones already triaged and recorded, so the gate stays
-        # DETERMINISTIC instead of failing on whichever ~3% run happens to crash. They are
-        # printed every run, loudly, and counted separately — this is a to-do list, not an
-        # exemption, and it should only ever shrink.
-        # `${a[@]+"${a[@]}"}`: bash 3.2 (macOS) treats an EMPTY array as unbound under `set -u`,
-        # so the plain expansion would abort the gate now that the list is empty.
         if [ "$s1_rc" != "$s1_rc2" ] && printf '%s\n' ${KNOWN_INTERMITTENT[@]+"${KNOWN_INTERMITTENT[@]}"} | grep -qx "$name"; then
-            intermittent=$((intermittent + 1))
-            echo "$name (stage0 $s0_rc, stage1 $s1_rc/$s1_rc2)" >> "$WORK/intermittent.txt"
-            continue
+            printf 'INTERMITTENT\t%s\t(stage0 %s, stage1 %s/%s)\n' "$name" "$s0_rc" "$s1_rc" "$s1_rc2"; return 0
         fi
         if [ "$s1_rc" != "$s1_rc2" ]; then
-            mismatch=$((mismatch + 1))
-            printf '%-44s stage0=%-4s stage1=%s/%s (INTERMITTENT)  %s\n' "$name" "$s0_rc" "$s1_rc" "$s1_rc2" "$src" >> "$WORK/mismatches.txt"
-            continue
+            printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=%s/%s (INTERMITTENT)  %s' "$name" "$s0_rc" "$s1_rc" "$s1_rc2" "$src")"; return 0
         fi
-        s0_rc=$s0_rc2
-        s1_rc=$s1_rc2
+        s0_rc=$s0_rc2; s1_rc=$s1_rc2
     fi
-
     if [ "$s0_rc" -eq "$s1_rc" ]; then
-        match=$((match + 1))
+        printf 'MATCH\t%s\t\n' "$name"
     else
-        mismatch=$((mismatch + 1))
-        printf '%-44s stage0=%-4s stage1=%-4s  %s\n' "$name" "$s0_rc" "$s1_rc" "$src" >> "$WORK/mismatches.txt"
+        printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=%-4s  %s' "$name" "$s0_rc" "$s1_rc" "$src")"
     fi
-done 3< "$WORK/programs.txt"
+}
 
-# The loop body runs in THIS shell (redirect, not a pipe), so the counters below are the
-# real totals — piping `find` straight into `while` would subshell them away to zero.
+if [[ "${1:-}" == "--one" ]]; then
+    # /dev/null on stdin belongs on the WORKER, never on xargs: `... | xargs ... </dev/null`
+    # replaces the pipe with an empty stream and xargs runs the worker once with no program.
+    exec </dev/null
+    one_program "$3" > "$(mktemp "$WORK/res/r.XXXXXX")"
+    exit 0
+fi
+
+JOBS="${ELISA_CORPUS_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+mkdir -p "$WORK/res"
+# Workers get /dev/null on stdin (a compiled program that reads input must not drain the
+# list) and the corpus as NUL-separated arguments (paths contain spaces).
+tr '\n' '\0' < "$WORK/programs.txt" \
+  | xargs -0 -P "$JOBS" -n 1 env ELISACORE_BIN="$ELISACORE_BIN" ELISA_STAGE1_BIN="$STAGE1" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" ELISA_CORE="$ELISA_CORE" LLVM_CONFIG="$LLVM_CONFIG" \
+      bash "$0" --one "$WORK"
+
+# Reduce: one line per program, deterministic order.
+cat "$WORK/res"/r.* 2>/dev/null | sort > "$WORK/results.txt"
+count_kind() { grep -c "^$1"$'\t' "$WORK/results.txt" 2>/dev/null || true; }
+match="$(count_kind MATCH)"; mismatch="$(count_kind MISMATCH)"; declined="$(count_kind DECLINED)"
+skipped=$(( $(count_kind SKIP) + $(count_kind FLAKY) )); intermittent="$(count_kind INTERMITTENT)"
+awk -F'\t' '$1=="MISMATCH"{print $3}' "$WORK/results.txt" > "$WORK/mismatches.txt"
+awk -F'\t' '$1=="DECLINED"{print $2" "$3}' "$WORK/results.txt" > "$WORK/declines.txt"
+awk -F'\t' '$1=="FLAKY"{print $2" "$3}' "$WORK/results.txt" > "$WORK/flaky.txt"
+awk -F'\t' '$1=="INTERMITTENT"{print $2" "$3}' "$WORK/results.txt" > "$WORK/intermittent.txt"
 
 total=$((match + mismatch + declined + skipped + intermittent))
 echo "differential corpus: $total programs — $match match, $mismatch MISMATCH, $declined declined, $skipped skipped (stage0 could not arbitrate)" >&2
@@ -245,7 +254,7 @@ if [ -s "$WORK/flaky.txt" ]; then
     echo "NONDETERMINISTIC (skipped — cannot arbitrate):" >&2
     cat "$WORK/flaky.txt" >&2
 fi
-if [ "$VERBOSE" -eq 1 ] && [ "$declined" -gt 0 ]; then
+if [ "$declined" -gt 0 ]; then
     echo "declined by stage1:" >&2
     cat "$WORK/declines.txt" >&2
 fi

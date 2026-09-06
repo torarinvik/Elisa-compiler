@@ -64,11 +64,12 @@ stage0_messages() {
     return 0
 }
 
-failed=0
-checked=0
-for fixture in "$FIXTURES"/*.elisa; do
-    [ -f "$fixture" ] || continue
-    checked=$((checked + 1))
+# PARALLEL (Phase T, 2026-09-06): each fixture is two independent compiler runs, so they
+# fan out under `xargs -P` (ELISA_DIAG_JOBS, default = core count) by re-entering this script
+# as `--one <work> <fixture>`. A worker writes its mismatch blocks plus one trailing
+# `#failed N` / `#known <msg>` line per fixture; the parent reduces in fixture order.
+one_fixture() {
+    local fixture="$1" s0 s1 expected actual found is_known known failed=0
     s0="$(stage0_messages "$fixture")"
     s1="$(stage1_messages "$fixture")"
     while IFS= read -r expected; do
@@ -85,15 +86,44 @@ EOF
                 [ "$known" = "$expected" ] && is_known=1
             done
             if [ "$is_known" -eq 1 ]; then
-                known_hit+=("$expected")
+                printf '#known %s\n' "$expected"
             else
                 printf 'diagnostic mismatch: %s\nstage0: %s\nstage1: %s\n' \
-                    "${fixture#"$REPO_ROOT"/}" "$expected" "${s1//$'\n'/ | }" >&2
+                    "${fixture#"$REPO_ROOT"/}" "$expected" "${s1//$'\n'/ | }"
                 failed=$((failed + 1))
             fi
         fi
     done <<EOF
 $s0
+EOF
+    printf '#failed %s\n' "$failed"
+}
+
+if [ "${1:-}" = "--one" ]; then
+    exec </dev/null
+    WORK="$2"
+    one_fixture "$3" > "$WORK/$(basename "$3").out"
+    exit 0
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+JOBS="${ELISA_DIAG_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+find "$FIXTURES" -maxdepth 1 -name '*.elisa' -print0 \
+  | xargs -0 -P "$JOBS" -n 1 env ELISACORE_BIN="$ELISACORE_BIN" ELISA_CORE="$ELISA_CORE" bash "$0" --one "$WORK"
+
+failed=0
+checked=0
+for fixture in "$FIXTURES"/*.elisa; do
+    [ -f "$fixture" ] || continue
+    checked=$((checked + 1))
+    out="$WORK/$(basename "$fixture").out"
+    [ -f "$out" ] || { echo "diagnostics diff FAILED: no result for $fixture (worker died)" >&2; failed=$((failed + 1)); continue; }
+    grep -v '^#' "$out" >&2
+    n="$(awk '/^#failed /{print $2}' "$out")"
+    failed=$((failed + ${n:-0}))
+    while IFS= read -r kn; do known_hit+=("${kn#\#known }"); done <<EOF
+$(grep '^#known ' "$out")
 EOF
 done
 
