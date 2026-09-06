@@ -389,20 +389,27 @@ run_one() {
 # what silently yielded an EMPTY corpus elsewhere in this suite.
 #
 # ORDERED LONGEST-FIRST from the measured profile. With a fixed pool, starting the long poles
-# last leaves workers idle at the tail: the three heaviest checks alone were 881s of a 1398s
-# serial total (differential corpus 355s, driver acceptance 310s, backend_native 216s), so
-# they must be in flight from the first moment. Anything unlisted sorts after these.
+# last leaves workers idle at the tail. The order below is the 2026-09-06 box profile (927 s
+# wall against a 5620 s serial total); `self_host_gen3_smoke.sh` leads because it IS the
+# makespan — three sequential self-compiles, 636 s, 69 % of the wall — and it previously sat
+# NINTH in the dispatch list behind four short named checks, so on an 8-wide pool it could not
+# start until something else finished. Anything unlisted sorts after these.
 resultdir="$(mktemp -d)"
 
 HEAVY_FIRST=(
-  "$REPO_ROOT/test/parity/differential_corpus.sh"
-  "$REPO_ROOT/test/parity/driver_acceptance_smoke.sh"
-  "$REPO_ROOT/test/parity/backend_native_smoke.sh"
+  "$REPO_ROOT/test/parity/self_host_gen3_smoke.sh"       # 636s — the critical path
+  "$REPO_ROOT/test/parity/driver_acceptance_smoke.sh"    # 448s
+  "$REPO_ROOT/test/parity/differential_corpus.sh"        # 403s
+  "$REPO_ROOT/test/parity/resolve_smoke.sh"              # 335s
+  "$REPO_ROOT/test/parity/check_self_hostable.sh"        # 333s
+  "$REPO_ROOT/test/parity/malformed_input_smoke.sh"      # 314s
+  "$REPO_ROOT/test/parity/cli_includes_smoke.sh"         # 303s
+  "$REPO_ROOT/test/parity/compile_time_smoke.sh"         # 224s
+  "$REPO_ROOT/test/parity/adversarial_differential_smoke.sh"  # 206s
+  "$REPO_ROOT/test/parity/backend_native_smoke.sh"       # 169s
+  "$REPO_ROOT/test/parity/loop_smoke.sh"                 # 121s
   "$REPO_ROOT/test/parity/extern_view_abi_smoke.sh"
-  "$REPO_ROOT/test/parity/self_host_gen3_smoke.sh"
   "$REPO_ROOT/test/parity/scope_binding_smoke.sh"
-  "$REPO_ROOT/test/parity/resolve_smoke.sh"
-  "$REPO_ROOT/test/parity/check_self_hostable.sh"
   "$REPO_ROOT/test/parity/semantic_internal_diff.sh"
 )
 
@@ -412,6 +419,11 @@ push() { in_profile "$1" || return 0; JOB_NAMES+=("$1"); shift; JOB_CMDS+=("$(pr
 
 push "behavioural differential corpus (ratchet)" "$REPO_ROOT/test/parity/differential_corpus.sh"
 push "self-hostable (0 unresolved / 132 files)" "$REPO_ROOT/test/parity/check_self_hostable.sh"
+# The heavy smokes go in FIRST (see HEAVY_FIRST): a short named check ahead of them occupies
+# a pool slot that a long pole needs at t=0.
+for h in "${HEAVY_FIRST[@]}"; do
+  [[ "$h" == *_smoke.sh && -f "$h" ]] && push "$(basename "$h")" "$h"
+done
 push "runtime drift guard (elisacore_std in sync)" "$REPO_ROOT/scripts/check_runtime_drift.sh"
 push "lexer parity (stage1 == stage0)" "$REPO_ROOT/test/parity/run_parity.sh"
 oracle_lane=(
@@ -428,10 +440,6 @@ oracle_names=(
 )
 push "diagnostic breadth baseline" "$REPO_ROOT/test/breadth/run.sh" --baseline "$REPO_ROOT/test/fixtures/diagnostics.baseline.tsv" "$REPO_ROOT/test/fixtures/diagnostics"
 
-# The behavioural smokes, heavy ones first so they are never left to the tail.
-for h in "${HEAVY_FIRST[@]}"; do
-  [[ "$h" == *_smoke.sh && -f "$h" ]] && push "$(basename "$h")" "$h"
-done
 serial_lane=()
 for smoke in "$REPO_ROOT"/test/parity/*_smoke.sh; do
   skip=""
@@ -546,7 +554,10 @@ if [[ -z "${ELISA_GATE_QUIET:-}" ]]; then
 fi
 rm -f "$timings_file"
 if [[ -n "${ELISA_S0_CACHE_STATS:-}" && -f "$ELISA_S0_CACHE_STATS" ]]; then
-  echo "stage0 oracle cache: $(sort "$ELISA_S0_CACHE_STATS" | uniq -c | awk '{printf "%s=%s ", $2, $1}')"
+  # Aggregate by KIND (the stats file is `kind<TAB>mode<TAB>why`, so counting whole lines
+  # printed one bucket per mode and read as gibberish). The per-mode census stays in the file.
+  echo "stage0 oracle cache: $(awk -F'\t' '{n[$1]++} END{for (k in n) printf "%s=%s ", k, n[k]}' "$ELISA_S0_CACHE_STATS")"
+  echo "  by mode: $(awk -F'\t' '$1!="bypass"{n[$1"/"$2]++} END{for (k in n) printf "%s=%s ", k, n[k]}' "$ELISA_S0_CACHE_STATS")"
   rm -f "$ELISA_S0_CACHE_STATS"
 fi
 echo "----------------------------------------"
