@@ -7,11 +7,11 @@ source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
 out=$(printf 'def use() -> i64:\n    x: i64 = 42i64\n    y: f64 = 1.5f64\n    return x\n' | "$RPT")
-echo "$out" | grep -Fq 'numeric literal suffix "i64" is discouraged' || { echo "missing i64 suffix warning: $out" >&2; exit 1; }
-echo "$out" | grep -Fq 'numeric literal suffix "f64" is discouraged' || { echo "missing f64 suffix warning: $out" >&2; exit 1; }
+grep -Fq 'numeric literal suffix "i64" is discouraged' <<< "$out" || { echo "missing i64 suffix warning: $out" >&2; exit 1; }
+grep -Fq 'numeric literal suffix "f64" is discouraged' <<< "$out" || { echo "missing f64 suffix warning: $out" >&2; exit 1; }
 
 plain=$(printf 'def use() -> i64:\n    x: i64 = 42\n    y: f64 = 1.5\n    return x\n' | "$RPT")
-if echo "$plain" | grep -Fq 'numeric literal suffix'; then
+if grep -Fq 'numeric literal suffix' <<< "$plain"; then
     echo "unsuffixed literal produced suffix warning: $plain" >&2
     exit 1
 fi

@@ -13,7 +13,7 @@ summary="$(printf '%s\n' "$output" | grep '\[ SUMMARY  \]' | tail -1)"
     echo "lexer machine-state smoke FAILED: test summary was not emitted" >&2
     exit 1
 }
-printf '%s\n' "$summary" | grep -Eq 'failed=0$' || {
+grep -Eq 'failed=0$' <<< "$summary" || {
     echo "lexer machine-state smoke FAILED: $summary" >&2
     exit 1
 }

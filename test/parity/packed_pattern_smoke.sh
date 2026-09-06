@@ -27,23 +27,23 @@ grep -q '^D 1$' <<< "$wrong_store" || fail "wrong packed Store owner was not rej
 grep -q "requires store type \"Expr.Store\", got Token.Store" <<< "$wrong_store" || fail "wrong packed Store diagnostic missing: $wrong_store"
 
 store_assign=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad(store: Expr.Store[Frozen], node: Expr) -> void:\n    store[0] <- node\n' | "$RPT")
-echo "$store_assign" | grep -Fq 'cannot assign to packed store index result' || fail "packed store index assignment not flagged: $store_assign"
+grep -Fq 'cannot assign to packed store index result' <<< "$store_assign" || fail "packed store index assignment not flagged: $store_assign"
 
 bare_ctor=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad() -> Expr:\n    return Expr.Int(value: 1)\n' | "$RPT")
-echo "$bare_ctor" | grep -Fq 'packed enum constructor "Expr.Int" requires an active in Expr.Store' || fail "bare packed constructor not flagged: $bare_ctor"
+grep -Fq 'packed enum constructor "Expr.Int" requires an active in Expr.Store' <<< "$bare_ctor" || fail "bare packed constructor not flagged: $bare_ctor"
 clean $'packed enum Expr:\n    Int(value: int)\n\ndef build(owner: Arena) -> Expr:\n    store: Expr.Store[Local] = Expr.Store(owner)\n    return Expr.Int(value: 1)\n'
 
 missing_match_store=$(printf 'packed enum Expr:\n    Int(value: int)\n\ndef bad(node: Expr) -> int:\n    match node:\n        Expr.Int(value: value):\n            return value\n' | "$RPT")
-echo "$missing_match_store" | grep -Fq 'packed enum match over "Expr" requires an in Expr.Store clause' || fail "packed match without store not flagged: $missing_match_store"
+grep -Fq 'packed enum match over "Expr" requires an in Expr.Store clause' <<< "$missing_match_store" || fail "packed match without store not flagged: $missing_match_store"
 ordinary_store=$(printf 'enum Expr:\n    Int(value: int)\npacked enum PackedExpr:\n    Int(value: int)\ndef bad(node: Expr, store: PackedExpr.Store[Local]) -> int:\n    match node in store:\n        Expr.Int(value: value):\n            return value\n' | "$RPT")
-echo "$ordinary_store" | grep -Fq 'ordinary enum match over "Expr" does not take an in-store clause' || fail "ordinary match store clause not flagged: $ordinary_store"
+grep -Fq 'ordinary enum match over "Expr" does not take an in-store clause' <<< "$ordinary_store" || fail "ordinary match store clause not flagged: $ordinary_store"
 
 missing_if_binder=$(printf 'packed enum Expr:\n    Int(value: int)\ndef bad(node: Expr, store: Expr.Store[Local]) -> int:\n    if node in store:\n        return 1\n    return 0\n' | "$RPT")
-echo "$missing_if_binder" | grep -Fq 'if pattern binder requires `as Enum.Variant(...)` after store expression' || fail "packed if-store binder omission not flagged: $missing_if_binder"
+grep -Fq 'if pattern binder requires `as Enum.Variant(...)` after store expression' <<< "$missing_if_binder" || fail "packed if-store binder omission not flagged: $missing_if_binder"
 clean $'def contains(value: int, values: darray[int]&) -> bool:\n    if value in values:\n        return true\n    return false\n'
 
 ordinary_variant_type=$(printf 'enum Expr:\n    Int(value: int)\ndef bad(node: Expr.Int) -> int:\n    return 0\n' | "$RPT")
-echo "$ordinary_variant_type" | grep -Fq 'bare variant type "Expr.Int" requires a packed enum or tree category' || fail "ordinary bare variant type not flagged: $ordinary_variant_type"
+grep -Fq 'bare variant type "Expr.Int" requires a packed enum or tree category' <<< "$ordinary_variant_type" || fail "ordinary bare variant type not flagged: $ordinary_variant_type"
 clean $'packed enum Expr:\n    Int(value: int)\ndef ok(node: Expr.Int) -> int:\n    return 0\n'
 
 clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    can Abort.Panic:\n        expect node as Expr.Int(value):\n            return value\n    return 0\n'
@@ -53,12 +53,12 @@ grep -q '^P 1$' <<< "$removed" || fail "removed value cast was accepted: $remove
 grep -q "unexpected token \"as\"" <<< "$removed" || fail "removed value cast lacks directed error: $removed"
 
 removed_abi=$(printf '@packed_abi(dense_fixed)\npacked enum Expr:\n    Lit(value: int)\n' | "$RPT")
-echo "$removed_abi" | grep -Fq '@packed_abi on enum "Expr" has been removed' || fail "removed packed ABI annotation not flagged: $removed_abi"
+grep -Fq '@packed_abi on enum "Expr" has been removed' <<< "$removed_abi" || fail "removed packed ABI annotation not flagged: $removed_abi"
 removed_prefix=$(printf '@packed_prefix(common_only)\npacked enum Expr:\n    common:\n        span: int\n    Lit(value: int)\n' | "$RPT")
-echo "$removed_prefix" | grep -Fq '@packed_prefix on enum "Expr" has been removed' || fail "removed packed prefix annotation not flagged: $removed_prefix"
+grep -Fq '@packed_prefix on enum "Expr" has been removed' <<< "$removed_prefix" || fail "removed packed prefix annotation not flagged: $removed_prefix"
 
 removed_store_as="$(printf '%s' $'packed enum Expr:\n    Lit(value: int)\n\ndef bad(node: Expr, store: Expr.Store[Local]) -> int:\n    if node in store as Expr.Lit(value):\n        return value\n    return 0\n' | "$RPT")"
-echo "$removed_store_as" | grep -Eq '^P [1-9][0-9]*$' || fail "removed in-store as binder was accepted: $removed_store_as"
+grep -Eq '^P [1-9][0-9]*$' <<< "$removed_store_as" || fail "removed in-store as binder was accepted: $removed_store_as"
 
 move_arity="$(printf '%s' $'struct Pair:\n    left: mutable i64\n    right: mutable i64\n\ndef bad(pair: Pair) -> void:\n    move pair as Pair(left)\n' | "$RPT")"
 grep -q '^D 1$' <<< "$move_arity" || fail "move struct arity mismatch was not rejected exactly once: $move_arity"

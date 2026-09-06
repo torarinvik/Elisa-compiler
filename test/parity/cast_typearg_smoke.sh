@@ -28,19 +28,19 @@ grep -q "undefined identifier \"missingidx\"" <<< "$out" || fail "ordinary index
 
 # 5. Direct specialization is valid only for a function with generic params.
 out=$(printf 'def id(value: int) -> int:\n    return value\ndef run() -> int:\n    return id[int](7)\n' | "$RPT")
-echo "$out" | grep -Fq 'function "id" is not generic' || fail "non-generic specialization accepted: $out"
+grep -Fq 'function "id" is not generic' <<< "$out" || fail "non-generic specialization accepted: $out"
 out=$(printf 'def id[T](value: T) -> T:\n    return value\ndef run() -> int:\n    return id[int](7)\n' | "$RPT")
-echo "$out" | grep -Fq 'is not generic' && fail "generic specialization rejected: $out"
+grep -Fq 'is not generic' <<< "$out" && fail "generic specialization rejected: $out"
 
 # 6. A local binding shadows a same-named function and remains ordinary indexing.
 out=$(printf 'def item(value: int) -> int:\n    return value\ndef run(item: darray[int]&) -> int:\n    return item[0]\n' | "$RPT")
-echo "$out" | grep -Fq 'is not generic' && fail "shadowed local index treated as specialization: $out"
+grep -Fq 'is not generic' <<< "$out" && fail "shadowed local index treated as specialization: $out"
 
 # 7. Explicit generic type arguments must satisfy retained interface bounds.
 bounded_prefix='struct BuilderTag:\n    tag: int\n\nprotocol Builder:\n    type State\n    def state() -> State\n\nimpl Builder for BuilderTag:\n    type State = int\n\n    def state() -> int:\n        return 1\n\ndef build[B: Builder]() -> B.State:\n    return B.state()\n'
 out=$(printf "${bounded_prefix}\ndef bad() -> int:\n    return build[sview]()\n" | "$RPT")
-echo "$out" | grep -Fq 'type "sview" does not satisfy required interface fact "Builder" for type argument' || fail "unsatisfied interface bound accepted: $out"
+grep -Fq 'type "sview" does not satisfy required interface fact "Builder" for type argument' <<< "$out" || fail "unsatisfied interface bound accepted: $out"
 out=$(printf "${bounded_prefix}\ndef ok() -> int:\n    return build[BuilderTag]()\n" | "$RPT")
-echo "$out" | grep -Fq 'does not satisfy required interface fact' && fail "recorded interface implementation rejected: $out"
+grep -Fq 'does not satisfy required interface fact' <<< "$out" && fail "recorded interface implementation rejected: $out"
 
 echo "cast-typearg smoke OK: .cast/.ref/.specialize type args skipped, real undefined identifiers + ordinary indexing still resolved"
