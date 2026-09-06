@@ -8,7 +8,141 @@ extend Semantic:
 
         # Signature + mutability checks for one function: duplicate parameter names,
         # then assignment-to-immutable over the body.
-        def check_function(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], table: lmut SymbolTable, line: u32) -> void:
+        # Functions declared `-> mutable T&`: a local `r: T& = f()` initialised by a DIRECT call to
+        # one of them holds a reference whose TARGET is writable, so `r <- v` is a legal write-
+        # through (stage0 keeps the initializer-derived `RefType.Mutable` on the binding; the
+        # annotation `T&` is only a view). Nothing else about the local changes — the list is
+        # consulted only for that one initializer shape (memory: write-through-ref-gap).
+        def collect_mutable_ref_return_fns(declarations: darray[Ast::Decl], names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            if return_type is declared_return:
+                                names.push(name) if type_contains_ref(declared_return) and type_is_mutable(declared_return)
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_mutable_ref_return_fns(module_body, names)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_mutable_ref_return_fns(scoped_body, names)
+                        _:
+                            pass
+
+
+        # Whether VALUE is a direct call `f(...)` / `M::f(...)` to a function in NAMES.
+        def value_is_mutable_ref_return_call(value: Ast::Expr, names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        match callee:
+                            Expr.Ident(callee_name, ident_line):
+                                return any listed in names where listed == callee_name
+                            Expr.Scope(scope_base, member_name, scope_line):
+                                return any listed in names where listed == member_name
+                            _:
+                                return false
+                    Expr.Paren(inner, paren_line):
+                        return value_is_mutable_ref_return_call(inner, names)
+                    _:
+                        return false
+
+
+        # A non-mutable `r: T& = f()` whose callee returns `mutable T&` is a write-through
+        # binding: route it to `skip` so `check_assigns` does not flag `r <- v`. A `mutable`-
+        # declared local is a REBIND target and keeps its own classification; every other
+        # initializer shape (`&x`, a field, a chain) stays as strict as before.
+        def skip_write_through_ref_locals(statements: darray[Ast::Stmt], names: darray[sview]&, skip: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |skip|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            through: bool = type_contains_ref(type_expression) and not type_is_mutable(type_expression) and value_is_mutable_ref_return_call(value, names)
+                            skip.push(name) if through
+                        Stmt.If(condition, then_body, else_body, line):
+                            skip_write_through_ref_locals(then_body, names, skip)
+                            skip_write_through_ref_locals(else_body, names, skip)
+                        Stmt.While(condition, body, line):
+                            skip_write_through_ref_locals(body, names, skip)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            skip_write_through_ref_locals(body, names, skip)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            skip_write_through_ref_locals(body, names, skip)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |skip|:
+                                skip_write_through_ref_locals(arm.body, names, skip)
+                        _:
+                            pass
+
+
+        # Non-`mutable` locals declared as a plain `T&` that are NOT write-through bindings
+        # (skip_write_through_ref_locals above): a `<-` on one is a write through a READONLY
+        # reference. stage0 words that differently from a plain immutable local (`cannot assign
+        # through readonly ref "r"` plus a note line), so these names are collected with their
+        # base type and reported by check_readonly_ref_assigns, then added to `skip` so
+        # check_assigns does not also report them as immutable locals.
+        def collect_readonly_ref_locals(statements: darray[Ast::Stmt], mutable_ref_return_fns: darray[sview]&, names: mutable darray[sview]&, base_types: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |names, base_types|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            readonly: bool = type_contains_ref(type_expression) and not type_is_mutable(type_expression) and not value_is_mutable_ref_return_call(value, mutable_ref_return_fns)
+                            if readonly:
+                                names.push(name)
+                                base_types.push(bare_type_name_through_ref(type_expression))
+                        Stmt.If(condition, then_body, else_body, line):
+                            collect_readonly_ref_locals(then_body, mutable_ref_return_fns, names, base_types)
+                            collect_readonly_ref_locals(else_body, mutable_ref_return_fns, names, base_types)
+                        Stmt.While(condition, body, line):
+                            collect_readonly_ref_locals(body, mutable_ref_return_fns, names, base_types)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            collect_readonly_ref_locals(body, mutable_ref_return_fns, names, base_types)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            collect_readonly_ref_locals(body, mutable_ref_return_fns, names, base_types)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |names, base_types|:
+                                collect_readonly_ref_locals(arm.body, mutable_ref_return_fns, names, base_types)
+                        _:
+                            pass
+
+
+        def readonly_ref_local_index(names: darray[sview]&, name: sview) -> i64:
+            can Abort.Panic:
+                for index in 0..<names.count |names, name|:
+                    index.i64() return if names[index] == name
+                return -1
+
+
+        def check_readonly_ref_assigns(statements: darray[Ast::Stmt], names: darray[sview]&, base_types: darray[sview]&, mutable_names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Assign(target, operator, value, line):
+                            if operator != TokenKind.Assign:
+                                match target:
+                                    Expr.Ident(name, ident_line):
+                                        found: i64 = readonly_ref_local_index(names, name)
+                                        ever_mutable: bool = any mutable_name in mutable_names where mutable_name == name
+                                        if found >= 0 and not ever_mutable:
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignThroughReadonlyRef, name: name, line: line.line, expected: base_types[found.usize()], actual: ""})
+                                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ReadonlyRefAssignNote, name: name, line: line.line, expected: base_types[found.usize()], actual: ""})
+                                    _:
+                                        pass
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- check_readonly_ref_assigns(then_body, names, base_types, mutable_names, table)
+                            table <- check_readonly_ref_assigns(else_body, names, base_types, mutable_names, table)
+                        Stmt.While(condition, body, line):
+                            table <- check_readonly_ref_assigns(body, names, base_types, mutable_names, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            table <- check_readonly_ref_assigns(body, names, base_types, mutable_names, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- check_readonly_ref_assigns(body, names, base_types, mutable_names, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- check_readonly_ref_assigns(arm.body, names, base_types, mutable_names, table)
+                        _:
+                            pass
+
+
+        def check_function(parameters: darray[Ast::ParamDecl], body: darray[Ast::Stmt], mutable_ref_return_fns: darray[sview]&, table: lmut SymbolTable, line: u32) -> void:
             can Memory.Allocate, Abort.Panic:
                 seen: mutable darray[sview] = []
                 for parameter in parameters |table, seen| -> table:
@@ -54,6 +188,13 @@ extend Semantic:
                 for parameter in parameters |immutable_names, mutable_names|:
                     note_binding(parameter.name, parameter.is_mutable or type_is_mutable(parameter.type_expression) or type_is_lmut(parameter.type_expression), immutable_names, mutable_names)
                 gather_mutability(body, immutable_names, mutable_names, skip)
+                skip_write_through_ref_locals(body, mutable_ref_return_fns, skip)
+                readonly_ref_names: mutable darray[sview] = []
+                readonly_ref_types: mutable darray[sview] = []
+                collect_readonly_ref_locals(body, mutable_ref_return_fns, readonly_ref_names, readonly_ref_types)
+                table <- check_readonly_ref_assigns(body, readonly_ref_names, readonly_ref_types, mutable_names, table)
+                for readonly_ref_name in readonly_ref_names |skip|:
+                    skip.push(readonly_ref_name)
                 table <- check_assigns(body, table, immutable_names, mutable_names, skip)
 
                 function_scope: mutable darray[sview] = [parameter.name for parameter in parameters]
@@ -63,6 +204,13 @@ extend Semantic:
 
         # Resolve references in every function declaration in `declarations` (recursing modules).
         def resolve_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                mutable_ref_return_fns: mutable darray[sview] = []
+                collect_mutable_ref_return_fns(declarations, mutable_ref_return_fns)
+                table <- resolve_declarations_with(declarations, mutable_ref_return_fns, table)
+
+
+        def resolve_declarations_with(declarations: darray[Ast::Decl], mutable_ref_return_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
@@ -87,7 +235,7 @@ extend Semantic:
                             for parameter in parameters |table| -> table:
                                 table <- record_reference(table, line.line, parameter.name, true)
                             table <- resolve_body(body, table, bound, bound_mutability)
-                            table <- check_function(parameters, body, table, line.line)
+                            table <- check_function(parameters, body, mutable_ref_return_fns, table, line.line)
                             table <- check_returns(body, return_type_is_void(return_type), name, table)
                             table <- check_missing_return(body, return_type_is_void(return_type), name, table, line.line)
                             parameter_names: mutable darray[sview] = []
@@ -113,9 +261,9 @@ extend Semantic:
                         Decl.Module(name, body, line):
                             previous_module: sview = table.current_module
                             table.current_module <- name
-                            table <- resolve_declarations(body, table)
+                            table <- resolve_declarations_with(body, mutable_ref_return_fns, table)
                             table.current_module <- previous_module
                         Decl.Scoped(body, line):
-                            table <- resolve_declarations(body, table)
+                            table <- resolve_declarations_with(body, mutable_ref_return_fns, table)
                         _:
                             pass
