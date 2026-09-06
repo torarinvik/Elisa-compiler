@@ -1,0 +1,112 @@
+# An owned container allocated inside a `region NAME:` block and RETURNED from it (§3.3.7):
+#
+#     def build() -> darray[i64]:
+#         region r:
+#             xs: mutable darray[i64] = []
+#             xs.push(1)
+#             return xs            # freed at scope exit; the caller would hold a dangling value
+#
+# stage0 rejects this with TWO findings, in this order (MEASURED 2026-09-06, one probe per row):
+#   at the returned name   value allocated in region "r" escapes via return; the region is freed
+#                          at scope exit. Copy it into a caller-provided region param
+#                          (def f[@r] ... -> ... @r) or a longer-lived region first
+#   at `return`            cannot return value: region dependency facts include local region "r"
+# A `return xs if c else xs` yields only the second (the value is not a bare name); a local
+# DECLARED OUTSIDE the block and returned inside it is fine; a struct value is fine (not heap
+# owning); the innermost enclosing region is the one named (`region r: region q: …` -> "q");
+# a `-> darray[i64] @r` function is region-polymorphic and allowed. stage1 accepted all of it —
+# a PERMISSIVE gap no gate could see. Sound subset: the function's declared return type is a
+# bare owned container (return_type_is_owned_container) and the returned name was declared,
+# with an owned-container type, inside an enclosing region block of the same function.
+extend Semantic:
+    private:
+        # The region a returned VALUE depends on, or "": a bare name declared in a region, through
+        # parentheses; an `if` value whose BOTH arms depend on a region (the then-arm's is named).
+        # `is_bare` says whether the value itself is the name (that shape gets both findings).
+        def rre_value_region(value: Ast::Expr, names: darray[sview]&, regions: darray[sview]&) -> (region: sview, is_bare: bool, pos: Ast::Pos):
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Ident(name, ident_pos):
+                        found: mutable sview = sview("", 0, 0)
+                        for index in 0..<names.count |found, names, regions, name|:
+                            found <- regions[index] if names[index] == name
+                        return (found, true, ident_pos)
+                    Expr.Paren(inner, paren_pos):
+                        return rre_value_region(inner, names, regions)
+                    Expr.If(condition, then_value, else_value, if_pos):
+                        then_arm: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(then_value, names, regions)
+                        else_arm: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(else_value, names, regions)
+                        return (then_arm.region if then_arm.region != "" and else_arm.region != "" else sview("", 0, 0), false, if_pos)
+                    _:
+                        return (sview("", 0, 0), false, Ast::pos_at_line(0))
+
+        # The declared type behind a `mutable` prefix: `xs: mutable darray[i64]` parses as
+        # `Unary(Mutable, darray[i64])`, and the helper matches the bare container node only —
+        # left unpeeled, the check was silent on every fixture (measured: fires without `mutable`).
+        def rre_declared_type(type_expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        return rre_declared_type(operand) if operator == TokenKind.Mutable else type_expression
+                    _:
+                        return type_expression
+
+        def rre_statements(statements: darray[Ast::Stmt], nesting: darray[sview]&, names: darray[sview]&, regions: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Lexical scoping for free: this list's declarations live in a copy that dies with it.
+                scope_names: mutable darray[sview] = [entry for entry in names]
+                scope_regions: mutable darray[sview] = [entry for entry in regions]
+                for statement in statements |table, scope_names, scope_regions| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            if nesting.count > 0 and return_type_is_owned_container(rre_declared_type(type_expression)):
+                                scope_names.push(name)
+                                scope_regions.push(nesting[nesting.count - 1])
+                        Stmt.Return(value, return_pos):
+                            if value is returned:
+                                dependency: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(returned, scope_names, scope_regions)
+                                if dependency.region != "":
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionValueEscapesReturn, name: dependency.region, line: dependency.pos.line, pos: dependency.pos, expected: "", actual: ""}) if dependency.is_bare
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionReturnDependency, name: dependency.region, line: return_pos.line, pos: return_pos, expected: "", actual: ""})
+                        Stmt.Block(kind, clause, binding, body, line):
+                            if kind == "region" and clause.count > 0:
+                                child_nesting: mutable darray[sview] = [entry for entry in nesting]
+                                child_nesting.push(clause[0])
+                                table <- rre_statements(body, child_nesting, scope_names, scope_regions, table)
+                            else:
+                                table <- rre_statements(body, nesting, scope_names, scope_regions, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- rre_statements(then_body, nesting, scope_names, scope_regions, table)
+                            table <- rre_statements(else_body, nesting, scope_names, scope_regions, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- rre_statements(while_body, nesting, scope_names, scope_regions, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- rre_statements(for_body, nesting, scope_names, scope_regions, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table, scope_names, scope_regions| -> table:
+                                table <- rre_statements(arm.body, nesting, scope_names, scope_regions, table)
+                        _:
+                            pass
+
+        def rre_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if return_type is declared_return:
+                                if return_type_is_owned_container(declared_return):
+                                    no_nesting: darray[sview] = []
+                                    no_names: darray[sview] = []
+                                    no_regions: darray[sview] = []
+                                    table <- rre_statements(body, no_nesting, no_names, no_regions, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- rre_walk(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- rre_walk(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_region_return_escape(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- rre_walk(file.top_decls, table)
