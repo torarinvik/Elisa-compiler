@@ -82,8 +82,15 @@ run_case() {
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
         echo "  FAIL $name: llc rejected the emitted IR (backend produced invalid module)"; return
     fi
-    if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
-        echo "  FAIL $name: link failed"; return
+    # Keep the linker's FIRST line: a "link failed" with the reason discarded was undiagnosable
+    # when this check went red only inside a loaded gate (2026-09-06, twice).
+    # One retry: this check went red only inside loaded gates (passed=400/511 twice, 511/511
+    # alone), and a host linker that fails under memory pressure is not a compiler verdict.
+    if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>"$exe.linkerr"; then
+        sleep 1
+        if ! clang -o "$exe" "$obj" "$RUNTIME_OBJ" 2>"$exe.linkerr"; then
+            echo "  FAIL $name: link failed: $(head -1 "$exe.linkerr" 2>/dev/null | cut -c1-160)"; return
+        fi
     fi
     RUN "$exe"
     local got=$?

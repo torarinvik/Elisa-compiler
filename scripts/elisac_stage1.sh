@@ -486,14 +486,13 @@ trap 'rm -f "$stage1_request"' EXIT
 # never got to run. Verified identical to stage0 for both formats over a nested include chain
 # before this was deleted.
 
-# `-emit exe`: compile to a temporary object, then link with the runtime object.
+# `-emit exe`: the DRIVER emits the object beside the executable and links it (§4.3:
+# link_executable — runtime object, weak callback fallback, -link flags, dead-strip). The
+# wrapper only checks the runtime object exists, so the failure names the fix rather than
+# surfacing as an undefined `_arena_free` from the host linker.
 runtime_obj="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-link_out=""
 if [[ "$emit_mode" == "exe" ]]; then
   [[ -f "$runtime_obj" ]] || { echo "-emit exe requires the runtime object at $runtime_obj (run scripts/build_runtime_object.sh)" >&2; exit 2; }
-  link_out="$out"
-  out="$(mktemp).o"
-  emit_mode="obj"
 fi
 
 # `-emit pymodule-so` is the host-facing convenience path for the complete Python
@@ -830,6 +829,10 @@ driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
 [[ "$emit_mode" == "bc" ]] && driver_env+=("ELISA_STAGE1_EMIT=bc")
+if [[ "$emit_mode" == "exe" ]]; then
+  driver_env+=("ELISA_STAGE1_EMIT=exe" "ELISA_RUNTIME_OBJ=$runtime_obj")
+  [[ -x "$ELISA_CLANG_TOOL" ]] && driver_env+=("ELISA_CLANG=$ELISA_CLANG_TOOL")
+fi
 # `-emit c-archive` writes its OWN files (the archive and three sidecars), so it needs the
 # mode and the source path but must NOT have stdout redirected like a text report.
 if [[ "$emit_mode" == "interpret" ]]; then
@@ -887,37 +890,4 @@ elif [[ "$bounds_check" == 1 ]]; then
 fi
 run_stage1_driver_guarded
 compile_rc=$?
-if [[ -n "$link_out" ]]; then
-  [[ "$compile_rc" == 0 && -f "$out" ]] || { rm -f "$out"; exit "${compile_rc:-1}"; }
-  [[ -x "$ELISA_CLANG_TOOL" ]] || {
-    echo "-emit exe requires clang compatible with LLVM_CONFIG=$LLVM_CONFIG (set ELISA_CLANG)" >&2
-    rm -f "$out"
-    exit 2
-  }
-  runtime_link_inputs=("$out" "$runtime_obj")
-  runtime_callback_fallback_obj=""
-  runtime_nm_tool="${ELISA_LLVM_NM:-$LLVM_BIN_DIR/llvm-nm}"
-  # The runtime deliberately leaves optional native callback hooks unresolved so a host
-  # embedding Elisa can provide them. Ordinary executables have no host callback provider,
-  # however, and must receive the documented no-op/fallback implementations just like the
-  # pymodule-so path above; otherwise a simple project `run` fails at the final link with an
-  # unrelated `_elisa_native_callback_call_i32_voidp` symbol error.
-  runtime_unresolved_symbols=""
-  if [[ -x "$runtime_nm_tool" ]]; then
-    runtime_unresolved_symbols="$("$runtime_nm_tool" -u "$runtime_obj" 2>/dev/null || true)"
-  fi
-  if [[ "$runtime_unresolved_symbols" == *elisa_native_callback_* ]]; then
-    runtime_callback_fallback_obj="$out.native-callback.o"
-    "$ELISA_CLANG_TOOL" -c -fPIC -fno-builtin -O2 -o "$runtime_callback_fallback_obj" "$ROOT/scripts/pymodule_runtime_fallback.c" || {
-      rm -f "$out" "$runtime_callback_fallback_obj"
-      exit 1
-    }
-    runtime_link_inputs+=("$runtime_callback_fallback_obj")
-  fi
-  "$ELISA_CLANG_TOOL" -fno-builtin -Wl,-dead_strip -o "$link_out" "${runtime_link_inputs[@]}" || {
-    rm -f "$out" "$runtime_callback_fallback_obj"
-    exit 1
-  }
-  rm -f "$out" "$runtime_callback_fallback_obj"
-fi
 exit "$compile_rc"
