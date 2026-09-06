@@ -65,16 +65,23 @@ def run(cmd, **kw):
 OK, DECLINED, LINK_FAILED, TIMEOUT = "ok", "declined", "link", "timeout"
 
 
-def _attempt(src_path, work, tag, run_timeout):
+def _compile_budget(base, scale):
+    """The compile budget for this attempt, capped so a genuine hang still ends."""
+    return min(int(base * scale), 600)
+
+
+def _attempt(src_path, work, tag, run_timeout, scale=1):
     obj = os.path.join(work, f"{tag}.o")
     exe = os.path.join(work, tag)
     try:
         if tag == "s0":
-            r = run([S0, "-emit", "obj", "-o", obj, src_path], timeout=90)
+            r = run([S0, "-emit", "obj", "-o", obj, src_path], timeout=_compile_budget(90, scale))
         elif tag == "s1O2":
-            r = run(["bash", WRAP, "-O2", "-o", obj, src_path], env=STAGE1_ENV, timeout=180)
+            r = run(["bash", WRAP, "-O2", "-o", obj, src_path], env=STAGE1_ENV,
+                    timeout=_compile_budget(180, scale))
         else:
-            r = run(["bash", WRAP, "-o", obj, src_path], env=STAGE1_ENV, timeout=90)
+            r = run(["bash", WRAP, "-o", obj, src_path], env=STAGE1_ENV,
+                    timeout=_compile_budget(90, scale))
     except subprocess.TimeoutExpired:
         return (TIMEOUT, None)
     if r.returncode != 0:
@@ -106,7 +113,13 @@ def build_and_run(src_path, work, tag):
     machine happened to be doing."""
     status, rc = _attempt(src_path, work, tag, 10)
     if status == TIMEOUT:
-        status, rc = _attempt(src_path, work, tag, 30)
+        # Widen BOTH budgets, not just the run. The retry used to keep the 90 s / 180 s
+        # compile timeouts, so inside the gate — where hundreds of sibling compiles share the
+        # host — a slow compile timed out twice and was reported as a TIMEOUT verdict; the
+        # same 387 programs pass standalone. (Mac gate 2026-09-06: adversarial FAILed at
+        # 1139 s in the gate, OK alone.)
+        scale = int(os.environ.get("ELISA_TIMEOUT_ESCALATE", "6"))
+        status, rc = _attempt(src_path, work, tag, 30, scale)
     return (status, rc)
 
 # ---------------------------------------------------------------- generators
