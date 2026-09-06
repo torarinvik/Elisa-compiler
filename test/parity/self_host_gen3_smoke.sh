@@ -76,11 +76,16 @@ BASELINE_GEN3_RC="${BASELINE_GEN3_RC:-0}"
 # host loader is resolving libLLVM); an unbounded Stage A or Stage D probe would
 # otherwise make the entire bootstrap gate hang with no diagnostic. These are
 # deliberately named policy constants rather than scattered timing literals.
-DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS=30
+# The full self-host compiler is intentionally a large input. On the reference
+# macOS host, stage B/C each take several minutes even when the process is
+# CPU-running and well below the memory guard; 30 seconds classified healthy
+# bootstrap work as a regression. Keep the bound finite, but make the default
+# large enough for a normal host rather than a tiny fixture probe.
+DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS=600
 DEFAULT_SELF_HOST_PROBE_POLL_SECONDS=0.05
 SELF_HOST_PROBE_TIMEOUT_SECONDS="${SELF_HOST_PROBE_TIMEOUT_SECONDS:-$DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS}"
 SELF_HOST_PROBE_POLL_SECONDS="${SELF_HOST_PROBE_POLL_SECONDS:-$DEFAULT_SELF_HOST_PROBE_POLL_SECONDS}"
-SELF_HOST_PROBE_TIMEOUT_POLLS="${SELF_HOST_PROBE_TIMEOUT_POLLS:-600}"
+SELF_HOST_PROBE_TIMEOUT_POLLS="${SELF_HOST_PROBE_TIMEOUT_POLLS:-12000}"
 
 fail() { echo "self_host_gen3_smoke FAIL: $1" >&2; exit 1; }
 
