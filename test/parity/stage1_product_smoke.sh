@@ -28,7 +28,7 @@ fi
 # Isolate from stage0: no ELISACORE_BIN, no ~/.elisac on PATH for the compile step.
 unset ELISACORE_BIN || true
 export ELISA_STAGE1_BIN="$BIN"
-export PATH="/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin"
+export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
 
 fixture="$SCRATCH_DIR/fixture.elisa"
 obj="$SCRATCH_DIR/fixture.o"

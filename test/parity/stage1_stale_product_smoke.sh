@@ -16,8 +16,13 @@ trap 'rm -rf "$WORK"' EXIT
 install -m 755 "$ROOT/bin/elisac-stage1" "$WORK/elisac-stage1"
 touch -t 202001010000 "$WORK/elisac-stage1"
 
+# This check EXISTS to prove the guard refuses. An environment that has already opted out
+# (`ELISA_ALLOW_STALE_STAGE1=1` — the verification env exports it so the other 345 checks may
+# use a hand-seeded product) would turn the refusal into a success and the check would pass
+# vacuously, which is how it read as a FAIL on both hosts. Clear it for this invocation.
+unset ELISA_ALLOW_STALE_STAGE1
 set +e
-ELISA_STAGE1_BIN="$WORK/elisac-stage1" \
+ELISA_STAGE1_BIN="$WORK/elisac-stage1" ELISA_ALLOW_STALE_STAGE1=0 \
   "$ROOT/scripts/elisac_stage1.sh" -emit tokens -o "$WORK/tokens" \
   "$ROOT/test/fixtures/machine_from/typed_state_arrows.elisa" \
   >"$WORK/stdout" 2>"$WORK/stderr"

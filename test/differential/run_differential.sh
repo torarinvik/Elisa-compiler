@@ -100,7 +100,8 @@ if [[ "${1:-}" == "--one" ]]; then
   exit 0
 fi
 
-JOBS="${ELISA_DIFF_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+source "$ROOT/test/parity/host_jobs.sh"
+JOBS="${ELISA_DIFF_JOBS:-$(elisa_host_jobs)}"
 mkdir -p "$WORK/res"
 find "$CASES" -maxdepth 1 -name '*.elisa' -print0 \
   | xargs -0 -P "$JOBS" -n 1 env ELISACORE_BIN="$STAGE0" bash "$0" --one "$WORK"

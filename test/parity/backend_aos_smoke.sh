@@ -20,7 +20,7 @@ grep -q 'declare.*@ctx_aos_store_alloc(ptr, ptr)' "$BUILD/aos.ll"
 # i64 (commit 33320f9 moved AoS record indices to 64-bit); this assertion said i32.
 grep -q 'declare ptr @ctx_aos_store_record(ptr, i64)' "$BUILD/aos.ll"
 
-/opt/homebrew/opt/llvm/bin/llc -filetype=obj -o "$BUILD/aos.o" "$BUILD/aos.ll"
+"${LLC:-/opt/homebrew/opt/llvm/bin/llc}" -filetype=obj -o "$BUILD/aos.o" "$BUILD/aos.ll"
 clang -Wl,-dead_strip -o "$BUILD/aos" "$BUILD/aos.o" "$ROOT/build/runtime/elisacore_runtime.o"
 set +e
 "$BUILD/aos"

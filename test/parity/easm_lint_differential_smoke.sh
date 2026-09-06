@@ -79,7 +79,8 @@
 # So the port has no discovery left: the corpus, the 22 messages, and the tables are all
 # here. What remains is writing the parser and the checks, each with a fixture that FAILS
 # first — a passing fixture cannot tell an implemented check from an unimplemented one.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 20 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 20 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"

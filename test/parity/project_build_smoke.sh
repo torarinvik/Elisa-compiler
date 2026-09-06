@@ -12,7 +12,8 @@
 # path an installed binary could guess, so the driver requires ELISA_RUNTIME_OBJ and says so
 # by name; the last check pins that message rather than letting it regress into the raw
 # "Undefined symbols: _arena_free" dump the host linker produces.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 300 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"

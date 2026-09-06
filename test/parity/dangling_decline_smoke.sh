@@ -14,7 +14,8 @@
 #
 # The check is narrow, and each case below pins one of the narrowings — a broader rule was
 # measured and refuses to compile this compiler.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 60 "$@"; }
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"

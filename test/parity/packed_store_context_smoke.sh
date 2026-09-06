@@ -12,7 +12,8 @@
 # This gate pins the DECLINE. It cannot live in the differential suite: stage0
 # rejects the program too, and the runner skips a case stage0 will not compile, so
 # a stage1 regression there would read as SKIP rather than as a failure.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 60 "$@"; }
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"

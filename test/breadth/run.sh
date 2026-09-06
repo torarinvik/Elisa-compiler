@@ -48,8 +48,11 @@ fi
 one_file() {
     local f="$1" report p diag relative_f
     report=$("$RPT" < "$f")
-    p=$(printf '%s\n' "$report" | head -1 | awk '{print $2}')
-    diag=$(printf '%s\n' "$report" | sed -n '2p' | awk '{print $2}')
+    # Read the two `P <n>` / `D <n>` lines WITHOUT a pipe. `printf … | head -1` raced head's
+    # exit: head closes the pipe after one line, printf takes SIGPIPE, and under `pipefail`
+    # + `set -e` the worker died with no observation line — which the parallel sweep then
+    # scored as a baseline mismatch. Rare when this loop was serial, frequent under xargs -P.
+    { read -r _ p _ || true; read -r _ diag _ || true; } <<< "$report"
     relative_f="${f#"$ROOT"/}"
     printf '%s\t%s\t%s\n' "$relative_f" "${diag:-0}" "${p:-0}"
 }
@@ -59,7 +62,8 @@ if [ "${1:-}" = "--one" ]; then
     exit 0
 fi
 obs_dir="$(mktemp -d)"
-JOBS="${ELISA_BREADTH_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+source "$REPO_ROOT/test/parity/host_jobs.sh"
+JOBS="${ELISA_BREADTH_JOBS:-$(elisa_host_jobs)}"
 for d in "$@"; do
     # Skip corpus files parked as stale/unmaintained: a path SEGMENT named `_unused`
     # (…/_unused/…) or a basename ending `_unused.elisa`. Deliberately NOT the bare

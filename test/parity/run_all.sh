@@ -49,7 +49,7 @@ if bins:
     h.update(bins.encode())
 else:
     for f in (os.path.join(root, "bin/elisac-stage1"),
-              os.environ.get("ELISACORE_BIN", ""),
+              os.environ.get("ELISA_S0_REAL") or os.environ.get("ELISACORE_BIN", ""),
               os.path.join(root, "build/runtime/elisacore_runtime.o")):
         try:
             h.update(hashlib.sha256(open(f, "rb").read()).digest())
@@ -101,7 +101,12 @@ if [[ "${1:-}" == "--exec-one" ]]; then
     fi
   fi
   _t0=$SECONDS
-  if bash "$@" >"$_log" 2>&1; then _st=ok; else _st=FAIL; fi
+  # The gen3 fixpoint is three SERIAL self-compiles and the gate's critical path; every other
+  # check is bulk. Run the bulk at lower priority so the chain is never starved by 300 siblings
+  # (measured: gen3 206-354 s idle, 1167-1252 s inside the gate). ELISA_GATE_NICE=0 disables.
+  _nice=("nice" "-n" "${ELISA_GATE_NICE:-10}")
+  case "$_name" in self_host_gen3_smoke.sh) _nice=() ;; esac
+  if "${_nice[@]}" bash "$@" >"$_log" 2>&1; then _st=ok; else _st=FAIL; fi
   _el=$((SECONDS - _t0))
   if [[ "$_st" == ok && -n "$_cachefile" ]]; then
     mkdir -p "$_cachedir" && printf '%s' "$_key" > "$_cachefile"
@@ -146,9 +151,13 @@ export ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ"
 # cached here only for the race, not the time — an earlier 56.7s reading for it was pure
 # contention with a gate running in parallel, and re-measuring idle corrected it.)
 export ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
+# If the caller already routed the oracle through tools/s0cache, the REAL binary is in
+# ELISA_S0_REAL — build that, never the wrapper's path (a `go build -o` onto the wrapper
+# replaced it with stage0 once, silently disabling the cache for a whole gate).
+S0_BUILD_TARGET="${ELISA_S0_REAL:-$ELISACORE_BIN}"
 if [[ -z "${ELISA_GATE_PREBUILT:-}" ]]; then
   echo "prebuilding shared artifacts (stage0, parse_report, easm driver)…" >&2
-  ( cd "$ELISA_CORE/compiler" && go build -o "$ELISACORE_BIN" ./src ) || {
+  ( cd "$ELISA_CORE/compiler" && go build -o "$S0_BUILD_TARGET" ./src ) || {
     echo "error: could not build stage0" >&2; exit 2; }
   # The shared reporter is a STAGE1 artifact; using stage0 here would make every semantic
   # check below test the oracle instead of the product. build_parse_report.sh owns the same
@@ -162,7 +171,17 @@ if [[ -z "${ELISA_GATE_PREBUILT:-}" ]]; then
     exit 2
   fi
   bash "$REPO_ROOT/test/parity/easm_project_driver_smoke.sh" >/dev/null 2>&1 || true
+  # emit_native: twelve checks share build/emit_native; prime it once so none races (Phase T).
+  REPO_ROOT="$REPO_ROOT" bash "$REPO_ROOT/test/parity/build_emit_native.sh" >/dev/null 2>&1 || true
   export ELISA_GATE_PREBUILT=1
+fi
+# The stage0 ORACLE is memoised (tools/s0cache): an unchanged question gets its stored answer,
+# so a stage1-only change re-runs stage1 but not the hundreds of stage0 report emissions and
+# .neg rejections. Keyed on the real binary + expanded source + args; ELISA_S0_CACHE=0 disables.
+if [[ "${ELISA_S0_CACHE:-1}" != 0 && -z "${ELISA_S0_REAL:-}" ]]; then
+  export ELISA_S0_REAL="$ELISACORE_BIN"
+  export ELISACORE_BIN="$REPO_ROOT/tools/s0cache"
+  export ELISA_S0_CACHE_STATS="${ELISA_S0_CACHE_STATS:-$(mktemp)}"
 fi
 
 # How many checks run at once. The box has 10 logical / 4 performance cores and every check
@@ -212,11 +231,38 @@ gate_jobs_by_memory() {
     # 251 GB host running six checks at a time; ELISA_GATE_JOBS still overrides).
     local n=$((gb / 3)) cores
     cores="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 6) )"
+    # A CONTAINER QUOTA beats the visible core count. A Vast box advertised 32 cores and
+    # ran the gate 32-wide, yet vmstat showed 29 % busy with 60-98 runnable processes:
+    # cgroup `cpu.max` was 768000/100000 = 7.68 CPUs and every period was throttled
+    # (2026-09-06). Size the pool by the quota, rounded up, or the gate thrashes.
+    if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+        local quota period
+        read -r quota period < /sys/fs/cgroup/cpu.max
+        if [[ "$quota" != max && -n "$period" && "$period" -gt 0 ]]; then
+            local q=$(( (quota + period - 1) / period ))
+            (( q < cores )) && cores=$q
+        fi
+    fi
     (( n < 2 )) && n=2
     (( n > cores )) && n=$cores
     echo "$n"
 }
 GATE_JOBS="${ELISA_GATE_JOBS:-$(gate_jobs_by_memory)}"
+# Inner fan-out per worker: the pool already fills the host, so each harness gets its share
+# (host width / pool), never the whole core count again (Phase T — nested `xargs -P nproc`
+# under a 32-wide pool put 60-98 runnable processes on a 7.68-CPU quota).
+#
+# With a FLOOR of 2, and a wider allowance for the long poles. An exact fair share reached
+# `-P 1` on the quota-bound box (host 8 / pool 8) and serialised `differential_corpus`, the
+# check that sets the gate's makespan: 226 programs one at a time while pool slots drained
+# to idle (measured: still running at 25 min, against 121 s at -P 32). A long pole starved
+# to one process costs far more wall than the mild oversubscription of unblocking it.
+source "$REPO_ROOT/test/parity/host_jobs.sh"
+_host_w="$(elisa_host_jobs)"
+_fair=$(( (_host_w + GATE_JOBS - 1) / GATE_JOBS )); (( _fair < 2 )) && _fair=2
+export ELISA_JOBS="${ELISA_JOBS:-$_fair}"
+_heavy=$(( (_host_w + 1) / 2 )); (( _heavy < _fair )) && _heavy=$_fair
+export ELISA_HEAVY_JOBS="${ELISA_HEAVY_JOBS:-$_heavy}"
 
 # The tree hash is taken ONCE here, pre-dispatch, on a quiesced tree — checks that
 # create and delete scratch files inside test/ mid-run otherwise make every
@@ -247,7 +293,7 @@ import hashlib, os, sys
 h = hashlib.sha256()
 root = sys.argv[1]
 for f in (os.path.join(root, "bin/elisac-stage1"),
-          os.environ.get("ELISACORE_BIN", ""),
+          os.environ.get("ELISA_S0_REAL") or os.environ.get("ELISACORE_BIN", ""),
           os.path.join(root, "build/runtime/elisacore_runtime.o")):
     try:
         h.update(hashlib.sha256(open(f, "rb").read()).digest())
@@ -499,6 +545,10 @@ if [[ -z "${ELISA_GATE_QUIET:-}" ]]; then
   printf '  %5ds  TOTAL\n' "$(awk -F'\t' '{t+=$1} END{print t}' "$timings_file")"
 fi
 rm -f "$timings_file"
+if [[ -n "${ELISA_S0_CACHE_STATS:-}" && -f "$ELISA_S0_CACHE_STATS" ]]; then
+  echo "stage0 oracle cache: $(sort "$ELISA_S0_CACHE_STATS" | uniq -c | awk '{printf "%s=%s ", $2, $1}')"
+  rm -f "$ELISA_S0_CACHE_STATS"
+fi
 echo "----------------------------------------"
 if [[ $fail -eq 0 ]]; then
   if [[ "$GATE_PROFILE" == full ]]; then

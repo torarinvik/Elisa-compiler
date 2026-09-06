@@ -19,7 +19,8 @@
 #
 # Both halves are asserted. The refusal is not a skip: if the verifier is ever ported, the last
 # check fails and says so, rather than the refusal quietly outliving the gap.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 120 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 120 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"

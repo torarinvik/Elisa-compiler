@@ -14,7 +14,8 @@
 # PRELUDE declaring DynSet/SetBucket — but ONLY for stage1: stage0 already has them builtin,
 # so feeding stage0 the prelude would redeclare them. stage0 validates the un-preluded
 # source; stage1's emitter gets the preluded one.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 15 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 15 "$@"; }
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -28,14 +29,12 @@ STD="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}/compiler/runtime/elisa
 command -v python3 >/dev/null 2>&1 || { echo "set_real_smoke SKIP: no python3"; exit 0; }
 
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLC="$(dirname "$LLVM_CONFIG")/llc"
+LLC="$("$LLVM_CONFIG" --bindir)/llc"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 EMIT="$BUILD/emit_native"
 
-if [ ! -x "$EMIT" ]; then
-    "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_native.o" "$ROOT/test/breadth/emit_native.elisa" 2>/dev/null \
-        && clang -o "$EMIT" "$BUILD/emit_native.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null
-fi
+# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
+ELISA_EMIT_NATIVE="$EMIT" REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh" >/dev/null 2>&1
 [ -x "$EMIT" ] || { echo "set_real_smoke FAILED: no emit_native"; exit 1; }
 RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
 if [ ! -f "$RUNTIME_OBJ" ]; then

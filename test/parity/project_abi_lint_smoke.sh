@@ -9,7 +9,8 @@
 # Both directions matter: a matcher that never matches passes a fire-only suite trivially if
 # the expected output is taken from stage1 rather than stage0. It is not — every expectation
 # here is whatever stage0 printed.
-RUN() { if command -v timeout >/dev/null 2>&1; then timeout 120 "$@"; else "$@"; fi; }
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 120 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"

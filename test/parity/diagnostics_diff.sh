@@ -108,7 +108,8 @@ fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
-JOBS="${ELISA_DIAG_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+source "$REPO_ROOT/test/parity/host_jobs.sh"
+JOBS="${ELISA_DIAG_JOBS:-$(elisa_host_jobs)}"
 find "$FIXTURES" -maxdepth 1 -name '*.elisa' -print0 \
   | xargs -0 -P "$JOBS" -n 1 env ELISACORE_BIN="$ELISACORE_BIN" ELISA_CORE="$ELISA_CORE" bash "$0" --one "$WORK"
 

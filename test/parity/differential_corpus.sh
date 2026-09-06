@@ -63,7 +63,27 @@ RUN() {
     if [ "$status" -eq 124 ]; then timeout 30 "$@" >/dev/null 2>&1 </dev/null; status=$?; fi
     return $status
 }
+# Last resort for a program that expired BOTH budgets while the other compiler answered: on a
+# host running several gates at once the thread/pool fixtures need more than 30 s of wall for
+# work they do in two seconds idle, and a 124 on one side then reads as `stage0=42 stage1=124`
+# — a fabricated MISMATCH (8 of them in one loaded run, none on a quiet host). A real runaway
+# expires this budget too and is still reported.
+RUN_LONG() {
+    timeout "${ELISA_CORPUS_LONG_TIMEOUT:-180}" "$@" >/dev/null 2>&1 </dev/null
+}
 COMPILE_TIMEOUT=60
+# …and the same rule for COMPILING. A compile that expires is not a DECLINE — the classifier
+# below reads a nonzero exit as "stage1 dropped a function", so on a loaded host a slow
+# compile was filed as a language gap (5 spurious declines against a baseline of 0 in one
+# run; the same corpus on a quiet host declined only the known `lmut_threading_value`).
+COMPILE() {
+    timeout "$COMPILE_TIMEOUT" "$@" >/dev/null 2>&1 </dev/null
+    local status=$?
+    if [ "$status" -eq 124 ]; then
+        timeout "${ELISA_CORPUS_LONG_TIMEOUT:-180}" "$@" >/dev/null 2>&1 </dev/null; status=$?
+    fi
+    return $status
+}
 
 # Link an object into a runnable program. THREE recipes, tried in order, because the plain
 # one silently cost this check SIX programs — counted as "stage0 could not arbitrate" when
@@ -167,7 +187,7 @@ one_program() {
     work="$(mktemp -d "$WORK/p.XXXXXX")"
     # ---- stage0 is the ORACLE. If IT cannot produce a running program, this file is not
     # a parity signal (a fixture meant to fail to compile, a driver needing stdin, ...).
-    if ! timeout "$COMPILE_TIMEOUT" "$ELISACORE_BIN" -emit obj -o "$work/s0.o" "$src" >/dev/null 2>&1 </dev/null; then
+    if ! COMPILE "$ELISACORE_BIN" -emit obj -o "$work/s0.o" "$src"; then
         printf 'SKIP\t%s\t\n' "$name"; return 0
     fi
     if ! link_program "$work/s0" "$work/s0.o"; then printf 'SKIP\t%s\t\n' "$name"; return 0; fi
@@ -176,8 +196,8 @@ one_program() {
     if [ "$s0_rc" -eq 124 ]; then printf 'SKIP\t%s\t\n' "$name"; return 0; fi
     # ---- stage1. A compile or link failure is the ACCEPTANCE gap, not a wrong answer:
     # a declined function is dropped, so the link fails with an undefined symbol.
-    if ! timeout "$COMPILE_TIMEOUT" env ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" \
-            -o "$work/s1.o" "$src" >/dev/null 2>&1 </dev/null; then
+    if ! COMPILE env ELISA_STAGE1_BIN="$STAGE1" bash "$ROOT/scripts/elisac_stage1.sh" \
+            -o "$work/s1.o" "$src"; then
         printf 'DECLINED\t%s\t(compile)\n' "$name"; return 0
     fi
     if ! link_program "$work/s1" "$work/s1.o"; then
@@ -202,12 +222,22 @@ one_program() {
         if [ "$s1_rc" != "$s1_rc2" ]; then
             printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=%s/%s (INTERMITTENT)  %s' "$name" "$s0_rc" "$s1_rc" "$s1_rc2" "$src")"; return 0
         fi
+        # A reproduced stage1 TIMEOUT is not an answer. Give it one uncontended-sized budget
+        # before believing it (see RUN_LONG); the oracle already answered, so only stage1 runs.
+        if [ "$s1_rc2" -eq 124 ] && [ "$s0_rc2" -ne 124 ]; then
+            RUN_LONG "$work/s1"; local s1_rc3=$?
+            if [ "$s1_rc3" -ne 124 ]; then s1_rc2=$s1_rc3; fi
+        fi
         s0_rc=$s0_rc2; s1_rc=$s1_rc2
     fi
     if [ "$s0_rc" -eq "$s1_rc" ]; then
         printf 'MATCH\t%s\t\n' "$name"
     else
-        printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=%-4s  %s' "$name" "$s0_rc" "$s1_rc" "$src")"
+        if [ "$s1_rc" -eq 124 ]; then
+            printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=TIMEOUT  %s' "$name" "$s0_rc" "$src")"
+        else
+            printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=%-4s  %s' "$name" "$s0_rc" "$s1_rc" "$src")"
+        fi
     fi
 }
 
@@ -219,7 +249,10 @@ if [[ "${1:-}" == "--one" ]]; then
     exit 0
 fi
 
-JOBS="${ELISA_CORPUS_JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+source "$ROOT/test/parity/host_jobs.sh"
+# A long pole: it starts first and sets the gate's makespan, so it takes the wider
+# allowance (ELISA_HEAVY_JOBS, exported by run_all) rather than the fair share.
+JOBS="${ELISA_CORPUS_JOBS:-${ELISA_HEAVY_JOBS:-$(elisa_host_jobs)}}"
 mkdir -p "$WORK/res"
 # Workers get /dev/null on stdin (a compiled program that reads input must not drain the
 # list) and the corpus as NUL-separated arguments (paths contain spaces).

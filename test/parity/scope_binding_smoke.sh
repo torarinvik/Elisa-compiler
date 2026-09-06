@@ -30,13 +30,8 @@
 # a wider budget before it is believed — these fixtures finish in milliseconds, and on a
 # loaded host a single 10s expiry reported a 124 as a scope divergence (a wrong answer that
 # vanished on the standalone re-run). A genuine spin expires both times and still fails.
-RUN() {
-    local status
-    if ! command -v timeout >/dev/null 2>&1; then "$@"; return $?; fi
-    timeout 10 "$@"; status=$?
-    if [ "$status" -eq 124 ]; then timeout 30 "$@"; status=$?; fi
-    return $status
-}
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
+RUN() { elisa_run_timeout 10 "$@"; }
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

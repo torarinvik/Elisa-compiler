@@ -7237,7 +7237,15 @@ def main():
             continue
         progs.extend(g())
     import multiprocessing
-    jobs = int(os.environ.get("ELISA_ADV_JOBS", "0") or 0) or (os.cpu_count() or 4)
+    jobs = int(os.environ.get("ELISA_ADV_JOBS", "0") or 0) or int(os.environ.get("ELISA_JOBS", "0") or 0)
+    if not jobs:
+        jobs = os.cpu_count() or 4
+        try:  # a container CPU quota beats the visible core count (test/parity/host_jobs.sh)
+            quota, period = open("/sys/fs/cgroup/cpu.max").read().split()
+            if quota != "max":
+                jobs = min(jobs, max(1, -(-int(quota) // int(period))))
+        except (OSError, ValueError):
+            pass
     items = [(name, src, work) for name, src in progs]
     if jobs > 1 and len(items) > 1:
         with multiprocessing.Pool(processes=jobs) as pool:
