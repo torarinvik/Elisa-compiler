@@ -466,10 +466,8 @@ if [[ "$emit_mode" != "pymodule-so" && "$emit_mode" != "pymodule-pyi" && -z "$ou
   exit 2
 fi
 [[ -f "$src" ]] || { echo "missing source: $src" >&2; exit 2; }
-[[ -x "$PYTHON_HOST" ]] || {
-  echo "stage1 requires python3 for include expansion (set PYTHON_BIN)" >&2
-  exit 2
-}
+# Python is needed only by the pymodule-so and wasm pipelines below, each of which checks
+# for it itself; include expansion is the driver's (§4.1), so an ordinary compile needs none.
 # Keep all Python-facing emitters consistent: explicit manifest, generated C, stub, and
 # complete-extension paths may point into a directory that does not exist yet.
 case "$emit_mode" in
