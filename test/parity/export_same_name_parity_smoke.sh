@@ -2,7 +2,21 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../wasm-sdk-stage0/compiler/bin/elisac}"
+if [[ -n "${ELISACORE_BIN:-}" ]]; then
+    STAGE0="$ELISACORE_BIN"
+else
+    STAGE0=""
+    for stage0_candidate in \
+        "$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac" \
+        "$ROOT/../../../Go projects/structpy-tree/compiler/bin/elisac" \
+        "$ROOT/../wasm-sdk-stage0/compiler/bin/elisac"; do
+        if [[ -x "$stage0_candidate" ]]; then
+            STAGE0="$stage0_candidate"
+            break
+        fi
+    done
+    STAGE0="${STAGE0:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+fi
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 FIXTURE="$ROOT/test/repro/export_same_name.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-same-name-parity.XXXXXX")"

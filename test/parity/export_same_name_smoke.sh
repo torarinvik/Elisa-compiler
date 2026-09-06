@@ -6,7 +6,21 @@
 # to export_same_name_parity_smoke.sh.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../wasm-sdk-stage0/compiler/bin/elisac}"
+if [[ -n "${ELISACORE_BIN:-}" ]]; then
+    STAGE0="$ELISACORE_BIN"
+else
+    STAGE0=""
+    for stage0_candidate in \
+        "$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac" \
+        "$ROOT/../../../Go projects/structpy-tree/compiler/bin/elisac" \
+        "$ROOT/../wasm-sdk-stage0/compiler/bin/elisac"; do
+        if [[ -x "$stage0_candidate" ]]; then
+            STAGE0="$stage0_candidate"
+            break
+        fi
+    done
+    STAGE0="${STAGE0:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+fi
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 FIXTURE="$ROOT/test/repro/export_same_name.elisa"
