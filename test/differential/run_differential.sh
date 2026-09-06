@@ -13,7 +13,7 @@
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../stage0/compiler/bin/elisac-local}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"
 RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
 CASES="${1:-$ROOT/test/differential/cases}"

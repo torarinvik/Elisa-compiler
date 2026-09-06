@@ -1,0 +1,273 @@
+# Call-site AGGREGATE STATE check (plan §3.3.2). A struct declared `struct Holder[?]` gives
+# every value a state per slot: `?` (nullable, the default for a bare `Holder` value), `&`
+# (non-null) or `!` (null). stage0 (`aggregateStateListAssignable` over `refStateAssignable`)
+# accepts an argument only when each slot is assignable to the parameter's: `?` takes
+# anything, `&` needs `&`, `!` needs `!`, and reports
+#   argument 1 to "read" expects Holder[&], got Holder[?]
+# stage1 lowered the states (erased, like stage0) but never checked them, so the program in
+# test/fixtures/diagnostics/aggregate_state_call.neg.elisa compiled and ran (memory:
+# typestate-check-gap). This check is deliberately NARROW: it looks only at a positional
+# argument that is a BARE local/parameter whose state is known from its own annotation (or
+# the default), and only until that local is first passed to any call, assigned with `<-`,
+# or tested with `is`/`match` — stage0 has call post-states and flow narrowing that can
+# change a local's state, and none of that is modeled here. Anything not matching stays
+# silent rather than guessing.
+extend Semantic:
+    private:
+        def aggregate_state_marker_code(marker: sview) -> u32:
+            can Abort.Panic:
+                return when marker:
+                    "?" -> 1
+                    "&" -> 2
+                    "!" -> 3
+                    _ -> 0
+
+        # Packed state list of a type annotation: 2 bits per slot, slot i at bits 2i; 0 when
+        # the annotation carries no markers (or any non-marker argument).
+        def aggregate_state_code_of(type_expression: Ast::Expr) -> u32:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Index(head, argument, line):
+                        return aggregate_state_marker_code(ident_name_of(argument))
+                    Expr.IndexN(head, arguments, line):
+                        code: mutable u32 = 0
+                        shift: mutable u32 = 1
+                        for argument in arguments |code, shift|:
+                            marker: u32 = aggregate_state_marker_code(ident_name_of(argument))
+                            0 return if marker == 0
+                            code <- code + marker * shift
+                            shift <- shift * 4
+                        return code
+                    Expr.Unary(operator, operand, line):
+                        return aggregate_state_code_of(operand)
+                    Expr.Paren(inner, paren_line):
+                        return aggregate_state_code_of(inner)
+                    _:
+                        return 0
+
+        # The struct name an annotation is about (`Holder`, `Holder[&]`, `Holder[?, !]`).
+        def aggregate_state_head_name(type_expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, line):
+                        return name
+                    Expr.Index(head, argument, line):
+                        return ident_name_of(head)
+                    Expr.IndexN(head, arguments, line):
+                        return ident_name_of(head)
+                    Expr.Unary(operator, operand, line):
+                        return aggregate_state_head_name(operand)
+                    Expr.Paren(inner, paren_line):
+                        return aggregate_state_head_name(inner)
+                    _:
+                        return ""
+
+        # stage0's DefaultAggregateStateType: a bare `Holder` is `Holder[?]` per slot.
+        def aggregate_state_default_code(arity: u32) -> u32:
+            can Abort.Panic:
+                code: mutable u32 = 0
+                shift: mutable u32 = 1
+                for _ in 0..<arity |code, shift|:
+                    code <- code + shift
+                    shift <- shift * 4
+                return code
+
+        # The state code a LOCAL declared with TYPE_EXPRESSION holds: the annotation's
+        # markers, or the default when the bare struct declares state slots; 0 otherwise.
+        def aggregate_state_local_code(type_expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&) -> u32:
+            can Abort.Panic:
+                explicit: u32 = aggregate_state_code_of(type_expression)
+                explicit return if explicit != 0
+                head: sview = aggregate_state_head_name(type_expression)
+                0 return if head == ""
+                return aggregate_state_default_code(declared_aggregate_state_arity(annotations, head))
+
+        def aggregate_state_slot(code: u32, slot: u32) -> u32:
+            can Abort.Panic:
+                shifted: mutable u32 = code
+                for _ in 0..<slot |shifted|:
+                    shifted <- shifted / 4
+                return shifted - (shifted / 4) * 4
+
+        # stage0's refStateAssignable per slot, over whole packed codes.
+        def aggregate_state_codes_assignable(destination: u32, source: u32) -> bool:
+            can Abort.Panic:
+                slot: mutable u32 = 0
+                while slot < 16 |slot, destination, source|:
+                    wanted: u32 = aggregate_state_slot(destination, slot)
+                    given: u32 = aggregate_state_slot(source, slot)
+                    true return if wanted == 0 and given == 0
+                    false return if wanted == 0 or given == 0
+                    false return if wanted != 1 and wanted != given
+                    slot <- slot + 1
+                return true
+
+        def function_param_state_code_at(table: SymbolTable&, function_name: sview, position: usize) -> u32:
+            can Abort.Panic:
+                seen: mutable usize = 0
+                cur: mutable u32 = function_param_chain_head(table, function_name)
+                while cur != 4294967295:
+                    if table.function_param_owner[cur.usize()] == function_name:
+                        table.function_param_state_code[cur.usize()] return if seen == position
+                        seen <- seen + 1
+                    cur <- table.function_param_name_next[cur.usize()]
+                return 0
+
+        def asc_local_index(names: darray[sview]&, name: sview) -> i64:
+            can Abort.Panic:
+                index: mutable usize = names.count
+                while index > 0 |index, names, name|:
+                    index <- index - 1
+                    index.i64() return if names[index] == name
+                return -1
+
+        def asc_taint(name: sview, names: darray[sview]&, tainted: mutable darray[bool]&) -> void:
+            can Abort.Panic:
+                found: i64 = asc_local_index(names, name)
+                tainted[found.usize()] <- true if found >= 0
+
+        # Any identifier mentioned inside a condition/scrutinee may be narrowed by stage0's
+        # flow analysis; forget its state from here on.
+        def asc_taint_mentions(expression: Ast::Expr, names: darray[sview]&, tainted: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        asc_taint(name, names, tainted)
+                    Expr.Binary(left, operator, right, line):
+                        asc_taint_mentions(left, names, tainted)
+                        asc_taint_mentions(right, names, tainted)
+                    Expr.Unary(operator, operand, line):
+                        asc_taint_mentions(operand, names, tainted)
+                    Expr.Paren(inner, line):
+                        asc_taint_mentions(inner, names, tainted)
+                    Expr.Field(object, field, line):
+                        asc_taint_mentions(object, names, tainted)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        asc_taint_mentions(callee, names, tainted)
+                        for argument in arguments |names, tainted|:
+                            asc_taint_mentions(argument, names, tainted)
+                    _:
+                        pass
+
+        def asc_check_call(callee: Ast::Expr, arguments: darray[Ast::Expr]&, argument_names: darray[sview]&, line: Ast::Pos, names: darray[sview]&, heads: darray[sview]&, codes: darray[u32]&, tainted: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                function_name: sview = ident_name_of(callee)
+                position: mutable usize = 0
+                for argument in arguments |position, table, tainted|:
+                    argument_name: sview = ident_name_of(argument)
+                    named: bool = argument_names.count > position and argument_names[position] != ""
+                    found: i64 = asc_local_index(names, argument_name) if argument_name != "" and not named else -1
+                    if found >= 0 and function_name != "":
+                        known: bool = not tainted[found.usize()] and codes[found.usize()] != 0
+                        wanted: u32 = function_param_state_code_at(table, function_name, position)
+                        if known and wanted != 0 and not aggregate_state_codes_assignable(wanted, codes[found.usize()]):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AggregateStateArgMismatch, name: function_name, line: line.line, pos: line, expected: heads[found.usize()], actual: "", expected_count: (position + 1).u32(), actual_count: wanted, state_code: codes[found.usize()]})
+                        # Passed to a call: stage0 may apply a call post-state. Forget it.
+                        tainted[found.usize()] <- true
+                    position <- position + 1
+
+        def asc_walk_expression(expression: Ast::Expr, names: darray[sview]&, heads: darray[sview]&, codes: darray[u32]&, tainted: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        # The callee itself may be a chain over an inner call (`read(h).i64()`).
+                        table <- asc_walk_expression(callee, names, heads, codes, tainted, table)
+                        for argument in arguments |table, tainted|:
+                            table <- asc_walk_expression(argument, names, heads, codes, tainted, table)
+                        table <- asc_check_call(callee, arguments, argument_names, line, names, heads, codes, tainted, table)
+                    Expr.Binary(left, operator, right, line):
+                        # `x is P` narrows x from here on (stage0 flow): forget its state.
+                        asc_taint_mentions(left, names, tainted) if operator == TokenKind.Is
+                        table <- asc_walk_expression(left, names, heads, codes, tainted, table)
+                        table <- asc_walk_expression(right, names, heads, codes, tainted, table)
+                    Expr.Unary(operator, operand, line):
+                        table <- asc_walk_expression(operand, names, heads, codes, tainted, table)
+                    Expr.Paren(inner, line):
+                        table <- asc_walk_expression(inner, names, heads, codes, tainted, table)
+                    Expr.Field(object, field, line):
+                        table <- asc_walk_expression(object, names, heads, codes, tainted, table)
+                    _:
+                        pass
+
+        def asc_walk_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, names: mutable darray[sview]&, heads: mutable darray[sview]&, codes: mutable darray[u32]&, tainted: mutable darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, names, heads, codes, tainted|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- asc_walk_expression(value, names, heads, codes, tainted, table)
+                            names.push(name)
+                            heads.push(aggregate_state_head_name(type_expression))
+                            codes.push(aggregate_state_local_code(type_expression, annotations))
+                            tainted.push(false)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- asc_walk_expression(value, names, heads, codes, tainted, table)
+                            asc_taint_mentions(target, names, tainted)
+                        Stmt.Expr(expression, line):
+                            table <- asc_walk_expression(expression, names, heads, codes, tainted, table)
+                        Stmt.Return(value, line):
+                            if value is returned:
+                                table <- asc_walk_expression(returned, names, heads, codes, tainted, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            asc_taint_mentions(condition, names, tainted)
+                            table <- asc_walk_statements(then_body, annotations, names, heads, codes, tainted, table)
+                            table <- asc_walk_statements(else_body, annotations, names, heads, codes, tainted, table)
+                        Stmt.While(condition, body, line):
+                            asc_taint_mentions(condition, names, tainted)
+                            table <- asc_walk_statements(body, annotations, names, heads, codes, tainted, table)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            asc_taint_mentions(iterable, names, tainted)
+                            table <- asc_walk_statements(body, annotations, names, heads, codes, tainted, table)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- asc_walk_statements(body, annotations, names, heads, codes, tainted, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            asc_taint_mentions(scrutinee, names, tainted)
+                            for arm in arms |table, names, heads, codes, tainted|:
+                                table <- asc_walk_statements(arm.body, annotations, names, heads, codes, tainted, table)
+                        _:
+                            pass
+
+        def asc_walk_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            names: mutable darray[sview] = []
+                            heads: mutable darray[sview] = []
+                            codes: mutable darray[u32] = []
+                            tainted: mutable darray[bool] = []
+                            for parameter in parameters |names, heads, codes, tainted|:
+                                names.push(parameter.name)
+                                heads.push(aggregate_state_head_name(parameter.type_expression))
+                                codes.push(aggregate_state_local_code(parameter.type_expression, annotations))
+                                tainted.push(false)
+                            table <- asc_walk_statements(body, annotations, names, heads, codes, tainted, table)
+                        Decl.Module(module_name, body, module_line):
+                            table <- asc_walk_declarations(body, annotations, table)
+                        Decl.Scoped(body, scoped_line):
+                            table <- asc_walk_declarations(body, annotations, table)
+                        _:
+                            pass
+
+    public:
+        # Renders `Holder[&]` / `Holder[?, !]` from a packed state code (message helper).
+        def push_aggregate_state_spelling(buffer: mutable darray[u8]&, head: sview, code: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                buffer.extend(head)
+                buffer.push(91)
+                slot: mutable u32 = 0
+                remaining: mutable u32 = code
+                while remaining != 0 |buffer, slot, remaining|:
+                    marker: u32 = remaining - (remaining / 4) * 4
+                    if slot > 0:
+                        buffer.push(44)
+                        buffer.push(32)
+                    buffer.push(63) if marker == 1
+                    buffer.push(38) if marker == 2
+                    buffer.push(33) if marker == 3
+                    remaining <- remaining / 4
+                    slot <- slot + 1
+                buffer.push(93)
+
+        def check_aggregate_state_call(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- asc_walk_declarations(file.top_decls, file.enum_annotations, table)

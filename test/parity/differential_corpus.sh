@@ -125,6 +125,16 @@ CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 #
 # A repro that declines is a FILED BUG, not a regression. The ratchet's job is to
 # catch regressions in ordinary programs; repros are tracked by their own files.
+# A file carrying the header `# corpus: deliberate-decline` is EXCLUDED: it is a program
+# stage0 compiles that stage1 REFUSES on purpose, with its own smoke asserting the refusal
+# (assert_by_min_i64: stage0 proves `0 - MIN_I64 > 0` by wrapping; stage1 declines the
+# overflowing extremum). The marker keeps the reason next to the program.
+#
+# `*.neg.elisa` is EXCLUDED too (2026-09-05). A negative fixture that stage0 ACCEPTS is,
+# by construction, a place where stage1 is deliberately STRICTER (the effect-row `::` rule,
+# for instance) and a dedicated smoke asserts the rejection with its message. Counting it
+# here as a "decline" put three such fixtures on this ratchet the day they were written.
+#
 # `*.xfail.elisa` is EXCLUDED for the same reason as repro/, and it is the same mistake in a
 # different costume. test/differential/cases/ names a case `*.xfail.elisa` when the
 # divergence is already known, documented in the file's own header, and not yet fixed --
@@ -137,6 +147,8 @@ find "${CORPUS_DIRS[@]}" -name '*.elisa' -print0 2>/dev/null \
   | xargs -0 grep -l '^def main' 2>/dev/null \
   | grep -v '/repro/' \
   | grep -v '\.xfail\.elisa$' \
+  | grep -v '\.neg\.elisa$' \
+  | tr '\n' '\0' | xargs -0 grep -L 'corpus: deliberate-decline' 2>/dev/null \
   | sort > "$WORK/programs.txt"
 
 # Read the list on FD 3, and give every child /dev/null for stdin. Reading it on plain

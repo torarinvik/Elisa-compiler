@@ -6,7 +6,7 @@
 # signatures clang emits for the same shapes (byval / sret / lone-scalar unwrap).
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../stage0/compiler/bin/elisac-local}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
 FIX="$ROOT/test/parity/fixtures/export_cabi"
 [ -x "$ELISACORE_BIN" ] || { echo "export_cabi_shapes_smoke SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
