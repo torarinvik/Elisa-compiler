@@ -8,6 +8,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_SCRIPT="$ROOT/scripts/build_runtime_object.sh"
 ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
 STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 OUT="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
@@ -25,7 +26,7 @@ SRC="$ROOT/elisacore_std/native_runtime_support.elisa"
 # Freshness against the REAL stage0: in the gate STAGE0_BIN is the tools/s0cache wrapper,
 # whose own mtime says nothing about the compiler.
 REAL_STAGE0="${ELISA_S0_REAL:-$STAGE0_BIN}"
-if [[ -s "$OUT" && ! "$SRC" -nt "$OUT" && ! "$REAL_STAGE0" -nt "$OUT" && "${ELISA_RUNTIME_FORCE:-0}" != 1 ]]; then
+if [[ -s "$OUT" && ! "$SRC" -nt "$OUT" && ! "$BUILD_SCRIPT" -nt "$OUT" && ! "$REAL_STAGE0" -nt "$OUT" && "${ELISA_RUNTIME_FORCE:-0}" != 1 ]]; then
   exit 0
 fi
 TMP="$OUT.$$.tmp"
