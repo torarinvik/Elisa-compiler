@@ -341,7 +341,7 @@ EXPECTS=(
     "\"A.counter\" is private to module \"A\""
     "view of local \"scratch\" escapes via return; the array dies at scope exit"
     "array literal element expects i64, got static u8"
-    "array literal element expects void, got i64"
+    "array literal element expects void, got int"
 )
 
 total=0
