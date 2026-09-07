@@ -152,6 +152,25 @@ else
     echo "  FAIL location_in_root_after_includes:"; echo "    stage0: $want"; echo "    stage1: $got"
 fi
 
+# A DEDUPLICATED include (the same file reached twice, here directly and through c.elisa)
+# contributes nothing to the buffer but still costs it stage0's newline-guard byte — an empty
+# buffer line the line map must count, or every line after it maps one too low per dedup'd
+# include (found 2026-09-07: a.elisa:7 reported for a fault on line 5).
+mkdir -p "$WORK/dedup_loc"
+printf 'def b1() -> i64:\n    return 1\n' > "$WORK/dedup_loc/b.elisa"
+printf 'include "./b.elisa"\ndef c1() -> i64:\n    return oops_in_c\n' > "$WORK/dedup_loc/c.elisa"
+printf 'include "./b.elisa"\ninclude "./c.elisa"\ninclude "./b.elisa"\ndef main() -> i64:\n    return oops_in_root\n' > "$WORK/dedup_loc/a.elisa"
+for needle in oops_in_c oops_in_root; do
+    total=$((total + 1))
+    want="$("$ELISACORE_BIN" -emit semantic "$WORK/dedup_loc/a.elisa" 2>&1 >/dev/null | grep "$needle" | loc_of)"
+    got="$(RUN "$BIN" -o "$WORK/dedup_loc/a.o" "$WORK/dedup_loc/a.elisa" 2>&1 | grep "$needle" | loc_of)"
+    if [ -n "$want" ] && [ "$want" = "$got" ]; then
+        ok
+    else
+        echo "  FAIL location_after_deduplicated_include ($needle):"; echo "    stage0: $want"; echo "    stage1: $got"
+    fi
+done
+
 if [ "$pass" -ne "$total" ]; then
     echo "cli_includes_smoke FAILED: passed=$pass total=$total"
     exit 1
