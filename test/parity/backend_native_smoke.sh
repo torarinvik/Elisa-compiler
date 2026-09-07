@@ -779,6 +779,10 @@ diff_case module_u8_param 'module M:\n    def widen(b: u8) -> i64:\n        retu
 diff_case cstr_local 'def main() -> i64:\n    s: cstr = "hi"\n    return 42\n'
 diff_case cstr_param 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    return take("hi")\n'
 diff_case cstr_two_literals 'def take(s: cstr) -> i64:\n    return 42\n\ndef main() -> i64:\n    a: cstr = "one"\n    b: cstr = "two"\n    return take(a) - take(b) + 42\n'
+# A global cstr const passed to an sview parameter must carry the decoded length,
+# just like an inline string literal. The stage1 backend previously forwarded only
+# the pointer, leaving the aggregate length undefined and making the result diverge.
+diff_case global_cstr_to_sview 'const LABEL: cstr = "compiler_id"\n\ndef consume(value: sview) -> i64:\n    return value.len\n\ndef main() -> i64:\n    return consume(LABEL) - 11\n'
 diff_case cstr_empty 'def main() -> i64:\n    s: cstr = ""\n    return 42\n'
 # `@link_name` changes only the emitted symbol spelling; source calls still use `c_strlen`.
 diff_case extern_link_name '@link_name(strlen)\nextern c_strlen(s: cstr) -> usize\n\ndef main() -> i64:\n    return c_strlen("hello").i64()\n'
