@@ -184,6 +184,10 @@ NAMES=(
     tuple_destructure_arity
     region_return_escape
     region_return_dependency
+    private_global_access
+    local_view_escape
+    array_literal_element_return
+    array_literal_element_void_return
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -334,6 +338,10 @@ EXPECTS=(
     "tuple destructuring expects 3 bindings, got 2"
     "escapes via return; the region is freed at scope exit"
     "cannot return value: region dependency facts include local region \"r\""
+    "\"A.counter\" is private to module \"A\""
+    "view of local \"scratch\" escapes via return; the array dies at scope exit"
+    "array literal element expects i64, got static u8"
+    "array literal element expects void, got i64"
 )
 
 total=0
