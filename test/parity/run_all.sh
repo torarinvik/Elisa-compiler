@@ -427,6 +427,7 @@ for h in "${HEAVY_FIRST[@]}"; do
   [[ "$h" == *_smoke.sh && -f "$h" ]] && push "$(basename "$h")" "$h"
 done
 push "runtime drift guard (elisacore_std in sync)" "$REPO_ROOT/scripts/check_runtime_drift.sh"
+push "seeded stress (module-private state, both compilers, executed)" "$REPO_ROOT/test/stress/run_stress.sh"
 push "lexer parity (stage1 == stage0)" "$REPO_ROOT/test/parity/run_parity.sh"
 oracle_lane=(
   "$REPO_ROOT/test/parity/parser_acceptance_diff.sh"

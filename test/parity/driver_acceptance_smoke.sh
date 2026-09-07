@@ -92,7 +92,12 @@ JOBS="${ELISA_ACCEPT_JOBS:-${ELISA_HEAVY_JOBS:-$(elisa_host_jobs)}}"
 compare_all() {
     local mode="$1" disagree=0 accept_gap=0 reject_gap=0 resdir="$WORK/$1" verdict name r1
     mkdir -p "$resdir"
-    find "$REPO_ROOT/test/fixtures/diagnostics" -maxdepth 1 -name '*.elisa' -print0 \
+    # A fixture carrying `# corpus: deliberate-decline` is a program stage0 accepts and stage1
+    # rejects ON PURPOSE (a stage0 unsoundness stage1 closes, e.g. a view of a frame-local
+    # array escaping via return) -- the same exclusion the differential corpus applies.
+    while IFS= read -r -d '' fixture; do
+        grep -q '^# corpus: deliberate-decline' "$fixture" || printf '%s\0' "$fixture"
+    done < <(find "$REPO_ROOT/test/fixtures/diagnostics" -maxdepth 1 -name '*.elisa' -print0) \
         | xargs -0 -P "$JOBS" -n 1 bash "${BASH_SOURCE[0]}" --one "$mode" "$resdir"
     while IFS=$'\t' read -r verdict name r1; do
         [ "$verdict" = same ] && continue

@@ -74,6 +74,41 @@ extend Backend:
         # silently reverting to unchecked arithmetic.
         def emit_checked_int_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             signed: bool = operand_type.kind == TypeKind.Signed
+            # A signed 64-bit `*` on a 32-BIT target is checked WITHOUT `llvm.smul.with.overflow.i64`:
+            # that intrinsic widens to an i128 multiply, and LLVM lowers it on wasm32 to a
+            # `__multi3` libcall that no freestanding host provides — the module validated and
+            # then failed to instantiate. stage0's LLVM happens to expand it inline; ours does
+            # not, and the semantics (trap on overflow) must not depend on which LLVM is linked.
+            # The check is the classic division back-test with the one trapping corner
+            # (`MIN * -1`, i.e. `MIN / -1`) decided before any division: overflow iff
+            #     (a == -1 and b == MIN) or (a != 0 and (a*b) sdiv a != b)
+            # `sdiv` divides by 1 whenever the real divisor would be 0 or that corner, so it can
+            # never trap itself. Unsigned 64-bit multiply needs none of this (no libcall).
+            if operator == TokenKind.Star and signed and operand_type.bits == 64 and target_pointer_bits() == 32:
+                wide_type: LLVMTypeRef = llvm_type_of(operand_type, structs, ctx)
+                product: LLVMValueRef = LLVMBuildMul(builder, left, right, "smul64.product")
+                zero: LLVMValueRef = LLVMConstInt(wide_type, 0, 0)
+                one: LLVMValueRef = LLVMConstInt(wide_type, 1, 0)
+                minus_one: LLVMValueRef = LLVMConstInt(wide_type, 18446744073709551615, 1)
+                int_min: LLVMValueRef = LLVMConstInt(wide_type, 9223372036854775808, 0)
+                a_is_zero: LLVMValueRef = LLVMBuildICmp(builder, 32, left, zero, "smul64.a.zero")
+                a_is_minus_one: LLVMValueRef = LLVMBuildICmp(builder, 32, left, minus_one, "smul64.a.neg1")
+                b_is_min: LLVMValueRef = LLVMBuildICmp(builder, 32, right, int_min, "smul64.b.min")
+                min_corner: LLVMValueRef = LLVMBuildAnd(builder, a_is_minus_one, b_is_min, "smul64.min.corner")
+                divisor_unsafe: LLVMValueRef = LLVMBuildOr(builder, a_is_zero, min_corner, "smul64.div.unsafe")
+                divisor: LLVMValueRef = LLVMBuildSelect(builder, divisor_unsafe, one, left, "smul64.divisor")
+                quotient: LLVMValueRef = LLVMBuildSDiv(builder, product, divisor, "smul64.quotient")
+                quotient_differs: LLVMValueRef = LLVMBuildICmp(builder, 33, quotient, right, "smul64.q.differs")
+                back_test: LLVMValueRef = LLVMBuildAnd(builder, LLVMBuildNot(builder, divisor_unsafe, "smul64.div.safe"), quotient_differs, "smul64.back.test")
+                overflow64: LLVMValueRef = LLVMBuildOr(builder, min_corner, back_test, "smul64.overflow")
+                function64: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                trap_block64: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function64, "signed.arith.overflow.trap")
+                ok_block64: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function64, "signed.arith.ok")
+                _ = LLVMBuildCondBr(builder, overflow64, trap_block64, ok_block64)
+                LLVMPositionBuilderAtEnd(builder, trap_block64)
+                emit_trap_unreachable(m, ctx, builder)
+                LLVMPositionBuilderAtEnd(builder, ok_block64)
+                return product
             intrinsic_name: mutable sview = ""
             if operator == TokenKind.Plus:
                 intrinsic_name <- "llvm.sadd.with.overflow" if signed else "llvm.uadd.with.overflow"
