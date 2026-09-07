@@ -1,0 +1,123 @@
+# A view into a FRAME-LOCAL fixed array RETURNED from the function that owns the frame:
+#
+#     def leak() -> view[i64]:
+#         scratch: mutable i64[4] = zeroed
+#         return scratch[0:2]      # the array dies with the frame; the caller reads dead stack
+#
+# Both compilers accepted this (MEASURED 2026-09-07) and the program read a dead frame -- a
+# memory-unsafe SILENT miscompile no gate could see. Sound subset rejected here: the declared
+# return type is `view[...]`, and the returned value is a slice (through parentheses, or either
+# arm of an `if`) of a bare name declared in this function as a `T[N]`/`array[T, N]` local or a
+# by-VALUE `T[N]` parameter (a copy that lives in the callee's frame). A ref parameter (`T[N]&`)
+# is caller-owned and stays allowed, as does any global. A view bound to a local first
+# (`v = scratch[0:2]; return v`) is a second-order escape this check does not see. Every finding
+# is a genuine dangling view.
+extend Semantic:
+    private:
+        # The declared type behind `mutable` and parentheses.
+        def lvre_declared_type(type_expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        return lvre_declared_type(operand) if operator == TokenKind.Mutable else type_expression
+                    Expr.Paren(inner, paren_pos):
+                        return lvre_declared_type(inner)
+                    _:
+                        return type_expression
+
+        # A fixed array held IN the frame: the bare `T[N]` / `array[T, N]` node itself. A ref to
+        # one (`T[N]&`) is a different node and is NOT a frame array.
+        def lvre_frame_array(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                peeled: Ast::Expr = lvre_declared_type(type_expression)
+                match peeled:
+                    Expr.Index(index_object, index_argument, index_pos):
+                        return fixed_array_extent(peeled) > 0
+                    Expr.IndexN(indexn_object, indexn_arguments, indexn_pos):
+                        return fixed_array_extent(peeled) > 0
+                    _:
+                        return false
+
+        # The bare name a slice is taken of, through parentheses; "" for anything else.
+        def lvre_slice_root(object: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match object:
+                    Expr.Ident(name, ident_pos):
+                        return name
+                    Expr.Paren(inner, paren_pos):
+                        return lvre_slice_root(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        # The frame array a returned VALUE is a slice of, if any: `scratch[0:2]`, `(scratch[0:2])`,
+        # either arm of `a[..] if c else b[..]` (the first escaping arm is named).
+        def lvre_escaping_name(value: Ast::Expr, names: darray[sview]&) -> (name: sview, pos: Ast::Pos, found: bool):
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(inner, paren_pos):
+                        return lvre_escaping_name(inner, names)
+                    Expr.Slice(slice_object, slice_low, slice_high, slice_pos):
+                        root: sview = lvre_slice_root(slice_object)
+                        for entry in names:
+                            if entry == root:
+                                return (root, slice_pos, true)
+                        return (sview("", 0, 0), slice_pos, false)
+                    Expr.If(condition, then_value, else_value, if_pos):
+                        then_arm: (name: sview, pos: Ast::Pos, found: bool) = lvre_escaping_name(then_value, names)
+                        return then_arm if then_arm.found else lvre_escaping_name(else_value, names)
+                    _:
+                        return (sview("", 0, 0), Ast::pos_at_line(0), false)
+
+        def lvre_statements(statements: darray[Ast::Stmt], names: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Lexical scoping for free: this list's declarations live in a copy that dies with it.
+                scope_names: mutable darray[sview] = [entry for entry in names]
+                for statement in statements |table, scope_names| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            if lvre_frame_array(type_expression):
+                                scope_names.push(name)
+                        Stmt.Return(value, return_pos):
+                            if value is returned:
+                                escape: (name: sview, pos: Ast::Pos, found: bool) = lvre_escaping_name(returned, scope_names)
+                                if escape.found:
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalViewEscapesReturn, name: escape.name, line: escape.pos.line, pos: escape.pos, expected: "", actual: ""})
+                        Stmt.Block(kind, clause, binding, body, line):
+                            table <- lvre_statements(body, scope_names, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- lvre_statements(then_body, scope_names, table)
+                            table <- lvre_statements(else_body, scope_names, table)
+                        Stmt.While(condition, while_body, line):
+                            table <- lvre_statements(while_body, scope_names, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            table <- lvre_statements(for_body, scope_names, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table, scope_names| -> table:
+                                table <- lvre_statements(arm.body, scope_names, table)
+                        _:
+                            pass
+
+        def lvre_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            if return_type is declared_return:
+                                head_arg: (head: sview, argument: sview) = dd_type_head_arg(declared_return)
+                                if head_arg.head == "view":
+                                    frame_params: mutable darray[sview] = []
+                                    for parameter in parameters |frame_params|:
+                                        if lvre_frame_array(parameter.type_expression):
+                                            frame_params.push(parameter.name)
+                                    table <- lvre_statements(body, frame_params, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- lvre_walk(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- lvre_walk(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_local_view_return_escape(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- lvre_walk(file.top_decls, table)
