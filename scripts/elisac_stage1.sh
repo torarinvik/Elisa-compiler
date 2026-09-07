@@ -414,10 +414,9 @@ if [[ -n "$PYTHON_CONFIG_HOST" ]]; then
   export PYTHON_CONFIG="$PYTHON_CONFIG_HOST"
 fi
 
-# WASM is a packaging target, not just another object suffix: it needs a wasm-ld link
-# (or wasm-component-ld for WIT packages). The default
-# compatibility path may generate a JS facade, while --wasm-only deliberately emits
-# only WASM plus its package manifest for native/component hosts.
+# `-emit wasm` is the driver's (§4.4): it emits the wasm32 object, builds the portable
+# runtime object, links with wasm-ld and writes the manifest and the JS/TS facade itself.
+# The packaging options travel by environment like every other option.
 if [[ "$emit_mode" == "wasm" ]]; then
   [[ -n "$src" ]] || { echo "usage: $0 -emit wasm -o out.wasm source.elisa" >&2; exit 2; }
   if [[ -z "$out" ]]; then
@@ -425,24 +424,14 @@ if [[ "$emit_mode" == "wasm" ]]; then
   elif [[ "$out" != *.wasm ]]; then
     out="${out}.wasm"
   fi
-  wasm_python="${PYTHON_BIN:-python3}"
-  command -v "$wasm_python" >/dev/null 2>&1 || {
-    echo "-emit wasm requires Python 3 (set PYTHON_BIN)" >&2
-    exit 2
-  }
-  wasm_command=("$wasm_python" "$ROOT/scripts/wasm_build.py" --root "$ROOT" --compiler "$0" --source "$src" --output "$out" --target "${target_triple:-wasm32-unknown-unknown}")
-  [[ -n "$wasm_ld" ]] && wasm_command+=(--wasm-ld "$wasm_ld")
-  [[ -n "$wasm_component_ld" ]] && wasm_command+=(--wasm-component-ld "$wasm_component_ld")
+  [[ -z "$target_triple" ]] && target_triple="wasm32-unknown-unknown"
+  joined_component_types=""
   if [[ "${#component_types[@]}" -gt 0 ]]; then
     for component_type in "${component_types[@]}"; do
-      wasm_command+=(--component-type "$component_type")
+      absolute_component_type="$(cd -- "$(dirname -- "$component_type")" && pwd)/$(basename -- "$component_type")"
+      joined_component_types="${joined_component_types:+$joined_component_types;}$absolute_component_type"
     done
   fi
-  [[ "$wasm_only" == 1 ]] && wasm_command+=(--wasm-only)
-  [[ "$noalias" == 1 ]] && wasm_command+=(--compiler-flag=-fnoalias)
-  [[ "$bounds_check" == 1 ]] && wasm_command+=(--compiler-flag=-fbounds-check)
-  [[ "$opt_level" != 0 ]] && wasm_command+=("--compiler-flag=-O$opt_level")
-  exec "${wasm_command[@]}"
 fi
 
 # `-emit tests|benches|fixtures` list annotated functions on STDOUT and stage0 rejects
@@ -827,6 +816,13 @@ driver_env+=("ELISA_STAGE1_SRC=$src")
 [[ "$opt_level" != 0 ]] && driver_env+=("ELISA_STAGE1_OPT=$opt_level")
 [[ "$emit_mode" == "llvm" ]] && driver_env+=("ELISA_STAGE1_EMIT=llvm")
 [[ "$emit_mode" == "bc" ]] && driver_env+=("ELISA_STAGE1_EMIT=bc")
+if [[ "$emit_mode" == "wasm" ]]; then
+  driver_env+=("ELISA_STAGE1_EMIT=wasm" "ELISA_STAGE1_ROOT=$ROOT" "ELISA_STAGE1_SELF=$0")
+  [[ -n "$wasm_ld" ]] && driver_env+=("ELISA_STAGE1_WASM_LD=$wasm_ld")
+  [[ -n "$wasm_component_ld" ]] && driver_env+=("ELISA_STAGE1_WASM_COMPONENT_LD=$wasm_component_ld")
+  [[ "$wasm_only" == 1 ]] && driver_env+=("ELISA_STAGE1_WASM_ONLY=1")
+  [[ -n "$joined_component_types" ]] && driver_env+=("ELISA_STAGE1_WASM_COMPONENT_TYPES=$joined_component_types")
+fi
 if [[ "$emit_mode" == "exe" ]]; then
   driver_env+=("ELISA_STAGE1_EMIT=exe" "ELISA_RUNTIME_OBJ=$runtime_obj")
   [[ -x "$ELISA_CLANG_TOOL" ]] && driver_env+=("ELISA_CLANG=$ELISA_CLANG_TOOL")

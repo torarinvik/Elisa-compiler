@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """Build an Elisa WebAssembly module and its zero-glue ESM/TypeScript facade.
 
-The compiler owns the object file and the host script owns the final wasm link.  Keeping
-the linker here makes the normal ``-emit wasm`` path work on machines where ``wasm-ld``
-is installed next to LLVM but no C compiler or JavaScript bundler is present.
+NO LONGER ON STAGE1'S PATH (§4.4, 2026-09-07).  ``bin/elisac-stage1`` does all of this
+itself now — runtime object, ``wasm-ld`` link, manifest, facade — in
+``src/driver/emit_wasm.elisa``; ``scripts/elisac_stage1.sh -emit wasm`` no longer spawns
+Python at all.
+
+This script stays because it is the only WASM packager STAGE0 has: the Go oracle's CLI has
+no ``-emit wasm``, and ``test/parity/wasm_component_runtime_smoke.sh`` drives this file with
+``--compiler "$ELISACORE_BIN"`` to keep stage0's component ABI covered.  It therefore also
+serves as the port's oracle: ``test/parity/wasm_python_parity_smoke.sh`` builds the same
+sources both ways and requires every artifact — module included — to be byte-identical.
+Change one side and that smoke tells you the other has drifted.
 """
 
 from __future__ import annotations
