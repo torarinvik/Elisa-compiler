@@ -102,7 +102,6 @@ terminate_guarded_pid() {
 }
 
 source "$ROOT/scripts/elisac_stage1_seed.sh"
-source "$ROOT/scripts/elisac_stage1_pymodule.sh"
 
 if [[ "${1:-}" == "--seed" ]]; then
   seed_build
@@ -326,13 +325,11 @@ if [[ "$emit_mode" == "exe" ]]; then
   [[ -f "$runtime_obj" ]] || { echo "-emit exe requires the runtime object at $runtime_obj (run scripts/build_runtime_object.sh)" >&2; exit 2; }
 fi
 
-# `-emit pymodule-so` is the host-facing convenience path for the complete Python
-# extension pipeline.  The compiler still owns the language-facing pieces (the
-# machine-readable export manifest, the CPython C shim, and the native object); this
-# wrapper owns the platform toolchain invocation so a user only needs one command.
-if [[ "$emit_mode" == "pymodule-so" ]]; then
-  emit_pymodule_so
-fi
+# `-emit pymodule-so` and `-emit pymodule-pyi` are the DRIVER's (§4.5): it emits the
+# manifest, the C shim and the object in-process, spawns the target interpreter for the three
+# facts only that interpreter can answer (EXT_SUFFIX, the suffixes its import machinery
+# recognises, and its header directory), and runs clang itself. The wrapper's remaining job
+# is to hand over the toolchain paths it already resolved.
 
 # Run the self-hosted compiler as a direct child so its RSS can be observed. The previous
 # stdin pipeline made it possible for a large compile to escape every wrapper-level guard:
@@ -372,40 +369,6 @@ run_stage1_driver_guarded() {
   return "$driver_rc"
 }
 
-# `-emit pymodule-pyi` renders a type-checker stub from the compiler-owned JSON contract. It
-# intentionally has no native-toolchain dependency: a manifest is enough to describe the Python
-# surface, so editor/type-checking workflows remain useful even when clang or the runtime object
-# are not installed on the host.
-if [[ "$emit_mode" == "pymodule-pyi" ]]; then
-  python_bin="$PYTHON_HOST"
-  [[ -x "$python_bin" ]] || {
-    echo "-emit pymodule-pyi requires python3 (set PYTHON_BIN)" >&2
-    exit 2
-  }
-  pymodule_work="$(mktemp -d)"
-  trap 'rm -rf "$pymodule_work"' EXIT
-  pymodule_manifest="$pymodule_work/manifest.json"
-  "$0" -emit pymodule -o "$pymodule_manifest" "$src"
-  pymodule_module="$("$python_bin" - "$pymodule_manifest" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    manifest = json.load(f)
-module = manifest.get("module")
-if not isinstance(module, str) or not module:
-    raise SystemExit("pymodule manifest has no module name")
-print(module)
-PY
-)"
-  if [[ -z "$out" ]]; then
-    out="$pymodule_module.pyi"
-  fi
-  mkdir -p "$(dirname -- "$out")"
-  "$python_bin" "$ROOT/scripts/pymodule_pyi.py" "$pymodule_manifest" "$out"
-  echo "pymodule-pyi: wrote $out" >&2
-  exit 0
-fi
 
 # Optimisation level and emit mode reach the driver via env (the stdin protocol
 # carries only the output path and the source).
@@ -429,6 +392,18 @@ if [[ "$emit_mode" == "wasm" ]]; then
   [[ -n "$wasm_component_ld" ]] && driver_env+=("ELISA_STAGE1_WASM_COMPONENT_LD=$wasm_component_ld")
   [[ "$wasm_only" == 1 ]] && driver_env+=("ELISA_STAGE1_WASM_ONLY=1")
   [[ -n "$joined_component_types" ]] && driver_env+=("ELISA_STAGE1_WASM_COMPONENT_TYPES=$joined_component_types")
+fi
+if [[ "$emit_mode" == "pymodule-so" || "$emit_mode" == "pymodule-pyi" ]]; then
+  # ELISA_STAGE1_SELF is how the driver re-invokes itself to auto-build a missing runtime
+  # object; without it the child would be `bin/elisac-stage1` relative to the CWD.
+  driver_env+=("ELISA_STAGE1_EMIT=$emit_mode" "ELISA_STAGE1_ROOT=$ROOT" "ELISA_RUNTIME_OBJ=$runtime_obj")
+  driver_env+=("ELISA_STAGE1_SELF=$BIN")
+  driver_env+=("ELISA_LLVM_BIN_DIR=$LLVM_BIN_DIR")
+  [[ -x "$ELISA_CLANG_TOOL" ]] && driver_env+=("ELISA_CLANG=$ELISA_CLANG_TOOL")
+  # `-o` reaches the driver through the environment for these two: absent, it names the
+  # output after the MODULE, which no path default can express.
+  driver_env+=("ELISA_STAGE1_PYMODULE_OUT=$out")
+  out=""
 fi
 if [[ "$emit_mode" == "exe" ]]; then
   driver_env+=("ELISA_STAGE1_EMIT=exe" "ELISA_RUNTIME_OBJ=$runtime_obj")
@@ -476,7 +451,7 @@ fi
 # file (that is how the redirected report modes work), and `-o /dev/null` routed the whole
 # `-emit tests|benches|fixtures|test` listing into the void (emit_annotated_list and
 # emit_test_run parity, 2026-09-06). Without `-o` the listing is stdout, as it always was.
-if [[ "$out" == /dev/null ]]; then
+if [[ "$out" == /dev/null || -z "$out" ]]; then
   driver_args=("$src")
 else
   driver_args=(-o "$out" "$src")

@@ -9,8 +9,8 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-seed-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 mkdir -p "$WORK/scripts" "$WORK/src/driver" "$WORK/core/compiler/bin" "$WORK/lib" "$WORK/tmp"
-# The wrapper sources its seed and pymodule halves, so the fixture worktree needs all three.
-for part in elisac_stage1.sh elisac_stage1_seed.sh elisac_stage1_pymodule.sh; do
+# The wrapper sources its seed half, so the fixture worktree needs both files.
+for part in elisac_stage1.sh elisac_stage1_seed.sh; do
   cp "$ROOT/scripts/$part" "$WORK/scripts/$part"
 done
 printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"
