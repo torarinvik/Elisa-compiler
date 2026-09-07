@@ -1,0 +1,277 @@
+# Stage1 backend — the calls that BUILD something rather than invoke a function: `Node.Store(r)`
+# assembling an AoS store, a packed-enum constructor writing a row, and a named constructor.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_call_store_and_constructor(callee: Expr, arguments: darray[Expr]&, argument_names: darray[sview], local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # `Node.Store(owner)` — build the AoS store: ask the runtime for its state, then
+            # assemble `{arena, row_bytes, state}` with three insertvalues (stage0's shape).
+            if callee is Expr.Field(store_ctor_head, store_ctor_member, store_ctor_line):
+                # Module-qualified as well as bare: `Ast::Node.Store(r)`. See the matching
+                # note in annotation_index_store_value_type -- the TYPE and the CONSTRUCTOR
+                # have to agree about which spellings name a store, or one half resolves and
+                # the other declines.
+                store_ctor_enum: sview = packed_constructor_enum_name(store_ctor_head)
+                if store_ctor_enum != "":
+                    if store_ctor_member == "Store":
+                        store_ctor_index: i64 = packed_index_of(structs, store_ctor_enum)
+                        if store_ctor_index >= 0:
+                            null return if arguments.count != 1
+                            # The owner is an Arena; the runtime takes it BY POINTER, so the
+                            # argument must be a name whose slot we can hand over rather than
+                            # a temporary.
+                            if arguments[0] is Expr.Ident(owner_name, owner_line):
+                                null return if lookup_type(local_scope, owner_name).kind != TypeKind.Arena
+                                if lookup_slot(local_scope, owner_name) is owner_slot:
+                                    row_bytes: i64 = packed_row_bytes(structs, store_ctor_index)
+                                    # Dynamic AoS hierarchies keep inherited `common:` fields in
+                                    # a side table.  The explicit `E.Store(arena)` constructor
+                                    # must therefore use the side-aware runtime constructor too;
+                                    # calling the plain constructor leaves `side_words == 0`, so
+                                    # the first common-field read follows a null side-chunk table
+                                    # even though the row itself was allocated successfully.
+                                    store_side_words: u32 = packed_aos_side_common_count(structs, store_ctor_index) if runtime.packed_mode == 2 and packed_is_dynamic_aos_enum(structs, store_ctor_index) else 0
+                                    state_args: mutable darray[LLVMValueRef] = [owner_slot, LLVMConstInt(LLVMInt64TypeInContext(ctx), row_bytes.u64(), 0)]
+                                    state_fn: mutable LLVMValueRef = runtime.packed_state_new
+                                    state_type: mutable LLVMTypeRef = runtime.packed_state_new_type
+                                    if store_side_words > 0:
+                                        state_args.push(LLVMConstInt(LLVMInt64TypeInContext(ctx), store_side_words.u64(), 0))
+                                        state_fn <- runtime.packed_state_new_side
+                                        state_type <- runtime.packed_state_new_side_type
+                                    state_pointer: void& = (&state_args[0]).cast[void&] can Unsafe.PointerCast
+                                    state: LLVMValueRef = LLVMBuildCall2(builder, state_type, state_fn, state_pointer, state_args.count.u32(), "packed.store.state")
+                                    store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: store_ctor_index.u32()}
+                                    store_llvm: LLVMTypeRef = llvm_type_of(store_type, structs, ctx)
+                                    with_arena: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetUndef(store_llvm), owner_slot, 0, "packed.store.arena")
+                                    with_row: LLVMValueRef = LLVMBuildInsertValue(builder, with_arena, LLVMConstInt(LLVMInt64TypeInContext(ctx), row_bytes.u64(), 0), 1, "packed.store.row_bytes")
+                                    return LLVMBuildInsertValue(builder, with_row, state, 2, "packed.store.state1")
+                            return null
+
+            # `Node.Leaf(v: 42)` inside an `in store:` block — a PACKED constructor. Unlike
+            # a payload enum's inline value, this allocates a ROW: extract the arena/state
+            # out of the active store, call alloc_fixed_tagged_variant_sparse_result(arena,
+            # state, tag), zero the row, then write the payload. stage0's shape exactly.
+            if callee is Expr.Field(packed_ctor_head, packed_ctor_variant, packed_ctor_line):
+                packed_ctor_enum_name: sview = packed_constructor_enum_name(packed_ctor_head)
+                if packed_ctor_enum_name != "":
+                    packed_ctor_index: i64 = packed_index_of(structs, packed_ctor_enum_name)
+                    if packed_ctor_index >= 0:
+                        # No active store -> decline. stage0 rejects the same program
+                        # ("requires an active in Node.Store: scope"), and there is no store
+                        # to allocate the row from anyway.
+                        packed_store_index: i64 = packed_root_index_of(structs, packed_ctor_index)
+                        null return if packed_store_index < 0
+                        # `new[store] E.V(...)` — an EXPLICIT allocation target, outside any
+                        # `in store:` block. The parser consumes the bracket and leaves only a
+                        # line-keyed `__region_use` row, so the selector is looked up here and
+                        # made active for this allocation, exactly as the block form does.
+                        # Without it only the AMBIENT store was ever honoured.
+                        packed_runtime: mutable Runtime = copied_runtime(runtime)
+                        packed_selector: sview = region_use_name_at(packed_ctor_line.line, structs)
+                        if packed_selector != "":
+                            packed_selector_type: ValueType = lookup_type(local_scope, packed_selector)
+                            if packed_selector_type.kind == TypeKind.PackedStore:
+                                if lookup_slot(local_scope, packed_selector) is packed_selector_slot:
+                                    packed_runtime.active_store <- LLVMBuildLoad2(builder, llvm_type_of(packed_selector_type, structs, ctx), packed_selector_slot, "store.active")
+                                    packed_runtime.active_store_enum <- packed_selector_type.bits.i64()
+                                    packed_runtime.active_store_is_block <- true
+                        null return if packed_runtime.active_store_enum != packed_store_index
+                        packed_tag: i64 = packed_variant_index(structs, packed_ctor_index, packed_ctor_variant)
+                        null return if packed_tag < 0
+                        packed_slot_index: usize = structs.packed_variant_start[packed_ctor_index.usize()] + packed_variant_local_index(structs, packed_ctor_index, packed_ctor_variant).usize()
+                        # A child row inherits the root's common prefix. Its own registry slot
+                        # records zero because the `common:` block belongs to the variant-less
+                        # root, so use the hierarchy-wide count for dynamic AoS constructors.
+                        packed_commons: u32 = packed_aos_common_count(structs, packed_ctor_index) if runtime.packed_mode == 2 and packed_is_dynamic_aos_enum(structs, packed_ctor_index) else structs.packed_common_counts[packed_ctor_index.usize()]
+                        # `new Expr.Int(span: 1, value: 42)` — the COMMON args come first,
+                        # then at most one payload arg. The parser prepends commons to the
+                        # variant's field list, so the arity is commons (+1 with a payload).
+                        packed_field_count: usize = structs.packed_field_type_count[packed_slot_index]
+                        packed_expected_args: usize = packed_commons.usize() + packed_field_count
+                        null return if arguments.count != packed_expected_args
+
+                        packed_arena: LLVMValueRef = LLVMBuildExtractValue(builder, packed_runtime.active_store, 0, "packed.arena")
+                        packed_state: LLVMValueRef = LLVMBuildExtractValue(builder, packed_runtime.active_store, 2, "packed.state")
+                        # Recursive AST payloads contain darray side-tables. Those tables
+                        # belong to the AoS store's arena, not to the constructor's temporary
+                        # function arena. The latter is normally freed when this parser helper
+                        # returns; using it for the clone leaves a dangling side-table header
+                        # and turns a valid node handle into a later semantic crash. Keep the
+                        # original runtime for expression evaluation, but direct aggregate
+                        # adoption below at the store owner.
+                        packed_runtime.arena <- packed_arena
+                        packed_alloc_args: mutable darray[LLVMValueRef] = [packed_arena, packed_state, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0)]
+                        if runtime.packed_mode == 2:
+                            packed_alloc_args <- [packed_arena, packed_state]
+                        packed_alloc_pointer: void& = (&packed_alloc_args[0]).cast[void&] can Unsafe.PointerCast
+                        packed_alloc_result: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_alloc_type, runtime.packed_alloc, packed_alloc_pointer, 2 if runtime.packed_mode == 2 else 3, "packed.variant.alloc")
+                        packed_row: LLVMValueRef = LLVMBuildExtractValue(builder, packed_alloc_result, 0, "packed.alloc.ptr")
+
+                        packed_handle_llvm: LLVMTypeRef = packed_row_llvm_type(structs, packed_ctor_index, ctx)
+                        _ = LLVMBuildStore(builder, LLVMConstNull(packed_handle_llvm), packed_row)
+                        packed_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, 0, "packed.tag.ptr")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0), packed_tag_pointer)
+                        packed_dynamic_aos: bool = runtime.packed_mode == 2 and packed_is_dynamic_aos_enum(structs, packed_ctor_index)
+                        packed_side_words: u32 = packed_aos_side_common_count(structs, packed_ctor_index) if packed_dynamic_aos else 0
+                        packed_side_buffer: mutable LLVMValueRef = zeroed
+                        packed_side_raw: mutable LLVMValueRef = zeroed
+                        if packed_side_words > 0:
+                            packed_side_array_type: LLVMTypeRef = LLVMArrayType(runtime_size_llvm_type(ctx), packed_side_words)
+                            packed_side_buffer <- LLVMBuildAlloca(builder, packed_side_array_type, "packed.side.words")
+                            _ = LLVMBuildStore(builder, LLVMConstNull(packed_side_array_type), packed_side_buffer)
+                            packed_side_raw <- LLVMBuildBitCast(builder, packed_side_buffer, LLVMPointerTypeInContext(ctx, 0), "packed.side.raw")
+                        # Dynamic AoS rows split commons according to their explicit storage
+                        # decorators: inline fields are typed row members, while side-table
+                        # fields use the parallel word column. The legacy row keeps all commons
+                        # inline. Every path uses the declared type recorded during registration.
+                        packed_common_ok: mutable bool = true
+                        for common_index in 0..<packed_commons.usize() |packed_common_ok, arguments, packed_handle_llvm, packed_row, packed_dynamic_aos, packed_side_raw, packed_side_words, packed_ctor_index, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            common_slot_type: ValueType = packed_common_type_at(structs, structs.packed_names[packed_ctor_index.usize()], common_index.u32())
+                            if emit_expression(arguments[common_index], common_slot_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is common_value:
+                                if packed_dynamic_aos and packed_common_is_inline(structs, structs.packed_names[packed_ctor_index.usize()], common_index.u32()):
+                                    common_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, packed_dynamic_common_row_field_index(structs, packed_ctor_index, common_index.u32()), "packed.common.ptr")
+                                    _ = LLVMBuildStore(builder, common_value, common_pointer)
+                                elif packed_dynamic_aos:
+                                    common_slots: u32 = packed_common_side_word_count(common_slot_type, structs)
+                                    common_offset: u32 = packed_common_side_word_offset(structs, structs.packed_names[packed_ctor_index.usize()], common_index.u32())
+                                    packed_common_ok <- false if common_slots == 0 or common_offset + common_slots > packed_side_words
+                                    packed_common_ok <- false if not packed_raw_words_store_value(common_value, common_slot_type, common_slots, packed_side_raw, common_offset, structs, ctx, builder)
+                                else:
+                                    common_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, packed_common_row_field_index(structs, packed_ctor_index, common_index.u32()), "packed.common.ptr")
+                                    common_slots: u32 = packed_common_side_word_count(common_slot_type, structs)
+                                    packed_common_ok <- false if common_slots == 0 or common_slots > 1
+                                    packed_common_ok <- false if not packed_raw_words_store_value(common_value, common_slot_type, common_slots, common_pointer, 0, structs, ctx, builder)
+                            else:
+                                packed_common_ok <- false
+                        null return if not packed_common_ok
+                        if packed_side_words > 0:
+                            packed_side_index: LLVMValueRef = LLVMBuildExtractValue(builder, packed_alloc_result, 1, "packed.side.index")
+                            packed_side_args: mutable darray[LLVMValueRef] = [packed_arena, packed_side_buffer, packed_state, packed_side_index]
+                            packed_side_args_pointer: void& = (&packed_side_args[0]).cast[void&] can Unsafe.PointerCast
+                            _ = LLVMBuildCall2(builder, runtime.packed_record_side_words_type, runtime.packed_record_side_words, packed_side_args_pointer, 4, "")
+                        # `packed_has_payload` means "exactly one field" in the metadata
+                        # table.  Multi-field variants still carry payloads; they use the
+                        # aggregate branch below.  Gating this block on that convenience
+                        # flag silently left recursive AST nodes such as Call and Block
+                        # with zeroed side data.
+                        # `packed_field_count` counts the variant's OWN fields — the commons
+                        # are separate (and were 0 for every enum until the count started
+                        # flowing). Comparing against `packed_commons` skipped the payload
+                        # store for a one-field variant of a one-common enum, so the row kept
+                        # its zeroinitializer.
+                        if packed_field_count > 0:
+                            packed_payload_type: ValueType = copied_type(structs.packed_payloads[packed_slot_index])
+                            # Dynamic AoS rows have only `{tag, [u32]}`. Do not first
+                            # form the legacy typed GEP: the common-prefix index can be
+                            # outside that two-field struct even though the raw carrier
+                            # path below is valid.
+                            packed_payload_pointer: LLVMValueRef = packed_dynamic_row_payload_words(structs, packed_ctor_index, packed_row, ctx, builder, "packed.payload.raw") if packed_dynamic_aos else LLVMBuildStructGEP2(builder, packed_handle_llvm, packed_row, packed_payload_row_field_index(structs, packed_ctor_index), "packed.payload.ptr")
+                            if packed_field_count == 1:
+                                if emit_expression(arguments[packed_commons.usize()], packed_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is packed_payload_value:
+                                    # Stage0 adopts darray-backed payloads into the store
+                                    # arena before recording the node.  This matters when a
+                                    # constructor receives a side table built in a nested
+                                    # region; storing the source header directly leaves the
+                                    # AST pointing at storage that may be freed on return.
+                                    if emit_clone_aggregate_value(packed_payload_value, packed_payload_type, packed_payload_type, structs, packed_runtime, m, ctx, builder) is adopted_payload:
+                                        if packed_dynamic_aos:
+                                            null return if not packed_dynamic_row_store_value(adopted_payload, packed_payload_type, packed_variant_row_slots(structs, packed_slot_index), structs, packed_ctor_index, packed_row, ctx, builder)
+                                        else:
+                                            _ = LLVMBuildStore(builder, adopted_payload, packed_payload_pointer)
+                                    else:
+                                        return null
+                                else:
+                                    return null
+                            else:
+                                payload_llvm: LLVMTypeRef = llvm_type_of(packed_payload_type, structs, ctx)
+                                payload_value: mutable LLVMValueRef = LLVMGetUndef(payload_llvm)
+                                payload_start: usize = structs.packed_field_type_start[packed_slot_index]
+                                for payload_index in 0..<packed_field_count |payload_value, payload_start, arguments, packed_commons, structs, local_scope, fns, generics, runtime, m, ctx, builder|:
+                                    field_type: ValueType = copied_type(structs.packed_field_types[payload_start + payload_index])
+                                    if emit_expression(arguments[packed_commons.usize() + payload_index], field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is field_value:
+                                        payload_value <- LLVMBuildInsertValue(builder, payload_value, field_value, payload_index.u32(), "packed.payload.field")
+                                    else:
+                                        return null
+                                if emit_clone_aggregate_value(payload_value, packed_payload_type, packed_payload_type, structs, packed_runtime, m, ctx, builder) is adopted_payload:
+                                    payload_value <- adopted_payload
+                                else:
+                                    return null
+                                if packed_dynamic_aos:
+                                    null return if not packed_dynamic_row_store_value(payload_value, packed_payload_type, packed_variant_row_slots(structs, packed_slot_index), structs, packed_ctor_index, packed_row, ctx, builder)
+                                else:
+                                    _ = LLVMBuildStore(builder, payload_value, packed_payload_pointer)
+                        if runtime.packed_mode == 1:
+                            packed_prefix_args: mutable darray[LLVMValueRef] = [packed_arena, packed_row, packed_state]
+                            packed_prefix_pointer: void& = (&packed_prefix_args[0]).cast[void&] can Unsafe.PointerCast
+                            LLVMBuildCall2(builder, runtime.packed_record_prefix_type, runtime.packed_record_prefix, packed_prefix_pointer, 3, "")
+                        # The VALUE is the row's INDEX, not the row.
+                        return LLVMBuildExtractValue(builder, packed_alloc_result, 1, "packed.alloc.index")
+
+            # `Shape.Circle(42)` — a payload-enum CONSTRUCTOR. stage0 emits: alloca, store
+            # zeroinitializer, store the tag at field 0, store the payload at field 1, load
+            # the value. Only ONE payload argument is modeled, matching what
+            # register_payload_enum accepts.
+            if callee is Expr.Field(ctor_head, ctor_variant, ctor_line):
+                # The head is the enum's bare name or a module-qualified one
+                # (`UiCore::Command.Clear`); enums are registered bare either way.
+                ctor_enum_name: sview = packed_constructor_enum_name(ctor_head)
+                if ctor_enum_name != "":
+                    ctor_enum_index: i64 = penum_index_of(structs, ctor_enum_name)
+                    if ctor_enum_index >= 0:
+                        # Owner-aware: `MouseEvent.Move` inside an inline hierarchy's span.
+                        ctor_tag: i64 = penum_variant_index_owned(structs, ctor_enum_index, ctor_enum_name, ctor_variant)
+                        null return if ctor_tag < 0
+                        ctor_variant_slot: usize = structs.penum_variant_start[ctor_enum_index.usize()] + ctor_tag.usize()
+                        # `Shape.Rect(4, 5)` — a MULTI-FIELD variant: build the field tuple and
+                        # store it at the payload pointer (stage0's `store {i64,i64} …`).
+                        if structs.penum_field_type_count[ctor_variant_slot] > 1:
+                            null return if arguments.count != structs.penum_field_type_count[ctor_variant_slot]
+                            multi_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: ctor_enum_index.u32()}
+                            multi_llvm: LLVMTypeRef = llvm_type_of(multi_type, structs, ctx)
+                            multi_slot_alloca: LLVMValueRef = LLVMBuildAlloca(builder, multi_llvm, "enum.ctor")
+                            _ = LLVMBuildStore(builder, LLVMConstNull(multi_llvm), multi_slot_alloca)
+                            multi_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, multi_llvm, multi_slot_alloca, 0, "enum.tag.ptr")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), ctor_tag.u64(), 0), multi_tag_pointer)
+                            multi_tuple_llvm: LLVMTypeRef = penum_field_tuple_type(ctor_variant_slot, structs, ctx)
+                            multi_field_start: usize = structs.penum_field_type_start[ctor_variant_slot]
+                            # Stored field-by-field THROUGH the payload pointer rather than
+                            # built with InsertValue: an ARRAY field's value cannot be inserted
+                            # into the tuple, so `Note(text: i64, extra: i64[2])` declined its
+                            # constructor (and, since a declined constructor leaves a dangling
+                            # call, every program that used it). The struct-literal emitter
+                            # already stores its fields this way for the same reason.
+                            multi_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, multi_llvm, multi_slot_alloca, 1, "enum.payload.ptr")
+                            multi_declined: mutable bool = false
+                            # LABELLED fields are reordered into declaration order.
+                            # `Shape.Rect(h: 5, w: 2)` was read POSITIONALLY, so the two
+                            # fields swapped and the program silently computed a different
+                            # answer (stage0 59, stage1 47) -- a wrong answer, not a decline,
+                            # because the constructor still emitted. The same reorder the
+                            # fn-typed call paths already do, over the variant's field names.
+                            for multi_index in 0..<arguments.count |multi_declined, multi_field_start, multi_payload_pointer, multi_tuple_llvm, arguments, argument_names, structs, local_scope, fns, generics, runtime, m, ctx, builder|:
+                                multi_field_type: ValueType = copied_type(structs.penum_field_types[multi_field_start + multi_index])
+                                multi_source: i64 = named_argument_index(argument_names, structs.penum_field_flat_names, multi_field_start, arguments.count, 0.usize(), multi_index)
+                                multi_declined <- true if multi_source < 0
+                                continue if multi_source < 0
+                                if emit_expression(arguments[multi_source.usize()], multi_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is multi_field_value:
+                                    _ = LLVMBuildStore(builder, multi_field_value, LLVMBuildStructGEP2(builder, multi_tuple_llvm, multi_payload_pointer, multi_index.u32(), "enum.field.ptr"))
+                                else:
+                                    multi_declined <- true
+                            null return if multi_declined
+                            return LLVMBuildLoad2(builder, multi_llvm, multi_slot_alloca, "enum.value")
+                        null return if arguments.count != 1
+                        ctor_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: ctor_enum_index.u32()}
+                        ctor_payload_type: ValueType = copied_type(structs.penum_payloads[structs.penum_variant_start[ctor_enum_index.usize()] + ctor_tag.usize()])
+                        null return if ctor_payload_type.kind == TypeKind.Unmodeled
+                        ctor_llvm: LLVMTypeRef = llvm_type_of(ctor_type, structs, ctx)
+                        ctor_slot: LLVMValueRef = LLVMBuildAlloca(builder, ctor_llvm, "enum.ctor")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(ctor_llvm), ctor_slot)
+                        ctor_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, ctor_llvm, ctor_slot, 0, "enum.tag.ptr")
+                        _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), ctor_tag.u64(), 0), ctor_tag_pointer)
+                        if emit_expression(arguments[0], ctor_payload_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ctor_payload_value:
+                            ctor_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, ctor_llvm, ctor_slot, 1, "enum.payload.ptr")
+                            _ = LLVMBuildStore(builder, ctor_payload_value, ctor_payload_pointer)
+                            return LLVMBuildLoad2(builder, ctor_llvm, ctor_slot, "enum.value")
+                        return null
+            return emit_call_receiver(callee, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)

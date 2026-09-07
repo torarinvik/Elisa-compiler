@@ -1,0 +1,241 @@
+# Stage1 backend — the struct REGISTRY lookups and the `Runtime` record the emitters thread
+# through every call: the runtime entry points, their LLVM types, and the per-function state
+# that travels with them. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        # An EXACT (owner, name) lookup. "" is the top-level owner.
+        def struct_index_of_in(structs: mutable StructTable&, owner: sview, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<structs.names.count |structs, name, owner|:
+                if structs.names[index] == name and struct_owner_at(structs, index) == owner:
+                    return index.i64()
+            return -1
+
+
+
+
+        # The owner recorded for row `index`. Reads defensively rather than indexing
+        # blind: `owners` is index-parallel with `names`, and a registration site that
+        # forgot to grow it would otherwise be an out-of-bounds read rather than a
+        # missing owner. Every site does grow it; this is what makes that checkable.
+        def struct_owner_at(structs: mutable StructTable&, index: usize) -> sview can[Abort.Panic]:
+            return "" if index >= structs.owners.count
+            return structs.owners[index]
+
+
+
+
+        # The registry index of struct `name`, or -1.
+        #
+        # Resolved the way a name written at a use site means: the ENCLOSING module first,
+        # then a top-level struct, and only then any module's -- which is what a bare name
+        # outside every module used to mean and stays meaning, so nothing that compiled
+        # before declines now.
+        def struct_index_of(structs: mutable StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            if structs.current_owner != "":
+                owned: i64 = struct_index_of_in(structs, structs.current_owner, name)
+                owned return if owned >= 0
+            top_level: i64 = struct_index_of_in(structs, "", name)
+            top_level return if top_level >= 0
+            for index in 0..<structs.names.count |structs, name|:
+                index.i64() return if structs.names[index] == name
+            return -1
+
+
+
+
+        # The position of `field` within struct `struct_index`, or -1. This IS the LLVM
+        # element index: fields are emitted in declaration order.
+        def field_index_of(structs: mutable StructTable&, struct_index: usize, field: sview) -> i64 can[Abort.Panic]:
+            for offset in 0..<structs.field_count[struct_index] |structs, struct_index, field|:
+                offset.i64() return if structs.field_names[structs.field_start[struct_index] + offset] == field
+            return -1
+
+
+
+
+        # The runtime entry points a darray needs, plus the current function's auto
+        # region. Declared once per module and threaded down, because `push` can appear
+        # anywhere an expression can.
+        #
+        # `arena` is the function's AUTO REGION: stage0 gives every function one, zeroed,
+        # with strategy 2 (lazy), and `arena_free`s it on every return path. That is the
+        # first real piece of Elisa's region model in this backend — container backing
+        # lives in a region, not in malloc.
+        struct Runtime:
+            disjoint_param_slots: mutable darray[LLVMValueRef]
+            disjoint_param_indices: mutable darray[u32]
+            disjoint_element_ptrs: mutable darray[LLVMValueRef]
+            disjoint_element_indices: mutable darray[u32]
+            # Active per-function disjoint scope state. The slot arrays are rebuilt for
+            # each body so element GEPs can be associated with their source parameter.
+            disjoint_function_name: mutable sview
+            # `arena` is the current allocation region. `caller_arena` is the hidden
+            # caller-owned region used by by-reference container parameters. A function can
+            # need both at once: local scratch containers belong to `arena`, while mutations
+            # of `mutable darray&`/container-struct parameters must grow in `caller_arena`.
+            arena: mutable LLVMValueRef
+            caller_arena: mutable LLVMValueRef
+            # Complete hidden-region mapping. The scalar caller_arena view is only the first
+            # slot; multi-owner functions need the distinct arena for each forwarded reference.
+            caller_arenas: mutable darray[LLVMValueRef]
+            arena_alloc: LLVMValueRef
+            arena_realloc: LLVMValueRef
+            arena_free: LLVMValueRef
+            arena_alloc_type: LLVMTypeRef
+            arena_realloc_type: LLVMTypeRef
+            arena_free_type: LLVMTypeRef
+            # `region r(4096):` — a region with an explicit CAPACITY gets its backing up
+            # front from the runtime (`call ptr @new_region_backend(i64 4096, i64 0)`)
+            # instead of the lazy strategy an auto region uses.
+            new_region_backend: LLVMValueRef
+            new_region_backend_type: LLVMTypeRef
+            # The AoS store's runtime entry points. The store is RUNTIME-CALL based rather
+            # than open-coded, which is why porting it is declaring these and calling them.
+            packed_state_new: LLVMValueRef
+            packed_state_new_type: LLVMTypeRef
+            packed_state_new_side: LLVMValueRef
+            packed_state_new_side_type: LLVMTypeRef
+            packed_alloc: LLVMValueRef
+            packed_alloc_type: LLVMTypeRef
+            packed_alloc_result_type: LLVMTypeRef
+            packed_read_tag: LLVMValueRef
+            packed_read_tag_type: LLVMTypeRef
+            packed_read_word: LLVMValueRef
+            packed_read_word_type: LLVMTypeRef
+            packed_record_prefix: LLVMValueRef
+            packed_record_prefix_type: LLVMTypeRef
+            packed_record_side_words: LLVMValueRef
+            packed_record_side_words_type: LLVMTypeRef
+            packed_read_side_word: LLVMValueRef
+            packed_read_side_word_type: LLVMTypeRef
+            # The store an `in store:` block made ACTIVE, and which packed enum it stores
+            # (-1 = none). Threaded on Runtime for the same reason `arena` is: a packed
+            # constructor names no store, it uses whichever one is in scope. stage0 is
+            # explicit that this is required, not implicit -- "packed enum constructor
+            # Node.Leaf requires an active in Node.Store: scope".
+            active_store: mutable LLVMValueRef
+            active_store_enum: mutable i64
+            # When the current function returns an error union: the leading `ptr` out-param
+            # (the T value is stored through it) and a flag. A `return x` then stores x to
+            # the out-param and returns `i32 0`; a `raise` returns `i32 (ordinal + 1)`.
+            error_out: mutable LLVMValueRef
+            # `cstr == cstr` / `!=` lower to `ctx_streq(a, b)` (i64, nonzero = equal), the
+            # same content comparison stage0 emits — NOT a pointer compare.
+            streq: LLVMValueRef
+            streq_type: LLVMTypeRef
+            # `sview == sview` / `!=` lower to `ctx_string_views_eq(a, b)` (i64, nonzero =
+            # equal), taking two `%StringView` values BY VALUE.
+            sview_eq: LLVMValueRef
+            sview_eq_type: LLVMTypeRef
+            # `sview[i]` lowers to `ctx_string_view_index(sv, i)` (i64 byte), the view passed
+            # BY VALUE.
+            sview_index: LLVMValueRef
+            sview_index_type: LLVMTypeRef
+            # DWARF. A variable DIE only reaches the object when a DECLARE record ties it to
+            # its storage, so these must be available AT the alloca -- carried on Runtime
+            # (already threaded everywhere) rather than in a separate later pass.
+            # `debug_active` is false for a `-g`-less build, where every declare is skipped.
+            debug_builder: mutable LLVMDIBuilderRef
+            debug_file: mutable LLVMMetadataRef
+            # Optional stage0-compatible execution trace hook. The runtime owns the ring
+            # buffer; the backend only supplies the current function and source line.
+            trace_record: LLVMValueRef
+            trace_record_type: LLVMTypeRef
+            trace_record_value: LLVMValueRef
+            trace_record_value_type: LLVMTypeRef
+            trace_name: mutable LLVMValueRef
+            # The stage0 trace runtime installs the optional SIGSEGV/SIGBUS referee
+            # lazily. The backend calls its idempotent entry point when trace emission is
+            # enabled so fault-time records use the same ring as ordinary steps.
+            trace_fault_install: LLVMValueRef
+            trace_fault_install_type: LLVMTypeRef
+            disjoint_function_mask: mutable u64
+            packed_mode: i32
+            # True when active_store came from a REAL store (an `in store:` block, a store
+            # PARAMETER, a `new[store]` selector, a match/is scrutinee). False for the
+            # SYNTHETIC store installed at main's entry, which holds no nodes -- a
+            # common-field read that trusted it answered from an empty store (`frozen[1]`
+            # bound to a local then read gave 2 where stage0 says 6).
+            active_store_is_block: mutable bool
+            # Source declaration line of the body currently being emitted. Region selectors
+            # such as `new[r]` are resolved against this line's `@r` metadata rather than by a
+            # global bare-name lookup.
+            function_line: mutable u32 = 0
+            # False when `arena` is the CALLER's, handed over as the implicit trailing
+            # parameter. Freeing it then would destroy a region this function does not own
+            # and the caller is still using -- so every arena_free is gated on this.
+            owns_arena: mutable bool
+            fast_math: mutable bool
+            force_bounds_check: bool
+            in_error_fn: mutable bool
+            # The enclosing error function's declaration LINE, so `raise` can look up WHICH
+            # error set it must build. Meaningful only while in_error_fn.
+            error_fn_line: mutable u32 = 0
+            # First-class fallible lambdas do not have a declaration line in the function
+            # table. Carry their concrete error-family selector directly so their `raise`
+            # and implicit-success returns use the same ABI as named error functions.
+            error_fn_family: mutable sview = ""
+            # The enclosing function's declared RETURN type. The expression emitters have no
+            # statement context (no loops/regions/return_type), so a form that has to emit a
+            # `return` from inside an expression — a `catch` arm that terminates rather than
+            # yielding — had no type to emit the returned value at. Defaulted, so a partial
+            # Runtime literal stays valid.
+            fn_return_type: mutable ValueType = unmodeled_type()
+            # A source-level `void main` is still void in the Elisa type system, but the
+            # externally visible C entry point must return an explicit i32 status. Keeping
+            # this ABI fact in the per-function runtime lets every return path (including
+            # `return helper()` and fall-through) emit the same deterministic zero value.
+            main_returns_status: mutable bool
+            debug_active: mutable bool
+            trace_enabled: mutable bool
+
+
+
+
+        # LLVM function and aggregate types shared by the runtime declarations. Keeping
+        # this ABI construction separate from the Runtime value assembly makes the
+        # self-hosted backend's declaration pass small enough to lower independently.
+        struct RuntimeTypes:
+            pointer: LLVMTypeRef
+            alloc: LLVMTypeRef
+            realloc: LLVMTypeRef
+            free: LLVMTypeRef
+            backend: LLVMTypeRef
+            state_new: LLVMTypeRef
+            alloc_result: LLVMTypeRef
+            packed_alloc: LLVMTypeRef
+            read_tag: LLVMTypeRef
+            read_word: LLVMTypeRef
+            record_prefix: LLVMTypeRef
+            state_new_side: LLVMTypeRef
+            record_side_words: LLVMTypeRef
+            read_side_word: LLVMTypeRef
+            streq: LLVMTypeRef
+            sview: LLVMTypeRef
+            sview_eq: LLVMTypeRef
+            sview_index: LLVMTypeRef
+            trace: LLVMTypeRef
+            trace_value: LLVMTypeRef
+            trace_fault_install: LLVMTypeRef
+
+
+
+
+        struct RuntimeCoreTypes:
+            pointer: LLVMTypeRef
+            alloc: LLVMTypeRef
+            realloc: LLVMTypeRef
+            free: LLVMTypeRef
+            backend: LLVMTypeRef
+            state_new: LLVMTypeRef
+            alloc_result: LLVMTypeRef
+            packed_alloc: LLVMTypeRef
+            read_tag: LLVMTypeRef
+            read_word: LLVMTypeRef
+            record_prefix: LLVMTypeRef
+            state_new_side: LLVMTypeRef
+            record_side_words: LLVMTypeRef
+            read_side_word: LLVMTypeRef

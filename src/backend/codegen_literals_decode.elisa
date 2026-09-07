@@ -1,0 +1,196 @@
+# Stage1 backend — decoding SOURCE LITERALS: string escapes to bytes, a codepoint to UTF-8, the
+# quote-inclusive span a string PATTERN arrives as, and the LLVM symbol a qualified name is
+# emitted under. Part of `module Backend` (see codegen.elisa).
+
+using Ast
+
+extend Backend:
+    private:
+        # LLVM-C takes NUL-terminated `const char*`, but an `sview` is a (ptr, len) view
+        # into the source buffer with no terminator — taking `&view[0]` would hand LLVM a
+        # string that runs to the end of the FILE. Copy the bytes and terminate.
+        # `storage` is caller-owned on purpose: the returned pointer aliases it, so it
+        # must outlive the LLVM call that consumes the name.
+        def sview_to_cstr(name: sview, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<sview_len(name) |storage|:
+                storage.push(sview_at(name, index))
+            storage.push(0)
+            return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+
+        # Decode a string literal's source escapes into `storage`.
+        #
+        # The LEXER deliberately leaves escapes undecoded (tokens.elisa: the token's interior is
+        # "escapes and `{EXPR}` spans undecoded"), so the BACKEND owns this. stage1 did not do
+        # it at all, and every literal reached LLVM with its backslashes intact: a diagnostic
+        # written `f"… \"{name}\" …"` rendered as `\"__rg_state\"` where stage0 renders
+        # `"__rg_state"`.
+        #
+        # The set is stage0's, verified against it byte by byte: \n \t \r \0, and \\ \" \'
+        # which stand for themselves. An UNRECOGNISED escape is left exactly as written (both
+        # bytes) and clears `all_known`, so a caller that must not guess — the match-pattern
+        # path — can still decline rather than risk a mis-encoded compare.
+        # -1 for a non-hex byte, so a malformed escape can be detected rather than folded
+        # into a wrong value.
+        def hex_digit_value(byte: u8) -> i64:
+            return (byte - 48.u8()).i64() if byte >= 48.u8() and byte <= 57.u8() else ((byte - 97.u8()).i64() + 10 if byte >= 97.u8() and byte <= 102.u8() else ((byte - 65.u8()).i64() + 10 if byte >= 65.u8() and byte <= 70.u8() else -1))
+
+
+
+        # A codepoint as UTF-8. `\uXXXX` tops out at U+FFFF, so three bytes is the widest
+        # this can produce.
+        def push_utf8(storage: mutable darray[u8]&, codepoint: i64) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                if codepoint < 128:
+                    storage.push(codepoint.u8())
+                    return
+                if codepoint < 2048:
+                    storage.push((192 + (codepoint / 64)).u8())
+                    storage.push((128 + (codepoint % 64)).u8())
+                    return
+                storage.push((224 + (codepoint / 4096)).u8())
+                storage.push((128 + ((codepoint / 64) % 64)).u8())
+                storage.push((128 + (codepoint % 64)).u8())
+
+
+
+        def decode_string_escapes(text: sview, storage: mutable darray[u8]&, all_known: mutable bool&) -> void can[Abort.Panic, Memory.Allocate]:
+            all_known <- true
+            length: usize = sview_len(text)
+            index: mutable usize = 0
+            while index < length |index, storage, all_known|:
+                byte: u8 = sview_at(text, index)
+                # A trailing lone backslash is not an escape; keep it verbatim.
+                if byte != 92 or index + 1.usize() >= length:
+                    storage.push(byte)
+                    index <- index + 1.usize()
+                    continue
+                next_byte: u8 = sview_at(text, index + 1.usize())
+                # `\xHH` is one byte; `\uXXXX` is the codepoint's UTF-8 bytes. Neither was
+                # decoded, so the SOURCE TEXT survived verbatim -- `"\x41\x42"` was eight
+                # characters rather than "AB". That is a SILENT WRONG ANSWER, not a decline:
+                # the program compiles and the two compilers are simply fed different bytes.
+                # Caught by the differential corpus as the only MISMATCH in 145 programs
+                # (stage0=4, stage1=14); see repro/nw_json_hex_escape_literal_stage1.elisa.
+                if next_byte == 120 or next_byte == 117:
+                    hex_digits: usize = 2.usize() if next_byte == 120 else 4.usize()
+                    hex_value: mutable i64 = 0
+                    hex_ok: mutable bool = index + 2.usize() + hex_digits <= length
+                    hex_index: mutable usize = 0
+                    while hex_index < hex_digits and hex_ok |hex_index, hex_value, hex_ok, text, index, hex_digits|:
+                        hex_at: i64 = hex_digit_value(sview_at(text, index + 2.usize() + hex_index))
+                        hex_ok <- false if hex_at < 0
+                        hex_value <- hex_value * 16 + hex_at if hex_at >= 0
+                        hex_index <- hex_index + 1.usize()
+                    if hex_ok:
+                        push_utf8(storage, hex_value) if next_byte == 117
+                        storage.push(hex_value.u8()) if next_byte == 120
+                        index <- index + 2.usize() + hex_digits
+                        continue
+                    # Malformed: keep it verbatim and say so, rather than guess a value.
+                    all_known <- false
+                    storage.push(byte)
+                    index <- index + 1.usize()
+                    continue
+                known: bool = next_byte == 110 or next_byte == 116 or next_byte == 114 or next_byte == 48 or next_byte == 92 or next_byte == 34 or next_byte == 39
+                if not known:
+                    all_known <- false
+                    storage.push(byte)
+                    index <- index + 1.usize()
+                    continue
+                # `\\`, `\"` and `\'` stand for themselves; the rest are control codes.
+                decoded: u8 = when next_byte:
+                    110 -> 10
+                    116 -> 9
+                    114 -> 13
+                    48 -> 0
+                    _ -> next_byte
+                storage.push(decoded)
+                index <- index + 2.usize()
+
+
+
+
+        # A literal's decoded bytes as a NUL-terminated cstr. The transient-buffer contract is
+        # the same as sview_to_cstr's: LLVM copies the name/contents, so `storage` may die.
+        def decoded_literal_cstr(text: sview, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate:
+                escapes_known: mutable bool = true
+                decode_string_escapes(text, storage, escapes_known)
+                storage.push(0)
+                return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+
+
+            # The INNER bytes of a string-literal pattern span, which arrives quote-INCLUSIVE
+            # (`"yes"`) because a pattern literal keeps its raw source text. Strips the surrounding
+            # double quotes and returns a NUL-terminated cstr of the content. Declines (null) on a
+            # backslash: escape decoding would have to match stage0's exactly, so a `"a\n"` pattern
+            # is left to decline rather than risk a mis-encoded compare.
+        def string_pattern_content_cstr(text: sview, storage: mutable darray[u8]&) -> cstr? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate:
+                length: usize = sview_len(text)
+                # An EMPTY span is the content of a `""` pattern — a legitimate pattern that matches
+                # only the empty string, not a decoding failure. Rejecting it dropped every function
+                # with a `match s: "": …` arm (semantic_api_message's diagnostic builders test
+                # `diagnostic.actual` against "" throughout). Falling through is safe: `quoted` needs
+                # length >= 2 so there is no underflow, the copy loop runs zero times, and the result
+                # is the NUL-only cstr, which ctx_string_views_eq matches against an empty sview
+                # exactly. A backslash still declines below.
+                # The span may or may not include the surrounding double quotes depending on how
+                # the pattern lexer captured it; strip a matched pair when present.
+                quoted: bool = length >= 2 and sview_at(text, 0) == 34 and sview_at(text, length - 1) == 34
+                start: usize = 1 if quoted else 0
+                stop: usize = length - 1 if quoted else length
+                # A backslash used to decline outright. It no longer has to: decode_string_escapes
+                # is the SAME decoder the literal-emission path uses, so a `"a\nb"` pattern is
+                # compared against exactly the bytes an `"a\nb"` value carries. An escape the
+                # decoder does not recognise still declines — matching against a guess would be a
+                # silent wrong answer, and declining is loud.
+                inner: sview = text[start:stop]
+                escapes_known: mutable bool = true
+                decode_string_escapes(inner, storage, escapes_known)
+                null return if not escapes_known
+                storage.push(0)
+                return (&storage[0]).cast[cstr] can Unsafe.PointerCast
+
+
+
+
+            # The i1 "this sview equals that string-literal pattern" test, or null when the
+            # literal cannot be decoded (see string_pattern_content_cstr). Shared by the plain
+            # literal arm and the `"a" | "b"` alternation arm, which ORs several of these — the
+            # comparison is a pure call, so emitting them all in one block is sound.
+        def sview_literal_hit(pattern_text: sview, scrutinee_raw: LLVMValueRef, scrutinee_type: ValueType, structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            pattern_storage: mutable darray[u8] = []
+            if string_pattern_content_cstr(pattern_text, pattern_storage) is pattern_cstr:
+                pattern_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, pattern_cstr, "svpat")
+                literal_type: LLVMTypeRef = llvm_type_of(scrutinee_type, structs, ctx)
+                literal_undef: LLVMValueRef = LLVMGetUndef(literal_type)
+                literal_with_ptr: LLVMValueRef = LLVMBuildInsertValue(builder, literal_undef, pattern_global, 0, "svpat.ptr")
+                literal_len: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), (pattern_storage.count - 1).u64(), 0)
+                literal_value: LLVMValueRef = LLVMBuildInsertValue(builder, literal_with_ptr, literal_len, 1, "svpat.len")
+                eq_args: mutable darray[LLVMValueRef] = [scrutinee_raw, literal_value]
+                eq_pointer: void& = (&eq_args[0]).cast[void&] can Unsafe.PointerCast
+                eq_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, eq_pointer, 2, "match.sview.eq")
+                return LLVMBuildICmp(builder, 33, eq_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "match.sview.hit")
+            return null
+
+
+
+
+        # The LLVM SYMBOL name for `owner::name`: stage0 emits `module M: def get()` as
+        # `define i64 @M.get` — DOT-separated, even though the call spelling is `M::get()`.
+        # An empty owner is a top-level function and keeps its bare name.
+        def qualified_name_cstr(owner: sview, name: sview, storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                sview_to_cstr(name, storage) return if sview_len(owner) == 0
+                for index in 0..<sview_len(owner) |storage|:
+                    storage.push(sview_at(owner, index))
+                storage.push(46)
+                for index in 0..<sview_len(name) |storage|:
+                    storage.push(sview_at(name, index))
+                storage.push(0)
+                return (&storage[0]).cast[cstr]

@@ -1,0 +1,273 @@
+# Stage1 backend — the assignment forms whose VALUE decides the lowering: `xs <- xs.push(v)` and
+# its dict twin (rewritten to mutate the receiver in place rather than rebuild it), a reborrow
+# through a reference, and the compound operators (`+=`, `-=` …).
+# Called from codegen_stmt_assign_flow.elisa; `matched` reports which happened.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_assign_container_and_compound(assign_target: Expr, assign_operator: TokenKind, assign_value: Expr, assign_line: Ast::Pos, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, matched: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            matched <- true
+            if assign_value is Expr.Call(push_assign_callee, push_assign_args, push_assign_arg_names, push_assign_line):
+                if push_assign_callee is Expr.Field(push_assign_object, push_assign_method, push_assign_method_line):
+                    if push_assign_method == "push" and push_assign_args.count == 1:
+                        push_assign_type: ValueType = darray_type_behind_expr(push_assign_object, local_scope, structs)
+                        if push_assign_type.kind == TypeKind.DArray:
+                            if darray_address_of_expr(push_assign_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is push_assign_slot:
+                                # Growth comes from the arena the container was DECLARED
+                                # under, not the ambient one (see growth_arena_for).
+                                push_assign_growth: Runtime = growth_runtime_for(push_assign_object, local_scope, runtime)
+                                if emit_darray_push(push_assign_slot, push_assign_type, push_assign_args[0], local_scope, fns, structs, generics, push_assign_growth, m, ctx, builder):
+                                    return EmitStatus.Open
+                            return EmitStatus.Declined
+                    # `xs <- xs.truncate(n)` — same in-place pattern as push-assign; used by
+                    # lexer pop_indent / trim_finished_grouped_block_contexts (docs/120 §10
+                    # wants the reassignment form on `lmut` paths).
+                    if push_assign_method == "truncate" and push_assign_args.count == 1:
+                        trunc_assign_type: ValueType = darray_type_behind_expr(push_assign_object, local_scope, structs)
+                        if trunc_assign_type.kind == TypeKind.DArray:
+                            if darray_address_of_expr(push_assign_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is trunc_assign_slot:
+                                trunc_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                if emit_expression(push_assign_args[0], ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is trunc_n:
+                                    trunc_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                    trunc_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, trunc_header, trunc_assign_slot, 1, "trunc.assign.cnt.ptr")
+                                    trunc_count: LLVMValueRef = LLVMBuildLoad2(builder, trunc_i64, trunc_count_ptr, "trunc.assign.cnt")
+                                    trunc_smaller: LLVMValueRef = LLVMBuildICmp(builder, 36, trunc_n, trunc_count, "trunc.assign.lt")
+                                    trunc_new: LLVMValueRef = LLVMBuildSelect(builder, trunc_smaller, trunc_n, trunc_count, "trunc.assign.new")
+                                    _ = LLVMBuildStore(builder, trunc_new, trunc_count_ptr)
+                                    return EmitStatus.Open
+                            return EmitStatus.Declined
+                    # `xs <- xs.resize(n)` / `xs <- xs.clear()` — the same in-place
+                    # reassignment shape as push/truncate above, and the two the darray
+                    # method set was still missing it for. Both mutate through the
+                    # receiver and return it for chaining, so the form is a mutation with
+                    # no store.
+                    #
+                    # emit_expression models neither, so both DECLINED — and one decline
+                    # anywhere kills every function in the unit (the emitted_count guard
+                    # in elisac.elisa), which is how a single `pile <- pile.resize(n)` in
+                    # the project system took the whole driver down. stage0 compiles both.
+                    #
+                    # Delegate to the STATEMENT emitter rather than duplicate its
+                    # lowering, exactly as the `_ = xs.resize(n)` discard path above does.
+                    #
+                    # same_assign_place is the guard push/truncate lack: without it
+                    # `xs <- ys.resize(n)` would resize `ys`, store nothing, and leave
+                    # `xs` stale — a silent wrong answer rather than a decline.
+                    if push_assign_method == "resize" or push_assign_method == "clear":
+                        if same_assign_place(assign_target, push_assign_object):
+                            resize_assign_type: ValueType = darray_type_behind_expr(push_assign_object, local_scope, structs)
+                            if resize_assign_type.kind == TypeKind.DArray:
+                                resize_assign_handled: mutable bool = false
+                                resize_assign_status: EmitStatus = emit_statement_blocks_exprs((Stmt.Expr(assign_value, assign_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, &resize_assign_handled)
+                                resize_assign_status return if resize_assign_handled
+            # `d <- d.put(k, v)` — the DICT analogue of push-assign above. The helper
+            # mutates the map through the receiver's address and returns a ref to the
+            # ELEMENT, so the reassignment form must emit the call and store NOTHING.
+            # Storing the result put a pointer into the middle of the bucket array where
+            # the header's `items` belongs: capacity still said 64 while the array behind
+            # `items` was short by that offset, and the next probe walked off the end of
+            # the block. That is what crashed the stage1-built semantic analyzer —
+            # `table.name_primary <- table.name_primary.put(hash, name)` in
+            # Semantic.index_name.
+            #
+            # The receiver must BE the assignment target: `found <- d.remove(k)` is an
+            # ordinary assignment of a bool and must keep its store.
+            if assign_value is Expr.Call(dict_assign_callee, dict_assign_args, dict_assign_arg_names, dict_assign_line):
+                match dict_assign_callee:
+                    Expr.Field(dict_assign_recv, dict_assign_method, dict_assign_method_line):
+                        dict_assign_base: sview = container_receiver_base(dict_assign_recv, local_scope, fns, structs, generics)
+                        if container_method_mutates_in_place(dict_assign_base, dict_assign_method) and same_assign_place(assign_target, dict_assign_recv):
+                            dict_assign_type_args: darray[ValueType] = dict_type_args_of(dict_assign_recv, local_scope, fns, structs, generics)
+                            if dict_assign_type_args.count != 0:
+                                dict_assign_helper: sview = resolved_container_helper(dict_assign_base, dict_assign_method, generics)
+                                EmitStatus.Declined return if sview_len(dict_assign_helper) == 0
+                                dict_assign_leading: bool = container_method_is_mutating(dict_assign_base, dict_assign_method)
+                                if emit_dict_method_call(dict_assign_helper, dict_assign_type_args, dict_assign_recv, dict_assign_args, dict_assign_leading, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dict_assign_result:
+                                    _ = dict_assign_result
+                                    return EmitStatus.Open
+                                return EmitStatus.Declined
+                    _:
+                        pass
+            # `PLACE as & <- value` — a REBORROW-ASSIGN to an optional-REFERENCE field
+            # (`arena: mutable Arena&?`): store `value` (a pointer) as the PRESENT payload.
+            # Parsed as an `as`-Binary target; the `&` leaf is the reinterpret marker. The
+            # std dict binds `m.arena as & <- owner` to adopt its backing region.
+            if assign_target is Expr.Binary(reborrow_place, reborrow_operator, reborrow_leaf, reborrow_line):
+                if reborrow_operator == TokenKind.As and assign_operator == TokenKind.LArrow:
+                    # `buffer as ! <- (sfree_bytes(buffer))` — the LINEAR-consume spelling,
+                    # whose place is a bare LOCAL rather than a field chain. stage0 lowers
+                    # the whole form to a PLAIN STORE into the local's slot (read from its
+                    # IR: `%c = call ptr @sfree_bytes(...)` then `store ptr %c, ptr %buffer`)
+                    # — `as !` is a linear-typing annotation with no codegen of its own.
+                    #
+                    # The branch below resolves its address through struct_chain_address,
+                    # which wants a field chain, so a bare local declined and took the whole
+                    # `defer block:` (and the function) with it.
+                    match reborrow_place:
+                        Expr.Ident(reborrow_local_name, reborrow_local_line):
+                            if lookup_slot(local_scope, reborrow_local_name) is reborrow_local_slot:
+                                reborrow_local_type: ValueType = lookup_type(local_scope, reborrow_local_name)
+                                if reborrow_local_type.kind != TypeKind.Unmodeled:
+                                    if emit_expression(assign_value, reborrow_local_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is reborrow_local_value:
+                                        _ = LLVMBuildStore(builder, reborrow_local_value, reborrow_local_slot)
+                                        return EmitStatus.Open
+                                    return EmitStatus.Declined
+                        _:
+                            pass
+                    reborrow_type: ValueType = struct_chain_type(reborrow_place, local_scope, structs)
+                    # A PLAIN pointer field takes the same spelling with no tag to set:
+                    # `out.items as & <- buf` installs a freshly allocated buffer into a
+                    # `dstr` (which IS a `darray[u8]`, so `.items` is a bare `u8&`).
+                    # Only the optional form was handled, so ctx_fstr_alloc declined.
+                    if reborrow_type.kind == TypeKind.Ref:
+                        if struct_chain_address(reborrow_place, local_scope, fns, structs, generics, runtime, m, ctx, builder) is plain_reborrow_address:
+                            if emit_expression(assign_value, reborrow_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is plain_reborrow_value:
+                                _ = LLVMBuildStore(builder, plain_reborrow_value, plain_reborrow_address)
+                                return EmitStatus.Open
+                        return EmitStatus.Declined
+                    EmitStatus.Declined return if reborrow_type.kind != TypeKind.Optional
+                    reborrow_payload: ValueType = optional_payload_of(reborrow_type, structs)
+                    EmitStatus.Declined return if reborrow_payload.kind != TypeKind.Ref
+                    if struct_chain_address(reborrow_place, local_scope, fns, structs, generics, runtime, m, ctx, builder) is reborrow_address:
+                        reborrow_llvm: LLVMTypeRef = llvm_type_of(reborrow_type, structs, ctx)
+                        if emit_expression(assign_value, reborrow_payload, local_scope, fns, structs, generics, runtime, m, ctx, builder) is reborrow_value:
+                            # A NICHE optional has no tag field to set and no payload
+                            # field to GEP — the pointer IS the optional, so the store
+                            # goes straight to the field address.
+                            if optional_is_niche(reborrow_type, structs):
+                                _ = LLVMBuildStore(builder, reborrow_value, reborrow_address)
+                                return EmitStatus.Open
+                            reborrow_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, reborrow_llvm, reborrow_address, 0, "reborrow.tag.ptr")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), reborrow_tag_pointer)
+                            reborrow_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, reborrow_llvm, reborrow_address, 1, "reborrow.value.ptr")
+                            _ = LLVMBuildStore(builder, reborrow_value, reborrow_payload_pointer)
+                            return EmitStatus.Open
+                    return EmitStatus.Declined
+            # `x op= v` is exactly `x <- x op v`: load, apply, store.
+            compound: TokenKind = compound_operator_of(assign_operator)
+            if compound != TokenKind.Eof:
+                if assign_target is Expr.Ident(compound_name, compound_name_line):
+                    if lookup_slot(local_scope, compound_name) is compound_slot:
+                        target_type: ValueType = lookup_type(local_scope, compound_name)
+                        # stage0 categorically rejects `x op= v` for a struct target
+                        # ("augmented assignment requires numeric operands") -- no
+                        # protocol dispatch exists for compound-assignment operators,
+                        # only for the plain binary form. emit_binary below assumes a
+                        # scalar LLVM value; feeding it a struct aggregate crashes
+                        # (emit_checked_int_binary misuses the overflow intrinsic on a
+                        # non-integer type) instead of declining like stage0 does.
+                        EmitStatus.Declined return if target_type.kind == TypeKind.Struct
+                        if emit_expression(assign_value, target_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is operand:
+                            current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(target_type, structs, ctx), compound_slot, "aug.load")
+                            if emit_binary(compound, current, operand, target_type, structs, runtime.fast_math, m, ctx, builder) is combined:
+                                _ = LLVMBuildStore(builder, combined, compound_slot)
+                                return EmitStatus.Open
+                # `p.x op= v` -- same load/apply/store shape as the plain-Ident case
+                # above, but the slot is a struct FIELD address rather than a local.
+                # Reuses the same receiver resolution (ref/optional field, nested
+                # chain) as the `p.x <- v` field-assignment path below.
+                if assign_target is Expr.Field(compound_object, compound_field, compound_field_line):
+                    compound_struct_type: mutable ValueType = struct_chain_type(compound_object, local_scope, structs)
+                    compound_struct_type <- expression_type(compound_object, local_scope, fns, structs, generics) if compound_struct_type.kind == TypeKind.Unmodeled
+                    compound_struct_type <- ref_target_of(compound_struct_type, structs) if compound_struct_type.kind == TypeKind.Ref
+                    if compound_struct_type.kind == TypeKind.Struct:
+                        compound_struct_slot: usize = compound_struct_type.bits.usize()
+                        compound_field_position: i64 = field_index_of(structs, compound_struct_slot, compound_field)
+                        if compound_field_position >= 0:
+                            compound_field_type: ValueType = structs.field_types[structs.field_start[compound_struct_slot] + compound_field_position.usize()]
+                            # Same restriction as the plain-Ident case: no protocol
+                            # dispatch for compound-assign, so a struct-typed field
+                            # declines rather than reaching the scalar-only emit_binary.
+                            if compound_field_type.kind != TypeKind.Struct:
+                                if struct_chain_address(compound_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_address:
+                                    compound_recv_declared: ValueType = struct_chain_type(compound_object, local_scope, structs)
+                                    compound_recv_is_field: mutable bool = false
+                                    match compound_object:
+                                        Expr.Field(compound_recv_head, compound_recv_name, compound_recv_line):
+                                            compound_recv_is_field <- true
+                                        _:
+                                            pass
+                                    compound_base: mutable LLVMValueRef = compound_address
+                                    if compound_recv_is_field and compound_recv_declared.kind == TypeKind.Ref:
+                                        compound_base <- LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), compound_address, "aug.recv.ref")
+                                    compound_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(compound_struct_type, structs, ctx), compound_base, compound_field_position.u32(), "aug.field.ptr")
+                                    if emit_expression(assign_value, compound_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_operand:
+                                        compound_current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(compound_field_type, structs, ctx), compound_field_pointer, "aug.field.load")
+                                        if emit_binary(compound, compound_current, compound_operand, compound_field_type, structs, runtime.fast_math, m, ctx, builder) is compound_combined:
+                                            _ = LLVMBuildStore(builder, compound_combined, compound_field_pointer)
+                                            return EmitStatus.Open
+                # `xs[i] op= v` -- same load/apply/store shape, element address
+                # computed ONCE and reused for both the load and the store (unlike
+                # `xs[i] <- v`, which only ever stores). Covers a local `darray[T]`,
+                # a local fixed `T[N]` array, a borrowed `darray[T]&` parameter, and
+                # a borrowed fixed `T[N]&` parameter (all mirror the corresponding
+                # branch of the plain-store path below).
+                if assign_target is Expr.Index(compound_array, compound_index, compound_index_line):
+                    match compound_array:
+                        Expr.Ident(compound_array_name, compound_array_ident_line):
+                            compound_array_type: ValueType = lookup_type(local_scope, compound_array_name)
+                            compound_borrowed_type: ValueType = darray_type_behind(local_scope, compound_array_name, structs)
+                            if compound_borrowed_type.kind == TypeKind.DArray and compound_array_type.kind == TypeKind.Ref:
+                                if darray_address_of(local_scope, compound_array_name, structs, ctx, builder) is compound_borrowed_slot:
+                                    if emit_darray_index_address(compound_borrowed_slot, compound_borrowed_type, compound_index, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_borrowed_pointer:
+                                        compound_borrowed_element: ValueType = darray_element_of(compound_borrowed_type, structs)
+                                        if compound_borrowed_element.kind != TypeKind.Struct:
+                                            if emit_expression(assign_value, compound_borrowed_element, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_borrowed_operand:
+                                                compound_borrowed_current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(compound_borrowed_element, structs, ctx), compound_borrowed_pointer, "aug.elem.load")
+                                                if emit_binary(compound, compound_borrowed_current, compound_borrowed_operand, compound_borrowed_element, structs, runtime.fast_math, m, ctx, builder) is compound_borrowed_combined:
+                                                    compound_borrowed_store: LLVMValueRef = LLVMBuildStore(builder, compound_borrowed_combined, compound_borrowed_pointer)
+                                                    tag_disjoint_darray_access(compound_borrowed_store, compound_borrowed_pointer, runtime, ctx)
+                                                    return EmitStatus.Open
+                            if lookup_slot(local_scope, compound_array_name) is compound_array_slot:
+                                if compound_array_type.kind == TypeKind.DArray:
+                                    if emit_darray_index_address(compound_array_slot, compound_array_type, compound_index, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_element_pointer:
+                                        compound_element_type: ValueType = darray_element_of(compound_array_type, structs)
+                                        if compound_element_type.kind != TypeKind.Struct:
+                                            if emit_expression(assign_value, compound_element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_index_operand:
+                                                compound_index_current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(compound_element_type, structs, ctx), compound_element_pointer, "aug.elem.load")
+                                                if emit_binary(compound, compound_index_current, compound_index_operand, compound_element_type, structs, runtime.fast_math, m, ctx, builder) is compound_index_combined:
+                                                    compound_index_store: LLVMValueRef = LLVMBuildStore(builder, compound_index_combined, compound_element_pointer)
+                                                    tag_disjoint_darray_access(compound_index_store, compound_element_pointer, runtime, ctx)
+                                                    return EmitStatus.Open
+                                elif compound_array_type.kind == TypeKind.Array:
+                                    if emit_index_address(compound_array_slot, compound_array_type, compound_index, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_element_pointer:
+                                        compound_element_type: ValueType = array_element_of(compound_array_type, structs)
+                                        if compound_element_type.kind != TypeKind.Struct:
+                                            if emit_expression(assign_value, compound_element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_index_operand:
+                                                compound_index_current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(compound_element_type, structs, ctx), compound_element_pointer, "aug.elem.load")
+                                                if emit_binary(compound, compound_index_current, compound_index_operand, compound_element_type, structs, runtime.fast_math, m, ctx, builder) is compound_index_combined:
+                                                    _ = LLVMBuildStore(builder, compound_index_combined, compound_element_pointer)
+                                                    return EmitStatus.Open
+                                elif compound_array_type.kind == TypeKind.Ref and ref_target_of(compound_array_type, structs).kind == TypeKind.Array:
+                                    compound_ref_array_type: ValueType = ref_target_of(compound_array_type, structs)
+                                    compound_ref_array_base: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), compound_array_slot, "aug.arr.ref.base")
+                                    if emit_index_address(compound_ref_array_base, compound_ref_array_type, compound_index, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_element_pointer:
+                                        compound_element_type: ValueType = array_element_of(compound_ref_array_type, structs)
+                                        if compound_element_type.kind != TypeKind.Struct:
+                                            if emit_expression(assign_value, compound_element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is compound_index_operand:
+                                                compound_index_current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(compound_element_type, structs, ctx), compound_element_pointer, "aug.elem.load")
+                                                if emit_binary(compound, compound_index_current, compound_index_operand, compound_element_type, structs, runtime.fast_math, m, ctx, builder) is compound_index_combined:
+                                                    _ = LLVMBuildStore(builder, compound_index_combined, compound_element_pointer)
+                                                    return EmitStatus.Open
+                        _:
+                            pass
+                # `m[i][j] op= v` -- a NESTED index chain, where neither the
+                # Ident-array branches above nor the Field branch match because the
+                # target's own object is itself an Index/Field expression. Falls back
+                # to the same generic chain resolver the plain-store path uses
+                # (struct_chain_type/struct_chain_address) for the element's type and
+                # address, then applies the same load/apply/store shape as every other
+                # compound-assign branch above.
+                chain_compound_type: ValueType = struct_chain_type(assign_target, local_scope, structs)
+                if chain_compound_type.kind != TypeKind.Unmodeled and chain_compound_type.kind != TypeKind.Struct:
+                    if struct_chain_address(assign_target, local_scope, fns, structs, generics, runtime, m, ctx, builder) is chain_compound_address:
+                        if emit_expression(assign_value, chain_compound_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is chain_compound_operand:
+                            chain_compound_current: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(chain_compound_type, structs, ctx), chain_compound_address, "aug.chain.load")
+                            if emit_binary(compound, chain_compound_current, chain_compound_operand, chain_compound_type, structs, runtime.fast_math, m, ctx, builder) is chain_compound_combined:
+                                _ = LLVMBuildStore(builder, chain_compound_combined, chain_compound_address)
+                                return EmitStatus.Open
+                return EmitStatus.Declined
+            # Bitset flag store: `t.flags.has_suffix <- true` (pack bit into u8).
+            matched <- false
+            return EmitStatus.Declined

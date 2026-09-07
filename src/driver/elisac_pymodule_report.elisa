@@ -1,0 +1,522 @@
+# `-emit pymodule` — the machine-readable Python interop MANIFEST, plus the renaming pass that
+# makes the generated C shim's local identifiers unique without touching member accesses or
+# longer identifiers that merely contain the same text.
+
+
+def pymodule_generated_matches_at(source: darray[u8]&, cursor: usize, needle: sview, needle_len: usize) -> bool can[Abort.Panic]:
+    return false if needle_len > source.count
+    return false if cursor > source.count - needle_len
+    for needle_index in 0..<needle_len |source, cursor, needle|:
+        return false if source[cursor + needle_index] != sview_at(needle, needle_index)
+    return true
+
+
+
+
+def pymodule_replace_generated(buffer: mutable darray[u8]&, needle: sview, replacement: sview) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    needle_len: usize = sview_len(needle)
+    return if needle_len == 0 or buffer.count == 0
+    # Most rewrite passes are feature-gated: a replacement often has no match in a
+    # particular module.  Do not allocate a full shadow copy just to discover that
+    # case; this was a needless peak-memory multiplier during large pymodule emits.
+    return if needle_len > buffer.count
+    probe: mutable usize = 0
+    found: mutable bool = false
+    while probe <= buffer.count - needle_len and not found |probe, found, buffer, needle, needle_len|:
+        found <- pymodule_generated_matches_at(buffer, probe, needle, needle_len)
+        probe <- probe + 1.usize()
+    return if not found
+    original: mutable darray[u8] = []
+    for copy_index in 0..<buffer.count |original, buffer|:
+        original.push(buffer[copy_index])
+    buffer.clear()
+    cursor: mutable usize = 0
+    while cursor < original.count |buffer, original, cursor, needle, replacement|:
+        matches: bool = pymodule_generated_matches_at(original, cursor, needle, needle_len)
+        if matches:
+            emit_tokens_push_sview(buffer, replacement)
+            cursor <- cursor + needle_len
+        else:
+            buffer.push(original[cursor])
+            cursor <- cursor + 1.usize()
+
+
+
+
+# Rename a generated local C identifier without touching member accesses or larger identifiers.
+# The nested dictionary/set converters use `out` as their standalone result variable, but a legal
+# Elisa struct may also have a field named `out` (or `set_out`) and helper/type names may contain
+# the same byte sequence. Plain substring replacement silently rewrote those names and produced
+# malformed C; keep the rewrite token-aware and skip `value.out`/`value->out` member expressions.
+def pymodule_replace_generated_local(buffer: mutable darray[u8]&, needle: sview, replacement: sview) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    needle_len: usize = sview_len(needle)
+    return if needle_len == 0 or buffer.count == 0 or needle_len > buffer.count
+    # A local-name rewrite is feature-gated just like the ordinary helper.  Probe first so a
+    # large generated module does not pay for a full shadow copy when this particular helper
+    # shape was not emitted; this matters for mixed struct/container exports and keeps the
+    # token-aware path from reintroducing the peak-memory multiplier that the main helper avoids.
+    probe: mutable usize = 0
+    found: mutable bool = false
+    while probe <= buffer.count - needle_len and not found |probe, found, buffer, needle, needle_len|:
+        found <- pymodule_generated_matches_at(buffer, probe, needle, needle_len)
+        probe <- probe + 1.usize()
+    return if not found
+    original: mutable darray[u8] = []
+    for copy_index in 0..<buffer.count |original, buffer|:
+        original.push(buffer[copy_index])
+    buffer.clear()
+    cursor: mutable usize = 0
+    while cursor < original.count |buffer, original, cursor, needle, replacement, needle_len|:
+        matches: bool = pymodule_generated_matches_at(original, cursor, needle, needle_len)
+        previous_identifier: mutable bool = false
+        next_identifier: mutable bool = false
+        member_access: mutable bool = false
+        if matches:
+            if cursor > 0.usize():
+                previous: u8 = original[cursor - 1.usize()]
+                previous_identifier <- (previous >= 48 and previous <= 57) or (previous >= 65 and previous <= 90) or (previous >= 97 and previous <= 122) or previous == 95
+                member_access <- previous == 46 or previous == 62
+            next_cursor: usize = cursor + needle_len
+            if next_cursor < original.count:
+                following: u8 = original[next_cursor]
+                next_identifier <- (following >= 48 and following <= 57) or (following >= 65 and following <= 90) or (following >= 97 and following <= 122) or following == 95
+        if matches and not previous_identifier and not next_identifier and not member_access:
+            emit_tokens_push_sview(buffer, replacement)
+            cursor <- cursor + needle_len
+        else:
+            buffer.push(original[cursor])
+            cursor <- cursor + 1.usize()
+
+
+
+
+def pymodule_contextualize_generated_returns(buffer: mutable darray[u8]&, function_name: sview, parameter_name: sview) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    replacement: mutable darray[u8] = []
+    emit_tokens_push_sview(&replacement, "do { elisa_pymodule_annotate_argument_error(\"")
+    emit_tokens_push_sview(&replacement, function_name)
+    emit_tokens_push_sview(&replacement, "\", \"")
+    emit_tokens_push_sview(&replacement, parameter_name)
+    emit_tokens_push_sview(&replacement, "\"); return NULL; } while (0);")
+    pymodule_replace_generated(buffer, "return NULL;", sview(&replacement[0], 0, replacement.count))
+
+
+
+
+def emit_pymodule_argument_error_annotation(buffer: mutable darray[u8]&, function_name: sview, parameter_name: sview, indent: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    emit_tokens_push_sview(buffer, indent)
+    emit_tokens_push_sview(buffer, "elisa_pymodule_annotate_argument_error(\"")
+    emit_tokens_push_sview(buffer, function_name)
+    emit_tokens_push_sview(buffer, "\", \"")
+    emit_tokens_push_sview(buffer, parameter_name)
+    emit_tokens_push_sview(buffer, "\");\n")
+
+
+
+
+def pymodule_python_expected_type(type_name: sview) -> sview can[Abort.Panic]:
+    # Keep structured boundary errors machine-readable as well as human-readable.  Scalar
+    # parser failures already report `int`/`float`/`str | bytes`; conversion failures need the
+    # same expectation even when PyArg_ParseTupleAndKeywords accepted an opaque `O` value first.
+    if type_name == "py::Object":
+        return "object"
+    if type_name == "py::Object?":
+        return "object | None"
+    if type_name == "cstr" or type_name == "sview":
+        return "str | bytes"
+    if type_name == "cstr?" or type_name == "sview?":
+        return "str | bytes | None"
+    if type_name == "bool":
+        return "bool"
+    if type_name == "f32" or type_name == "f64":
+        return "float"
+    if type_name == "i8" or type_name == "i16" or type_name == "i32" or type_name == "i64" or type_name == "int" or type_name == "isize" or type_name == "char" or type_name == "u8" or type_name == "u16" or type_name == "u32" or type_name == "u64" or type_name == "usize" or type_name == "uintptr":
+        return "int"
+    if pymodule_is_optional_scalar_type(type_name):
+        payload_name: sview = pymodule_optional_payload_name(type_name)
+        if payload_name == "bool":
+            return "bool | None"
+        if payload_name == "f32" or payload_name == "f64":
+            return "float | None"
+        return "int | None"
+    if pymodule_is_dict_type(type_name):
+        return "mapping"
+    if pymodule_is_set_type(type_name):
+        return "iterable"
+    if pymodule_is_darray_type(type_name) or pymodule_is_view_type(type_name) or pymodule_is_fixed_array_type(type_name):
+        return "sequence"
+    # Named structs accept both mappings and attribute-bearing Python objects.  Returning this
+    # conservative description is more useful than exposing an internal Elisa type spelling.
+    return "mapping or object"
+
+
+
+
+def emit_pymodule_argument_context(buffer: mutable darray[u8]&, function_name: sview, parameter_name: sview, type_name: sview, indent: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    # Conversion helpers are deliberately small C functions and therefore do not
+    # receive the exported wrapper's name/parameter as arguments. Keep the active
+    # boundary context in thread-local storage so their cleanup paths can annotate
+    # nested element failures without changing every helper signature.
+    emit_tokens_push_sview(buffer, indent)
+    emit_tokens_push_sview(buffer, "elisa_pymodule_current_path_clear(); elisa_pymodule_current_function = \"")
+    emit_tokens_push_sview(buffer, function_name)
+    emit_tokens_push_sview(buffer, "\"; elisa_pymodule_current_parameter = \"")
+    emit_tokens_push_sview(buffer, parameter_name)
+    emit_tokens_push_sview(buffer, "\"; elisa_pymodule_current_expected = \"")
+    emit_tokens_push_sview(buffer, pymodule_python_expected_type(type_name))
+    emit_tokens_push_sview(buffer, "\";\n")
+
+
+
+
+# `-emit pymodule` — the machine-readable Python interop contract. The companion
+# `-emit pymodule-c` mode turns the same contract into a scalar/string/list/bytes/dict/opaque-object/error CPython source shim; keeping the
+# JSON form stable also gives build systems a cheap introspection artifact.
+def emit_pymodule_manifest_structs(buffer: mutable darray[u8]&, file: Ast::File&, declarations: darray[Ast::Decl]&, first: mutable bool&, owner: sview) -> i64 can[Abort.Panic, Memory.Allocate, Console]:
+    for declaration in declarations |buffer, file, first, owner|:
+        if declaration is Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, pos):
+            emit_tokens_push_sview(buffer, ",") if first == false
+            emit_tokens_push_sview(buffer, "\n    {\"name\": \"")
+            emit_tokens_push_sview(buffer, struct_name)
+            if owner != "":
+                emit_tokens_push_sview(buffer, "\", \"owner\": \"")
+                emit_tokens_push_sview(buffer, owner)
+            emit_tokens_push_sview(buffer, "\", \"fields\": [")
+            field_first: mutable bool = true
+            for member in members |buffer, file, field_first|:
+                field_type_name: mutable sview = pymodule_alias_type_name(file, member.type_expression)
+                # The manifest walks source structs for useful introspection, including private
+                # generic helper records that never cross an exported boundary. Their unresolved
+                # generic fields intentionally have no Python ABI spelling; keep the manifest
+                # valid and explicit without rejecting an otherwise valid module. Exported
+                # function parameters/returns still fail hard above when their type is empty.
+                field_type_name <- "<unsupported>" if field_type_name == ""
+                emit_tokens_push_sview(buffer, ",") if field_first == false
+                emit_tokens_push_sview(buffer, "{\"name\": \"")
+                emit_tokens_push_sview(buffer, member.name)
+                emit_tokens_push_sview(buffer, "\", \"type\": \"")
+                emit_tokens_push_sview(buffer, field_type_name)
+                emit_tokens_push_sview(buffer, "\"")
+                if member.has_default:
+                    emit_tokens_push_sview(buffer, ", \"optional\": true, \"default\": \"")
+                    if pymodule_struct_default_supported(file, field_type_name, member.default_value):
+                        emit_pymodule_manifest_default_literal(buffer, file, member.default_value, field_type_name)
+                    else:
+                        emit_tokens_push_sview(buffer, "<unsupported>")
+                    emit_tokens_push_sview(buffer, "\"")
+                elif pymodule_parameter_is_implicit_optional(field_type_name):
+                    emit_tokens_push_sview(buffer, ", \"optional\": true")
+                emit_tokens_push_sview(buffer, "}")
+                field_first <- false
+            emit_tokens_push_sview(buffer, "]}")
+            first <- false
+        elif declaration is Decl.Module(module_name, module_body, module_pos):
+            nested_status: i64 = emit_pymodule_manifest_structs(buffer, file, module_body, first, module_name)
+            return nested_status if nested_status != 0
+        elif declaration is Decl.Scoped(scoped_body, scoped_pos):
+            nested_status_scoped: i64 = emit_pymodule_manifest_structs(buffer, file, scoped_body, first, owner)
+            return nested_status_scoped if nested_status_scoped != 0
+    return 0
+
+
+
+
+def emit_pymodule_report(file: mutable Ast::File&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    pymodule_expand_wildcard_exports(file)
+    module_name: mutable sview = ""
+    for annotation in file.enum_annotations |module_name|:
+        module_name <- annotation.owner if annotation.name == "__export_pymodule" and module_name == ""
+    if module_name == "":
+        message: mutable darray[u8] = []
+        emit_tokens_push_sview(&message, "error: -emit pymodule requires `export pymodule NAME:`\n")
+        write_stderr(message)
+        return 1
+    return 1 if not pymodule_validate_reserved_export_names(file, "pymodule")
+    buffer: mutable darray[u8] = []
+    emit_tokens_push_sview(&buffer, "{\n  \"module\": \"")
+    emit_tokens_push_sview(&buffer, module_name)
+    emit_tokens_push_sview(&buffer, "\",\n  \"functions\": [")
+    first: mutable bool = true
+    for annotation in file.enum_annotations |buffer, first, file|:
+        continue if annotation.name != "__pymodule_fn"
+        target: mutable sview = ""
+        for target_annotation in file.enum_annotations |target, annotation|:
+            target <- target_annotation.owner if target_annotation.name == "__pymodule_target_ref" and target_annotation.line == annotation.line
+        emit_tokens_push_sview(&buffer, ",") if not first
+        emit_tokens_push_sview(&buffer, "\n    {\"name\": \"")
+        emit_tokens_push_sview(&buffer, annotation.owner)
+        emit_tokens_push_sview(&buffer, "\", \"target\": \"")
+        emit_tokens_push_sview(&buffer, target)
+        emit_tokens_push_sview(&buffer, "\", \"parameters\": [")
+        target_decl: Ast::Decl? = pymodule_find_function_in(file.top_decls, target)
+        manifest_structured_payload: mutable bool = false
+        if target_decl is target_function:
+            if target_function is Decl.Func(target_function_name, target_params, target_return, target_body, target_effects, target_decorators, target_pos):
+                saw_optional_parameter: mutable bool = false
+                for parameter_index in 0..<target_params.count |buffer, target_params, saw_optional_parameter|:
+                    parameter_type_name: sview = pymodule_alias_type_name(file, target_params[parameter_index].type_expression)
+                    if parameter_type_name == "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent parameter `")
+                        emit_tokens_push_sview(&message, target_params[parameter_index].name)
+                        emit_tokens_push_sview(&message, "` on target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "` in the Python manifest\n")
+                        write_stderr(message)
+                        return 1
+                    if target_params[parameter_index].has_default and not pymodule_default_supported(file, parameter_type_name, target_params[parameter_index].default_value):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule supports only literal scalar/text or recursively literal container defaults (target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`, parameter `")
+                        emit_tokens_push_sview(&message, target_params[parameter_index].name)
+                        emit_tokens_push_sview(&message, "`)\n")
+                        write_stderr(message)
+                        return 1
+                    unsupported_dict_key: sview = pymodule_unsupported_dict_key_in_type(file, parameter_type_name)
+                    if unsupported_dict_key != "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule dictionary key type `")
+                        emit_tokens_push_sview(&message, unsupported_dict_key)
+                        emit_tokens_push_sview(&message, "` is not supported by Python interop (use a scalar hashable key such as an integer, bool, cstr, or sview)\n")
+                        write_stderr(message)
+                        return 1
+                    unsupported_set_element: sview = pymodule_unsupported_set_element_in_type(file, parameter_type_name)
+                    if unsupported_set_element != "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule set element type `")
+                        emit_tokens_push_sview(&message, unsupported_set_element)
+                        emit_tokens_push_sview(&message, "` is not supported by Python interop (use a scalar hashable element such as an integer, bool, cstr, or sview)\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_darray_type(parameter_type_name) and pymodule_type_contains_mutable(target_params[parameter_index].type_expression):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule does not support mutable darray references because Python inputs use temporary copied storage (target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "` parameter)\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_view_type(parameter_type_name) and not pymodule_view_input_supported(file, parameter_type_name):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent parameter `")
+                        emit_tokens_push_sview(&message, target_params[parameter_index].name)
+                        emit_tokens_push_sview(&message, "` on target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`: the view element contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                    parameter_struct_decl: Ast::Decl? = pymodule_find_struct_in(file.top_decls, parameter_type_name)
+                    if parameter_struct_decl is parameter_struct and not pymodule_struct_input_supported(file, parameter_type_name):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent parameter `")
+                        emit_tokens_push_sview(&message, target_params[parameter_index].name)
+                        emit_tokens_push_sview(&message, "` on target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`: the named struct contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                    if not pymodule_nested_dict_values_supported_in_type(file, parameter_type_name, 0.usize()):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule supports nested darray dictionary values up to eight levels with representable aggregate elements (target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "` parameter)\n")
+                        write_stderr(message)
+                        return 1
+                    if not target_params[parameter_index].has_default and not pymodule_parameter_is_implicit_optional(parameter_type_name) and saw_optional_parameter:
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule requires default/nullable parameters to be trailing (target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`)\n")
+                        write_stderr(message)
+                        return 1
+                    # Keep the manifest contract identical to the generated C shim. A fixed
+                    # array can have a valid canonical spelling while still being outside the
+                    # bounded scalar adapter (or using a mutable reference/aggregate element),
+                    # in which case emitting it would promise a Python ABI that cannot build.
+                    if pymodule_is_fixed_array_type(parameter_type_name) and not pymodule_fixed_array_input_supported(file, parameter_type_name, target_params[parameter_index].type_expression):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent fixed-array parameter `")
+                        emit_tokens_push_sview(&message, target_params[parameter_index].name)
+                        emit_tokens_push_sview(&message, "` on target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`: Python interop supports scalar fixed arrays with at most 4096 elements\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_darray_type(parameter_type_name) and not pymodule_top_level_darray_input_supported(file, parameter_type_name):
+                        message: mutable darray[u8] = []
+                        if pymodule_darray_nesting_depth(parameter_type_name) >= 2.usize():
+                            emit_tokens_push_sview(&message, "error: -emit pymodule supports nested darrays up to eight levels for scalar/text/object/struct elements (target `")
+                            emit_tokens_push_sview(&message, target)
+                            emit_tokens_push_sview(&message, "` parameter)\n")
+                        else:
+                            emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent parameter `")
+                            emit_tokens_push_sview(&message, target_params[parameter_index].name)
+                            emit_tokens_push_sview(&message, "` on target `")
+                            emit_tokens_push_sview(&message, target)
+                            emit_tokens_push_sview(&message, "`: the darray element contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                    emit_tokens_push_sview(&buffer, ", ") if parameter_index > 0
+                    emit_tokens_push_sview(&buffer, "{\"name\": \"")
+                    emit_tokens_push_sview(&buffer, target_params[parameter_index].name)
+                    emit_tokens_push_sview(&buffer, "\", \"type\": \"")
+                    emit_tokens_push_sview(&buffer, parameter_type_name)
+                    emit_tokens_push_sview(&buffer, "\"")
+                    if target_params[parameter_index].has_default:
+                        emit_tokens_push_sview(&buffer, ", \"default\": \"")
+                        if pymodule_default_supported(file, parameter_type_name, target_params[parameter_index].default_value):
+                            emit_pymodule_manifest_default_literal(&buffer, file, target_params[parameter_index].default_value, parameter_type_name)
+                        else:
+                            emit_tokens_push_sview(&buffer, "<unsupported>")
+                        emit_tokens_push_sview(&buffer, "\"")
+                    elif pymodule_parameter_is_implicit_optional(parameter_type_name):
+                        emit_tokens_push_sview(&buffer, ", \"default\": \"None\"")
+                    emit_tokens_push_sview(&buffer, "}")
+                    saw_optional_parameter <- true if target_params[parameter_index].has_default or pymodule_parameter_is_implicit_optional(parameter_type_name)
+                return_type_name: mutable sview = "void"
+                if target_return is declared_return:
+                    return_type_name <- pymodule_alias_type_name(file, declared_return)
+                    if return_type_name == "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent the return type on target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "` in the Python manifest\n")
+                        write_stderr(message)
+                        return 1
+                    unsupported_return_dict_key: sview = pymodule_unsupported_dict_key_in_type(file, return_type_name)
+                    if unsupported_return_dict_key != "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule dictionary key type `")
+                        emit_tokens_push_sview(&message, unsupported_return_dict_key)
+                        emit_tokens_push_sview(&message, "` is not supported by Python interop (use a scalar hashable key such as an integer, bool, cstr, or sview)\n")
+                        write_stderr(message)
+                        return 1
+                    unsupported_return_set_element: sview = pymodule_unsupported_set_element_in_type(file, return_type_name)
+                    if unsupported_return_set_element != "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule set element type `")
+                        emit_tokens_push_sview(&message, unsupported_return_set_element)
+                        emit_tokens_push_sview(&message, "` is not supported by Python interop (use a scalar hashable element such as an integer, bool, cstr, or sview)\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_view_type(return_type_name) and not pymodule_view_return_supported(file, return_type_name):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent the return type on target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`: the view element contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                    return_struct_decl: Ast::Decl? = pymodule_find_struct_in(file.top_decls, return_type_name)
+                    if return_struct_decl is return_struct and not pymodule_struct_return_supported(file, return_type_name):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent the return type on target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`: the named struct contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                    if not pymodule_nested_dict_values_supported_in_type(file, return_type_name, 0.usize()):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule supports nested darray dictionary values up to eight levels with representable aggregate elements (target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "` return)\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_fixed_array_type(return_type_name) and not pymodule_fixed_array_return_supported(return_type_name):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent a fixed-array return on target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`: Python interop supports scalar fixed arrays with at most 4096 elements\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_darray_type(return_type_name) and not pymodule_top_level_darray_return_supported(file, return_type_name):
+                        message: mutable darray[u8] = []
+                        if pymodule_darray_nesting_depth(return_type_name) >= 2.usize():
+                            emit_tokens_push_sview(&message, "error: -emit pymodule supports nested darrays up to eight levels for scalar/text/object/struct elements (target `")
+                            emit_tokens_push_sview(&message, target)
+                            emit_tokens_push_sview(&message, "` return)\n")
+                        else:
+                            emit_tokens_push_sview(&message, "error: -emit pymodule cannot represent the return type on target `")
+                            emit_tokens_push_sview(&message, target)
+                            emit_tokens_push_sview(&message, "`: the darray element contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_function_is_error(file, target) and return_struct_decl is return_struct:
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule does not support struct returns for error targets (target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`)\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_function_is_error(file, target) and pymodule_is_fixed_array_type(return_type_name) and pymodule_fixed_array_return_supported(return_type_name):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule does not support fixed-array returns for error targets (target `")
+                        emit_tokens_push_sview(&message, target)
+                        emit_tokens_push_sview(&message, "`)\n")
+                        write_stderr(message)
+                        return 1
+                if pymodule_function_is_error(file, target):
+                    manifest_error_family: sview = pymodule_function_error_family(file, target)
+                    manifest_has_payload: bool = manifest_error_family != "" and pymodule_error_set_has_payload_in(file.top_decls, manifest_error_family)
+                    if manifest_has_payload:
+                        manifest_payload_type: sview = pymodule_error_payload_type_in(file, file.top_decls, manifest_error_family)
+                        manifest_error_structured: bool = pymodule_error_payload_is_structured_in(file.top_decls, manifest_error_family)
+                        manifest_error_structured_supported: bool = manifest_error_structured and pymodule_error_payload_structured_supported_in(file, file.top_decls, manifest_error_family)
+                        if (not manifest_error_structured and (manifest_payload_type == "" or not pymodule_error_payload_supported(file, manifest_payload_type))) or (manifest_error_structured and not manifest_error_structured_supported):
+                            message: mutable darray[u8] = []
+                            emit_tokens_push_sview(&message, "error: -emit pymodule supports scalar/text/object, darray, view, and dictionary payload fields for error set `")
+                            emit_tokens_push_sview(&message, manifest_error_family)
+                            emit_tokens_push_sview(&message, "` on target `")
+                            emit_tokens_push_sview(&message, target)
+                            emit_tokens_push_sview(&message, "`; unsupported aggregate payload fields remain unavailable\n")
+                            write_stderr(message)
+                            return 1
+                emit_tokens_push_sview(&buffer, "], \"return\": \"")
+                emit_tokens_push_sview(&buffer, return_type_name)
+                if pymodule_function_is_error(file, target):
+                    error_family: sview = pymodule_function_error_family(file, target)
+                    if error_family != "":
+                        emit_tokens_push_sview(&buffer, "\", \"raises\": \"")
+                        emit_tokens_push_sview(&buffer, error_family)
+                        payload_type_name: sview = pymodule_error_payload_type_in(file, file.top_decls, error_family)
+                        if payload_type_name != "":
+                            emit_tokens_push_sview(&buffer, "\", \"payload\": \"")
+                            emit_tokens_push_sview(&buffer, payload_type_name)
+                        elif pymodule_error_payload_is_structured_in(file.top_decls, error_family):
+                            # Structured scalar/text/object payloads arrive as a Python dict
+                            # with `variant` plus named fields. Keep the manifest explicit so
+                            # generators can offer a useful shape without reverse-engineering
+                            # the error declaration.
+                            emit_tokens_push_sview(&buffer, "\", \"payload\": \"struct\", \"payload_variants\": [")
+                            _ = emit_pymodule_error_payload_manifest(&buffer, file, file.top_decls, error_family)
+                            emit_tokens_push_sview(&buffer, "]")
+                            manifest_structured_payload <- true
+        emit_tokens_push_sview(&buffer, "}") if manifest_structured_payload else emit_tokens_push_sview(&buffer, "\"}")
+        first <- false
+    emit_tokens_push_sview(&buffer, "],\n  \"constants\": [")
+    const_first: mutable bool = true
+    for const_annotation in file.enum_annotations |buffer, const_first, file|:
+        continue if const_annotation.name != "__pymodule_const"
+        target_name: mutable sview = ""
+        for target_annotation in file.enum_annotations |target_name, const_annotation|:
+            target_name <- target_annotation.owner if target_annotation.name == "__pymodule_const_target_ref" and target_annotation.line == const_annotation.line
+        emit_tokens_push_sview(&buffer, ",") if not const_first
+        emit_tokens_push_sview(&buffer, "\n    {\"name\": \"")
+        emit_tokens_push_sview(&buffer, const_annotation.owner)
+        emit_tokens_push_sview(&buffer, "\", \"target\": \"")
+        emit_tokens_push_sview(&buffer, target_name)
+        emit_tokens_push_sview(&buffer, "\", \"type\": \"")
+        target_const_decl: Ast::Decl? = pymodule_find_const_in(file.top_decls, target_name)
+        if target_const_decl is target_const:
+            if target_const is Decl.Const(target_const_name, target_const_type, target_const_value, target_const_mutable, target_const_pos):
+                emit_tokens_push_sview(&buffer, pymodule_const_decl_type_name(file, target_const_type, target_const_value))
+        emit_tokens_push_sview(&buffer, "\"}")
+        const_first <- false
+    emit_tokens_push_sview(&buffer, "],\n  \"structs\": [")
+    struct_first: mutable bool = true
+    manifest_struct_status: i64 = emit_pymodule_manifest_structs(&buffer, file, file.top_decls, struct_first, "")
+    return manifest_struct_status if manifest_struct_status != 0
+    if not struct_first:
+        buffer.push(10)
+        emit_tokens_push_sview(&buffer, "  ]\n}\n")
+    else:
+        emit_tokens_push_sview(&buffer, "]\n}\n")
+    return emit_tokens_flush(buffer)

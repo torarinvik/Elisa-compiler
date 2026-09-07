@@ -1,0 +1,126 @@
+# Stage1 backend — the RUNTIME GUARDS: the trap intrinsic and its unreachable tail, the opt-in
+# null-deref and index-bounds checks, contract guards, and the `ensure` postconditions checked
+# against a value on its way out. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+            # Emit the LLVM trap intrinsic and terminate the failure block. This is shared by
+            # forced dereference guards and the dynamic index watchdog; unlike libc abort it
+            # remains a recognizable `llvm.trap` for both LLVM and stage0 parity checks.
+        def emit_trap_unreachable(m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Unsafe.PointerCast]:
+            trap_name: cstr = "llvm.trap"
+            trap_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+            # `LLVMAddFunction` does NOT deduplicate by name — a second call with the same
+            # name gets a MANGLED symbol (`llvm.trap.1`, `llvm.trap.2`, …), which is no
+            # longer the real `llvm.trap` INTRINSIC LLVM recognizes at codegen time; it
+            # becomes an ordinary external declaration with no definition anywhere, and the
+            # link fails with "undefined symbol _llvm.trap.N". Harmless for callers that
+            # trap at most once per function, which is why this went unnoticed — checked
+            # arithmetic overflow can trap from many call sites in the SAME function.
+            trap_fn: mutable LLVMValueRef = zeroed
+            if LLVMGetNamedFunction(m, trap_name) is existing_trap:
+                trap_fn <- existing_trap
+            else:
+                trap_fn <- LLVMAddFunction(m, trap_name, trap_type)
+            _ = LLVMBuildCall2(builder, trap_type, trap_fn, null, 0, "")
+            _ = LLVMBuildUnreachable(builder)
+
+
+
+
+        # In forced bounds mode, reject null and near-null addresses before they are
+        # dereferenced. Runtime-derived pointers are compared directly; this deliberately
+        # stays conservative for stack/global addresses, which is safe and keeps the
+        # guard independent of LLVM's value-kind introspection API.
+        def emit_pointer_deref_guard(pointer: LLVMValueRef, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Unsafe.PointerCast]:
+            return if not runtime.force_bounds_check
+            return if pointer == zeroed
+            int_pointer: LLVMValueRef = LLVMBuildPtrToInt(builder, pointer, LLVMInt64TypeInContext(ctx), "pg.addr")
+            limit: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 65536, 0)
+            valid: LLVMValueRef = LLVMBuildICmp(builder, 35, int_pointer, limit, "pg.valid")
+            ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)), "pg.ok")
+            fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)), "pg.fail")
+            _ = LLVMBuildCondBr(builder, valid, ok_block, fail_block)
+            LLVMPositionBuilderAtEnd(builder, fail_block)
+            emit_trap_unreachable(m, ctx, builder)
+            LLVMPositionBuilderAtEnd(builder, ok_block)
+
+
+
+
+        # Dynamic container indices are checked when the opt-in flag is active. The
+        # semantic checker already handles `get ... else` and proven accesses; this
+        # backend guard covers unchecked reads/writes before their GEP is used.
+        def emit_index_bounds_guard(array_slot: LLVMValueRef, array_type: ValueType, index: LLVMValueRef, runtime: Runtime&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not runtime.force_bounds_check
+            emit_pointer_deref_guard(array_slot, runtime, m, ctx, builder)
+            count_pointer: mutable LLVMValueRef = zeroed
+            count_value: mutable LLVMValueRef = zeroed
+            if array_type.kind == TypeKind.DArray:
+                count_pointer <- LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), array_slot, 1, "bounds.count.ptr")
+                count_value <- LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), count_pointer, "bounds.count")
+            elif array_type.kind == TypeKind.Array:
+                count_value <- LLVMConstInt(LLVMInt64TypeInContext(ctx), structs.array_extents[array_type.bits.usize()].u64(), 0)
+            else:
+                return
+            valid: LLVMValueRef = LLVMBuildICmp(builder, 36, index, count_value, "wd.in_bounds")
+            parent: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "wd.ok")
+            fail_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, parent, "wd.fail")
+            _ = LLVMBuildCondBr(builder, valid, ok_block, fail_block)
+            LLVMPositionBuilderAtEnd(builder, fail_block)
+            emit_trap_unreachable(m, ctx, builder)
+            LLVMPositionBuilderAtEnd(builder, ok_block)
+
+
+
+
+        # Emit a runtime contract guard: branch on `condition`, abort on false, and leave
+        # the builder positioned on the success path. Shared by `requires`/`assert` (checked
+        # where they are written) and `ensure` (checked at every return).
+        def emit_contract_guard(condition: LLVMValueRef, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic]:
+            guard_fn: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            guard_ok: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, guard_fn, "contract.ok")
+            guard_fail: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, guard_fn, "contract.fail")
+            _ = LLVMBuildCondBr(builder, condition, guard_ok, guard_fail)
+            LLVMPositionBuilderAtEnd(builder, guard_fail)
+            guard_abort_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+            guard_abort_fn: LLVMValueRef = declare_or_get_abort(m, guard_abort_type)
+            _ = LLVMBuildCall2(builder, guard_abort_type, guard_abort_fn, null, 0, "")
+            _ = LLVMBuildUnreachable(builder)
+            LLVMPositionBuilderAtEnd(builder, guard_ok)
+
+
+
+
+        # Check the current function's `ensure` postconditions against the value it is about
+        # to return. Mirrors stage0's shape: bind the returned value as `result` (stage0
+        # allocates a `%result` slot and stores into it), then guard on each predicate.
+        # Called on the return path, BEFORE the regions are unwound -- a predicate may read a
+        # container the auto region still backs.
+        #
+        # False = DECLINE (a predicate the expression emitter cannot model). Never silently
+        # skips a check: a contract that is not emitted is a contract that is not enforced.
+        def emit_ensure_checks(return_value: LLVMValueRef, return_type: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            ensure_count: usize = structs.pending_ensures.count
+            true return if ensure_count == 0
+            false return if return_type.kind == TypeKind.Void
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(return_type, structs, ctx), "result")
+            _ = LLVMBuildStore(builder, return_value, result_slot)
+            # `result` is an ordinary local from here, so the predicate's `result >= a` needs
+            # no special case in the expression emitter.
+            declare_local(local_scope, "result", result_slot, return_type)
+            ensure_bool: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+            ensure_index: mutable usize = 0
+            while ensure_index < ensure_count |ensure_index, ensure_count, ensure_bool, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                # Copied OUT of the table: emit_expression takes `structs` mutably, so a
+                # borrow held across the call would conflict.
+                ensure_pred: Expr = structs.pending_ensures[ensure_index]
+                if emit_expression(ensure_pred, ensure_bool, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ensure_value:
+                    emit_contract_guard(ensure_value, m, ctx, builder)
+                else:
+                    return false
+                ensure_index <- ensure_index + 1
+            return true

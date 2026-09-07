@@ -1,0 +1,137 @@
+# Stage1 backend — `catch` over a first-class error union VALUE (as opposed to a call, which
+# has its own lowering in codegen_try_lowering.elisa).
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+            # Catch a first-class value-carrying error union. Calls have a separate lowering
+            # below because their ABI is split into an i32 status plus an out pointer; locals,
+            # fields, and parameters already use the stage0 descriptor `{i32 code, ptr payload}`.
+        def emit_catch_error_union_value(union_value: LLVMValueRef, value_type: ValueType, result_type: ValueType, catch_arms: darray[MatchArm]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if catch_arms.count < 1
+            payload_type: ValueType = error_union_payload_of(value_type, structs)
+            null return if payload_type.kind == TypeKind.Unmodeled
+            union_code: LLVMValueRef = error_union_code_of(union_value, value_type, structs, ctx, builder)
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            value_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.value")
+            dispatch_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.dispatch")
+            done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.done")
+            payload_llvm: LLVMTypeRef = llvm_type_of(payload_type, structs, ctx)
+            output_type: ValueType = payload_type if result_type.kind == TypeKind.Unmodeled else result_type
+            result_llvm: LLVMTypeRef = llvm_type_of(output_type, structs, ctx)
+            result_slot: LLVMValueRef = LLVMBuildAlloca(builder, result_llvm, "catch.union.result")
+            ok: LLVMValueRef = LLVMBuildICmp(builder, 32, union_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "catch.union.ok")
+            _ = LLVMBuildCondBr(builder, ok, value_block, dispatch_block)
+
+            LLVMPositionBuilderAtEnd(builder, value_block)
+            success_arm: MatchArm = catch_arms[0]
+            null return if arm_has_guard(success_arm.guard)
+            match success_arm.pattern:
+                Pattern.Binding(success_name):
+                    success_payload_ptr: LLVMValueRef = LLVMBuildExtractValue(builder, union_value, 1, "catch.union.payload.ptr")
+                    declare_local(local_scope, success_name, success_payload_ptr, payload_type)
+                _:
+                    pass
+            if arm_value_expression(success_arm.body) is success_expression:
+                if emit_expression(success_expression, output_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is success_result:
+                    _ = LLVMBuildStore(builder, success_result, result_slot)
+                    _ = LLVMBuildBr(builder, done_block)
+                else:
+                    return null
+            else:
+                return null
+
+            LLVMPositionBuilderAtEnd(builder, dispatch_block)
+            error_arm_index: mutable usize = 1
+            declined: mutable bool = false
+            saw_catch_all: mutable bool = false
+            while error_arm_index < catch_arms.count |error_arm_index, declined, saw_catch_all, catch_arms, union_code, payload_type, result_slot, done_block, function, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                error_arm: MatchArm = catch_arms[error_arm_index]
+                error_arm_index <- error_arm_index + 1
+                continue if declined or saw_catch_all
+                if arm_has_guard(error_arm.guard):
+                    declined <- true
+                    continue
+                if arm_value_expression(error_arm.body) is error_expression:
+                    match error_arm.pattern:
+                        Pattern.Wildcard:
+                            if emit_expression(error_expression, output_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is wildcard_result:
+                                _ = LLVMBuildStore(builder, wildcard_result, result_slot)
+                                _ = LLVMBuildBr(builder, done_block)
+                                saw_catch_all <- true
+                            else:
+                                declined <- true
+                            continue
+                        Pattern.TypeBind(error_type_name, _):
+                            if error_type_name != "error":
+                                declined <- true
+                                continue
+                            if emit_expression(error_expression, output_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is error_bind_result:
+                                _ = LLVMBuildStore(builder, error_bind_result, result_slot)
+                                _ = LLVMBuildBr(builder, done_block)
+                                saw_catch_all <- true
+                            else:
+                                declined <- true
+                            continue
+                        Pattern.Variant(error_path, error_fields):
+                            ordinal: mutable i64 = penum_variant_index_of_path(error_path, structs)
+                            if ordinal < 0:
+                                ordinal <- ordinal_of_dotted_path(error_path, structs)
+                            if ordinal < 0:
+                                declined <- true
+                                continue
+                            arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.arm")
+                            next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "catch.union.next")
+                            hit: LLVMValueRef = LLVMBuildICmp(builder, 32, union_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), (ordinal + 1).u64(), 0), "catch.union.cmp")
+                            _ = LLVMBuildCondBr(builder, hit, arm_block, next_block)
+                            LLVMPositionBuilderAtEnd(builder, arm_block)
+                            union_arm_mark: usize = scope_mark(local_scope)
+                            if error_fields.count > 0:
+                                error_family: sview = resolved_error_family(error_union_family_of(value_type, structs), structs)
+                                error_set_index: i64 = penum_index_of(structs, error_family)
+                                if error_set_index < 0 or ordinal >= structs.penum_variant_count[error_set_index.usize()].i64():
+                                    declined <- true
+                                else:
+                                    error_variant_start: usize = structs.penum_variant_start[error_set_index.usize()]
+                                    error_variant_slot: usize = error_variant_start + ordinal.usize()
+                                    error_field_count: usize = structs.penum_field_type_count[error_variant_slot]
+                                    if error_fields.count != error_field_count:
+                                        declined <- true
+                                    else:
+                                        error_field_base: usize = error_set_variant_field_base(structs, error_set_index, ordinal.usize())
+                                        error_status_value: LLVMValueRef = LLVMBuildExtractValue(builder, union_value, 0, "catch.union.status")
+                                        error_field_index: mutable usize = 0
+                                        for error_field in error_fields |error_field_index, error_field_base, error_status_value, error_set_index, error_variant_slot, structs, local_scope, ctx, builder|:
+                                            match error_field:
+                                                Pattern.Wildcard:
+                                                    pass
+                                                Pattern.Binding(error_binding):
+                                                    error_type: ValueType = copied_type(structs.penum_field_types[structs.penum_field_type_start[error_variant_slot] + error_field_index])
+                                                    error_value: LLVMValueRef = LLVMBuildExtractValue(builder, error_status_value, (error_field_base + error_field_index).u32(), "catch.union.payload")
+                                                    error_storage: mutable darray[u8] = []
+                                                    error_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(error_type, structs, ctx), sview_to_cstr(error_binding, error_storage))
+                                                    _ = LLVMBuildStore(builder, error_value, error_slot)
+                                                    declare_local(local_scope, error_binding, error_slot, error_type)
+                                                _:
+                                                    declined <- true
+                                            error_field_index <- error_field_index + 1
+                            if emit_expression(error_expression, output_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is arm_result:
+                                scope_restore(local_scope, union_arm_mark)
+                                _ = LLVMBuildStore(builder, arm_result, result_slot)
+                                _ = LLVMBuildBr(builder, done_block)
+                            else:
+                                scope_restore(local_scope, union_arm_mark)
+                                declined <- true
+                            LLVMPositionBuilderAtEnd(builder, next_block)
+                            continue
+                        _:
+                            declined <- true
+                else:
+                    declined <- true
+            null return if declined
+            if not saw_catch_all:
+                _ = LLVMBuildUnreachable(builder)
+            LLVMPositionBuilderAtEnd(builder, done_block)
+            return LLVMBuildLoad2(builder, result_llvm, result_slot, "catch.union.value")

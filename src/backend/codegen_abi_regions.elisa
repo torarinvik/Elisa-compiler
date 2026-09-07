@@ -1,0 +1,203 @@
+# Stage1 backend — REGION facts about a SIGNATURE: which functions take a hidden caller-region
+# slot, which parameters and returns contribute one, and how many arenas a call therefore
+# passes. The pre-pass that propagates a region THROUGH a body is in
+# codegen_region_forwarding.elisa. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+            # `def f[@r](xs: darray[T] @r)` — a REGION PARAMETER. The body's `@r`-annotated locals
+            # allocate from the caller's region, and the values they build are written back into
+            # caller-visible storage, so the region must be threaded in. Nothing in such a
+            # signature need be a reference: `easm_prune_conditional_inputs[@r]` takes a
+            # `mutable darray[Function] @r` BY VALUE (the header is copied; the element storage is
+            # shared) and rebuilds each element's `inputs`/`params` darrays. With no arena
+            # threaded, stage1 gave it an auto region, allocated those darrays there, and
+            # `arena_free`d the region on return -- handing the caller freed memory. That is the
+            # intermittent (~3%) `easm_lockstep_parse_smoke` segfault: whether the munmap'd block
+            # had been remapped by the time `verify_function_header` read it was pure luck.
+            #
+            # Measured against stage0, which is the same rule: `def prune[@r](boxes: mutable
+            # darray[Box] @r)` emits `void @prune(%DynArray__Box, ptr)`; drop the `[@r]` and the
+            # trailing `ptr` disappears.
+        def line_has_region_parameter(line: u32, structs: StructTable&) -> bool:
+            for region_line in structs.region_param_lines |line|:
+                true return if region_line == line
+            return false
+
+
+
+
+        # The hidden caller-region slot selected by a generic region name such as `r` in
+        # `new[r] value`. The parser records one row per `@r` parameter in declaration order;
+        # the ABI uses that same order for the hidden arena values. Return -1 when the current
+        # function has no matching region parameter so ordinary named Arena locals and packed
+        # store selectors keep their existing paths.
+        def region_parameter_index(line: u32, name: sview, structs: StructTable&) -> i64 can[Abort.Panic]:
+            slot: mutable i64 = 0
+            for row in 0..<structs.region_param_lines.count |slot, row, line, name, structs|:
+                continue if structs.region_param_lines[row] != line
+                if row < structs.region_param_names.count and structs.region_param_names[row] == name:
+                    return slot
+                slot <- slot + 1
+            return -1
+
+
+
+        # The methods whose receiver can allocate into its backing region. A reference parameter
+        # only acquires a hidden region slot when the body actually grows that receiver. Counting
+        # every reference aggregate from its TYPE was the source of the self-hosting corruption:
+        # `check_assigns` has three read-only darray references but only grows `table.diagnostics`,
+        # so stage0 gives it one slot, not four.
+        def region_growth_method(method: sview) -> bool can[Abort.Panic]:
+            return method == "push" or method == "extend" or method == "insert" or method == "resize" or method == "reserve" or method == "put" or method == "add" or method == "append"
+
+
+
+
+        def region_growth_root(expression: Expr) -> sview can[Abort.Panic]:
+            if expression is Expr.Ident(region_root_name, region_root_line):
+                return region_root_name
+            if expression is Expr.Paren(region_root_inner, region_root_paren_line):
+                return region_growth_root(region_root_inner)
+            if expression is Expr.Move(region_root_moved, region_root_move_line):
+                return region_growth_root(region_root_moved)
+            if expression is Expr.Unary(region_root_operator, region_root_operand, region_root_unary_line):
+                return region_growth_root(region_root_operand)
+            if expression is Expr.Field(region_root_object, region_root_field, region_root_field_line):
+                return region_growth_root(region_root_object)
+            if expression is Expr.Index(region_root_indexed, region_root_index, region_root_index_line):
+                return region_growth_root(region_root_indexed)
+            if expression is Expr.Slice(region_root_sliced, region_root_low, region_root_high, region_root_slice_line):
+                return region_growth_root(region_root_sliced)
+            return ""
+
+
+
+
+        def ref_type_can_grow(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                false return if value_type.kind != TypeKind.Ref
+                target: ValueType = ref_target_of(value_type, structs)
+                true return if target.kind == TypeKind.DArray
+                true return if is_growable_container_struct(target, structs)
+                true return if target.kind == TypeKind.Struct and struct_contains_darray(target, structs)
+                return false
+
+
+
+
+        def region_fact_row(name: sview, line: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+            for function_index in 0..<structs.region_fact_names.count |structs, name, line|:
+                return function_index.i64() if structs.region_fact_names[function_index] == name and structs.region_fact_lines[function_index] == line
+            return -1
+
+
+
+
+        def region_flags_for_function(params: darray[ParamDecl]&, body: darray[Stmt], line: u32, structs: mutable StructTable&, flags: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                row: i64 = region_fact_row_from_params(params, line, structs)
+                if row >= 0:
+                    start: usize = structs.region_fact_starts[row.usize()]
+                    for parameter_index in 0..<params.count |flags, structs, start, row|:
+                        flags.push(structs.region_fact_params[start + parameter_index])
+                    return
+                # No recorded fact for this signature: infer from the body, which is what
+                # the comment on signature_arena_count says reference-parameter slots come
+                # from. This CALLED ITSELF with identical arguments -- an infinite recursion
+                # that only stayed hidden because a fact row is normally found. Reaching it
+                # blew the stack instead of falling back.
+                body_region_parameter_flags(params, body, structs, flags)
+
+
+
+
+        def region_fact_row_from_params(params: darray[ParamDecl]&, line: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+            for row in 0..<structs.region_fact_lines.count |structs, params, line|:
+                continue if structs.region_fact_lines[row] != line or structs.region_fact_counts[row] != params.count
+                return row.i64()
+            return -1
+
+
+
+
+        # Number of hidden caller-region parameters required by this function. Return storage and
+        # explicit function region parameters remain signature facts; reference-parameter slots
+        # come only from `body_region_parameter_flags`, matching stage0's inference pass.
+        def signature_arena_count(params: darray[ParamDecl]&, return_value_type: ValueType, body: darray[Stmt], line: u32, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                # A returned value has one ownership region even when several structural
+                # predicates describe it (Parser is both an AST-bearing value and a struct
+                # containing darrays). Counting predicates instead of regions shifted every
+                # later hidden ABI parameter while still leaving verifier-valid LLVM.
+                # Keep this decision in the same early-return helper used by body lowering.
+                # Apart from avoiding two definitions of ownership, this prevents bootstrap
+                # generations from disagreeing on the lowering of a long short-circuit chain.
+                count: mutable usize = 1 if value_type_returns_caller_region(return_value_type, structs) else 0
+                flags: mutable darray[bool] = []
+                region_flags_for_function(params, body, line, structs, flags)
+                for parameter_index in 0..<flags.count |flags, count|:
+                    count <- count + 1.usize() if flags[parameter_index]
+                count <- count + 1.usize() if line_has_region_parameter(line, structs)
+                return count
+
+
+
+
+        # The std collection helpers own their allocation ABI explicitly. Mutating helpers
+        # receive `a: mutable Arena&` as their first declared parameter; read-only helpers do
+        # not grow at all. Their generic `dict[K, T]&`/`set[T]&` parameters must therefore NOT
+        # acquire a second hidden arena merely because type binding later reveals a growable
+        # concrete struct. Stage0 decides the generic template ABI before specialization, so
+        # adding that slot here makes the stage1 monomorph disagree with both the runtime symbol
+        # and its own callers.
+        def generic_helper_uses_explicit_allocator(name: sview) -> bool can[Abort.Panic]:
+            return sview_matches_prefix(name, "arena_dict_", 0, 11) or sview_matches_prefix(name, "arena_set_", 0, 10)
+
+
+
+
+        # Whether one explicit parameter contributes a hidden caller-region slot. Kept separate
+        # from the aggregate signature counter so direct calls can map each hidden slot back to
+        # the actual argument's declaration arena (e.g. table -> caller, var_types -> scratch).
+        def value_type_carries_caller_region(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                false return if value_type.kind != TypeKind.Ref
+                target: ValueType = ref_target_of(value_type, structs)
+                true return if target.kind == TypeKind.DArray
+                true return if is_growable_container_struct(target, structs)
+                true return if target.kind == TypeKind.Struct and struct_contains_darray(target, structs)
+                return ast_value_needs_arena(target, structs)
+
+
+
+
+        def function_parameter_has_region(fns: FnTable&, fn_index: i64, parameter_position: usize) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                false return if fn_index < 0 or fn_index.usize() >= fns.param_start.count
+                flat_index: usize = fns.param_start[fn_index.usize()] + parameter_position
+                return flat_index < fns.param_region_slots.count and fns.param_region_slots[flat_index]
+
+
+
+
+        # A returned aggregate owns storage visible to the caller. When this fact is present,
+        # the function's ambient allocation region is the hidden caller slot, even if the body
+        # also creates temporary darrays. Using a callee-local scratch region here frees the
+        # returned backing immediately before the caller can read it.
+        def value_type_returns_caller_region(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            true return if value_type.kind == TypeKind.DArray
+            true return if is_growable_container_struct(value_type, structs)
+            true return if value_type.kind == TypeKind.Struct and struct_contains_darray(value_type, structs)
+            return ast_value_needs_arena(value_type, structs)
+
+
+
+
+        def signature_needs_arena(params: darray[ParamDecl]&, return_value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                # Generic callers that have a body use signature_arena_count directly. This
+                # compatibility helper is retained for type-only probes and deliberately does
+                # not infer a reference slot from shape alone.
+                return ast_value_needs_arena(return_value_type, structs) or return_value_type.kind == TypeKind.DArray or is_growable_container_struct(return_value_type, structs) or (return_value_type.kind == TypeKind.Struct and struct_contains_darray(return_value_type, structs))

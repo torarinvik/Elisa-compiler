@@ -1,0 +1,197 @@
+# Stage1 parser — the CONTRACT clauses on a method signature: `requires`/`ensure` spans captured
+# by a non-consuming peek over the impl body, the `changes`/`preserves` frame clauses and the
+# conflicts between them. Part of `module Parser` (see parser.elisa).
+
+extend Parser:
+    private:
+        # Frame-clause scanners keep an explicit state instead of an untyped integer/bool
+        # latch. Both scanners are peek-only, but naming the states makes transitions total and
+        # keeps a future clause from accidentally being treated as `changes` or `preserves`.
+        const enum FrameClauseMode of u8:
+            Inactive
+            Changes
+            Preserves
+
+
+
+
+        # Return the contract portion of the one-line signature beginning at a token index. Abstract effect
+        # bodies are intentionally not materialized as ordinary declarations, but their
+        # operation contracts must still survive parsing so a static handler can be checked
+        # before the backend sees a rewritten direct call. The returned view points into the
+        # parser-owned source buffer, just like ordinary token text.
+        def signature_span_at(parser: Parser&, token_index: usize) -> sview:
+            return sview("", 0, 0) if token_index >= parser.tokens.count
+            start: usize = parser.tokens[token_index].start.usize()
+            end: mutable usize = start
+            probe: mutable usize = token_index
+            depth: mutable int = 0
+            while probe < parser.tokens.count |probe, end, depth|:
+                token: Token = parser.tokens[probe]
+                break if token.kind == TokenKind.Newline or token.kind == TokenKind.Dedent or token.kind == TokenKind.Eof
+                # The operation contract ends before a handler body's colon or a local
+                # concrete-authority clause. Keeping those clauses out of signature
+                # metadata makes `def write(...) -> void` compare equal to
+                # `def write(...) -> void can[Console.Write]:`; the authority remains
+                # available through the existing handler-method effect rows.
+                break if depth == 0 and token.kind == TokenKind.Colon
+                if depth == 0 and token.kind == TokenKind.Ident:
+                    word: sview = Lexer::text_or_empty(token, parser.source)
+                    break if word == "can" or word == "requires" or word == "ensures" or word == "decreases"
+                end <- token.start.usize() + token.length.usize()
+                depth <- depth + 1 if token.kind == TokenKind.LParen or token.kind == TokenKind.LBracket or token.kind == TokenKind.LBrace
+                depth <- depth - 1 if depth > 0 and (token.kind == TokenKind.RParen or token.kind == TokenKind.RBracket or token.kind == TokenKind.RBrace)
+                probe <- probe + 1.usize()
+            return parser.span_view(start, end)
+
+
+
+        def signature_span_at_offset(parser: Parser&, offset: usize) -> sview:
+            index: mutable usize = 0
+            while index < parser.tokens.count |index|:
+                return parser.signature_span_at(index) if parser.tokens[index].start.usize() == offset
+                index <- index + 1.usize()
+            return sview("", 0, 0)
+
+
+
+        # Scan a method signature's leading tokens (up to the block colon / end of line) for a
+        # `changes self.FIELD, self.FIELD2` clause and record each FIELD on the side-table keyed by
+        # METHOD_NAME under SENTINEL (protocol vs impl). The whole signature is later skipped, so
+        # this is the only capture point for frame-condition conformance. Non-consuming (peek-only).
+        # Whether WORD is a frame/contract clause keyword (ends the current clause's target list).
+        def frame_clause_keyword(word: sview) -> bool:
+            can Abort.Panic:
+                return when word:
+                    "changes" | "preserves" | "requires" | "ensure" | "ensures" | "decreases" | "invariant" | "uses" -> true
+                    _ -> false
+
+
+
+        # Peek-scan a signature's `changes`/`preserves` clauses, recording each whole-`changes ROOT`
+        # root (sentinel 3900000010) and each `preserves ROOT.field` root+field (3900000011/12, pushed
+        # in lockstep) so the preserves-conflict check can detect a place that is both preserved and
+        # changed (docs/87 §7). Non-consuming; the header is skipped elsewhere.
+        def scan_preserves_conflict(parser: lmut Parser, function_name: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if function_name == ""
+                scan: mutable usize = 0
+                depth: mutable int = 0
+                mode: mutable FrameClauseMode = FrameClauseMode.Inactive
+                while parser.peek_at(scan) != TokenKind.Eof |parser, scan, depth, mode|:
+                    kind: TokenKind = parser.peek_at(scan)
+                    break if depth == 0 and kind == TokenKind.Newline
+                    break if depth == 0 and kind == TokenKind.Colon and parser.peek_at(scan + 1) == TokenKind.Newline
+                    depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket
+                    depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket
+                    if kind == TokenKind.Ident:
+                        word: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan], parser.source)
+                        mode <- when word:
+                            "changes" -> FrameClauseMode.Changes
+                            "preserves" -> FrameClauseMode.Preserves
+                            _ -> FrameClauseMode.Inactive if frame_clause_keyword(word) else mode
+                        # A function whose signature carries ANY frame/contract clause is marked
+                        # `__has_contract` (sentinel 3900000040). Consumers that conservatively
+                        # assume a plain mutable borrow mutates use this to EXEMPT contracted
+                        # callees (ensures-preserve, disjoint `changes`, etc.) — over-marking only
+                        # suppresses, never over-fires.
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: "__has_contract", line: 3900000040}) if frame_clause_keyword(word)
+                        next_is_dot: bool = parser.peek_at(scan + 1) == TokenKind.Dot
+                        prev_is_dot: bool = scan > 0 and parser.peek_at(scan - 1) == TokenKind.Dot
+                        # Whole-`changes ROOT` root (bare, not a `.field` selector).
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: word, line: 3900000010}) if mode == FrameClauseMode.Changes and not frame_clause_keyword(word) and not next_is_dot and not prev_is_dot
+                        # `preserves ROOT.field` — root + field pushed together (index-paired).
+                        if mode == FrameClauseMode.Preserves and not frame_clause_keyword(word) and next_is_dot and not prev_is_dot:
+                            preserved_field: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan + 2], parser.source) if parser.peek_at(scan + 2) == TokenKind.Ident else sview("", 0, 0)
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: word, line: 3900000011})
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: preserved_field, line: 3900000012})
+                        # `changes ROOT.field` — the mutated field, keyed by function (3900000014).
+                        # A contracted callee whose declared `changes` set OVERLAPS a caller's
+                        # postcondition field cannot preserve it (interproc frame violation).
+                        if mode == FrameClauseMode.Changes and not frame_clause_keyword(word) and next_is_dot and not prev_is_dot:
+                            changed_field: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan + 2], parser.source) if parser.peek_at(scan + 2) == TokenKind.Ident else sview("", 0, 0)
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: function_name, name: changed_field, line: 3900000077}) if changed_field != ""
+                    scan <- scan + 1
+
+
+
+        def capture_signature_changes(parser: lmut Parser, method_name: sview, sentinel: u32) -> void:
+            return if method_name == ""
+            scan: mutable usize = 0
+            depth: mutable int = 0
+            mode: mutable FrameClauseMode = FrameClauseMode.Inactive
+            while parser.peek_at(scan) != TokenKind.Eof |parser, scan, depth, mode|:
+                kind: TokenKind = parser.peek_at(scan)
+                break if depth == 0 and kind == TokenKind.Newline
+                break if depth == 0 and kind == TokenKind.Colon and parser.peek_at(scan + 1) == TokenKind.Newline
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket
+                depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket
+                if kind == TokenKind.Ident:
+                    keyword: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan], parser.source)
+                    mode <- when keyword:
+                        "changes" -> FrameClauseMode.Changes
+                        _ -> FrameClauseMode.Inactive if frame_clause_keyword(keyword) else mode
+                if mode == FrameClauseMode.Changes and kind == TokenKind.Dot and parser.peek_at(scan + 1) == TokenKind.Ident:
+                    field: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan + 1], parser.source)
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: method_name, name: field, line: sentinel})
+                # The ROOT of each `changes` target — an Ident that starts a target (directly
+                # preceded by the `changes` keyword or a top-level comma) and is followed by `.`.
+                # Recorded under sentinel 3900000006 so the changes-target-is-a-parameter check can
+                # verify the root names an actual parameter. (The field capture above drops the root.)
+                if mode == FrameClauseMode.Changes and kind == TokenKind.Ident and parser.peek_at(scan + 1) == TokenKind.Dot and scan > 0:
+                    previous_token: Token = parser.tokens[parser.position + scan - 1]
+                    previous_is_target_start: bool = previous_token.kind == TokenKind.Comma or (previous_token.kind == TokenKind.Ident and Lexer::text_or_empty(previous_token, parser.source) == "changes")
+                    root: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan], parser.source)
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: method_name, name: root, line: 3900000006}) if previous_is_target_start
+                scan <- scan + 1
+
+
+
+        # Peek-scan the upcoming impl body (non-consuming) for each method's `requires`/`ensure`
+        # PREDICATE source span, keyed by method name: requires -> 3900000074, ensure -> 3900000075.
+        # The impl body is parsed normally afterward; this is a parallel capture so the variance
+        # check can text-compare impl vs protocol clauses without walking the parsed contract Exprs.
+        def capture_impl_contract_spans(parser: lmut Parser) -> void:
+            can Memory.Allocate, Abort.Panic:
+                scan: mutable usize = 0
+                indent_depth: mutable int = 0
+                seen_indent: mutable bool = false
+                current_method: mutable sview = ""
+                collecting_params: mutable bool = false
+                param_paren_depth: mutable int = 0
+                param_expect_name: mutable bool = false
+                while parser.peek_at(scan) != TokenKind.Eof |parser, scan, indent_depth, seen_indent, current_method, collecting_params, param_paren_depth, param_expect_name|:
+                    kind: TokenKind = parser.peek_at(scan)
+                    scanned: Token = parser.tokens[parser.position + scan]
+                    seen_indent <- true if kind == TokenKind.Indent
+                    indent_depth <- indent_depth + 1 if kind == TokenKind.Indent
+                    indent_depth <- indent_depth - 1 if kind == TokenKind.Dedent
+                    break if seen_indent and indent_depth == 0 and kind == TokenKind.Dedent
+                    current_method <- Lexer::text_or_empty(parser.tokens[parser.position + scan + 1], parser.source) if kind == TokenKind.Def and parser.peek_at(scan + 1) == TokenKind.Ident
+                    # Capture the impl method's ORDERED param names (excluding self) at 3900000068.
+                    collecting_params <- true if kind == TokenKind.Def and parser.peek_at(scan + 1) == TokenKind.Ident
+                    if collecting_params:
+                        param_paren_depth <- param_paren_depth + 1 if kind == TokenKind.LParen
+                        param_expect_name <- true if kind == TokenKind.LParen and param_paren_depth == 0
+                        param_expect_name <- true if kind == TokenKind.Comma and param_paren_depth == 1
+                        if kind == TokenKind.Ident and param_expect_name and param_paren_depth == 1 and current_method != "":
+                            impl_param_ident: sview = Lexer::text_or_empty(scanned, parser.source)
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: current_method, name: impl_param_ident, line: 3900000068}) if impl_param_ident != "self"
+                            param_expect_name <- false
+                        param_paren_depth <- param_paren_depth - 1 if kind == TokenKind.RParen
+                        collecting_params <- false if kind == TokenKind.RParen and param_paren_depth == 0
+                    if kind == TokenKind.Ident and current_method != "":
+                        keyword: sview = Lexer::text_or_empty(scanned, parser.source)
+                        is_req: bool = keyword == "requires"
+                        is_ens: bool = keyword == "ensure" or keyword == "ensures"
+                        if is_req or is_ens:
+                            pred_end: mutable usize = scan + 1
+                            while parser.peek_at(pred_end) != TokenKind.Newline and parser.peek_at(pred_end) != TokenKind.Eof and parser.peek_at(pred_end) != TokenKind.Dedent and parser.peek_at(pred_end) != TokenKind.Indent |pred_end|:
+                                pred_end <- pred_end + 1
+                            if pred_end > scan + 1:
+                                pred_first: Token = parser.tokens[parser.position + scan + 1]
+                                pred_last: Token = parser.tokens[parser.position + pred_end - 1]
+                                pred_span: sview = Lexer::source_view_or_empty(parser.source, pred_first.start.usize(), pred_last.start.usize() + pred_last.length.usize())
+                                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: current_method, name: pred_span, line: 3900000074}) if is_req
+                                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: current_method, name: pred_span, line: 3900000075}) if is_ens
+                    scan <- scan + 1

@@ -1,0 +1,372 @@
+# Project system — a JSON READER over the raw bytes. Only what a manifest can contain is modelled:
+# objects, string lists, bools, and enough skipping to step over a value whose key was not
+# wanted. Escapes (including surrogate pairs) are resolved to UTF-8 here.
+# Continues project.elisa.
+
+extend ProjectSystem:
+
+    # ---- JSON ----------------------------------------------------------------------------
+    #
+    # Enough of RFC 8259 to read project.json and manifest.json, and no more. Values are
+    # pulled straight into the destination fields; there is no DOM. Every routine threads a
+    # JsonCursor — once `ok` goes false the caller stops, so a malformed file reports one
+    # failure rather than a cascade.
+    #
+    # The cursor is a struct rather than a pair of `mutable usize&` / `mutable bool&`
+    # out-parameters because a `mutable T&` reads as a reference, not a number: `data[position]`
+    # is rejected with "index must be numeric", while `data[cursor.position]` is a plain field
+    # read and works.
+    #
+    # stage0 decodes with DisallowUnknownFields, so an unrecognised key is an ERROR, not
+    # something to skip.
+
+    struct JsonCursor:
+        position: mutable usize
+        ok: mutable bool
+        # The key that failed, so the caller can reproduce Go's
+        # `json: unknown field "x"` verbatim rather than a generic message.
+        bad_key_start: mutable usize
+        bad_key_length: mutable usize
+
+
+
+    def json_skip_ws(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        while cursor.position < data.count |cursor, data|:
+            break if not bytes_is_space(data[cursor.position])
+            cursor.position <- cursor.position + 1.usize()
+
+
+
+    def json_at(data: darray[u8]&, position: usize) -> u8:
+        0 return if position >= data.count
+        return data[position]
+
+
+
+    def json_peek(data: darray[u8]&, cursor: mutable JsonCursor&) -> u8:
+        json_skip_ws(data, cursor)
+        return json_at(data, cursor.position)
+
+
+
+    # Append the UTF-8 encoding of a code point. A surrogate pair arrives as two \u escapes
+    # and is combined by the caller before this is reached.
+    def json_push_utf8(out: mutable darray[u8]&, code: u32) -> void:
+        can Memory.Allocate, Abort.Panic:
+            if code < 128:
+                out.push(code.u8())
+            elif code < 2048:
+                out.push((192 + (code / 64)).u8())
+                out.push((128 + (code % 64)).u8())
+            elif code < 65536:
+                out.push((224 + (code / 4096)).u8())
+                out.push((128 + ((code / 64) % 64)).u8())
+                out.push((128 + (code % 64)).u8())
+            else:
+                out.push((240 + (code / 262144)).u8())
+                out.push((128 + ((code / 4096) % 64)).u8())
+                out.push((128 + ((code / 64) % 64)).u8())
+                out.push((128 + (code % 64)).u8())
+
+
+
+    def json_hex_digit(byte: u8) -> i64:
+        (byte - 48).i64() return if byte >= 48 and byte <= 57
+        (byte - 97 + 10).i64() return if byte >= 97 and byte <= 102
+        (byte - 65 + 10).i64() return if byte >= 65 and byte <= 70
+        return -1
+
+
+
+    # Four hex digits at `position`, or -1 when they are not all hex.
+    def json_hex4(data: darray[u8]&, position: usize) -> i64:
+        value: mutable i64 = 0
+        for offset in 0..<4 |value, data, position|:
+            digit: i64 = json_hex_digit(json_at(data, position + offset.usize()))
+            -1 return if digit < 0
+            value <- value * 16 + digit
+        return value
+
+
+
+    def json_span_is(data: darray[u8]&, start: usize, length: usize, name: sview) -> bool:
+        false return if length.i64() != sview_len(name).i64()
+        false return if start + length > data.count
+        for index in 0..<length |data, name, start|:
+            false return if data[start + index] != sview_at(name, index.i64())
+        return true
+
+
+
+    # A quoted string with escapes resolved. The cursor must be at the opening quote and is
+    # left just past the closing one.
+    def json_parse_string(data: darray[u8]&, cursor: mutable JsonCursor&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            json_skip_ws(data, cursor)
+            if json_at(data, cursor.position) != 34:
+                cursor.ok <- false
+                return out
+            cursor.position <- cursor.position + 1.usize()
+            while cursor.position < data.count |cursor, out, data|:
+                byte: u8 = data[cursor.position]
+                if byte == 34:
+                    cursor.position <- cursor.position + 1.usize()
+                    return out
+                if byte != 92:
+                    out.push(byte)
+                    cursor.position <- cursor.position + 1.usize()
+                    continue
+                escape: u8 = json_at(data, cursor.position + 1.usize())
+                cursor.position <- cursor.position + 2.usize()
+                if escape == 34 or escape == 92 or escape == 47:
+                    out.push(escape)
+                elif escape == 98:
+                    out.push(8)
+                elif escape == 102:
+                    out.push(12)
+                elif escape == 110:
+                    out.push(10)
+                elif escape == 114:
+                    out.push(13)
+                elif escape == 116:
+                    out.push(9)
+                elif escape == 117:
+                    first: i64 = json_hex4(data, cursor.position)
+                    if first < 0:
+                        cursor.ok <- false
+                        return out
+                    cursor.position <- cursor.position + 4.usize()
+                    code: mutable i64 = first
+                    # A high surrogate followed by \uDC00-\uDFFF combines into one code
+                    # point, so the bytes match what Go's decoder produces.
+                    if first >= 55296 and first <= 56319 and json_at(data, cursor.position) == 92 and json_at(data, cursor.position + 1.usize()) == 117:
+                        low: i64 = json_hex4(data, cursor.position + 2.usize())
+                        if low >= 56320 and low <= 57343:
+                            code <- 65536 + (first - 55296) * 1024 + (low - 56320)
+                            cursor.position <- cursor.position + 6.usize()
+                    json_push_utf8(&out, code.u32())
+                else:
+                    cursor.ok <- false
+                    return out
+            cursor.ok <- false
+            return out
+
+
+
+    # Decode one quoted string DIRECTLY into `list` as a new entry. Like `json_skip_value`,
+    # this cannot delegate to `json_parse_string`: the function returns void and so has no
+    # region for an owned result. Appending into the list's own buffer avoids the temporary
+    # altogether, which is the same trick the escape handling below relies on.
+    def json_push_string_entry(data: darray[u8]&, cursor: mutable JsonCursor&, list: lmut StrList) -> void:
+        can Memory.Allocate, Abort.Panic:
+            json_skip_ws(data, cursor)
+            if json_at(data, cursor.position) != 34:
+                cursor.ok <- false
+                return
+            cursor.position <- cursor.position + 1.usize()
+            entry_start: usize = list.data.count
+            while cursor.position < data.count |cursor, list, data|:
+                byte: u8 = data[cursor.position]
+                if byte == 34:
+                    cursor.position <- cursor.position + 1.usize()
+                    list.starts <- list.starts.push(entry_start)
+                    list.lengths <- list.lengths.push(list.data.count - entry_start)
+                    return
+                if byte != 92:
+                    list.data <- list.data.push(byte)
+                    cursor.position <- cursor.position + 1.usize()
+                    continue
+                escape: u8 = json_at(data, cursor.position + 1.usize())
+                cursor.position <- cursor.position + 2.usize()
+                if escape == 34 or escape == 92 or escape == 47:
+                    list.data <- list.data.push(escape)
+                elif escape == 98:
+                    list.data <- list.data.push(8)
+                elif escape == 102:
+                    list.data <- list.data.push(12)
+                elif escape == 110:
+                    list.data <- list.data.push(10)
+                elif escape == 114:
+                    list.data <- list.data.push(13)
+                elif escape == 116:
+                    list.data <- list.data.push(9)
+                elif escape == 117:
+                    first_unit: i64 = json_hex4(data, cursor.position)
+                    if first_unit < 0:
+                        cursor.ok <- false
+                        return
+                    cursor.position <- cursor.position + 4.usize()
+                    code: mutable i64 = first_unit
+                    if first_unit >= 55296 and first_unit <= 56319 and json_at(data, cursor.position) == 92 and json_at(data, cursor.position + 1.usize()) == 117:
+                        low: i64 = json_hex4(data, cursor.position + 2.usize())
+                        if low >= 56320 and low <= 57343:
+                            code <- 65536 + (first_unit - 55296) * 1024 + (low - 56320)
+                            cursor.position <- cursor.position + 6.usize()
+                    scalar: u32 = code.u32()
+                    if scalar < 128:
+                        list.data <- list.data.push(scalar.u8())
+                    elif scalar < 2048:
+                        list.data <- list.data.push((192 + (scalar / 64)).u8())
+                        list.data <- list.data.push((128 + (scalar % 64)).u8())
+                    elif scalar < 65536:
+                        list.data <- list.data.push((224 + (scalar / 4096)).u8())
+                        list.data <- list.data.push((128 + ((scalar / 64) % 64)).u8())
+                        list.data <- list.data.push((128 + (scalar % 64)).u8())
+                    else:
+                        list.data <- list.data.push((240 + (scalar / 262144)).u8())
+                        list.data <- list.data.push((128 + ((scalar / 4096) % 64)).u8())
+                        list.data <- list.data.push((128 + ((scalar / 64) % 64)).u8())
+                        list.data <- list.data.push((128 + (scalar % 64)).u8())
+                else:
+                    cursor.ok <- false
+                    return
+            cursor.ok <- false
+
+
+
+    # Consume `[` ... `]` of strings into `list`. The cursor must be at the opening bracket.
+    def json_read_string_list(data: darray[u8]&, cursor: mutable JsonCursor&, list: lmut StrList) -> void:
+        can Memory.Allocate, Abort.Panic:
+            json_skip_ws(data, cursor)
+            if json_at(data, cursor.position) != 91:
+                cursor.ok <- false
+                return
+            cursor.position <- cursor.position + 1.usize()
+            first: mutable bool = true
+            while cursor.ok |cursor, list, first, data|:
+                json_skip_ws(data, cursor)
+                if json_at(data, cursor.position) == 93:
+                    cursor.position <- cursor.position + 1.usize()
+                    break
+                if not first:
+                    if json_at(data, cursor.position) != 44:
+                        cursor.ok <- false
+                        break
+                    cursor.position <- cursor.position + 1.usize()
+                first <- false
+                list <- json_push_string_entry(data, cursor, list)
+                break if not cursor.ok
+
+
+
+    # Step over a quoted string WITHOUT building it. `json_skip_value` returns void, so it
+    # cannot call `json_parse_string`: a void function has no region to allocate the result
+    # in. Scanning in place sidesteps that entirely.
+    def json_skip_string(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        if json_at(data, cursor.position) != 34:
+            cursor.ok <- false
+            return
+        cursor.position <- cursor.position + 1.usize()
+        while cursor.position < data.count |cursor, data|:
+            byte: u8 = data[cursor.position]
+            if byte == 92:
+                cursor.position <- cursor.position + 2.usize()
+                continue
+            cursor.position <- cursor.position + 1.usize()
+            return if byte == 34
+        cursor.ok <- false
+
+
+
+    # Step over any value, used only once its key has already been rejected so that the
+    # error message can name a position inside a well-formed document.
+    def json_skip_value(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        json_skip_ws(data, cursor)
+        byte: u8 = json_at(data, cursor.position)
+        if byte == 34:
+            json_skip_string(data, cursor)
+            return
+        if byte == 91 or byte == 123:
+            depth: mutable i64 = 0
+            while cursor.position < data.count |cursor, depth, data|:
+                current: u8 = data[cursor.position]
+                if current == 34:
+                    json_skip_string(data, cursor)
+                    break if not cursor.ok
+                    continue
+                depth <- depth + 1 if current == 91 or current == 123
+                depth <- depth - 1 if current == 93 or current == 125
+                cursor.position <- cursor.position + 1.usize()
+                break if depth == 0
+            cursor.ok <- false if depth != 0
+            return
+        # A bare literal or number: run to the next structural byte.
+        start: usize = cursor.position
+        while cursor.position < data.count |cursor, data|:
+            current: u8 = data[cursor.position]
+            break if current == 44 or current == 93 or current == 125 or bytes_is_space(current)
+            cursor.position <- cursor.position + 1.usize()
+        cursor.ok <- false if cursor.position == start
+
+
+
+    def json_read_bool(data: darray[u8]&, cursor: mutable JsonCursor&) -> bool:
+        json_skip_ws(data, cursor)
+        if json_span_is(data, cursor.position, 4.usize(), "true"):
+            cursor.position <- cursor.position + 4.usize()
+            return true
+        if json_span_is(data, cursor.position, 5.usize(), "false"):
+            cursor.position <- cursor.position + 5.usize()
+            return false
+        cursor.ok <- false
+        return false
+
+
+
+    # Position the cursor at the value of the next key of an object, reporting the key as a
+    # span into `data` (neither schema uses escapes in a key). Returns false at `}`.
+    def json_next_key(data: darray[u8]&, cursor: mutable JsonCursor&, first: mutable bool&, out_start: mutable usize&, out_length: mutable usize&) -> bool:
+        json_skip_ws(data, cursor)
+        if json_at(data, cursor.position) == 125:
+            cursor.position <- cursor.position + 1.usize()
+            return false
+        # `not first` is rejected on a `mutable bool&` (it reads as a reference, not a
+        # bool); the comparison form derefs.
+        if first == false:
+            if json_at(data, cursor.position) != 44:
+                cursor.ok <- false
+                return false
+            cursor.position <- cursor.position + 1.usize()
+            json_skip_ws(data, cursor)
+            # Go rejects a trailing comma before `}`, so this does too.
+            if json_at(data, cursor.position) == 125:
+                cursor.ok <- false
+                return false
+        first <- false
+        if json_at(data, cursor.position) != 34:
+            cursor.ok <- false
+            return false
+        cursor.position <- cursor.position + 1.usize()
+        out_start <- cursor.position
+        while cursor.position < data.count |cursor, data|:
+            break if data[cursor.position] == 34 or data[cursor.position] == 92
+            cursor.position <- cursor.position + 1.usize()
+        if json_at(data, cursor.position) != 34:
+            cursor.ok <- false
+            return false
+        out_length <- cursor.position - out_start
+        cursor.position <- cursor.position + 1.usize()
+        json_skip_ws(data, cursor)
+        if json_at(data, cursor.position) != 58:
+            cursor.ok <- false
+            return false
+        cursor.position <- cursor.position + 1.usize()
+        return true
+
+
+
+    # Consume the `{` that opens an object.
+    def json_open_object(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        json_skip_ws(data, cursor)
+        if json_at(data, cursor.position) != 123:
+            cursor.ok <- false
+            return
+        cursor.position <- cursor.position + 1.usize()
+
+
+
+    # After the top-level value: only whitespace may remain (Go reports trailing data).
+    def json_finish(data: darray[u8]&, cursor: mutable JsonCursor&) -> void:
+        json_skip_ws(data, cursor)
+        cursor.ok <- false if cursor.position != data.count

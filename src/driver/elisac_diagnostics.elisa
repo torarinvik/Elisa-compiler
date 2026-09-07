@@ -1,0 +1,248 @@
+# Driver — DIAGNOSTIC OUTPUT. Findings go to stderr through libc `write`, in stage0's
+# `PATH:LINE:COLUMN: message` shape. The location half has to map a FLAT line back to its
+# original file and line, because the unit the driver compiles is the include expansion, not the
+# file the user named.
+# Diagnostics go to STDERR through the std's libc `write` (declared in debug_referee.elisa as
+# `write(fd: int, buf: void&, count: usize)`), NOT through `puts`: the driver includes
+# elisacore_std, whose own `puts` overload shadows libc's under both the stage0 seed and the
+# stage1 meta-compile. Passing an explicit length also avoids needing a NUL terminator on an
+# owned darray.
+
+
+# `n` as ASCII decimal, appended to `buffer`. Line numbers only, so u32 range is enough.
+def append_decimal(buffer: mutable darray[u8]&, value: u32) -> void can[Abort.Panic, Memory.Allocate]:
+    if value == 0:
+        buffer.push(48)
+        return
+    digits: mutable darray[u8] = []
+    remaining: mutable u32 = value
+    for _step in 0..<12 |digits, remaining|:
+        break if remaining == 0
+        digits.push((48 + (remaining % 10)).u8())
+        remaining <- remaining / 10
+    for reverse_index in 0..<digits.count |buffer, digits|:
+        buffer.push(digits[digits.count - 1.usize() - reverse_index])
+
+
+
+
+# Signed counterpart used when reproducing literal default arguments in generated C. Keep the
+# minimum i64 spelling explicit because negating it would overflow before it reaches the buffer.
+def append_decimal_i64(buffer: mutable darray[u8]&, value: i64) -> void can[Abort.Panic, Memory.Allocate]:
+    if value == -9223372036854775807 - 1:
+        emit_tokens_push_sview(buffer, "-9223372036854775808")
+        return
+    negative: bool = value < 0
+    magnitude: mutable i64 = -value if negative else value
+    buffer.push(45) if negative
+    digits: mutable darray[u8] = []
+    digits.push(48) if magnitude == 0
+    while magnitude > 0 |digits, magnitude|:
+        digits.push((48 + (magnitude % 10)).u8())
+        magnitude <- magnitude / 10
+    for reverse_index in 0..<digits.count |buffer, digits|:
+        buffer.push(digits[digits.count - 1.usize() - reverse_index])
+
+
+
+
+def write_stderr(buffer: darray[u8]&) -> void can[Abort.Panic, Unsafe.PointerCast, Console]:
+    can Console:
+        return if buffer.count == 0
+        # The cast is its own statement: an inline `expr.cast[T] can Effect` inside an argument
+        # list reads as the end of the call.
+        raw: void& = (&buffer[0]).cast[void&] can Unsafe.PointerCast
+        _ = write(2, raw, buffer.count)
+
+
+
+
+    # One diagnostic in stage0's shape minus the file/column span the stdin protocol does not
+    # carry: `LINE: error: MESSAGE`. Wording comes from Semantic::diagnostic_message, the single
+    # source of truth, so the CLI never re-derives per-kind text.
+    #
+    # Without this the driver rejected a program with a bare exit 1 and no explanation — the
+    # accept/reject DECISION matched stage0 while the compiler was unusable for the thing a
+    # diagnostic exists to do. Errors only: warnings do not block the build, and stage1's
+    # semantic layer still over-reports them relative to stage0.
+# Append the source path from ELISA_STAGE1_SRC, raw (no escaping — that is the JSON
+# tokens report's concern). Nothing is appended when the variable is unset, which is how a
+# pure-stdin caller that never named a file still gets a usable `LINE: message`.
+def push_source_path(buffer: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    flag_storage: mutable darray[u8] = []
+    for flag_index in 0..<sview_len("ELISA_STAGE1_SRC") |flag_storage|:
+        flag_storage.push(sview_at("ELISA_STAGE1_SRC", flag_index))
+    flag_storage.push(0)
+    flag_name: cstr = (&flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+    wrote_any: mutable bool = false
+    if getenv(flag_name) is path_bytes:
+        cursor: mutable i64 = 0
+        keep_scanning: mutable bool = true
+        while keep_scanning |cursor, keep_scanning, buffer, wrote_any, path_bytes|:
+            byte_ref: u8& = path_bytes + cursor
+            path_byte: u8 = byte_ref
+            if path_byte == 0:
+                keep_scanning <- false
+            else:
+                buffer.push(path_byte)
+                wrote_any <- true
+                cursor <- cursor + 1
+    return wrote_any
+
+
+
+
+# A PARSE error, in stage0's position shape `PATH:LINE:COLUMN: message`.
+#
+# stage1 previously reported parse errors by exiting 1 with NO output at all — the one
+# class of diagnostic every user hits first, and the compiler said nothing. Unlike a
+# semantic Diagnostic, Ast::ParseError carries BOTH line and column, so the position here
+# is exactly stage0's.
+#
+# The wording is deliberately close-but-not-identical to stage0's: stage0 names the
+# offending TOKEN KIND ("unexpected token DEDENT in expression"), which needs a token-kind
+# name table this driver does not have. The offending token's TEXT is printed instead,
+# which is the actionable part. Position parity first; wording parity is a separate job.
+# Write `PATH:LINE` for a diagnostic reported at FLAT_LINE of the flattened unit.
+#
+# stage0 names the file the fault is IN and that file's own line number. stage1 reported the
+# flattened line against the ROOT path, so in any program with includes the location named a
+# line the reader could not find — `a.elisa:6` for a fault stage0 puts at `a.elisa:4`, and a
+# fault inside an included file was attributed to the root entirely.
+#
+# ELISA_STAGE1_LINE_MAP holds `FLAT:ORIG:PATH` entries (see push_line_map_entry). Take the
+# LAST entry whose FLAT is <= flat_line: that is the file-run the line falls in, and the
+# original line is `orig + (flat_line - flat)`. With no map — the wrapper flattens before the
+# driver runs and sets none — fall back to the previous behaviour unchanged.
+# The original line alone (no path), for printers that already print their own file: the
+# same LAST-entry-at-or-below rule as push_diagnostic_location; the flat line unchanged
+# without a map.
+def flat_line_to_original(flat_line: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    map_storage: mutable darray[u8] = []
+    flat_line return if not env_value("ELISA_STAGE1_LINE_MAP", &map_storage)
+    best_flat: mutable u32 = 0
+    best_orig: mutable u32 = 0
+    cursor: mutable usize = 0.usize()
+    while cursor < map_storage.count |cursor, best_flat, best_orig, map_storage, flat_line|:
+        entry_stop: mutable usize = cursor
+        while entry_stop < map_storage.count |entry_stop, map_storage|:
+            break if map_storage[entry_stop] == 10
+            entry_stop <- entry_stop + 1.usize()
+        scan: mutable usize = cursor
+        entry_flat: mutable u32 = 0
+        while scan < entry_stop |scan, entry_flat, map_storage|:
+            break if map_storage[scan] == 58
+            entry_flat <- entry_flat * 10 + (map_storage[scan] - 48).u32()
+            scan <- scan + 1.usize()
+        scan <- scan + 1.usize()
+        entry_orig: mutable u32 = 0
+        while scan < entry_stop |scan, entry_orig, map_storage|:
+            break if map_storage[scan] == 58
+            entry_orig <- entry_orig * 10 + (map_storage[scan] - 48).u32()
+            scan <- scan + 1.usize()
+        if entry_flat <= flat_line and entry_flat >= best_flat:
+            best_flat <- entry_flat
+            best_orig <- entry_orig
+        cursor <- entry_stop + 1.usize()
+    flat_line return if best_flat == 0
+    return best_orig + (flat_line - best_flat)
+
+
+
+
+def push_diagnostic_location(buffer: mutable darray[u8]&, flat_line: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    map_storage: mutable darray[u8] = []
+    if env_value("ELISA_STAGE1_LINE_MAP", &map_storage):
+        best_flat: mutable u32 = 0
+        best_orig: mutable u32 = 0
+        best_start: mutable usize = 0.usize()
+        best_stop: mutable usize = 0.usize()
+        cursor: mutable usize = 0.usize()
+        while cursor < map_storage.count |cursor, best_flat, best_orig, best_start, best_stop, map_storage, flat_line|:
+            entry_stop: mutable usize = cursor
+            while entry_stop < map_storage.count |entry_stop, map_storage|:
+                break if map_storage[entry_stop] == 10
+                entry_stop <- entry_stop + 1.usize()
+            # FLAT ':' ORIG ':' PATH
+            scan: mutable usize = cursor
+            entry_flat: mutable u32 = 0
+            while scan < entry_stop |scan, entry_flat, map_storage|:
+                break if map_storage[scan] == 58
+                entry_flat <- entry_flat * 10 + (map_storage[scan] - 48).u32()
+                scan <- scan + 1.usize()
+            scan <- scan + 1.usize()
+            entry_orig: mutable u32 = 0
+            while scan < entry_stop |scan, entry_orig, map_storage|:
+                break if map_storage[scan] == 58
+                entry_orig <- entry_orig * 10 + (map_storage[scan] - 48).u32()
+                scan <- scan + 1.usize()
+            scan <- scan + 1.usize()
+            if entry_flat <= flat_line and entry_flat >= best_flat:
+                best_flat <- entry_flat
+                best_orig <- entry_orig
+                best_start <- scan
+                best_stop <- entry_stop
+            cursor <- entry_stop + 1.usize()
+        if best_flat > 0:
+            for path_index in best_start..<best_stop |buffer, map_storage|:
+                buffer.push(map_storage[path_index])
+            buffer.push(58)
+            append_decimal(buffer, best_orig + (flat_line - best_flat))
+            return
+    if push_source_path(buffer):
+        buffer.push(58)
+    append_decimal(buffer, flat_line)
+
+
+
+
+def report_parse_error(failure: Ast::ParseError) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    line_buffer: mutable darray[u8] = []
+    push_diagnostic_location(&line_buffer, failure.line)
+    line_buffer.push(58)                                  # ':'
+    append_decimal(line_buffer, failure.column)
+    line_buffer.push(58)                                  # ':'
+    line_buffer.push(32)                                  # ' '
+    text: sview = match failure.kind:
+        Ast::ParseErrorKind.ExpectedToken: "expected a different token"
+        Ast::ParseErrorKind.UnexpectedToken: "unexpected token"
+        Ast::ParseErrorKind.ExpectedDeclaration: "expected a declaration"
+        Ast::ParseErrorKind.ExpectedExpression: "expected an expression"
+        Ast::ParseErrorKind.MismatchedWithBindings: "or-arm alternatives bind different constants"
+        Ast::ParseErrorKind.SubmitOutsidePool: "submit outside a pool"
+        _: "parse error"
+    for text_index in 0..<sview_len(text) |line_buffer, text|:
+        line_buffer.push(sview_at(text, text_index))
+    if sview_len(failure.context) > 0:
+        for prefix_index in 0..<sview_len(" near \"") |line_buffer|:
+            line_buffer.push(sview_at(" near \"", prefix_index))
+        for context_index in 0..<sview_len(failure.context) |line_buffer, failure|:
+            line_buffer.push(sview_at(failure.context, context_index))
+        line_buffer.push(34)                              # '"'
+    line_buffer.push(10)
+    write_stderr(line_buffer)
+
+
+
+
+def report_diagnostic(diagnostic: Semantic::Diagnostic) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    line_buffer: mutable darray[u8] = []
+    # stage0's shape is `PATH:LINE:COLSTART-COLEND: MESSAGE`.
+    #
+    # The span is printed when the reporting check carried one. A check that has not been
+    # threaded to the AST node's `Ast::Pos` yet leaves `end_column` at zero and prints
+    # `PATH:LINE:` — what every check printed before the AST grew spans. So this converges
+    # check by check rather than needing all ~790 construction sites changed at once, and a
+    # half-threaded tree is never WRONG about a column, only silent about it.
+    push_diagnostic_location(&line_buffer, diagnostic.line)
+    line_buffer.push(58)                                  # ':'
+    if diagnostic.pos.end_column > 0:
+        append_decimal(line_buffer, diagnostic.pos.column)
+        line_buffer.push(45)                              # '-'
+        append_decimal(line_buffer, diagnostic.pos.end_column)
+        line_buffer.push(58)                              # ':'
+    line_buffer.push(32)                                  # ' '
+    message: darray[u8] = Semantic::diagnostic_message(diagnostic)
+    line_buffer.extend(message)
+    line_buffer.push(10)                                  # '\n'
+    write_stderr(line_buffer)

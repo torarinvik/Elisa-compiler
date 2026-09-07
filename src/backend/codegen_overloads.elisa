@@ -1,0 +1,307 @@
+# Stage1 backend — resolving a NAME to a function: overload selection by argument types and
+# arity, `__cast__` hooks, named arguments, and the declared parameter and return types an
+# emitter asks about before it emits a call.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        # The handle for `owner::name`, or null when there is no such function.
+        # When overloads share a bare name, the first registered entry is returned —
+        # prefer `lookup_function_arity` at call sites with a known argument count.
+        def lookup_function(fns: FnTable&, owner: sview, name: sview) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.handles[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return null
+
+
+
+        # Among several overloads sharing (owner, name, ARITY), the index whose declared
+        # parameter types match the arguments — or -1.
+        #
+        # Arity alone is not enough. `def f(x: i64)` and `def f(x: bool)` are both legal and
+        # both arity 1 (stage0 accepts type-based overloads and REJECTS arity-based ones), and
+        # emit_direct_call took the FIRST arity match, so `f(true)` called the i64 body:
+        # stage0 answered 21 and stage1 answered 11. The symbols were already distinct
+        # (`f` and `f.1`, suffixed by arity) — the defect was purely in resolution.
+        #
+        # A bare numeric literal matches its whole numeric family, since `f(5)` types as
+        # Unmodeled: an int literal has no type of its own and adopts its context.
+        # The type a receiver-method cast NAMES when it is not a builtin scalar: a packed
+        # (hierarchy) or payload enum. Used to recognise `x.Event()` as a `__cast__` hook
+        # call rather than a UFCS call to a function named `Event`.
+        def cast_hook_target_type(name: sview, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            packed_target: i64 = packed_index_of(structs, name)
+            ValueType{kind: TypeKind.PackedEnum, bits: packed_target.u32()} return if packed_target >= 0
+            payload_target: i64 = penum_index_of(structs, name)
+            ValueType{kind: TypeKind.PayloadEnum, bits: payload_target.u32()} return if payload_target >= 0
+            return unmodeled_type()
+
+
+
+        # The index of a visible `__cast__(source) -> target` overload, or -1. The pair is
+        # EXACT on both ends, which is stage0's rule: an untyped literal must be given a
+        # type first (`5.i32().Event()`), and a hook is never picked by return type alone.
+        def cast_hook_index(fns: FnTable&, source: ValueType, target: ValueType) -> i64 can[Abort.Panic]:
+            return -1 if source.kind == TypeKind.Unmodeled or target.kind == TypeKind.Unmodeled
+            for index in 0..<fns.names.count |fns, source, target|:
+                continue if fns.names[index] != "__cast__"
+                continue if fns.param_count[index] != 1
+                declared: ValueType = fns.param_types[fns.param_start[index]]
+                continue if declared.kind != source.kind or declared.bits != source.bits
+                returned: ValueType = fns.returns[index]
+                continue if returned.kind != target.kind or returned.bits != target.bits
+                return index.i64()
+            return -1
+
+
+
+        def overload_index_for_args(fns: FnTable&, owner: sview, name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, structs: mutable StructTable&, generics: mutable GenericTable&) -> i64 can[Abort.Panic, Memory.Allocate] :
+            can Abort.Panic:
+                for index in 0..<fns.names.count |fns, owner, name, arguments, local_scope, structs, generics|:
+                    continue if fns.names[index] != name or fns.owners[index] != owner
+                    continue if fns.param_count[index] != arguments.count
+                    matched: mutable bool = arguments.count > 0
+                    for position in 0..<arguments.count |matched, index, fns, arguments, local_scope, structs, generics|:
+                        continue if not matched
+                        declared: ValueType = fns.param_types[fns.param_start[index] + position]
+                        actual: ValueType = expression_type(arguments[position], local_scope, fns, structs, generics)
+                        if actual.kind == TypeKind.Unmodeled:
+                            lit_ok: mutable bool = false
+                            match arguments[position]:
+                                Expr.IntLit(oia_int_text):
+                                    lit_ok <- declared.kind == TypeKind.Signed or declared.kind == TypeKind.Unsigned
+                                _:
+                                    pass
+                            match arguments[position]:
+                                Expr.FloatLit(oia_float_text):
+                                    lit_ok <- declared.kind == TypeKind.Float
+                                _:
+                                    pass
+                            matched <- lit_ok
+                        else:
+                            # A `T&` PARAMETER is matched by a plain `T` ARGUMENT. The call
+                            # emitter borrows the place implicitly (see the ref-argument path
+                            # in emit_direct_call), so `def fail(detail: i64&)` really is a
+                            # candidate for `fail(n)` with an i64 local — but comparing Ref
+                            # against Signed disqualified it, the candidate set came back
+                            # EMPTY, and resolution fell through to "first overload with this
+                            # arity".
+                            #
+                            # That fallback is what made this a real bug rather than a missed
+                            # optimisation: elisacore_std's test.elisa declares
+                            # `def fail(message: cstr)` and the prelude pulls it into every
+                            # program, so any user function named `fail` taking one reference
+                            # argument lost the resolution to it, and emitting the argument at
+                            # `cstr` then DECLINED — killing every function in the unit. It
+                            # cost a long bisect in the project system, where the only symptom
+                            # was that routing errors through a shared helper stopped
+                            # compiling. stage0 resolves it correctly.
+                            #
+                            # Only when the argument is not ITSELF a reference: `T&` given a
+                            # `T&` already matches on kind, and rewriting that case would let
+                            # a `T&&` parameter claim a `T&` argument.
+                            expected: mutable ValueType = declared
+                            expected <- ref_target_of(declared, structs) if declared.kind == TypeKind.Ref and actual.kind != TypeKind.Ref
+                            matched <- false if expected.kind != actual.kind or expected.bits != actual.bits
+                    index.i64() return if matched
+                return -1
+
+
+
+        # How many overloads of `owner::name` overload_index_for_args would accept — i.e. the
+        # size of the candidate set it returns the FIRST of. Same predicate, counted instead
+        # of short-circuited.
+        #
+        # A caller that cannot tolerate a guess asks for this first. Static protocol dispatch
+        # through a bound type parameter is the case: stage1 models `char`, `int`, `i64` and
+        # `isize` as ONE ValueType (Signed/64, see scalar_type_of_name), so the std's
+        # `impl Str for char` and `impl Str for i64` are indistinguishable here, and taking
+        # the first made `print(42)` answer "*" — chr(42), through the char impl. Measured.
+        # A wrong answer is worse than a decline, so an ambiguous set falls through.
+        def overload_match_count(fns: FnTable&, owner: sview, name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, structs: mutable StructTable&, generics: mutable GenericTable&) -> i64 can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic:
+                total: mutable i64 = 0
+                for index in 0..<fns.names.count |total, fns, owner, name, arguments, local_scope, structs, generics|:
+                    continue if fns.names[index] != name or fns.owners[index] != owner
+                    continue if fns.param_count[index] != arguments.count
+                    matched: mutable bool = arguments.count > 0
+                    for position in 0..<arguments.count |matched, index, fns, arguments, local_scope, structs, generics|:
+                        continue if not matched
+                        declared: ValueType = fns.param_types[fns.param_start[index] + position]
+                        actual: ValueType = expression_type(arguments[position], local_scope, fns, structs, generics)
+                        if actual.kind == TypeKind.Unmodeled:
+                            lit_ok: mutable bool = false
+                            match arguments[position]:
+                                Expr.IntLit(omc_int_text):
+                                    lit_ok <- declared.kind == TypeKind.Signed or declared.kind == TypeKind.Unsigned
+                                _:
+                                    pass
+                            match arguments[position]:
+                                Expr.FloatLit(omc_float_text):
+                                    lit_ok <- declared.kind == TypeKind.Float
+                                _:
+                                    pass
+                            matched <- lit_ok
+                        else:
+                            expected: mutable ValueType = declared
+                            expected <- ref_target_of(declared, structs) if declared.kind == TypeKind.Ref and actual.kind != TypeKind.Ref
+                            matched <- false if expected.kind != actual.kind or expected.bits != actual.bits
+                    total <- total + 1 if matched
+                return total
+
+
+
+
+            # Does a NON-GENERIC top-level overload of NAME take EXACTLY these argument types?
+            #
+            # The second half of the overload fix; see decl_line_is_generic for the first. Once
+            # the non-generic body is emitted again, calls still have to PREFER it: resolution
+            # tries generics first, which is right for `identity(42)` and wrong whenever an
+            # exact overload exists. `f(5)` beside `f[T](x: T)` bound to the instantiation and
+            # answered 2 where stage0 answers 1.
+            #
+            # Strict on everything EXCEPT a bare numeric literal: `f(5)` types as Unmodeled (an
+            # int literal has no type of its own and adopts its context), so requiring an exact
+            # type would disqualify the very call this exists for. A literal therefore matches
+            # any parameter of the corresponding numeric family; everything else must match on
+            # kind AND bits, and a non-literal argument of unknown type still disqualifies the
+            # candidate — a near-match has to fall through to the generic, which is what converts.
+        def exact_overload_exists(fns: FnTable&, name: sview, arguments: darray[Expr]&, local_scope: mutable Scope&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic:
+                for index in 0..<fns.names.count |fns, name, arguments, local_scope, structs, generics|:
+                    continue if fns.names[index] != name or fns.owners[index] != ""
+                    continue if fns.param_count[index] != arguments.count
+                    matched: mutable bool = arguments.count > 0
+                    for position in 0..<arguments.count |matched, index, fns, arguments, local_scope, structs, generics|:
+                        continue if not matched
+                        declared: ValueType = fns.param_types[fns.param_start[index] + position]
+                        actual: ValueType = expression_type(arguments[position], local_scope, fns, structs, generics)
+                        if actual.kind == TypeKind.Unmodeled:
+                            literal_ok: mutable bool = false
+                            match arguments[position]:
+                                Expr.IntLit(ovl_int_text):
+                                    literal_ok <- declared.kind == TypeKind.Signed or declared.kind == TypeKind.Unsigned
+                                _:
+                                    pass
+                            match arguments[position]:
+                                Expr.FloatLit(ovl_float_text):
+                                    literal_ok <- declared.kind == TypeKind.Float
+                                _:
+                                    pass
+                            matched <- literal_ok
+                        else:
+                            matched <- false if declared.kind != actual.kind or declared.bits != actual.bits
+                    true return if matched
+                return false
+
+
+
+            # Overload-aware lookup: match bare name + owner + declared parameter count
+            # (arena / error-out params are not included in `arity`).
+        def lookup_function_arity(fns: FnTable&, owner: sview, name: sview, arity: usize) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, arity|:
+                fns.handles[index] return if fns.names[index] == name and fns.owners[index] == owner and fns.param_count[index] == arity
+            return null
+
+
+
+
+        # The declared type of function `name`'s parameter `position`, or Unmodeled.
+        # Emitting each argument at its parameter's type is what makes a literal argument
+        # adopt the parameter type instead of defaulting to i64.
+        def param_type_of(fns: FnTable&, owner: sview, name: sview, position: usize) -> ValueType can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, position|:
+                if fns.names[index] == name and fns.owners[index] == owner:
+                    unmodeled_type() return if position >= fns.param_count[index]
+                    return copied_type(fns.param_types[fns.param_start[index] + position])
+            return unmodeled_type()
+
+
+
+
+        def param_type_count(fns: FnTable&, owner: sview, name: sview) -> usize can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                fns.param_count[index] return if fns.names[index] == name and fns.owners[index] == owner
+            return 0
+
+
+
+
+        # Return the source-argument index that supplies parameter `wanted`. Positional
+        # arguments fill the next unassigned parameter; labelled arguments select by name.
+        # `first_position` is 1 for UFCS calls because parameter 0 is the implicit receiver.
+        # An entirely empty name vector is the canonical AST representation for an all-positional
+        # call built by a lowering pass (for example `machine from`'s enum-state constructor),
+        # so it must not be read as an argument-count mismatch. The old loop returned -1 for that
+        # shape, making every lowered multi-field constructor decline while the same source-written
+        # constructor compiled.
+        def named_argument_index(argument_names: darray[sview]&, parameter_names: darray[sview]&, parameter_start: usize, parameter_count: usize, first_position: usize, wanted: usize) -> i64 can[Abort.Panic, Memory.Allocate]:
+            -1 return if wanted < first_position or wanted >= parameter_count
+            if argument_names.count == 0:
+                return (wanted - first_position).i64()
+            assigned: mutable darray[bool] = [false for _slot in 0..<parameter_count]
+            assigned[0] <- true if first_position == 1 and parameter_count > 0
+            next_pos: mutable usize = first_position
+            for argument_index in 0..<argument_names.count |assigned, next_pos, argument_names, parameter_names, parameter_start, parameter_count, first_position, wanted|:
+                argument_name: sview = argument_names[argument_index]
+                selected: mutable usize = parameter_count
+                if argument_name != "":
+                    for parameter_index in first_position..<parameter_count |selected, argument_name, parameter_names, parameter_start|:
+                        if parameter_names[parameter_start + parameter_index] == argument_name:
+                            selected <- parameter_index
+                            break
+                else:
+                    while next_pos < parameter_count and assigned[next_pos] |next_pos, assigned|:
+                        next_pos <- next_pos + 1
+                    selected <- next_pos
+                    next_pos <- next_pos + 1 if next_pos < parameter_count
+                argument_index.i64() return if selected == wanted and selected < parameter_count and not assigned[selected]
+                -1 return if selected >= parameter_count or assigned[selected]
+                assigned[selected] <- true
+            return -1
+
+
+
+
+        # Generic declarations retain their parameter names in the AST rather than in FnTable.
+        # Use the same source-to-parameter assignment rules as ordinary calls.
+        def generic_named_argument_index(argument_names: darray[sview]&, parameters: darray[ParamDecl], wanted: usize) -> i64 can[Abort.Panic, Memory.Allocate]:
+            assigned: mutable darray[bool] = [false for _slot in 0..<parameters.count]
+            next_pos: mutable usize = 0
+            for argument_index in 0..<argument_names.count |assigned, next_pos, argument_names, parameters, wanted|:
+                argument_name: sview = argument_names[argument_index]
+                selected: mutable usize = parameters.count
+                if argument_name != "":
+                    for parameter_index in 0..<parameters.count |selected, argument_name, parameters|:
+                        if parameters[parameter_index].name == argument_name:
+                            selected <- parameter_index
+                            break
+                else:
+                    while next_pos < parameters.count and assigned[next_pos] |next_pos, assigned|:
+                        next_pos <- next_pos + 1
+                    selected <- next_pos
+                    next_pos <- next_pos + 1 if next_pos < parameters.count
+                argument_index.i64() return if selected == wanted and selected < parameters.count and not assigned[selected]
+                -1 return if selected >= parameters.count or assigned[selected]
+                assigned[selected] <- true
+            return -1
+
+
+
+
+        # C default argument promotions for the unnamed tail of a variadic call.
+        def c_variadic_promoted_type(value_type: ValueType) -> ValueType can[Abort.Panic]:
+            ValueType{kind: TypeKind.Signed, bits: 32} return if value_type.kind == TypeKind.Bool
+            ValueType{kind: TypeKind.Signed, bits: 32} return if (value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned) and value_type.bits < 32
+            ValueType{kind: TypeKind.Float, bits: 64} return if value_type.kind == TypeKind.Float and value_type.bits == 32
+            return copied_type(value_type)
+
+
+
+
+        # The declared return type of `name`, or Unmodeled when the module has no such
+        # function.
+        def lookup_return_type(fns: FnTable&, owner: sview, name: sview) -> ValueType can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name|:
+                copied_type(fns.returns[index]) return if fns.names[index] == name and fns.owners[index] == owner
+            return unmodeled_type()

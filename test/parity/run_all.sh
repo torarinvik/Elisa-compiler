@@ -418,7 +418,9 @@ declare -a JOB_NAMES JOB_CMDS
 push() { in_profile "$1" || return 0; JOB_NAMES+=("$1"); shift; JOB_CMDS+=("$(printf '%s\037' "$@")"); }
 
 push "behavioural differential corpus (ratchet)" "$REPO_ROOT/test/parity/differential_corpus.sh"
-push "self-hostable (0 unresolved / 132 files)" "$REPO_ROOT/test/parity/check_self_hostable.sh"
+# The file COUNT used to be in this label and rotted every time the frontend was split into
+# more part files; what the check actually asserts is the zero, so only the zero is named.
+push "self-hostable (0 unresolved across the frontend)" "$REPO_ROOT/test/parity/check_self_hostable.sh"
 # The heavy smokes go in FIRST (see HEAVY_FIRST): a short named check ahead of them occupies
 # a pool slot that a long pole needs at t=0.
 for h in "${HEAVY_FIRST[@]}"; do

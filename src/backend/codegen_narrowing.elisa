@@ -1,0 +1,193 @@
+# Stage1 backend — NULL NARROWING proofs: what an `assert PATH != null` or a guard condition
+# proves, what an assignment invalidates, and the snapshot/restore pair that rolls a branch's
+# proofs back at the join. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        # The `owner` half of a narrowable path: `m.items` -> "m", `p` -> "p". "" = a shape
+        # too complex to track (a call result, an index, a nested path), which simply never
+        # narrows.
+        def narrow_ident_of(path: Expr) -> sview can[Abort.Panic]:
+            # The translator keeps null-safe C pointer access explicit:
+            # `elisa_nonnull(pointer).field` and `(pointer).cast[T&].field`.
+            # Both wrappers preserve the same storage identity as the bare local, so
+            # flow proofs must look through them. Without this, the assertion on
+            # `elisa_nonnull(hooks).allocate` did not make the following callback call
+            # callable, even though the source had already proved the field non-null.
+            if path is Expr.Ident(narrow_ident_name, _):
+                return narrow_ident_name
+            if path is Expr.Paren(narrow_paren_inner, _):
+                return narrow_ident_of(narrow_paren_inner)
+            if path is Expr.Field(narrow_field_object, _, _):
+                return narrow_ident_of(narrow_field_object)
+            if path is Expr.Call(narrow_call_callee, narrow_call_args, _, _):
+                if narrow_call_callee is Expr.Ident(narrow_call_name, _):
+                    if narrow_call_name == "elisa_nonnull" and narrow_call_args.count == 1:
+                        return narrow_ident_of(narrow_call_args[0])
+                return ""
+            if path is Expr.Index(narrow_index_base, narrow_index_type, _):
+                if narrow_index_base is Expr.Field(narrow_cast_object, narrow_cast_name, _):
+                    if narrow_cast_name == "cast":
+                        return narrow_ident_of(narrow_cast_object)
+                return ""
+            return ""
+
+
+
+
+        def narrow_owner_of(path: Expr) -> sview can[Abort.Panic]:
+            can Abort.Panic:
+                return match path:
+                    Expr.Field(narrow_head, _, _): narrow_ident_of(narrow_head)
+                    Expr.Ident(narrow_ident_name, _): narrow_ident_name
+                    _: ""
+
+
+
+
+            # The `field` half: `m.items` -> "items", `p` -> "" (a bare local).
+        def narrow_field_of(path: Expr) -> sview can[Abort.Panic]:
+            return match path:
+                Expr.Field(_, narrow_f_name, _): narrow_f_name
+                _: ""
+
+
+
+
+        # Whether `path` has been proven non-null by an earlier `assert PATH != null`.
+        def path_is_narrowed(path: Expr, structs: StructTable&) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                narrow_owner: sview = narrow_owner_of(path)
+                false return if narrow_owner == ""
+                narrow_field: sview = narrow_field_of(path)
+                narrow_index: mutable usize = 0
+                while narrow_index < structs.narrowed_owners.count |narrow_index, narrow_owner, narrow_field, structs|:
+                    true return if structs.narrowed_owners[narrow_index] == narrow_owner and structs.narrowed_fields[narrow_index] == narrow_field
+                    narrow_index <- narrow_index + 1
+                return false
+
+
+
+
+            # Record `assert PATH != null`. Only a `!=` against the null literal narrows; `==
+            # null` proves the opposite and must NOT record.
+        def record_null_assert(predicate: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic:
+                if predicate is Expr.Binary(assert_left, assert_operator, assert_right, assert_line):
+                    return if assert_operator != TokenKind.BangEq
+                    left_null: bool = is_null_literal(assert_left)
+                    right_null: bool = is_null_literal(assert_right)
+                    return if not (left_null or right_null)
+                    asserted_path: Expr = assert_right if left_null else assert_left
+                    asserted_owner: sview = narrow_owner_of(asserted_path)
+                    return if asserted_owner == ""
+                    structs.narrowed_owners <- structs.narrowed_owners.push(asserted_owner)
+                    structs.narrowed_fields <- structs.narrowed_fields.push(narrow_field_of(asserted_path))
+
+
+
+
+            # Drop any narrowing proof about `path` -- an assignment replaces the value the
+            # proof was about, so a stale proof would unwrap a fresh null.
+        def invalidate_narrowing(path: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            invalid_owner: sview = narrow_owner_of(path)
+            return if invalid_owner == ""
+            # Assigning to `m` invalidates every proof about `m.FIELD` too: the whole struct
+            # was replaced. So an owner match alone is enough to drop the row.
+            # Collected into LOCALS, then the table is emptied and refilled by PUSH. Binding
+            # `structs.narrowed_owners <- kept_owners` instead would hand the caller's field
+            # a darray backed by this function's auto region, freed on return -- the
+            # callee-rebind use-after-free the region checker rejects outright.
+            kept_owners: mutable darray[sview] = []
+            kept_fields: mutable darray[sview] = []
+            keep_index: mutable usize = 0
+            while keep_index < structs.narrowed_owners.count |keep_index, kept_owners, kept_fields, invalid_owner, structs|:
+                if structs.narrowed_owners[keep_index] != invalid_owner:
+                    kept_owners.push(structs.narrowed_owners[keep_index])
+                    kept_fields.push(structs.narrowed_fields[keep_index])
+                keep_index <- keep_index + 1
+            clear_narrowings(structs)
+            refill_index: mutable usize = 0
+            while refill_index < kept_owners.count |refill_index, kept_owners, kept_fields, structs|:
+                structs.narrowed_owners <- structs.narrowed_owners.push(kept_owners[refill_index])
+                structs.narrowed_fields <- structs.narrowed_fields.push(kept_fields[refill_index])
+                refill_index <- refill_index + 1
+
+
+
+
+        # Record every `PATH != null` a guard CONDITION proves, walking `and` chains (the std
+        # dict writes `if old_items_opt != null and old_capacity > 0:`). Only `and` is walked:
+        # under `or` neither side is guaranteed, so nothing is proven.
+        def record_null_guards(condition: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                if condition is Expr.Binary(guard_left, guard_operator, guard_right, guard_line):
+                    if guard_operator == TokenKind.And:
+                        record_null_guards(guard_left, structs)
+                        record_null_guards(guard_right, structs)
+                        return
+                record_null_assert(condition, structs)
+
+
+
+
+            # What a FALSE condition proves. An EARLY-RETURN guard (`X return if PATH == null`)
+            # only falls through when the condition did NOT hold, so `PATH` is non-null for
+            # everything after it — the shape the std's region and fixed-buffer helpers all open
+            # with before using PATH as a plain ref. Mirrors stage0, which narrows here too.
+            #
+            # `or` is the walkable operator for the NEGATED form (both sides must be false), the
+            # mirror of `and` in record_null_guards; under `and` neither side is proven.
+        def record_null_guard_negation(condition: Expr, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                if condition is Expr.Binary(neg_left, neg_operator, neg_right, neg_line):
+                    if neg_operator == TokenKind.Or:
+                        record_null_guard_negation(neg_left, structs)
+                        record_null_guard_negation(neg_right, structs)
+                        return
+                    return if neg_operator != TokenKind.EqEq
+                    neg_left_null: bool = is_null_literal(neg_left)
+                    neg_right_null: bool = is_null_literal(neg_right)
+                    return if not (neg_left_null or neg_right_null)
+                    negated_path: Expr = neg_right if neg_left_null else neg_left
+                    negated_owner: sview = narrow_owner_of(negated_path)
+                    return if negated_owner == ""
+                    structs.narrowed_owners <- structs.narrowed_owners.push(negated_owner)
+                    structs.narrowed_fields <- structs.narrowed_fields.push(narrow_field_of(negated_path))
+
+
+
+
+            # Save the proof set so a branch's narrowings can be rolled back at the join: a proof
+            # that only holds inside the `then` arm must not leak past it.
+        def snapshot_narrowings(structs: StructTable&, saved_owners: mutable darray[sview]&, saved_fields: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            snapshot_index: mutable usize = 0
+            while snapshot_index < structs.narrowed_owners.count |snapshot_index, saved_owners, saved_fields, structs|:
+                saved_owners.push(structs.narrowed_owners[snapshot_index])
+                saved_fields.push(structs.narrowed_fields[snapshot_index])
+                snapshot_index <- snapshot_index + 1
+
+
+
+
+        def restore_narrowings(structs: mutable StructTable&, saved_owners: darray[sview]&, saved_fields: darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                clear_narrowings(structs)
+                restore_index: mutable usize = 0
+                while restore_index < saved_owners.count |restore_index, saved_owners, saved_fields, structs|:
+                    structs.narrowed_owners <- structs.narrowed_owners.push(saved_owners[restore_index])
+                    structs.narrowed_fields <- structs.narrowed_fields.push(saved_fields[restore_index])
+                    restore_index <- restore_index + 1
+
+
+
+
+            # Drop every narrowing proof (per-function reset, and the first half of a rebuild).
+        def clear_narrowings(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic:
+                while structs.narrowed_owners.count > 0 |structs|:
+                    _ = structs.narrowed_owners.pop()
+                while structs.narrowed_fields.count > 0 |structs|:
+                    _ = structs.narrowed_fields.pop()

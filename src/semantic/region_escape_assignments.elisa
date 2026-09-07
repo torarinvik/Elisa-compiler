@@ -1,0 +1,116 @@
+# Nested-region store-escape — the ASSIGNMENT check: `target <- value` where the target's region
+# strictly outlives the value's. The target's root is found through field, index and paren
+# selectors, and a direct call's callee is resolved so a container-returning function
+# contributes its own region. Continues check_region_escape.elisa.
+
+extend Semantic:
+    private:
+
+        # The root ident of an assignment target, walking through field/index selectors and parens
+        # (`h.xs <- v` / `out.items[0] <- v` -> "h" / "out"). Storing a region value into a FIELD of
+        # an outer-living aggregate dangles just as a whole-value store does, so the outlives check
+        # keys on the aggregate's root.
+        def region_escape_assign_target_root(target: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match target:
+                    Expr.Ident(name, ident_line): name
+                    Expr.Field(receiver, field_name, field_line): region_escape_assign_target_root(receiver)
+                    Expr.Index(object, index, index_line): region_escape_assign_target_root(object)
+                    Expr.Paren(inner, paren_line): region_escape_assign_target_root(inner)
+                    _: sview("", 0, 0)
+
+
+
+        # The callee name of a direct call VALUE (`make_users()` -> "make_users"), else "".
+        def region_escape_call_callee_name(value: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        return ident_name_of(callee)
+                    Expr.Paren(inner, paren_line):
+                        return region_escape_call_callee_name(inner)
+                    _:
+                        return sview("", 0, 0)
+
+
+
+        # Whether an assignment target selects a FIELD (`out.p`, `a.b.c`) rather than being a
+        # whole binding (`out`) — a forwarded-ref store escapes only through a field of a
+        # longer-lived ref target, never a whole-binding assign (which is a type error).
+        def region_escape_is_field_target(target: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match target:
+                    Expr.Field(receiver, field_name, field_line):
+                        return true
+                    Expr.Index(object, index, index_line):
+                        return region_escape_is_field_target(object)
+                    Expr.Paren(inner, paren_line):
+                        return region_escape_is_field_target(inner)
+                    _:
+                        return false
+
+
+
+        def region_escape_check_assign(target: Ast::Expr, value: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, container_fns: darray[sview]&, taint_names: darray[sview]&, taint_regions: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                target_name: sview = region_escape_assign_target_root(target)
+                return if target_name == ""
+                target_is_global_mutable: bool = any global_name in mutable_globals where global_name == target_name
+                # Forwarded-reference escape: a plain ref param stored into a global.
+                value_name: sview = ident_name_of(value)
+                value_is_ref_param: bool = value_name != "" and (any ref_name in ref_params where ref_name == value_name)
+                if target_is_global_mutable and value_is_ref_param:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: "", actual: ""})
+                    return
+                # Forwarded-reference escape into a REF PARAMETER's field: `out.p <- x` where
+                # `out: mutable Box&` points to caller-owned (longer-lived) storage and `x` is a
+                # plain ref param whose pointee is only frame-local. Requires a FIELD target (a
+                # whole-`out <- x` is a type error, not an escape) whose root is itself a ref param.
+                target_is_field: bool = region_escape_is_field_target(target)
+                target_root_is_ref_param: bool = any ref_name in ref_params where ref_name == target_name
+                if target_is_field and target_root_is_ref_param and value_is_ref_param:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: "", actual: ""})
+                    return
+                # `dst.users <- make_users()` — an inferred-region container value (a call to an
+                # owned-container / container-struct-returning free function) stored into a ref
+                # parameter's field escapes: the inferred region is freed at scope exit while the
+                # caller-owned target outlives it. stage0: "escapes its `in auto:` scope".
+                value_callee_name: sview = region_escape_call_callee_name(value)
+                value_is_container_call: bool = value_callee_name != "" and (any container_fn in container_fns where container_fn == value_callee_name)
+                if target_is_field and target_root_is_ref_param and value_is_container_call:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: "", actual: ""})
+                    return
+                value_region: sview = effective_value_region(value, annotations, view_fns, taint_names, taint_regions, line)
+                return if value_region == ""
+                # A value copy that carries no region handle cannot dangle, whatever the
+                # regions say (see region_escape_value_carries_handles).
+                return if not region_escape_value_carries_handles(value, annotations, line)
+                value_position: (found: bool, position: usize) = region_stack_position(nesting, value_region)
+                # Store of a function-local region value into a GLOBAL is an unconditional escape:
+                # a global outlives every function-local region, so no nesting comparison is needed.
+                # The value must live in a region block currently on the nesting stack (a param
+                # region — region-polymorphic/adopted — is never on the local stack, so it is not
+                # flagged here, matching stage0's exceptions).
+                if value_position.found and target_is_global_mutable:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: value_region, actual: value_region})
+                    return
+                target_region: sview = local_region_name(annotations, target_name, line)
+                # Outlives escape: a value living in an active inner `region` block stored into a
+                # plain local declared in an ENCLOSING scope (outside that region block). The outer
+                # local outlives the region, so once the region is freed the stored reference
+                # dangles ("stored into X, which outlives the region"). Only un-annotated outer
+                # locals participate — a region-annotated target goes through the nesting comparison
+                # below; an inner local (declared inside the region body) is not in outer_locals.
+                target_is_outer_local: bool = any outer_name in outer_locals where outer_name == target_name
+                # `outer_locals` is relative to the CURRENT (innermost) block, so it only proves the
+                # target outlives the value's region when the value lives in that innermost region.
+                # A value from an ENCLOSING region stored into a same-level local does not dangle (the
+                # local does not outlive that enclosing region), so require value_region == innermost.
+                value_is_innermost: bool = nesting.count > 0 and nesting[nesting.count - 1] == value_region
+                if value_position.found and target_region == "" and target_is_outer_local and value_is_innermost:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: value_region, actual: value_region})
+                    return
+                return if target_region == "" or target_region == value_region
+                target_position: (found: bool, position: usize) = region_stack_position(nesting, target_region)
+                escapes: bool = target_position.found and value_position.found and target_position.position < value_position.position
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: target_region, actual: value_region}) if escapes

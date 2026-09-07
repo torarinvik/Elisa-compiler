@@ -1,0 +1,191 @@
+# Stage1 backend — the i1 TEST a pattern denotes: ranges, simple binding-free arms, or-pattern
+# options, and the multi-column `when` rows that AND their columns together.
+# Part of `module Backend` (see codegen.elisa).
+
+using Ast
+
+extend Backend:
+    private:
+
+
+        # The i1 test for a `Pattern.Range` arm (`lo..<hi` / `lo..=hi`) over an INTEGER
+        # scrutinee: `scrutinee >= lo AND scrutinee </<= hi`. Signed/unsigned drives the
+        # predicate (a u8 range must compare with U* predicates). Returns null when either
+        # bound is not an integer literal (e.g. a char-literal range) so the caller declines.
+        # LLVM IntPredicate: UGE=35 ULT=36 ULE=37 SGE=39 SLT=40 SLE=41.
+        def emit_range_test(scrutinee: LLVMValueRef, scrutinee_type: ValueType, lo_text: sview, hi_text: sview, inclusive: bool, compare_type: LLVMTypeRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            lo_value: mutable i64 = 0
+            hi_value: mutable i64 = 0
+            null return if not parse_pattern_scalar(lo_text, lo_value)
+            null return if not parse_pattern_scalar(hi_text, hi_value)
+            unsigned: bool = scrutinee_type.kind == TypeKind.Unsigned
+            lo_pred: u32 = 35 if unsigned else 39
+            hi_pred: mutable u32 = 40
+            hi_pred <- 41 if inclusive
+            if unsigned:
+                hi_pred <- 37 if inclusive else 36
+            lo_hit: LLVMValueRef = LLVMBuildICmp(builder, lo_pred, scrutinee, LLVMConstInt(compare_type, lo_value.u64(), 1), "range.lo")
+            hi_hit: LLVMValueRef = LLVMBuildICmp(builder, hi_pred, scrutinee, LLVMConstInt(compare_type, hi_value.u64(), 1), "range.hi")
+            return LLVMBuildAnd(builder, lo_hit, hi_hit, "range.in")
+
+
+
+
+        # The i1 test for ONE simple, binding-free arm pattern against an already-lowered
+        # `scrutinee` (a raw integer, or a payload-enum's extracted i32 tag when `penum`).
+        # Handles integer/const-enum-ordinal literals, field-less variant paths, and integer
+        # ranges — the sub-patterns an OR-pattern (`0 | 2 | 4`, `E.A | E.B`) is built from.
+        # Returns null for anything with a binding or payload (an OR alternative cannot bind).
+        def emit_simple_pattern_hit(pattern: Pattern, scrutinee: LLVMValueRef, scrutinee_type: ValueType, penum: bool, compare_type: LLVMTypeRef, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            can Abort.Panic:
+                if pattern is Pattern.Literal(literal_text):
+                    literal_value: mutable i64 = 0
+                    null return if not parse_pattern_scalar(literal_text, literal_value)
+                    return LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(compare_type, literal_value.u64(), 1), "or.cmp")
+                if pattern is Pattern.Variant(variant_path, variant_fields):
+                    null return if variant_fields.count != 0
+                    ordinal: mutable i64 = penum_variant_index_of_path(variant_path, structs) if penum else ordinal_of_dotted_path(variant_path, structs)
+                    null return if ordinal < 0
+                    return LLVMBuildICmp(builder, 32, scrutinee, LLVMConstInt(compare_type, ordinal.u64(), 1), "or.cmp")
+                if pattern is Pattern.Range(range_lo, range_hi, range_inclusive):
+                    null return if penum
+                    return emit_range_test(scrutinee, scrutinee_type, range_lo, range_hi, range_inclusive, compare_type, ctx, builder)
+                return null
+
+
+
+
+            # The combined i1 test for an OR-pattern's option list: hit if ANY option hits.
+            # Returns null if any option is not a simple binding-free pattern.
+        def emit_or_pattern_hit(options: darray[Pattern], scrutinee: LLVMValueRef, scrutinee_type: ValueType, penum: bool, compare_type: LLVMTypeRef, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic:
+                null return if options.count == 0
+                combined: mutable LLVMValueRef = zeroed
+                have: mutable bool = false
+                failed: mutable bool = false
+                for option in options |combined, have, failed, scrutinee, scrutinee_type, penum, compare_type, structs, ctx, builder|:
+                    continue if failed
+                    if emit_simple_pattern_hit(option, scrutinee, scrutinee_type, penum, compare_type, structs, ctx, builder) is option_hit:
+                        combined <- option_hit if not have
+                        combined <- LLVMBuildOr(builder, combined, option_hit, "or.any") if have
+                        have <- true
+                    else:
+                        failed <- true
+                null return if failed or not have
+                return combined
+
+
+
+
+            # --- multi-column `when` (docs/125 §4) -------------------------------------------
+            #
+            # `when a, b:` is a DECISION TABLE. The parser desugars it (parser_stmt_when.elisa)
+            # exactly as stage0 does — an `Expr.Tuple` scrutinee whose arms carry `Pattern.Tuple`
+            # rows — and nothing downstream may change that shape, because `-emit ast` is held to
+            # byte parity with stage0. So the columns are lowered HERE, in the backend.
+            #
+            # A row hits when EVERY column hits: the table is a conjunction per row, tested in
+            # source order, which is the same first-wins chain the scalar emitter already builds.
+            # There is no tuple VALUE anywhere in the lowering — each scrutinee column is emitted
+            # once as an ordinary scalar and reused across rows, so no tuple ABI is involved.
+            # (Elisa has no tuple expressions in the surface language; `Expr.Tuple` exists only
+            # as this desugar and the multi-value forms.)
+
+            # One column's i1 test. `_` is "no constraint" and yields a constant true rather than
+            # a comparison, so an all-wildcard row folds to `true` and the optimizer drops the
+            # branch. Everything else reuses the scalar arm machinery — a column's grammar is a
+            # subset of an arm's.
+        def emit_when_column_hit(column: Pattern, value: LLVMValueRef, value_type: ValueType, compare_type: LLVMTypeRef, structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0) return if column is Pattern.Wildcard
+                # String columns use content equality, exactly like scalar string matches.
+                # Do this before the scalar-pattern helper: cstr/sview are aggregate/pointer
+                # values and cannot be compared by the integer ICmp path.
+                if value_type.kind == TypeKind.SView:
+                    if column is Pattern.Literal(sview_column_text):
+                        return sview_literal_hit(sview_column_text, value, value_type, structs, runtime, ctx, builder)
+                    if column is Pattern.Or(sview_column_options):
+                        sview_combined: mutable LLVMValueRef = zeroed
+                        sview_have: mutable bool = false
+                        sview_failed: mutable bool = false
+                        for sview_option in sview_column_options |sview_combined, sview_have, sview_failed, value, value_type, structs, runtime, ctx, builder|:
+                            continue if sview_failed
+                            if sview_option is Pattern.Literal(sview_option_text):
+                                if sview_literal_hit(sview_option_text, value, value_type, structs, runtime, ctx, builder) is sview_option_hit:
+                                    sview_combined <- LLVMBuildOr(builder, sview_combined, sview_option_hit, "when.col.sview.or") if sview_have
+                                    sview_combined <- sview_option_hit if not sview_have
+                                    sview_have <- true
+                                else:
+                                    sview_failed <- true
+                            else:
+                                sview_failed <- true
+                        null return if sview_failed or not sview_have
+                        return sview_combined
+                    return null
+                if value_type.kind == TypeKind.CStr:
+                    cstr_options: mutable darray[Pattern] = []
+                    cstr_options.push(column)
+                    if column is Pattern.Or(cstr_column_options):
+                        cstr_options <- [cstr_option for cstr_option in cstr_column_options]
+                    cstr_combined: mutable LLVMValueRef = zeroed
+                    cstr_have: mutable bool = false
+                    cstr_failed: mutable bool = false
+                    for cstr_option in cstr_options |cstr_combined, cstr_have, cstr_failed, value, runtime, ctx, builder|:
+                        continue if cstr_failed
+                        if cstr_option is Pattern.Literal(cstr_option_text):
+                            cstr_storage: mutable darray[u8] = []
+                            if string_pattern_content_cstr(cstr_option_text, cstr_storage) is cstr_pattern:
+                                cstr_global: LLVMValueRef = LLVMBuildGlobalStringPtr(builder, cstr_pattern, "when.cstr")
+                                cstr_args: mutable darray[LLVMValueRef] = [value, cstr_global]
+                                cstr_args_pointer: void& = (&cstr_args[0]).cast[void&] can Unsafe.PointerCast
+                                cstr_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.streq_type, runtime.streq, cstr_args_pointer, 2, "when.cstr.eq")
+                                cstr_hit: LLVMValueRef = LLVMBuildICmp(builder, 33, cstr_code, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), "when.cstr.hit")
+                                cstr_combined <- LLVMBuildOr(builder, cstr_combined, cstr_hit, "when.col.cstr.or") if cstr_have
+                                cstr_combined <- cstr_hit if not cstr_have
+                                cstr_have <- true
+                            else:
+                                cstr_failed <- true
+                        else:
+                            cstr_failed <- true
+                    null return if cstr_failed or not cstr_have
+                    return cstr_combined
+                # `true` / `false` columns. parse_pattern_scalar reads integer and CHAR text; the
+                # boolean keywords reach it as bare identifiers and would be read as a char code,
+                # so they are resolved here before it ever sees them.
+                if column is Pattern.Literal(column_literal):
+                    if column_literal == "true" or column_literal == "false":
+                        column_bool: u64 = 1.u64() if column_literal == "true" else 0.u64()
+                        return LLVMBuildICmp(builder, 32, value, LLVMConstInt(compare_type, column_bool, 0), "when.col.bool")
+                if column is Pattern.Or(column_options):
+                    return emit_or_pattern_hit(column_options, value, value_type, false, compare_type, structs, ctx, builder)
+                return emit_simple_pattern_hit(column, value, value_type, false, compare_type, structs, ctx, builder)
+
+
+
+
+            # The whole row's i1: AND across its columns. Null when any column is a shape the
+            # scalar machinery cannot test (a binding, a payload variant), so the caller declines
+            # the enclosing body rather than emitting a row that silently never hits.
+        def emit_when_row_hit(columns: darray[Pattern]&, values: darray[LLVMValueRef]&, value_types: darray[ValueType]&, compare_types: darray[LLVMTypeRef]&, structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            null return if columns.count != values.count
+            combined: mutable LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0)
+            row_failed: mutable bool = false
+            for column_index in 0..<columns.count |combined, row_failed, columns, values, value_types, compare_types, structs, runtime, ctx, builder|:
+                continue if row_failed
+                if emit_when_column_hit(columns[column_index], values[column_index], value_types[column_index], compare_types[column_index], structs, runtime, ctx, builder) is column_hit:
+                    combined <- LLVMBuildAnd(builder, combined, column_hit, "when.row")
+                else:
+                    row_failed <- true
+            null return if row_failed
+            return combined
+
+
+
+
+        # A `when`-desugared row: `Pattern.Tuple` columns, or the trailing `_` default the
+        # parser emits last. Anything else means this is not a decision table.
+        def when_row_columns(pattern: Pattern, out_columns: mutable darray[Pattern]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            if pattern is Pattern.Tuple(tuple_columns):
+                out_columns.extend(tuple_columns)
+                return true
+            return false

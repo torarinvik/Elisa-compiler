@@ -1,0 +1,187 @@
+# Stage1 backend — the modeled TYPE of a value: the `TypeKind` a lowered value can have, the
+# `ValueType` record that carries it, and the predicates every emitter asks of one.
+# Part of `module Backend` (see codegen.elisa).
+
+using Ast
+
+extend Backend:
+    private:
+
+
+            # A modeled value's type. `bits` is the integer width; `Bool` is i1 (LLVM's
+            # natural boolean) and carries no width of its own.
+            #
+            # Signedness is not cosmetic: stage0 lowers `u8 200 / 3` to `udiv` (66) and
+            # `u8 200 >> 1` to `lshr` (100). Reading those as signed gives -56 and 228 — so a
+            # backend that ignores signedness silently miscompiles unsigned arithmetic.
+        const enum TypeKind of u8:
+            Unmodeled
+            Signed
+            Unsigned
+            Bool
+            Float
+            # `void` — legal ONLY as a return type. It has no values, so nothing can be a
+            # `void` local, parameter, or operand; every other position rejects it because
+            # `unmodeled_type()` is what those paths test for and Void is not that.
+            Void
+            # A user struct. `bits` is its index in the StructTable — a ValueType must stay
+            # POD (an sview name would be fine, but an index also gives O(1) field lookup).
+            Struct
+            # A fixed array `T[N]`. `bits` indexes the StructTable's ARRAY side-pool
+            # (`array_elements` / `array_extents`) — same reason as Struct: ValueType is
+            # POD, so a nested element type cannot live inline.
+            Array
+            # A `packed enum`'s HANDLE. Same `{i32, [N x i64]}` shape as a payload enum, but
+            # the value is a row in an AoS store rather than inline data: the tag and payload
+            # are read back through ctx_packed_store_* rather than by extractvalue/GEP.
+            # `bits` indexes the PACKED side-pool.
+            PackedEnum
+            # `Node.Store[Local]` — `{ptr arena, i64 row_bytes, ptr state}`. `bits` indexes
+            # the PACKED side-pool of the enum it stores.
+            PackedStore
+            # `Arena` — the runtime's region carrier, `{ptr, ptr, i64, i64}`, passed BY
+            # VALUE (stage0: `define i64 @build(%Arena %0)` and `%r1 = load %Arena, ptr %r`
+            # at the call site). Note the asymmetry: `Arena` is legal as a PARAMETER type
+            # but rejected as a region ANNOTATION (`-> darray[i64] @owner` is "internal
+            # runtime carrier type ... not supported in user-facing code").
+            Arena
+            # A PAYLOAD-carrying enum (`enum Shape: Circle(r: i64)`). In LLVM a TAGGED UNION
+            # `{ i32, [N x i64] }`: field 0 is the variant ORDINAL, field 1 is payload
+            # storage sized to the largest variant (stage0's `%Shape = type { i32, [1 x
+            # i64] }`, read from its IR). NOT the AoS packed store -- that is `packed enum`,
+            # a different subsystem. `bits` indexes the PAYLOAD-ENUM side-pool.
+            PayloadEnum
+            # `cstr` — a NUL-terminated string constant. In LLVM just a `ptr`: stage0
+            # lowers `s: cstr = "hi"` to `@str = private unnamed_addr constant [3 x i8]
+            # c"hi\00"` plus `store ptr @str`. Carries no length, so `.count`, indexing and
+            # comparison are NOT modeled (they need the runtime) and decline.
+            CStr
+            # `py::Object` — an opaque borrowed CPython object pointer. The compiler does not
+            # inspect the object; this escape hatch exists so Python-facing functions can pass
+            # objects through a native wrapper without forcing a fake Elisa representation.
+            # Ownership is defined by the generated CPython shim: parameters are borrowed and
+            # object returns are retained before crossing back into Python.
+            PyObject
+            # A reference `T&` / `mutable T&`. `bits` indexes the REF side-pool
+            # (`ref_targets`). In LLVM it is just a `ptr` — stage0 lowers
+            # `def bump(n: mutable i64&)` to `define void @bump(ptr)` and `bump(x)` to
+            # `call void @bump(ptr %x)`. Mutability is a FRONTEND concern (it already
+            # rejects writes through a `T&`), so the backend models only the referent.
+            Ref
+            # An optional `T?`. `bits` indexes the OPTIONAL side-pool (`optional_targets`).
+            # Represented exactly as stage0 does — `{i1 has_value, T value}` (read from its
+            # `-emit llvm`: `%Optional__i64 = type { i1, i64 }`).
+            Optional
+            # A value-carrying `T error[E]`. `bits` indexes the ERROR-UNION side-pools;
+            # LLVM uses stage0's `{i32 error_code, ptr payload}` descriptor.
+            ErrorUnion
+            # A `darray[T]`. `bits` indexes the DARRAY side-pool (`darray_elements`).
+            # Represented exactly as stage0 does — `{ptr items, i64 count, i64 capacity}`,
+            # backed by an Arena — because both link the SAME runtime, so the layout is
+            # dictated, not chosen.
+            DArray
+            # A `view[T]` — the runtime's `DynArrayView` fat pointer `{data, len}`. `bits`
+            # indexes the VIEW side-pool (`view_elements`), carrying the phantom element T
+            # so a generic call like `arena_da_fill(view, …)` can INFER T from the argument.
+            # Lowers to the one `DynArrayView` struct regardless of T (like darray).
+            View
+            # `sview` — a string VIEW, stage0's `%StringView = type { ptr, i64 }` (a byte
+            # pointer plus a length). Distinct from `cstr` (bare `ptr`, NUL-terminated) and
+            # from `view[T]` (DynArrayView). A literal `s: sview = "hi"` is the aggregate
+            # `{ptr @str, i64 2}`; equality goes through `ctx_string_views_eq` BY VALUE.
+            SView
+            # `fn(A, …) -> R` — a first-class function value. Represented as stage0 does: a
+            # low-bit-TAGGED `ptr`. Bit0 clear = a raw function pointer (`@f`), called directly;
+            # bit0 set = points (after `& ~1`) at an `%ElisaCoreLambdaClosure = {ptr code, ptr
+            # env}`, called `code(env, args…)`. The result type at a call site comes from the
+            # EXPECTED type (a `return f(x)` / `y: R = f(x)` supplies it), so `bits` is unused.
+            Fn
+            # `GuestVAddr[L]` / `HostPtr[T]` address-space carriers (docs/107). ABI storage is
+            # `i64`/`uintptr`; `bits` indexes `guest_layouts` with the layout/pointee name so
+            # overlay accessors can resolve field offsets. HostPtr uses the same kind because
+            # both are raw address integers at the LLVM boundary.
+            GuestCarrier
+            # A CONST-GENERIC value argument (`InlineVec[T, N: usize]` — the `N`). NOT a real
+            # runtime type: it is a phantom carried in a generic's type-arg tuple so a `usize`
+            # value like `4` threads through instantiation. `bits` holds the VALUE itself (not a
+            # side-pool index). It only ever appears as a type-arg binding — `fold_const_atom`
+            # reads it to resolve a `T[N]` extent, and `mangled_name_multi_into` encodes its
+            # value so `InlineVec[i64, 4]` and `[i64, 8]` mangle differently. It must never reach
+            # llvm_type_of as a real value (no field/local/param is ConstUsize-typed).
+            ConstUsize
+
+
+
+
+        struct ValueType:
+            kind: TypeKind
+            bits: u32
+            # The CONST ENUM this scalar was spelled as, plus one (0 = none). A
+            # `const enum RoutineFlag of u8` IS its backing `u8` everywhere that matters —
+            # same kind, same width, same arithmetic — so this is deliberately NOT part of
+            # type identity: every `.kind ==`/`.bits ==` check behaves exactly as before.
+            # It exists only so MANGLING can spell `add__RoutineFlag` where stage0 does,
+            # instead of erasing to `add__u8`.
+            #
+            # DEFAULTED so the hundreds of existing `ValueType{kind:…, bits:…}` literals
+            # keep compiling untouched. Adding a TypeKind instead would have fallen silently
+            # through 799 `.kind == TypeKind.X` comparisons.
+            enum_id: u32 = 0
+
+
+
+        # Representation equality is intentionally weaker than generic type identity:
+        # const enums use their backing scalar for arithmetic, but two distinct const
+        # enums must never share a generic instantiation, container interning row, or
+        # static-effect handler selection merely because both lower to (say) u8.
+        def value_type_identity_equal(left: ValueType, right: ValueType) -> bool:
+            return false if left.kind != right.kind or left.bits != right.bits
+            return false if left.enum_id != right.enum_id and (left.enum_id != 0 or right.enum_id != 0)
+            return true
+
+
+
+        # The `{value, overflow}` result returned by LLVM's checked integer intrinsics.
+        # Stage0 uses these for every allocation-size multiplication and for darray capacity
+        # growth; keeping the pair explicit lets the stage1 emitter choose between trapping
+        # and the safe-capacity fallback without silently dropping the flag.
+        struct OverflowResult:
+            value: LLVMValueRef
+            overflow: LLVMValueRef
+
+
+
+
+        def unmodeled_type() -> ValueType:
+            return ValueType{kind: TypeKind.Unmodeled, bits: 0}
+
+
+
+
+        def is_integer_type(value_type: ValueType) -> bool:
+            return value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned
+
+
+
+
+        def is_numeric_type(value_type: ValueType) -> bool:
+            return is_integer_type(value_type) or value_type.kind == TypeKind.Float
+
+
+
+
+        # Whether the type lowers to an LLVM `ptr` — a reference, cstr, or opaque Python
+        # object. Used to keep a `.cast[T]` reinterpret to the pointer<->pointer no-op the std
+        # alloc helpers need.
+        def type_is_pointer(value_type: ValueType) -> bool:
+            return value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.PyObject
+
+
+
+
+        # Explicit WASM builds are 32-bit even when the host compiler is arm64. Keep this
+        # fact in the codegen type model, not just in LLVM's data layout: `usize`/`isize` are
+        # part of exported function signatures and of the stdlib's arena ABI.
+        def target_pointer_bits() -> u32:
+            32 return if getenv("ELISA_STAGE1_WASM") is wasm_target
+            return 64

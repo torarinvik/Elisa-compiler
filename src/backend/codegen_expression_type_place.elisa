@@ -1,0 +1,564 @@
+# Stage1 backend — the TYPE of an expression that reads a PLACE: an index, a field, a struct
+# construction or record update, a refinement, and the calls whose result type comes from a
+# signature. Continues the walk begun in codegen_expression_type.elisa, which covers the
+# literal and operator forms; both answer WITHOUT emitting anything.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def expression_type_of_place(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, depth: i64) -> ValueType can[Abort.Panic]:
+            # `x.cast[T]` — a reinterpret cast has the target type.
+            match expression:
+                Expr.Index(cast_type_head, cast_type_arg, cast_type_line):
+                    match cast_type_head:
+                        Expr.Field(cast_type_source, cast_type_method, cast_type_method_line):
+                            if cast_type_method == "cast":
+                                return annotation_value_type(cast_type_arg, structs)
+                        _:
+                            pass
+                _:
+                    pass
+            # `p.call_as[fn(A) -> R](args)` has the fn type's RETURN type. Without this the
+            # DISCARD path (`_ = entry.call_as[…](arg)`, the runtime's only call site) saw
+            # Unmodeled and fell back to i64, which then demanded a bogus pointer→integer
+            # conversion of a `void&` result and declined the whole statement.
+            match expression:
+                Expr.Call(ca_type_callee, ca_type_args, ca_type_names, ca_type_call_line):
+                    match ca_type_callee:
+                        Expr.Index(ca_type_index_head, ca_type_fn_expr, ca_type_index_line):
+                            match ca_type_index_head:
+                                Expr.Field(ca_type_object, ca_type_method, ca_type_method_line):
+                                    if ca_type_method == "call_as":
+                                        return fn_return_type_of(annotation_value_type(ca_type_fn_expr, structs), structs)
+                                _:
+                                    pass
+                        _:
+                            pass
+                _:
+                    pass
+            # `xs[i]` — an index READ yields the element type of an array, a darray, OR a
+            # `Struct&` used as a C-style pointer base (`items[i]` on a `DictBucket[K,T]&`).
+            match expression:
+                Expr.Index(indexed_object, index_expression, index_line):
+                    indexed_type: ValueType = expression_type_depth(indexed_object, local_scope, fns, structs, generics, depth + 1)
+                    # A struct subscript is an overloadable `__index__` call. Keep this
+                    # before the built-in container cases so the emitted call's return
+                    # reference is also visible to place/address resolution.
+                    custom_index_type: ValueType = index_overload_type(indexed_object, index_expression, local_scope, fns, structs, generics)
+                    custom_index_type return if custom_index_type.kind != TypeKind.Unmodeled
+                    # The C translator spells `sizeof(T)` as `size_of[T]` so the
+                    # type argument remains an annotation rather than a runtime
+                    # expression. It is a compile-time byte count, just like the
+                    # call spelling handled by the ordinary call typer.
+                    if indexed_object is Expr.Ident(indexed_size_name, indexed_size_line):
+                        ValueType{kind: TypeKind.Unsigned, bits: 64} return if indexed_size_name == "size_of"
+                    # A `Flags[T]` bit test is a BOOL, not the struct or its field. Without this the
+                    # value binding typed as the struct and `if value[F.X]:` declined outright,
+                    # since emit_condition requires the condition to resolve to Bool.
+                    ValueType{kind: TypeKind.Bool, bits: 1} return if flags_bit_test_ordinal(indexed_type, index_expression, structs) >= 0
+                    # `frozen[2]` — indexing a packed STORE by ORDINAL yields a node HANDLE of
+                    # the store's enum, which is what `ctx_packed_store_index_at` returns.
+                    if indexed_type.kind == TypeKind.PackedStore:
+                        packed_store_root: usize = indexed_type.bits.usize()
+                        ValueType{kind: TypeKind.PackedEnum, bits: packed_store_root.u32()} return if packed_store_root < structs.packed_names.count
+                    # A byte read from a string (cstr / view[u8]) is an i64 (the runtime index
+                    # helpers return i64), matching stage0.
+                    ValueType{kind: TypeKind.Signed, bits: 64} return if indexed_type.kind == TypeKind.CStr or indexed_type.kind == TypeKind.SView
+                    darray_element_of(indexed_type, structs) return if indexed_type.kind == TypeKind.DArray
+                    # `v[i]` on a VIEW is its ELEMENT. There was no View case here at all, so an
+                    # indexed view had no type — which is why `state.tokens[0].kind` could not even
+                    # find the element's struct to take a field from.
+                    view_element_of(indexed_type, structs) return if indexed_type.kind == TypeKind.View
+                    if indexed_type.kind == TypeKind.Ref:
+                        ref_indexed_element: ValueType = ref_target_of(indexed_type, structs)
+                        ref_indexed_element return if ref_indexed_element.kind == TypeKind.Struct
+                        # `p[i]` where `p: T&` is a ref to a NUMERIC scalar used as a pointer base
+                        # (Slice's `p: T& = base.cast[T&]; p[i]` / `&p[lo]`): the element IS that scalar.
+                        ref_indexed_element return if ref_indexed_element.kind == TypeKind.Signed or ref_indexed_element.kind == TypeKind.Unsigned or ref_indexed_element.kind == TypeKind.Float
+                        # `argv[i]` where `argv: cstr&&` — a C `char**`. A POINTER-sized element
+                        # indexes exactly like a scalar one (stage0 emits the same `getelementptr
+                        # ptr` + `load ptr`), and the element IS that pointer type. Without this the
+                        # emitter's matching branch was unreachable and every `T&&` index declined.
+                        ref_indexed_element return if ref_indexed_element.kind == TypeKind.Ref or ref_indexed_element.kind == TypeKind.CStr
+                        # `da[i]` where `da: darray[T]&` — a borrowed darray param: the element is the
+                        # darray's element (so `&da[i]` types as a ref to it, which slice() needs).
+                        darray_element_of(ref_indexed_element, structs) return if ref_indexed_element.kind == TypeKind.DArray
+                        # `pts[i]` where `pts: T[N]&` — a borrowed reference to a single fixed-size
+                        # array (the standard borrowed-array-parameter shape). Without this the
+                        # catch-all `array_element_of(indexed_type, ...)` below ran on the RAW Ref
+                        # type (not its Array target) and answered Unmodeled — silently, since
+                        # array_element_of just declines a non-Array input rather than erroring.
+                        # That made every type-dependent use of `pts[i]` (an explicit `.i64()` cast,
+                        # in particular) decline, AND meant the codegen-level read of the same
+                        # expression (emit_expression_index_fields's sibling Ref+Array branch) had
+                        # no correctly-typed `expected` to convert against — the two gaps together
+                        # let `ys[1] + zs[1].i64()` (i64[3]& and u8[3]& in one function) build an
+                        # LLVM module with a WIDTH-MISMATCHED `sadd.with.overflow.i64(i64, i8)`
+                        # call and silently answer wrong (200 instead of 202) rather than crash or
+                        # decline. Mirrors the DArray-behind-Ref case just above.
+                        array_element_of(ref_indexed_element, structs) return if ref_indexed_element.kind == TypeKind.Array
+                    # `found[0]` where `found: T&?` is an optional ref to a numeric scalar (narrowed
+                    # non-null): the element is that scalar. index_map_find_index reads it this way.
+                    if indexed_type.kind == TypeKind.Optional:
+                        opt_indexed_payload: ValueType = optional_payload_of(indexed_type, structs)
+                        if opt_indexed_payload.kind == TypeKind.Ref:
+                            opt_indexed_elem: ValueType = ref_target_of(opt_indexed_payload, structs)
+                            # `T&&?` is a nullable pointer-to-pointer. Its outer
+                            # subscript yields the inner pointer value, not a tagged
+                            # optional aggregate; keep the element pointer-shaped so
+                            # calls, casts, and assignments see the same ABI as `argv[i]`.
+                            opt_indexed_elem return if opt_indexed_elem.kind == TypeKind.Signed or opt_indexed_elem.kind == TypeKind.Unsigned or opt_indexed_elem.kind == TypeKind.Float or opt_indexed_elem.kind == TypeKind.Ref or opt_indexed_elem.kind == TypeKind.CStr or opt_indexed_elem.kind == TypeKind.Fn
+                    return array_element_of(indexed_type, structs)
+                _:
+                    pass
+            # `p.x` — a field READ has the field's declared type. (A cast `x.u8()` is a
+            # Field under a Call, handled below, so a bare Field is always a field read.)
+            # `Color.Green` / `Lexer::TokenKind.Ident` has the enum's BACKING type.
+            match expression:
+                Expr.Field(enum_head, enum_member, enum_head_line):
+                    enum_head_name: mutable sview = ""
+                    match enum_head:
+                        Expr.Ident(enum_ident_name, enum_ident_line):
+                            enum_head_name <- enum_ident_name
+                        _:
+                            pass
+                    # Module-qualified enum type: `Lexer::TokenKind.Ident`.
+                    match enum_head:
+                        Expr.Scope(enum_scope_head, enum_scope_name, enum_scope_line):
+                            enum_head_name <- enum_scope_name
+                        _:
+                            pass
+                    if enum_head_name != "":
+                        penum_head_index: i64 = penum_index_of(structs, enum_head_name)
+                        ValueType{kind: TypeKind.PayloadEnum, bits: penum_head_index.u32()} return if penum_head_index >= 0
+                        enum_slot: i64 = enum_index_of(structs, enum_head_name)
+                        if enum_slot >= 0:
+                            copied_type(structs.enum_backings[enum_slot.usize()]) return if enum_ordinal_of(structs, enum_slot.usize(), enum_member) >= 0
+                _:
+                    pass
+            match expression:
+                Expr.Field(field_object, field_name, field_line):
+                    # `table.values` on a view-typed receiver IS that view (NodeTable is erased
+                    # to its backing view).
+                    if field_name == "count":
+                        ps_count_recv_t: ValueType = expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
+                        ValueType{kind: TypeKind.Signed, bits: 64} return if ps_count_recv_t.kind == TypeKind.PackedStore
+                    if field_name == "values":
+                        nt_values_recv: ValueType = expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
+                        nt_values_recv return if nt_values_recv.kind == TypeKind.View
+                    # Bitset flag names type as bool (`token.flags.has_suffix`).
+                    ValueType{kind: TypeKind.Bool, bits: 1} return if field_name == "has_suffix" or field_name == "has_prefix"
+                    # `d.entry(k).found` / `.value` — the ENTRY api's READ members. `found` is a
+                    # bool; `value` is the cached `T&?` that `arena_dict_get_mut` returns.
+                    if field_name == "found" or field_name == "value":
+                        match field_object:
+                            Expr.Call(read_entry_callee, read_entry_args, read_entry_names, read_entry_line):
+                                match read_entry_callee:
+                                    Expr.Field(read_entry_recv, read_entry_method, read_entry_method_line):
+                                        if read_entry_method == "entry":
+                                            read_entry_dict: darray[ValueType] = dict_type_args_of(read_entry_recv, local_scope, fns, structs, generics)
+                                            if read_entry_dict.count != 0:
+                                                ValueType{kind: TypeKind.Bool, bits: 1} return if field_name == "found"
+                                                read_entry_helper: sview = resolved_container_helper("DynDict", "get_mut", generics)
+                                                if read_entry_helper != "":
+                                                    read_entry_narrowed: darray[ValueType] = container_helper_type_args(read_entry_helper, read_entry_dict, generics)
+                                                    return generic_return_type(read_entry_helper, read_entry_narrowed, generics, structs)
+                                    _:
+                                        pass
+                            _:
+                                pass
+                    object_type: mutable ValueType = expression_type_depth(field_object, local_scope, fns, structs, generics, depth + 1)
+                    # AUTO-DEREF: `p.x` where `p: P&` reads P's field. A reference is
+                    # transparent for member access — the frontend has already decided the
+                    # access is legal, so the backend just looks through it. An optional HEAP
+                    # ref (`heap T&?`) is looked through too: stage0 represents it as a bare
+                    # ptr and permits flow-guarded access without narrowing.
+                    if object_type.kind == TypeKind.Optional:
+                        field_opt_payload: ValueType = optional_payload_of(object_type, structs)
+                        # C pointers are translated as nullable references too. Once control
+                        # flow has established presence, member access is the same raw-pointer
+                        # dereference regardless of whether the source pointer came from a C
+                        # heap allocation or an ordinary `T*` expression.
+                        object_type <- field_opt_payload if field_opt_payload.kind == TypeKind.Ref
+                    object_type <- ref_target_of(object_type, structs) if object_type.kind == TypeKind.Ref
+                    # Builtin string views are anonymous `{ptr, i64}` values rather than entries
+                    # in StructTable. Their two ABI fields are still source-visible as `.data` and
+                    # `.len`; resolve them directly before the named-struct path below.
+                    if object_type.kind == TypeKind.SView:
+                        if field_name == "data":
+                            return intern_ref_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs)
+                        if field_name == "len":
+                            return ValueType{kind: TypeKind.Signed, bits: 64}
+                        return unmodeled_type()
+                    # `s.len` on a CSTR is not a field at all — a cstr is a bare pointer, so
+                    # stage0 lowers it to a `ctx_strlen(s)` call. It reads like a field, which is
+                    # why `for ch in s[0:s.len]` (the std's FNV hash over a cstr) declined on the
+                    # BOUND rather than on the slice or the loop, both of which already worked.
+                    ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.CStr and field_name == "len"
+                    # An arena CARRIER's fields read the user-declared `struct Arena`.
+                    object_type <- arena_user_struct(structs) if object_type.kind == TypeKind.Arena
+                    # A packed enum's COMMON field uses its declared source type. The field
+                    # emitter reads dynamic AoS commons from the side table and inline commons
+                    # from the row, so typing it here is what lets a BARE
+                    # `return node.span` through: the return path types the expression first,
+                    # so an Unmodeled answer declined the whole function even though the
+                    # emitter could serve the read (`node.span + 0` compiled, `node.span` did not).
+                    if object_type.kind == TypeKind.PackedEnum and object_type.bits.usize() < structs.packed_names.count:
+                        packed_common_index: i64 = packed_common_index_of(structs.packed_names[object_type.bits.usize()], field_name, structs)
+                        if packed_common_index >= 0:
+                            packed_common_type: ValueType = packed_common_type_at(structs, structs.packed_names[object_type.bits.usize()], packed_common_index.u32())
+                            return packed_common_type if packed_common_type.kind != TypeKind.Unmodeled
+                            return ValueType{kind: TypeKind.Signed, bits: 64}
+                    # `xs.count` is a usize-shaped i64.
+                    ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "count"
+                    # `.capacity` is the header's third field, the same i64 shape as `.count`.
+                    # Only `.count` was readable, so ctx_fstr_alloc could SET a capacity it then
+                    # could not read back.
+                    ValueType{kind: TypeKind.Signed, bits: 64} return if object_type.kind == TypeKind.DArray and field_name == "capacity"
+                    # `xs.items` is the header's element-storage POINTER. Typed as a ref to the
+                    # element so a null test reads it as a plain pointer compare.
+                    if object_type.kind == TypeKind.DArray and field_name == "items":
+                        return intern_ref_type(copied_type(structs.darray_elements[object_type.bits.usize()]), structs)
+                    # A `view[T]` field read goes through its DynArrayView struct.
+                    object_type <- view_struct_type(object_type, structs) if object_type.kind == TypeKind.View
+                    unmodeled_type() return if object_type.kind != TypeKind.Struct
+                    struct_slot: usize = object_type.bits.usize()
+                    position: i64 = field_index_of(structs, struct_slot, field_name)
+                    unmodeled_type() return if position < 0
+                    return copied_type(structs.field_types[structs.field_start[struct_slot] + position.usize()])
+                _:
+                    pass
+            # `Point{x: 1, y: 2}` — a brace construction has the constructed type.
+            match expression:
+                Expr.Construct(construct_type, construct_fields, construct_line):
+                    return annotation_value_type(construct_type, structs)
+                _:
+                    pass
+            # `base{field = v}` — a record update yields the BASE's type: it overrides some
+            # fields and copies the rest, so the struct identity is unchanged. It has no type
+            # name of its own to resolve, which is why this reads the base rather than an
+            # annotation.
+            match expression:
+                Expr.RecordUpdate(record_update_base, record_update_fields, record_update_line):
+                    return expression_type_depth(record_update_base, local_scope, fns, structs, generics, depth + 1)
+                _:
+                    pass
+            # `try CALL else FALLBACK` / `get OPT else FALLBACK` -> Expr.Refinement(fallback,
+            # guarded). The EMITTER models all three of its shapes; the TYPER had no case at
+            # all, so this answered Unmodeled and every position that has to INFER the type
+            # declined — `if (try f(3) else null) is v:` gave `main: DECLINE If` while stage0
+            # built and ran it. A VarDecl with an annotation was unaffected, which is why the
+            # shape first looked like an error-union problem and is not one.
+            #
+            # The ORDER here is the emitter's, and it is not the obvious one. For an
+            # error-returning callee `expression_type` ALREADY reports the payload, so
+            # `try f(3) else null` where `f -> i64? error[E]` must answer `i64?` — while
+            # `get OPT else FALLBACK` UNWRAPS and answers the payload. Backwards, and the
+            # optional is silently dropped.
+            match expression:
+                Expr.Refinement(try_type_fallback, try_type_guarded, try_type_line):
+                    try_type_guarded_type: ValueType = expression_type_depth(try_type_guarded, local_scope, fns, structs, generics, depth + 1)
+                    unmodeled_type() return if try_type_guarded_type.kind == TypeKind.Unmodeled
+                    # A first-class error-union VALUE carries its payload in the descriptor.
+                    error_union_payload_of(try_type_guarded_type, structs) return if try_type_guarded_type.kind == TypeKind.ErrorUnion
+                    # A CALL to an error-returning function already reports its payload — including
+                    # when that payload is itself optional, which has to survive.
+                    match try_type_guarded:
+                        Expr.Call(try_type_callee, try_type_args, try_type_names, try_type_call_line):
+                            match try_type_callee:
+                                Expr.Ident(try_type_fn_name, try_type_fn_line):
+                                    try_type_guarded_type return if function_is_error(fns, "", try_type_fn_name)
+                                _:
+                                    pass
+                        _:
+                            pass
+                    # Otherwise this is `get OPT else FALLBACK`: the value is the PAYLOAD.
+                    optional_payload_of(try_type_guarded_type, structs) return if try_type_guarded_type.kind == TypeKind.Optional
+                    return try_type_guarded_type
+                _:
+                    pass
+            match expression:
+                Expr.Call(call_callee, call_arguments, call_argument_names, call_line):
+                    # `readonly(x)` is a type-level marker with no representation, so it types as
+                    # its OPERAND. Without this it answered Unmodeled, and anything that reads an
+                    # argument's type — generic inference, `chunks_exact(readonly(v), n)` — saw
+                    # nothing to work with.
+                    match call_callee:
+                        Expr.Field(typestate_ctor_object, typestate_ctor_method, typestate_ctor_line):
+                            if typestate_ctor_method == "new" and typestate_ctor_object is Expr.Ident(typestate_ctor_type, typestate_ctor_type_line) and struct_declares_aggregate_state(structs, typestate_ctor_type):
+                                typestate_ctor_storage: mutable darray[u8] = []
+                                for typestate_ctor_prefix_index in 0..<sview_len("__typestate_") |typestate_ctor_storage|:
+                                    typestate_ctor_storage.push(sview_at("__typestate_", typestate_ctor_prefix_index))
+                                for typestate_ctor_type_index in 0..<sview_len(typestate_ctor_type) |typestate_ctor_storage, typestate_ctor_type|:
+                                    typestate_ctor_storage.push(sview_at(typestate_ctor_type, typestate_ctor_type_index))
+                                for typestate_ctor_suffix_index in 0..<sview_len("_new") |typestate_ctor_storage|:
+                                    typestate_ctor_storage.push(sview_at("_new", typestate_ctor_suffix_index))
+                                typestate_ctor_name: sview = sview(&typestate_ctor_storage[0], 0, typestate_ctor_storage.count)
+                                typestate_ctor_return: ValueType = lookup_return_type(fns, "", typestate_ctor_name)
+                                typestate_ctor_return return if typestate_ctor_return.kind != TypeKind.Unmodeled
+                        Expr.Ident(readonly_name, readonly_name_line):
+                            if readonly_name == "readonly" and call_arguments.count == 1:
+                                return expression_type_depth(call_arguments[0], local_scope, fns, structs, generics, depth + 1)
+                        _:
+                            pass
+                    # A call through a `fn(…)`-typed local is an indirect call; its type is the
+                    # fn value's declared RETURN type (so `f(f(x))` types its inner call).
+                    match call_callee:
+                        Expr.Ident(fn_call_name, fn_call_name_line):
+                            fn_call_type: ValueType = lookup_type(local_scope, fn_call_name)
+                            fn_return_type_of(fn_call_type, structs) return if fn_call_type.kind == TypeKind.Fn
+                            # C function pointers are nullable function values. Their call ABI
+                            # is still the payload signature; a null call remains the same
+                            # runtime UB as in C, while safe Elisa fn? calls are rejected by the
+                            # frontend before code generation.
+                            if fn_call_type.kind == TypeKind.Optional:
+                                narrowed_fn_type: ValueType = optional_payload_of(fn_call_type, structs)
+                                fn_return_type_of(narrowed_fn_type, structs) return if narrowed_fn_type.kind == TypeKind.Fn
+                        Expr.Field(fn_call_object, fn_call_field, fn_call_field_line):
+                            fn_field_type: ValueType = expression_type_depth(call_callee, local_scope, fns, structs, generics, depth + 1)
+                            if fn_field_type.kind == TypeKind.Optional:
+                                narrowed_field_fn_type: ValueType = optional_payload_of(fn_field_type, structs)
+                                fn_return_type_of(narrowed_field_fn_type, structs) return if narrowed_field_fn_type.kind == TypeKind.Fn
+                        _:
+                            pass
+                    # `x.u8()` is a CAST (postfix call unifies cast and UFCS: `recv.Name()`
+                    # where Name is a type name is a conversion).
+                    # `dense_key(node, frozen)` is a NodeKey, which stage1 erases to the i32
+                    # handle it wraps.
+                    match call_callee:
+                        Expr.Ident(dense_key_type_name, dense_key_type_line):
+                            ValueType{kind: TypeKind.Signed, bits: 32} return if dense_key_type_name == "dense_key" and call_arguments.count == 2
+                        _:
+                            pass
+                    match call_callee:
+                        Expr.Field(cast_object, cast_name, cast_line):
+                            match cast_object:
+                                Expr.Ident(packed_call_enum, packed_call_enum_line):
+                                    packed_call_index: i64 = packed_index_of(structs, packed_call_enum)
+                                    ValueType{kind: TypeKind.PackedEnum, bits: packed_call_index.u32()} return if packed_call_index >= 0 and cast_name != "Store"
+                                _:
+                                    pass
+                            qualified_packed_name: sview = packed_constructor_enum_name(cast_object)
+                            if qualified_packed_name != "":
+                                qualified_packed_index: i64 = packed_index_of(structs, qualified_packed_name)
+                                ValueType{kind: TypeKind.PackedEnum, bits: qualified_packed_index.u32()} return if qualified_packed_index >= 0 and cast_name != "Store"
+                            # Both spellings of the store type, for the reason the qualified
+                            # PackedEnum lookup just above exists.
+                            if cast_name == "Store":
+                                store_type_enum: sview = packed_constructor_enum_name(cast_object)
+                                if store_type_enum != "":
+                                    store_type_index: i64 = packed_index_of(structs, store_type_enum)
+                                    ValueType{kind: TypeKind.PackedStore, bits: store_type_index.u32()} return if store_type_index >= 0
+                            # `Shape.Circle(42)` is a payload-enum CONSTRUCTOR and has the enum's
+                            # type. Checked before the cast/UFCS split: the head is an enum NAME, so
+                            # neither of those readings applies.
+                            match cast_object:
+                                Expr.Ident(ctor_enum_name, ctor_enum_line):
+                                    ctor_index: i64 = penum_index_of(structs, ctor_enum_name)
+                                    ValueType{kind: TypeKind.PayloadEnum, bits: ctor_index.u32()} return if ctor_index >= 0
+                                # Module-qualified head: `UiCore::Command.Clear(...)`.
+                                Expr.Scope(ctor_scope_head, ctor_scoped_enum_name, ctor_scope_line):
+                                    scoped_ctor_index: i64 = penum_index_of(structs, ctor_scoped_enum_name)
+                                    ValueType{kind: TypeKind.PayloadEnum, bits: scoped_ctor_index.u32()} return if scoped_ctor_index >= 0
+                                _:
+                                    pass
+                            # `T.tag_of(v)` — STATIC protocol dispatch through a BOUND type parameter
+                            # (emit_call has the matching branch). Its type is the resolved impl
+                            # member's return type. Without this the call typed as Unmodeled and the
+                            # ENCLOSING overload resolution had nothing to go on — the std's
+                            # `print(T.__cast__(value))` preferred the generic `print[T: Str]` over
+                            # `print(value: cstr)` and instantiated it at a junk type argument
+                            # (`print__u32`), which declined.
+                            #
+                            # The head must name a bound type parameter and NOT a local, so an
+                            # ordinary receiver sharing the name keeps the value paths below. The
+                            # UNIQUE-match rule is the emitter's, so the two agree by construction:
+                            # both resolve, or both fall through.
+                            match cast_object:
+                                Expr.Ident(pstatic_param, pstatic_param_line):
+                                    if lookup_type(local_scope, pstatic_param).kind == TypeKind.Unmodeled and bound_type_of(structs, pstatic_param).kind != TypeKind.Unmodeled:
+                                        pstatic_matches: i64 = overload_match_count(fns, "", cast_name, call_arguments, local_scope, structs, generics) can Memory.Allocate
+                                        pstatic_index: i64 = overload_index_for_args(fns, "", cast_name, call_arguments, local_scope, structs, generics) can Memory.Allocate
+                                        copied_type(fns.returns[pstatic_index.usize()]) return if pstatic_matches == 1 and pstatic_index >= 0
+                                _:
+                                    pass
+                            # `d.entry(k).insert(v)` / `.get_or_insert(v)` — the ENTRY api's mutating
+                            # members have the MISS-side helper's return type (`T&?`), the same type
+                            # the hit side yields. The receiver here is the `entry` call, which has
+                            # no type of its own, so the dict path just below cannot see it.
+                            if cast_name == "insert" or cast_name == "get_or_insert":
+                                match cast_object:
+                                    Expr.Call(entry_type_callee, entry_type_args_expr, entry_type_names, entry_type_line):
+                                        match entry_type_callee:
+                                            Expr.Field(entry_type_recv, entry_type_method, entry_type_method_line):
+                                                if entry_type_method == "entry":
+                                                    entry_type_dict: darray[ValueType] = dict_type_args_of(entry_type_recv, local_scope, fns, structs, generics)
+                                                    if entry_type_dict.count != 0:
+                                                        entry_miss_name: sview = "put" if cast_name == "insert" else "get_or_insert"
+                                                        entry_miss_helper: sview = resolved_container_helper("DynDict", entry_miss_name, generics)
+                                                        if entry_miss_helper != "":
+                                                            entry_miss_narrowed: darray[ValueType] = container_helper_type_args(entry_miss_helper, entry_type_dict, generics)
+                                                            return generic_return_type(entry_miss_helper, entry_miss_narrowed, generics, structs)
+                                            _:
+                                                pass
+                                    _:
+                                        pass
+                            # A dict receiver's `.get`/`.put`/… is a synthesized std-generic call —
+                            # its type is that helper's return annotation resolved under the receiver's
+                            # (K, T). Needed so `if d.get(k) is v:` can see the `T&?` it narrows.
+                            dict_return_args: darray[ValueType] = dict_type_args_of(cast_object, local_scope, fns, structs, generics)
+                            if dict_return_args.count != 0:
+                                dict_return_helper: sview = resolved_container_helper(container_receiver_base(cast_object, local_scope, fns, structs, generics), cast_name, generics)
+                                if dict_return_helper != "":
+                                    dict_return_narrowed: darray[ValueType] = container_helper_type_args(dict_return_helper, dict_return_args, generics)
+                                    return generic_return_type(dict_return_helper, dict_return_narrowed, generics, structs)
+                            # A type name is a CAST and has that type; anything else is UFCS
+                            # (`p.get()` == `get(p)`) and has the FUNCTION's return type. Without
+                            # the second case a UFCS call reports Unmodeled and every
+                            # type-directed check downstream silently stops applying.
+                            cast_type: ValueType = scalar_type_of_name(cast_name)
+                            cast_type return if cast_type.kind != TypeKind.Unmodeled
+                            # A conversion to an INTEGER-backed handle alias (`type X = id[T]`), which
+                            # is not a builtin scalar name. Mirrors the emit side; checked BEFORE the
+                            # UFCS lookup for the same reason the emit side is, and kept to integer
+                            # aliases so a same-named function still wins for every other alias.
+                            cast_alias_slot: i64 = alias_index_of(structs, cast_name)
+                            if cast_alias_slot >= 0:
+                                cast_alias_value: ValueType = copied_type(structs.alias_types[cast_alias_slot.usize()])
+                                cast_alias_value return if is_integer_type(cast_alias_value)
+                            top_ufcs: ValueType = lookup_return_type(fns, "", cast_name)
+                            top_ufcs return if top_ufcs.kind != TypeKind.Unmodeled
+                            # Module methods (`module Lexer: def match_char`) live under owner M.
+                            # Prefer arity match: UFCS has implicit receiver + call_arguments.
+                            ufcs_arity: usize = call_arguments.count + 1
+                            for ufcs_ret_scan in 0..<fns.names.count |cast_name, fns, ufcs_arity|:
+                                if fns.names[ufcs_ret_scan] == cast_name and fns.param_count[ufcs_ret_scan] == ufcs_arity:
+                                    return copied_type(fns.returns[ufcs_ret_scan])
+                            ufcs_owner: mutable sview = ""
+                            ufcs_hits: mutable i64 = 0
+                            for ufcs_ret_scan2 in 0..<fns.names.count |ufcs_owner, ufcs_hits, cast_name, fns|:
+                                if fns.names[ufcs_ret_scan2] == cast_name:
+                                    ufcs_hits <- ufcs_hits + 1
+                                    ufcs_owner <- fns.owners[ufcs_ret_scan2]
+                            lookup_return_type(fns, ufcs_owner, cast_name) return if ufcs_hits == 1
+                            return unmodeled_type()
+                        _:
+                            pass
+                    # `f[i64](x)` — an explicit generic call. Its type is the template's return
+                    # annotation resolved under that binding, which for `-> T` is the type
+                    # argument itself.
+                    match call_callee:
+                        Expr.Index(generic_head, generic_type_argument, generic_head_line):
+                            match generic_head:
+                                Expr.Ident(generic_head_name, generic_head_name_line):
+                                    if generic_head_name == "clone":
+                                        clone_payload_type: ValueType = annotation_value_type(generic_type_argument, structs)
+                                        clone_error_family: sview = clone_error_family_at(generic_head_line.line, structs)
+                                        if clone_error_family != "":
+                                            return intern_error_union_type(clone_payload_type, clone_error_family, structs)
+                                        return clone_payload_type
+                                    if generic_index_of(generics, generic_head_name) >= 0:
+                                        single_return_args: mutable darray[ValueType] = [annotation_value_type(generic_type_argument, structs)]
+                                        return generic_return_type(generic_head_name, single_return_args, generics, structs)
+                                _:
+                                    pass
+                        _:
+                            pass
+                    # `f[K, V](x)` — an explicit MULTI-argument generic call's type.
+                    match call_callee:
+                        Expr.IndexN(multi_head, multi_head_args, multi_head_line):
+                            match multi_head:
+                                Expr.Ident(multi_head_name, multi_head_name_line):
+                                    if multi_head_name == "clone" and multi_head_args.count > 0:
+                                        clone_multi_payload: ValueType = annotation_value_type(multi_head_args[0], structs)
+                                        clone_multi_family: sview = clone_error_family_at(multi_head_line.line, structs)
+                                        if clone_multi_family != "":
+                                            return intern_error_union_type(clone_multi_payload, clone_multi_family, structs)
+                                        return clone_multi_payload
+                                    if generic_index_of(generics, multi_head_name) >= 0:
+                                        multi_return_args: mutable darray[ValueType] = []
+                                        multi_return_args.extend([annotation_value_type(multi_return_arg_expr, structs) for multi_return_arg_expr in multi_head_args])
+                                        return generic_return_type(multi_head_name, multi_return_args, generics, structs)
+                                _:
+                                    pass
+                        _:
+                            pass
+                    match call_callee:
+                        Expr.Ident(callee_name, callee_line):
+                            # The `ctx_hash_value` builtin returns u64.
+                            ValueType{kind: TypeKind.Unsigned, bits: 64} return if callee_name == "ctx_hash_value"
+                            # `__fstr(…)` builds a dstr (`darray[u8]`).
+                            intern_darray_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, structs) return if callee_name == "__fstr"
+                            ValueType{kind: TypeKind.Unsigned, bits: 64} return if callee_name == "size_of"
+                            intern_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs) return if callee_name == "arena_alloc"
+                            # `i64(x)` / `u8(x)` — a prefix value CONVERSION (the canonical `T(x)`
+                            # spelling; postfix `x.i64()` is on the cast path). A scalar type name applied
+                            # to one argument has that scalar type. Checked before the generic/function
+                            # lookup so a downstream `i64(x) - k` sees an i64 operand, not Unmodeled.
+                            prefix_conversion_type: ValueType = scalar_type_of_name(callee_name)
+                            prefix_conversion_type return if prefix_conversion_type.kind != TypeKind.Unmodeled and call_arguments.count == 1
+                            # A GENERIC template is NOT in `fns` — only its instantiations are —
+                            # so it must be resolved through the template. Without this a generic
+                            # call reports Unmodeled and every type-directed check downstream
+                            # (operand typing, the mixed-width guard) silently stops applying.
+                            #
+                            # …unless a NON-GENERIC overload matches EXACTLY, which wins — the same
+                            # guard emit_call already applies (codegen_call.elisa). It was added
+                            # there and never here, so the TYPE of a call to a std-overloaded name
+                            # came from the template even where the user's own overload was the one
+                            # being called. Harmless at the top of a statement, fatal one level in:
+                            # `add(add(20, 20), 2)` typed its inner call through the std's `add[T]`,
+                            # which made exact_overload_exists reject the OUTER call too, so that
+                            # routed into the generic path and inferred from a size-less type —
+                            # SIGTRAP in LLVM's getTypeSizeInBits for `add`, a plain decline for
+                            # `get`/`put`/`push`/`len`. The FLAT call was fine throughout, because
+                            # literal arguments never reach this arm.
+                            if generic_index_of(generics, callee_name) >= 0 and not exact_overload_exists(fns, callee_name, call_arguments, local_scope, structs, generics):
+                                unmodeled_type() return if call_arguments.count == 0
+                                inferred_return_slot: usize = generic_index_of(generics, callee_name).usize()
+                                inferred_return_args: darray[ValueType] = infer_generic_args(inferred_return_slot, call_arguments, local_scope, fns, structs, generics)
+                                unmodeled_type() return if inferred_return_args.count == 0
+                                return generic_return_type(callee_name, inferred_return_args, generics, structs)
+                            top_return: ValueType = lookup_return_type(fns, "", callee_name)
+                            top_return return if top_return.kind != TypeKind.Unmodeled
+                            # Bare sibling call inside a module. Prefer arity-matched overload
+                            # (Token 4-arg forwarding to 5-arg); unique-name fallback otherwise.
+                            bare_ret_arity: usize = call_arguments.count
+                            for bare_ret_scan in 0..<fns.names.count |callee_name, fns, bare_ret_arity|:
+                                if fns.names[bare_ret_scan] == callee_name and fns.param_count[bare_ret_scan] == bare_ret_arity:
+                                    return copied_type(fns.returns[bare_ret_scan])
+                            bare_ret_owner: mutable sview = ""
+                            bare_ret_hits: mutable i64 = 0
+                            for bare_ret_scan2 in 0..<fns.names.count |bare_ret_owner, bare_ret_hits, callee_name, fns|:
+                                if fns.names[bare_ret_scan2] == callee_name:
+                                    bare_ret_hits <- bare_ret_hits + 1
+                                    bare_ret_owner <- fns.owners[bare_ret_scan2]
+                            lookup_return_type(fns, bare_ret_owner, callee_name) return if bare_ret_hits == 1
+                            return unmodeled_type()
+                        _:
+                            pass
+                    # A module-qualified call's type is the qualified function's return type.
+                    match call_callee:
+                        Expr.Scope(scope_head, scope_name, scope_line):
+                            match scope_head:
+                                Expr.Ident(module_name, module_name_line):
+                                    # Bare head inside the enclosing module (`Inner::f()` in
+                                    # `module Outer:` -> owner `Outer::Inner`), same rule as
+                                    # emit_call.
+                                    if function_index_of(fns, module_name, scope_name) < 0:
+                                        if qualified_owner_of(fns, structs.current_owner, module_name) is enclosing_owner:
+                                            return lookup_return_type(fns, enclosing_owner, scope_name)
+                                    return lookup_return_type(fns, module_name, scope_name)
+                                Expr.Scope(nested_head, nested_mid, nested_line):
+                                    # `A::B::f()`: the owner is the verbatim `A::B`.
+                                    if nested_head is Expr.Ident(nested_root, nested_root_line):
+                                        if qualified_owner_of(fns, nested_root, nested_mid) is nested_owner:
+                                            return lookup_return_type(fns, nested_owner, scope_name)
+                                _:
+                                    pass
+                        _:
+                            pass
+                _:
+                    pass
+            return unmodeled_type()
+

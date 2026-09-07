@@ -1,0 +1,407 @@
+# `-emit test` — COMPILE the unit once, then run each selected `@test` in its OWN process, so a
+# panic or a fatal signal is reported rather than taking the runner down with it. Each child's
+# streams are captured to files and replayed under stage0's `[ STDOUT ]` / `[ STDERR ]` headers.
+
+
+# `-emit test` — COMPILE the unit once, then RUN each selected `@test` in its OWN
+# PROCESS, which is what stage0 does and the reason the mode exists at all: a test that
+# panics has to be reported as a failure and the suite has to keep going.
+#
+# stage0 links one binary whose entry point dispatches on the test NAME in argv[1]; this
+# does the same through a small C shim linked against the unit's object. The shim is C
+# rather than Elisa because the entry point only has to compare argv[1] against each name
+# — `main(argc, argv)` plus `strcmp` is far less machinery than expressing that dispatch
+# in Elisa and pushing it back through the front end. A top-level test function carries
+# its bare name as its C symbol (`_checks_one`), so the shim declares and calls it
+# directly.
+#
+# stage0 refuses `-o` for this mode; the report is stdout.
+
+
+# stage0's formatTestLine: `[ STATUS ] name detail`, the status padded to 8 columns —
+# LEFT-aligned, except `OK`, which is RIGHT-aligned. That asymmetry is why `[ RUN      ]`
+# and `[       OK ]` do not line up the same way, and it is load-bearing for byte parity.
+def test_push_line(buffer: mutable darray[u8]&, status: sview, name: sview, detail: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    emit_tokens_push_sview(buffer, "[ ")
+    used: i64 = sview_len(status).i64()
+    padding: i64 = (8 - used) if used < 8 else 0
+    if status == "OK":
+        for left_index in 0..<padding |buffer|:
+            buffer.push(32)
+        emit_tokens_push_sview(buffer, status)
+    else:
+        emit_tokens_push_sview(buffer, status)
+        for right_index in 0..<padding |buffer|:
+            buffer.push(32)
+    emit_tokens_push_sview(buffer, " ] ")
+    emit_tokens_push_sview(buffer, name)
+    emit_tokens_push_sview(buffer, detail)
+    buffer.push(10)
+
+
+
+
+# Every `@test` the filter selects, in declaration order, with a parallel flag for the
+# ones `@skip` marks. A skipped test is still SELECTED — it counts toward the summary's
+# total and prints its own line — so the two lists have to stay index-aligned.
+def test_collect_cases(declarations: darray[Ast::Decl]&, needle: darray[u8]&, names: mutable darray[sview]&, skipped: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate]:
+    for declaration in declarations |needle, names, skipped|:
+        if declaration is Decl.Module(case_m_name, case_m_body, case_m_line):
+            test_collect_cases(case_m_body, needle, names, skipped)
+            continue
+        if declaration is Decl.Scoped(case_s_body, case_s_line):
+            test_collect_cases(case_s_body, needle, names, skipped)
+            continue
+        if declaration is Decl.Func(case_f_name, case_f_params, case_f_ret, case_f_body, case_f_effects, case_f_decorators, case_f_line):
+            is_test: mutable bool = false
+            is_skip: mutable bool = false
+            for case_f_decorator in case_f_decorators |is_test, is_skip|:
+                is_test <- true if case_f_decorator.name == "test"
+                is_skip <- true if case_f_decorator.name == "skip"
+            continue if not is_test
+            continue if not test_name_matches(case_f_name, needle)
+            names.push(case_f_name)
+            skipped.push(is_skip)
+
+
+
+
+# Go's `syscall.Signal.String()` on Darwin, for the signals a test can realistically die
+# from. An unknown number renders the way Go's fallback does.
+def test_push_signal_name(buffer: mutable darray[u8]&, signal: i64) -> void can[Abort.Panic, Memory.Allocate]:
+    signal_name: sview = when signal:
+        4 -> "illegal instruction"
+        5 -> "trace/BPT trap"
+        6 -> "abort trap"
+        8 -> "floating point exception"
+        9 -> "killed"
+        10 -> "bus error"
+        11 -> "segmentation fault"
+        15 -> "terminated"
+        _ -> ""
+    if signal_name != "":
+        emit_tokens_push_sview(buffer, signal_name)
+    else:
+        emit_tokens_push_sview(buffer, "signal ")
+        append_decimal(buffer, signal.u32())
+
+
+
+
+# Is a signal one stage0 classifies as a PANIC rather than a plain failure?
+def test_signal_is_panic(signal: i64) -> bool can[Abort.Panic]:
+    return when signal:
+        4 -> true
+        5 -> true
+        6 -> true
+        10 -> true
+        11 -> true
+        _ -> false
+
+
+
+
+# The C dispatch shim: one `extern void NAME(void);` per runnable test and a `main` that
+# calls the one argv[1] names. Exits 2 for an unknown name so a dispatch bug cannot be
+# mistaken for a passing test.
+def test_push_dispatch_shim(buffer: mutable darray[u8]&, names: darray[sview]&, skipped: darray[bool]&) -> void can[Abort.Panic, Memory.Allocate]:
+    emit_tokens_push_sview(buffer, "#include <stdio.h>\n#include <string.h>\n\n")
+    # The complete runtime object contains optional native-callback and varargs bridges.
+    # A stage1 test runner has no executable host callback registry, so provide the same
+    # documented fallback/no-op definitions used by extension-module links. Without these
+    # definitions the linker rejected even a one-line @test because the runtime object
+    # legitimately carries the optional bridge wrappers.
+    emit_tokens_push_sview(buffer, "#include <stddef.h>\n#include <stdint.h>\n\n")
+    emit_tokens_push_sview(buffer, "void *elisa_native_callback_ptr(uint8_t *name) { (void)name; return NULL; }\n")
+    emit_tokens_push_sview(buffer, "uint32_t elisa_native_callback_call_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) { (void)name; (void)arg; return fallback; }\n")
+    emit_tokens_push_sview(buffer, "int32_t elisa_native_callback_call_i32_voidp(uint8_t *name, void *arg, int32_t fallback) { (void)name; (void)arg; return fallback; }\n")
+    emit_tokens_push_sview(buffer, "uintptr_t elisa_native_callback_call_usize_voidp(uint8_t *name, void *arg, uintptr_t fallback) { (void)name; (void)arg; return fallback; }\n")
+    emit_tokens_push_sview(buffer, "intptr_t elisa_native_callback_call_isize_voidp(uint8_t *name, void *arg, intptr_t fallback) { (void)name; (void)arg; return fallback; }\n")
+    emit_tokens_push_sview(buffer, "uint32_t elisa_native_callback_spawn_join_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) { (void)name; (void)arg; return fallback; }\n")
+    emit_tokens_push_sview(buffer, "void *elisa_native_callback_context_new_u32_voidp(uint8_t *name, void *arg, uint32_t fallback) { (void)name; (void)arg; (void)fallback; return NULL; }\n")
+    emit_tokens_push_sview(buffer, "void *elisa_native_callback_context_entry_u32_voidp(void) { return NULL; }\n")
+    emit_tokens_push_sview(buffer, "int32_t elisa_native_callback_context_start_u32_voidp(void *ctx, uintptr_t *thread) { (void)ctx; (void)thread; return -1; }\n")
+    emit_tokens_push_sview(buffer, "uint32_t elisa_native_callback_context_join_u32_voidp(uintptr_t handle, void *ctx, uint32_t fallback) { (void)handle; (void)ctx; return fallback; }\n")
+    emit_tokens_push_sview(buffer, "uint32_t elisa_native_callback_context_spawn_join_u32_voidp(void *ctx, uint32_t fallback) { (void)ctx; return fallback; }\n")
+    emit_tokens_push_sview(buffer, "uint32_t elisa_native_callback_context_result_u32(void *ctx, uint32_t fallback) { (void)ctx; return fallback; }\n")
+    emit_tokens_push_sview(buffer, "void elisa_native_callback_context_free(void *ctx) { (void)ctx; }\n")
+    emit_tokens_push_sview(buffer, "void *va_copy(void *source) { return source; }\n")
+    emit_tokens_push_sview(buffer, "void va_end(void *argument) { (void)argument; }\n\n")
+    for declare_index in 0..<names.count |buffer, names, skipped|:
+        continue if skipped[declare_index]
+        emit_tokens_push_sview(buffer, "extern void ")
+        emit_tokens_push_sview(buffer, names[declare_index])
+        emit_tokens_push_sview(buffer, "(void);\n")
+    emit_tokens_push_sview(buffer, "\nint main(int argc, char **argv) {\n    if (argc < 2) return 2;\n")
+    for dispatch_index in 0..<names.count |buffer, names, skipped|:
+        continue if skipped[dispatch_index]
+        emit_tokens_push_sview(buffer, "    if (strcmp(argv[1], \"")
+        emit_tokens_push_sview(buffer, names[dispatch_index])
+        emit_tokens_push_sview(buffer, "\") == 0) { ")
+        # stage0's shim announces the test on STDERR before calling it, so a test that
+        # dies takes its own name to the captured stream. Matching it keeps the STDERR
+        # replay identical up to the backtrace addresses.
+        emit_tokens_push_sview(buffer, "fprintf(stderr, \"[ ACTIVE   ] %s\\n\", \"")
+        emit_tokens_push_sview(buffer, names[dispatch_index])
+        emit_tokens_push_sview(buffer, "\"); ")
+        emit_tokens_push_sview(buffer, names[dispatch_index])
+        emit_tokens_push_sview(buffer, "(); return 0; }\n")
+    emit_tokens_push_sview(buffer, "    return 2;\n}\n")
+
+
+
+
+# One captured stream, replayed under a `[ STDOUT   ]`/`[ STDERR   ]` header with every
+# line indented four spaces. An empty stream (after trailing newlines are dropped) prints
+# nothing at all — not even the header.
+def test_push_captured(buffer: mutable darray[u8]&, label: sview, name: sview, path: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    for path_index in 0..<path.count |path_c, path|:
+        path_c.push(path[path_index])
+    path_c.push(0)
+    path_cstr: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    captured: darray[u8] = read_file(path_cstr)
+    stop: mutable usize = captured.count
+    while stop > 0 and captured[stop - 1] == 10 |stop, captured|:
+        stop <- stop - 1
+    return if stop == 0
+    test_push_line(buffer, label, name, "")
+    emit_tokens_push_sview(buffer, "    ")
+    for byte_index in 0..<stop |buffer, captured|:
+        byte: u8 = captured[byte_index]
+        buffer.push(byte)
+        emit_tokens_push_sview(buffer, "    ") if byte == 10
+    buffer.push(10)
+
+
+
+
+# Stamp the module's IDENTIFIER and SOURCE FILENAME with the stable source basename, matching
+# stage0. An absolute path here changes only LLVM's module header but can change target-machine
+# code generation; full paths remain available in `#line` directives and frontend diagnostics.
+# The panic lowering reads the source filename back out of the module to name the file in
+# `panic at FILE:LINE:COL: MESSAGE`.
+def stamp_module_source_path(module_handle: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    path: mutable darray[u8] = []
+    push_stable_module_source_name(&path)
+    path.push(0)
+    path_cstr: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
+    LLVMSetModuleIdentifier(module_handle, path_cstr, path.count - 1.usize())
+    LLVMSetSourceFileName(module_handle, path_cstr, path.count - 1.usize())
+
+
+
+
+# Test-runner panic reports intentionally retain the full source path, matching stage0's
+# `panic at /absolute/file.elisa:...` output. The module identifier stays basename-stable so
+# target code generation is still independent of how the caller spelled the input path.
+def stamp_test_module_source_path(module_handle: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    module_path: mutable darray[u8] = []
+    push_stable_module_source_name(&module_path)
+    module_path.push(0)
+    module_cstr: cstr = (&module_path[0]).cast[cstr] can Unsafe.PointerCast
+    LLVMSetModuleIdentifier(module_handle, module_cstr, module_path.count - 1.usize())
+    source_path: mutable darray[u8] = []
+    push_absolute_source_path(&source_path)
+    if source_path.count == 0:
+        for fallback_index in 0..<(module_path.count - 1.usize()) |source_path, module_path|:
+            source_path.push(module_path[fallback_index])
+    source_path.push(0)
+    source_cstr: cstr = (&source_path[0]).cast[cstr] can Unsafe.PointerCast
+    LLVMSetSourceFileName(module_handle, source_cstr, source_path.count - 1.usize())
+
+
+
+
+def emit_test_run(file: Ast::File&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    needle: mutable darray[u8] = []
+    push_test_filter(&needle)
+    names: mutable darray[sview] = []
+    skipped_flags: mutable darray[bool] = []
+    test_collect_cases(file.top_decls, needle, &names, &skipped_flags)
+    if names.count == 0:
+        empty: mutable darray[u8] = []
+        emit_tokens_push_sview(&empty, "[ NO TESTS ] no @test functions matched filter \"")
+        for needle_index in 0..<needle.count |empty, needle|:
+            empty.push(needle[needle_index])
+        emit_tokens_push_sview(&empty, "\"\n")
+        _ = emit_tokens_flush(empty)
+        return 1
+    return run_selected_tests(file, names, skipped_flags)
+
+
+
+
+# Split from emit_test_run so the compile/run buffers nest inside the case lists rather
+# than interleaving with them — the inferred region rejects the single-function form.
+def run_selected_tests(file: Ast::File&, names: darray[sview]&, skipped_flags: darray[bool]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    work: mutable darray[u8] = []
+    emit_tokens_push_sview(&work, "/tmp/elisa-test-stage1-")
+    append_decimal(&work, elisa_stage1_getpid().u32())
+    make_directory(work)
+    binary_path: darray[u8] = joined_path(work, "runner")
+    if not build_test_runner_binary(file, names, skipped_flags, work, binary_path):
+        message: mutable darray[u8] = []
+        emit_tokens_push_sview(&message, "error: -emit test: could not build the test runner\n")
+        write_stderr(message)
+        return 1
+    return run_test_cases(names, skipped_flags, work, binary_path)
+
+
+
+
+# Codegen the unit to an object, generate the C shim, and link the two with the runtime.
+def build_test_runner_binary(file: Ast::File&, names: darray[sview]&, skipped_flags: darray[bool]&, work: darray[u8]&, binary_path: darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    ctx: LLVMContextRef = LLVMContextCreate()
+    module_handle: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_test", ctx)
+    stamp_test_module_source_path(module_handle)
+    triple_storage: mutable darray[u8] = []
+    machine: LLVMTargetMachineRef = Backend::configure_module_target_for(module_handle, requested_target_triple(&triple_storage))
+    target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(machine)
+    builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+    emitted: i64 = Backend::emit_module_for_tests(file, module_handle, ctx, builder, target_data)
+    false return if emitted <= 0 and unit_declares_function(file.top_decls)
+    object_path: darray[u8] = joined_path(work, "unit.o")
+    object_c: mutable darray[u8] = []
+    for object_index in 0..<object_path.count |object_c, object_path|:
+        object_c.push(object_path[object_index])
+    object_c.push(0)
+    object_cstr: cstr = (&object_c[0]).cast[cstr] can Unsafe.PointerCast
+    false return if not Backend::emit_object(machine, module_handle, object_cstr)
+    shim_path: darray[u8] = joined_path(work, "dispatch.c")
+    shim: mutable darray[u8] = []
+    test_push_dispatch_shim(&shim, names, skipped_flags)
+    false return if not write_file_bytes(shim_path, shim)
+    return link_test_runner(object_path, shim_path, binary_path, not unit_defines_default_runtime(file.top_decls))
+
+
+
+
+def link_test_runner(object_path: darray[u8]&, shim_path: darray[u8]&, binary_path: darray[u8]&, include_runtime: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    link_command: mutable darray[u8] = []
+    # The shim supplies the runtime's va_copy/va_end compatibility symbols. Clang
+    # exposes those names as builtins by default and rejects the fallback definitions;
+    # use the same -fno-builtin mode as the standalone runtime fallback object.
+    emit_tokens_push_sview(&link_command, "clang -fno-builtin -o ")
+    carchive_push_quoted(&link_command, binary_path)
+    link_command.push(32)
+    carchive_push_quoted(&link_command, object_path)
+    link_command.push(32)
+    carchive_push_quoted(&link_command, shim_path)
+    runtime_object: mutable darray[u8] = []
+    push_runtime_object_path(&runtime_object)
+    if runtime_object.count > 0 and include_runtime:
+        link_command.push(32)
+        carchive_push_quoted(&link_command, runtime_object)
+    emit_tokens_push_sview(&link_command, " >/dev/null 2>&1")
+    return cbind_run(link_command) == 0
+
+
+
+
+def run_test_cases(names: darray[sview]&, skipped_flags: darray[bool]&, work: darray[u8]&, binary_path: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    out_path: darray[u8] = joined_path(work, "case.out")
+    err_path: darray[u8] = joined_path(work, "case.err")
+    report: mutable darray[u8] = []
+    passed: mutable i64 = 0
+    skipped: mutable i64 = 0
+    failed: mutable i64 = 0
+    for case_index in 0..<names.count |report, passed, skipped, failed, names, skipped_flags, binary_path, out_path, err_path|:
+        case_name: sview = names[case_index]
+        if skipped_flags[case_index]:
+            skipped <- skipped + 1
+            test_push_line(&report, "SKIPPED", case_name, " (annotation-requested)")
+            continue
+        test_push_line(&report, "RUN", case_name, "")
+        status: i64 = run_one_test_case(case_name, binary_path, out_path, err_path)
+        if status == 0:
+            passed <- passed + 1
+            test_push_line(&report, "OK", case_name, "")
+            continue
+        failed <- failed + 1
+        detail: mutable darray[u8] = []
+        push_test_failure_detail(&detail, status)
+        signal: i64 = test_status_signal(status)
+        status_label: sview = "PANIC" if signal != 0 and test_signal_is_panic(signal) else "FAILED"
+        test_push_line(&report, status_label, case_name, sview_of_bytes(detail))
+        test_push_captured(&report, "STDOUT", case_name, out_path)
+        test_push_captured(&report, "STDERR", case_name, err_path)
+    emit_tokens_push_sview(&report, "[ SUMMARY  ] ")
+    append_decimal(&report, names.count.u32())
+    emit_tokens_push_sview(&report, " test(s) selected; passed=")
+    append_decimal(&report, passed.u32())
+    emit_tokens_push_sview(&report, " skipped=")
+    append_decimal(&report, skipped.u32())
+    emit_tokens_push_sview(&report, " failed=")
+    append_decimal(&report, failed.u32())
+    report.push(10)
+    _ = emit_tokens_flush(report)
+    return 1 if failed > 0 else 0
+
+
+
+
+# The signal that killed the test, or 0 if it exited normally.
+#
+# system() runs the command through `/bin/sh -c`, so what comes back is the SHELL's wait
+# status, not the test's: a child killed by signal N is reported by the shell as a NORMAL
+# exit with code 128+N. Reading the low byte for a signal therefore finds nothing and a
+# panic prints ` (exit 134)` where stage0 prints ` (signal abort trap)`.
+#
+# Both encodings are decoded: the low byte in case the shell itself is signalled, and the
+# 128+N exit convention for the child.
+def test_status_signal(status: i64) -> i64 can[Abort.Panic]:
+    raw_signal: i64 = status % 128
+    raw_signal return if raw_signal != 0
+    exit_code: i64 = status / 256
+    return (exit_code - 128) if exit_code > 128 and exit_code < 160 else 0
+
+
+
+
+# ` (signal abort trap)` for a signalled child, ` (exit N)` otherwise — stage0's
+# classifyTestExecutionError detail, minus the non-ExitError branch, which cannot arise
+# here because the binary is known to exist by the time it runs.
+def push_test_failure_detail(buffer: mutable darray[u8]&, status: i64) -> void can[Abort.Panic, Memory.Allocate]:
+    signal: i64 = test_status_signal(status)
+    if signal != 0:
+        emit_tokens_push_sview(buffer, " (signal ")
+        test_push_signal_name(buffer, signal)
+        buffer.push(41)
+        return
+    emit_tokens_push_sview(buffer, " (exit ")
+    append_decimal(buffer, (status / 256).u32())
+    buffer.push(41)
+
+
+
+
+# The RAW wait status of one test process, with its streams captured to files.
+def run_one_test_case(case_name: sview, binary_path: darray[u8]&, out_path: darray[u8]&, err_path: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    command: mutable darray[u8] = []
+    carchive_push_quoted(&command, binary_path)
+    command.push(32)
+    command.push(39)
+    emit_tokens_push_sview(&command, case_name)
+    command.push(39)
+    emit_tokens_push_sview(&command, " >")
+    carchive_push_quoted(&command, out_path)
+    emit_tokens_push_sview(&command, " 2>")
+    carchive_push_quoted(&command, err_path)
+    command_c: mutable darray[u8] = []
+    for command_index in 0..<command.count |command_c, command|:
+        command_c.push(command[command_index])
+    command_c.push(0)
+    # The RAW status, NOT `/ 256` as cbind_run returns: the signal lives in the low byte
+    # and a `/ 256` reading reports a signalled child as exit 0, i.e. as a PASS.
+    command_cstr: cstr = (&command_c[0]).cast[cstr] can Unsafe.PointerCast
+    return system(command_cstr)
+
+
+
+
+# A buffer as an sview, for the detail strings test_push_line takes.
+def sview_of_bytes(bytes: darray[u8]&) -> sview can[Abort.Panic, Unsafe.PointerCast]:
+    "" return if bytes.count == 0
+    first: u8& = &bytes[0]
+    return sview(first, 0, bytes.count.i64())

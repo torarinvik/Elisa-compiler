@@ -1,0 +1,126 @@
+# Stage1 backend — `export … as …`: the target a name is exported under, and the global
+# aliases (including instantiated generics) that spelling materialises.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        def export_target_of(annotations: darray[Ast::EnumAnnotation]&, export_name: sview) -> sview can[Abort.Panic]:
+            marked: mutable bool = false
+            for marker_annotation in annotations |marked, export_name|:
+                marked <- true if marker_annotation.owner == export_name and marker_annotation.name == "__export_fn"
+            "" return if not marked
+            for annotation in annotations |export_name|:
+                if annotation.owner == export_name and annotation.name != "__export_fn":
+                    return annotation.name
+            return ""
+
+
+
+
+        def export_global_target_of(annotations: darray[Ast::EnumAnnotation]&, export_name: sview) -> sview can[Abort.Panic]:
+            marked: mutable bool = false
+            for marker_annotation in annotations |marked, export_name|:
+                marked <- true if marker_annotation.owner == export_name and marker_annotation.name == "__export_global"
+            "" return if not marked
+            for annotation in annotations |export_name|:
+                if annotation.owner == export_name and annotation.name != "__export_global":
+                    return annotation.name
+            return ""
+
+
+
+        def declare_export_global_alias(alias_name: sview, target_name: sview, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # `export global G as G`: nothing new -- an alias to itself came out as a
+            # bogus `G.1`. The global simply stays external under its own name.
+            if alias_name == target_name:
+                same_global_index: i64 = mutable_global_index_of(structs, target_name)
+                LLVMSetLinkage(structs.mutable_global_handles[same_global_index.usize()], 0) if same_global_index >= 0
+                same_const_index: i64 = const_index_of(structs, target_name)
+                LLVMSetLinkage(structs.const_globals[same_const_index.usize()], 0) if same_global_index < 0 and same_const_index >= 0 and structs.const_global_ok[same_const_index.usize()]
+                return true
+            target: mutable LLVMValueRef = zeroed
+            target_type: mutable ValueType = unmodeled_type()
+            mutable_index: i64 = mutable_global_index_of(structs, target_name)
+            if mutable_index >= 0:
+                target <- structs.mutable_global_handles[mutable_index.usize()]
+                target_type <- copied_type(structs.mutable_global_types[mutable_index.usize()])
+            else:
+                const_index: i64 = const_index_of(structs, target_name)
+                false return if const_index < 0 or not structs.const_resolved[const_index.usize()]
+                target_type <- copied_type(structs.const_types[const_index.usize()])
+                if structs.const_global_ok[const_index.usize()]:
+                    target <- structs.const_globals[const_index.usize()]
+                else:
+                    target_type_llvm: LLVMTypeRef = llvm_type_of(target_type, structs, ctx)
+                    target_name_storage: mutable darray[u8] = []
+                    target <- LLVMAddGlobal(m, target_type_llvm, sview_to_cstr(target_name, target_name_storage))
+                    initializer: mutable LLVMValueRef = LLVMConstNull(target_type_llvm)
+                    if target_type.kind == TypeKind.Float and structs.const_float_ok[const_index.usize()]:
+                        initializer <- LLVMConstReal(target_type_llvm, structs.const_float_values[const_index.usize()])
+                    elif target_type.kind == TypeKind.Float and structs.const_float_text[const_index.usize()] != "":
+                        float_storage: mutable darray[u8] = []
+                        initializer <- LLVMConstRealOfString(target_type_llvm, sview_to_cstr(structs.const_float_text[const_index.usize()], float_storage))
+                    elif is_integer_type(target_type) or target_type.kind == TypeKind.Bool:
+                        initializer <- LLVMConstInt(target_type_llvm, structs.const_values[const_index.usize()].u64(), 0)
+                    else:
+                        return false
+                    LLVMSetInitializer(target, initializer)
+            false return if target_type.kind == TypeKind.Unmodeled
+            alias_type: LLVMTypeRef = llvm_type_of(target_type, structs, ctx)
+            alias_storage: mutable darray[u8] = []
+            _ = LLVMAddAlias2(m, alias_type, 0, target, sview_to_cstr(alias_name, alias_storage))
+            return true
+
+
+
+        # `export global target as public` is represented by the parser as an annotation
+        # pair. Materialize aliases after all globals exist, before the extern declaration
+        # pass; doing it from the extern row is order-sensitive and can see only a zero
+        # placeholder for the target handle.
+        def materialize_export_global_aliases(annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for annotation in annotations |structs, m, ctx|:
+                    # `export global MAGIC as MAGIC` names the implementation itself. The
+                    # target is already the public symbol; adding an alias named MAGIC would
+                    # produce the spurious `@MAGIC.1` self-alias seen only in Stage1.
+                    continue if annotation.name == "__export_global" or annotation.owner == annotation.name
+                    if mutable_global_index_of(structs, annotation.name) >= 0 or const_index_of(structs, annotation.name) >= 0:
+                        _ = declare_export_global_alias(annotation.owner, annotation.name, structs, m, ctx)
+
+
+
+
+        # `export type Vec[i32] as Vec2i` names an INSTANTIATED generic. The parser records
+        # it only as annotations (alias -> base, plus a `__export_type` marker on the base),
+        # so `Vec2i` is not in the alias table and an `export fn f(x: Vec2i, …)` failed to
+        # declare — which is why stage1 emitted no `_vec2i_add` where stage0 exports one.
+        #
+        # Resolved HERE, at declaration time, rather than registered as an ordinary alias:
+        # aliases resolve in ONE pass in declaration order, before any generic struct is
+        # instantiated, and feeding `Vec[i32]` into that pass segfaults the compiler. By the
+        # time an extern is declared the instantiation exists, because the function it wraps
+        # is declared earlier in the same loop.
+        #
+        # Scoped to a base with EXACTLY ONE instantiation. With none the type genuinely is
+        # not known yet; with several the alias is ambiguous and guessing would bind the
+        # wrong one. Both keep today's decline.
+        def export_alias_value_type(annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&, alias_name: sview) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            unmodeled_type() return if alias_name == ""
+            base_name: mutable sview = ""
+            for annotation in annotations |base_name, alias_name|:
+                base_name <- annotation.name if annotation.owner == alias_name and annotation.name != "" and annotation.name != "__export_type"
+            unmodeled_type() return if base_name == ""
+            exported: mutable bool = false
+            for marker in annotations |exported, base_name|:
+                exported <- true if marker.owner == base_name and marker.name == "__export_type"
+            unmodeled_type() return if not exported
+            found_index: mutable i64 = -1
+            matches: mutable i64 = 0
+            for inst in 0..<structs.generic_struct_inst_bases.count |structs, base_name, found_index, matches|:
+                if structs.generic_struct_inst_bases[inst] == base_name and structs.generic_struct_inst_ready[inst]:
+                    found_index <- structs.generic_struct_inst_index[inst].i64()
+                    matches <- matches + 1
+            unmodeled_type() return if matches != 1 or found_index < 0
+            return ValueType{kind: TypeKind.Struct, bits: found_index.u32()}

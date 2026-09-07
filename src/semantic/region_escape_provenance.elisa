@@ -1,0 +1,156 @@
+# Nested-region store-escape — VALUE PROVENANCE: which region does a stored value actually live
+# in? Its own `@region` annotation, the region of the receiver it was sliced or viewed from, or
+# a region it was TAINTED with when a value from there flowed into it. The nesting position of
+# that region is what the escape check compares. Continues check_region_escape.elisa.
+
+extend Semantic:
+    private:
+
+
+        # The declared @region of a local, or "" when it carries none.
+        def local_region_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, before_line: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                annotation_option: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, name, before_line)
+                region_name: mutable sview = sview("", 0, 0)
+                region_name <- present.region if annotation_option is present
+                return region_name
+
+
+
+        # The nesting position of REGION on the nesting (outer regions have smaller indices),
+        # with found=false when it is not an enclosing function-local region.
+        def region_stack_position(nesting: darray[sview]&, region_name: sview) -> (found: bool, position: usize):
+            can Abort.Panic:
+                found_here: mutable bool = false
+                position_here: mutable usize = 0
+                while probe < nesting.count |probe: usize = 0, found_here, position_here|:
+                    matched: bool = nesting[probe] == region_name
+                    found_here <- true if matched
+                    position_here <- probe if matched
+                    probe <- probe + 1
+                return (found_here, position_here)
+
+
+
+        # The @region of a stored VALUE expression: a plain ident's region, or — for a list
+        # literal `[v, …]` — the (single) inner region shared by its element idents. Returns
+        # "" when no region-annotated value is found. Sound: only explicitly-annotated
+        # idents contribute, so a region-less element yields no false region.
+        def stored_value_region(value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, line: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Ident(name, ident_line):
+                        return local_region_name(annotations, name, line)
+                    Expr.Paren(inner, paren_line):
+                        return stored_value_region(inner, annotations, view_fns, line)
+                    Expr.Index(head, argument, index_line):
+                        # A view/element of a region-local (`v[i]`) lives in the base's region.
+                        return stored_value_region(head, annotations, view_fns, line)
+                    Expr.Slice(object, low, high, slice_line):
+                        # A slice `v[0:n]` is a view into the base's region.
+                        return stored_value_region(object, annotations, view_fns, line)
+                    Expr.Field(object, field, field_line):
+                        # A field of a region-local lives in the same region.
+                        return stored_value_region(object, annotations, view_fns, line)
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        # A view-producing method on a region-local (`d.as_sview()`,
+                        # `d.as_cstr()`, `d.as_view()`, `d.as_slice()`) aliases the region's
+                        # backing. Other methods (`d.count()`) return owned values → not a region
+                        # dependency, so only these whitelisted borrows carry the region.
+                        method_region: sview = stored_view_method_region(callee, annotations, view_fns, line)
+                        method_region return if method_region != ""
+                        # A VIEW-returning free function's result aliases its argument's
+                        # backing (`escaped <- head(&v, 1)` with v @inner ties the view
+                        # to inner) — cross-function view provenance.
+                        called: sview = ident_name_of(callee)
+                        return_region: mutable sview = sview("", 0, 0)
+                        if called != "" and (any vf in view_fns where vf == called):
+                            for argument in arguments |return_region|:
+                                candidate2: sview = stored_value_region(view_arg_base(argument), annotations, view_fns, line)
+                                return_region <- candidate2 if return_region == "" and candidate2 != ""
+                        return return_region
+                    Expr.Move(inner, move_line):
+                        return stored_value_region(inner, annotations, view_fns, line)
+                    Expr.Array(elements, array_line):
+                        element_region: mutable sview = sview("", 0, 0)
+                        for element in elements |element_region|:
+                            candidate: sview = stored_value_region(element, annotations, view_fns, line)
+                            element_region <- candidate if candidate != ""
+                        return element_region
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_line):
+                        return stored_value_region(body, annotations, view_fns, line)
+                    Expr.If(condition, then_expression, else_expression, if_line):
+                        # A conditional value `v if c else w` escapes if EITHER branch carries
+                        # an inner region.
+                        then_region: sview = stored_value_region(then_expression, annotations, view_fns, line)
+                        return then_region if then_region != "" else stored_value_region(else_expression, annotations, view_fns, line)
+                    _:
+                        return sview("", 0, 0)
+
+
+
+        # The region of the receiver of a whitelisted view-producing method call, else "".
+        def stored_view_method_region(callee: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, line: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Field(object, method, field_line):
+                        is_view_method: bool = method == "as_sview" or method == "as_cstr" or method == "as_view" or method == "as_slice" or method == "as_str"
+                        stored_value_region(object, annotations, view_fns, line) return if is_view_method
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+
+
+        # The root ident of a stored VALUE expression, through field/index/paren/move selectors
+        # (`inner.xs` / `mid` -> "inner" / "mid"). A `copy(x)`/other-call value has no ident root,
+        # so a deep copy correctly launders the region (returns "").
+        def region_value_root_ident(value: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match value:
+                    Expr.Ident(name, ident_line): name
+                    Expr.Field(object, field_name, field_line): region_value_root_ident(object)
+                    Expr.Index(object, index, index_line): region_value_root_ident(object)
+                    Expr.Paren(inner, paren_line): region_value_root_ident(inner)
+                    Expr.Move(inner, move_line): region_value_root_ident(inner)
+                    _: sview("", 0, 0)
+
+
+
+        # The region a name has been TAINTED with (a value from that region flowed into it, directly
+        # or via a struct field/copy), or "".
+        def region_taint_lookup(taint_names: darray[sview]&, taint_regions: darray[sview]&, name: sview) -> sview:
+            can Abort.Panic:
+                found: mutable sview = sview("", 0, 0)
+                while probe < taint_names.count |found, probe: usize = 0|:
+                    found <- taint_regions[probe] if taint_names[probe] == name and found == "" and name != ""
+                    probe <- probe + 1
+                return found
+
+
+
+        # The region a stored value lives in: its own `@region` provenance, or — when it has none —
+        # the region tainting its root ident (a struct copied/field-assigned from a region value).
+        def effective_value_region(value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, taint_names: darray[sview]&, taint_regions: darray[sview]&, line: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                direct: sview = stored_value_region(value, annotations, view_fns, line)
+                direct return if direct != ""
+                return region_taint_lookup(taint_names, taint_regions, region_value_root_ident(value))
+
+
+
+        # The taint region a value contributes: its own @region/taint, OR — for a call to an
+        # ambient-allocating container-returning function made INSIDE a region block — the innermost
+        # region (the call allocates its owned result in the current block's region).
+        def region_escape_stored_or_call_region(value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, container_fns: darray[sview]&, nesting: darray[sview]&, taint_names: darray[sview]&, taint_regions: darray[sview]&, line: u32) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                direct: sview = effective_value_region(value, annotations, view_fns, taint_names, taint_regions, line)
+                direct return if direct != ""
+                sview("", 0, 0) return if nesting.count == 0
+                match value:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        callee_name: sview = ident_name_of(callee)
+                        nesting[nesting.count - 1] return if callee_name != "" and (any container_fn in container_fns where container_fn == callee_name)
+                        return sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)

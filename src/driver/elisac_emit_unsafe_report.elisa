@@ -1,0 +1,498 @@
+# `-emit unsafe` — collecting the capability rows into the report: each function's declared and
+# inferred capabilities, the transitive closure over its calls, the statement-level grants that
+# survive only in the tokens, and the boundary rules. `-emit c-archive` writes the same bytes as
+# an audit sidecar.
+
+
+# Walk a body: collect runtime-length locals, `.count`-proven binders, in-body grants, and
+# every expression contribution.
+def unsafe_scan_statements(statements: darray[Ast::Stmt], owner: sview, runtime_names: mutable darray[sview]&, proven: mutable darray[sview]&, owners: mutable darray[sview]&, caps: mutable darray[sview]&, call_from: mutable darray[sview]&, call_to: mutable darray[sview]&, trusted_owners: mutable darray[sview]&, trusted_caps: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    can Abort.Panic, Memory.Allocate:
+        # Locals and binders FIRST, so a subscript earlier in the body still sees them.
+        for statement in statements |runtime_names, proven|:
+            if statement is Stmt.VarDecl(us_vd_name, us_vd_type, us_vd_value, us_vd_line):
+                runtime_names.push(us_vd_name) if unsafe_is_runtime_length(us_vd_type)
+            if statement is Stmt.For(us_for_bind, us_for_vars, us_for_iterable, us_for_body, us_for_line):
+                # `for i in 0..<xs.count` proves `i` against the container's own length.
+                # Recorded WITHOUT tying it to the container, which can only ever suppress a
+                # report, never invent one — the direction that keeps over-claim at zero.
+                if us_for_iterable is Expr.Binary(us_range_lo, us_range_op, us_range_hi, us_range_line):
+                    if us_range_op == Lexer::TokenKind.RangeLt or us_range_op == Lexer::TokenKind.RangeLe:
+                        if us_range_hi is Expr.Field(us_count_object, us_count_field, us_count_line):
+                            if us_count_field == "count":
+                                proven.push(us_for_bind) if us_for_bind != ""
+                                for us_for_var in us_for_vars |proven|:
+                                    proven.push(us_for_var)
+        for statement in statements |owner, runtime_names, proven, owners, caps, call_from, call_to|:
+            match statement:
+                Stmt.VarDecl(us_s_name, us_s_type, us_s_value, us_s_line):
+                    unsafe_scan_expression(us_s_value, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                Stmt.Expr(us_e_expression, us_e_line):
+                    unsafe_scan_expression(us_e_expression, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                Stmt.Return(us_r_value, us_r_line):
+                    if us_r_value is us_r_present:
+                        unsafe_scan_expression(us_r_present, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                Stmt.Assign(us_a_target, us_a_operator, us_a_value, us_a_line):
+                    unsafe_scan_expression(us_a_target, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                    unsafe_scan_expression(us_a_value, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                Stmt.If(us_i_condition, us_i_then, us_i_else, us_i_line):
+                    unsafe_scan_expression(us_i_condition, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                    unsafe_scan_statements(us_i_then, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                    unsafe_scan_statements(us_i_else, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                Stmt.While(us_w_condition, us_w_body, us_w_line):
+                    unsafe_scan_expression(us_w_condition, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                    unsafe_scan_statements(us_w_body, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                Stmt.For(us_f_bind, us_f_vars, us_f_iterable, us_f_body, us_f_line):
+                    unsafe_scan_expression(us_f_iterable, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                    unsafe_scan_statements(us_f_body, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                Stmt.Block(us_b_kind, us_b_clause, us_b_binding, us_b_body, us_b_line):
+                    # An in-body `can Unsafe.X:` / `trusted Unsafe.X:` grant names a capability
+                    # the function HOLDS. Each clause entry is a whole dotted permission
+                    # (parse_dotted_name), not split identifier tokens.
+                    for us_b_grant in us_b_clause |owners, caps, trusted_owners, trusted_caps, owner, us_b_kind|:
+                        if us_b_kind == "trusted" and unsafe_permission_is_unsafe(us_b_grant):
+                            unsafe_add_row(trusted_owners, trusted_caps, owner, us_b_grant)
+                        elif unsafe_permission_is_unsafe(us_b_grant):
+                            unsafe_add_row(owners, caps, owner, us_b_grant)
+                    if us_b_kind == "trusted":
+                        # A trusted block is a firewall: unsafe operations and calls inside it
+                        # belong only to the trusted audit. Scan with scratch ordinary rows and
+                        # edges so a same-named capability declared outside the block is not
+                        # accidentally erased later.
+                        ignored_owners: mutable darray[sview] = []
+                        ignored_caps: mutable darray[sview] = []
+                        ignored_call_from: mutable darray[sview] = []
+                        ignored_call_to: mutable darray[sview] = []
+                        unsafe_scan_statements(us_b_body, owner, runtime_names, proven, &ignored_owners, &ignored_caps, &ignored_call_from, &ignored_call_to, trusted_owners, trusted_caps)
+                    else:
+                        unsafe_scan_statements(us_b_body, owner, runtime_names, proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+                _:
+                    pass
+
+
+
+
+# Every function's DECLARED capabilities and its body's contributions.
+def unsafe_collect_declarations(declarations: darray[Ast::Decl]&, export_markers: darray[sview]&, owners: mutable darray[sview]&, caps: mutable darray[sview]&, all_names: mutable darray[sview]&, call_from: mutable darray[sview]&, call_to: mutable darray[sview]&, trusted_owners: mutable darray[sview]&, trusted_caps: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    can Abort.Panic, Memory.Allocate:
+        for declaration in declarations |owners, caps, all_names, call_from, call_to|:
+            if declaration is Decl.Module(us_m_name, us_m_body, us_m_line):
+                unsafe_collect_declarations(us_m_body, export_markers, owners, caps, all_names, call_from, call_to, trusted_owners, trusted_caps)
+                continue
+            if declaration is Decl.Scoped(us_sc_body, us_sc_line):
+                unsafe_collect_declarations(us_sc_body, export_markers, owners, caps, all_names, call_from, call_to, trusted_owners, trusted_caps)
+                continue
+            if declaration is Decl.Extern(us_x_name, us_x_start, us_x_arity, us_x_variadic, us_x_callable, us_x_ret, us_x_decorators, us_x_line):
+                # A callable extern carries Unsafe.RawExtern IMPLICITLY — stage0 reports it
+                # for an `extern puts(...)` that declares no `can` clause at all.
+                #
+                # But `export fn name(...) = target` ALSO parses to Decl.Extern, and an EXPORT
+                # is not a foreign import: it publishes an Elisa function under a C symbol and
+                # calls nothing foreign. Counting those reported RawExtern: 4 for a unit with
+                # four exports and no externs at all, where stage0 reports 0.
+                continue if not us_x_callable
+                us_x_is_export: mutable bool = false
+                for us_x_annotation in export_markers |us_x_is_export, us_x_name|:
+                    us_x_is_export <- true if us_x_annotation == us_x_name
+                continue if us_x_is_export
+                all_names.push(us_x_name)
+                unsafe_add_row(owners, caps, us_x_name, "Unsafe.RawExtern")
+                continue
+            if declaration is Decl.Func(us_f_name, us_f_params, us_f_ret, us_f_body, us_f_effects, us_f_decorators, us_f_line):
+                all_names.push(us_f_name)
+                for us_f_effect in us_f_effects |owners, caps, us_f_name|:
+                    unsafe_add_row(owners, caps, us_f_name, us_f_effect) if unsafe_permission_is_unsafe(us_f_effect)
+                runtime_names: mutable darray[sview] = []
+                proven: mutable darray[sview] = []
+                for us_f_param in us_f_params |runtime_names|:
+                    runtime_names.push(us_f_param.name) if unsafe_is_runtime_length(us_f_param.type_expression)
+                unsafe_scan_statements(us_f_body, us_f_name, &runtime_names, &proven, owners, caps, call_from, call_to, trusted_owners, trusted_caps)
+
+
+
+
+# Transitive closure: a caller holds everything its callees hold.
+def unsafe_close_over_calls(owners: mutable darray[sview]&, caps: mutable darray[sview]&, call_from: darray[sview]&, call_to: darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    changed: mutable bool = true
+    while changed |changed, owners, caps, call_from, call_to|:
+        changed <- false
+        for edge in 0..<call_from.count |changed, owners, caps, call_from, call_to|:
+            caller: sview = call_from[edge]
+            callee: sview = call_to[edge]
+            for row in 0..<owners.count |changed, owners, caps, caller, callee|:
+                continue if owners[row] != callee
+                cap: sview = caps[row]
+                present: mutable bool = false
+                for probe in 0..<owners.count |present, owners, caps, caller, cap|:
+                    present <- true if owners[probe] == caller and caps[probe] == cap
+                if not present:
+                    owners.push(caller)
+                    caps.push(cap)
+                    changed <- true
+
+
+
+
+def unsafe_boundary_name(index: i64) -> sview can[Abort.Panic]:
+    return when index:
+        0 -> "GuestHostPointer"
+        1 -> "ExecutableCodePublish"
+        2 -> "MachineSegmentState"
+        3 -> "TinyCallable"
+        4 -> "ThreadAffineSignalJump"
+        _ -> ""
+
+
+
+
+def unsafe_boundary_triggers(index: i64) -> sview can[Abort.Panic]:
+    return when index:
+        0 -> "PointerCast PointerArithmetic GuestHostPointerCast"
+        1 -> "ExecutableCodePublish MachineCodeBuilder Assembly"
+        2 -> "SegmentMutation GuestSegmentInstall"
+        3 -> "IndirectCall PoisonPointerSentinel TinyPointerSentinel"
+        4 -> "CrossThreadSignalJump ThreadShare"
+        _ -> ""
+
+
+
+
+def unsafe_boundary_rule(index: i64, which: i64) -> sview can[Abort.Panic]:
+    match index:
+        0:
+            return when which:
+                0 -> "guest addresses must resolve to a proven host/native-mapped pointer before dereference"
+                1 -> "trace every guest-to-host address resolve with address, length, mapping, and result"
+                _ -> "debug/referee mode traps unresolved, unmapped, poison, or near-null address use"
+        1:
+            return when which:
+                0 -> "runtime executable code must flow through a named publish primitive before call/jump"
+                1 -> "trace publish address, size, protection, cache/publish result, and first execution"
+                _ -> "debug/referee mode halts execution of unpublished generated code"
+        2:
+            return when which:
+                0 -> "segment register writes require an explicit restore/persistent contract"
+                1 -> "trace every host/guest segment switch with thread id and selector"
+                _ -> "debug/referee mode asserts expected segment state at guest/host boundaries"
+        3:
+            return when which:
+                0 -> "callable targets must not be poison or near-null unless explicitly marked sentinel"
+                1 -> "trace every dynamic callable materialization with source slot/symbol provenance"
+                _ -> "debug/referee mode halts poison, non-canonical, or near-null call/jump targets"
+        _:
+            return when which:
+                0 -> "signal-handler longjmp requires a thread-affine buffer or explicit cross-thread trust"
+                1 -> "trace signal number, faulting thread, guard thread, and jump decision"
+                _ -> "referee mode refuses cross-thread longjmp and records a labeled boundary fault"
+
+
+
+
+def unsafe_triggers_contain(haystack: sview, needle: sview) -> bool can[Abort.Panic]:
+    start: mutable usize = 0
+    while start < sview_len(haystack) |start, haystack, needle|:
+        stop: mutable usize = start
+        while stop < sview_len(haystack) and sview_at(haystack, stop) != 32 |stop, haystack|:
+            stop <- stop + 1
+        if stop - start == sview_len(needle):
+            matched: mutable bool = true
+            for probe in 0..<sview_len(needle) |matched, haystack, needle, start|:
+                matched <- false if sview_at(haystack, start + probe) != sview_at(needle, probe)
+            true return if matched
+        start <- stop + 1
+    return false
+
+
+
+
+# STATEMENT-LEVEL grants, recovered from tokens: `x = expr can Unsafe.PointerCast`.
+#
+# A postfix `can` on a statement is not a `Stmt.Block` clause and the AST does not carry it
+# (the formatter recovers it from tokens too), so it is scanned here and attributed to the
+# enclosing function by LINE. Without it a unit whose only pointer cast is granted this way
+# reported Unsafe.PointerCast: 0.
+def unsafe_collect_token_grants(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&, owners: mutable darray[sview]&, caps: mutable darray[sview]&, trusted_owners: mutable darray[sview]&, trusted_caps: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    # Function start lines, so a grant can be attributed to the function containing it.
+    fn_names: mutable darray[sview] = []
+    fn_lines: mutable darray[u32] = []
+    for declaration in file.top_decls |fn_names, fn_lines|:
+        if declaration is Decl.Func(ug_name, ug_params, ug_ret, ug_body, ug_effects, ug_decorators, ug_line):
+            fn_names.push(ug_name)
+            fn_lines.push(ug_line.line)
+    return if fn_names.count == 0
+    for probe in 0..<tokens.count |owners, caps, trusted_owners, trusted_caps, tokens, source, fn_names, fn_lines|:
+        continue if tokens[probe].kind != Lexer::TokenKind.Ident
+        grant_keyword: sview = Lexer::text_or_empty(tokens[probe], source)
+        # The AST carries ordinary `trusted Unsafe.X:` blocks, but the bracketed list form is
+        # intentionally source-recovered (the formatter accepts both spellings). Recover it
+        # here as well so trusted capabilities do not disappear from the safety report.
+        if grant_keyword == "trusted" and probe + 1 < tokens.count and tokens[probe + 1].kind == Lexer::TokenKind.LBracket:
+            trusted_probe: mutable usize = probe + 2
+            while trusted_probe + 3 < tokens.count and tokens[trusted_probe].kind != Lexer::TokenKind.RBracket |trusted_probe, tokens|:
+                if Lexer::text_or_empty(tokens[trusted_probe], source) == "Unsafe" and tokens[trusted_probe + 1].kind == Lexer::TokenKind.Dot:
+                    trusted_member: sview = Lexer::text_or_empty(tokens[trusted_probe + 2], source)
+                    trusted_best: mutable sview = ""
+                    trusted_best_line: mutable u32 = 0
+                    for candidate in 0..<fn_names.count |trusted_best, trusted_best_line, fn_names, fn_lines, tokens, probe|:
+                        continue if fn_lines[candidate] > tokens[probe].line
+                        if trusted_best == "" or fn_lines[candidate] >= trusted_best_line:
+                            trusted_best <- fn_names[candidate]
+                            trusted_best_line <- fn_lines[candidate]
+                    for capability_index in 0..<22 |trusted_owners, trusted_caps, trusted_best, trusted_member|:
+                        capability: sview = unsafe_capability_at(capability_index)
+                        continue if capability != trusted_member
+                        unsafe_add_row(trusted_owners, trusted_caps, trusted_best, unsafe_dotted_capability(capability_index)) if trusted_best != ""
+                    trusted_probe <- trusted_probe + 3
+                else:
+                    trusted_probe <- trusted_probe + 1
+            continue
+        continue if grant_keyword != "can"
+        # `can Unsafe.X` — an Ident "Unsafe", a Dot, then the capability name.
+        continue if probe + 3 >= tokens.count
+        continue if Lexer::text_or_empty(tokens[probe + 1], source) != "Unsafe"
+        continue if tokens[probe + 2].kind != Lexer::TokenKind.Dot
+        member: sview = Lexer::text_or_empty(tokens[probe + 3], source)
+        continue if member == ""
+        # The enclosing function is the one with the greatest start line at or before this.
+        best: mutable sview = ""
+        best_line: mutable u32 = 0
+        for candidate in 0..<fn_names.count |best, best_line, fn_names, fn_lines, tokens, probe|:
+            continue if fn_lines[candidate] > tokens[probe].line
+            if best == "" or fn_lines[candidate] >= best_line:
+                best <- fn_names[candidate]
+                best_line <- fn_lines[candidate]
+        continue if best == ""
+        # Rebuild the dotted spelling; the pool holds whole permissions elsewhere.
+        for capability_index in 0..<22 |owners, caps, best, member|:
+            capability: sview = unsafe_capability_at(capability_index)
+            continue if capability != member
+            unsafe_add_row(owners, caps, best, unsafe_dotted_capability(capability_index))
+
+
+
+
+# The `Unsafe.<capability>` spelling for a capability index, as a stable sview.
+def unsafe_dotted_capability(index: i64) -> sview can[Abort.Panic]:
+    return when index:
+        0 -> "Unsafe.PointerCast"
+        1 -> "Unsafe.PointerArithmetic"
+        2 -> "Unsafe.IndirectCall"
+        3 -> "Unsafe.UncheckedIndex"
+        4 -> "Unsafe.RawExtern"
+        5 -> "Unsafe.MutableGlobal"
+        6 -> "Unsafe.ThreadShare"
+        7 -> "Unsafe.StaleRef"
+        8 -> "Unsafe.Alias"
+        9 -> "Unsafe.BufferReinterpret"
+        10 -> "Unsafe.Assembly"
+        11 -> "Unsafe.ExecutableCodePublish"
+        12 -> "Unsafe.GuestHostPointerCast"
+        13 -> "Unsafe.PoisonPointerSentinel"
+        14 -> "Unsafe.TinyPointerSentinel"
+        15 -> "Unsafe.SegmentMutation"
+        16 -> "Unsafe.GuestSegmentInstall"
+        17 -> "Unsafe.CrossThreadSignalJump"
+        18 -> "Unsafe.MachineCodeBuilder"
+        19 -> "Unsafe.NonProgress"
+        20 -> "Unsafe.BlockMain"
+        21 -> "Unsafe.AssumeProgress"
+        _ -> ""
+
+
+
+
+def unsafe_emit_trusted_report(buffer: mutable darray[u8]&, trusted_owners: darray[sview]&, trusted_caps: darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    emit_tokens_push_sview(buffer, "trusted-total: ")
+    append_decimal(buffer, trusted_owners.count.u32())
+    buffer.push(10)
+    if trusted_owners.count == 0:
+        emit_tokens_push_sview(buffer, "trusted: none\n")
+        return
+    emit_tokens_push_sview(buffer, "trusted:\n")
+    for capability_index in 0..<22 |buffer, trusted_caps|:
+        capability: sview = unsafe_dotted_capability(capability_index)
+        count: mutable u32 = 0
+        for cap in trusted_caps |count, capability|:
+            count <- count + 1 if cap == capability
+        continue if count == 0
+        emit_tokens_push_sview(buffer, "  ")
+        emit_tokens_push_sview(buffer, capability)
+        emit_tokens_push_sview(buffer, ": ")
+        append_decimal(buffer, count)
+        buffer.push(10)
+    emitted: mutable darray[sview] = []
+    for _round in 0..<trusted_owners.count |buffer, trusted_owners, trusted_caps, emitted|:
+        best: mutable sview = ""
+        found: mutable bool = false
+        for candidate in 0..<trusted_owners.count |best, found, trusted_owners, emitted|:
+            name: sview = trusted_owners[candidate]
+            already: mutable bool = false
+            for done in emitted |already, name|:
+                already <- true if done == name
+            continue if already
+            if not found or unsafe_name_less(name, best):
+                best <- name
+                found <- true
+        break if not found
+        emitted.push(best)
+        emit_tokens_push_sview(buffer, "  ")
+        emit_tokens_push_sview(buffer, best)
+        emit_tokens_push_sview(buffer, ": ")
+        first: mutable bool = true
+        shown: mutable darray[sview] = []
+        for _permission_round in 0..<trusted_owners.count |buffer, trusted_owners, trusted_caps, best, first, shown|:
+            pick: mutable sview = ""
+            picked: mutable bool = false
+            for row in 0..<trusted_owners.count |pick, picked, trusted_owners, trusted_caps, best, shown|:
+                continue if trusted_owners[row] != best
+                candidate: sview = trusted_caps[row]
+                already: mutable bool = false
+                for done in shown |already, candidate|:
+                    already <- true if done == candidate
+                continue if already
+                if not picked or unsafe_name_less(candidate, pick):
+                    pick <- candidate
+                    picked <- true
+            break if not picked
+            shown.push(pick)
+            emit_tokens_push_sview(buffer, ", ") if not first
+            first <- false
+            emit_tokens_push_sview(buffer, pick)
+        buffer.push(10)
+
+
+
+
+def build_unsafe_report(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    owners: mutable darray[sview] = []
+    caps: mutable darray[sview] = []
+    trusted_owners: mutable darray[sview] = []
+    trusted_caps: mutable darray[sview] = []
+    all_names: mutable darray[sview] = []
+    call_from: mutable darray[sview] = []
+    call_to: mutable darray[sview] = []
+    alias_fn_names: mutable darray[sview] = []
+    alias_fn_indices: mutable darray[usize] = []
+    alias_param_names: mutable darray[sview] = []
+    # `export fn` shares Decl.Extern with a real foreign import; the `__export_fn` marker is
+    # what tells them apart.
+    export_markers: mutable darray[sview] = []
+    for export_annotation in file.enum_annotations |export_markers|:
+        export_markers.push(export_annotation.owner) if export_annotation.name == "__export_fn"
+    unsafe_collect_declarations(file.top_decls, export_markers, &owners, &caps, &all_names, &call_from, &call_to, &trusted_owners, &trusted_caps)
+    unsafe_collect_alias_param_info(file.top_decls, &alias_fn_names, &alias_fn_indices, &alias_param_names)
+    unsafe_collect_alias_reborrows(file.top_decls, alias_fn_names, alias_fn_indices, alias_param_names, &owners, &caps)
+    unsafe_collect_token_grants(file, tokens, source, &owners, &caps, &trusted_owners, &trusted_caps)
+    unsafe_close_over_calls(&owners, &caps, call_from, call_to)
+
+    buffer: mutable darray[u8] = []
+    emit_tokens_push_sview(&buffer, "=== unsafe ===\ntotal: ")
+    append_decimal(&buffer, owners.count.u32())
+    emit_tokens_push_sview(&buffer, "\ncapabilities:\n")
+    for capability_index in 0..<22 |buffer, caps|:
+        capability: sview = unsafe_capability_at(capability_index)
+        count: mutable u32 = 0
+        for cap in caps |count, capability|:
+            count <- count + 1 if unsafe_permission_is(cap, capability)
+        emit_tokens_push_sview(&buffer, "  Unsafe.")
+        emit_tokens_push_sview(&buffer, capability)
+        emit_tokens_push_sview(&buffer, ": ")
+        append_decimal(&buffer, count)
+        buffer.push(10)
+
+    active_any: mutable bool = false
+    for boundary_probe in 0..<5 |active_any, caps, trusted_caps|:
+        for cap in caps |active_any, boundary_probe|:
+            for capability_index in 0..<22 |active_any, cap, boundary_probe|:
+                capability: sview = unsafe_capability_at(capability_index)
+                continue if not unsafe_permission_is(cap, capability)
+                active_any <- true if unsafe_triggers_contain(unsafe_boundary_triggers(boundary_probe), capability)
+        for cap in trusted_caps |active_any, boundary_probe|:
+            for capability_index in 0..<22 |active_any, cap, boundary_probe|:
+                capability: sview = unsafe_capability_at(capability_index)
+                continue if not unsafe_permission_is(cap, capability)
+                active_any <- true if unsafe_triggers_contain(unsafe_boundary_triggers(boundary_probe), capability)
+    if not active_any:
+        emit_tokens_push_sview(&buffer, "boundary-invariants: none\n")
+    else:
+        emit_tokens_push_sview(&buffer, "boundary-invariants:\n")
+        for boundary_index in 0..<5 |buffer, caps, trusted_caps|:
+            boundary_active: mutable bool = false
+            for cap in caps |boundary_active, boundary_index|:
+                for capability_index in 0..<22 |boundary_active, cap, boundary_index|:
+                    capability: sview = unsafe_capability_at(capability_index)
+                    continue if not unsafe_permission_is(cap, capability)
+                    boundary_active <- true if unsafe_triggers_contain(unsafe_boundary_triggers(boundary_index), capability)
+            for cap in trusted_caps |boundary_active, boundary_index|:
+                for capability_index in 0..<22 |boundary_active, cap, boundary_index|:
+                    capability: sview = unsafe_capability_at(capability_index)
+                    continue if not unsafe_permission_is(cap, capability)
+                    boundary_active <- true if unsafe_triggers_contain(unsafe_boundary_triggers(boundary_index), capability)
+            continue if not boundary_active
+            emit_tokens_push_sview(&buffer, "  ")
+            emit_tokens_push_sview(&buffer, unsafe_boundary_name(boundary_index))
+            emit_tokens_push_sview(&buffer, ":\n    static: ")
+            emit_tokens_push_sview(&buffer, unsafe_boundary_rule(boundary_index, 0))
+            emit_tokens_push_sview(&buffer, "\n    trace: ")
+            emit_tokens_push_sview(&buffer, unsafe_boundary_rule(boundary_index, 1))
+            emit_tokens_push_sview(&buffer, "\n    runtime: ")
+            emit_tokens_push_sview(&buffer, unsafe_boundary_rule(boundary_index, 2))
+            buffer.push(10)
+
+    if owners.count == 0:
+        emit_tokens_push_sview(&buffer, "functions: none\n")
+    else:
+        emit_tokens_push_sview(&buffer, "functions:\n")
+        emitted: mutable darray[sview] = []
+        for _round in 0..<owners.count |buffer, owners, caps, emitted|:
+            best: mutable sview = ""
+            found: mutable bool = false
+            for candidate in 0..<owners.count |best, found, owners, emitted|:
+                name: sview = owners[candidate]
+                already: mutable bool = false
+                for done in emitted |already, name|:
+                    already <- true if done == name
+                continue if already
+                if not found or unsafe_name_less(name, best):
+                    best <- name
+                    found <- true
+            break if not found
+            emitted.push(best)
+            emit_tokens_push_sview(&buffer, "  ")
+            emit_tokens_push_sview(&buffer, best)
+            emit_tokens_push_sview(&buffer, ": ")
+            # ALPHABETICAL by dotted name, which is how stage0 prints a function's list —
+            # NOT the capability-table order used for the `capabilities:` block above.
+            first: mutable bool = true
+            shown: mutable darray[sview] = []
+            for _permission_round in 0..<owners.count |buffer, owners, caps, best, first, shown|:
+                pick: mutable sview = ""
+                picked: mutable bool = false
+                for row in 0..<owners.count |pick, picked, owners, caps, best, shown|:
+                    continue if owners[row] != best
+                    candidate: sview = caps[row]
+                    already: mutable bool = false
+                    for done in shown |already, candidate|:
+                        already <- true if done == candidate
+                    continue if already
+                    if not picked or unsafe_name_less(candidate, pick):
+                        pick <- candidate
+                        picked <- true
+                break if not picked
+                shown.push(pick)
+                emit_tokens_push_sview(&buffer, ", ") if not first
+                first <- false
+                emit_tokens_push_sview(&buffer, pick)
+            buffer.push(10)
+
+    unsafe_emit_trusted_report(&buffer, trusted_owners, trusted_caps)
+    return buffer
+
+
+
+
+# `-emit unsafe` writes the report built above; `-emit c-archive` writes the same bytes to
+# its `<base>.unsafe.txt` sidecar.
+def emit_unsafe_report(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    report: darray[u8] = build_unsafe_report(file, tokens, source)
+    return emit_tokens_flush(report)

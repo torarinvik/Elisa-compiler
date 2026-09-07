@@ -1,0 +1,217 @@
+# Stage1 backend — the WRAPPER an `export fn public(args) -> T = internal` needs: the small,
+# target-data-driven C ABI lowering for a same-name export, and the wrapper body emitted
+# against an explicit target handle. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+        # Small, target-data-driven C ABI lowering for same-name exports. The ordinary
+        # Stage1 export path historically required an Elisa implementation name different
+        # from the public name, so it never needed to materialize this boundary. Stage0 now
+        # permits `export fn point(...) = point`: scalar/pointer signatures can stay direct,
+        # while small aggregates cross the public boundary as an integer of their byte width.
+        def export_abi_packs_value(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            aggregate: bool = value_type.kind == TypeKind.Struct or value_type.kind == TypeKind.Array or value_type.kind == TypeKind.PayloadEnum
+            false return if not aggregate
+            value_llvm: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            value_bytes: u64 = LLVMABISizeOfType(structs.target_data, value_llvm)
+            return value_bytes > 0 and value_bytes <= 8
+
+
+
+        def export_abi_type(value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if export_abi_packs_value(value_type, structs, ctx):
+                value_bytes: u64 = LLVMABISizeOfType(structs.target_data, llvm_type_of(value_type, structs, ctx))
+                return LLVMIntTypeInContext(ctx, value_bytes.u32() * 8)
+            return llvm_type_of(value_type, structs, ctx)
+
+
+
+        def export_abi_unpack(value: LLVMValueRef, value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef, name: cstr) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return value if not export_abi_packs_value(value_type, structs, ctx)
+            abi_type: LLVMTypeRef = export_abi_type(value_type, structs, ctx)
+            semantic_type: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            storage: LLVMValueRef = LLVMBuildAlloca(builder, abi_type, name)
+            _ = LLVMBuildStore(builder, value, storage)
+            cast_storage: LLVMValueRef = LLVMBuildBitCast(builder, storage, LLVMPointerTypeInContext(ctx, 0), "export.arg.cast")
+            return LLVMBuildLoad2(builder, semantic_type, cast_storage, "export.arg.load")
+
+
+
+        def export_abi_pack(value: LLVMValueRef, value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return value if not export_abi_packs_value(value_type, structs, ctx)
+            semantic_type: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            storage: LLVMValueRef = LLVMBuildAlloca(builder, semantic_type, "export.ret.semantic")
+            _ = LLVMBuildStore(builder, value, storage)
+            cast_storage: LLVMValueRef = LLVMBuildBitCast(builder, storage, LLVMPointerTypeInContext(ctx, 0), "export.ret.cast")
+            return LLVMBuildLoad2(builder, export_abi_type(value_type, structs, ctx), cast_storage, "export.ret.load")
+
+
+
+        def same_name_implementation_index(fns: FnTable&, name: sview, arity: usize) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, name, arity|:
+                return index.i64() if fns.names[index] == name and fns.owners[index] == "" and not fns.is_extern[index] and fns.param_count[index] == arity
+            return -1
+
+
+
+        # `export fn public(args) -> T = internal` is represented by the parser as an
+        # extern-shaped declaration plus side-table metadata. For the scalar/like-for-like
+        # ABI, emit the public symbol as a thin LLVM wrapper around the internal function.
+        # Aggregate C ABI lowering is intentionally left to the dedicated export/header path;
+        # declining here is safer than silently using the language ABI for a C boundary.
+        # `export fn foo(...) = foo`: the public name is the implementation's own. DIRECT
+        # when the implementation's lowered type already is the export ABI type (scalars,
+        # pointers): no wrapper, the implementation keeps `foo`, and goes external at the
+        # end of emission. Otherwise the declaration's own `foo.export` handle receives
+        # the wrapper body, the implementation is renamed `foo.impl`, and the wrapper takes
+        # `foo`. Mirrors stage0's isDirectlyExportedFunction / sameNameExportNeedsWrapper.
+        def emit_same_name_export(export_name: sview, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            impl_index: mutable i64 = -1
+            wrapper_index: mutable i64 = -1
+            for index in 0..<fns.names.count |impl_index, wrapper_index, fns, export_name|:
+                continue if fns.names[index] != export_name or fns.owners[index] != ""
+                if fns.is_extern[index]:
+                    wrapper_index <- index.i64() if wrapper_index < 0
+                else:
+                    impl_index <- index.i64() if impl_index < 0
+            false return if impl_index < 0 or wrapper_index < 0
+            false return if fns.is_error[impl_index.usize()] or fns.needs_arena[impl_index.usize()]
+            false return if fns.param_count[impl_index.usize()] != fns.param_count[wrapper_index.usize()]
+            impl: LLVMValueRef = fns.handles[impl_index.usize()]
+            wrapper: LLVMValueRef = fns.handles[wrapper_index.usize()]
+            if LLVMGlobalGetValueType(impl) == LLVMGlobalGetValueType(wrapper):
+                structs.direct_export_names.push(export_name)
+                structs.direct_export_handles.push(impl)
+                LLVMSetLinkage(impl, 0)
+                return true
+            false return if not emit_export_wrapper_to(export_name, impl, false, wrapper, fns, structs, runtime, m, ctx, builder)
+            impl_name_storage: mutable darray[u8] = []
+            for impl_name_index in 0..<sview_len(export_name) |impl_name_storage, export_name|:
+                impl_name_storage.push(sview_at(export_name, impl_name_index))
+            impl_name_storage.push(46)
+            impl_name_storage.push(105)
+            impl_name_storage.push(109)
+            impl_name_storage.push(112)
+            impl_name_storage.push(108)
+            impl_name_storage.push(0)
+            impl_name_cstr: cstr = (&impl_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            LLVMSetValueName2(impl, impl_name_cstr, export_name.len + 5)
+            wrapper_name_storage: mutable darray[u8] = []
+            for wrapper_name_index in 0..<sview_len(export_name) |wrapper_name_storage, export_name|:
+                wrapper_name_storage.push(sview_at(export_name, wrapper_name_index))
+            wrapper_name_storage.push(0)
+            wrapper_name_cstr: cstr = (&wrapper_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            LLVMSetValueName2(wrapper, wrapper_name_cstr, export_name.len)
+            LLVMSetLinkage(wrapper, 0)
+            return true
+
+
+
+        def emit_export_wrapper(export_name: sview, target_name: sview, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            wrapper_index: i64 = function_index_of(fns, "", export_name)
+            # An export declaration carries only the source target name. When
+            # that name is overloaded, resolve the target using the wrapper's
+            # declared arity instead of whichever overload happened to be
+            # registered first.
+            target_index: mutable i64 = function_index_of_arity(fns, "", target_name, fns.param_count[wrapper_index.usize()]) if wrapper_index >= 0 else -1
+            target_index <- function_index_of(fns, "", target_name) if target_index < 0
+            false return if wrapper_index < 0 or target_index < 0
+            false return if fns.needs_arena[wrapper_index.usize()]
+            false return if fns.is_error[wrapper_index.usize()] or fns.is_error[target_index.usize()]
+            false return if fns.param_count[wrapper_index.usize()] != fns.param_count[target_index.usize()]
+            target: LLVMValueRef = fns.handles[target_index.usize()]
+            return emit_export_wrapper_to(export_name, target, fns.needs_arena[target_index.usize()], fn, fns, structs, runtime, m, ctx, builder)
+
+
+
+
+        # The wrapper body, against an explicit target HANDLE. Split out so a GENERIC target
+        # (`= keep_left[Vec[i32]]`) can be wrapped too: an instantiation has no FnTable row,
+        # so the arena flag comes from the caller rather than from a row lookup.
+        def emit_export_wrapper_to(export_name: sview, target: LLVMValueRef, target_needs_arena: bool, fn: LLVMValueRef, fns: FnTable&, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            wrapper_index: i64 = function_index_of(fns, "", export_name)
+            false return if wrapper_index < 0
+            entry: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn, "entry")
+            LLVMPositionBuilderAtEnd(builder, entry)
+            argument_count: usize = fns.param_count[wrapper_index.usize()]
+            arguments: mutable darray[LLVMValueRef] = []
+            # Each exported parameter arrives in its C ABI form (cabi_classify_arg) and is
+            # rebuilt as the value the implementation takes: register parts are spilled
+            # into an aligned slot and read back as the struct (or the slot itself is
+            # handed over when the implementation takes the aggregate indirectly); an
+            # indirect parameter is loaded through the incoming pointer.
+            export_ret_declared: ValueType = copied_type(fns.returns[wrapper_index.usize()])
+            export_ret_plan: CabiRetPlan = cabi_classify_ret(export_ret_declared, structs, ctx) if cabi_is_aggregate(export_ret_declared) else CabiRetPlan{direct: true, sret: false, ret_type: LLVMVoidTypeInContext(ctx), value_type: LLVMVoidTypeInContext(ctx)}
+            llvm_param_cursor: mutable u32 = 1 if export_ret_plan.sret else 0
+            for position in 0..<argument_count |arguments, fn, wrapper_index, fns, structs, ctx, builder, llvm_param_cursor|:
+                export_declared: ValueType = copied_type(fns.param_types[fns.param_start[wrapper_index.usize()] + position])
+                export_is_aggregate: bool = cabi_is_aggregate(export_declared)
+                if export_is_aggregate == false:
+                    arguments.push(LLVMGetParam(fn, llvm_param_cursor))
+                    llvm_param_cursor <- llvm_param_cursor + 1
+                    continue
+                export_plan: CabiArgPlan = cabi_classify_arg(export_declared, structs, ctx)
+                export_impl_indirect: bool = value_type_uses_indirect_aggregate(export_declared, structs, ctx)
+                if export_plan.direct:
+                    export_bytes: mutable u64 = LLVMABISizeOfType(structs.target_data, export_plan.value_type)
+                    for export_part_index in 0..<export_plan.parts.count |export_bytes, export_plan, structs|:
+                        export_part_end: u64 = export_plan.offsets[export_part_index] + LLVMABISizeOfType(structs.target_data, export_plan.parts[export_part_index])
+                        export_bytes <- export_part_end if export_part_end > export_bytes
+                    export_slot: LLVMValueRef = cabi_slot(export_bytes, ctx, builder)
+                    for export_store_index in 0..<export_plan.parts.count |export_plan, export_slot, fn, llvm_param_cursor, ctx, builder|:
+                        _ = LLVMBuildStore(builder, LLVMGetParam(fn, llvm_param_cursor), cabi_ptr_at(export_slot, export_plan.offsets[export_store_index], ctx, builder))
+                        llvm_param_cursor <- llvm_param_cursor + 1
+                    if export_impl_indirect:
+                        arguments.push(export_slot)
+                    else:
+                        arguments.push(LLVMBuildLoad2(builder, export_plan.value_type, export_slot, "export.arg"))
+                else:
+                    export_incoming: LLVMValueRef = LLVMGetParam(fn, llvm_param_cursor)
+                    llvm_param_cursor <- llvm_param_cursor + 1
+                    if export_impl_indirect:
+                        arguments.push(export_incoming)
+                    else:
+                        arguments.push(LLVMBuildLoad2(builder, export_plan.value_type, export_incoming, "export.arg"))
+            export_arena_slot: mutable LLVMValueRef = zeroed
+            export_threads_arena: bool = target_needs_arena
+            if export_threads_arena:
+                export_arena_type: LLVMTypeRef = arena_llvm_type(ctx)
+                export_arena_slot <- LLVMBuildAlloca(builder, export_arena_type, "auto.region")
+                _ = LLVMBuildStore(builder, LLVMConstNull(export_arena_type), export_arena_slot)
+                _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), LLVMBuildStructGEP2(builder, export_arena_type, export_arena_slot, 3, "region.strategy"))
+                arguments.push(export_arena_slot)
+            target_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+            call_result: mutable LLVMValueRef = zeroed
+            # LLVM rejects a named instruction whose result type is void. The call still needs
+            # to be emitted, but its SSA name must be empty; the wrapper returns void directly
+            # below. Scalar export wrappers keep the descriptive name for readable IR.
+            call_name: mutable cstr = "export.call"
+            call_name <- "" if fns.returns[wrapper_index.usize()].kind == TypeKind.Void
+            if arguments.count == 0:
+                call_result <- LLVMBuildCall2(builder, target_type, target, zeroed, 0, call_name)
+            else:
+                arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+                call_result <- LLVMBuildCall2(builder, target_type, target, arguments_pointer, arguments.count.u32(), call_name)
+            if export_threads_arena:
+                export_free_args: mutable darray[LLVMValueRef] = [export_arena_slot]
+                export_free_pointer: void& = (&export_free_args[0]).cast[void&] can Unsafe.PointerCast
+                _ = LLVMBuildCall2(builder, runtime.arena_free_type, runtime.arena_free, export_free_pointer, 1, "")
+            if fns.returns[wrapper_index.usize()].kind == TypeKind.Void:
+                _ = LLVMBuildRetVoid(builder)
+            elif export_ret_plan.sret:
+                # The implementation's struct result is stored through the leading sret
+                # pointer; the wrapper returns nothing.
+                _ = LLVMBuildStore(builder, call_result, LLVMGetParam(fn, 0))
+                _ = LLVMBuildRetVoid(builder)
+            elif cabi_is_aggregate(export_ret_declared) and export_ret_plan.ret_type != export_ret_plan.value_type:
+                # Spill the struct and read it back at the ABI return type.
+                export_ret_bytes: mutable u64 = LLVMABISizeOfType(structs.target_data, export_ret_plan.value_type)
+                export_ret_abi_bytes: u64 = LLVMABISizeOfType(structs.target_data, export_ret_plan.ret_type)
+                export_ret_bytes <- export_ret_abi_bytes if export_ret_abi_bytes > export_ret_bytes
+                export_ret_slot: LLVMValueRef = cabi_slot(export_ret_bytes, ctx, builder)
+                _ = LLVMBuildStore(builder, call_result, export_ret_slot)
+                _ = LLVMBuildRet(builder, LLVMBuildLoad2(builder, export_ret_plan.ret_type, export_ret_slot, "export.ret"))
+            else:
+                _ = LLVMBuildRet(builder, call_result)
+            return true

@@ -1,0 +1,337 @@
+# Stage1 parser — DESUGARING `machine from` into an ordinary value block: result/done/mode
+# locals driving a `while not done:` over the state, each arm's terminators folded into a
+# nested if/else, and the roots a body assigns or mutates (which the block must capture).
+# Part of `module Parser` (see parser.elisa).
+
+extend Parser:
+    public:
+
+        # Build the value-block desugar: result/done/mode locals + `while not done:` over a
+        # mode if-chain, yielding result. Dispatch is an `if mode is Enum.State(binds): …`
+        # chain rather than `mode == Enum.State`: the refinement `is`-pattern both selects
+        # the arm AND binds the state's payload fields (docs/125 §5 state payloads), so a
+        # body reading a payload resolves. Payload-free states use a bare `mode is Enum.State`
+        # test. Every arm is conditional (innermost else is empty) so each arm's `is` binds in
+        # its own branch; stage0 owns exhaustiveness, the stage1 parse stays structural.
+        def build_machine_from_block(start_enum: sview, start_state: sview, start_args: darray[Ast::Expr], machine_arms: darray[MachineFromArmS], header_declarations: darray[Ast::Stmt], header_captures: darray[sview], decreases: Ast::Expr, result_var: sview, done_var: sview, mode_var: sview, line: u32) -> Ast::Expr:
+
+            # Header accumulators are machine-private locals, so they must precede the mode
+            # locals and the loop in the same value-block scope. Their initializers may be
+            # referenced by both the decreases measure and every arm.
+            declarations: mutable darray[Ast::Stmt] = [declaration for declaration in header_declarations]
+            # The result carrier is intentionally context-typed by the backend from the value
+            # block's expected type. `zeroed` is only an initialization seed; every machine arm
+            # assigns the carrier before the block yields it. Keeping the language's zero value
+            # here preserves machine results whose type is not an integer (structs, arrays,
+            # optionals, and views) instead of forcing all lowered machines through i64.
+            declarations.push((Ast::Stmt.VarDecl(result_var, (Ast::Expr.Invalid), (Ast::Expr.Ident("zeroed", Ast::pos_at_line(line))), Ast::pos_at_line(line))))
+            declarations.push((Ast::Stmt.VarDecl(done_var, (Ast::Expr.Unary(TokenKind.Mutable, (Ast::Expr.Ident("bool", Ast::pos_at_line(line))), Ast::pos_at_line(line))), (Ast::Expr.BoolLit(false)), Ast::pos_at_line(line))))
+            # The machine mode is an existing enum, not an inferred temporary. Keeping its
+            # mutable annotation explicit is important for every transition: the backend must
+            # know the aggregate carrier type before it emits the entry constructor and later
+            # arm-local `is` refinements, and must treat `mode <- next_state` as a store. Scalar
+            # payload-free states happened to infer and rebind here, which masked both type
+            # boundaries for multi-field payloads.
+            declarations.push((Ast::Stmt.VarDecl(mode_var, (Ast::Expr.Unary(TokenKind.Mutable, (Ast::Expr.Ident(start_enum, Ast::pos_at_line(line))), Ast::pos_at_line(line))), machine_from_state_value(start_enum, start_state, start_args, line), Ast::pos_at_line(line))))
+
+            # Per-state dispatch block: arm body ++ terminator if/else chain.
+            state_blocks: mutable darray[darray[Ast::Stmt]] = []
+            for arm in machine_arms:
+                block: mutable darray[Ast::Stmt] = []
+                # `extend` rather than push-loops: the terminator chain is a returned darray, and
+                # iterating a call TEMPORARY directly is outside the emitted subset.
+                chained: darray[Ast::Stmt] = machine_from_terminator_chain(arm.terminators, start_enum, result_var, done_var, mode_var, arm.line)
+                block.extend(arm.body)
+                block.extend(chained)
+                state_blocks.push(block)
+
+            # Mode dispatch built right-to-left: `if mode is S0(..): b0 else: (if mode is S1(..):
+            # b1 else: …)`, innermost else empty.
+            dispatch: mutable darray[Ast::Stmt] = []
+            state_index: mutable usize = machine_arms.count
+            while state_index > 0 |dispatch, state_index, machine_arms, state_blocks, start_enum, mode_var|:
+                current: usize = state_index - 1
+                arm_line: u32 = machine_arms[current].line
+                condition: Ast::Expr = machine_from_is_condition(mode_var, start_enum, machine_arms[current].state, machine_arms[current].bindings, arm_line)
+                dispatch <- [(Ast::Stmt.If(condition, state_blocks[current], dispatch, Ast::pos_at_line(arm_line)))]
+                state_index <- state_index - 1
+
+            loop_condition: Ast::Expr = (Ast::Expr.Unary(TokenKind.Not, (Ast::Expr.Ident(done_var, Ast::pos_at_line(line))), Ast::pos_at_line(line)))
+            loop_body: mutable darray[Ast::Stmt] = []
+            # Keep the machine-level termination obligation attached to the generated loop.
+            # This lets stage1's normal decreases walkers inspect the same AST shape that
+            # stage0's analyzer constructs, including the measure's actual expression.
+            loop_body.push((Ast::Stmt.Contract("decreases", decreases, Ast::pos_at_line(line)))) if not machine_expr_is_invalid(decreases)
+            loop_body.extend(dispatch)
+            declarations.push((Ast::Stmt.While(loop_condition, loop_body, Ast::pos_at_line(line))))
+
+            # A machine-from expression is a value block, so every outer binding it
+            # mutates must be an explicit block capture. This is especially important
+            # for `lmut` resources such as the lexer: the graph yields both its result
+            # and the updated resource rather than hiding mutation inside a value block.
+            # Locals declared by an arm stay internal and are not captures.
+            header_local_names: mutable darray[sview] = []
+            for declaration in header_declarations |header_local_names|:
+                match declaration:
+                    Ast::Stmt.VarDecl(name, _, _, _):
+                        header_local_names.push(name)
+                    _:
+                        pass
+            captures: mutable darray[sview] = []
+            for arm in machine_arms |captures|:
+                arm_assigned: mutable darray[sview] = []
+                arm_declared: mutable darray[sview] = [binding for binding in arm.bindings]
+                gather_machine_assigned_idents(arm.body, arm_assigned)
+                gather_machine_declared_idents(arm.body, arm_declared)
+                arm_called: mutable darray[sview] = []
+                gather_machine_mutating_call_statement_roots(arm.body, arm_called)
+                for terminator in arm.terminators |arm_called|:
+                    gather_machine_mutating_call_expr_roots(terminator.guard, arm_called)
+                    gather_machine_mutating_call_expr_roots(terminator.value, arm_called)
+                    for argument in terminator.args |arm_called|:
+                        gather_machine_mutating_call_expr_roots(argument, arm_called)
+                for assigned_name in arm_assigned |captures|:
+                    captures.push(assigned_name) if not (any declared_name in arm_declared where declared_name == assigned_name) and not (any header_name in header_local_names where header_name == assigned_name) and not (any existing in captures where existing == assigned_name)
+                for called_name in arm_called |captures|:
+                    captures.push(called_name) if not (any declared_name in arm_declared where declared_name == called_name) and not (any header_name in header_local_names where header_name == called_name) and not (any existing in captures where existing == called_name)
+            for header_capture in header_captures |captures|:
+                captures.push(header_capture) if not (any existing in captures where existing == header_capture)
+            return (Ast::Expr.Block(declarations, (Ast::Expr.Ident(result_var, Ast::pos_at_line(line))), captures, Ast::pos_at_line(line)))
+
+
+
+        # Collect the root identifiers assigned (`x <- …` / `x = …`) anywhere in a body.
+        def gather_machine_assigned_idents(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            for statement in statements |out|:
+                match statement:
+                    Ast::Stmt.Assign(target, operator, value, line):
+                        target_name: sview = machine_assignment_expr_root(target)
+                        out.push(target_name) if target_name != ""
+                    Ast::Stmt.If(condition, then_body, else_body, line):
+                        gather_machine_assigned_idents(then_body, out)
+                        gather_machine_assigned_idents(else_body, out)
+                    Ast::Stmt.While(condition, body, line):
+                        gather_machine_assigned_idents(body, out)
+                    Ast::Stmt.For(bind, variables, iterable, body, line):
+                        gather_machine_assigned_idents(body, out)
+                    Ast::Stmt.Block(kind, clause, binding, body, line):
+                        gather_machine_assigned_idents(body, out)
+                    Ast::Stmt.Match(scrutinee, arms, line):
+                        for arm in arms |out|:
+                            gather_machine_assigned_idents(arm.body, out)
+                    _:
+                        pass
+
+
+
+        def gather_machine_declared_idents(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            for statement in statements |out|:
+                match statement:
+                    Ast::Stmt.VarDecl(name, type_expression, initializer, line):
+                        out.push(name)
+                    Ast::Stmt.If(condition, then_body, else_body, line):
+                        gather_machine_declared_idents(then_body, out)
+                        gather_machine_declared_idents(else_body, out)
+                    Ast::Stmt.While(condition, body, line):
+                        gather_machine_declared_idents(body, out)
+                    Ast::Stmt.For(bind, variables, iterable, body, line):
+                        out.extend(variables)
+                        gather_machine_declared_idents(body, out)
+                    Ast::Stmt.Block(kind, clause, binding, body, line):
+                        gather_machine_declared_idents(body, out)
+                    Ast::Stmt.Match(scrutinee, arms, line):
+                        for arm in arms |out|:
+                            gather_machine_declared_idents(arm.body, out)
+                    _:
+                        pass
+
+
+
+        # Collection method calls mutate their receiver through an implicit mutable reference.
+        # The parser cannot resolve arbitrary function signatures yet, so recognize only the
+        # same builtin mutators that stage0's pre-lowering capture pass knows structurally.
+        # In particular, do not capture every call argument: read-only calls must remain valid
+        # inside a value block without becoming spurious outer mutations.
+        def machine_from_mutating_method(method: sview) -> bool:
+            return method == "push" or method == "pop" or method == "extend" or method == "clear" or method == "truncate" or method == "insert" or method == "remove" or method == "reserve" or method == "resize" or method == "set" or method == "put" or method == "add" or method == "get_or_insert"
+
+
+
+        def gather_machine_mutating_call_statement_roots(statements: darray[Ast::Stmt], out: mutable darray[sview]&) -> void:
+            for statement in statements |out|:
+                match statement:
+                    Ast::Stmt.VarDecl(name, type_expression, value, line):
+                        gather_machine_mutating_call_expr_roots(value, out)
+                    Ast::Stmt.Assign(target, operator, value, line):
+                        gather_machine_mutating_call_expr_roots(target, out)
+                        gather_machine_mutating_call_expr_roots(value, out)
+                    Ast::Stmt.Expr(expression, line):
+                        gather_machine_mutating_call_expr_roots(expression, out)
+                    Ast::Stmt.Return(value, line):
+                        if value is returned:
+                            gather_machine_mutating_call_expr_roots(returned, out)
+                    Ast::Stmt.If(condition, then_body, else_body, line):
+                        gather_machine_mutating_call_expr_roots(condition, out)
+                        gather_machine_mutating_call_statement_roots(then_body, out)
+                        gather_machine_mutating_call_statement_roots(else_body, out)
+                    Ast::Stmt.While(condition, body, line):
+                        gather_machine_mutating_call_expr_roots(condition, out)
+                        gather_machine_mutating_call_statement_roots(body, out)
+                    Ast::Stmt.For(bind, variables, iterable, body, line):
+                        gather_machine_mutating_call_expr_roots(iterable, out)
+                        gather_machine_mutating_call_statement_roots(body, out)
+                    Ast::Stmt.Block(kind, clause, binding, body, line):
+                        gather_machine_mutating_call_statement_roots(body, out)
+                    Ast::Stmt.Match(scrutinee, arms, line):
+                        gather_machine_mutating_call_expr_roots(scrutinee, out)
+                        for arm in arms |out|:
+                            gather_machine_mutating_call_expr_roots(arm.guard, out)
+                            gather_machine_mutating_call_statement_roots(arm.body, out)
+                    Ast::Stmt.Contract(_, expression, _):
+                        gather_machine_mutating_call_expr_roots(expression, out)
+                    _:
+                        pass
+
+
+
+        def gather_machine_mutating_call_expr_roots(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
+            match expression:
+                Ast::Expr.Call(callee, arguments, _, _):
+                    match callee:
+                        Ast::Expr.Field(receiver, method, _):
+                            root: sview = machine_assignment_expr_root(receiver)
+                            out.push(root) if root != "" and machine_from_mutating_method(method)
+                        _:
+                            pass
+                    gather_machine_mutating_call_expr_roots(callee, out)
+                    for argument in arguments |out|:
+                        gather_machine_mutating_call_expr_roots(argument, out)
+                Ast::Expr.Field(object, _, _):
+                    gather_machine_mutating_call_expr_roots(object, out)
+                Ast::Expr.Scope(base, _, _):
+                    gather_machine_mutating_call_expr_roots(base, out)
+                Ast::Expr.Index(object, index, _):
+                    gather_machine_mutating_call_expr_roots(object, out)
+                    gather_machine_mutating_call_expr_roots(index, out)
+                Ast::Expr.Slice(object, low, high, _):
+                    gather_machine_mutating_call_expr_roots(object, out)
+                    gather_machine_mutating_call_expr_roots(low, out)
+                    gather_machine_mutating_call_expr_roots(high, out)
+                Ast::Expr.IndexN(object, arguments, _):
+                    gather_machine_mutating_call_expr_roots(object, out)
+                    for argument in arguments |out|:
+                        gather_machine_mutating_call_expr_roots(argument, out)
+                Ast::Expr.Binary(left, _, right, _):
+                    gather_machine_mutating_call_expr_roots(left, out)
+                    gather_machine_mutating_call_expr_roots(right, out)
+                Ast::Expr.Unary(_, operand, _):
+                    gather_machine_mutating_call_expr_roots(operand, out)
+                Ast::Expr.Move(operand, _):
+                    gather_machine_mutating_call_expr_roots(operand, out)
+                Ast::Expr.RegionNew(operand, _, _):
+                    gather_machine_mutating_call_expr_roots(operand, out)
+                Ast::Expr.Paren(inner, _):
+                    gather_machine_mutating_call_expr_roots(inner, out)
+                Ast::Expr.Refinement(base, predicate, _):
+                    gather_machine_mutating_call_expr_roots(base, out)
+                    gather_machine_mutating_call_expr_roots(predicate, out)
+                Ast::Expr.GetElse(guarded, recovery, _):
+                    gather_machine_mutating_call_expr_roots(guarded, out)
+                    gather_machine_mutating_call_statement_roots(recovery, out)
+                Ast::Expr.Array(elements, _):
+                    for element in elements |out|:
+                        gather_machine_mutating_call_expr_roots(element, out)
+                Ast::Expr.Tuple(elements, _):
+                    for element in elements |out|:
+                        gather_machine_mutating_call_expr_roots(element, out)
+                Ast::Expr.SetLit(elements, _):
+                    for element in elements |out|:
+                        gather_machine_mutating_call_expr_roots(element, out)
+                Ast::Expr.DictLit(entries, _):
+                    for entry in entries |out|:
+                        gather_machine_mutating_call_expr_roots(entry.key, out)
+                        gather_machine_mutating_call_expr_roots(entry.value, out)
+                Ast::Expr.Construct(_, fields, _):
+                    for field in fields |out|:
+                        gather_machine_mutating_call_expr_roots(field.value, out)
+                Ast::Expr.RecordUpdate(base, fields, _):
+                    gather_machine_mutating_call_expr_roots(base, out)
+                    for field in fields |out|:
+                        gather_machine_mutating_call_expr_roots(field.value, out)
+                Ast::Expr.If(condition, then_expression, else_expression, _):
+                    gather_machine_mutating_call_expr_roots(condition, out)
+                    gather_machine_mutating_call_expr_roots(then_expression, out)
+                    gather_machine_mutating_call_expr_roots(else_expression, out)
+                Ast::Expr.Comprehension(_, iterable, condition, body, _):
+                    gather_machine_mutating_call_expr_roots(iterable, out)
+                    gather_machine_mutating_call_expr_roots(condition, out)
+                    gather_machine_mutating_call_expr_roots(body, out)
+                Ast::Expr.Lambda(_, body, _):
+                    gather_machine_mutating_call_statement_roots(body, out)
+                Ast::Expr.Block(statements, value, _, _):
+                    gather_machine_mutating_call_statement_roots(statements, out)
+                    gather_machine_mutating_call_expr_roots(value, out)
+                Ast::Expr.Match(scrutinee, arms, _):
+                    gather_machine_mutating_call_expr_roots(scrutinee, out)
+                    for arm in arms |out|:
+                        gather_machine_mutating_call_expr_roots(arm.guard, out)
+                        gather_machine_mutating_call_statement_roots(arm.body, out)
+                Ast::Expr.Catch(scrutinee, arms, _):
+                    gather_machine_mutating_call_expr_roots(scrutinee, out)
+                    for arm in arms |out|:
+                        gather_machine_mutating_call_expr_roots(arm.guard, out)
+                        gather_machine_mutating_call_statement_roots(arm.body, out)
+                _:
+                    pass
+
+
+
+        # A trailing run of terminators as a nested if/else: guarded terminators become the
+        # conditions, the final unguarded one the else. A single unguarded terminator is its
+        # bare action.
+        def machine_from_terminator_chain(terminators: darray[MachineFromTermAst], start_enum: sview, result_var: sview, done_var: sview, mode_var: sview, line: u32) -> darray[Ast::Stmt]:
+            count: usize = terminators.count
+            no_terminators: darray[Ast::Stmt] = []
+            no_terminators return if count == 0
+            # Build right-to-left: the last terminator's action is the base.
+            chain: mutable darray[Ast::Stmt] = machine_from_terminator_action(terminators[count - 1], start_enum, result_var, done_var, mode_var)
+            machine over chain while true:
+                state Fold(remaining: usize)
+                start Fold(count - 1)
+
+                Fold(remaining), _ if remaining == 0:
+                    break
+
+                Fold(remaining), _ if machine_from_term_guard_absent(terminators[remaining - 1]):
+                    chain <- machine_from_terminator_action(terminators[remaining - 1], start_enum, result_var, done_var, mode_var)
+                    -> Fold(remaining - 1)
+
+                Fold(remaining), _:
+                    action: darray[Ast::Stmt] = machine_from_terminator_action(terminators[remaining - 1], start_enum, result_var, done_var, mode_var)
+                    chain <- [(Ast::Stmt.If(terminators[remaining - 1].guard, action, chain, Ast::pos_at_line(terminators[remaining - 1].line)))]
+                    -> Fold(remaining - 1)
+            return chain
+
+
+
+        def machine_from_term_guard_absent(term: MachineFromTermAst) -> bool:
+            return match term.guard:
+                Ast::Expr.Absent: true
+                _: false
+
+
+
+        def machine_from_terminator_action(term: MachineFromTermAst, start_enum: sview, result_var: sview, done_var: sview, mode_var: sview) -> darray[Ast::Stmt]:
+            machine_from_done_action(term, result_var, done_var) return if term.is_done
+            # `next State(args)` -> `mode <- Enum.State(args)` (a payload-free target stays a
+            # bare member reference).
+            return [(Ast::Stmt.Assign((Ast::Expr.Ident(mode_var, Ast::pos_at_line(term.line))), TokenKind.LArrow, machine_from_state_value(start_enum, term.target, term.args, term.line), Ast::pos_at_line(term.line)))]
+
+
+
+        # `done VALUE` -> `result <- VALUE; done <- true`.
+        def machine_from_done_action(term: MachineFromTermAst, result_var: sview, done_var: sview) -> darray[Ast::Stmt]:
+            stmts: mutable darray[Ast::Stmt] = []
+            stmts.push((Ast::Stmt.Assign((Ast::Expr.Ident(result_var, Ast::pos_at_line(term.line))), TokenKind.LArrow, term.value, Ast::pos_at_line(term.line))))
+            stmts.push((Ast::Stmt.Assign((Ast::Expr.Ident(done_var, Ast::pos_at_line(term.line))), TokenKind.LArrow, (Ast::Expr.BoolLit(true)), Ast::pos_at_line(term.line))))
+            return stmts

@@ -1,0 +1,230 @@
+# Stage1 backend — the packed STORE ROW's layout: field alignment and byte extent, how many u32
+# slots a variant's payload needs, the widest variant a store must fit, and the LLVM type the
+# row therefore has. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        # The AoS row's payload area, in u32 slots.
+        #
+        # stage0 sizes it as the MAXIMUM over the whole hierarchy's leaves of
+        # `ceil(payload_bytes / 4)` (ensurePackedEnumRowType + enumVariantPayloadSlots, with
+        # a u32 slot type). stage1 had `32` written in — which WAS that maximum for the AST
+        # as it stood, and silently stopped being one the moment a variant grew. Widening the
+        # AST's position payload from a bare `line: u32` to a 24-byte `Pos` span pushed
+        # `Decl.Func` to 144 bytes, so every constructor wrote 16 bytes PAST its record and
+        # into the next node's tag.
+        #
+        # Nothing declined and nothing faulted at the write. It surfaced far away, as an
+        # exhaustive `match` falling through to its unreachable arm — and only in gen2, the
+        # compiler stage1 builds, because gen1 is built by stage0 and stage0 sizes the row
+        # correctly. That is the signature of this class of bug: a hard-coded layout constant
+        # is invisible until the thing it was measured from changes.
+        #
+        # A field kind this pass cannot size yields 0, which propagates to "cannot size this
+        # variant" and leaves the floor in place rather than guessing. An undersized row
+        # corrupts memory, so no answer is better than a wrong one.
+        def packed_row_field_align(value_type: ValueType, structs: mutable StructTable&) -> u64 can[Abort.Panic]:
+            can Abort.Panic:
+                # A packed handle is the u32 row INDEX, not the row.
+                4 return if value_type.kind == TypeKind.PackedEnum
+                8 return if value_type.kind == TypeKind.SView or value_type.kind == TypeKind.DArray or value_type.kind == TypeKind.View
+                8 return if value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.Fn
+                if value_type.kind == TypeKind.Optional:
+                    return packed_row_field_align(optional_payload_of(value_type, structs), structs)
+                return payload_type_align(value_type, structs)
+
+
+
+
+        def packed_row_field_bytes(value_type: ValueType, structs: mutable StructTable&) -> u64 can[Abort.Panic]:
+            can Abort.Panic:
+                4 return if value_type.kind == TypeKind.PackedEnum
+                16 return if value_type.kind == TypeKind.SView
+                24 return if value_type.kind == TypeKind.DArray or value_type.kind == TypeKind.View
+                8 return if value_type.kind == TypeKind.CStr or value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.Fn
+                # `T?` lowers to `{i1 present, T}`, and the flag pads out to the payload's own
+                # alignment — which is why `Expr?` measures 8 and not 5.
+                if value_type.kind == TypeKind.Optional:
+                    inner: ValueType = optional_payload_of(value_type, structs)
+                    inner_align: u64 = packed_row_field_align(inner, structs)
+                    inner_bytes: u64 = packed_row_field_bytes(inner, structs)
+                    0 return if inner_align == 0 or inner_bytes == 0
+                    return inner_align + inner_bytes
+                return payload_type_byte_size(value_type, structs)
+
+
+
+
+        # One variant's payload in u32 slots, laid out C-style: each field at the next
+        # multiple of its own alignment, the aggregate rounded to the widest.
+        def packed_variant_row_slots(structs: mutable StructTable&, variant_slot: usize) -> u32 can[Abort.Panic]:
+            can Abort.Panic:
+                0 return if variant_slot >= structs.packed_field_type_count.count
+                field_start: usize = structs.packed_field_type_start[variant_slot]
+                field_count: usize = structs.packed_field_type_count[variant_slot]
+                0 return if field_count == 0
+                offset: mutable u64 = 0
+                widest_align: mutable u64 = 1
+                unsized: mutable bool = false
+                for field_index in 0..<field_count |offset, widest_align, unsized, field_start, structs|:
+                    member: ValueType = copied_type(structs.packed_field_types[field_start + field_index])
+                    member_align: u64 = packed_row_field_align(member, structs)
+                    member_size: u64 = packed_row_field_bytes(member, structs)
+                    if member_align == 0 or member_size == 0:
+                        unsized <- true
+                    else:
+                        offset <- offset + (member_align - (offset % member_align)) if offset % member_align != 0
+                        offset <- offset + member_size
+                        widest_align <- member_align if member_align > widest_align
+                0 return if unsized
+                offset <- offset + (widest_align - (offset % widest_align)) if offset % widest_align != 0
+                return ((offset + 3) / 4).u32()
+
+
+
+
+        # The AST root row's payload slots: the widest variant across every Node refinement.
+        #
+        # Floored at the historical 32 so a hierarchy this pass cannot fully size can only
+        # ever WIDEN the row, never shrink it below what already shipped. The floor is not a
+        # substitute for measuring — `packed_ast_row_slots_smoke.sh` asserts this number
+        # against the `[N x i32]` stage0 emits for the same source.
+        def packed_ast_row_slots(structs: mutable StructTable&) -> u32 can[Abort.Panic]:
+            can Abort.Panic:
+                widest: mutable u32 = 32
+                for enum_slot in 0..<structs.packed_names.count |widest, structs|:
+                    continue if not packed_is_ast_refinement(structs, enum_slot.i64())
+                    variant_start: usize = structs.packed_variant_start[enum_slot]
+                    variant_count: usize = structs.packed_variant_count[enum_slot]
+                    for variant_offset in 0..<variant_count |widest, structs, variant_start|:
+                        slots: u32 = packed_variant_row_slots(structs, (variant_start + variant_offset))
+                        widest <- slots if slots > widest
+                return widest
+
+
+
+
+        # The user AoS row's payload slots: the widest variant across the whole hierarchy. A
+        # root row must be large enough for every descendant, since values flow through the
+        # root handle and constructors/matches use one shared store.
+        def packed_dynamic_aos_row_slots(structs: mutable StructTable&, enum_index: i64) -> u32 can[Abort.Panic]:
+            can Abort.Panic:
+                1 return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+                root_name: sview = packed_hierarchy_root_name(structs, structs.packed_names[enum_index.usize()])
+                widest: mutable u32 = 1
+                for candidate in 0..<structs.packed_names.count |widest, structs, root_name|:
+                    candidate_name: sview = structs.packed_names[candidate]
+                    continue if packed_hierarchy_root_name(structs, candidate_name) != root_name
+                    variant_start: usize = structs.packed_variant_start[candidate]
+                    variant_count: usize = structs.packed_variant_count[candidate]
+                    for variant_offset in 0..<variant_count |widest, structs, variant_start|:
+                        slots: u32 = packed_variant_row_slots(structs, variant_start + variant_offset)
+                        widest <- slots if slots > widest
+                return widest
+
+
+
+
+        # The ROW LAYOUT `{i32 tag, [N x i64] payload}` — what a row contains, as distinct
+        # from the handle (an i32 index) that names it.
+        def packed_row_llvm_type(structs: mutable StructTable&, enum_index: i64, ctx: LLVMContextRef) -> LLVMTypeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if packed_is_ast_root_row(structs, packed_root_index_of(structs, enum_index)):
+                row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx), LLVMArrayType(LLVMInt32TypeInContext(ctx), packed_ast_row_slots(structs))]
+                row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, row_pointer, 2, 0)
+            if packed_is_dynamic_aos_enum(structs, enum_index):
+                # Dynamic AoS rows follow stage0's physical layout: the tag, then only the
+                # explicitly inline common fields, then the raw payload carrier. Commons that
+                # remain in the side table do not occupy a row field at all.
+                row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx)]
+                dynamic_commons: u32 = packed_aos_common_count(structs, enum_index)
+                dynamic_name: sview = structs.packed_names[enum_index.usize()] if enum_index >= 0 and enum_index.usize() < structs.packed_names.count else ""
+                for common_index in 0..<dynamic_commons.usize() |row_fields, common_index, dynamic_name, structs, ctx|:
+                    if packed_common_is_inline(structs, dynamic_name, common_index.u32()):
+                        common_type: ValueType = packed_common_type_at(structs, dynamic_name, common_index.u32())
+                        row_fields.push(llvm_type_of(common_type, structs, ctx))
+                row_fields.push(LLVMArrayType(LLVMInt32TypeInContext(ctx), packed_dynamic_aos_row_slots(structs, enum_index)))
+                row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
+                return LLVMStructTypeInContext(ctx, row_pointer, row_fields.count.u32(), 0)
+            layout_index: mutable i64 = packed_root_index_of(structs, enum_index)
+            layout_index <- enum_index if layout_index < 0
+            words: u32 = structs.packed_payload_words[layout_index.usize()]
+            commons: u32 = structs.packed_common_counts[layout_index.usize()]
+            # `{i32 tag, <commons>, [N x i64] payload}` — commons sit BETWEEN the tag and
+            # the payload, which is why every payload index shifts by `commons`. Keep each
+            # common at its declared LLVM type; the old hardcoded i64 row was only correct for
+            # the compiler's own integer commons and rejected user hierarchies with f32/etc.
+            row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx)]
+            row_fields.push(LLVMArrayType(LLVMInt8TypeInContext(ctx), 4)) if commons > 0
+            for common_index in 0..<commons.usize() |row_fields, common_index, structs, layout_index, ctx|:
+                common_type: ValueType = packed_common_type_at(structs, structs.packed_names[layout_index.usize()], common_index.u32())
+                common_llvm_type: LLVMTypeRef = llvm_type_of(common_type, structs, ctx)
+                row_fields.push(common_llvm_type)
+                common_bytes: u64 = LLVMABISizeOfType(structs.target_data, common_llvm_type)
+                row_fields.push(LLVMArrayType(LLVMInt8TypeInContext(ctx), (8 - common_bytes).u32())) if common_bytes > 0 and common_bytes < 8
+            row_fields.push(LLVMArrayType(LLVMInt64TypeInContext(ctx), words))
+            row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
+            # The explicit four-byte alignment fillers are real LLVM fields, so the
+            # field count is larger than `2 + commons` whenever a common is narrower
+            # than one runtime word. Passing the logical count truncated the row type
+            # before the payload and made later GEPs either read the wrong field or
+            # walk past the LLVM struct for multiple i32 commons.
+            return LLVMStructTypeInContext(ctx, row_pointer, row_fields.count.u32(), 0)
+
+
+
+
+        # Dynamic AoS rows use the canonical stage0 representation `{i32, [N x i32]}`.
+        # The payload array is a raw byte carrier, so typed Elisa values must cross it through
+        # a temporary and four-byte loads/stores; loading an `i64` directly from the array
+        # would overrun a one-word row and is invalid for f32 or handle payloads.
+        def packed_dynamic_row_payload_words(structs: mutable StructTable&, enum_index: i64, row: LLVMValueRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, name: cstr) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            row_type: LLVMTypeRef = packed_row_llvm_type(structs, enum_index, ctx)
+            array_type: LLVMTypeRef = LLVMArrayType(LLVMInt32TypeInContext(ctx), packed_dynamic_aos_row_slots(structs, enum_index))
+            field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, row_type, row, packed_dynamic_payload_row_field_index(structs, enum_index), name)
+            indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)]
+            indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+            return LLVMBuildGEP2(builder, array_type, field_pointer, indices_pointer, 2, name)
+
+
+
+        def packed_row_bytes(structs: mutable StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                # 4 (u32 tag) + 4 per u32 payload slot — 132 while the row was [32 x i32].
+                # ONLY when the AST is really here; see packed_program_has_ast_refinements.
+                resolved_root: i64 = packed_root_index_of(structs, enum_index)
+                if packed_is_ast_root_row(structs, resolved_root) and packed_program_has_ast_refinements(structs):
+                    return (4 + 4 * packed_ast_row_slots(structs).i64())
+                if packed_is_ast_root_row(structs, resolved_root):
+                    # A reserved AST header can still be the lookup result in a small user
+                    # program. It must not force the compiler's fixed 132-byte stride. Dynamic
+                    # AoS rows retain their exact typed inline-common layout here.
+                    if packed_is_dynamic_aos_enum(structs, enum_index):
+                        dynamic_row_type: LLVMTypeRef = packed_row_llvm_type(structs, enum_index, structs.context)
+                        return LLVMABISizeOfType(structs.target_data, dynamic_row_type).i64()
+                    # A user program whose entry store was keyed on the reserved header: the
+                    # store is shared by every hierarchy in the program, so its stride must
+                    # cover the WIDEST variant of any of them -- each member's own payload
+                    # width, plus the commons of the root it belongs to.
+                    widest_bytes: mutable i64 = 8
+                    for member_index in 0..<structs.packed_names.count |widest_bytes, structs|:
+                        continue if structs.packed_variant_count[member_index] == 0
+                        member_root: i64 = packed_root_index_of(structs, member_index.i64())
+                        member_root_row: usize = member_root.usize() if member_root >= 0 else member_index
+                        member_bytes: i64 = 8 + 8 * structs.packed_common_counts[member_root_row].i64() + 8 * structs.packed_payload_words[member_index].i64()
+                        widest_bytes <- member_bytes if member_bytes > widest_bytes
+                    return widest_bytes
+                if packed_is_dynamic_aos_enum(structs, enum_index):
+                    # Inline common fields are part of the physical row, so measure the complete
+                    # LLVM type instead of assuming `{i32, [N x i32]}`. The same stride is passed
+                    # to the runtime allocator and used by every hierarchy member.
+                    dynamic_row_type: LLVMTypeRef = packed_row_llvm_type(structs, enum_index, structs.context)
+                    return LLVMABISizeOfType(structs.target_data, dynamic_row_type).i64()
+                # Measure the exact root row type. Every refinement's row lives in the root's
+                # store, so one ABI stride governs all members; using a member's own width made
+                # a narrow row too short. This also accounts for real alignment/size differences
+                # between f32, pointers, and aggregate common fields.
+                row_type: LLVMTypeRef = packed_row_llvm_type(structs, enum_index, structs.context)
+                return LLVMABISizeOfType(structs.target_data, row_type).i64()

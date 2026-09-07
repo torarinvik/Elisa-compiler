@@ -1,0 +1,290 @@
+# Stage1 backend — the BINARY forms that are really OPTIONAL tests: `opt == null` and
+# `opt != null` read the tag rather than comparing values, and `v is name` narrows the
+# optional and binds its payload. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_expression_optional_binary(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if expression is Expr.Binary(null_left, null_operator, null_right, null_line):
+                if null_operator == TokenKind.EqEq or null_operator == TokenKind.BangEq:
+                    left_is_null: bool = is_null_literal(null_left)
+                    right_is_null: bool = is_null_literal(null_right)
+                    if left_is_null or right_is_null:
+                        optional_operand: Expr = null_right if left_is_null else null_left
+                        null_optional_type: ValueType = expression_type(optional_operand, local_scope, fns, structs, generics)
+                        # A BARE pointer (`void&`, `heap T&`, an opaque handle) has no {i1,T}
+                        # tag — null IS the absent value, so the test is a plain pointer
+                        # compare. The `is` narrowing path already reads Ref/CStr this way;
+                        # `!= null` has to agree, or a runtime null guard such as the std's
+                        # `if state_bits != null:` declines and takes its function with it.
+                        if null_optional_type.kind == TypeKind.Ref or null_optional_type.kind == TypeKind.CStr:
+                            if emit_expression(optional_operand, null_optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is null_pointer_value:
+                                null_pointer_llvm: LLVMTypeRef = llvm_type_of(null_optional_type, structs, ctx)
+                                # 32 = EQ, 33 = NE.
+                                null_pointer_predicate: i32 = 32 if null_operator == TokenKind.EqEq else 33
+                                return LLVMBuildICmp(builder, null_pointer_predicate, null_pointer_value, LLVMConstNull(null_pointer_llvm), "nullcmp.ptr")
+                            return null
+                        # A callback value is also represented as one opaque LLVM pointer.
+                        # `fn(T) -> U` has no optional tag, so a C-style callback guard such
+                        # as `if callback != null:` belongs to the same raw-pointer family as
+                        # `void& != null`, rather than the tagged Optional branch below.
+                        if null_optional_type.kind == TypeKind.Fn:
+                            if emit_expression(optional_operand, null_optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is null_fn_value:
+                                null_fn_llvm: LLVMTypeRef = llvm_type_of(null_optional_type, structs, ctx)
+                                # 32 = EQ, 33 = NE.
+                                null_fn_predicate: i32 = 32 if null_operator == TokenKind.EqEq else 33
+                                return LLVMBuildICmp(builder, null_fn_predicate, null_fn_value, LLVMConstNull(null_fn_llvm), "nullcmp.fn")
+                            return null
+                        null return if null_optional_type.kind != TypeKind.Optional
+                        if emit_expression(optional_operand, null_optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is null_optional_value:
+                            null_tag: LLVMValueRef = optional_tag_of(null_optional_value, null_optional_type, structs, ctx, builder)
+                            # tag TRUE = present. `== null` is absence (not tag); `!= null` is
+                            # presence (tag).
+                            if null_operator == TokenKind.EqEq:
+                                return LLVMBuildXor(builder, null_tag, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), "nullcmp.absent")
+                            return null_tag
+                        return null
+            # `v is name` — optional NARROWING. Yields the tag as a bool AND binds the
+            # payload to `name`, which the guarded block then reads. The binding is
+            # introduced unconditionally here; the frontend has already proved it is only
+            # read where the tag is true, so the backend does not re-prove it.
+            if expression is Expr.Binary(is_left, is_operator, is_right, is_line):
+                if is_operator == TokenKind.Is:
+                    # `node in STORE is Expr.Variant(…)` — the in-store variant test in
+                    # EXPRESSION position. `in` and `is` share a precedence level, so the parser
+                    # hands over `(node in STORE) is PATTERN`; every packed test below expects a
+                    # bare node on the left and so declined the whole shape. The statement form
+                    # (`match NODE in STORE:`) already had this unwrap; this is its `if` twin.
+                    #
+                    # Make the store ACTIVE and re-enter with the bare node, so the packed
+                    # narrowing paths run unchanged.
+                    if is_left is Expr.Binary(mis_node, mis_operator, mis_store, mis_in_line):
+                        if mis_operator == TokenKind.In:
+                            if mis_store is Expr.Ident(mis_store_name, mis_store_name_line):
+                                mis_store_type: ValueType = lookup_type(local_scope, mis_store_name)
+                                if mis_store_type.kind == TypeKind.PackedStore:
+                                    if lookup_slot(local_scope, mis_store_name) is mis_store_slot:
+                                        mis_runtime: mutable Runtime = copied_runtime(runtime)
+                                        mis_runtime.active_store <- LLVMBuildLoad2(builder, llvm_type_of(mis_store_type, structs, ctx), mis_store_slot, "store.active")
+                                        mis_runtime.active_store_enum <- mis_store_type.bits.i64()
+                                        mis_runtime.active_store_is_block <- true
+                                        return emit_expression((Expr.Binary(mis_node, TokenKind.Is, is_right, is_line)), expected, local_scope, fns, structs, generics, mis_runtime, m, ctx, builder)
+                                    return null
+                    # `player is Player[Alive]` — a DERIVED STATE test. stage0 inlines the
+                    # declared predicate (`derive state: Alive when self.health > 0` becomes
+                    # `extractvalue …, 0; icmp sgt i64 %health, 0` right here), so there is no
+                    # state tag to read: the state IS the predicate over the value's fields.
+                    #
+                    # `self` in the condition denotes the scrutinee, so it is bound to the
+                    # scrutinee's own slot for the emit and dropped again after.
+                    if is_right is Expr.Index(ds_type_head, ds_state_expr, ds_index_line):
+                        if ds_type_head is Expr.Ident(ds_type_name, ds_type_line):
+                            if ds_state_expr is Expr.Ident(ds_state_name, ds_state_line):
+                                ds_rule: i64 = derived_state_rule_index(structs, ds_type_name, ds_state_name)
+                                if ds_rule >= 0:
+                                    if is_left is Expr.Ident(ds_subject, ds_subject_line):
+                                        if lookup_slot(local_scope, ds_subject) is ds_slot:
+                                            ds_mark: usize = scope_mark(local_scope)
+                                            declare_local(local_scope, "self", ds_slot, lookup_type(local_scope, ds_subject))
+                                            ds_value: LLVMValueRef? = emit_expression(structs.derived_state_conditions[ds_rule.usize()], ValueType{kind: TypeKind.Bool, bits: 1}, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                            scope_restore(local_scope, ds_mark)
+                                            return ds_value
+                                    return null
+                    # `x is .Variant` — the leading-dot shorthand. The parser keeps it as its
+                    # own node (Expr.ShorthandMember) and every variant-test path below matches
+                    # Expr.Field, so the shorthand fell through all of them and declined. Resolve
+                    # the owning enum by name and re-enter with the equivalent `Enum.Variant`
+                    # spelling, so the const/payload/packed paths handle it unchanged rather than
+                    # each growing a second shape to match. Unresolvable (ambiguous or unknown)
+                    # keeps declining.
+                    if is_right is Expr.ShorthandMember(shorthand_parts, shorthand_line):
+                        if shorthand_parts.count == 1:
+                            shorthand_enum: sview = shorthand_member_enum_name(structs, shorthand_parts[0])
+                            if shorthand_enum != "":
+                                shorthand_head: Expr = (Expr.Ident(shorthand_enum, shorthand_line))
+                                shorthand_field: Expr = (Expr.Field(shorthand_head, shorthand_parts[0], shorthand_line))
+                                shorthand_test: Expr = (Expr.Binary(is_left, TokenKind.Is, shorthand_field, is_line))
+                                return emit_expression(shorthand_test, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                        return null
+                    # Packed AST variant tests without payload bindings (`x is T.V`).
+                    if is_right is Expr.Field(packed_is_head, packed_is_variant, packed_is_line):
+                        if packed_is_head is Expr.Ident(packed_is_enum, packed_is_enum_line):
+                            packed_is_scrutinee_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                            if packed_is_scrutinee_type.kind == TypeKind.PackedEnum and runtime.packed_mode == 2:
+                                packed_is_ordinal: i64 = packed_variant_index_of_parts(packed_is_enum, packed_is_variant, structs)
+                                null return if packed_is_ordinal < 0
+                                packed_is_root: i64 = packed_root_index_of(structs, packed_is_scrutinee_type.bits.i64())
+                                null return if runtime.active_store_enum != packed_is_root
+                                if emit_expression(is_left, packed_is_scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is packed_is_value:
+                                    packed_is_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "is.packed.state")
+                                    packed_is_index_value: LLVMValueRef = LLVMBuildZExt(builder, packed_is_value, LLVMInt64TypeInContext(ctx), "is.packed.index")
+                                    packed_is_args: mutable darray[LLVMValueRef] = [packed_is_state, packed_is_index_value]
+                                    packed_is_args_pointer: void& = (&packed_is_args[0]).cast[void&] can Unsafe.PointerCast
+                                    packed_is_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_tag_type, runtime.packed_read_tag, packed_is_args_pointer, 2, "is.packed.record")
+                                    packed_is_row_type: LLVMTypeRef = packed_row_llvm_type(structs, packed_is_scrutinee_type.bits.i64(), ctx)
+                                    packed_is_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, packed_is_row_type, packed_is_record, 0, "is.packed.tag.ptr")
+                                    packed_is_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), packed_is_tag_pointer, "is.packed.tag")
+                                    return LLVMBuildICmp(builder, 32, packed_is_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_is_ordinal.u64(), 0), "is.packed.eq")
+                    # `value is Enum.Variant` with no payload binders — compare only the tag of
+                    # a payload enum. This is the pattern form needed by machine-state arms such
+                    # as `Nested.Inner:` where the arm intentionally ignores both payload fields.
+                    # Constructing `Enum.Variant` for that spelling is invalid for a payload
+                    # variant, and aggregate equality is not the semantic operation here.
+                    if is_right is Expr.Field(pe_bare_head, pe_bare_variant, pe_bare_line):
+                        if pe_bare_head is Expr.Ident(pe_bare_enum, pe_bare_enum_line):
+                            pe_bare_enum_index: i64 = penum_index_of(structs, pe_bare_enum)
+                            if pe_bare_enum_index >= 0:
+                                pe_bare_scrutinee_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                                null return if pe_bare_scrutinee_type.kind != TypeKind.PayloadEnum
+                                null return if pe_bare_scrutinee_type.bits.i64() != pe_bare_enum_index
+                                pe_bare_tag: i64 = penum_variant_index(structs, pe_bare_enum_index, pe_bare_variant)
+                                null return if pe_bare_tag < 0
+                                if emit_expression(is_left, pe_bare_scrutinee_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pe_bare_value:
+                                    pe_bare_actual_tag: LLVMValueRef = LLVMBuildExtractValue(builder, pe_bare_value, 0, "is.penum.bare.tag")
+                                    return LLVMBuildICmp(builder, 32, pe_bare_actual_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), pe_bare_tag.u64(), 0), "is.penum.bare.eq")
+                                return null
+                    if is_right is Expr.Ident(bind_name, bind_line):
+                        optional_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                        # A REF scrutinee (`heap T&`, or an extern `-> T&?` return that lowers to a
+                        # bare ptr with null = absent, e.g. `getenv(x) is real`) has no {i1,T} tag:
+                        # stage0 wraps it into `T?` only at an assignment destination; a direct `is`
+                        # has none, so narrow the ptr here — `ptr != null` is the bool and the
+                        # (non-null) ref is the binding.
+                        if optional_type.kind == TypeKind.Ref:
+                            if emit_expression(is_left, optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is heap_ref_value:
+                                heap_ref_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+                                heap_bind_slot: LLVMValueRef = bind_is_slot(local_scope, structs, bind_name, optional_type, heap_ref_llvm, builder)
+                                _ = LLVMBuildStore(builder, heap_ref_value, heap_bind_slot)
+                                return LLVMBuildICmp(builder, 33, heap_ref_value, LLVMConstNull(heap_ref_llvm), "is.heap.nonnull")
+                        # An extern `-> Handle?` whose head is an OPAQUE LLVM handle (modeled as CStr,
+                        # e.g. `LLVMGetNamedFunction(..) -> LLVMValueRef?`) registers with the `?`
+                        # STRIPPED — its return type is a BARE CStr (nullable ptr, null = absent), not
+                        # `{i1, T}`. Narrow the ptr directly like the Ref case: bind the (non-null)
+                        # handle, `ptr != null` is the bool.
+                        if optional_type.kind == TypeKind.CStr:
+                            if emit_expression(is_left, optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is is_handle_value:
+                                is_handle_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+                                is_handle_slot: LLVMValueRef = bind_is_slot(local_scope, structs, bind_name, optional_type, is_handle_llvm, builder)
+                                _ = LLVMBuildStore(builder, is_handle_value, is_handle_slot)
+                                return LLVMBuildICmp(builder, 33, is_handle_value, LLVMConstNull(is_handle_llvm), "is.handle.nonnull")
+                        null return if optional_type.kind != TypeKind.Optional
+                        if emit_expression(is_left, optional_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is optional_value:
+                            payload_type: ValueType = optional_payload_of(optional_type, structs)
+                            bind_slot: LLVMValueRef = bind_is_slot(local_scope, structs, bind_name, payload_type, llvm_type_of(payload_type, structs, ctx), builder)
+                            _ = LLVMBuildStore(builder, optional_payload_value_of(optional_value, optional_type, structs, ctx, builder), bind_slot)
+                            return optional_tag_of(optional_value, optional_type, structs, ctx, builder)
+                    # `x is Dir.S` — a PAYLOADLESS payload-enum variant test (RHS is a bare
+                    # `Enum.Variant` Field, no binders). The bool is `tag(x) == ordinal(Variant)`.
+                    if is_right is Expr.Field(ple_head, ple_variant, ple_field_line):
+                        ple_enum_name: sview = enum_head_name(ple_head)
+                        if ple_enum_name != "":
+                            ple_enum_index: i64 = penum_index_of(structs, ple_enum_name)
+                            if ple_enum_index >= 0:
+                                ple_scrut_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                                null return if ple_scrut_type.kind != TypeKind.PayloadEnum
+                                ple_tag: i64 = penum_variant_index(structs, ple_enum_index, ple_variant)
+                                null return if ple_tag < 0
+                                if emit_expression(is_left, ple_scrut_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ple_value:
+                                    ple_actual_tag: LLVMValueRef = LLVMBuildExtractValue(builder, ple_value, 0, "is.penum.tag")
+                                    return LLVMBuildICmp(builder, 32, ple_actual_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), ple_tag.u64(), 0), "is.penum.eq")
+                                return null
+                    # `d is Dir.S` — a CONST enum variant test. A const enum's value IS its
+                    # ordinal (an integer of the enum's backing width), so the test is a plain
+                    # compare. Only the payload-enum form above was modeled, so every `is` on
+                    # an ordinary enum declined -- including `match`-produced values.
+                    if is_right is Expr.Field(ce_head, ce_variant, ce_field_line):
+                        ce_enum_name: sview = enum_head_name(ce_head)
+                        if ce_enum_name != "":
+                            ce_enum_index: i64 = enum_index_of(structs, ce_enum_name)
+                            if ce_enum_index >= 0 and penum_index_of(structs, ce_enum_name) < 0:
+                                # Compare against the member's VALUE. Membership is decided by
+                                # what the member compiles to, which is not its ordinal.
+                                null return if enum_ordinal_of(structs, ce_enum_index.usize(), ce_variant) < 0
+                                ce_ordinal: i64 = enum_value_of(structs, ce_enum_index.usize(), ce_variant)
+                                ce_scrut_type: ValueType = expression_type(is_left, local_scope, fns, structs, generics)
+                                null return if ce_scrut_type.kind != TypeKind.Signed and ce_scrut_type.kind != TypeKind.Unsigned and ce_scrut_type.kind != TypeKind.Bool
+                                if emit_expression(is_left, ce_scrut_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ce_value:
+                                    return LLVMBuildICmp(builder, 32, ce_value, LLVMConstInt(llvm_type_of(ce_scrut_type, structs, ctx), ce_ordinal.u64(), 0), "is.enum.eq")
+                                return null
+                    # `p is Point{x, y}` — a plain STRUCT destructure. The RHS parses as an
+                    # ordinary struct-construction expression (`Expr.Construct`); the frontend's
+                    # gather_is_target treats every field VALUE that is a bare Ident as a fresh
+                    # binding (docs: resolve_scope.elisa's gather_is_target). Since `p`'s STATIC
+                    # type already names the struct, there is no runtime discriminant to test —
+                    # the fields are simply extracted and bound, and the test is unconditionally
+                    # true. Matches stage0's emitted shape exactly (checked against its `-emit
+                    # llvm` output): per-field `extractvalue` into the bound name, no icmp.
+                    #
+                    # SOUND SUBSET: only bare-Ident (or positional-shorthand) fields are modeled.
+                    # A field with a literal or a nested sub-pattern (`Pair{left: 1, right: v}`)
+                    # declines rather than risk silently dropping the comparison — the corpus has
+                    # no example of either shape to verify against.
+                    # `k is [.LT | .LTEQ | .GT]` — a BRACKETED ALTERNATION. It means "matches
+                    # any of these", which is an OR of the individual `is` tests, so each
+                    # alternative is re-entered as its own `is` and the i1 results are OR-ed.
+                    # Reusing the per-leaf lowering is what makes the const-enum, shorthand
+                    # and payload-enum forms all work here without restating any of them.
+                    #
+                    # `|` between alternatives parses as an ordinary binary operator inside
+                    # the brackets, so the element list is flattened through Pipe/Or before
+                    # testing. A single-element `[.LT]` is just the one test.
+                    # The alternation also has a PARENTHESISED spelling, which the corpus uses
+                    # interchangeably with the bracketed one:
+                    #   `value is (Expr.Int | Expr.Bool | Expr.Char)`
+                    # That arrives as a Paren wrapping a Pipe chain rather than an Array, so
+                    # the element list is seeded from either shape and flattened the same way.
+                    # A paren wrapping a SINGLE expression is left alone -- `is (X)` is just
+                    # `is X`, which the ordinary paths already handle.
+                    alt_seed: mutable darray[Expr] = []
+                    if is_right is Expr.Array(alt_array_elements, alt_array_line):
+                        alt_seed.extend(alt_array_elements)
+                    # Strip any PAREN layers first: the grouped spelling arrives as a Paren
+                    # (sometimes nested) around the Pipe chain, and a bare `A | B` RHS has no
+                    # paren at all. A single non-alternation expression is left alone -- only
+                    # a Pipe/Or chain seeds the alternation.
+                    alt_unwrapped: mutable Expr = is_right
+                    while alt_unwrapped is Expr.Paren(alt_paren_inner, alt_paren_line) |alt_unwrapped|:
+                        alt_unwrapped <- alt_paren_inner
+                    if alt_unwrapped is Expr.Binary(alt_chain_left, alt_chain_operator, alt_chain_right, alt_chain_line):
+                        alt_seed.push(alt_unwrapped) if alt_chain_operator == TokenKind.Pipe or alt_chain_operator == TokenKind.Or
+                    if alt_seed.count > 0:
+                        alt_elements: darray[Expr] = alt_seed
+                        alt_leaves: mutable darray[Expr] = []
+                        for alt_element in alt_elements |alt_leaves|:
+                            alt_pending: mutable darray[Expr] = [alt_element]
+                            while alt_pending.count > 0 |alt_pending, alt_leaves|:
+                                alt_current: Expr = alt_pending[alt_pending.count - 1.usize()]
+                                _ = alt_pending.pop()
+                                alt_split: mutable bool = false
+                                if alt_current is Expr.Binary(alt_left, alt_operator, alt_right, alt_binary_line):
+                                    if alt_operator == TokenKind.Pipe or alt_operator == TokenKind.Or:
+                                        alt_pending.push(alt_left)
+                                        alt_pending.push(alt_right)
+                                        alt_split <- true
+                                alt_leaves.push(alt_current) if not alt_split
+                        null return if alt_leaves.count == 0
+                        alt_hit: mutable LLVMValueRef = zeroed
+                        alt_first: mutable bool = true
+                        alt_declined: mutable bool = false
+                        for alt_leaf in alt_leaves |alt_hit, alt_first, alt_declined, is_left, is_line, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            continue if alt_declined
+                            alt_test: Expr = (Expr.Binary(is_left, TokenKind.Is, alt_leaf, is_line))
+                            if emit_expression(alt_test, ValueType{kind: TypeKind.Bool, bits: 1}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is alt_value:
+                                if alt_first:
+                                    alt_hit <- alt_value
+                                    alt_first <- false
+                                else:
+                                    alt_hit <- LLVMBuildOr(builder, alt_hit, alt_value, "is.alt.or")
+                            else:
+                                alt_declined <- true
+                        null return if alt_declined
+                        return alt_hit
+                    is_struct_matched: mutable bool = false
+                    is_struct_value: LLVMValueRef? = emit_is_struct_and_call_patterns(is_left, is_right, is_line, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder, &is_struct_matched)
+                    is_struct_value return if is_struct_matched
+                    return null
+            # Membership `x in [a, b, …]` over a LITERAL array of a modeled numeric element
+            # type lowers to an OR-chain of equality compares (`x==a or x==b or …`), exactly
+            # as stage0's emitMembershipCompareValueAndExpr does. Empty list is constant false.
+            # Also: `x in lo..hi` / `x in lo..=hi` (char/int ranges used by the lexer helpers).
+            return emit_expression_membership(expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder, handled)

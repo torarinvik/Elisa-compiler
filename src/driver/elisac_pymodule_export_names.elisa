@@ -1,0 +1,315 @@
+# `-emit pymodule` — the EXPORT SURFACE: expanding the opt-in `fn *` / `const *` rows once the
+# whole file is parsed, and rejecting any name the generated module already owns (`__all__`,
+# `ElisaError`, its exception class) or that Python cannot spell as an identifier.
+
+
+# Expand opt-in `fn *` / `const *` rows after parsing the complete file. Keep the expansion
+# limited to top-level declarations: nested modules can still be selected explicitly with the
+# existing qualified-target form, while a wildcard remains predictable and collision-safe.
+def pymodule_expand_wildcard_exports(file: mutable Ast::File&) -> void can[Abort.Panic, Memory.Allocate]:
+    has_fn_wildcard: mutable bool = false
+    has_const_wildcard: mutable bool = false
+    already_expanded: mutable bool = false
+    for annotation in file.enum_annotations |has_fn_wildcard, has_const_wildcard, already_expanded|:
+        has_fn_wildcard <- true if annotation.name == "__pymodule_fn_all"
+        has_const_wildcard <- true if annotation.name == "__pymodule_const_all"
+        already_expanded <- true if annotation.name == "__pymodule_wildcard_expanded"
+    return if already_expanded or (not has_fn_wildcard and not has_const_wildcard)
+    if has_fn_wildcard:
+        for declaration in file.top_decls |file|:
+            if declaration is Decl.Func(wildcard_function_name, wildcard_function_params, wildcard_function_return, wildcard_function_body, wildcard_function_effects, wildcard_function_decorators, wildcard_function_pos):
+                file.enum_annotations <- file.enum_annotations.push(Ast::EnumAnnotation{owner: wildcard_function_name, name: "__pymodule_fn", line: wildcard_function_pos.line})
+                file.enum_annotations <- file.enum_annotations.push(Ast::EnumAnnotation{owner: wildcard_function_name, name: "__pymodule_target_ref", line: wildcard_function_pos.line})
+    if has_const_wildcard:
+        for declaration in file.top_decls |file|:
+            if declaration is Decl.Const(wildcard_const_name, wildcard_const_type, wildcard_const_value, wildcard_const_mutable, wildcard_const_pos):
+                file.enum_annotations <- file.enum_annotations.push(Ast::EnumAnnotation{owner: wildcard_const_name, name: "__pymodule_const", line: wildcard_const_pos.line})
+                file.enum_annotations <- file.enum_annotations.push(Ast::EnumAnnotation{owner: wildcard_const_name, name: "__pymodule_const_target_ref", line: wildcard_const_pos.line})
+    file.enum_annotations <- file.enum_annotations.push(Ast::EnumAnnotation{owner: "*", name: "__pymodule_wildcard_expanded", line: 0})
+
+
+
+
+# Python source and CPython extension initialization both require identifier-shaped public names.
+# Keep this check in the compiler-owned contract so `-emit pymodule`, `-emit pymodule-c`, and the
+# convenience `-emit pymodule-so` path fail before producing an unusable module or invalid stub.
+def pymodule_python_name_is_keyword(name: sview) -> bool can[Abort.Panic]:
+    return true if name == "False" or name == "None" or name == "True" or name == "and" or name == "as" or name == "assert" or name == "async" or name == "await"
+    return true if name == "break" or name == "class" or name == "continue" or name == "def" or name == "del" or name == "elif" or name == "else" or name == "except"
+    return true if name == "finally" or name == "for" or name == "from" or name == "global" or name == "if" or name == "import" or name == "in" or name == "is"
+    return true if name == "lambda" or name == "nonlocal" or name == "not" or name == "or" or name == "pass" or name == "raise" or name == "return" or name == "try"
+    return true if name == "while" or name == "with" or name == "yield" or name == "__debug__"
+    return false
+
+
+
+
+def pymodule_python_name_is_identifier(name: sview) -> bool can[Abort.Panic]:
+    length: usize = sview_len(name)
+    return false if length == 0
+    first: u8 = sview_at(name, 0)
+    return false if not (first == 95 or first in 65..90 or first in 97..122)
+    for index in 1..<length |name|:
+        character: u8 = sview_at(name, index)
+        return false if not (character == 95 or character in 48..57 or character in 65..90 or character in 97..122)
+    return false if pymodule_python_name_is_keyword(name)
+    return true
+
+
+
+
+# The Python manifest currently identifies named records by their leaf name. A pair of
+# module-local `Point` declarations would therefore make both the generated stub aliases
+# and the C conversion helpers ambiguous. Detect that shape before publishing a contract;
+# qualified record metadata can relax this restriction later without changing diagnostics
+# for today's unambiguous modules.
+def pymodule_duplicate_struct_name(file: Ast::File&) -> sview can[Abort.Panic]:
+    for first_index in 0..<file.struct_names.count |file|:
+        for second_index in first_index + 1.usize()..<file.struct_names.count |file, first_index|:
+            if file.struct_names[first_index] == file.struct_names[second_index]:
+                return file.struct_names[first_index]
+    return ""
+
+
+
+
+# The generated module always owns `__all__`, `ElisaError`, and one Python exception class per
+# exported error family. Reject an export that would overwrite one of those runtime attributes;
+# otherwise the extension could import successfully while silently replacing its error API.
+def pymodule_validate_reserved_export_names(file: Ast::File&, emit_mode: sview) -> bool can[Abort.Panic, Memory.Allocate, Console]:
+    module_name: mutable sview = ""
+    for module_annotation in file.enum_annotations |module_name|:
+        module_name <- module_annotation.owner if module_annotation.name == "__export_pymodule" and module_name == ""
+    if not pymodule_python_name_is_identifier(module_name):
+        message_module: mutable darray[u8] = []
+        emit_tokens_push_sview(&message_module, "error: -emit ")
+        emit_tokens_push_sview(&message_module, emit_mode)
+        emit_tokens_push_sview(&message_module, " module name `")
+        emit_tokens_push_sview(&message_module, module_name)
+        emit_tokens_push_sview(&message_module, "` must be a valid Python identifier (ASCII letters, digits, and underscores; not a keyword)\n")
+        write_stderr(message_module)
+        return false
+    duplicate_struct_name: sview = pymodule_duplicate_struct_name(file)
+    if duplicate_struct_name != "":
+        message_duplicate_struct: mutable darray[u8] = []
+        emit_tokens_push_sview(&message_duplicate_struct, "error: -emit ")
+        emit_tokens_push_sview(&message_duplicate_struct, emit_mode)
+        emit_tokens_push_sview(&message_duplicate_struct, " struct name `")
+        emit_tokens_push_sview(&message_duplicate_struct, duplicate_struct_name)
+        emit_tokens_push_sview(&message_duplicate_struct, "` appears more than once; Python interop currently requires unique named-struct names\n")
+        write_stderr(message_duplicate_struct)
+        return false
+    families: darray[sview] = pymodule_error_families(file)
+    for family in families:
+        if not pymodule_python_name_is_identifier(family):
+            message_error_family_identifier: mutable darray[u8] = []
+            emit_tokens_push_sview(&message_error_family_identifier, "error: -emit ")
+            emit_tokens_push_sview(&message_error_family_identifier, emit_mode)
+            emit_tokens_push_sview(&message_error_family_identifier, " error family name `")
+            emit_tokens_push_sview(&message_error_family_identifier, family)
+            emit_tokens_push_sview(&message_error_family_identifier, "` must be a valid Python identifier (ASCII letters, digits, and underscores; not a keyword)\n")
+            write_stderr(message_error_family_identifier)
+            return false
+        if family == "__all__":
+            message_error_family_all: mutable darray[u8] = []
+            emit_tokens_push_sview(&message_error_family_all, "error: -emit ")
+            emit_tokens_push_sview(&message_error_family_all, emit_mode)
+            emit_tokens_push_sview(&message_error_family_all, " error family `__all__` conflicts with the generated module attribute\n")
+            write_stderr(message_error_family_all)
+            return false
+        if family == "ElisaError":
+            message: mutable darray[u8] = []
+            emit_tokens_push_sview(&message, "error: -emit ")
+            emit_tokens_push_sview(&message, emit_mode)
+            emit_tokens_push_sview(&message, " error family `ElisaError` conflicts with the generated base exception name\n")
+            write_stderr(message)
+            return false
+    # Every public row becomes a module-level Python attribute and, for functions,
+    # a C wrapper symbol. Reject duplicate names before emitting either artifact;
+    # otherwise two wrappers can collide at compile time or a later row can silently
+    # replace an earlier function/constant in the imported module.
+    exported_names: mutable darray[sview] = []
+    for export_annotation in file.enum_annotations |exported_names, file, emit_mode|:
+        continue if export_annotation.name != "__pymodule_fn" and export_annotation.name != "__pymodule_const"
+        for existing_export_name in exported_names |export_annotation, emit_mode|:
+            if existing_export_name == export_annotation.owner:
+                message_duplicate: mutable darray[u8] = []
+                emit_tokens_push_sview(&message_duplicate, "error: -emit ")
+                emit_tokens_push_sview(&message_duplicate, emit_mode)
+                emit_tokens_push_sview(&message_duplicate, " export name `")
+                emit_tokens_push_sview(&message_duplicate, export_annotation.owner)
+                emit_tokens_push_sview(&message_duplicate, "` is declared more than once; Python module attributes must be unique\n")
+                write_stderr(message_duplicate)
+                return false
+        exported_names.push(export_annotation.owner)
+    for annotation in file.enum_annotations |families, file, emit_mode|:
+        continue if annotation.name != "__pymodule_fn" and annotation.name != "__pymodule_const"
+        if not pymodule_python_name_is_identifier(annotation.owner):
+            message_identifier: mutable darray[u8] = []
+            emit_tokens_push_sview(&message_identifier, "error: -emit ")
+            emit_tokens_push_sview(&message_identifier, emit_mode)
+            emit_tokens_push_sview(&message_identifier, " export name `")
+            emit_tokens_push_sview(&message_identifier, annotation.owner)
+            emit_tokens_push_sview(&message_identifier, "` must be a valid Python identifier (ASCII letters, digits, and underscores; not a keyword)\n")
+            write_stderr(message_identifier)
+            return false
+        if annotation.name == "__pymodule_fn":
+            target_name: mutable sview = ""
+            for target_annotation in file.enum_annotations |target_name, annotation|:
+                target_name <- target_annotation.owner if target_annotation.name == "__pymodule_target_ref" and target_annotation.line == annotation.line
+            target_decl: Ast::Decl? = pymodule_find_function_in(file.top_decls, target_name)
+            if target_decl is target_function:
+                if target_function is Decl.Func(target_function_name, target_params, target_return, target_body, target_effects, target_decorators, target_pos):
+                    for parameter in target_params |file, emit_mode, annotation|:
+                        if not pymodule_python_name_is_identifier(parameter.name):
+                            message_parameter: mutable darray[u8] = []
+                            emit_tokens_push_sview(&message_parameter, "error: -emit ")
+                            emit_tokens_push_sview(&message_parameter, emit_mode)
+                            emit_tokens_push_sview(&message_parameter, " parameter name `")
+                            emit_tokens_push_sview(&message_parameter, parameter.name)
+                            emit_tokens_push_sview(&message_parameter, "` in exported function `")
+                            emit_tokens_push_sview(&message_parameter, annotation.owner)
+                            emit_tokens_push_sview(&message_parameter, "` must be a valid Python identifier (ASCII letters, digits, and underscores; not a keyword)\n")
+                            write_stderr(message_parameter)
+                            return false
+        elif annotation.name == "__pymodule_const":
+            constant_target_name: mutable sview = ""
+            for constant_target_annotation in file.enum_annotations |constant_target_name, annotation|:
+                constant_target_name <- constant_target_annotation.owner if constant_target_annotation.name == "__pymodule_const_target_ref" and constant_target_annotation.line == annotation.line
+            constant_target_decl: Ast::Decl? = pymodule_find_const_in(file.top_decls, constant_target_name)
+            constant_target_found: mutable bool = false
+            if constant_target_decl is constant_target:
+                constant_target_found <- true
+                if constant_target is Decl.Const(constant_target_decl_name, constant_target_type, constant_target_value, constant_target_mutable, constant_target_pos):
+                    if pymodule_target_is_qualified(constant_target_name) and pymodule_const_leaf_count(file.top_decls, constant_target_name) > 1:
+                        message_ambiguous_constant: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message_ambiguous_constant, "error: -emit ")
+                        emit_tokens_push_sview(&message_ambiguous_constant, emit_mode)
+                        emit_tokens_push_sview(&message_ambiguous_constant, " cannot disambiguate qualified constant target `")
+                        emit_tokens_push_sview(&message_ambiguous_constant, constant_target_name)
+                        emit_tokens_push_sview(&message_ambiguous_constant, "` because multiple constants share its leaf name; use a unique target leaf or export an accessor\n")
+                        write_stderr(message_ambiguous_constant)
+                        return false
+                    constant_type_name: sview = pymodule_const_decl_type_name(file, constant_target_type, constant_target_value)
+                    if not pymodule_const_type_supported(constant_type_name):
+                        message_unsupported_constant: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message_unsupported_constant, "error: -emit ")
+                        emit_tokens_push_sview(&message_unsupported_constant, emit_mode)
+                        emit_tokens_push_sview(&message_unsupported_constant, " supports scalar, text, and byte constants (target `")
+                        emit_tokens_push_sview(&message_unsupported_constant, constant_target_name)
+                        emit_tokens_push_sview(&message_unsupported_constant, "`)\n")
+                        write_stderr(message_unsupported_constant)
+                        return false
+            if not constant_target_found:
+                message_missing_constant: mutable darray[u8] = []
+                emit_tokens_push_sview(&message_missing_constant, "error: -emit ")
+                emit_tokens_push_sview(&message_missing_constant, emit_mode)
+                emit_tokens_push_sview(&message_missing_constant, " export target \"")
+                emit_tokens_push_sview(&message_missing_constant, constant_target_name)
+                emit_tokens_push_sview(&message_missing_constant, "\" is undefined\n")
+                write_stderr(message_missing_constant)
+                return false
+        if annotation.owner == "__all__":
+            message_all: mutable darray[u8] = []
+            emit_tokens_push_sview(&message_all, "error: -emit ")
+            emit_tokens_push_sview(&message_all, emit_mode)
+            emit_tokens_push_sview(&message_all, " export name `__all__` conflicts with the generated module attribute\n")
+            write_stderr(message_all)
+            return false
+        if annotation.owner == "ElisaError":
+            message_base: mutable darray[u8] = []
+            emit_tokens_push_sview(&message_base, "error: -emit ")
+            emit_tokens_push_sview(&message_base, emit_mode)
+            emit_tokens_push_sview(&message_base, " export name `ElisaError` conflicts with the generated base exception\n")
+            write_stderr(message_base)
+            return false
+        for family in families |file, emit_mode, annotation|:
+            if annotation.owner == family:
+                message_family: mutable darray[u8] = []
+                emit_tokens_push_sview(&message_family, "error: -emit ")
+                emit_tokens_push_sview(&message_family, emit_mode)
+                emit_tokens_push_sview(&message_family, " export name `")
+                emit_tokens_push_sview(&message_family, annotation.owner)
+                emit_tokens_push_sview(&message_family, "` conflicts with its generated error class\n")
+                write_stderr(message_family)
+                return false
+    return true
+
+
+
+
+def pymodule_named_container_element_name(expression: Ast::Expr) -> sview can[Abort.Panic]:
+    if expression is Expr.Index(container_head, container_argument, container_pos):
+        if container_head is Expr.Ident(container_name, container_name_pos):
+            if container_name == "darray" or container_name == "view":
+                element_name: mutable sview = pymodule_type_atom_name(container_argument)
+                element_name <- pymodule_bare_type_name(container_argument) if element_name == ""
+                return element_name if element_name != "" and pymodule_darray_c_element_type(element_name) == ""
+    if expression is Expr.IndexN(container_head_n, container_arguments, container_pos_n):
+        if container_head_n is Expr.Ident(container_name_n, container_name_pos_n) and (container_name_n == "darray" or container_name_n == "view") and container_arguments.count == 1:
+            element_name_n: mutable sview = pymodule_type_atom_name(container_arguments[0])
+            element_name_n <- pymodule_bare_type_name(container_arguments[0]) if element_name_n == ""
+            return element_name_n if element_name_n != "" and pymodule_darray_c_element_type(element_name_n) == ""
+    if expression is Expr.Unary(unary_operator, unary_operand, unary_pos):
+        return pymodule_named_container_element_name(unary_operand) if unary_operator == Lexer::TokenKind.Mutable or unary_operator == Lexer::TokenKind.Lmut or unary_operator == Lexer::TokenKind.Ampersand else ""
+    if expression is Expr.Paren(paren_inner, paren_pos):
+        return pymodule_named_container_element_name(paren_inner)
+    return ""
+
+
+
+
+def pymodule_expression_head_is_owned_container(expression: Ast::Expr) -> bool can[Abort.Panic]:
+    if expression is Expr.Ident(generic_name, generic_pos):
+        return generic_name == "dict" or generic_name == "set" or generic_name == "darray" or generic_name == "view"
+    return false
+
+
+
+
+def pymodule_expression_has_owned_container_element(expression: Ast::Expr) -> bool can[Abort.Panic]:
+    # Some nested aggregate spellings (notably `darray[dict[K,V]]`) cannot be
+    # represented by the small no-allocation bare-name helper. Cleanup still needs
+    # to know that the element converter owns a struct arena and Python-reference
+    # table, so recognize those container heads structurally.
+    if expression is Expr.Unary(owned_operator, owned_operand, owned_pos):
+        return pymodule_expression_has_owned_container_element(owned_operand) if owned_operator == Lexer::TokenKind.Mutable or owned_operator == Lexer::TokenKind.Lmut or owned_operator == Lexer::TokenKind.Ampersand else false
+    if expression is Expr.Paren(owned_inner, owned_paren_pos):
+        return pymodule_expression_has_owned_container_element(owned_inner)
+    if expression is Expr.Index(owned_head, owned_argument, owned_index_pos):
+        if owned_head is Expr.Ident(owned_container_name, owned_container_pos) and (owned_container_name == "darray" or owned_container_name == "view"):
+            return true if pymodule_named_container_element_name(expression) != ""
+            if owned_argument is Expr.Index(owned_element_head, owned_element_argument, owned_element_pos):
+                return pymodule_expression_head_is_owned_container(owned_element_head)
+            if owned_argument is Expr.IndexN(owned_element_head_n, owned_element_arguments, owned_element_pos_n):
+                return pymodule_expression_head_is_owned_container(owned_element_head_n)
+    if expression is Expr.IndexN(owned_head_n, owned_arguments_n, owned_index_pos_n):
+        if owned_head_n is Expr.Ident(owned_container_name_n, owned_container_pos_n) and (owned_container_name_n == "darray" or owned_container_name_n == "view") and owned_arguments_n.count == 1:
+            return true if pymodule_named_container_element_name(expression) != ""
+            owned_argument_n: Ast::Expr = owned_arguments_n[0]
+            if owned_argument_n is Expr.Index(owned_element_head_n, owned_element_argument_n, owned_element_pos_n):
+                return pymodule_expression_head_is_owned_container(owned_element_head_n)
+            if owned_argument_n is Expr.IndexN(owned_element_head_n_n, owned_element_arguments_n, owned_element_pos_n_n):
+                return pymodule_expression_head_is_owned_container(owned_element_head_n_n)
+    return false
+
+
+
+
+def pymodule_expression_is_dict(expression: Ast::Expr) -> bool can[Abort.Panic]:
+    # Cleanup runs from the original parameter expression and intentionally has no `Ast::File`
+    # handle. Recognize the dictionary shape structurally so parser-cached named values (for
+    # example `dict[cstr, Point]`) still release their arena and retained Python references.
+    if expression is Expr.Index(index_head, index_argument, index_pos):
+        if index_head is Expr.Ident(index_name, index_name_pos):
+            return index_name == "dict"
+        return false
+    if expression is Expr.IndexN(index_head_n, index_arguments, index_pos_n):
+        if index_head_n is Expr.Ident(index_name_n, index_name_pos_n):
+            return index_name_n == "dict" and index_arguments.count == 2
+        return false
+    if expression is Expr.Unary(index_operator, index_operand, index_pos_unary):
+        return pymodule_expression_is_dict(index_operand) if index_operator == Lexer::TokenKind.Mutable or index_operator == Lexer::TokenKind.Lmut or index_operator == Lexer::TokenKind.Ampersand else false
+    if expression is Expr.Paren(index_inner, index_pos_paren):
+        return pymodule_expression_is_dict(index_inner)
+    return false

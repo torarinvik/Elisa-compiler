@@ -1,0 +1,407 @@
+# Driver — the PROJECT subcommands: `project view|deps` and `build|run|test|bench`, which
+# resolve a project target and compile its entry, plus `-emit deps`. A subcommand stage0 has and
+# stage1 does not is named explicitly, because a bare "not supported" leaves the caller
+# guessing.
+
+
+# `-emit deps` / `-emit deps-json`: the resolved include CLOSURE, root first, in include
+# order. stage0 emits this natively; stage1 had it only as PYTHON inside the host wrapper,
+# which meant the compiler could not answer "what does this file depend on" on its own.
+#
+# expand_includes already walks exactly this graph and records each file once, so deps is
+# that walk with its `seen` buffer printed instead of its expanded source.
+def emit_deps_report(json_form: bool) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    source_path_bytes: mutable darray[u8] = []
+    1 return if not push_source_path(&source_path_bytes)
+    seen: mutable darray[u8] = []
+    scratch: mutable darray[u8] = []
+    deps_line_map: mutable darray[u8] = []
+    deps_emitted_lines: mutable u32 = 0
+    1 return if not expand_includes(source_path_bytes, &scratch, &seen, 0, &deps_line_map, &deps_emitted_lines)
+    out: mutable darray[u8] = []
+    if not json_form:
+        for byte_index in 0..<seen.count |out, seen|:
+            out.push(10) if seen[byte_index] == 0 else out.push(seen[byte_index])
+        return emit_tokens_flush(out)
+    # stage0's JSON names the ROOT and then lists EVERY file, the root included — so the
+    # root appears twice, once per field. Two scans rather than one, because the root is
+    # not a special case in `files`.
+    for prefix_index in 0..<sview_len("{\n  \"root\": \"") |out|:
+        out.push(sview_at("{\n  \"root\": \"", prefix_index))
+    root_index: mutable usize = 0.usize()
+    while root_index < seen.count |root_index, out, seen|:
+        break if seen[root_index] == 0
+        out.push(seen[root_index])
+        root_index <- root_index + 1.usize()
+    for files_index in 0..<sview_len("\",\n  \"files\": [\n") |out|:
+        out.push(sview_at("\",\n  \"files\": [\n", files_index))
+    index: mutable usize = 0.usize()
+    start: mutable usize = 0.usize()
+    entry_number: mutable i64 = 0
+    while index < seen.count |index, start, out, seen, entry_number|:
+        if seen[index] == 0:
+            if entry_number > 0:
+                for sep_index in 0..<sview_len(",\n") |out|:
+                    out.push(sview_at(",\n", sep_index))
+            for quote_index in 0..<sview_len("    \"") |out|:
+                out.push(sview_at("    \"", quote_index))
+            for byte_index in start..<index |out, seen|:
+                out.push(seen[byte_index])
+            out.push(34)
+            entry_number <- entry_number + 1
+            start <- index + 1.usize()
+        index <- index + 1.usize()
+    for tail_index in 0..<sview_len("\n  ]\n}\n") |out|:
+        out.push(sview_at("\n  ]\n}\n", tail_index))
+    return emit_tokens_flush(out)
+
+
+
+
+
+# ---- `elisac-stage1 project view|deps [target] [--project DIR] [--json]` -----------------
+#
+# stage0's runProjectView / runProjectDeps. The reports themselves live in ProjectSystem;
+# this is the argument handling and the two output streams.
+#
+# The error paths are written out inline rather than funnelled through a shared helper:
+# routing them through one `fail(detail)` makes stage1's own backend decline the whole unit
+# (zero functions emitted, exit 2, no diagnostic) while stage0 compiles it. Same code, minus
+# the trigger. test/parity/project_report_smoke.sh pins the behaviour either way.
+def write_stdout_bytes(buffer: darray[u8]&) -> void can[Abort.Panic, Unsafe.PointerCast, Console]:
+    can Console:
+        return if buffer.count == 0
+        raw: void& = (&buffer[0]).cast[void&] can Unsafe.PointerCast
+        _ = write(1, raw, buffer.count)
+
+
+
+
+def run_project(argc: i64, argv: mutable void&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    slots: mutable cstr&& = argv.cast[mutable cstr&&]
+    start: mutable darray[u8] = []
+    requested: mutable darray[u8] = []
+    command: mutable darray[u8] = []
+    want_json: mutable bool = false
+    strict_contracts: mutable bool = false
+    rejected: mutable bool = false
+    index: mutable i64 = 2
+    while index < argc |index, start, requested, command, want_json, rejected, slots|:
+        piece: mutable darray[u8] = []
+        ProjectSystem::bytes_extend_cstr(&piece, slots[index.usize()].cast[cstr])
+        if ProjectSystem::bytes_equal_view(piece, "--project"):
+            index <- index + 1
+            start <- []
+            ProjectSystem::bytes_extend_cstr(&start, slots[index.usize()].cast[cstr]) if index < argc
+        elif ProjectSystem::bytes_equal_view(piece, "--json"):
+            want_json <- true
+        elif ProjectSystem::bytes_equal_view(piece, "--strict-contracts"):
+            strict_contracts <- true
+        elif command.count == 0.usize():
+            command <- piece
+        elif piece.count > 0.usize() and piece[0.usize()] != 45:
+            requested <- piece
+        else:
+            # An unrecognised flag must not be ignored: `project view --bogus` silently
+            # reporting the default target would hide a typo in a scripted invocation.
+            rejected <- true
+        index <- index + 1
+    is_view: bool = ProjectSystem::bytes_equal_view(command, "view")
+    is_deps: bool = ProjectSystem::bytes_equal_view(command, "deps")
+    is_abi_lint: bool = ProjectSystem::bytes_equal_view(command, "abi-lint")
+    is_easm_lint: bool = ProjectSystem::bytes_equal_view(command, "easm-lint")
+    if rejected or not (is_view or is_deps or is_abi_lint or is_easm_lint):
+        usage: mutable darray[u8] = []
+        ProjectSystem::bytes_extend_view(&usage, "error: unsupported project subcommand \"")
+        ProjectSystem::bytes_extend(&usage, command)
+        ProjectSystem::bytes_extend_view(&usage, "\"\n")
+        write_stderr(usage)
+        return 1
+    project_file: darray[u8] = ProjectSystem::find_project_file(start)
+    if project_file.count == 0.usize():
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: could not find project.json from ")
+        origin: darray[u8] = ProjectSystem::project_search_origin(start)
+        ProjectSystem::bytes_extend(&message, origin)
+        message.push(10)
+        write_stderr(message)
+        return 1
+    raw: darray[u8] = ProjectSystem::read_file_bytes(project_file)
+    cursor: mutable ProjectSystem::JsonCursor = ProjectSystem::JsonCursor{position: 0.usize(), ok: true, bad_key_start: 0.usize(), bad_key_length: 0.usize()}
+    project: ProjectSystem::ProjectDef = ProjectSystem::parse_project(raw, &cursor)
+    if not cursor.ok:
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        detail: darray[u8] = ProjectSystem::json_error_message(raw, &cursor, project_file)
+        ProjectSystem::bytes_extend(&message, detail)
+        message.push(10)
+        write_stderr(message)
+        return 1
+    # stage0's loadResolvedProject rejects an empty target table at LOAD time, before the
+    # view header is printed — so this must come before the header, not at target selection.
+    if project.targets.count == 0.usize():
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        ProjectSystem::bytes_extend(&message, project_file)
+        ProjectSystem::bytes_extend_view(&message, " does not define any targets")
+        message.push(10)
+        write_stderr(message)
+        return 1
+
+    # stage0 prints the project line and the target table BEFORE resolving, so an
+    # unresolvable target still shows them.
+    if is_view:
+        header: darray[u8] = ProjectSystem::render_view_header(&project, project_file)
+        write_stdout_bytes(header)
+    graph: ProjectSystem::ManifestGraph = ProjectSystem::build_dependency_graph(&project, project_file, requested)
+    resolved: ProjectSystem::ResolvedTarget = ProjectSystem::resolve_project_target(&project, project_file, requested, &graph)
+    if resolved.failed:
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        ProjectSystem::bytes_extend(&message, resolved.error_text)
+        message.push(10)
+        write_stderr(message)
+        return 1
+    if is_view:
+        body: darray[u8] = ProjectSystem::render_view_body(&resolved, &graph)
+        write_stdout_bytes(body)
+        return 0
+    if is_easm_lint:
+        # Targets with NO EASM inputs get the full report. Any target that carries them is
+        # refused by name: stage0's easm-lint VERIFIES the routines (entry-fact whitelist,
+        # label and control contracts, input bindings, and register dataflow over the
+        # instruction stream), and a report without those checks says "no issues" about code
+        # stage0 rejects. See the note in abi_lint.elisa.
+        easm_parsed_ok: mutable bool = true
+        easm_report: darray[u8] = ProjectSystem::render_easm_lint_text(&resolved, &easm_parsed_ok)
+        easm_parsed_ok <- false if want_json and ProjectSystem::strlist_count(&resolved.easm) != 0.usize()
+        if not easm_parsed_ok:
+            message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: target \"")
+            ProjectSystem::bytes_extend(&message, resolved.name)
+            ProjectSystem::bytes_extend_view(&message, "\" carries EASM inputs, and this compiler cannot verify them\n")
+            ProjectSystem::bytes_extend_view(&message, "note: easm-lint VERIFIES routines (facts, label and control contracts, input bindings, register dataflow); reporting without those checks would claim code is clean that stage0 rejects\n")
+            write_stderr(message)
+            return 1
+        easm_report_json: darray[u8] = ProjectSystem::render_easm_lint_json(&resolved)
+        write_stdout_bytes(easm_report_json) if want_json
+        write_stdout_bytes(easm_report) if not want_json
+        # stage0 exits 1 when the report carries an ERROR issue (easm.HasErrors). Every issue
+        # in the modelled subset is severity error, so the presence of the section is the test.
+        return 1 if ProjectSystem::abi_contains(easm_report, "Issues:") else 0
+    if is_abi_lint:
+        # stage0 exits 1 when any issue is ERROR severity, after printing the report.
+        abi_had_error: mutable bool = false
+        abi_report: darray[u8] = ProjectSystem::render_abi_lint(&resolved, strict_contracts, want_json, &abi_had_error)
+        write_stdout_bytes(abi_report)
+        return 1 if abi_had_error else 0
+    sources: ProjectSystem::StrList = ProjectSystem::collect_all_sources(&resolved, &graph)
+    if want_json:
+        json_payload: darray[u8] = ProjectSystem::render_project_deps_json(&resolved, &graph, &sources)
+        write_stdout_bytes(json_payload)
+        return 0
+    text_payload: darray[u8] = ProjectSystem::render_project_deps_text(&resolved, &graph, &sources)
+    write_stdout_bytes(text_payload)
+    return 0
+
+
+
+
+# ---- `elisac-stage1 build|run|test|bench [target] [--project DIR]` ----------------------
+#
+# stage0's runLoadedProgramWithOptions, minus the link step. Each of these RESOLVES a target
+# and then compiles its entry in a particular emit mode, which is exactly the pipeline the
+# CLI already runs — so rather than duplicate it, this builds the same request buffer
+# `cli_request` produces and lets main continue unchanged. The emit mode and output path
+# come from the resolved target instead of from flags.
+#
+#   build -> target.emit      into target.output_path   (stage0: cli.emit/cli.output)
+#   run   -> target.run_emit  no output                 (stage0 clears cli.output)
+#   test  -> "test"           no output
+#   bench -> "benches"        no output
+#
+# LINKING is not done here. stage0's build sets linkNative when the emit is an object and
+# the output is not a bare `.o`; that path shells out to a host linker and is the one piece
+# of these four the driver still cannot do alone — a project whose target emits an object
+# and asks for a linked binary is REFUSED by name rather than silently left unlinked.
+
+# Whether `build` on this target would need a host linker (stage0's
+# shouldLinkNativeProjectBuild: an object emit whose output is not itself a `.o`).
+def project_build_needs_linker(emit: darray[u8]&, output: darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate]:
+    false return if not ProjectSystem::bytes_equal_view(emit, "obj")
+    false return if output.count == 0.usize()
+    dot: mutable bool = false
+    if output.count >= 2.usize():
+        dot <- output[output.count - 2.usize()] == 46 and output[output.count - 1.usize()] == 111
+    return not dot
+
+
+
+
+def project_compile_request(argc: i64, argv: mutable void&, status: mutable i64&) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    request: mutable darray[u8] = []
+    status <- 1
+    slots: mutable cstr&& = argv.cast[mutable cstr&&]
+    command: mutable darray[u8] = []
+    ProjectSystem::bytes_extend_cstr(&command, slots[1.usize()].cast[cstr])
+    start: mutable darray[u8] = []
+    requested: mutable darray[u8] = []
+    rejected: mutable bool = false
+    index: mutable i64 = 2
+    while index < argc |index, start, requested, rejected, slots|:
+        piece: mutable darray[u8] = []
+        ProjectSystem::bytes_extend_cstr(&piece, slots[index.usize()].cast[cstr])
+        if ProjectSystem::bytes_equal_view(piece, "--project") or ProjectSystem::bytes_equal_view(piece, "-p"):
+            index <- index + 1
+            start <- []
+            ProjectSystem::bytes_extend_cstr(&start, slots[index.usize()].cast[cstr]) if index < argc
+        elif piece.count > 0.usize() and piece[0.usize()] != 45:
+            requested <- piece
+        else:
+            rejected <- true
+        index <- index + 1
+    if rejected:
+        usage: mutable darray[u8] = ProjectSystem::bytes_from_view("error: unrecognised option for ")
+        ProjectSystem::bytes_extend(&usage, command)
+        usage.push(10)
+        write_stderr(usage)
+        return request
+    project_file: darray[u8] = ProjectSystem::find_project_file(start)
+    if project_file.count == 0.usize():
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: could not find project.json from ")
+        origin: darray[u8] = ProjectSystem::project_search_origin(start)
+        ProjectSystem::bytes_extend(&message, origin)
+        message.push(10)
+        write_stderr(message)
+        return request
+    raw: darray[u8] = ProjectSystem::read_file_bytes(project_file)
+    cursor: mutable ProjectSystem::JsonCursor = ProjectSystem::JsonCursor{position: 0.usize(), ok: true, bad_key_start: 0.usize(), bad_key_length: 0.usize()}
+    project: ProjectSystem::ProjectDef = ProjectSystem::parse_project(raw, &cursor)
+    if not cursor.ok:
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        detail: darray[u8] = ProjectSystem::json_error_message(raw, &cursor, project_file)
+        ProjectSystem::bytes_extend(&message, detail)
+        message.push(10)
+        write_stderr(message)
+        return request
+    if project.targets.count == 0.usize():
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        ProjectSystem::bytes_extend(&message, project_file)
+        ProjectSystem::bytes_extend_view(&message, " does not define any targets")
+        message.push(10)
+        write_stderr(message)
+        return request
+    graph: ProjectSystem::ManifestGraph = ProjectSystem::build_dependency_graph(&project, project_file, requested)
+    resolved: ProjectSystem::ResolvedTarget = ProjectSystem::resolve_project_target(&project, project_file, requested, &graph)
+    if resolved.failed:
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        ProjectSystem::bytes_extend(&message, resolved.error_text)
+        message.push(10)
+        write_stderr(message)
+        return request
+
+    # Which emit mode this subcommand runs the entry under.
+    selected_emit: mutable darray[u8] = []
+    wants_output: mutable bool = false
+    if ProjectSystem::bytes_equal_view(command, "build"):
+        selected_emit <- ProjectSystem::bytes_copy(resolved.emit)
+        wants_output <- true
+    elif ProjectSystem::bytes_equal_view(command, "run"):
+        selected_emit <- ProjectSystem::bytes_copy(resolved.run_emit)
+    elif ProjectSystem::bytes_equal_view(command, "test"):
+        selected_emit <- ProjectSystem::bytes_from_view("test")
+    else:
+        selected_emit <- ProjectSystem::bytes_from_view("benches")
+
+    # A project target that says `emit: object` with an executable output is stage0's
+    # linkNative form. The ordinary CLI already implements that path as `-emit exe`; route
+    # through the same driver mode instead of rejecting a valid project target. The host
+    # linker remains orchestration, while code generation and target selection stay in Elisa.
+    if wants_output and project_build_needs_linker(selected_emit, resolved.output_path):
+        selected_emit <- ProjectSystem::bytes_from_view("exe")
+
+    # `build` (when its object output is a program), `run`, and `test` LINK the program before
+    # running it, so they need the Elisa runtime
+    # object. There is no path an installed binary could guess, and without it the failure
+    # surfaces as a raw `Undefined symbols: _arena_free` dump from the host linker — which
+    # says nothing about what the caller should do.
+    runtime_probe: mutable darray[u8] = []
+    needs_runtime: bool = ProjectSystem::bytes_equal_view(selected_emit, "interpret") or ProjectSystem::bytes_equal_view(selected_emit, "test") or ProjectSystem::bytes_equal_view(selected_emit, "exe")
+    if needs_runtime and not env_value("ELISA_RUNTIME_OBJ", &runtime_probe):
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: ")
+        ProjectSystem::bytes_extend(&message, command)
+        ProjectSystem::bytes_extend_view(&message, " links the program before running it and needs the Elisa runtime object\n")
+        ProjectSystem::bytes_extend_view(&message, "note: set ELISA_RUNTIME_OBJ to the path of elisacore_runtime.o (scripts/build_runtime_object.sh builds one)\n")
+        write_stderr(message)
+        return request
+
+    setenv_bytes("ELISA_STAGE1_EMIT", selected_emit)
+    setenv_bytes("ELISA_STAGE1_SRC", resolved.entry_path)
+    # `link_executable` historically read the stage1-specific spelling, while project
+    # callers expose the portable `ELISA_RUNTIME_OBJ` spelling. Bridge the two explicitly
+    # so project builds use the same runtime object as direct `-emit exe` invocations.
+    setenv_bytes("ELISA_STAGE1_RUNTIME_OBJ", runtime_probe) if needs_runtime and runtime_probe.count > 0.usize()
+    setenv_bytes("ELISA_STAGE1_TRIPLE", resolved.target_triple) if resolved.target_triple.count > 0.usize()
+    if resolved.has_opt_level:
+        level: mutable darray[u8] = []
+        level.push((48 + resolved.opt_level).u8())
+        setenv_bytes("ELISA_STAGE1_OPT", level)
+    # Link flags travel as one space-separated string, the shape ELISA_STAGE1_LINK already
+    # uses (see the -link handling in cli_request).
+    link_line: mutable darray[u8] = []
+    for link_index in 0..<ProjectSystem::strlist_count(&resolved.link_flags) |link_line, resolved|:
+        link_line.push(32) if link_line.count > 0.usize()
+        ProjectSystem::strlist_append_entry(&link_line, &resolved.link_flags, link_index)
+    setenv_bytes("ELISA_STAGE1_LINK", link_line) if link_line.count > 0.usize()
+
+    # The request buffer, in cli_request's exact shape: output path, newline, expanded
+    # source, NUL. `run`/`test`/`bench` print on stdout and ignore the path, but the
+    # protocol still carries one.
+    output_path: mutable darray[u8] = ProjectSystem::bytes_copy(resolved.output_path) if wants_output else ProjectSystem::bytes_copy(resolved.entry_path)
+    included_seen: mutable darray[u8] = []
+    expanded_source: mutable darray[u8] = []
+    project_line_map: mutable darray[u8] = []
+    project_emitted_lines: mutable u32 = 0
+    _ = expand_includes(resolved.entry_path, &expanded_source, &included_seen, 0, &project_line_map, &project_emitted_lines)
+    setenv_bytes("ELISA_STAGE1_LINE_MAP", project_line_map) if project_line_map.count > 0.usize()
+    if expanded_source.count == 0.usize():
+        message: mutable darray[u8] = ProjectSystem::bytes_from_view("error: could not read entry ")
+        ProjectSystem::bytes_extend(&message, resolved.entry_path)
+        message.push(10)
+        write_stderr(message)
+        return request
+    for path_index in 0..<output_path.count |request, output_path|:
+        request.push(output_path[path_index])
+    request.push(10)
+    for content_index in 0..<expanded_source.count |request, expanded_source|:
+        request.push(expanded_source[content_index])
+    request.push(0)
+    status <- 0
+    return request
+
+
+
+
+# The four that resolve a project target and compile its entry.
+def subcommand_compiles_project(name: cstr) -> bool can[Abort.Panic, Memory.Allocate]:
+    return when name:
+        "build" | "run" | "test" | "bench" -> true
+        _ -> false
+
+
+
+
+# stage0 subcommands stage1 has not implemented. `build|run|test|bench` are handled above;
+# what remains are the two project LINT subcommands, which need analyses stage1 lacks
+# (abi-lint a native-source ABI scanner, easm-lint the EASM parser).
+def subcommand_is_unimplemented(name: cstr) -> bool can[Abort.Panic, Memory.Allocate]:
+    return false
+
+
+
+
+# Say which subcommand, and say that stage0 has it — a bare "not supported" leaves the
+# reader unsure whether they mistyped it.
+def run_unimplemented_subcommand(name: cstr) -> i64 can[Console, Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    message: mutable darray[u8] = []
+    emit_tokens_push_sview(message, "error: subcommand \"")
+    ProjectSystem::bytes_extend_cstr(&message, name)
+    emit_tokens_push_sview(message, "\" is not implemented by this compiler\n")
+    emit_tokens_push_sview(message, "note: it compiles and links a resolved target; stage1 implements the reporting subcommands only (project view, project deps)\n")
+    write_stderr(message)
+    return 1

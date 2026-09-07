@@ -1,0 +1,358 @@
+# Stage1 backend — dict and set METHOD CALLS: which std helper each method lowers to (and the
+# frictionless `_or_panic` wrapper stage0 prefers), which of them mutate, and the `.entry(k)`
+# api built on top. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        def emit_dict_method_call(base: sview, full_type_args: darray[ValueType]&, receiver: Expr, arguments: darray[Expr]&, arena_leading: bool, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            type_args: darray[ValueType] = container_helper_type_args(base, full_type_args, generics)
+            if instantiate_generic(base, type_args, generics, structs, m, ctx) is target:
+                dict_arg_values: mutable darray[LLVMValueRef] = []
+                param_index: mutable usize = 0
+                # The leading region for a mutating helper is the receiver's owner arena.
+                # Using the ambient scratch region here frees a table's bucket storage with
+                # the callee's auto region; stage0 resolves this from the receiver root.
+                dict_leading_arena: mutable LLVMValueRef = runtime.arena
+                if arena_leading:
+                    dict_leading_arena <- growth_arena_for(receiver, local_scope, runtime)
+                    dict_arg_values.push(dict_leading_arena)
+                    param_index <- 1
+                # The receiver, emitted at its `dict[K,T]&` parameter type (a bare dict local
+                # auto-borrows to its slot).
+                receiver_wanted: ValueType = instantiation_param_type(base, type_args, param_index, generics, structs)
+                if emit_expression(receiver, receiver_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is receiver_value:
+                    dict_arg_values.push(receiver_value)
+                    param_index <- param_index + 1
+                    method_declined: mutable bool = false
+                    for method_argument in arguments |dict_arg_values, method_declined, param_index, base, type_args, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        method_wanted: ValueType = instantiation_param_type(base, type_args, param_index, generics, structs)
+                        if emit_expression(method_argument, method_wanted, local_scope, fns, structs, generics, runtime, m, ctx, builder) is method_argument_value:
+                            dict_arg_values.push(method_argument_value)
+                        else:
+                            method_declined <- true
+                        param_index <- param_index + 1
+                    null return if method_declined
+                    # The TRAILING arena, if this instantiation's signature has one. The leading
+                    # region above is the helper's own declared `a: Arena&` parameter and is a
+                    # different slot; a growing helper carries BOTH. Omitting this made the
+                    # callee read its arena from a register the caller never set.
+                    dict_arg_values.push(runtime.arena) if instantiation_wants_arena(base, type_args, generics, structs)
+                    dict_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(target)
+                    dict_return_type: ValueType = generic_return_type(base, type_args, generics, structs)
+                    dict_result_name: cstr = call_result_name(dict_return_type, value_type_uses_sret(dict_return_type, structs, ctx))
+                    dict_args_pointer: void& = (&dict_arg_values[0]).cast[void&] can Unsafe.PointerCast
+                    return LLVMBuildCall2(builder, dict_fn_type, target, dict_args_pointer, dict_arg_values.count.u32(), dict_result_name)
+                return null
+            return null
+
+
+
+
+        # ---- the dict ENTRY api ------------------------------------------------------
+        #
+        # `d.entry(k)` names a PLACE in the map. stage0 materialises a three-word aggregate
+        # `{dict, key, cached}` — `cached` being `arena_dict_get_mut__T(d, k)` — and then
+        # extracts from it at the very next instruction, at every use:
+        #
+        #   .found          -> `icmp ne <cached>, null`
+        #   .value          -> `<cached>` (a `T&?`)
+        #   .insert(v)      -> `<cached>` when present, else `arena_dict_put__T(a, d, k, v)`
+        #   .get_or_insert(v) -> same branch, `arena_dict_get_or_insert__T` on the miss side
+        #
+        # All three fields are recomputable from the receiver expression, so stage1 matches
+        # the CHAIN and skips the aggregate rather than modeling an anonymous tuple type it
+        # has no ValueType for. A program that BINDS the entry to a local and reads it later
+        # is not recognised here and declines — stage0's own dict surface never spells that.
+        #
+        # The insert forms re-emit the receiver and key on the miss path, so the key is
+        # restricted to a side-effect-free expression; a computed key would otherwise be
+        # evaluated twice on the branch stage0 evaluates once.
+        def dict_entry_key_is_repeatable(key: Expr) -> bool can[Abort.Panic]:
+            return match key:
+                Expr.StringLit(_): true
+                Expr.IntLit(_): true
+                Expr.CharLit(_): true
+                Expr.Ident(_, _): true
+                _: false
+
+
+
+
+        # `cached` for `<recv>.entry(key)`, plus the receiver/key the insert forms re-use.
+        def emit_dict_entry_cached(entry_receiver: Expr, entry_key: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            entry_type_args: darray[ValueType] = dict_type_args_of(entry_receiver, local_scope, fns, structs, generics)
+            null return if entry_type_args.count == 0
+            null return if container_receiver_base(entry_receiver, local_scope, fns, structs, generics) != "DynDict"
+            entry_get_helper: sview = resolved_container_helper("DynDict", "get_mut", generics)
+            null return if sview_len(entry_get_helper) == 0
+            entry_key_args: darray[Expr] = [entry_key]
+            return emit_dict_method_call(entry_get_helper, entry_type_args, entry_receiver, entry_key_args, false, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+
+
+
+
+        # Emit `<entry_call>.<member>(<member_arguments>)`. `entry_call` must itself be the
+        # `<recv>.entry(k)` call; anything else returns null and the caller falls through to
+        # its ordinary paths.
+        def emit_dict_entry_member(entry_call: Expr, member: sview, member_arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match entry_call:
+                Expr.Call(entry_callee, entry_arguments, entry_argument_names, entry_call_line):
+                    match entry_callee:
+                        Expr.Field(entry_receiver, entry_method, entry_method_line):
+                            if entry_method == "entry" and entry_arguments.count == 1.usize():
+                                entry_key: Expr = entry_arguments[0]
+                                # The read-only members: one helper call, no branch.
+                                if member == "found" or member == "value":
+                                    null return if member_arguments.count != 0.usize()
+                                    if emit_dict_entry_cached(entry_receiver, entry_key, local_scope, fns, structs, generics, runtime, m, ctx, builder) is read_cached:
+                                        read_cached return if member == "value"
+                                        # 33 = NE.
+                                        return LLVMBuildICmp(builder, 33, read_cached, LLVMConstNull(LLVMPointerTypeInContext(ctx, 0)), "dict.entry.found")
+                                    return null
+                                if member == "insert" or member == "get_or_insert":
+                                    null return if member_arguments.count != 1.usize()
+                                    null return if not dict_entry_key_is_repeatable(entry_key)
+                                    miss_method: sview = "put" if member == "insert" else "get_or_insert"
+                                    miss_helper: sview = resolved_container_helper("DynDict", miss_method, generics)
+                                    null return if sview_len(miss_helper) == 0
+                                    entry_miss_args: darray[ValueType] = dict_type_args_of(entry_receiver, local_scope, fns, structs, generics)
+                                    null return if entry_miss_args.count == 0
+                                    if emit_dict_entry_cached(entry_receiver, entry_key, local_scope, fns, structs, generics, runtime, m, ctx, builder) is insert_cached:
+                                        insert_pointer: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+                                        insert_slot: LLVMValueRef = build_entry_alloca(builder, insert_pointer, "dict.entry.slot")
+                                        _ = LLVMBuildStore(builder, insert_cached, insert_slot)
+                                        # 33 = NE.
+                                        insert_has: LLVMValueRef = LLVMBuildICmp(builder, 33, insert_cached, LLVMConstNull(insert_pointer), "dict.entry.insert.has")
+                                        insert_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                        insert_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, insert_function, "dict.entry.insert.insert")
+                                        merge_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, insert_function, "dict.entry.insert.merge")
+                                        _ = LLVMBuildCondBr(builder, insert_has, merge_block, insert_block)
+                                        LLVMPositionBuilderAtEnd(builder, insert_block)
+                                        insert_call_args: mutable darray[Expr] = [entry_key]
+                                        insert_call_args.push(member_arguments[0])
+                                        if emit_dict_method_call(miss_helper, entry_miss_args, entry_receiver, insert_call_args, true, local_scope, fns, structs, generics, runtime, m, ctx, builder) is insert_result:
+                                            _ = LLVMBuildStore(builder, insert_result, insert_slot)
+                                            _ = LLVMBuildBr(builder, merge_block)
+                                            LLVMPositionBuilderAtEnd(builder, merge_block)
+                                            return LLVMBuildLoad2(builder, insert_pointer, insert_slot, "dict.entry.insert.phi")
+                                        return null
+                                    return null
+                        _:
+                            pass
+                _:
+                    pass
+            return null
+
+
+
+
+        # If `receiver` has a `DynDict[K, T]` type, return its type-argument tuple (K, T);
+        # otherwise an empty darray. Used to lower `d.get`/`d.put` to the arena_dict_* helpers.
+        def dict_type_args_of(receiver: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            empty: darray[ValueType] = []
+            receiver_type: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+            empty return if receiver_type.kind != TypeKind.Struct
+            receiver_base: mutable sview = ""
+            receiver_arg_start: mutable usize = 0
+            receiver_arg_count: mutable usize = 0
+            has_instantiation: bool = generic_struct_instantiation_of(structs, receiver_type, receiver_base, receiver_arg_start, receiver_arg_count)
+            empty return if not has_instantiation
+            empty return if receiver_base != "DynDict" and receiver_base != "DynSet"
+            collected: mutable darray[ValueType] = []
+            for offset in 0..<receiver_arg_count |collected, structs, receiver_arg_start|:
+                collected.push(copied_type(structs.generic_struct_inst_args[receiver_arg_start + offset]))
+            return collected
+
+
+
+
+        # The std helper a dict method lowers to — the FRICTIONLESS (panic-on-OOM, no `can`)
+        # surface, matching stage0's synthetic `dict.<method>` lowering. Empty = not a dict
+        # method (fall through to ordinary UFCS).
+        def dict_method_helper(method_name: sview) -> sview can[Abort.Panic]:
+            return when method_name:
+                "get" -> "arena_dict_get"
+                "get_mut" -> "arena_dict_get_mut"
+                "put" -> "arena_dict_put_or_panic"
+                "get_or_insert" -> "arena_dict_get_or_insert_or_panic"
+                "reserve" -> "arena_dict_reserve_or_panic"
+                "contains" -> "arena_dict_contains"
+                "remove" -> "arena_dict_remove"
+                "clear" -> "arena_dict_clear"
+                _ -> ""
+
+
+
+
+        # The set twins. Same shape and the same `_or_panic` preference stage0 applies
+        # (dictMutationHelperName picks `<base>_or_panic` when the std declares one), over the
+        # method names stage0's set builtin accepts — `insert` is a synonym for `add` and
+        # `has` for `contains`.
+        def set_method_helper(method_name: sview) -> sview can[Abort.Panic]:
+            return when method_name:
+                "add" -> "arena_set_add_or_panic"
+                "insert" -> "arena_set_add_or_panic"
+                "reserve" -> "arena_set_reserve_or_panic"
+                "contains" -> "arena_set_contains"
+                "has" -> "arena_set_contains"
+                "remove" -> "arena_set_remove"
+                "clear" -> "arena_set_clear"
+                _ -> ""
+
+
+
+
+        # Route a container method by the receiver's BASE. The two families share method
+        # names (`contains`, `remove`, `clear`, `reserve`) with different helpers behind
+        # them, so the base has to reach the lookup — dispatching on the name alone would
+        # send a set's `contains` to `arena_dict_contains`.
+        def container_method_helper(container_base: sview, method_name: sview) -> sview can[Abort.Panic]:
+            can Abort.Panic:
+                set_method_helper(method_name) return if container_base == "DynSet"
+                return dict_method_helper(method_name)
+
+
+
+
+        # The PLAIN (non-`_or_panic`) helper for the same method. stage0 picks the
+        # frictionless wrapper only when the std in scope DECLARES one — a program that
+        # brings its own cut-down dict surface (the backend_store corpus file declares
+        # `arena_dict_put`/`arena_dict_get_or_insert` and no wrapper at all) gets the base
+        # name, and stage0's IR calls `@arena_dict_get_or_insert__i64` directly.
+        def dict_method_helper_plain(method_name: sview) -> sview can[Abort.Panic]:
+            return when method_name:
+                "put" -> "arena_dict_put"
+                "get_or_insert" -> "arena_dict_get_or_insert"
+                "reserve" -> "arena_dict_reserve"
+                _ -> ""
+
+
+
+
+        def set_method_helper_plain(method_name: sview) -> sview can[Abort.Panic]:
+            return when method_name:
+                "add" -> "arena_set_add"
+                "insert" -> "arena_set_add"
+                "reserve" -> "arena_set_reserve"
+                _ -> ""
+
+
+
+
+        # Pick the helper NAME a call site should instantiate: the frictionless wrapper when
+        # a template for it is in scope, else the plain base when THAT one is. Falling back
+        # unconditionally would change helper selection for every dict call in a program that
+        # declares both; keying on what is actually declared leaves those untouched.
+        def resolved_container_helper(container_base: sview, method_name: sview, generics: GenericTable&) -> sview can[Abort.Panic]:
+            can Abort.Panic:
+                preferred: sview = container_method_helper(container_base, method_name)
+                "" return if sview_len(preferred) == 0
+                preferred return if generic_index_of(generics, preferred) >= 0
+                plain: mutable sview = dict_method_helper_plain(method_name)
+                plain <- set_method_helper_plain(method_name) if container_base == "DynSet"
+                "" return if sview_len(plain) == 0
+                plain return if generic_index_of(generics, plain) >= 0
+                return preferred
+
+
+
+
+        # Narrow a dict's `(K, T)` tuple to what the resolved TEMPLATE actually declares.
+        # The std's helpers are `[K, T]`, but a program may declare the same helper with the
+        # key fixed (`def arena_dict_get_or_insert[T](m: dict[cstr[key_shape], T]&, ...)`) —
+        # one type parameter. instantiate_generic_at requires exactly one argument per
+        # parameter, so the full tuple declined the call outright. Values trail keys, so the
+        # TRAILING arguments are the ones a shorter template binds; that also reproduces
+        # stage0's mangling (`arena_dict_get_or_insert__i64`, T alone).
+        def container_helper_type_args(base: sview, type_args: darray[ValueType]&, generics: GenericTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                slot: i64 = generic_index_of(generics, base)
+                copied: mutable darray[ValueType] = []
+                for argument in type_args |copied|:
+                    copied <- copied.push(copied_type(argument))
+                copied return if slot < 0
+                declared: usize = generics.param_count[slot.usize()]
+                copied return if declared >= type_args.count
+                narrowed: mutable darray[ValueType] = []
+                dropped: usize = type_args.count - declared
+                for position in 0..<type_args.count |narrowed, type_args, dropped|:
+                    narrowed <- narrowed.push(copied_type(type_args[position])) if position >= dropped
+                return narrowed
+
+
+
+
+            # Whether a dict method mutates the map and therefore takes a LEADING region argument.
+        def dict_method_is_mutating(method_name: sview) -> bool can[Abort.Panic]:
+            return when method_name:
+                "put" | "get_or_insert" | "reserve" -> true
+                _ -> false
+
+
+
+
+        def set_method_is_mutating(method_name: sview) -> bool can[Abort.Panic]:
+            return when method_name:
+                "add" | "insert" | "reserve" -> true
+                _ -> false
+
+
+
+
+        def container_method_is_mutating(container_base: sview, method_name: sview) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                set_method_is_mutating(method_name) return if container_base == "DynSet"
+                return dict_method_is_mutating(method_name)
+
+
+
+
+            # The receiver's container family — "DynDict", "DynSet", or "" for anything else.
+        def container_receiver_base(receiver: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> sview can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                receiver_type: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+                "" return if receiver_type.kind != TypeKind.Struct
+                base: mutable sview = ""
+                arg_start: mutable usize = 0
+                arg_count: mutable usize = 0
+                "" return if not generic_struct_instantiation_of(structs, receiver_type, base, arg_start, arg_count)
+                base return if base == "DynDict" or base == "DynSet"
+                return ""
+
+
+
+
+            # Whether a dict method mutates the map IN PLACE, so the reassignment spelling
+            # `d <- d.method(…)` must emit the call and store NOTHING.
+            #
+            # These helpers return a REF TO THE ELEMENT (`T&?`) or a bool — never a dict. Storing
+            # that over the receiver overwrites the header's first word (`items`) with a pointer
+            # into the middle of the bucket array, after which the capacity says 64 while the
+            # array behind `items` is short by the offset. `d.put` in statement position was
+            # always right; only the reassignment form was wrong, which is why it took a
+            # self-hosted analyzer to surface it.
+            #
+            # Wider than dict_method_is_mutating: `remove`/`clear` mutate too, they just need no
+            # leading region.
+        def dict_method_mutates_in_place(method_name: sview) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                true return if dict_method_is_mutating(method_name)
+                return when method_name:
+                    "remove" | "clear" -> true
+                    _ -> false
+
+
+
+
+            # `s <- s.add(k)` is the same trap as `d <- d.put(k, v)`: the helper returns a BOOL,
+            # and storing it over the receiver overwrites the header's `items` word.
+        def container_method_mutates_in_place(container_base: sview, method_name: sview) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                if container_base == "DynSet":
+                    true return if set_method_is_mutating(method_name)
+                    return when method_name:
+                        "remove" | "clear" -> true
+                        _ -> false
+                return dict_method_mutates_in_place(method_name)

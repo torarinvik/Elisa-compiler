@@ -1,0 +1,586 @@
+# Stage1 backend — EXTERN declarations: libc-shaped symbols, LLVM intrinsics, `@c_opaque`
+# inline storage, typed non-call externs, and the pointer/optional return rules that follow
+# from a declaration with no body. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        # `extern strlen(s: cstr) -> usize` -> `declare i64 @strlen(ptr)`. No body: the
+        # symbol is resolved at link time.
+        #
+        # Param and return types are bare NAMES here, not Exprs: the params live in the
+        # `File.extern_params` SIDE TABLE (`param_start`/`arity` index it) and the return
+        # type is `return_type_name` on the node. So both resolve through
+        # scalar_type_of_name rather than annotation_value_type -- there is no type
+        # expression to walk. An empty return name is `-> void`.
+        # Whether the parser side-tabled this extern's `-> T` clause as a POINTER
+        # return (`__extern_return_ptr` owner, extern name in `name`). The node
+        # signature keeps only the bare head name, so this is the only channel.
+        def extern_return_is_pointer(annotations: darray[Ast::EnumAnnotation]&, extern_name: sview) -> bool can[Abort.Panic]:
+            for annotation in annotations |extern_name|:
+                true return if annotation.owner == "__extern_return_ptr" and annotation.name == extern_name
+            return false
+
+
+
+        # The companion of extern_return_is_pointer for `-> heap T&?` (see FnTable.returns_nullable).
+        def extern_return_is_optional(annotations: darray[Ast::EnumAnnotation]&, extern_name: sview) -> bool can[Abort.Panic]:
+            for annotation in annotations |extern_name|:
+                true return if annotation.owner == "__extern_return_optional" and annotation.name == extern_name
+            return false
+
+
+
+        # `@link_name(c_symbol)` changes only the linker spelling. The source-level name
+        # remains the key used by parser/semantic tables and call sites.
+        def extern_link_name(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&, source_name: sview) -> sview can[Abort.Panic]:
+            for decorator in decorators |annotation_args, source_name|:
+                if decorator.name == "link_name" and decorator.arg_count > 0 and decorator.arg_start.usize() < annotation_args.count:
+                    return annotation_args[decorator.arg_start.usize()]
+            return source_name
+
+
+
+        # The host byte size of an INLINE-storage `@c_opaque(header, ctype)` extern type, or -1
+        # if it has no @c_opaque or names a ctype whose size this backend does not know. A bare
+        # `@c_opaque` extern is otherwise modeled as an 8-byte pointer HANDLE, which is WRONG for
+        # a value you allocate inline and pass by address (`m: PthreadMutexT = zeroed; ...(&m)`):
+        # the C fn writes the FULL struct, so an 8-byte slot corrupts memory and, embedded in a
+        # struct, silently races. stage1 targets only the host triple (cf register_target_consts),
+        # so a host size table is exact. ctype is the SECOND @c_opaque arg (arg 0 = header).
+        # macOS-arm64 sizeof, cross-checked by the C sizeof probe in thread_real_smoke.
+        def c_opaque_host_size(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&) -> i64 can[Abort.Panic]:
+            for decorator in decorators |annotation_args|:
+                if decorator.name == "c_opaque" and decorator.arg_count >= 2 and decorator.arg_start.usize() + 1 < annotation_args.count:
+                    ctype: sview = annotation_args[decorator.arg_start.usize() + 1]
+                    64 return if ctype == "pthread_mutex_t"
+                    48 return if ctype == "pthread_cond_t"
+                    16 return if ctype == "pthread_once_t"
+            return -1
+
+
+
+
+        # Typed non-call externs retain only a bare head in Decl.Extern. Resolve the full
+        # annotation captured by the parser when one is available, so generic containers and
+        # nested fixed arrays get the same ValueType as an ordinary declaration.
+        def extern_global_value_type(name: sview, names: darray[sview]&, expressions: darray[Expr]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<names.count |name, expressions, structs|:
+                if names[index] == name and index < expressions.count:
+                    return annotation_value_type(expressions[index], structs)
+            return unmodeled_type()
+
+
+
+        # EARLY pass: register the `[size x i8]` alias for every inline-storage `@c_opaque` extern
+        # BEFORE struct bodies resolve (set_struct_bodies_from_metadata), so a struct FIELD of the
+        # opaque type gets its real size, not the 8-byte handle. Without this the alias is only
+        # registered in the later declaration pass — after fields are sized — and a struct-embedded
+        # mutex silently races. Recurses into modules. Idempotent: the declaration pass's
+        # `alias_index_of < 0` guard then skips any name registered here.
+        def register_one_opaque_extern(declaration: Decl, annotation_args: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                if declaration is Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
+                    return if callable or arity != 0 or return_type_name != ""
+                    return if alias_index_of(structs, extern_name) >= 0
+                    opaque_size: i64 = c_opaque_host_size(decorators, annotation_args)
+                    return if opaque_size <= 0
+                    structs.alias_names <- structs.alias_names.push(extern_name)
+                    structs.alias_types <- structs.alias_types.push(intern_array_type(ValueType{kind: TypeKind.Unsigned, bits: 8}, opaque_size.u32(), structs))
+
+
+
+        def register_opaque_extern_aliases(top: darray[Decl]&, annotation_args: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for declaration in top |annotation_args, structs|:
+                    if declaration_is_module(declaration):
+                        for nested_index in 0..<declaration_module_count(declaration) |declaration, annotation_args, structs|:
+                            register_one_opaque_extern(declaration_module_at(declaration, nested_index), annotation_args, structs)
+                    else:
+                        register_one_opaque_extern(declaration, annotation_args, structs)
+
+
+
+        # Intrinsics are declarations owned by LLVM, not ordinary extern symbols. The
+        # frontend stores the requested intrinsic name as the single @intrinsic argument;
+        # retain the source name separately in FnTable so Elisa calls still resolve by it.
+        def extern_intrinsic_name(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&) -> sview can[Abort.Panic]:
+            for decorator in decorators |annotation_args|:
+                if decorator.name == "intrinsic" and decorator.arg_count > 0 and decorator.arg_start.usize() < annotation_args.count:
+                    return annotation_args[decorator.arg_start.usize()]
+            return sview("", 0, 0)
+
+
+
+
+        def intrinsic_is_wasm_only(name: sview) -> bool can[Abort.Panic]:
+            return sview_matches_prefix(name, "llvm.wasm.", 0, 10)
+
+
+
+
+        # The export target of `export <name> as <target>`, or "" when `name` is not exported.
+        #
+        # The `__export_fn` MARKER must be present. Without that check any OTHER internal
+        # annotation on the same owner reads as a target name: an `extern f(...) -> T error[E]`
+        # carries `__error_return` on `f`, which made the export path fire on a plain extern,
+        # try to build a wrapper for a target named "__error_return", fail, and record `f` as
+        # DECLINED even though its declaration lowered correctly.
+        # The recorded ELEMENT type of an extern's `-> darray[T]` return, keyed by the extern's
+        # own line, or "".
+        def extern_return_darray_element_of(annotations: darray[Ast::EnumAnnotation]&, line: u32) -> sview can[Abort.Panic]:
+            for annotation in annotations |line|:
+                annotation.owner return if annotation.name == "__extern_return_darray_elem" and annotation.line == line
+            return ""
+
+
+
+
+        # Resolve the element retained by the compact extern scanner. This is intentionally
+        # name-based and small: the scanner only records the first application argument, while
+        # ordinary declarations retain a full Expr. It covers the scalar/nominal names that can
+        # cross the C boundary and lets `view[T]`/`darray[T]` use their normal interned ABI.
+        def extern_element_value_type(element_name: sview, annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            bound_element: ValueType = bound_type_of(structs, element_name)
+            return bound_element if bound_element.kind != TypeKind.Unmodeled
+            named_element: mutable ValueType = scalar_type_of_name(element_name)
+            named_element <- ValueType{kind: TypeKind.CStr, bits: 1} if named_element.kind == TypeKind.Unmodeled and llvm_opaque_handle_name(element_name)
+            if named_element.kind == TypeKind.Unmodeled:
+                element_struct: i64 = struct_index_of(structs, element_name)
+                named_element <- ValueType{kind: TypeKind.Struct, bits: element_struct.u32()} if element_struct >= 0
+            if named_element.kind == TypeKind.Unmodeled:
+                element_enum: i64 = enum_index_of(structs, element_name)
+                named_element <- copied_type(structs.enum_backings[element_enum.usize()]) if element_enum >= 0
+            if named_element.kind == TypeKind.Unmodeled:
+                named_element <- export_alias_value_type(annotations, structs, element_name)
+            return named_element
+
+
+
+
+        def declare_extern(declaration: Decl, extern_params: darray[ExternParam]&, extern_global_type_names: darray[sview]&, extern_global_type_exprs: darray[Expr]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, return_is_pointer: bool, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if declaration is Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
+                # `export pymodule NAME:` is a frontend-only export contract. Its declaration
+                # node is deliberately an Extern for AST compatibility, but it must not become
+                # an opaque handle/global in the ordinary Elisa object; the Python emitter owns
+                # the metadata and introduces stable wrapper symbols after ordinary bodies.
+                for pymodule_annotation in annotations |extern_name|:
+                    true return if pymodule_annotation.owner == extern_name and pymodule_annotation.name == "__export_pymodule"
+                linker_name: sview = extern_link_name(decorators, annotation_args, extern_name)
+                # An `export fn` declaration, and whether its public name IS its
+                # implementation's name. The latter must own a handle of its own:
+                # declare_or_get_named would hand it the implementation's, and the
+                # wrapper body would then be emitted into the implementation.
+                extern_export_target: sview = export_target_of(annotations, extern_name)
+                extern_is_export: bool = extern_export_target != ""
+                extern_same_name_export: bool = extern_is_export and extern_export_target == extern_name
+                # `extern name: T` (a typed non-call extern) is a GLOBAL, not a function.
+                if not callable:
+                    # `export type T as Public` is represented by the parser as a
+                    # non-callable extern row so the declaration survives the AST pass. It is
+                    # metadata for C-header naming, not an opaque LLVM handle. Treating it as
+                    # the latter registered `T` as a `cstr` alias after the real struct was
+                    # registered; annotation_ident_value_type gives aliases precedence over
+                    # structs, so every later `T` aggregate construction/field access resolved
+                    # to `ptr` and the enclosing functions were declined. Stage0 keeps the
+                    # struct type and emits both the implementation and its export wrapper.
+                    export_type_marker: mutable bool = false
+                    for export_type_annotation in annotations |export_type_marker, extern_name|:
+                        export_type_marker <- true if export_type_annotation.owner == extern_name and export_type_annotation.name == "__export_type"
+                    true return if export_type_marker
+                    # `extern LLVMModuleRef` / other opaque handle types: arity 0 and no
+                    # return type. Stage0 treats these as unnamed pointer types; register
+                    # them as aliases of `cstr` (LLVM `ptr`) so annotations resolve and
+                    # Backend functions that take LLVM handles can be declared under
+                    # stage1 meta-compile (gen2 self-host).
+                    if arity == 0 and return_type_name == "":
+                        if alias_index_of(structs, extern_name) < 0:
+                            structs.alias_names <- structs.alias_names.push(extern_name)
+                            # bits 1: the opaque-handle MARKER. A bare extern name IS an opaque
+                            # handle by definition, so its `==` must be pointer identity, never
+                            # the ctx_streq content compare a real cstr gets.
+                            structs.alias_types <- structs.alias_types.push(ValueType{kind: TypeKind.CStr, bits: 1})
+                        return true
+                    export_global_target: sview = export_global_target_of(annotations, extern_name)
+                    true return if export_global_target != ""
+                    global_type: mutable ValueType = scalar_type_of_name(return_type_name)
+                    full_global_type: ValueType = extern_global_value_type(extern_name, extern_global_type_names, extern_global_type_exprs, structs)
+                    global_type <- full_global_type if full_global_type.kind != TypeKind.Unmodeled
+                    global_type <- ValueType{kind: TypeKind.CStr, bits: 0} if return_type_name == "cstr"
+                    # Typed non-call externs retain only the bare head in the compact
+                    # declaration (`extern stderr: void&` becomes `void`). A bare `void`
+                    # global is therefore the pointer spelling used by the C runtime, not
+                    # an LLVM `void` object (LLVM rejects `global void` during codegen).
+                    global_type <- intern_heap_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs) if return_type_name == "void"
+                    false return if global_type.kind == TypeKind.Unmodeled
+                    global_name_storage: mutable darray[u8] = []
+                    global_handle: LLVMValueRef = LLVMAddGlobal(m, llvm_type_of(global_type, structs, ctx), sview_to_cstr(linker_name, global_name_storage))
+                    structs.extern_global_names <- structs.extern_global_names.push(extern_name)
+                    structs.extern_global_types <- structs.extern_global_types.push(global_type)
+                    structs.extern_global_handles <- structs.extern_global_handles.push(global_handle)
+                    return true
+                return_value_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+                if return_type_name != "":
+                    # A POINTER return lowers to `ptr` whatever the referent is — and the
+                    # referent may be `void`, which has no by-value lowering at all. Stage0
+                    # represents `heap T&?` as a BARE ptr (null = absent), so the optional
+                    # needs no extra tag here; the call site wraps it when the destination
+                    # is a `T?`. Checked before the scalar path so `void&` never reaches
+                    # `scalar_type_of_name("void")`.
+                    if return_is_pointer:
+                        # Keep the REFERENT when the head names a modeled scalar: `-> u8&?`
+                        # must register as a ref-to-u8, or `b: u8 = bound` after
+                        # `if c_getenv(x) is bound:` finds ref_target Void, the auto-deref
+                        # never fires, and the POINTER is stored into the i8 slot — the
+                        # program then computes with the pointer's low byte. An unmodeled
+                        # or void head keeps the erased `heap void&` (same `ptr` lowering,
+                        # same byte-pointer arithmetic).
+                        extern_pointee: ValueType = scalar_type_of_name(return_type_name)
+                        if extern_pointee.kind == TypeKind.Unmodeled or extern_pointee.kind == TypeKind.Void:
+                            return_value_type <- intern_heap_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs)
+                        else:
+                            return_value_type <- intern_heap_ref_type(extern_pointee, structs)
+                    else:
+                        return_value_type <- scalar_type_of_name(return_type_name)
+                        # `cstr` is not a scalar name but is a legal extern return.
+                        return_value_type <- ValueType{kind: TypeKind.CStr, bits: 0} if return_type_name == "cstr"
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            ret_alias: i64 = alias_index_of(structs, return_type_name)
+                            return_value_type <- copied_type(structs.alias_types[ret_alias.usize()]) if ret_alias >= 0 else return_value_type
+                        # `extern make_outer() -> Outer` — a STRUCT return. stage0 declares it
+                        # by value (`declare %Outer @make_outer()`) and reads fields off the
+                        # call result with extractvalue, so no sret rewrite is involved; the
+                        # name simply has to resolve. Without this the extern declined and
+                        # every caller went with it.
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            ret_struct: i64 = struct_index_of(structs, return_type_name)
+                            return_value_type <- ValueType{kind: TypeKind.Struct, bits: ret_struct.u32()} if ret_struct >= 0
+                        # A payload ENUM return resolves the same way.
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            ret_penum: i64 = penum_index_of(structs, return_type_name)
+                            return_value_type <- ValueType{kind: TypeKind.PayloadEnum, bits: ret_penum.u32()} if ret_penum >= 0
+                        # An APPLIED return type (`-> MutexGuard[Held]`, `-> view[i32]`) is not
+                        # a bare name, so none of the by-name lookups above can see it. Fall
+                        # back to the full annotation resolver, which is what every non-extern
+                        # signature already uses. Without this an extern returning an applied
+                        # type declined, and every caller went with it — while the SAME type
+                        # written on a local resolved fine, which is what localised it here.
+                        # An extern's return type is stored as a NAME, so an applied form
+                        # (`-> MutexGuard[Held]`) arrives as its head. The built-in handle types
+                        # have no template to look up, so resolve them here — without this an
+                        # extern returning a guard declined and every caller went with it, while
+                        # the SAME type written on a LOCAL resolved fine. That asymmetry is what
+                        # localised the gap to the extern path.
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            return_value_type <- export_alias_value_type(annotations, structs, return_type_name)
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            return_value_type <- synthesize_mutex_guard(unmodeled_type(), structs) if return_type_name == "MutexGuard"
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            # `ThreadPool` is deliberately NOT resolved here: with it, a
+                            # `pool workers(N):` block COMPILES but emits no `pool_shutdown`
+                            # where stage0 emits one (measured: shutdown=0 vs 1 on both the
+                            # early-return and fall-through paths). A leak that the
+                            # compile-only corpus would score as covered is worse than a
+                            # decline, so the block keeps declining until the pool branch's
+                            # cleanup is fixed. See the memory note.
+                            return_value_type <- synthesize_opaque_handle_struct(return_type_name, structs) if return_type_name == "Mutex" or return_type_name == "ThreadPool"
+                        # `extern make_array() -> darray[i32]`. The side table keeps only the
+                        # head (`darray`), which resolves to nothing, so the extern had no
+                        # usable return type and every caller declined. The element name is
+                        # recorded by the parser and paired to this extern's line.
+                        if return_value_type.kind == TypeKind.Unmodeled and (return_type_name == "darray" or return_type_name == "view"):
+                            darray_element_name: sview = extern_return_darray_element_of(annotations, extern_line.line)
+                            if darray_element_name != "":
+                                darray_element_type: ValueType = scalar_type_of_name(darray_element_name)
+                                if darray_element_type.kind != TypeKind.Unmodeled:
+                                    return_value_type <- intern_view_type(darray_element_type, structs) if return_type_name == "view" else intern_darray_type(darray_element_type, structs)
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            return_value_type <- synthesize_task_group(structs) if return_type_name == "TaskGroup"
+                        # Same convention on the RETURN side (`-> Task[R, Pending]`).
+                        if return_value_type.kind == TypeKind.Unmodeled:
+                            return_value_type <- synthesize_task_handle(structs) if return_type_name == "Pending"
+                        false return if return_value_type.kind == TypeKind.Unmodeled
+
+                extern_param_types: mutable darray[LLVMTypeRef] = []
+                declared_param_types: mutable darray[ValueType] = []
+                declined: mutable bool = false
+                for offset in 0..<arity.usize() |extern_param_types, declared_param_types, declined, extern_params, param_start, structs, ctx|:
+                    param_name: sview = extern_params[param_start.usize() + offset].type_name
+                    # A provenance-bearing param is a REFERENCE (`T&` / `lmut T`), so it is a
+                    # POINTER regardless of the referent — the type_name side table keeps only
+                    # the bare base name, dropping the `&`. Without this a `void&` param lowers
+                    # to an (invalid) `void` argument, and any `T&` extern param to a by-value T.
+                    if extern_params[param_start.usize() + offset].provenance_bearing:
+                        extern_param_types.push(LLVMPointerTypeInContext(ctx, 0))
+                        # The LLVM type is `ptr` either way, but the declared ValueType is what
+                        # the CALL SITE coerces against: with `void&` recorded for every
+                        # reference param, a bare struct local could not AUTO-BORROW into
+                        # `extern push(box: mutable Box&)` — only an explicit `&items` worked,
+                        # while the identical ordinary `def` accepted both. Keep the referent
+                        # when the side table's base name names a struct.
+                        extern_referent: i64 = struct_index_of(structs, param_name)
+                        if extern_referent >= 0:
+                            declared_param_types.push(intern_ref_type(ValueType{kind: TypeKind.Struct, bits: extern_referent.u32()}, structs))
+                        else:
+                            declared_param_types.push(intern_ref_type(ValueType{kind: TypeKind.Void, bits: 0}, structs))
+                    else:
+                        param_value_type: mutable ValueType = scalar_type_of_name(param_name)
+                        param_value_type <- ValueType{kind: TypeKind.CStr, bits: 0} if param_name == "cstr"
+                        # Opaque `extern TypeName` handles (LLVMModuleRef, …) are registered
+                        # as aliases of ptr/`cstr` — resolve them for extern params too.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            opaque_alias: i64 = alias_index_of(structs, param_name)
+                            param_value_type <- copied_type(structs.alias_types[opaque_alias.usize()]) if opaque_alias >= 0 else param_value_type
+                        # A C callback parameter is recorded by the compact extern scanner as
+                        # the head `fn`; its full signature lives in the source only, and the
+                        # LLVM ABI still needs a pointer-shaped function value. An extern may
+                        # also use a named `type Callback = fn(...) -> R` alias. Resolve both
+                        # before treating the parameter as unsupported. A generic Fn is enough
+                        # at this boundary: LLVM represents every function value as `ptr`, while
+                        # direct calls use the argument expression's own signature.
+                        if param_value_type.kind == TypeKind.Unmodeled and param_name == "fn":
+                            param_value_type <- ValueType{kind: TypeKind.Fn, bits: 0}
+                        # The compact extern scanner also preserves a complete function-type
+                        # expression when available. Resolve it through the same fn pool used by
+                        # ordinary typed parameters so nested reference ABI facts (for example
+                        # `fn(Item&) -> void`) reach call-site argument coercion.
+                        extern_fn_type_line: u32 = extern_params[param_start.usize() + offset].fn_type_line
+                        if extern_fn_type_line > 0:
+                            resolved_extern_fn_type: ValueType = annotation_lambda_value_type(extern_fn_type_line.i64(), extern_params[param_start.usize() + offset].fn_type_param_count.usize(), structs)
+                            param_value_type <- resolved_extern_fn_type if resolved_extern_fn_type.kind == TypeKind.Fn
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            callback_alias: i64 = alias_index_of(structs, param_name)
+                            param_value_type <- copied_type(structs.alias_types[callback_alias.usize()]) if callback_alias >= 0
+                        # A CONST ENUM parameter denotes its backing scalar — the same rule
+                        # annotation_value_type applies for an ORDINARY function, which is
+                        # why `def w(fd: FD)` resolved and `extern w(fd: FD)` did not. That
+                        # asymmetry cost the std its console output: `extern runtime_write(
+                        # fd: FileDescriptor, …)` declined, so BOTH printr/print overloads
+                        # were dropped and every program calling `print` failed to link.
+                        # Measured across every argument spelling and every storage head
+                        # (`of int`/`of i32`/`of u8`) — it was the extern path, not the
+                        # argument or the backing type.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            param_enum: i64 = enum_index_of(structs, param_name)
+                            param_value_type <- copied_type(structs.enum_backings[param_enum.usize()]) if param_enum >= 0 else param_value_type
+                        # Same as the return side: an APPLIED param type arrives as its head
+                        # name, and the built-in handle types have no template to look up.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            param_value_type <- synthesize_mutex_guard(unmodeled_type(), structs) if param_name == "MutexGuard"
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            param_value_type <- synthesize_opaque_handle_struct(param_name, structs) if param_name == "Mutex" or param_name == "ThreadPool"
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            param_value_type <- synthesize_task_group(structs) if param_name == "TaskGroup"
+                        # An extern param whose head is `Task`/`Thread` records the PROTOCOL
+                        # STATE, not the head — `parser_types_extern.elisa` keeps
+                        # `protocol_state` for those two heads deliberately. So
+                        # `pool_await(task: Task[i64, Pending])` arrives here as `Pending`, and
+                        # resolving `"Task"` can never fire. Map the state token onto the handle.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            param_value_type <- synthesize_task_handle(structs) if param_name == "Pending"
+                        # `export type Vec[i32] as Vec2i` — see export_alias_value_type.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            param_value_type <- export_alias_value_type(annotations, structs, param_name)
+                        # Applied container parameters arrive in the compact extern side table
+                        # as a head plus its first argument. Resolve that pair before declining:
+                        # stage0 passes `view[T]` by value as `%DynArrayView`, not as an opaque
+                        # bare name. The missing element was why extern view parameters declined
+                        # while the identical ordinary signatures worked.
+                        if param_value_type.kind == TypeKind.Unmodeled and (param_name == "view" or param_name == "darray"):
+                            extern_element: ValueType = extern_element_value_type(extern_params[param_start.usize() + offset].element_type_name, annotations, structs)
+                            if extern_element.kind != TypeKind.Unmodeled:
+                                param_value_type <- intern_view_type(extern_element, structs) if param_name == "view" else intern_darray_type(extern_element, structs)
+                        # A plain (non-generic) struct by its own name -- `export type Vec2 as
+                        # Vec2` or simply a `layout(c)` struct. Only generic instantiation
+                        # aliases resolved before, so a struct parameter fell through to
+                        # `declined` and the whole export was DROPPED with the object still
+                        # written.
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            plain_struct_index: i64 = struct_index_of(structs, param_name)
+                            param_value_type <- ValueType{kind: TypeKind.Struct, bits: plain_struct_index.u32()} if plain_struct_index >= 0
+                        if param_value_type.kind == TypeKind.Unmodeled:
+                            declined <- true
+                        else:
+                            # An exported aggregate crosses the boundary in the target's C ABI
+                            # form (cabi_classify_arg): one or two register parts, or a pointer.
+                            if extern_is_export and cabi_is_aggregate(param_value_type):
+                                export_arg_plan: CabiArgPlan = cabi_classify_arg(param_value_type, structs, ctx)
+                                if export_arg_plan.direct:
+                                    for export_arg_part in export_arg_plan.parts |extern_param_types|:
+                                        extern_param_types.push(export_arg_part)
+                                else:
+                                    extern_param_types.push(LLVMPointerTypeInContext(ctx, 0))
+                            else:
+                                extern_param_types.push(llvm_type_of(param_value_type, structs, ctx))
+                            declared_param_types.push(param_value_type)
+                false return if declined
+
+                # `extern f(...) -> T error[E]` uses the SAME out-param ABI as an ordinary
+                # error-returning function: an i32 status return and a LEADING pointer the
+                # success value is written through. The extern path modelled none of that, so
+                # it declared `T f(...)` and CALLED it that way while stage0 declares
+                # `i32 f(ptr, ...)`. A hard ABI mismatch, not a decline: a caller built here
+                # against a stage0-built implementation passes no out-pointer and reads the
+                # status as the value.
+                #
+                # Detected from the parser's `__error_return` annotation (recorded per extern
+                # NAME in parse_extern_signature_and_body), NOT from
+                # File.error_set_func_lines: that table only ever receives `def` lines,
+                # because its push is guarded by `signature_has_error_set`, which
+                # parse_signature_clauses sets and resets and which ONLY the `def` path
+                # calls. For an extern that flag is stale from the previous `def`, so keying
+                # on it would mark arbitrary externs error-returning.
+                extern_is_error: mutable bool = false
+                for extern_error_annotation in annotations |extern_is_error, extern_name|:
+                    extern_is_error <- true if extern_error_annotation.owner == extern_name and extern_error_annotation.name == "__error_return"
+                if extern_is_error:
+                    extern_error_params: mutable darray[LLVMTypeRef] = []
+                    extern_error_params.push(LLVMPointerTypeInContext(ctx, 0))
+                    extern_error_params.extend(extern_param_types)
+                    extern_param_types <- extern_error_params
+                extern_abi_arity: u32 = arity + (1 if extern_is_error else 0)
+                # An export's aggregate RETURN crosses the C ABI as the integer of its width
+                # (1/2/4/8 bytes), like a parameter; wider is declined as stage0 does. The
+                # wrapper packs the implementation's struct result into it.
+                # An exported aggregate RETURN takes the target's C ABI form: a register
+                # type, or sret through a leading pointer parameter.
+                llvm_return: mutable LLVMTypeRef = LLVMInt32TypeInContext(ctx) if extern_is_error else llvm_type_of(return_value_type, structs, ctx)
+                export_ret_sret: mutable bool = false
+                if extern_is_export and cabi_is_aggregate(return_value_type):
+                    export_ret_plan: CabiRetPlan = cabi_classify_ret(return_value_type, structs, ctx)
+                    llvm_return <- export_ret_plan.ret_type if export_ret_plan.direct
+                    if export_ret_plan.sret:
+                        llvm_return <- LLVMVoidTypeInContext(ctx)
+                        export_ret_sret <- true
+                        sret_params: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+                        sret_params.extend(extern_param_types)
+                        extern_param_types <- sret_params
+                # The LLVM parameter list is the LOWERED list, not the declared arity: an
+                # export's sret pointer is prepended and an x86-64 two-eightbyte aggregate
+                # is two parameters. Building the type from the declared count dropped the
+                # sret parameter (the wrapper then read a parameter that did not exist and
+                # the compiler died at teardown, after writing the object).
+                fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
+                if extern_param_types.count != 0:
+                    extern_pointer: void& = (&extern_param_types[0]).cast[void&] can Unsafe.PointerCast
+                    fn_type <- LLVMFunctionType(llvm_return, extern_pointer, extern_param_types.count.u32(), 1 if variadic else 0)
+                intrinsic_name: sview = extern_intrinsic_name(decorators, annotation_args)
+                handle: mutable LLVMValueRef = zeroed
+                if intrinsic_name != "":
+                    # LLVM's wasm intrinsics are valid only when the module is lowered for a
+                    # WebAssembly target. Creating one in the host-target module is not a
+                    # recoverable backend error: instruction selection aborts with
+                    # `LLVM ERROR: Cannot select`, so reject the declaration before LLVM sees it.
+                    false return if intrinsic_is_wasm_only(intrinsic_name) and not target_triple_is_wasm()
+                    intrinsic_storage: mutable darray[u8] = []
+                    intrinsic_cstr: cstr = sview_to_cstr(intrinsic_name, intrinsic_storage)
+                    intrinsic_id: u32 = LLVMLookupIntrinsicID(intrinsic_cstr, sview_len(intrinsic_name))
+                    false return if intrinsic_id == 0
+                    intrinsic_pointer: mutable void&? = null
+                    if extern_param_types.count > 0:
+                        intrinsic_pointer <- (&extern_param_types[0]).cast[void&] can Unsafe.PointerCast
+                    handle <- LLVMGetIntrinsicDeclaration(m, intrinsic_id, intrinsic_pointer, extern_param_types.count)
+                else:
+                    name_storage: mutable darray[u8] = []
+                    extern_cstr: cstr = sview_to_cstr(linker_name, name_storage)
+                    # REUSE an existing declaration of the same C symbol. Two Elisa externs
+                    # may deliberately name one C function — the std's
+                    # `@link_name(write) extern runtime_write(fd: FileDescriptor, …)` and a
+                    # program's own `extern write(…)` — and LLVMAddFunction does not merge
+                    # them: it UNIQUIFIES the second to `write.14`, which nothing defines, so
+                    # calls through it fail to link. Measured on
+                    # test/breadth/emit_obj_debug_ir.elisa: `Undefined symbols: "_write.14"`.
+                    # Differing signatures are fine — every call site passes its own type to
+                    # LLVMBuildCall2, which is exactly how C treats mismatched prototypes for
+                    # one symbol, and stage0 links the same program.
+                    if extern_same_name_export:
+                        # `<name>.export`: the export declaration's OWN handle. It either
+                        # receives the wrapper body and is renamed to the public name, or
+                        # stays an unreferenced declaration when the implementation is
+                        # exported directly (dropped by the object writer).
+                        export_handle_storage: mutable darray[u8] = []
+                        for export_name_index in 0..<sview_len(extern_name) |export_handle_storage, extern_name|:
+                            export_handle_storage.push(sview_at(extern_name, export_name_index))
+                        export_handle_storage.push(46)
+                        export_handle_storage.push(101)
+                        export_handle_storage.push(120)
+                        export_handle_storage.push(112)
+                        export_handle_storage.push(111)
+                        export_handle_storage.push(114)
+                        export_handle_storage.push(116)
+                        export_handle_storage.push(0)
+                        export_handle_cstr: cstr = (&export_handle_storage[0]).cast[cstr] can Unsafe.PointerCast
+                        handle <- LLVMAddFunction(m, export_handle_cstr, fn_type)
+                    else:
+                        handle <- declare_or_get_named(m, extern_cstr, fn_type)
+                if extern_is_export:
+                    # sret on the leading pointer; byval on indirect aggregate parameters.
+                    export_attr_position: mutable u32 = 1
+                    if export_ret_sret:
+                        add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx)
+                        export_attr_position <- 2
+                    for export_attr_type in declared_param_types |export_attr_position, structs, ctx, handle|:
+                        if cabi_is_aggregate(export_attr_type):
+                            export_attr_plan: CabiArgPlan = cabi_classify_arg(export_attr_type, structs, ctx)
+                            if export_attr_plan.direct:
+                                export_attr_position <- export_attr_position + export_attr_plan.parts.count.u32()
+                            else:
+                                add_type_parameter_attribute(handle, export_attr_position, "byval", export_attr_plan.value_type, ctx) if export_attr_plan.byval
+                                export_attr_position <- export_attr_position + 1
+                        else:
+                            export_attr_position <- export_attr_position + 1
+                apply_function_decorators(handle, decorators, annotation_args, false, ctx)
+                wasm_import_module: sview = function_decorator_wasm_import_module(decorators, annotation_args, extern_name)
+                add_function_string_attribute(handle, "wasm-import-module", wasm_import_module, ctx) if wasm_import_module != ""
+
+                fns.names <- fns.names.push(extern_name)
+                fns.lines <- fns.lines.push(extern_line.line)
+                fns.owners <- fns.owners.push("")
+                fns.needs_arena <- fns.needs_arena.push(false)
+                fns.arena_counts <- fns.arena_counts.push(0)
+                fns.needs_store <- fns.needs_store.push(false)
+                fns.is_error <- fns.is_error.push(extern_is_error)
+                fns.returns_nullable <- fns.returns_nullable.push(extern_return_is_optional(annotations, extern_name))
+                fns.is_variadic <- fns.is_variadic.push(variadic)
+                fns.is_extern <- fns.is_extern.push(true)
+                fns.handles <- fns.handles.push(handle)
+                fns.returns <- fns.returns.push(return_value_type)
+                fns.param_start <- fns.param_start.push(fns.param_types.count)
+                fns.param_count <- fns.param_count.push(arity.usize())
+                for parameter_index in 0..<declared_param_types.count |fns, extern_params, param_start|:
+                    fns.param_names <- fns.param_names.push(extern_params[param_start.usize() + parameter_index].name)
+                    fns.param_defaults <- fns.param_defaults.push((Expr.Invalid))
+                    fns.param_types <- fns.param_types.push(declared_param_types[parameter_index])
+                    fns.param_region_slots <- fns.param_region_slots.push(false)
+                # A file that CONSTRUCTS a ThreadPool needs `pool_shutdown` to close the
+                # `pool`/`scope` guard, and stage0 declares that companion IMPLICITLY — the
+                # backend corpus sources extern only `pool_new`, which is why every guard block
+                # in them declined on a missing shutdown. Declared once, on the same terms
+                # stage0 uses (`declare void @pool_shutdown(ptr)`), and only when the program
+                # has not declared it itself.
+                if return_type_name == "ThreadPool" and function_index_of(fns, "", "pool_shutdown") < 0:
+                    shutdown_param_types: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+                    shutdown_params_pointer: void& = (&shutdown_param_types[0]).cast[void&] can Unsafe.PointerCast
+                    shutdown_fn_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), shutdown_params_pointer, 1, 0)
+                    shutdown_handle: LLVMValueRef = declare_or_get_named(m, "pool_shutdown", shutdown_fn_type)
+                    fns.names <- fns.names.push("pool_shutdown")
+                    fns.lines <- fns.lines.push(extern_line.line)
+                    fns.owners <- fns.owners.push("")
+                    fns.needs_arena <- fns.needs_arena.push(false)
+                    fns.arena_counts <- fns.arena_counts.push(0)
+                    fns.needs_store <- fns.needs_store.push(false)
+                    fns.is_error <- fns.is_error.push(false)
+                    fns.returns_nullable <- fns.returns_nullable.push(false)
+                    fns.is_variadic <- fns.is_variadic.push(false)
+                    fns.is_extern <- fns.is_extern.push(true)
+                    fns.handles <- fns.handles.push(shutdown_handle)
+                    fns.returns <- fns.returns.push(ValueType{kind: TypeKind.Void, bits: 0})
+                    fns.param_start <- fns.param_start.push(fns.param_types.count)
+                    fns.param_count <- fns.param_count.push(1.usize())
+                    fns.param_names <- fns.param_names.push("pool")
+                    fns.param_defaults <- fns.param_defaults.push((Expr.Invalid))
+                    fns.param_types <- fns.param_types.push(intern_ref_type(return_value_type, structs))
+                    fns.param_region_slots <- fns.param_region_slots.push(false)
+                return true
+            return false

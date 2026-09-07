@@ -1,0 +1,406 @@
+# Stage1 parser — the POSTFIX suffixes an expression can carry: a call, a `[…]` subscript or
+# slice (told apart from a type-argument bracket), `.field`, `::`, `?`, `&` runs, and the
+# `{…}` record update. Part of `module Parser` (see parser.elisa).
+
+extend Parser:
+    private:
+
+        # An `else` that begins a recovery clause — `else return/raise/break/continue`
+        # or `else binding:` — belongs to an enclosing `get`/`try`, not to a postfix
+        # subscript default `a[i] else <value>`. Mirrors stage0's
+        # elseIntroducesRecoveryClause so `x = get a[i] else return -1` parses.
+        def else_introduces_recovery_clause(parser: Parser&) -> bool:
+            false return if parser.peek() != TokenKind.Else
+            after: TokenKind = parser.peek_at(1)
+            true return if after == TokenKind.Return or after == TokenKind.Raise or after == TokenKind.Break or after == TokenKind.Continue
+            return after == TokenKind.Ident and parser.peek_at(2) == TokenKind.Colon
+
+
+
+        # Consume a subscript-default `else` (`a[i] else <value>`) only when the `else`
+        # is not an enclosing get/try recovery clause. Returns whether it consumed one.
+        def accept_subscript_else(parser: lmut Parser) -> bool:
+            false return if parser.peek() != TokenKind.Else
+            false return if parser.else_introduces_recovery_clause()
+            parser, _ <- parser.advance()
+            return true
+
+
+
+        # Whether a `[...]` suffix on `active` is a TYPE-argument bracket rather than an index.
+        # Only the reinterpret spellings qualify: `p.cast[T]` and `p.call_as[fn(A) -> R]`. Kept
+        # to this closed set deliberately — a generic CALL's bracket (`f[K, V](x)`) shares the
+        # syntax but its arguments are ordinary type expressions that already parse.
+        def subscript_base_is_type_argument(active: Ast::Expr) -> bool:
+            match active:
+                Expr.Field(base_object, base_method, base_method_line):
+                    return when base_method:
+                        "cast" | "call_as" -> true
+                        _ -> false
+                _:
+                    return false
+
+
+
+        # Parse a `[...]` suffix on `active` — a subscript `a[i]`, a slice `a[lo:hi]` (with
+        # either bound optional), or a multi-arg subscript / generic application `m[i, j]`.
+        # The caller has matched the opening `[`; this consumes through the closing `]` and
+        # returns the resulting expression. `@region` type suffixes on bracketed arguments
+        # (`p.cast[T& @scratch]`) are consumed and discarded — a selector, not a value.
+        def subscript_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
+            parser, _ <- parser.advance()
+
+            # A reinterpret's bracket holds a TYPE, so mark the context: looks_like_lambda only
+            # accepts a `fn(A) -> R` with no `:`/`=>` body inside a type annotation, and without
+            # that the signature read as a CALL plus a trailing binary `->` and never became an
+            # Expr.Lambda for annotation_value_type to resolve.
+            saved_type_annotation: bool = parser.in_type_annotation
+            parser.in_type_annotation <- true if subscript_base_is_type_argument(active)
+
+            # Optional low bound (absent in `a[:end_bound]` / `a[:]`).
+            start_bound: mutable Ast::Expr = (Ast::Expr.Absent)
+            if parser.peek() == TokenKind.Question:
+                # Aggregate typestate marker `Foo[?]` (and as an element of
+                # `Foo[?, !]`) is a leaf selector, not postfix optional syntax.
+                rebind state_token: Token, parser = parser.advance()
+                start_bound <- (Ast::Expr.Ident(Lexer::text_or_empty(state_token, parser.source), Ast::pos_of_token(state_token)))
+            elif parser.peek() != TokenKind.Colon and parser.peek() != TokenKind.RBracket:
+                rebind bound_expr_opt: Ast::Expr?, parser = parser.expression()
+                start_bound <- bound_expr if bound_expr_opt is bound_expr
+                rebind accepted_at: bool, parser = parser.accept(TokenKind.At)
+                parser, _ <- parser.accept(TokenKind.Ident) if accepted_at
+
+            # `clone[T error[E]]` leaves the error suffix after the payload type
+            # expression has been parsed. Preserve it before dispatching on the
+            # following comma or closing bracket.
+            parser <- parser.record_clone_error_union(token.line) if parser.peek() == TokenKind.Error
+
+            rebind accepted_colon: bool, parser = parser.accept(TokenKind.Colon)
+            if accepted_colon:
+                # Slice `a[start_bound:end_bound]` (and open-ended variants): optional high bound.
+                end_bound: mutable Ast::Expr = (Ast::Expr.Absent)
+                if parser.peek() != TokenKind.RBracket:
+                    rebind end_bound_opt: Ast::Expr?, parser = parser.expression()
+                    end_bound <- get end_bound_opt else end_bound
+                parser, _ <- parser.expect(TokenKind.RBracket)
+                parser.in_type_annotation <- saved_type_annotation
+                return (Ast::Expr.Slice(active, start_bound, end_bound, Ast::pos_of_token(token)))
+            elif parser.peek() == TokenKind.Comma:
+                # Multi-arg subscript / generic type application (`m[i, j]`,
+                # `dict[K, V]`): the low bound is the first argument.
+                index_arguments: mutable darray[Ast::Expr] = [start_bound]
+                while parser.accept(TokenKind.Comma) |parser|:
+                    break if parser.peek() == TokenKind.RBracket
+                    if parser.peek() == TokenKind.Question:
+                        rebind state_token_n: Token, parser = parser.advance()
+                        index_arguments.push((Ast::Expr.Ident(Lexer::text_or_empty(state_token_n, parser.source), Ast::pos_of_token(state_token_n))))
+                    else:
+                        rebind index_argument_opt: Ast::Expr?, parser = parser.expression()
+                        index_arguments.push(index_argument) if index_argument_opt is index_argument
+                    # `@region` suffix on this argument (see the start-bound case).
+                    rebind accepted_at_2: bool, parser = parser.accept(TokenKind.At)
+                    parser, _ <- parser.accept(TokenKind.Ident) if accepted_at_2
+                parser, _ <- parser.expect(TokenKind.RBracket)
+                parser.in_type_annotation <- saved_type_annotation
+                return (Ast::Expr.IndexN(active, index_arguments, Ast::pos_of_token(token)))
+            else:
+                # Single subscript `a[i]`.
+                parser, _ <- parser.expect(TokenKind.RBracket)
+                parser.in_type_annotation <- saved_type_annotation
+                rebind accepted_fallback: bool, parser = parser.accept_subscript_else()
+                if accepted_fallback:
+                    rebind fallback_option: Ast::Expr?, parser = parser.expression()
+                    fallback: Ast::Expr = get fallback_option else (Ast::Expr.Invalid)
+                    indexed: Ast::Expr = (Ast::Expr.Index(active, start_bound, Ast::pos_of_token(token)))
+                    # The recursive Node refinement ABI is frozen while stage0 is the
+                    # bootstrap compiler. Preserve checked-index syntax losslessly using
+                    # the existing operator node: Binary(Index(...), Else, fallback).
+                    return (Ast::Expr.Binary(indexed, TokenKind.Else, fallback, Ast::pos_of_token(token)))
+                return (Ast::Expr.Index(active, start_bound, Ast::pos_of_token(token)))
+
+
+
+        def postfix_call_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
+            parser, _ <- parser.advance()
+            argument_items: mutable darray[Ast::Expr] = []
+            argument_names: mutable darray[sview] = []
+            has_arg_forward: mutable bool = false
+            saw_explicit_arg: mutable bool = false
+            while parser.peek() != TokenKind.RParen and parser.peek() != TokenKind.Eof |parser|:
+                is_do_argument: bool = parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon and parser.peek_at(2) == TokenKind.Newline and Lexer::text_or_empty(parser.tokens[parser.position], parser.source) == "do"
+                if is_do_argument:
+                    saw_explicit_arg <- true
+                    rebind do_value_opt: Ast::Expr?, parser = parser.expression()
+                    if do_value_opt is do_value:
+                        argument_items.push(do_value)
+                        argument_names.push("")
+                elif parser.peek() == TokenKind.Range:
+                    rebind forward_token: Token, parser = parser.advance()
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, forward_token) if has_arg_forward or saw_explicit_arg
+                    has_arg_forward <- true
+                elif parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
+                    saw_explicit_arg <- true
+                    rebind label_token: Token, parser = parser.advance()
+                    parser, _ <- parser.advance()
+                    rebind named_value_opt: Ast::Expr?, parser = parser.expression()
+                    if named_value_opt is named_value:
+                        rebind __a_28: Ast::Expr, parser = parser.consume_removed_as_cast(named_value)
+                        argument_items.push(__a_28)
+                        argument_names.push(Lexer::text_or_empty(label_token, parser.source))
+                else:
+                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor()) if has_arg_forward
+                    saw_explicit_arg <- true
+                    rebind positional_value_opt: Ast::Expr?, parser = parser.expression()
+                    if positional_value_opt is positional_value:
+                        rebind __a_33: Ast::Expr, parser = parser.consume_removed_as_cast(positional_value)
+                        argument_items.push(__a_33)
+                        argument_names.push("")
+                rebind accepted_comma: bool, parser = parser.accept(TokenKind.Comma)
+                break if not accepted_comma
+            parser, _ <- parser.expect(TokenKind.RParen)
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__arg_forward", name: "__arg_forward", line: token.line}) if has_arg_forward
+            # Static effect installation is a source-level rewrite. While parsing the body of
+            # `can Writer[sview] with ConsoleLines(stream):`, a call to `Writer.write(v)` becomes
+            # `__handler__ConsoleLines__write(stream, v)`. This is direct-call lowering: there is
+            # no runtime handler value, operation table, or continuation allocation.
+            rewritten_active: mutable Ast::Expr = active
+            if parser.active_effect_name != "" and parser.active_handler_name != "":
+                match active:
+                    Expr.Field(effect_head, operation_name, operation_line):
+                        if parser.handler_effect_head_matches(effect_head, parser.active_effect_name, token.start.usize()) and parser.handler_declares_operation(parser.active_handler_name, operation_name):
+                            active_handler: sview = parser.active_handler_name
+                            # A zero-line position distinguishes this compiler-generated
+                            # direct callee from a source reference to the reserved name.
+                            rewritten_active <- parser.handler_operation_callee(active_handler, operation_name, Ast::pos_at_line(0))
+                            rewritten_arguments: mutable darray[Ast::Expr] = []
+                            rewritten_names: mutable darray[sview] = []
+                            handler_argument_index: mutable usize = parser.active_handler_argument_start
+                            handler_argument_end: usize = handler_argument_index + parser.active_handler_argument_count
+                            while handler_argument_index < handler_argument_end |parser, handler_argument_index, rewritten_arguments, rewritten_names|:
+                                rewritten_arguments.push(parser.active_handler_arguments[handler_argument_index])
+                                rewritten_names.push("")
+                                handler_argument_index <- handler_argument_index + 1
+                            rewritten_arguments.extend(argument_items)
+                            rewritten_names.extend(argument_names)
+                            argument_items <- rewritten_arguments
+                            argument_names <- rewritten_names
+                        elif handler_effect_head_family(effect_head) == handler_effect_family(parser.active_effect_name) and parser.handler_is_known(parser.active_handler_name) and parser.handler_declares_operation(parser.active_handler_name, operation_name):
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__effect_specialization_mismatch", name: handler_effect_abstract(parser.active_effect_name), line: token.line})
+                    Expr.Scope(effect_head, operation_name, operation_line):
+                        if parser.handler_effect_head_matches(effect_head, parser.active_effect_name, token.start.usize()) and parser.handler_declares_operation(parser.active_handler_name, operation_name):
+                            active_handler_scope: sview = parser.active_handler_name
+                            rewritten_active <- parser.handler_operation_callee(active_handler_scope, operation_name, Ast::pos_at_line(0))
+                            rewritten_arguments_scope: mutable darray[Ast::Expr] = []
+                            rewritten_names_scope: mutable darray[sview] = []
+                            handler_argument_index_scope: mutable usize = parser.active_handler_argument_start
+                            handler_argument_end_scope: usize = handler_argument_index_scope + parser.active_handler_argument_count
+                            while handler_argument_index_scope < handler_argument_end_scope |parser, handler_argument_index_scope, rewritten_arguments_scope, rewritten_names_scope|:
+                                rewritten_arguments_scope.push(parser.active_handler_arguments[handler_argument_index_scope])
+                                rewritten_names_scope.push("")
+                                handler_argument_index_scope <- handler_argument_index_scope + 1.usize()
+                            rewritten_arguments_scope.extend(argument_items)
+                            rewritten_names_scope.extend(argument_names)
+                            argument_items <- rewritten_arguments_scope
+                            argument_names <- rewritten_names_scope
+                        elif handler_effect_head_family(effect_head) == handler_effect_family(parser.active_effect_name) and parser.handler_is_known(parser.active_handler_name) and parser.handler_declares_operation(parser.active_handler_name, operation_name):
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__effect_specialization_mismatch", name: handler_effect_abstract(parser.active_effect_name), line: token.line})
+                    _:
+                        pass
+            return (Ast::Expr.Call(rewritten_active, argument_items, argument_names, Ast::pos_of_token(token)))
+
+
+
+        def postfix_brace_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
+            can ComplexFlow:
+                if parser.brace_suffix_is_update():
+                    parser, _ <- parser.advance()
+                    update_fields: mutable darray[Ast::FieldInit] = []
+                    while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof |parser|:
+                        rebind field_name_token: Token, parser = parser.expect(TokenKind.Ident)
+                        field_name: sview = Lexer::text_or_empty(field_name_token, parser.source)
+                        field_value: mutable Ast::Expr = (Ast::Expr.Ident(field_name, Ast::pos_of_token(field_name_token)))
+                        rebind accepted_assign: bool, parser = parser.accept(TokenKind.Assign)
+                        if accepted_assign:
+                            rebind provided_opt: Ast::Expr?, parser = parser.expression()
+                            field_value <- provided if provided_opt is provided
+                        update_fields.push(Ast::FieldInit{name: field_name, value: field_value})
+                        rebind accepted_comma_2: bool, parser = parser.accept(TokenKind.Comma)
+                        break if not accepted_comma_2
+                    parser, _ <- parser.expect(TokenKind.RBrace)
+                    return (Ast::Expr.RecordUpdate(active, update_fields, Ast::pos_of_token(token)))
+                parser, _ <- parser.advance()
+                field_initializers: mutable darray[Ast::FieldInit] = []
+                while parser.peek() != TokenKind.RBrace and parser.peek() != TokenKind.Eof |parser|:
+                    if parser.peek() == TokenKind.Ident and parser.peek_at(1) == TokenKind.Colon:
+                        rebind label_token: Token, parser = parser.advance()
+                        parser, _ <- parser.advance()
+                        rebind field_value_opt: Ast::Expr?, parser = parser.expression()
+                        field_initializers.push(Ast::FieldInit{name: Lexer::text_or_empty(label_token, parser.source), value: field_value}) if field_value_opt is field_value
+                    elif parser.peek() == TokenKind.Ident and (parser.peek_at(1) == TokenKind.Comma or parser.peek_at(1) == TokenKind.RBrace):
+                        # Field punning: `T{ kind, parent }` initialises each field from
+                        # the local of the same name (stage0 parseStructLiteralBraceFields).
+                        rebind pun_token: Token, parser = parser.advance()
+                        pun_name: sview = Lexer::text_or_empty(pun_token, parser.source)
+                        field_initializers.push(Ast::FieldInit{name: pun_name, value: (Ast::Expr.Ident(pun_name, Ast::pos_of_token(pun_token)))})
+                    else:
+                        rebind bare_field_value_opt: Ast::Expr?, parser = parser.expression()
+                        field_initializers.push(Ast::FieldInit{name: "", value: field_value}) if bare_field_value_opt is field_value
+                    rebind accepted_comma_3: bool, parser = parser.accept(TokenKind.Comma)
+                    break if not accepted_comma_3
+                parser, _ <- parser.expect(TokenKind.RBrace)
+                return (Ast::Expr.Construct(active, field_initializers, Ast::pos_of_token(token)))
+
+
+
+        def postfix_expression(parser: lmut Parser) -> Ast::Expr?:
+            can Abort.Panic:
+                rebind __d_4: Ast::Expr?, parser = parser.primary_expression()
+                active: Ast::Expr = get __d_4 #unwrap or propagate null
+
+                machine over parser.position while true:
+                    state Suffix(active: Ast::Expr)
+                    start Suffix(active)
+
+                    Suffix(active), _ if parser.peek() == TokenKind.LParen:
+                        token: Token = parser.cursor()
+                        rebind call_result: Ast::Expr, parser = parser.postfix_call_suffix(active, token)
+                        -> Suffix(call_result)
+
+                    Suffix(active), _ if parser.peek() == TokenKind.Dot:
+                        token: Token = parser.cursor()
+                        rebind field_result: Ast::Expr, parser = parser.postfix_dot_suffix(active, token)
+                        -> Suffix(field_result)
+
+                    Suffix(active), _ if parser.peek() == TokenKind.Scope:
+                        token: Token = parser.cursor()
+                        rebind scope_result: Ast::Expr, parser = parser.postfix_scope_suffix(active, token)
+                        -> Suffix(scope_result)
+
+                    Suffix(active), _ if parser.peek() == TokenKind.Question:
+                        token: Token = parser.cursor()
+                        rebind question_result: Ast::Expr, parser = parser.postfix_question_suffix(active, token)
+                        -> Suffix(question_result)
+
+                    Suffix(active), _ if parser.peek() == TokenKind.Ampersand and parser.postfix_amp_is_infix():
+                        return active
+
+                    Suffix(active), _ if parser.peek() == TokenKind.Ampersand:
+                        token: Token = parser.cursor()
+                        rebind amp_result: Ast::Expr, parser = parser.postfix_amp_suffix(active, token)
+                        -> Suffix(amp_result)
+
+                    Suffix(active), _ if parser.peek() == TokenKind.LBracket:
+                        token: Token = parser.cursor()
+                        rebind subscripted: Ast::Expr, parser = parser.subscript_suffix(active, token)
+                        -> Suffix(subscripted)
+
+                    Suffix(active), _ if parser.peek() == TokenKind.LBrace:
+                        token: Token = parser.cursor()
+                        rebind brace_result: Ast::Expr, parser = parser.postfix_brace_suffix(active, token)
+                        -> Suffix(brace_result)
+
+                    Suffix(active), _:
+                        return active
+
+                return active
+
+
+
+        def postfix_dot_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
+            parser, _ <- parser.advance()
+            rebind field_token: Token, parser = parser.expect(TokenKind.Ident)
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, field_token) if Lexer::text_or_empty(field_token, parser.source) == "specialize"
+            return (Ast::Expr.Field(active, Lexer::text_or_empty(field_token, parser.source), Ast::pos_of_token(token)))
+
+
+
+        def postfix_scope_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
+            parser, _ <- parser.advance()
+            rebind scope_token: Token, parser = parser.expect(TokenKind.Ident)
+            return (Ast::Expr.Scope(active, Lexer::text_or_empty(scope_token, parser.source), Ast::pos_of_token(token)))
+
+
+
+        def postfix_question_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, token) if parser.peek_at(1) == TokenKind.Dot
+            rebind advanced_operator_token: Token, parser = parser.advance()
+            return (Ast::Expr.Unary(advanced_operator_token.kind, active, Ast::pos_of_token(token)))
+
+
+
+        def postfix_amp_is_infix(parser: Parser&) -> bool:
+            amp_run: int = parser.postfix_amp_run()
+            after_amps_index: usize = parser.position + amp_run.usize()
+            after_amps_text: sview = Lexer::text_or_empty(parser.tokens[after_amps_index], parser.source) if parser.peek_at(amp_run.usize()) == TokenKind.Ident and after_amps_index < parser.tokens.count else ""
+            # `where` and `can` are plain identifiers to the lexer, so a REF type followed by
+            # a refinement or a trailing effect grant (`-> void& can[Abort.Panic]`) otherwise
+            # looks like an infix `&` whose right operand is that keyword — the whole return
+            # annotation then resolves to Unmodeled and the function is dropped.
+            after_amps_is_clause: bool = after_amps_text == "where" or after_amps_text == "can"
+            return tokenStartsValue(parser.peek_at(amp_run)) and not after_amps_is_clause
+
+
+
+        def postfix_amp_suffix(parser: lmut Parser, active: Ast::Expr, token: Token) -> Ast::Expr:
+            amp_run: int = parser.postfix_amp_run()
+            updated: mutable Ast::Expr = active
+            for _ in 0..<amp_run |parser, updated|:
+                rebind advanced_operator_token: Token, parser = parser.advance()
+                updated <- (Ast::Expr.Unary(advanced_operator_token.kind, updated, Ast::pos_of_token(token)))
+            return updated
+
+
+
+        # Count a contiguous postfix reference run without embedding an expression-valued
+        # loop inside the suffix dispatcher. The first ampersand is the current token.
+        def postfix_amp_run(parser: Parser&) -> int:
+            amp_run: mutable int = 1
+            machine over amp_run while parser.peek_at(amp_run) == TokenKind.Ampersand:
+                state Scan
+                start Scan
+
+                Scan, _:
+                    amp_run <- amp_run + 1
+                    -> Scan
+            return amp_run
+
+
+
+        def brace_suffix_is_update(parser: Parser&) -> bool:
+            scan: mutable usize = 1
+            machine over scan while true:
+                state Scan(depth: int)
+                start Scan(1)
+
+                Scan(depth), _ if depth <= 0 or parser.peek_at(scan) == TokenKind.Eof:
+                    break
+
+                Scan(1), _ if parser.peek_at(scan) == TokenKind.Assign:
+                    return true
+
+                Scan(depth), _ if parser.peek_at(scan) == TokenKind.LBrace:
+                    scan <- scan + 1
+                    -> Scan(depth + 1)
+
+                Scan(depth), _ if parser.peek_at(scan) == TokenKind.RBrace:
+                    scan <- scan + 1
+                    -> Scan(depth - 1)
+
+                Scan(depth), _:
+                    scan <- scan + 1
+                    -> Scan(depth)
+            return false
+
+
+
+
+
+        # Whether the cursor is the `owned` ownership qualifier in TYPE position. Mirrors
+        # stage0's peekOwnedQualifier: the text must be "owned" and a type must plausibly
+        # follow.
+        def parser_owned_qualifier_ahead(parser: Parser&) -> bool:
+            can Abort.Panic:
+                false return if parser.peek() != TokenKind.Ident
+                owned_cursor: Token = parser.cursor()
+                false return if Lexer::text_or_empty(&owned_cursor, parser.source) != "owned"
+                return parser.peek_at(1) == TokenKind.Ident or parser.peek_at(1) == TokenKind.Mutable or parser.peek_at(1) == TokenKind.Tail or parser.peek_at(1) == TokenKind.LParen

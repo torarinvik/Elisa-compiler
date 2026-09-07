@@ -1,0 +1,90 @@
+# Stage1 backend — building a struct VALUE: `Type{field: v}` construction and `base with
+# {field: v}` record update, which takes the struct from the base's own type because it has
+# no type name to resolve. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_expression_record_and_construct(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.RecordUpdate(ru_base, ru_fields, ru_line):
+                    ru_type: ValueType = expression_type(ru_base, local_scope, fns, structs, generics)
+                    null return if ru_type.kind != TypeKind.Struct
+                    ru_slot: usize = ru_type.bits.usize()
+                    ru_llvm: LLVMTypeRef = llvm_type_of(ru_type, structs, ctx)
+                    if emit_expression(ru_base, ru_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ru_base_value:
+                        ru_temporary: LLVMValueRef = LLVMBuildAlloca(builder, ru_llvm, "record.update")
+                        _ = LLVMBuildStore(builder, ru_base_value, ru_temporary)
+                        ru_declined: mutable bool = false
+                        for ru_field in ru_fields |ru_declined, ru_slot, ru_llvm, ru_temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            ru_position: i64 = field_index_of(structs, ru_slot, ru_field.name)
+                            if ru_position < 0:
+                                ru_declined <- true
+                            else:
+                                ru_field_type: ValueType = structs.field_types[structs.field_start[ru_slot] + ru_position.usize()]
+                                if emit_expression_coerced(ru_field.value, ru_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ru_field_value:
+                                    _ = LLVMBuildStore(builder, ru_field_value, LLVMBuildStructGEP2(builder, ru_llvm, ru_temporary, ru_position.u32(), "record.update.field.ptr"))
+                                else:
+                                    ru_declined <- true
+                        null return if ru_declined
+                        return LLVMBuildLoad2(builder, ru_llvm, ru_temporary, "record.update.load")
+                    return null
+                _:
+                    pass
+            match expression:
+                Expr.Construct(construct_type, construct_fields, construct_line):
+                    built_type: mutable ValueType = annotation_value_type(construct_type, structs)
+                    null return if built_type.kind != TypeKind.Struct
+                    struct_slot: usize = built_type.bits.usize()
+                    # `StringView` is the named source spelling for the builtin `sview` ABI.
+                    # Its field registry is useful for labelled construction, but the value must
+                    # use the same anonymous `{ptr, i64}` LLVM type as every `sview` signature;
+                    # returning `%StringView` where the function returns `{ptr, i64}` is invalid.
+                    built_type <- ValueType{kind: TypeKind.SView, bits: 0} if structs.names[struct_slot] == "StringView"
+
+                    struct_llvm: LLVMTypeRef = llvm_type_of(built_type, structs, ctx)
+                    temporary: LLVMValueRef = LLVMBuildAlloca(builder, struct_llvm, "construct")
+                    _ = LLVMBuildStore(builder, LLVMConstNull(struct_llvm), temporary)
+                    declined: mutable bool = false
+                    field_order: mutable u32 = 0
+                    # Which positions the literal actually supplied — the rest are candidates for
+                    # a declared `= default`.
+                    supplied: mutable darray[bool] = []
+                    for _ in 0..<structs.field_count[struct_slot] |supplied|:
+                        supplied.push(false)
+                    for field_init in construct_fields |declined, field_order, supplied, struct_slot, struct_llvm, temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        position: mutable i64 = field_index_of(structs, struct_slot, field_init.name)
+                        if field_init.name == "":
+                            position <- field_order.i64()
+                        field_order <- field_order + 1
+                        if position < 0:
+                            declined <- true
+                        else:
+                            field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + position.usize()]
+                            supplied[position.usize()] <- true
+                            if emit_expression_coerced(field_init.value, field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is field_value:
+                                _ = LLVMBuildStore(builder, field_value, LLVMBuildStructGEP2(builder, struct_llvm, temporary, position.u32(), "field.ptr"))
+                            else:
+                                declined <- true
+                    null return if declined
+                    # An OMITTED field that declares `= default` gets the default stored over the
+                    # zero — `P{}` with `x: i64 = 42` answers 42, not 0. Two deliberate fallbacks
+                    # to the zero, both of which only preserve today's behavior: a field with no
+                    # declared default, and a default whose expression this backend cannot emit
+                    # (declining the whole literal there would turn a wrong answer into a lost
+                    # one, and StructTable's own literals lean on the omitted-field path).
+                    if built_type.kind == TypeKind.Struct:
+                        for default_position in 0..<supplied.count |supplied, struct_slot, struct_llvm, temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            if not supplied[default_position]:
+                                default_slot: usize = structs.field_start[struct_slot] + default_position
+                                default_row: i64 = field_default_row(structs, structs.names[struct_slot], structs.field_names[default_slot])
+                                if default_row >= 0:
+                                    if emit_expression(structs.field_default_values[default_row.usize()], structs.field_types[default_slot], local_scope, fns, structs, generics, runtime, m, ctx, builder) is default_value:
+                                        _ = LLVMBuildStore(builder, default_value, LLVMBuildStructGEP2(builder, struct_llvm, temporary, default_position.u32(), "field.default.ptr"))
+                    return LLVMBuildLoad2(builder, struct_llvm, temporary, "constructed")
+
+                _:
+                    pass
+            # Bitset flag read: `token.flags.has_suffix` — outer field is the packed u8,
+            # inner name is a 1-bit flag (stage0: load i8, and mask, icmp ne 0). For the
+            # self-host Token shape the only flag is bit 0 (`has_suffix`).
+            return emit_expression_field_read(expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder, handled)

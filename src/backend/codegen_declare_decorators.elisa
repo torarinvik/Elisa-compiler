@@ -1,0 +1,132 @@
+# Stage1 backend — what a DECORATOR does to a declaration: calling convention, branch hints,
+# `@link_name`, the WASM component import pair, and the trace-exit instrumentation.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def apply_branch_hint(branch: LLVMValueRef, hint: sview, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if hint == ""
+            marker: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "branch_weights", 14)
+            likely_weight: LLVMMetadataRef = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ctx), 2000, 0))
+            unlikely_weight: LLVMMetadataRef = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(ctx), 1, 0))
+            weights: mutable darray[LLVMMetadataRef] = [marker, likely_weight, unlikely_weight]
+            weights <- [marker, unlikely_weight, likely_weight] if hint == "unlikely"
+            weights_pointer: void& = (&weights[0]).cast[void&] can Unsafe.PointerCast
+            weights_node: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, weights_pointer, 3)
+            prof_kind: u32 = LLVMGetMDKindIDInContext(ctx, "prof", 4)
+            LLVMSetMetadata(branch, prof_kind, LLVMMetadataAsValue(ctx, weights_node))
+
+
+
+
+        def function_callconv(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&) -> u32 can[Abort.Panic]:
+            for decorator in decorators |annotation_args|:
+                continue if decorator.name != "callconv" or decorator.arg_count == 0 or decorator.arg_start.usize() >= annotation_args.count
+                convention: sview = annotation_args[decorator.arg_start.usize()]
+                # LLVM's stable C API enum values: C=0, fast=8, cold=9, x86 fastcall=65,
+                # and x86 stdcall/winapi=64. The semantic pass rejects every other spelling.
+                return when convention:
+                    "fast" -> 8
+                    "cold" | "coldcc" -> 9
+                    "fastcall" -> 65
+                    "stdcall" | "x86_stdcall" | "x86-stdcall" | "winapi" | "windows" -> 64
+                    _ -> 0
+            return 0
+
+
+
+
+        # Add one exit callback immediately before every LLVM return terminator in a
+        # completed body. Return lowering is intentionally spread across ordinary returns,
+        # propagating errors, optional `get`, `raise`, sret paths, and deferred cleanup; a
+        # terminator pass keeps all of those paths covered without duplicating the hook in
+        # twenty-two return branches. LLVMRet is opcode 1 in the stable C API.
+        def instrument_trace_function_exits(function: LLVMValueRef, function_name: sview, line: u32, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if not runtime.trace_enabled
+            exit_trace: LLVMValueRef = declare_or_get_named(m, "elisa_trace_function_exit", runtime.trace_record_type)
+            # Reuse the function-name global emitted for the entry hook. The collector keys
+            # trace locations by the stable name pointer, so entry and exit must carry the
+            # same pointer even though they are emitted at different points in the body.
+            exit_name: LLVMValueRef = runtime.trace_name
+            block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_opt is block |block_opt, block, function_name, line, runtime, m, ctx, builder, exit_trace, exit_name|:
+                instruction_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_opt is instruction |instruction_opt, instruction, function_name, line, runtime, m, ctx, builder, exit_trace, exit_name|:
+                    # Save the next instruction before inserting before the current one.
+                    next_instruction: LLVMValueRef? = LLVMGetNextInstruction(instruction)
+                    if LLVMGetInstructionOpcode(instruction) == 1:
+                        LLVMPositionBuilderBefore(builder, instruction)
+                        exit_arguments: mutable darray[LLVMValueRef] = [exit_name, LLVMConstInt(LLVMInt32TypeInContext(ctx), line.u64(), 0)]
+                        exit_arguments_pointer: void& = (&exit_arguments[0]).cast[void&] can Unsafe.PointerCast
+                        _ = LLVMBuildCall2(builder, runtime.trace_record_type, exit_trace, exit_arguments_pointer, 2, "")
+                    instruction_opt <- next_instruction
+                block_opt <- LLVMGetNextBasicBlock(block)
+
+
+
+
+        def apply_function_decorators(fn: LLVMValueRef, decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&, stamp_nounwind: bool, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for decorator in decorators |annotation_args, ctx, fn|:
+                    attribute_name: mutable sview = ""
+                    if decorator.name == "hot" or decorator.name == "cold" or decorator.name == "noinline" or decorator.name == "norecurse":
+                        attribute_name <- decorator.name
+                    if decorator.name == "inline":
+                        # @inline(always) and @inline(never) are the two source-level modes;
+                        # a bare @inline is LLVM's non-binding inline hint.
+                        if decorator.arg_count == 0:
+                            attribute_name <- "inlinehint"
+                        elif decorator.arg_start.usize() < annotation_args.count:
+                            mode: sview = annotation_args[decorator.arg_start.usize()]
+                            attribute_name <- "alwaysinline" if mode == "always"
+                            attribute_name <- "noinline" if mode == "never"
+                    add_function_attribute(fn, attribute_name, ctx) if attribute_name != ""
+                    if decorator.name == "async_entry" or decorator.name == "segment_agnostic" or decorator.name == "segment_establishing" or decorator.name == "segment_transition" or decorator.name == "reentrant_safe":
+                        add_function_string_attribute(fn, "elisacore.async_entry", "true", ctx) if decorator.name == "async_entry"
+                        add_function_string_attribute(fn, "elisacore.segment_agnostic", "true", ctx) if decorator.name == "segment_agnostic"
+                        add_function_string_attribute(fn, "elisacore.segment_establishing", "true", ctx) if decorator.name == "segment_establishing"
+                        add_function_string_attribute(fn, "elisacore.segment_transition", "true", ctx) if decorator.name == "segment_transition"
+                        add_function_string_attribute(fn, "elisacore.reentrant_safe", "true", ctx) if decorator.name == "reentrant_safe"
+                add_function_attribute(fn, "nounwind", ctx) if stamp_nounwind
+                LLVMSetFunctionCallConv(fn, function_callconv(decorators, annotation_args)) if function_callconv(decorators, annotation_args) != 0
+
+
+
+
+        def apply_export_target_decorators(declarations: darray[Decl], target_name: sview, annotation_args: darray[sview]&, wrapper: LLVMValueRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for declaration in declarations |annotation_args, target_name, wrapper, ctx|:
+                    if declaration_is_module(declaration):
+                        for nested_index in 0..<declaration_module_count(declaration) |declarations, target_name, annotation_args, wrapper, ctx, declaration|:
+                            region nested_declaration(4096):
+                                apply_export_target_decorators([declaration_module_at(declaration, nested_index)], target_name, annotation_args, wrapper, ctx)
+                    elif declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                        apply_function_decorators(wrapper, decorators, annotation_args, true, ctx) if function_name == target_name
+
+
+
+
+        # `@link_name` is useful on a definition as well as an extern. The
+        # source-level function name remains the FnTable key; only the LLVM
+        # symbol spelling changes. This lets a generated C ABI wrapper publish
+        # `foo` while the private implementation uses a collision-free native
+        # name.
+        def function_decorator_link_name(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&, source_name: sview) -> sview can[Abort.Panic]:
+            for decorator in decorators |annotation_args, source_name|:
+                if decorator.name == "link_name" and decorator.arg_count > 0 and decorator.arg_start.usize() < annotation_args.count:
+                    return annotation_args[decorator.arg_start.usize()]
+            return ""
+
+
+
+
+        # A component import has two independent names: the core import's symbol name
+        # (`@link_name`) and its WIT interface/package namespace. LLVM's WebAssembly backend
+        # carries the latter as the `wasm-import-module` string attribute. Keeping this
+        # separate from `link_name` lets one Elisa declaration spell a readable source name
+        # while still lowering to the exact WIT host interface.
+        def function_decorator_wasm_import_module(decorators: darray[Ast::Annotation]&, annotation_args: darray[sview]&, source_name: sview) -> sview can[Abort.Panic]:
+            for decorator in decorators |annotation_args, source_name|:
+                if decorator.name == "wasm_import_module" and decorator.arg_count > 0 and decorator.arg_start.usize() < annotation_args.count:
+                    return annotation_args[decorator.arg_start.usize()]
+            return ""
