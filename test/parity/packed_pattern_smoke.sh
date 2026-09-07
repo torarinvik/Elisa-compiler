@@ -50,7 +50,7 @@ clean $'enum Expr:\n    Int(value: int)\n\ndef check(node: Expr) -> int:\n    ca
 
 removed="$(printf '%s' $'struct Box:\n    value: int\n\ndef bad(value: int) -> Box:\n    return value as Box\n' | "$RPT")"
 grep -q '^P 1$' <<< "$removed" || fail "removed value cast was accepted: $removed"
-grep -q "unexpected token \"as\"" <<< "$removed" || fail "removed value cast lacks directed error: $removed"
+grep -q "cast has been removed" <<< "$removed" || fail "removed value cast lacks directed error: $removed"
 
 removed_abi=$(printf '@packed_abi(dense_fixed)\npacked enum Expr:\n    Lit(value: int)\n' | "$RPT")
 grep -Fq '@packed_abi on enum "Expr" has been removed' <<< "$removed_abi" || fail "removed packed ABI annotation not flagged: $removed_abi"
