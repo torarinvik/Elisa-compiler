@@ -34,12 +34,25 @@ ELISA_CLANG_TOOL="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 if [[ ! -x "$ELISA_CLANG_TOOL" ]]; then
   ELISA_CLANG_TOOL="$(command -v clang || true)"
 fi
-# Default to the canonical Elisa-core checkout every parity smoke and the drift guard
-# also assume (`../../Go projects/structpy-tree`). The old `../stage0/.../elisac-local`
-# default named a worktree that no longer exists, so a bare `--seed` failed with
-# "seed requires stage0 elisac" until ELISACORE_BIN was exported by hand. Callers can
-# still select an explicit compiler with ELISACORE_BIN.
-STAGE0_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+# Prefer the canonical Elisa-core checkout in both a top-level compiler checkout
+# and a nested profiler worktree. The old `../stage0/.../elisac-local` default
+# named a worktree that no longer exists, while a single fixed `../../` depth is
+# wrong for `elisa-compiler-worktrees/profiler`. Callers can still select an
+# explicit compiler with ELISACORE_BIN.
+if [[ -n "${ELISACORE_BIN:-}" ]]; then
+  STAGE0_BIN="$ELISACORE_BIN"
+else
+  STAGE0_BIN=""
+  for stage0_candidate in \
+      "$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac" \
+      "$ROOT/../../../Go projects/structpy-tree/compiler/bin/elisac"; do
+    if [[ -x "$stage0_candidate" ]]; then
+      STAGE0_BIN="$stage0_candidate"
+      break
+    fi
+  done
+  STAGE0_BIN="${STAGE0_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+fi
 # Host predicates for the product's `static if ELISA_TARGET_OS_*` / `PLATFORM_*` consts and
 # the project system's platform key (see register_target_consts / host_platform_name). stage0
 # reads runtime.GOOS; the self-hosted compiler reads these flags, exported once here.
