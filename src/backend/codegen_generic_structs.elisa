@@ -1,0 +1,225 @@
+# Stage1 backend — INSTANTIATING a generic struct: materialise `Base[Args]` into a concrete
+# registered struct under a mangled name, and the synthesized templates (`set[T]`) that have
+# no source declaration at all. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        # Materialize `Base[type_args]` into a concrete registered struct and return its
+        # Struct ValueType. Memoized by (base, args) so a second mention is a lookup and a
+        # recursive/self mention terminates. Declines (Unmodeled) if the base is not a
+        # template, the arity is wrong, any argument or field type is unmodeled, or the
+        # template recurses by value.
+        def instantiate_generic_struct(base: sview, type_args: darray[ValueType]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # Memo: an already-built (base, args) tuple resolves straight to its entry.
+            for inst in 0..<structs.generic_struct_inst_bases.count |structs, base, type_args|:
+                continue if structs.generic_struct_inst_bases[inst] != base
+                continue if structs.generic_struct_inst_arg_count[inst] != type_args.count
+                astart: usize = structs.generic_struct_inst_arg_start[inst]
+                matched: mutable bool = true
+                for k in 0..<type_args.count |structs, matched, astart, type_args|:
+                    stored: ValueType = structs.generic_struct_inst_args[astart + k]
+                    matched <- false if not value_type_identity_equal(stored, type_args[k])
+                if matched:
+                    if structs.generic_struct_inst_ready[inst]:
+                        return ValueType{kind: TypeKind.Struct, bits: structs.generic_struct_inst_index[inst].u32()}
+                    else:
+                        # An incomplete row is usable only for the recursive lookup made while
+                        # its own base is being resolved. Outside that window the prior attempt
+                        # declined, so do not leak its opaque handle into later code.
+                        for pending in structs.generic_struct_inprogress |structs, base|:
+                            ValueType{kind: TypeKind.Struct, bits: structs.generic_struct_inst_index[inst].u32()} return if pending == base
+                        return unmodeled_type()
+            template_index: i64 = generic_struct_index_of(structs, base)
+            unmodeled_type() return if template_index < 0
+            tslot: usize = template_index.usize()
+            unmodeled_type() return if structs.generic_struct_param_count[tslot] != type_args.count
+            # An UNRESOLVED type argument is fine when the parameter is a PHANTOM — a token
+            # that names a state rather than a representation. `MutexGuard[Held]` is exactly
+            # that: `Held` is declared nowhere, `struct MutexGuard[S]` never mentions `S` in
+            # a field, and stage0 instantiates `%MutexGuard__Held` regardless. Rejecting the
+            # arg up front declined every guard-returning lock primitive.
+            #
+            # Not a guess about which parameters are phantom: an argument that the fields
+            # DO use still fails, because substituting it leaves that field Unmodeled and
+            # the field loop below declines — the same check as before, one step later.
+            phantom_arg_count: mutable usize = 0
+            for arg in type_args |structs, phantom_arg_count|:
+                phantom_arg_count <- phantom_arg_count + 1 if arg.kind == TypeKind.Unmodeled
+            # Conservative recursion guard: a base already mid-instantiation would loop unless
+            # the recursive lookup finds the placeholder registered below. The placeholder is
+            # what makes `Node[T]&?` representable; a direct `Node[T]` field is rejected below
+            # because it would still have infinite size.
+
+            if structs.generic_struct_decls[tslot] is Decl.Struct(sname, members, saffinity, shas_states, shas_derive, sinvariants, sline):
+                unmodeled_type() return if members.count == 0
+
+                # Register the opaque named LLVM struct and its memo row BEFORE resolving
+                # members. Recursive pointer/optional fields can then resolve the same
+                # (base,args) tuple to this placeholder instead of recursing forever.
+                name_storage: mutable darray[u8] = []
+                for index in 0..<sview_len(base) |name_storage, base|:
+                    name_storage.push(sview_at(base, index))
+                for arg in type_args |name_storage, structs|:
+                    name_storage.push(95)
+                    name_storage.push(95)
+                    push_generic_arg_name(arg, structs, name_storage)
+                name_storage.push(0)
+                mangled: cstr = (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                handle: LLVMTypeRef = LLVMStructCreateNamed(structs.context, mangled)
+                idx: usize = structs.names.count
+                structs.names <- structs.names.push(base)
+                structs.owners <- structs.owners.push("")    # generic instantiation: a mangled concrete type, never a module member
+                structs.handles <- structs.handles.push(handle)
+                structs.alignments <- structs.alignments.push(0)
+                # Reserve the field-table row together with the named type. Nested generic
+                # fields can instantiate another generic while this body is being resolved;
+                # appending the outer row only at the end reverses the rows (Inner lands in
+                # Outer’s slot and vice versa), making every outer field lookup appear absent.
+                structs.field_start <- structs.field_start.push(0)
+                structs.field_count <- structs.field_count.push(0)
+                arg_start: usize = structs.generic_struct_inst_args.count
+                inst_row: usize = structs.generic_struct_inst_bases.count
+                for arg in type_args |structs|:
+                    structs.generic_struct_inst_args <- structs.generic_struct_inst_args.push(copied_type(arg))
+                structs.generic_struct_inst_bases <- structs.generic_struct_inst_bases.push(base)
+                structs.generic_struct_inst_arg_start <- structs.generic_struct_inst_arg_start.push(arg_start)
+                structs.generic_struct_inst_arg_count <- structs.generic_struct_inst_arg_count.push(type_args.count)
+                structs.generic_struct_inst_index <- structs.generic_struct_inst_index.push(idx)
+                structs.generic_struct_inst_ready <- structs.generic_struct_inst_ready.push(false)
+                structs.generic_struct_inprogress <- structs.generic_struct_inprogress.push(base)
+                pstart: usize = structs.generic_struct_param_start[tslot]
+                for k in 0..<type_args.count |structs, pstart, type_args|:
+                    structs.binding_names <- structs.binding_names.push(structs.generic_struct_param_names[pstart + k])
+                    structs.binding_types <- structs.binding_types.push(copied_type(type_args[k]))
+
+                element_types: mutable darray[LLVMTypeRef] = []
+                resolved_names: mutable darray[sview] = []
+                resolved_types: mutable darray[ValueType] = []
+                declined: mutable bool = false
+                for member in members |element_types, resolved_names, resolved_types, declined, structs|:
+                    member_type: mutable ValueType = annotation_value_type(member.type_expression, structs)
+                    field_error_family: sview = field_error_family_for(member.type_expression, structs)
+                    member_type <- intern_error_union_type(member_type, field_error_family, structs) if field_error_family != ""
+                    if member_type.kind == TypeKind.Unmodeled:
+                        declined <- true
+                    # The placeholder is valid behind a reference/optional wrapper, but a
+                    # direct self-value would make the struct infinitely large.
+                    elif member_type.kind == TypeKind.Struct and member_type.bits == idx.u32():
+                        declined <- true
+                    else:
+                        element_types.push(llvm_type_of(member_type, structs, structs.context))
+                        resolved_names.push(member.name)
+                        resolved_types.push(member_type)
+
+                for k in 0..<type_args.count |structs, type_args|:
+                    structs.binding_names <- structs.binding_names.truncate(structs.binding_names.count - 1)
+                    structs.binding_types <- structs.binding_types.truncate(structs.binding_types.count - 1)
+                structs.generic_struct_inprogress <- structs.generic_struct_inprogress.truncate(structs.generic_struct_inprogress.count - 1)
+                unmodeled_type() return if declined
+                field_start: usize = structs.field_names.count
+                for slot in 0..<resolved_names.count |structs, resolved_names, resolved_types|:
+                    structs.field_names <- structs.field_names.push(resolved_names[slot])
+                    structs.field_types <- structs.field_types.push(resolved_types[slot])
+                structs.field_start[idx] <- field_start
+                structs.field_count[idx] <- resolved_names.count
+                elements_pointer: void& = (&element_types[0]).cast[void&] can Unsafe.PointerCast
+                LLVMStructSetBody(handle, elements_pointer, element_types.count.u32(), 0)
+                structs.generic_struct_inst_ready[inst_row] <- true
+                return ValueType{kind: TypeKind.Struct, bits: idx.u32()}
+            return unmodeled_type()
+
+
+
+
+        # Register a CONCRETE struct under a mangled `Base__Arg` LLVM name with the given
+        # fields — what instantiate_generic_struct does once it has resolved a template's
+        # members, but from types supplied directly, for a layout that has no source
+        # declaration to resolve from.
+        def register_synthesized_struct(base: sview, type_arg: ValueType, synth_field_names: darray[sview]&, synth_field_types: darray[ValueType]&, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            name_storage: mutable darray[u8] = []
+            for name_index in 0..<sview_len(base) |name_storage, base|:
+                name_storage.push(sview_at(base, name_index))
+            name_storage.push(95)
+            name_storage.push(95)
+            push_generic_arg_name(type_arg, structs, name_storage)
+            name_storage.push(0)
+            mangled: cstr = (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            handle: LLVMTypeRef = LLVMStructCreateNamed(structs.context, mangled)
+            slot: usize = structs.names.count
+            structs.names <- structs.names.push(base)
+            structs.owners <- structs.owners.push("")    # synthesized layout struct: no source declaration, so no owner
+            structs.handles <- structs.handles.push(handle)
+            structs.alignments <- structs.alignments.push(0)
+            structs.field_start <- structs.field_start.push(structs.field_names.count)
+            structs.field_count <- structs.field_count.push(synth_field_names.count)
+            element_types: mutable darray[LLVMTypeRef] = []
+            for field_index in 0..<synth_field_names.count |structs, element_types, synth_field_names, synth_field_types|:
+                field_type: ValueType = copied_type(synth_field_types[field_index])
+                structs.field_names <- structs.field_names.push(synth_field_names[field_index])
+                structs.field_types <- structs.field_types.push(copied_type(field_type))
+                element_types.push(llvm_type_of(field_type, structs, structs.context))
+            elements_pointer: void& = (&element_types[0]).cast[void&] can Unsafe.PointerCast
+            LLVMStructSetBody(handle, elements_pointer, element_types.count.u32(), 0)
+            return ValueType{kind: TypeKind.Struct, bits: slot.u32()}
+
+
+
+
+        # `set[T]` — stage0 has NO source declaration for the set layout. collections.elisa
+        # declares DictBucket/DynDict, but `DynSet`/`SetBucket` are stage0 BACKEND BUILTINS,
+        # so there was no template for instantiate_generic_struct to find and EVERY set
+        # program declined at its DECLARATION, with add / membership / count all unreachable
+        # behind it. (test/parity/set_real_smoke.sh compiles the real std set path by
+        # PREPENDING these two structs as source; this registers the same layout instead of
+        # requiring every program to declare it.)
+        #
+        # Field order and widths read from stage0's own `-emit llvm`:
+        #
+        #   %SetBucket__i64 = type { i64, i8 }
+        #   %DynSet__i64    = type { ptr, i64, i64, i64, ptr }
+        #
+        # i.e. DictBucket/DynDict minus the value column — SetBucket{key: T, state: u8} and
+        # DynSet{items: SetBucket[T]&?, count, used, capacity: usize, arena: Arena&?}, with
+        # both optional refs niche-collapsed to a bare pointer (the same collapse that already
+        # makes stage1's DynDict layout agree with stage0's).
+        #
+        # The OPERATIONS need nothing here: arena_set_add_or_panic / arena_set_contains and
+        # the rest are ordinary generics in collections.elisa, which the std's include
+        # closure already pulls in.
+        # The memo, over the same instantiation rows the template path uses, so a second
+        # `set[T]` in the unit resolves to the SAME struct rather than a fresh one. -1 = absent.
+        def synthesized_struct_index_of(base: sview, element_type: ValueType, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            for existing in 0..<structs.generic_struct_inst_bases.count |structs, base, element_type|:
+                continue if structs.generic_struct_inst_bases[existing] != base
+                continue if structs.generic_struct_inst_arg_count[existing] != 1.usize()
+                continue if not structs.generic_struct_inst_ready[existing]
+                stored: ValueType = copied_type(structs.generic_struct_inst_args[structs.generic_struct_inst_arg_start[existing]])
+                continue if not value_type_identity_equal(stored, element_type)
+                return structs.generic_struct_inst_index[existing].i64()
+            return -1
+
+
+
+
+        # Is `struct_type` an instantiation of the synthesized template `base`? Keyed off the
+        # instantiation memo rather than the struct's NAME, which carries a mangled suffix.
+        def synthesized_struct_base_is(structs: StructTable&, struct_type: ValueType, base: sview) -> bool can[Abort.Panic]:
+            false return if struct_type.kind != TypeKind.Struct
+            for existing in 0..<structs.generic_struct_inst_bases.count |structs, base, struct_type|:
+                continue if structs.generic_struct_inst_bases[existing] != base
+                true return if structs.generic_struct_inst_index[existing] == struct_type.bits.usize()
+            return false
+
+
+    public:
+        # The single READY instantiation of a generic struct base, or unmodeled when there
+        # is none or more than one. Ambiguity is declined rather than guessed.
+        def unique_instantiation_of(structs: StructTable&, base: sview) -> ValueType can[Abort.Panic]:
+            found: mutable i64 = -1
+            matches: mutable i64 = 0
+            for inst in 0..<structs.generic_struct_inst_bases.count |structs, base, found, matches|:
+                if structs.generic_struct_inst_bases[inst] == base and structs.generic_struct_inst_ready[inst]:
+                    found <- structs.generic_struct_inst_index[inst].i64()
+                    matches <- matches + 1
+            unmodeled_type() return if matches != 1 or found < 0
+            return ValueType{kind: TypeKind.Struct, bits: found.u32()}

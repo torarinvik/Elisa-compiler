@@ -1,0 +1,286 @@
+# `-emit wasm` — the driver's port of scripts/wasm_build.py (§4.4). The Python did four
+# things after the compiler produced a wasm32 object: build the portable runtime object,
+# link with wasm-ld, write the `.json` manifest, and write the `.mjs` / `.d.ts` / `.d.mts`
+# facade from the export table. Everything here is a projection of that same table, so
+# the sidecars are byte-identical to the Python's (the oracle in wasm_smoke.sh); the
+# manifest's `line` is the export's source line (source_original_line), which is what
+# the Python's flat-source scan printed for a single-file unit.
+#
+# An export row is never STORED: a darray of rows with darray fields needs region plumbing
+# the driver avoids everywhere else, so the token scan is re-run per consumer (manifest,
+# bindings, declarations, link flags) through wasm_scan_exports with a mode.
+
+@link_name(access)
+extern access(path: cstr, mode: i64) -> i64
+
+include "./emit_wasm_bindings.elisa"
+include "./emit_wasm_exports.elisa"
+include "./emit_wasm_facade.elisa"
+include "./emit_wasm_host.elisa"
+
+
+
+
+
+def emit_wasm_finish(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&, object_path: darray[u8]&, out_path: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    message: mutable darray[u8] = []
+    component_types: mutable darray[u8] = []
+    component: bool = env_value("ELISA_STAGE1_WASM_COMPONENT_TYPES", &component_types) and component_types.count > 0
+    wasm_only: bool = wasm_flag_enabled("ELISA_STAGE1_WASM_ONLY") or component
+    wasm_report_error(message) return if wasm_scan_exports(WASM_SCAN_VALIDATE, &message, file, tokens, source, component, &message) < 0
+
+    # --- names: directory, module, sidecars
+    slash: mutable usize = 0.usize()
+    for index in 0..<out_path.count |slash, out_path|:
+        slash <- index + 1.usize() if out_path[index] == 47
+    module_name: mutable darray[u8] = []
+    for index in slash..<out_path.count |module_name, out_path|:
+        module_name.push(out_path[index])
+    # `.wasm` is FIVE bytes, and popping one at a time left `elisa-demo.was` as the module
+    # name — every sidecar was written beside the module under the wrong name.
+    dotted: bool = module_name.count > 5 and module_name[module_name.count - 1] == 109 and module_name[module_name.count - 2] == 115 and module_name[module_name.count - 3] == 97 and module_name[module_name.count - 4] == 119 and module_name[module_name.count - 5] == 46
+    module_name.resize(module_name.count - 5.usize()) if dotted
+    wasm_file_name: mutable darray[u8] = []
+    for index in slash..<out_path.count |wasm_file_name, out_path|:
+        wasm_file_name.push(out_path[index])
+    stem: mutable darray[u8] = []
+    for index in 0..<slash |stem, out_path|:
+        stem.push(out_path[index])
+    for index in 0..<module_name.count |stem, module_name|:
+        stem.push(module_name[index])
+    triple: mutable darray[u8] = []
+    wasm_push_env_or(&triple, "ELISA_STAGE1_TRIPLE", "wasm32-unknown-unknown")
+
+    # --- the portable runtime object (the driver re-invokes itself, as the Python did)
+    #
+    # THREE cases, exactly as the Python had them: a component links the freestanding
+    # canonical-ABI allocator, a unit that brings its own `arena_alloc` links NOTHING (the
+    # manifest calls that allocator inline), and everything else links the native runtime.
+    root: mutable darray[u8] = []
+    wasm_push_root(&root)
+    inline_runtime: bool = not component and wasm_source_defines_arena_alloc(file)
+    runtime_source: mutable darray[u8] = [entry for entry in root]
+    emit_tokens_push_sview(&runtime_source, "/elisacore_std/wasm_component_runtime.elisa" if component else "/elisacore_std/native_runtime_support.elisa")
+    # The cached object is content-addressed on (triple, runtime source, compiler binary), so
+    # a reseed or an edited stdlib file simply misses. ELISA_WASM_NO_CACHE=1 forces a cold
+    # build beside the output, which is what the component smoke asks for.
+    cached: bool = not wasm_flag_enabled("ELISA_WASM_NO_CACHE")
+    runtime_object: mutable darray[u8] = []
+    if cached:
+        wasm_cache_path(root, triple, runtime_source, &runtime_object)
+    else:
+        for index in 0..<out_path.count |runtime_object, out_path|:
+            runtime_object.push(out_path[index])
+        emit_tokens_push_sview(&runtime_object, ".runtime.o")
+    build_runtime: bool = not inline_runtime and not (cached and wasm_file_present(runtime_object))
+    if build_runtime:
+        target_object: mutable darray[u8] = []
+        if cached:
+            for index in 0..<out_path.count |target_object, out_path|:
+                target_object.push(out_path[index])
+            emit_tokens_push_sview(&target_object, ".runtime-candidate.o")
+        else:
+            for index in 0..<runtime_object.count |target_object, runtime_object|:
+                target_object.push(runtime_object[index])
+        runtime_command: mutable darray[u8] = []
+        self_path: mutable darray[u8] = []
+        wasm_push_env_or(&self_path, "ELISA_STAGE1_SELF", "bin/elisac-stage1")
+        # The child inherits THIS compile's environment, so neutralise everything that would
+        # make it take the wasm path again (it would re-run the export scan on the runtime
+        # source and reject it) or inherit our line map, which describes a different file.
+        # Only the MODE variables are cleared, and only ones whose readers compare a VALUE.
+        # `ELISACORE_FORCE_BOUNDS_CHECK` and `ELISACORE_NOALIAS_MUTABLE_REFS` are read by
+        # PRESENCE (codegen_env.elisa), so naming them here at all would switch them ON —
+        # an empty assignment made the runtime object 255899 bytes instead of 222854. They
+        # are left to inherit exactly as they did under the Python.
+        emit_tokens_push_sview(&runtime_command, "ELISA_STAGE1_EMIT= ELISA_STAGE1_WASM_ONLY= ELISA_STAGE1_WASM_COMPONENT_TYPES= ELISA_STAGE1_LINE_MAP= ELISA_STAGE1_SRC= ELISA_STAGE1_OPT= ")
+        carchive_push_quoted(&runtime_command, self_path)
+        emit_tokens_push_sview(&runtime_command, " -emit obj -target-triple ")
+        for index in 0..<triple.count |runtime_command, triple|:
+            runtime_command.push(triple[index])
+        emit_tokens_push_sview(&runtime_command, " -O0 -o ")
+        carchive_push_quoted(&runtime_command, target_object)
+        emit_tokens_push_sview(&runtime_command, " ")
+        carchive_push_quoted(&runtime_command, runtime_source)
+        1 return if not wasm_run(runtime_command, "WASM component runtime compilation" if component else "WASM runtime compilation")
+        if cached:
+            # Publish through a rename so a concurrent build never links a half-written object.
+            publish: mutable darray[u8] = []
+            emit_tokens_push_sview(&publish, "mkdir -p ")
+            cache_directory: mutable darray[u8] = []
+            for index in 0..<root.count |cache_directory, root|:
+                cache_directory.push(root[index])
+            emit_tokens_push_sview(&cache_directory, "/build/wasm-cache")
+            carchive_push_quoted(&publish, cache_directory)
+            emit_tokens_push_sview(&publish, " && mv -f ")
+            carchive_push_quoted(&publish, target_object)
+            emit_tokens_push_sview(&publish, " ")
+            carchive_push_quoted(&publish, runtime_object)
+            1 return if not wasm_run(publish, "WASM runtime cache publication")
+
+    # --- link
+    linker: mutable darray[u8] = []
+    wasm_find_linker(component, &linker)
+    link_command: mutable darray[u8] = []
+    carchive_push_quoted(&link_command, linker)
+    if component:
+        emit_tokens_push_sview(&link_command, " --wasi-adapter=none --validate-component=true --realloc-via-memory-grow")
+        type_start: mutable usize = 0.usize()
+        for index in 0..<(component_types.count + 1.usize()) |link_command, type_start, component_types|:
+            if index == component_types.count or component_types[index] == 59:
+                if index > type_start:
+                    emit_tokens_push_sview(&link_command, " --component-type ")
+                    one: mutable darray[u8] = []
+                    for copy_index in type_start..<index |one, component_types|:
+                        one.push(component_types[copy_index])
+                    carchive_push_quoted(&link_command, one)
+                type_start <- index + 1.usize()
+    emit_tokens_push_sview(&link_command, " --no-entry ")
+    emit_tokens_push_sview(&link_command, "--export-memory=memory" if component else "--import-memory")
+    emit_tokens_push_sview(&link_command, " --initial-memory=1048576 --max-memory=2147483648 --allow-undefined --gc-sections --export=__heap_base")
+    link_exports: mutable darray[u8] = []
+    wasm_report_error(message) return if wasm_scan_exports(WASM_SCAN_LINK_EXPORTS, &link_exports, file, tokens, source, component, &message) < 0
+    for index in 0..<link_exports.count |link_command, link_exports|:
+        link_command.push(link_exports[index])
+    emit_tokens_push_sview(&link_command, " --export=cabi_realloc") if component
+    emit_tokens_push_sview(&link_command, " -o ")
+    carchive_push_quoted(&link_command, out_path)
+    emit_tokens_push_sview(&link_command, " ")
+    carchive_push_quoted(&link_command, object_path)
+    if not inline_runtime:
+        emit_tokens_push_sview(&link_command, " ")
+        carchive_push_quoted(&link_command, runtime_object)
+    linked: bool = wasm_run(link_command, "WASM link")
+    if not cached and not inline_runtime:
+        unlink_buffer: mutable darray[u8] = [entry for entry in runtime_object]
+        unlink_buffer.push(0)
+        _ = unlink((&unlink_buffer[0]).cast[cstr] can Unsafe.PointerCast)
+    1 return if not linked
+
+    # --- manifest
+    manifest: mutable darray[u8] = []
+    emit_tokens_push_sview(&manifest, "{\n  \"version\": 1,\n  \"module\": ")
+    wasm_push_json_string(&manifest, module_name)
+    emit_tokens_push_sview(&manifest, ",\n  \"target\": ")
+    wasm_push_json_string(&manifest, triple)
+    emit_tokens_push_sview(&manifest, ",\n  \"memory_initial_pages\": 16,\n  \"memory_max_pages\": 32768,\n  \"memory\": {\n")
+    if component:
+        emit_tokens_push_sview(&manifest, "    \"export_name\": \"memory\",\n    \"heap_base_export\": \"__heap_base\"\n  },\n  \"exports\": [")
+    else:
+        emit_tokens_push_sview(&manifest, "    \"import_module\": \"env\",\n    \"import_name\": \"memory\",\n    \"heap_base_export\": \"__heap_base\"\n  },\n  \"exports\": [")
+    rows: i64 = wasm_scan_exports(WASM_SCAN_MANIFEST, &manifest, file, tokens, source, component, &message)
+    wasm_report_error(message) return if rows < 0
+    emit_tokens_push_sview(&manifest, "\n  ") if rows > 0
+    emit_tokens_push_sview(&manifest, "],\n  \"files\": {\n    \"wasm\": ")
+    wasm_push_json_string(&manifest, wasm_file_name)
+    if wasm_only:
+        emit_tokens_push_sview(&manifest, "\n  },\n  \"generated_by\": \"elisa -emit wasm --wasm-only\"")
+    else:
+        emit_tokens_push_sview(&manifest, ",\n    \"loader\": ")
+        loader_name: mutable darray[u8] = [entry for entry in module_name]
+        emit_tokens_push_sview(&loader_name, ".mjs")
+        wasm_push_json_string(&manifest, loader_name)
+        emit_tokens_push_sview(&manifest, ",\n    \"types\": ")
+        types_name: mutable darray[u8] = [entry for entry in module_name]
+        emit_tokens_push_sview(&types_name, ".d.ts")
+        wasm_push_json_string(&manifest, types_name)
+        emit_tokens_push_sview(&manifest, ",\n    \"types_esm\": ")
+        esm_name: mutable darray[u8] = [entry for entry in module_name]
+        emit_tokens_push_sview(&esm_name, ".d.mts")
+        wasm_push_json_string(&manifest, esm_name)
+        emit_tokens_push_sview(&manifest, "\n  },\n  \"generated_by\": \"elisa -emit wasm\"")
+    if component:
+        emit_tokens_push_sview(&manifest, ",\n  \"format\": \"wasm-component\",\n  \"component_types\": [")
+        type_start: mutable usize = 0.usize()
+        type_count: mutable i64 = 0
+        for index in 0..<(component_types.count + 1.usize()) |manifest, type_start, type_count, component_types|:
+            if index == component_types.count or component_types[index] == 59:
+                if index > type_start:
+                    emit_tokens_push_sview(&manifest, ",") if type_count > 0
+                    emit_tokens_push_sview(&manifest, "\n    ")
+                    one: mutable darray[u8] = []
+                    for copy_index in type_start..<index |one, component_types|:
+                        one.push(component_types[copy_index])
+                    wasm_push_json_string(&manifest, one)
+                    type_count <- type_count + 1
+                type_start <- index + 1.usize()
+        emit_tokens_push_sview(&manifest, "\n  ") if type_count > 0
+        emit_tokens_push_sview(&manifest, "]")
+    emit_tokens_push_sview(&manifest, ",\n  \"runtime\": {\n    \"mode\": ")
+    emit_tokens_push_sview(&manifest, "\"inline\"" if inline_runtime else "\"linked\"")
+    emit_tokens_push_sview(&manifest, ",\n    \"allocator\": ")
+    emit_tokens_push_sview(&manifest, "\"component-cabi-realloc\"" if component else "\"host-free-list\"")
+    emit_tokens_push_sview(&manifest, "\n  }\n}\n")
+    manifest_path: mutable darray[u8] = [entry for entry in stem]
+    emit_tokens_push_sview(&manifest_path, ".json")
+    1 return if not write_file(manifest_path, sview_of_bytes(manifest))
+
+    # --- facade
+    note: mutable darray[u8] = []
+    emit_tokens_push_sview(&note, "wasm: wrote ")
+    for index in 0..<out_path.count |note, out_path|:
+        note.push(out_path[index])
+    if not wasm_only:
+        rebuilt: mutable darray[u8] = []
+        wasm_push_mjs_seg1(&rebuilt)
+        url_text: mutable darray[u8] = []
+        emit_tokens_push_sview(&url_text, "./")
+        for index in 0..<wasm_file_name.count |url_text, wasm_file_name|:
+            url_text.push(wasm_file_name[index])
+        wasm_push_json_string(&rebuilt, url_text)
+        wasm_push_mjs_seg2(&rebuilt)
+        emit_tokens_push_sview(&rebuilt, "16")
+        wasm_push_mjs_seg3(&rebuilt)
+        emit_tokens_push_sview(&rebuilt, "32768")
+        wasm_push_mjs_seg4(&rebuilt)
+        wasm_report_error(message) return if wasm_scan_exports(WASM_SCAN_BINDINGS, &rebuilt, file, tokens, source, component, &message) < 0
+        wasm_push_mjs_seg5(&rebuilt)
+        loader_path: mutable darray[u8] = [entry for entry in stem]
+        emit_tokens_push_sview(&loader_path, ".mjs")
+        1 return if not write_file(loader_path, sview_of_bytes(rebuilt))
+        declarations: mutable darray[u8] = []
+        wasm_push_ts_seg1(&declarations)
+        interface_name: mutable darray[u8] = []
+        for index in 0..<module_name.count |interface_name, module_name|:
+            byte: u8 = module_name[index]
+            word: bool = (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95 or byte == 36
+            interface_name.push(byte if word else 95)
+        if interface_name.count == 0 or (interface_name[0] >= 48 and interface_name[0] <= 57):
+            prefixed: mutable darray[u8] = [95]
+            for index in 0..<interface_name.count |prefixed, interface_name|:
+                prefixed.push(interface_name[index])
+            interface_name.clear()
+            interface_name.extend(prefixed)
+        emit_tokens_push_sview(&interface_name, "Exports")
+        for index in 0..<interface_name.count |declarations, interface_name|:
+            declarations.push(interface_name[index])
+        emit_tokens_push_sview(&declarations, " {\n")
+        wasm_report_error(message) return if wasm_scan_exports(WASM_SCAN_DECLARATIONS, &declarations, file, tokens, source, component, &message) < 0
+        wasm_push_ts_seg3a(&declarations)
+        for index in 0..<interface_name.count |declarations, interface_name|:
+            declarations.push(interface_name[index])
+        emit_tokens_push_sview(&declarations, ">")
+        wasm_push_ts_seg3b(&declarations)
+        types_path: mutable darray[u8] = [entry for entry in stem]
+        emit_tokens_push_sview(&types_path, ".d.ts")
+        1 return if not write_file(types_path, sview_of_bytes(declarations))
+        esm_path: mutable darray[u8] = [entry for entry in stem]
+        emit_tokens_push_sview(&esm_path, ".d.mts")
+        1 return if not write_file(esm_path, sview_of_bytes(declarations))
+        emit_tokens_push_sview(&note, ", ")
+        for index in 0..<loader_path.count |note, loader_path|:
+            note.push(loader_path[index])
+        emit_tokens_push_sview(&note, ", ")
+        for index in 0..<types_path.count |note, types_path|:
+            note.push(types_path[index])
+        emit_tokens_push_sview(&note, ", ")
+        for index in 0..<esm_path.count |note, esm_path|:
+            note.push(esm_path[index])
+        emit_tokens_push_sview(&note, ", and ")
+    else:
+        emit_tokens_push_sview(&note, " and ")
+    for index in 0..<manifest_path.count |note, manifest_path|:
+        note.push(manifest_path[index])
+    emit_tokens_push_sview(&note, "\n")
+    write_stderr(note)
+    return 0

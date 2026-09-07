@@ -1,0 +1,461 @@
+# Stage1 backend — CONSTANTS: registering a const's name and declared type, and folding an
+# initializer to an actual integer, float or aggregate value — only the forms stage0 itself
+# calls a constant. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        # An EXACT (owner, name) lookup. "" is the top-level owner.
+        def const_index_of_in(structs: StructTable&, owner: sview, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.const_names.count |index, structs, name, owner|:
+                if structs.const_names[index] == name and structs.const_owners[index] == owner:
+                    return index.i64()
+                index <- index + 1
+            return -1
+
+
+
+
+        # Resolve a const by the name written at a use site. The ENCLOSING module wins, then
+        # a top-level const, and only then any module's -- which is what a bare name outside
+        # every module used to mean and stays meaning, so nothing that compiled before
+        # declines now.
+        def const_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            if structs.current_owner != "":
+                owned: i64 = const_index_of_in(structs, structs.current_owner, name)
+                owned return if owned >= 0
+            top_level: i64 = const_index_of_in(structs, "", name)
+            top_level return if top_level >= 0
+            index: mutable usize = 0
+            while index < structs.const_names.count |index, structs, name|:
+                index.i64() return if structs.const_names[index] == name
+                index <- index + 1
+            return -1
+
+
+
+
+        def extern_global_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.extern_global_names.count |index, structs, name|:
+                index.i64() return if structs.extern_global_names[index] == name
+                index <- index + 1
+            return -1
+
+
+
+
+        def mutable_global_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.mutable_global_names.count |index, structs, name|:
+                index.i64() return if structs.mutable_global_names[index] == name
+                index <- index + 1
+            return -1
+
+
+
+
+        # Register a global const's NAME and declared type; fold_consts fills in the value.
+        # `const A: mutable i64 = 42` is accepted by stage0, so is_mutable is not a decline.
+        # The type of an UNANNOTATED `const NAME = VALUE`, taken from the initializer the way
+        # stage0 does. Only literal initializers infer; anything else stays Unmodeled and
+        # declines rather than being guessed at.
+        def infer_const_type(const_value: Expr) -> ValueType can[Abort.Panic]:
+            if const_value is Expr.IntLit(inferred_int_literal):
+                # stage0's default integer type is `int` -- signed 64-bit.
+                return ValueType{kind: TypeKind.Signed, bits: 64}
+            if const_value is Expr.BoolLit(inferred_bool_literal):
+                return ValueType{kind: TypeKind.Bool, bits: 1}
+            if const_value is Expr.FloatLit(inferred_float_literal):
+                return ValueType{kind: TypeKind.Float, bits: 64}
+            if const_value is Expr.StringLit(inferred_string_literal):
+                # An unannotated string constant defaults to the compiler's NUL-terminated
+                # literal type, matching the ordinary `const NAME = "..."` source spelling.
+                return ValueType{kind: TypeKind.CStr, bits: 0}
+            if const_value is Expr.Paren(inferred_inner, inferred_paren_line):
+                return infer_const_type(inferred_inner)
+            return ValueType{kind: TypeKind.Unmodeled, bits: 0}
+
+
+
+
+        def register_const(declaration: Decl, owner: sview, annotations: darray[Ast::EnumAnnotation]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                if declaration is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                    const_annotated: ValueType = annotation_value_type(const_type_expression, structs)
+                    # `const A = 0x20` — the annotation is OPTIONAL, and stage0 takes the type
+                    # from the initializer (an integer literal is `int`). Without this the const
+                    # stays Unmodeled and every USE declines, which is how the arena's
+                    # ELISA_ARENA_PROT_* / MAP_* flags -- all written unannotated -- silently
+                    # took new_region_with_owner down with them.
+                    #
+                    # Only Expr.Absent infers: a PRESENT annotation that does not resolve is a
+                    # type the backend does not model, and guessing i64 there would be wrong.
+                    const_declared: mutable ValueType = const_annotated
+                    if const_type_expression is Expr.Absent:
+                        const_declared <- infer_const_type(const_value)
+                    if const_is_mutable:
+                        # `global` declarations use the same AST variant as consts, but
+                        # must remain addressable storage rather than entering the fold table.
+                        if const_declared.kind != TypeKind.Unmodeled:
+                            existing_mutable_global: i64 = mutable_global_index_of(structs, const_name)
+                            if existing_mutable_global >= 0:
+                                structs.mutable_global_types[existing_mutable_global.usize()] <- const_declared
+                                return
+                            structs.mutable_global_names <- structs.mutable_global_names.push(const_name)
+                            structs.mutable_global_types <- structs.mutable_global_types.push(const_declared)
+                            structs.mutable_global_handles <- structs.mutable_global_handles.push(zeroed)
+                        return
+                    # IDEMPOTENT: static-if selection registers consts repeatedly as it iterates
+                    # to a fixpoint (a branch condition may name a const declared in an earlier
+                    # branch), and a second ROW for the same name would shadow the folded first.
+                    #
+                    # It re-resolves the TYPE rather than returning early, because selection runs
+                    # BEFORE enums exist -- so a `const cs: C[2]` first registers with an
+                    # unresolved element type, and skipping here would freeze that provisional
+                    # answer even after `C` is known. (Caught by const_array_of_enum.)
+                    # A FLOAT const with a float-literal initializer resolves here (its text is
+                    # inlined at use); other consts fold in fold_consts.
+                    const_reg_float_text: mutable sview = ""
+                    if const_declared.kind == TypeKind.Float:
+                        if const_value is Expr.FloatLit(const_reg_float_lit):
+                            const_reg_float_text <- const_reg_float_lit
+                    # A `const cstr = "..."` resolves here too: its text is all the use site
+                    # needs, and leaving it unresolved declined every function that read it.
+                    const_reg_cstr_text: mutable sview = ""
+                    const_reg_is_byte_darray: bool = const_declared.kind == TypeKind.DArray and darray_element_of(const_declared, structs).kind == TypeKind.Unsigned and darray_element_of(const_declared, structs).bits == 8
+                    if const_declared.kind == TypeKind.CStr or const_declared.kind == TypeKind.SView or const_reg_is_byte_darray:
+                        if const_value is Expr.StringLit(const_reg_cstr_lit):
+                            const_reg_cstr_text <- const_reg_cstr_lit
+                    existing_const: i64 = const_index_of_in(structs, owner, const_name)
+                    if existing_const >= 0:
+                        structs.const_types[existing_const.usize()] <- const_declared
+                        # The TEXT carriers are re-resolved for exactly the reason the type is:
+                        # selection registers a const BEFORE its annotation can resolve, so the
+                        # first pass may have seen an Unmodeled type and recorded no text.
+                        # Freezing that provisional answer left `const GREETING: cstr = "..."`
+                        # unresolved forever, and every function reading it DECLINED.
+                        if const_reg_float_text != "":
+                            structs.const_float_text[existing_const.usize()] <- const_reg_float_text
+                            structs.const_resolved[existing_const.usize()] <- true
+                        if const_reg_cstr_text != "":
+                            structs.const_cstr_text[existing_const.usize()] <- const_reg_cstr_text
+                            structs.const_resolved[existing_const.usize()] <- true
+                        return
+                    structs.const_names <- structs.const_names.push(const_name)
+                    structs.const_owners <- structs.const_owners.push(owner)
+                    structs.const_types <- structs.const_types.push(const_declared)
+                    structs.const_values <- structs.const_values.push(0)
+                    structs.const_resolved <- structs.const_resolved.push(const_reg_float_text != "" or const_reg_cstr_text != "")
+                    structs.const_float_text <- structs.const_float_text.push(const_reg_float_text)
+                    structs.const_cstr_text <- structs.const_cstr_text.push(const_reg_cstr_text)
+                    structs.const_float_values <- structs.const_float_values.push(0.0)
+                    structs.const_float_ok <- structs.const_float_ok.push(false)
+                    structs.const_globals <- structs.const_globals.push(zeroed)
+                    structs.const_global_ok <- structs.const_global_ok.push(false)
+
+
+
+            # Constant-FOLD an initializer to an integer. Only the forms stage0 itself calls a
+            # "compile-time value" are modeled: literals, other consts, and integer arithmetic.
+            # `ok` is false for anything else (a call, an unresolved const), which propagates
+            # outward as a decline rather than a guessed value.
+        def fold_const_atom(expression: Expr, structs: mutable StructTable&, ok: mutable bool&, handled: mutable bool&) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                handled <- false
+                if expression is Expr.IntLit(literal_value):
+                    handled <- true
+                    return literal_value
+                if expression is Expr.BoolLit(bool_literal_value):
+                    handled <- true
+                    return 1 if bool_literal_value else 0
+                if expression is Expr.Field(enum_head_expression, enum_member_name, enum_field_line):
+                    handled <- true
+                    enum_fold_ordinal: i64 = ordinal_of_dotted_path_expr(expression, structs)
+                    if enum_fold_ordinal >= 0:
+                        return enum_fold_ordinal
+                    ok <- false
+                    return 0
+                # `Space::HEIGHT` in a const INITIALIZER. Both folders only ever matched
+                # Expr.Ident, so a qualified const naming another module's const fell
+                # through every arm to `ok <- false` -- and an unresolved const declines
+                # every function that reads it, which takes the whole unit with it. That
+                # is how `const ROWS_TOP: f64 = Display::REFERENCE_HEIGHT * 8.0 / 10.0`
+                # dropped menu_row_y and render_menu_frame the moment display.elisa
+                # became a module.
+                #
+                # Rewritten to the bare Ident under the named owner and re-folded, exactly
+                # as the use-site path in codegen_expr_idents_binary does, so int/float/cstr
+                # consts keep resolving through their own carriers.
+                if expression is Expr.Scope(scope_atom_base, scope_atom_name, scope_atom_line):
+                    if scope_atom_base is Expr.Ident(scope_atom_module, scope_atom_module_line):
+                        scope_atom_saved: sview = structs.current_owner
+                        structs.current_owner <- scope_atom_module
+                        scope_atom_value: i64 = fold_const_atom((Expr.Ident(scope_atom_name, scope_atom_line)), structs, ok, handled)
+                        structs.current_owner <- scope_atom_saved
+                        return scope_atom_value
+                if expression is Expr.Ident(ident_name, ident_line):
+                    handled <- true
+                    # A CONST-GENERIC param (`InlineVec[T, N: usize]`'s `N`) bound to a ConstUsize
+                    # during instantiation folds to its VALUE — so a `T[N]` extent resolves. Scan
+                    # the bindings newest-first (innermost instantiation wins), as name resolution
+                    # does. Checked BEFORE the const table: a param shadows a global of the name.
+                    if structs.binding_names.count > 0:
+                        bind_scan: mutable usize = structs.binding_names.count
+                        while bind_scan > 0 |bind_scan, ident_name, structs, handled|:
+                            bind_scan <- bind_scan - 1
+                            if structs.binding_names[bind_scan] == ident_name and structs.binding_types[bind_scan].kind == TypeKind.ConstUsize:
+                                return structs.binding_types[bind_scan].bits.i64()
+                    const_index: i64 = const_index_of(structs, ident_name)
+                    if const_index >= 0 and structs.const_resolved[const_index.usize()]:
+                        # RESOLVED does not mean "has an integer value". A float or cstr const
+                        # is resolved through its own carrier and leaves const_values at 0, so
+                        # returning it here would hand back a silent zero -- the same failure
+                        # this file's float folding work exists to remove. Fold only what is
+                        # actually an integer; anything else declines.
+                        const_atom_type: ValueType = copied_type(structs.const_types[const_index.usize()])
+                        if is_integer_type(const_atom_type) or const_atom_type.kind == TypeKind.Bool:
+                            return structs.const_values[const_index.usize()]
+                    ok <- false
+                    return 0
+                return 0
+
+
+
+        # Fold a FLOAT const initializer to an actual f64. The integer folder above cannot do
+        # this: it would truncate every leaf and, worse, `fold_consts` used to mark a float
+        # const RESOLVED on the strength of an integer fold while leaving its inlined source
+        # text empty -- so `const D: f64 = W - S` emitted ConstRealOfString("") and read back
+        # as 0.0 with no diagnostic at all.
+        #
+        # Leaves go through LLVM's own decimal parser (ConstRealOfString -> ConstRealGetDouble)
+        # so the bits match what a float LITERAL of the same text would have produced.
+        def fold_const_float_expr(expression: Expr, structs: mutable StructTable&, ok: mutable bool&) -> f64 can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                if expression is Expr.FloatLit(float_literal_text):
+                    float_text_storage: mutable darray[u8] = []
+                    loses_info: mutable i32 = 0
+                    parsed: LLVMValueRef = LLVMConstRealOfString(LLVMDoubleTypeInContext(structs.context), sview_to_cstr(float_literal_text, float_text_storage))
+                    return LLVMConstRealGetDouble(parsed, &loses_info)
+                # An integer literal is a valid float initializer (`const H: f64 = 2`).
+                if expression is Expr.IntLit(float_int_literal):
+                    return float_int_literal.f64()
+                if expression is Expr.Paren(float_paren_inner, float_paren_line):
+                    return fold_const_float_expr(float_paren_inner, structs, ok)
+                # See fold_const_atom: the qualified form under the named owner.
+                if expression is Expr.Scope(scope_float_base, scope_float_name, scope_float_line):
+                    if scope_float_base is Expr.Ident(scope_float_module, scope_float_module_line):
+                        scope_float_saved: sview = structs.current_owner
+                        structs.current_owner <- scope_float_module
+                        scope_float_value: f64 = fold_const_float_expr((Expr.Ident(scope_float_name, scope_float_line)), structs, ok)
+                        structs.current_owner <- scope_float_saved
+                        return scope_float_value
+                if expression is Expr.Ident(float_ident_name, float_ident_line):
+                    float_const_index: i64 = const_index_of(structs, float_ident_name)
+                    if float_const_index >= 0:
+                        if structs.const_float_ok[float_const_index.usize()]:
+                            return structs.const_float_values[float_const_index.usize()]
+                        # A float const that resolved as a LITERAL carries text, not a value.
+                        if structs.const_float_text[float_const_index.usize()] != "":
+                            ident_text_storage: mutable darray[u8] = []
+                            ident_loses_info: mutable i32 = 0
+                            ident_parsed: LLVMValueRef = LLVMConstRealOfString(LLVMDoubleTypeInContext(structs.context), sview_to_cstr(structs.const_float_text[float_const_index.usize()], ident_text_storage))
+                            return LLVMConstRealGetDouble(ident_parsed, &ident_loses_info)
+                        # An INTEGER const used in a float expression (`const N: int = 3`).
+                        if structs.const_resolved[float_const_index.usize()] and is_integer_type(copied_type(structs.const_types[float_const_index.usize()])):
+                            return structs.const_values[float_const_index.usize()].f64()
+                    ok <- false
+                    return 0.0
+                if expression is Expr.Unary(float_unary_operator, float_unary_operand, float_unary_line):
+                    float_operand: f64 = fold_const_float_expr(float_unary_operand, structs, ok)
+                    return 0.0 - float_operand if float_unary_operator == TokenKind.Minus else (float_operand if float_unary_operator == TokenKind.Plus else 0.0)
+                # `X.f64()` and friends are Calls in the AST, and are value-preserving here.
+                if expression is Expr.Call(float_cast_callee, float_cast_arguments, float_cast_argument_names, float_cast_line):
+                    if float_cast_callee is Expr.Field(float_cast_object, float_cast_name, float_cast_field_line):
+                        float_cast_type: ValueType = scalar_type_of_name(float_cast_name)
+                        if float_cast_type.kind == TypeKind.Float and float_cast_arguments.count == 0:
+                            return fold_const_float_expr(float_cast_object, structs, ok)
+                    ok <- false
+                    return 0.0
+                if expression is Expr.Binary(float_left, float_operator, float_right, float_line):
+                    float_left_value: f64 = fold_const_float_expr(float_left, structs, ok)
+                    float_right_value: f64 = fold_const_float_expr(float_right, structs, ok)
+                    float_operands_ok: bool = ok
+                    return 0.0 if not float_operands_ok
+                    return float_left_value + float_right_value if float_operator == TokenKind.Plus
+                    return float_left_value - float_right_value if float_operator == TokenKind.Minus
+                    return float_left_value * float_right_value if float_operator == TokenKind.Star
+                    # Division by a zero CONSTANT is not folded: leave it to decline rather
+                    # than bake in an inf/nan the source never wrote.
+                    if float_operator == TokenKind.Slash:
+                        if float_right_value != 0.0:
+                            return float_left_value / float_right_value
+                    ok <- false
+                    return 0.0
+                ok <- false
+                return 0.0
+
+
+
+        def fold_const_binary_values(left_value: i64, operator: TokenKind, right_value: i64, ok: mutable bool&) -> i64 can[Abort.Panic]:
+            if operator == TokenKind.EqEq:
+                return 1 if left_value == right_value else 0
+            if operator == TokenKind.BangEq:
+                return 1 if left_value != right_value else 0
+            if operator == TokenKind.Lt:
+                return 1 if left_value < right_value else 0
+            if operator == TokenKind.Gt:
+                return 1 if left_value > right_value else 0
+            if operator == TokenKind.LtEq:
+                return 1 if left_value <= right_value else 0
+            if operator == TokenKind.GtEq:
+                return 1 if left_value >= right_value else 0
+            if operator == TokenKind.And:
+                return 1 if left_value != 0 and right_value != 0 else 0
+            if operator == TokenKind.Or:
+                return 1 if left_value != 0 or right_value != 0 else 0
+            if operator == TokenKind.Plus:
+                return left_value + right_value
+            if operator == TokenKind.Minus:
+                return left_value - right_value
+            if operator == TokenKind.Star:
+                return left_value * right_value
+            if operator == TokenKind.Slash:
+                if right_value != 0:
+                    return left_value / right_value
+                ok <- false
+                return 0
+            if operator == TokenKind.Percent:
+                if right_value != 0:
+                    return left_value % right_value
+                ok <- false
+                return 0
+            if operator == TokenKind.Caret:
+                return left_value ^ right_value
+            if operator == TokenKind.Pipe:
+                return left_value | right_value
+            if operator == TokenKind.Ampersand:
+                return left_value & right_value
+            if operator == TokenKind.LShift:
+                if right_value < 0 or right_value >= 64:
+                    ok <- false
+                    return 0
+                return left_value << right_value
+            if operator == TokenKind.RShift:
+                if right_value < 0 or right_value >= 64:
+                    ok <- false
+                    return 0
+                return left_value >> right_value
+            ok <- false
+            return 0
+
+
+
+        def fold_const_expr(expression: Expr, structs: mutable StructTable&, ok: mutable bool&) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                atom_handled: mutable bool = false
+                atom_value: i64 = fold_const_atom(expression, structs, ok, atom_handled)
+                if atom_handled:
+                    return atom_value
+                if expression is Expr.Paren(paren_inner, paren_line):
+                    return fold_const_expr(paren_inner, structs, ok)
+                if expression is Expr.Unary(unary_operator, unary_operand, unary_line):
+                    operand_value: i64 = fold_const_expr(unary_operand, structs, ok)
+                    if unary_operator == TokenKind.Minus:
+                        return 0 - operand_value
+                    if unary_operator == TokenKind.Plus:
+                        return operand_value
+                    if unary_operator == TokenKind.Tilde:
+                        return ~operand_value
+                    ok <- false
+                    return 0
+                # Postfix numeric casts are represented as calls (`1.u32()`) in the AST. They
+                # are constant-preserving for the integer values used by aggregate initializers;
+                # the ordinary expression emitter applies the target-width conversion later.
+                # Without this branch, a global mask such as `1.u32() << 9` cannot be materialized,
+                # so every indexed read from that constant declines in the enclosing function.
+                if expression is Expr.Call(cast_callee, cast_arguments, cast_argument_names, cast_line):
+                    if cast_callee is Expr.Field(cast_object, cast_name, cast_field_line):
+                        cast_type: ValueType = scalar_type_of_name(cast_name)
+                        if cast_type.kind == TypeKind.Signed or cast_type.kind == TypeKind.Unsigned or cast_type.kind == TypeKind.Float or cast_type.kind == TypeKind.Bool:
+                            if cast_arguments.count == 0:
+                                return fold_const_expr(cast_object, structs, ok)
+                    ok <- false
+                    return 0
+                if expression is Expr.Binary(binary_left, binary_operator, binary_right, binary_line):
+                    left_value: i64 = fold_const_expr(binary_left, structs, ok)
+                    right_value: i64 = fold_const_expr(binary_right, structs, ok)
+                    operands_ok: bool = ok
+                    if not operands_ok:
+                        return 0
+                    return fold_const_binary_values(left_value, binary_operator, right_value, ok)
+                ok <- false
+                return 0
+
+
+
+
+        def fold_consts(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            pass_index: mutable usize = 0
+            while pass_index < structs.const_names.count |pass_index, file, structs|:
+                progressed: mutable bool = false
+                pending: mutable darray[Decl] = []
+                pending.extend(top)
+                # Flattening a module loses which one a const came from, and the fold then
+                # looked the name up bare -- so with two modules declaring `SIZE` it folded
+                # one row twice and left the other unresolved. The owner rides alongside.
+                pending_owners: mutable darray[sview] = []
+                for _top_index in 0..<top.count |pending_owners|:
+                    pending_owners.push("")
+                while pending.count > 0 |pending, pending_owners, progressed, structs|:
+                    current_index: usize = pending.count - 1
+                    current: Decl = pending[current_index]
+                    current_owner: sview = get pending_owners[current_index] else ""
+                    pending.truncate(current_index)
+                    pending_owners.truncate(current_index)
+                    if current is Decl.Module(module_name, module_body, module_line):
+                        pending.extend(module_body)
+                        for _member_index in 0..<module_body.count |pending_owners, module_name|:
+                            pending_owners.push(module_name)
+                        continue
+                    if current is Decl.Const(const_name, const_type_expression, const_value, const_is_mutable, const_line):
+                        const_index: i64 = const_index_of_in(structs, current_owner, const_name)
+                        continue if const_index < 0
+                        continue if structs.const_resolved[const_index.usize()]
+                        # A FLOAT const folds in the FLOAT domain. Running it through the
+                        # integer folder marked it resolved with an empty inlined text, and the
+                        # use site then emitted ConstRealOfString("") -- 0.0, silently.
+                        if copied_type(structs.const_types[const_index.usize()]).kind == TypeKind.Float:
+                            float_folded_ok: mutable bool = true
+                            float_folded: f64 = fold_const_float_expr(const_value, structs, float_folded_ok)
+                            continue if not float_folded_ok
+                            structs.const_float_values[const_index.usize()] <- float_folded
+                            structs.const_float_ok[const_index.usize()] <- true
+                            structs.const_resolved[const_index.usize()] <- true
+                            progressed <- true
+                            continue
+                        folded_ok: mutable bool = true
+                        folded: i64 = fold_const_expr(const_value, structs, folded_ok)
+                        continue if not folded_ok
+                        structs.const_values[const_index.usize()] <- folded
+                        structs.const_resolved[const_index.usize()] <- true
+                        progressed <- true
+                break if not progressed
+                pass_index <- pass_index + 1
+
+
+
+
+        # Build the LLVM constant for a const aggregate initializer, RECURSIVELY: a scalar
+        # element folds to a ConstInt, an array element (`[[1,2],[3,4]]`) builds a nested
+        # ConstArray. `ok` goes false on any non-foldable element, extent mismatch, or
+        # unmodeled element type — the caller then declines the whole global.
+        def const_global_expression(top: darray[Decl]&, name: sview, found: mutable bool&) -> Expr can[Abort.Panic]:
+            for declaration in top |name, found|:
+                if declaration is Decl.Const(global_name, global_type_expression, global_value, global_is_mutable, global_line):
+                    if global_name == name:
+                        found <- true
+                        return global_value
+            return Expr.Invalid

@@ -1,0 +1,204 @@
+# Stage1 backend — the STATE an emitter carries through a function body: the local scope, the
+# function table, the enclosing loops' branch targets, the owned regions a `return` must
+# unwind, and what emitting a statement did to control flow.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        # A deferred function body keeps references to the slots visible at its declaration
+        # point. Capturing slots (rather than only names) preserves stage0's lexical-shadowing
+        # rule when the deferred body runs later.
+        struct DeferredAction:
+            body: mutable darray[Stmt]
+            names: mutable darray[sview]
+            slots: mutable darray[LLVMValueRef]
+            types: mutable darray[ValueType]
+            scope_exit: bool
+
+
+
+
+        # A function's local slots: `names[i]` lives in the `alloca` at `slots[i]`.
+        # Parallel darrays rather than a dict: scopes are tiny (a handful of locals), a
+        # linear scan beats hashing, and it keeps the opaque extern handle out of a dict's
+        # key/value machinery.
+        struct Scope:
+            names: mutable darray[sview]
+            slots: mutable darray[LLVMValueRef]
+            types: mutable darray[ValueType]
+            # Kept index-parallel with names/slots/types by declare_local, which always
+            # pushes `false`. Only a plain `x: mutable T& = v` VarDecl (the one call site
+            # that can spell the `mutable` keyword on a Ref-typed annotation at all) flips
+            # its own entry true, via mark_last_local_mutable, right after declaring it.
+            # Everything else -- match-arm payloads, `get ... else` bindings, `try`
+            # bindings, loop accumulators -- has no such keyword to inspect and stays
+            # false, which is the PRE-EXISTING (write-through) behavior, unchanged.
+            local_is_mutable: mutable darray[bool] = []
+            # For a local declared `runner: fn(...) -> R = add`, the name of the function it
+            # ALIASES ("add"), else "". Index-parallel with names/slots/types; declare_local
+            # always pushes "" and only the VarDecl site that can see the initializer fills it
+            # in, via mark_last_local_fn_origin.
+            #
+            # It exists for LABELLED calls through the alias: a `fn(i64, i64) -> i64` type has
+            # no parameter NAMES to reorder `runner(y: 7, x: 3)` against, so without the origin
+            # the labels cannot be resolved at all (stage0 resolves the alias back to its
+            # target). Defaulted so partial Scope literals stay valid.
+            local_fn_origins: mutable darray[sview] = []
+            # The same fact one level in: a STRUCT-typed local whose fn-typed FIELD was
+            # initialised from a named function (`box: CallbackBox = CallbackBox{run: add}`),
+            # so that `box.run(y: 7, x: 3)` can be reordered against `add`'s parameter names.
+            # A `fn(i64, i64)` field type carries no names, and stage0 recovers them the same
+            # way -- by resolving the alias back to its target (measured: it answers 23 for
+            # `sub` called as `(y: 7, x: 30)`, i.e. 30 - 7, not 7 - 30).
+            #
+            # THREE parallel pools rather than one "local.field" key, because building that key
+            # means concatenating two sviews into a buffer whose region may die before the
+            # lookup -- the dangling-view trap the generic instantiation cache documents.
+            #
+            # NOT index-parallel with names/slots/types: a local contributes one entry per
+            # aliased field, or none. Looked up by scanning for the (local, field) pair.
+            fn_field_alias_locals: mutable darray[sview] = []
+            fn_field_alias_fields: mutable darray[sview] = []
+            fn_field_alias_targets: mutable darray[sview] = []
+            # The arena a local was DECLARED against because of an explicit `@region`
+            # qualifier, and whether it has one. Index-parallel with names/slots/types;
+            # declare_local pushes "absent" and only the VarDecl site that can see the
+            # qualifier fills it in. growth_arena_for consults it before the region frames,
+            # because an explicit pin overrides the lexical rule.
+            local_declared_arenas: mutable darray[LLVMValueRef] = []
+            local_has_declared_arena: mutable darray[bool] = []
+            # Index-parallel with names/slots/types. A non-negative entry identifies the
+            # hidden caller-region slot owned by a reference parameter; -1 means ordinary local.
+            local_parameter_arena_indices: mutable darray[i64] = []
+            # Active structured-concurrency owners. These are backend-only lexical stacks;
+            # the frontend has already checked pool/nursery nesting and submit placement.
+            pool_names: mutable darray[sview]
+            group_names: mutable darray[sview]
+            deferred: mutable darray[DeferredAction]
+            # REGION FRAMES: one entry per active `region r:` / `in owner:` block, innermost
+            # last. `starts` is names.count at block entry, `arenas` the block's arena, and
+            # `outers` the arena that was ambient OUTSIDE the block. A darray grows from the
+            # arena it was DECLARED under (stage0 allocates `outer.push` from %__auto even
+            # inside `region scratch:`), so growth sites resolve the target's root name
+            # against these frames instead of using the ambient runtime.arena. Defaulted so
+            # partial Scope literals (deferred capture, lambdas) stay valid — an empty frame
+            # stack simply falls back to runtime.arena, which is the pre-existing behavior.
+            region_frame_starts: mutable darray[usize] = []
+            region_frame_arenas: mutable darray[LLVMValueRef] = []
+            region_frame_outers: mutable darray[LLVMValueRef] = []
+
+
+
+
+        # The module's functions by name. Built in emit_module's declare pass, so a call
+        # to a function defined LATER in the file still resolves.
+        #
+        # Kept here rather than asking LLVMGetNamedFunction: that returns NULL-or-pointer,
+        # i.e. it needs `-> LLVMValueRef?`, and an extern returning an optional of an
+        # opaque extern type always binds null in stage0 (silent, no diagnostic). We
+        # already know every function we declared, so this is also just less work.
+        struct FnTable:
+            names: mutable darray[sview]
+            # Source declaration line for each entry. Body emission uses this to select
+            # the exact overload; name+arity is insufficient when several same-arity
+            # overloads exist (notably the std `__cast__` family).
+            lines: mutable darray[u32]
+            # The enclosing MODULE's name, or "" for a top-level function. Functions are
+            # keyed on the (owner, name) PAIR rather than on a mangled "M.get" string:
+            # `names` are sviews into the SOURCE buffer, and a synthesized name has no
+            # source text to point at — an sview into a growing darray would dangle. The
+            # mangled form is built only as a temporary cstr for the LLVM symbol.
+            owners: mutable darray[sview]
+            # True when the function has an implicit trailing arena parameter (it takes a
+            # growable container by reference). The CALL SITE must then pass its own arena.
+            needs_arena: mutable darray[bool]
+            # Number of hidden arena parameters. Parser functions carrying AST store context
+            # use the stage0 ABI `arena, store, arena`; ordinary arena-threaded functions use
+            # one trailing arena. Keeping the count avoids collapsing two distinct lifetimes.
+            arena_counts: mutable darray[usize]
+            # True when the function carries the compiler's implicit AST packed-store
+            # context. Stage0 injects this trailing ABI parameter for Parser/Backend
+            # functions that expose the recursive AST hierarchy; it is distinct from the
+            # caller-owned Arena parameter above.
+            needs_store: mutable darray[bool]
+            # True when the function returns an error union `T error[E]`: its LLVM signature
+            # is `i32 @f(ptr out, <params>)` -- an i32 error code, with the T value written
+            # through a leading out-pointer. `returns[i]` still holds T (the success type).
+            is_error: mutable darray[bool]
+            # True when the declared return type is a NULLABLE REFERENCE (`-> heap T&?`).
+            # Such a return registers as a plain Ref -- stage0 represents it as a bare ptr
+            # with null meaning absent -- so the ValueType alone cannot tell it from a
+            # non-nullable `-> T&`. `get f()` is legal on the nullable one only.
+            returns_nullable: mutable darray[bool]
+            # True for a C variadic extern. `param_count[i]` remains the number of fixed
+            # parameters; calls may provide additional promoted C arguments after them.
+            is_variadic: mutable darray[bool]
+            # True when this row came from a callable `extern`, rather than a function
+            # definition. A project include can place a prototype before the definition;
+            # declaration provenance lets the definition reuse that LLVM handle without
+            # confusing two real Elisa overloads with one C declaration/definition pair.
+            is_extern: mutable darray[bool] = []
+            handles: mutable darray[LLVMValueRef]
+            returns: mutable darray[ValueType]
+            # Parameter types as a FLAT pool plus a per-function span (`param_start[i]`,
+            # `param_count[i]`) — a nested `darray[darray[ValueType]]` would make this
+            # region-polymorphic for no benefit.
+            param_types: mutable darray[ValueType]
+            param_names: mutable darray[sview]
+            # Per-parameter DEFAULT value expression, parallel to param_names/param_types.
+            # Expr.Invalid when the parameter has no default. A call site that omits a
+            # trailing argument fills it from here; without this the call declined.
+            param_defaults: mutable darray[Expr]
+            param_start: mutable darray[usize]
+            param_count: mutable darray[usize]
+            # Whether each source parameter owns one of the hidden caller-region slots.
+            # This is inferred from the function body, not from the broad shape of its type.
+            param_region_slots: mutable darray[bool]
+
+
+
+
+        # The enclosing loops' branch targets, innermost LAST. `break` jumps to
+        # `exits[last]`, `continue` to `continues[last]`. A loop pushes before emitting its
+        # body and pops after, so a `break` outside any loop finds an empty stack and
+        # DECLINES rather than emitting a wild branch.
+        #
+        # `continue` targets differ per loop form: a `while` continues to its condition
+        # block, a `for` to its INCREMENT block (skipping the increment would make
+        # `continue` an infinite loop).
+        struct LoopStack:
+            exits: mutable darray[LLVMBasicBlockRef]
+            continues: mutable darray[LLVMBasicBlockRef]
+            # The `deferred` count when each loop BODY began. A `break` leaves every scope
+            # inside the loop at once, so it must unwind the scope-exit `defer`s registered
+            # since this mark — and no further, or it would run an enclosing region's.
+            defer_marks: mutable darray[usize]
+
+
+
+
+        # The OWNED regions currently live, outermost FIRST. A `return` has to unwind every
+        # one of them, not just the innermost: stage0's IR for a return inside `region r:`
+        # frees `%r` AND the enclosing function's auto region on that path.
+        #
+        # Only OWNED regions are listed. A threaded (borrowed) arena belongs to the caller
+        # and is never freed here, so an arena-threading function's stack is simply empty.
+        struct RegionStack:
+            arenas: mutable darray[LLVMValueRef]
+
+
+
+
+        # What emitting a statement did to control flow.
+        #
+        # `Terminated` means the statement ended the block (a `return`, or an `if` whose
+        # arms all returned). The emitter tracks this itself instead of asking
+        # LLVMGetBasicBlockTerminator — same optional-extern bug as FnTable — and it is
+        # the better design regardless: LLVM rejects a block with two terminators, so the
+        # emitter must know whether a block is still open BEFORE it appends a branch.
+        const enum EmitStatus of u8:
+            Declined
+            Open
+            Terminated

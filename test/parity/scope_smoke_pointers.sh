@@ -1,0 +1,357 @@
+# Scope smoke — POINTERS and NARROWING: what a null compare, an early-return guard, a while
+# condition or a ternary PROVES about a pointer, and what a `.cast[T&]` may then assume. Also
+# the darray header's element-storage pointer, which reads like a field and is not one.
+
+
+# 8. `ptr != null` / `ptr == null` on a BARE pointer. A `void&` has no {i1,T} optional
+#    tag — null IS the absent value — so the test is a plain pointer compare. stage1 only
+#    accepted Optional operands here and declined (and therefore DROPPED) every std
+#    function guarding a raw pointer, e.g. `if state_bits != null:`.
+differential null_compare_bare_pointer "$(cat <<'EOF'
+def probe(state_bits: mutable void&) -> i64:
+    if state_bits != null:
+        return 7
+    return 3
+
+
+def probe_eq(state_bits: mutable void&) -> i64:
+    if state_bits == null:
+        return 1
+    return 9
+
+
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        x: mutable i64 = 5
+        bits: mutable void& = (&x).cast[mutable void&]
+        return probe(bits) * 10 + probe_eq(bits)
+EOF
+)" 79
+
+# 9. `xs.items` — the darray header's element-storage POINTER. stage1 typed it Unmodeled
+#    (only `.count` was known), so `assert s.indices.items != null` declined and DROPPED
+#    every std function guarding its storage that way. Both branches are exercised: an
+#    empty darray has no storage, a pushed one does, so a constant-folded answer fails.
+differential darray_items_pointer "$(cat <<'EOF'
+struct Store:
+    indices: mutable darray[usize]
+
+
+def has_storage(s: Store&) -> bool:
+    return s.indices.items != null
+
+
+def probe(s: Store&) -> i64:
+    assert s.indices.items != null
+    assert s.indices.count > 0
+    return 4
+
+
+def main() -> i64:
+    empty: mutable Store = Store{indices: []}
+    filled: mutable Store = Store{indices: []}
+    filled.indices.push(1.usize())
+    empty_flag: i64 = 1 if has_storage(empty) else 0
+    return probe(filled) * 10 + empty_flag
+EOF
+)" 40
+
+# 10. EARLY-RETURN narrowing. `X return if PATH == null` only falls through when the
+#     condition was FALSE, so PATH is non-null below it and may be taken as a plain ref.
+#     stage1 recorded narrowing for if-THEN arms only, so the guard shape the std region
+#     and fixed-buffer helpers all open with declined — DROPPING the function. Both a
+#     present and an absent buffer are passed, so a narrowing that is simply assumed
+#     (rather than proven by the guard) gives the wrong answer on the absent one.
+differential early_return_guard_narrowing "$(cat <<'EOF'
+struct Buf:
+    data: mutable u8&?
+
+
+def first_byte(b: Buf&) -> i64:
+    0 return if b.data == null
+    p: mutable u8& = b.data
+    return p.i64()
+
+
+def main() -> i64:
+    storage: mutable u8[4] = zeroed
+    storage[0] <- 9
+    b: mutable Buf = Buf{data: &storage[0]}
+    empty: mutable Buf = Buf{data: null}
+    return first_byte(b) * 10 + first_byte(empty)
+EOF
+)" 90
+
+# 11. WHILE-condition narrowing. The condition holds INSIDE the body, exactly as in an
+#     `if`'s then-arm, so `while cursor != null:` lets the body take `cursor` as a plain
+#     ref. stage1 recorded narrowing for `if` only, so the std's region walks — which take
+#     the loop-carried optional as a ref on the body's first line — declined. Walking three
+#     nodes means a body that ran zero or once still gives the wrong sum.
+differential while_condition_narrowing "$(cat <<'EOF'
+struct Node:
+    value: i64
+    next: mutable Node&?
+
+
+def total(head: mutable Node&?) -> i64:
+    sum: mutable i64 = 0
+    cursor: mutable Node&? = head
+    while cursor != null |sum, cursor|:
+        here: mutable Node& = cursor
+        sum <- sum + here.value
+        cursor <- here.next
+    return sum
+
+
+def main() -> i64:
+    c: mutable Node = Node{value: 3, next: null}
+    b: mutable Node = Node{value: 2, next: &c}
+    a: mutable Node = Node{value: 1, next: &b}
+    return total(&a)
+EOF
+)" 6
+
+# 12. A narrowed OPTIONAL-of-pointer LOCAL reinterpreted by `.cast[T&]` — the std's
+#     *_or_panic allocator shape. Gated on the narrowing proof AND on a plain-Ident source:
+#     the same unwrap on a struct FIELD read compiles but returns the wrong answer, so that
+#     shape is deliberately still declined. Compares the unwrapped address against the one
+#     passed in, so an unwrap that yields a wrong-but-non-null pointer fails.
+differential narrowed_optional_local_cast "$(cat <<'EOF'
+def unwrap_addr(raw: mutable void&?) -> uintptr:
+    can Abort.Panic:
+        assert raw != null
+        trusted Unsafe.PointerCast:
+            return raw.cast[void&].cast[u8&].uintptr()
+
+
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        storage: mutable u8[8] = zeroed
+        direct: uintptr = (&storage[0]).cast[u8&].uintptr()
+        opt: mutable void&? = (&storage[0]).cast[mutable void&]
+        return 1 if unwrap_addr(opt) == direct else 0
+EOF
+)" 1
+
+# 13. `.uintptr()` on a ref is the ADDRESS; `.i64()` is the POINTEE. stage1 dereferenced
+#     for BOTH, so `&a[0]` and `&a[4]` reported the same address — a SILENT miscompile with
+#     no decline and no link error. Invisible to the self-host: the compiler only ever takes
+#     `&xs[0]`, where a dereferenced address still looks plausible. The two bytes are given
+#     DIFFERENT values so a fix that swapped the two rules also fails.
+differential ref_uintptr_is_address_not_pointee "$(cat <<'EOF'
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        local: mutable u8[16] = zeroed
+        local[0] <- 7
+        local[4] <- 9
+        p0: u8& = &local[0]
+        p4: u8& = &local[4]
+        addr_gap: i64 = (p4.uintptr() - p0.uintptr()).usize().i64()
+        byte0: i64 = p0.i64()
+        byte4: i64 = p4.i64()
+        gap_ok: i64 = 1 if addr_gap == 4 else 0
+        b0_ok: i64 = 1 if byte0 == 7 else 0
+        b4_ok: i64 = 1 if byte4 == 9 else 0
+        return gap_ok * 100 + b0_ok * 10 + b4_ok
+EOF
+)" 111
+
+# 14. The same address rule reached through a struct FIELD's fixed array, which is the shape
+#     the std allocators use (`&a.storage[i]`).
+differential struct_field_array_element_address "$(cat <<'EOF'
+struct Buf:
+    storage: mutable u8[16]
+
+
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        b: mutable Buf = zeroed
+        f0: uintptr = (&b.storage[0]).cast[u8&].uintptr()
+        f4: uintptr = (&b.storage[4]).cast[u8&].uintptr()
+        differ: i64 = 1 if f0 != f4 else 0
+        gap: i64 = (f4 - f0).usize().i64()
+        return differ * 100 + gap
+EOF
+)" 104
+
+# 15. `for x in CALL()` — iterating a darray a function RETURNED. A call result has no
+#     header address, so the loop has to spill the value; stage1 declined instead, and that
+#     one construct dropped `Easm.verify_module`, which every easm_* program reaches. Worth
+#     26 of the 29 corpus programs stage1 could not build. Sums distinct values so a loop
+#     that runs the wrong number of times fails.
+differential for_over_call_result "$(cat <<'EOF'
+def make() -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = []
+        out.push(1)
+        out.push(2)
+        out.push(4)
+        return out
+
+
+def total() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        sum: mutable i64 = 0
+        for v in make() |sum|:
+            sum <- sum + v
+        return sum
+
+
+def main() -> i64:
+    return total()
+EOF
+)" 7
+
+# 16. `.count` on a CALL RESULT. Same shape as case 15 — a darray read through a value
+#     with no header address, needing a spill. It dropped `Easm.parse_layout_module`, the
+#     last shared easm symbol, worth 10 more corpus programs.
+differential darray_count_on_call_result "$(cat <<'EOF'
+def make() -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = []
+        out.push(1)
+        out.push(2)
+        return out
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        return make().count.i64()
+EOF
+)" 2
+
+# 18. The same unwrap through a struct FIELD (`a.data: mutable u8&?`) — the std fixed-buffer
+#     allocator shape. Excluded for several rounds on a "10 vs 20" measurement that was
+#     itself wrong: that fixture ran through `.uintptr()`, which was returning the pointee.
+#     Checks a pointer INSIDE the buffer and one OUTSIDE, so an unwrap yielding a plausible
+#     but wrong base fails.
+differential narrowed_optional_field_cast "$(cat <<'EOF'
+struct Buf:
+    data: mutable u8&?
+    capacity: mutable usize
+
+
+def owns(a: Buf&, ptr: void&) -> bool:
+    false return if a.data == null
+
+    trusted Unsafe.PointerCast:
+        base: uintptr = a.data.cast[u8&].uintptr()
+        raw: uintptr = ptr.cast[u8&].uintptr()
+        limit: uintptr = base + a.capacity.uintptr()
+        return raw >= base and raw < limit
+
+
+def main() -> i64:
+    can Unsafe.PointerCast, Abort.Panic:
+        storage: mutable u8[16] = zeroed
+        b: mutable Buf = Buf{data: &storage[0], capacity: 16.usize()}
+        inside: bool = owns(b, (&storage[4]).cast[void&])
+        outside_target: mutable i64 = 0
+        outside: bool = owns(b, (&outside_target).cast[void&])
+        return 10 if inside and not outside else 20
+EOF
+)" 10
+
+# 19. A STRING LITERAL passed to a `T&` extern parameter. declare_extern records every
+#     provenance-bearing extern param as `void&` — the `&` is known, the referent is not —
+#     and the literal path required a `u8` referent, so `snprintf(…, "%llu", …)` declined
+#     and took its caller with it. Asserts the formatted LENGTH, so a literal lowered to
+#     the wrong pointer gives the wrong count rather than passing silently.
+# 19. A STRING LITERAL passed to a `T&` extern parameter. declare_extern records every
+#     provenance-bearing extern param as `void&` — the `&` is known, the referent is not —
+#     and the literal path required a `u8` referent, so `snprintf(…, "%llu", …)` declined
+#     and took its caller down with it. Asserts the formatted LENGTH, so a literal lowered
+#     to the wrong pointer gives a wrong count rather than passing silently.
+differential string_literal_to_ref_extern_param "$(cat <<'EOF'
+extern snprintf(buf: mutable u8&?, bufsize: usize, fmt: u8&, ...) -> int can[Console.Format]
+
+
+def digits(value: u64) -> i64:
+    can Console.Format, Abort.Panic:
+        len: int = snprintf(null, 0.usize(), "%llu", value)
+        return len.i64()
+
+
+def main() -> i64:
+    return digits(12345.u64())
+EOF
+)" 5
+
+# 20. A fixed-array GLOBAL whose extent is a named const (`i64[CAP]`), not a literal.
+#     The annotation accepted only Expr.IntLit, so the global never registered and every
+#     read and write of it declined — which is how the runtime's five trace/cache tapes
+#     dropped ~20 functions. Writes TWO distinct slots and sums them, so an extent folded
+#     to the wrong bound (or a base that is not the global) gives a wrong total rather
+#     than passing on a single lucky slot.
+differential array_global_const_extent "$(cat <<'EOF'
+const CAP: usize = 8
+
+
+global mutable tape: i64[CAP] = zeroed
+
+
+def put(index: usize, value: i64) -> void:
+    tape[index] <- value
+
+
+def get(index: usize) -> i64:
+    return tape[index]
+
+
+def main() -> i64:
+    put(0.usize(), 7)
+    put((CAP - 1.usize()), 35)
+    return get(0.usize()) + get((CAP - 1.usize()))
+EOF
+)" 42
+
+# 21. `xs.items[i] <- v` — a WRITE through the element-storage pointer of a BORROWED
+#     `darray[T]&` (how stores_core writes its region table). A darray is not a Struct, so
+#     both chain resolvers bailed and the assignment declined. Writes through `.items` but
+#     reads back through ORDINARY indexing, and leaves one slot untouched, so a store to
+#     the wrong base is caught rather than confirmed by its own read.
+differential darray_items_write "$(cat <<'EOF'
+def fill(xs: mutable darray[i64]&, at: usize, value: i64) -> void can[Abort.Panic]:
+    assert xs.items != null
+    xs.items[at] <- value
+
+
+def main() -> i64:
+    can Memory.Allocate, Abort.Panic:
+        xs: mutable darray[i64] = [1, 2, 3]
+        fill(&xs, 0.usize(), 10)
+        fill(&xs, 2.usize(), 30)
+        return xs[0] + xs[1] + xs[2]
+EOF
+)" 42
+
+# 22. A const extent on an annotation whose HEAD IS NOT A BARE NAME (`heap Entry&?[NB]`).
+#     Case 20 covers `i64[CAP]`, which dispatches on the named path; a qualified element
+#     type takes the OTHER branch, which still required a literal. The runtime's two string
+#     caches are declared exactly this way. Reads slot 3, so an extent folded
+#     to the wrong bound traps rather than passing.
+differential array_global_const_extent_qualified_head "$(cat <<'EOF'
+const NB: usize = 4
+
+
+struct Entry:
+    tag: mutable i64
+
+
+global mutable cache: heap Entry&?[NB] = zeroed
+
+
+def peek(bucket: usize) -> i64 can[Abort.Panic]:
+    entry: mutable heap Entry&? = cache[bucket]
+    if entry == null:
+        return 0
+    return entry.tag
+
+
+def main() -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        a: mutable Entry = Entry{tag: 7}
+        cache[0] <- (&a).cast[heap Entry&]
+        return peek(0.usize()) * 6 + peek(1.usize()) + peek(3.usize())
+EOF
+)" 42

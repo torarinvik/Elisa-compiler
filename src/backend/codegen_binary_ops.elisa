@@ -1,0 +1,212 @@
+# Stage1 backend — BINARY OPERATORS on scalars: the LLVM predicate each comparison maps to for
+# signed, unsigned and float operands, the checked arithmetic that traps on overflow, and the
+# literal parsing the operands need. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        # Map an Elisa comparison token to an LLVMIntPredicate, or -1 when the operator is
+        # not a comparison. Signed predicates (SLT/SLE/SGT/SGE): the subset is i64.
+        def int_predicate_of(operator: TokenKind) -> i32:
+            32 return if operator == TokenKind.EqEq
+            33 return if operator == TokenKind.BangEq
+            40 return if operator == TokenKind.Lt
+            41 return if operator == TokenKind.LtEq
+            38 return if operator == TokenKind.Gt
+            39 return if operator == TokenKind.GtEq
+            return -1
+
+
+
+
+        # The same comparison for an UNSIGNED operand type. Equality is signedness-free
+        # (32/33); ordering is not — SLT(40)/SLE(41)/SGT(38)/SGE(39) become
+        # ULT(36)/ULE(37)/UGT(34)/UGE(35). Comparing `u8 200 < 3` with SLT reads 200 as
+        # -56 and answers TRUE.
+        def unsigned_predicate_of(predicate: i32) -> i32:
+            36 return if predicate == 40
+            37 return if predicate == 41
+            34 return if predicate == 38
+            35 return if predicate == 39
+            return predicate
+
+
+
+
+        # Emit `left <op> right` for the modeled signed-i64 operators. `null` = unmodeled,
+        # so a bitwise/logical op declines rather than emitting something wrong.
+        #
+        # A comparison yields an `i1`; every modeled value is an i64, so the i1 is
+        # zero-extended back to i64. Conditions re-narrow with `!= 0` (emit_condition),
+        # which keeps ONE uniform value representation instead of tracking i1-vs-i64.
+        #
+        # SDiv/SRem (not UDiv/URem): the subset is signed. Elisa's `%` is LLVM's `srem`
+        # (sign follows the DIVIDEND: -7 % 2 == -1) — verified against stage0, which
+        # selects the same instruction for a signed operand type.
+        # The ORDERED float predicate matching an integer one. Ordered = any comparison
+        # with NaN is false, which is IEEE `==` / `<` semantics.
+        # OEQ=1, OGT=2, OGE=3, OLT=4, OLE=5, ONE=6.
+        def float_predicate_of(operator: TokenKind) -> i32:
+            1 return if operator == TokenKind.EqEq
+            6 return if operator == TokenKind.BangEq
+            4 return if operator == TokenKind.Lt
+            5 return if operator == TokenKind.LtEq
+            2 return if operator == TokenKind.Gt
+            3 return if operator == TokenKind.GtEq
+            return -1
+
+
+
+
+        # `left <op> right` for `+`/`-`/`*` on an integer type, trapping on overflow instead of
+        # silently wrapping — matching stage0 exactly (verified against its `-emit llvm -O0`
+        # output for plain `a + b` on two bare `i64` parameters: stage0 emits
+        # `llvm.sadd.with.overflow.i64` + a conditional trap, not a bare `add`, for every
+        # signed/unsigned integer width). This was previously MISSING for ordinary arithmetic
+        # entirely — only reserve-bound math (emit_checked_reserve_binary, usize-only) checked
+        # overflow — so integer overflow silently wrapped instead of trapping, a real behavior
+        # divergence from stage0 for any expression that overflows (rare in practice, which is
+        # why self-hosting a 124k-line corpus whose own arithmetic never approaches 2^63 never
+        # surfaced it).
+        #
+        # Returns null (decline) if the intrinsic cannot be found/declared, rather than risk
+        # silently reverting to unchecked arithmetic.
+        def emit_checked_int_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            signed: bool = operand_type.kind == TypeKind.Signed
+            intrinsic_name: mutable sview = ""
+            if operator == TokenKind.Plus:
+                intrinsic_name <- "llvm.sadd.with.overflow" if signed else "llvm.uadd.with.overflow"
+            elif operator == TokenKind.Minus:
+                intrinsic_name <- "llvm.ssub.with.overflow" if signed else "llvm.usub.with.overflow"
+            elif operator == TokenKind.Star:
+                intrinsic_name <- "llvm.smul.with.overflow" if signed else "llvm.umul.with.overflow"
+            null return if intrinsic_name == ""
+            intrinsic_storage: mutable darray[u8] = []
+            intrinsic_cstr: cstr = sview_to_cstr(intrinsic_name, intrinsic_storage)
+            intrinsic_id: u32 = LLVMLookupIntrinsicID(intrinsic_cstr, sview_len(intrinsic_name))
+            null return if intrinsic_id == 0
+            int_type: LLVMTypeRef = llvm_type_of(operand_type, structs, ctx)
+            parameter_types: mutable darray[LLVMTypeRef] = [int_type]
+            parameter_pointer: void& = (&parameter_types[0]).cast[void&] can Unsafe.PointerCast
+            intrinsic_fn: LLVMValueRef = LLVMGetIntrinsicDeclaration(m, intrinsic_id, parameter_pointer, 1)
+            null return if intrinsic_fn == zeroed
+            arguments: mutable darray[LLVMValueRef] = [left, right]
+            arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            call: LLVMValueRef = LLVMBuildCall2(builder, LLVMGlobalGetValueType(intrinsic_fn), intrinsic_fn, arguments_pointer, 2, "signed.arith.checked")
+            value: LLVMValueRef = LLVMBuildExtractValue(builder, call, 0, "signed.arith.value")
+            overflow: LLVMValueRef = LLVMBuildExtractValue(builder, call, 1, "signed.arith.overflow")
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            trap_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "signed.arith.overflow.trap")
+            ok_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "signed.arith.ok")
+            _ = LLVMBuildCondBr(builder, overflow, trap_block, ok_block)
+            LLVMPositionBuilderAtEnd(builder, trap_block)
+            emit_trap_unreachable(m, ctx, builder)
+            LLVMPositionBuilderAtEnd(builder, ok_block)
+            return value
+
+
+
+
+        def emit_binary(operator: TokenKind, left: LLVMValueRef, right: LLVMValueRef, operand_type: ValueType, structs: mutable StructTable&, fast_math: bool, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                # This helper is the scalar fallback. Aggregate equality must
+                # be lowered by a dedicated protocol/runtime path; never pass an
+                # aggregate through to LLVMBuildICmp, which would leave invalid IR.
+                null return if operand_type.kind == TypeKind.Array or operand_type.kind == TypeKind.DArray or operand_type.kind == TypeKind.View or operand_type.kind == TypeKind.Struct
+                # Floats are a different instruction family end to end: fadd/fdiv/fcmp, never
+                # add/sdiv/icmp. Bitwise and shifts have no float form and decline.
+                if operand_type.kind == TypeKind.Float:
+                    finish_float_instruction(LLVMBuildFAdd(builder, left, right, "fadd"), fast_math) return if operator == TokenKind.Plus
+                    finish_float_instruction(LLVMBuildFSub(builder, left, right, "fsub"), fast_math) return if operator == TokenKind.Minus
+                    finish_float_instruction(LLVMBuildFMul(builder, left, right, "fmul"), fast_math) return if operator == TokenKind.Star
+                    finish_float_instruction(LLVMBuildFDiv(builder, left, right, "fdiv"), fast_math) return if operator == TokenKind.Slash
+                    finish_float_instruction(LLVMBuildFRem(builder, left, right, "frem"), fast_math) return if operator == TokenKind.Percent
+                    float_predicate: i32 = float_predicate_of(operator)
+                    finish_float_instruction(LLVMBuildFCmp(builder, float_predicate, left, right, "fcmp"), fast_math) return if float_predicate >= 0
+                    return null
+                unsigned: bool = operand_type.kind == TypeKind.Unsigned
+                # Overflow trapping is a SIGNED-only feature — verified against stage0's
+                # `-emit llvm` output for `u32 + u32` / `u32 - u32` / `u32 * u32`, all of which
+                # lower to a plain (wrapping) `add`/`sub`/`mul`, never a `with.overflow`
+                # intrinsic. Unsigned wraparound is routinely intentional (hashing, modular
+                # counters); only the signed case traps.
+                if not unsigned and (operator == TokenKind.Plus or operator == TokenKind.Minus or operator == TokenKind.Star):
+                    return emit_checked_int_binary(operator, left, right, operand_type, structs, m, ctx, builder)
+                LLVMBuildAdd(builder, left, right, "add") return if operator == TokenKind.Plus
+                LLVMBuildSub(builder, left, right, "sub") return if operator == TokenKind.Minus
+                LLVMBuildMul(builder, left, right, "mul") return if operator == TokenKind.Star
+                LLVMBuildAnd(builder, left, right, "and") return if operator == TokenKind.Ampersand
+                LLVMBuildOr(builder, left, right, "or") return if operator == TokenKind.Pipe
+                LLVMBuildXor(builder, left, right, "xor") return if operator == TokenKind.Caret
+                LLVMBuildShl(builder, left, right, "shl") return if operator == TokenKind.LShift
+
+                # Signedness picks the INSTRUCTION, and it is observable: stage0 gives
+                # `u8 200 / 3` == 66 (udiv) and `u8 200 >> 1` == 100 (lshr); the signed forms
+                # answer -56 and 228.
+                if operator == TokenKind.Slash:
+                    return LLVMBuildUDiv(builder, left, right, "div") if unsigned else LLVMBuildSDiv(builder, left, right, "div")
+                if operator == TokenKind.Percent:
+                    return LLVMBuildURem(builder, left, right, "rem") if unsigned else LLVMBuildSRem(builder, left, right, "rem")
+                if operator == TokenKind.RShift:
+                    return LLVMBuildLShr(builder, left, right, "shr") if unsigned else LLVMBuildAShr(builder, left, right, "shr")
+
+                predicate: i32 = int_predicate_of(operator)
+                if predicate >= 0:
+                    resolved: i32 = unsigned_predicate_of(predicate) if unsigned else predicate
+                    # A comparison yields an i1 — the modeled `bool` — NOT a widened int.
+                    return LLVMBuildICmp(builder, resolved, left, right, "cmp")
+                return null
+
+
+
+
+        # Parse an integer pattern's literal TEXT (`Pattern.Literal` carries raw source
+        # text, not a value). False when it is not a plain decimal integer, so a
+        # char/string/float pattern DECLINES instead of being misread as a number.
+        def parse_int_literal(text: sview, out_value: mutable i64&) -> bool can[Abort.Panic]:
+            false return if sview_len(text) == 0
+            negative: bool = sview_at(text, 0) == 45
+            start: usize = 1 if negative else 0
+            false return if sview_len(text) == start
+            accumulated: mutable i64 = 0
+            ok: mutable bool = true
+            for index in start..<sview_len(text) |accumulated, ok, text|:
+                byte: u8 = sview_at(text, index)
+                if byte < 48 or byte > 57:
+                    ok <- false
+                else:
+                    accumulated <- accumulated * 10 + (byte.i64() - 48)
+            false return if not ok
+            out_value <- 0 - accumulated if negative else accumulated
+            return true
+
+
+
+
+        # Char pattern / CharLit interior → Unicode code unit as i64.
+        # Accepts lexer interior form (`A`, `\n`) and quoted form (`'A'`, `'\n'`).
+        def parse_char_literal_code(text: sview, out_value: mutable i64&) -> bool can[Abort.Panic]:
+            false return if sview_len(text) == 0
+            # Quoted: `'x'` / `'\n'`.
+            if sview_len(text) >= 3 and sview_at(text, 0) == 39 and sview_at(text, sview_len(text) - 1) == 39:
+                inner_start: usize = 1
+                inner_end: usize = sview_len(text) - 1
+                false return if inner_end <= inner_start
+                first: u8 = sview_at(text, inner_start)
+                if first == 92:
+                    false return if inner_start + 1 >= inner_end
+                    esc: u8 = sview_at(text, inner_start + 1)
+                    out_value <- 10 if esc == 110 else (9 if esc == 116 else (13 if esc == 114 else (0 if esc == 48 else (92 if esc == 92 else (39 if esc == 39 else esc.i64())))))
+                    return true
+                out_value <- first.i64()
+                return true
+            # Interior-only (lexer CharLit token text).
+            if sview_len(text) == 1:
+                out_value <- sview_at(text, 0).i64()
+                return true
+            if sview_len(text) >= 2 and sview_at(text, 0) == 92:
+                esc2: u8 = sview_at(text, 1)
+                out_value <- 10 if esc2 == 110 else (9 if esc2 == 116 else (13 if esc2 == 114 else (0 if esc2 == 48 else (92 if esc2 == 92 else (39 if esc2 == 39 else esc2.i64())))))
+                return true
+            return false

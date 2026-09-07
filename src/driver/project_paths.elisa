@@ -1,0 +1,281 @@
+# Project system — the FILESYSTEM and PATH layer: reading a file, the working directory, and Go's
+# filepath.Clean / Join / Dir / Abs reproduced lexically, because every path stage0 prints has
+# been through them and the parity gate diffs the printed bytes. Continues project.elisa.
+
+extend ProjectSystem:
+
+
+    # ---- filesystem ------------------------------------------------------------------------
+
+    # A NUL-terminated copy, for the libc calls below.
+    def bytes_to_cstr(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[u8] = []
+            bytes_extend(&out, path)
+            out.push(0)
+            return out
+
+
+
+    # An explicit `region` scope, because this returns a bool: a scalar-returning function
+    # has no inferred region, so the NUL-terminated copy needs somewhere to live. The scope
+    # is released on exit, which is correct — the copy does not outlive the call.
+    def file_exists(path: darray[u8]&) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            present: mutable bool = false
+            region probe(4096):
+                terminated: darray[u8] = bytes_to_cstr(path)
+                if terminated.count > 1.usize():
+                    handle: cstr = (&terminated[0.usize()]).cast[cstr] can Unsafe.PointerCast
+                    present <- project_access(handle, 0) == 0
+            return present
+
+
+
+    # Whole file by path; empty when it cannot be opened. Callers distinguish "absent" with
+    # `file_exists` beforehand, exactly as stage0 separates os.Stat from os.ReadFile.
+    def read_file_bytes(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            contents: mutable darray[u8] = []
+            terminated: darray[u8] = bytes_to_cstr(path)
+            contents return if terminated.count == 1.usize()
+            handle: cstr = (&terminated[0.usize()]).cast[cstr] can Unsafe.PointerCast
+            descriptor: i64 = project_open(handle, 0, 0)
+            contents return if descriptor < 0
+            chunk: mutable darray[u8] = []
+            chunk.resize(8192)
+            while true |contents, chunk, descriptor|:
+                amount: i64 = project_read(descriptor, &chunk[0.usize()], 8192.usize())
+                break if amount <= 0
+                for index in 0..<amount.usize() |contents, chunk|:
+                    contents.push(chunk[index])
+            _ = project_close(descriptor)
+            return contents
+
+
+
+    # The process working directory.
+    #
+    # $PWD is preferred over getcwd() because Go's os.Getwd does the same, and the difference
+    # is OBSERVABLE: stage0 run from a shell in /tmp reports "/tmp" (the logical path the
+    # shell exported) while getcwd(3) returns the resolved "/private/tmp". That string
+    # reaches the user in `could not find project.json from ...`.
+    #
+    # Go additionally stats $PWD and compares inodes against "."; this settles for "absolute
+    # and exists", which differs only for a $PWD left stale by something other than cd.
+    def working_directory() -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            logical: mutable darray[u8] = []
+            name: mutable darray[u8] = bytes_from_view("PWD")
+            name.push(0)
+            key: cstr = (&name[0.usize()]).cast[cstr] can Unsafe.PointerCast
+            if project_getenv(key) is real:
+                exported: cstr = project_getenv(key).cast[cstr] can Unsafe.PointerCast
+                bytes_extend_cstr(&logical, exported)
+            buffer: mutable darray[u8] = []
+            buffer.resize(4096)
+            target: void& = (&buffer[0.usize()]).cast[void&] can Unsafe.PointerCast
+            _ = project_getcwd(target, 4096.usize())
+            out: mutable darray[u8] = []
+            for index in 0..<buffer.count |out, buffer|:
+                break if buffer[index] == 0
+                out.push(buffer[index])
+            # $PWD is preferred ONLY when it names the SAME DIRECTORY as getcwd(3).
+            #
+            # Go's os.Getwd does exactly this: it takes $PWD when a Stat of it and a Stat of
+            # "." are the same file, and falls back to the syscall otherwise. The port used
+            # $PWD whenever it was absolute and existed, which is wrong in the case that
+            # matters — a process whose cwd differs from the $PWD it inherited. Any tool
+            # spawning the compiler with a working directory (a build script, a test harness,
+            # subprocess(cwd=...)) then had its project resolved from the PARENT's directory:
+            # `could not find project.json` for a project that is right there. stage0 gets it
+            # right, so this was a divergence as well as a bug.
+            #
+            # realpath() on both sides is the same test as Go's same-file check for this
+            # purpose, and keeps the reason $PWD is preferred at all: it preserves the
+            # symlinked spelling (/tmp rather than /private/tmp), which stage0 prints.
+            logical return if path_is_absolute(logical) and same_directory(logical, out)
+            return out
+
+
+
+    # Do two paths name the same directory once symlinks are resolved?
+    def same_directory(left: darray[u8]&, right: darray[u8]&) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            same: mutable bool = false
+            region probe(8192):
+                left_c: darray[u8] = bytes_to_cstr(left)
+                right_c: darray[u8] = bytes_to_cstr(right)
+                if left_c.count > 1.usize() and right_c.count > 1.usize():
+                    left_handle: cstr = (&left_c[0.usize()]).cast[cstr] can Unsafe.PointerCast
+                    right_handle: cstr = (&right_c[0.usize()]).cast[cstr] can Unsafe.PointerCast
+                    # A null `resolved` asks realpath to malloc the buffer (POSIX.1-2008).
+                    empty_buffer: void&? = null
+                    if project_realpath(left_handle, empty_buffer) is left_real:
+                        if project_realpath(right_handle, empty_buffer) is right_real:
+                            left_text: cstr = left_real.cast[cstr] can Unsafe.PointerCast
+                            right_text: cstr = right_real.cast[cstr] can Unsafe.PointerCast
+                            resolved_left: mutable darray[u8] = []
+                            resolved_right: mutable darray[u8] = []
+                            bytes_extend_cstr(&resolved_left, left_text)
+                            bytes_extend_cstr(&resolved_right, right_text)
+                            same <- bytes_equal(resolved_left, resolved_right)
+            return same
+
+
+
+    # The path `find_project_file` starts from, as stage0 names it in its failure message:
+    # the argument when one was given, otherwise the working directory.
+    def project_search_origin(start: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            trimmed: darray[u8] = bytes_trimmed(start)
+            trimmed return if trimmed.count > 0.usize()
+            return working_directory()
+
+
+
+    # Go's filepath.Abs: join a relative path onto the working directory, then Clean.
+    def absolute_path(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            path_clean(path) return if path_is_absolute(path)
+            cwd: darray[u8] = working_directory()
+            return path_join(cwd, path)
+
+
+
+    # ---- paths ---------------------------------------------------------------------------
+    #
+    # Go's path/filepath, restricted to what the project system uses. `filepath.Join` and
+    # `filepath.Abs` both CLEAN their result, and stage0's printed paths are all produced by
+    # one of the two, so cleaning is part of the observable output rather than a tidy-up.
+
+    def path_is_absolute(path: darray[u8]&) -> bool:
+        return path.count > 0.usize() and path[0.usize()] == 47
+
+
+
+    # Lexical Clean: collapse repeated separators, drop `.`, resolve `..` against the
+    # preceding segment, and leave a rooted path rooted. Never touches the filesystem, so a
+    # symlinked `..` resolves the way Go resolves it, not the way the kernel would.
+    # Segments are recorded as (start, length) spans into `path` itself and kept on a stack
+    # whose live height is `depth`. `..` lowers the height rather than removing an entry —
+    # `darray.pop` mis-resolves its overload on a `darray[usize]` here — and the next push
+    # overwrites the abandoned slot.
+    def path_clean(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            rooted: bool = path_is_absolute(path)
+            starts: mutable darray[usize] = []
+            lengths: mutable darray[usize] = []
+            depth: mutable usize = 0.usize()
+            segment_start: mutable usize = 0.usize()
+            index: mutable usize = 0.usize()
+            while index <= path.count |index, segment_start, depth, starts, lengths, path|:
+                at_end: bool = index == path.count
+                byte: u8 = 47 if at_end else path[index]
+                if byte == 47:
+                    length: usize = index - segment_start
+                    is_dot: bool = length == 1.usize() and path[segment_start] == 46
+                    is_parent: bool = length == 2.usize() and path[segment_start] == 46 and path[segment_start + 1.usize()] == 46
+                    if length == 0.usize() or is_dot:
+                        segment_start <- index + 1.usize()
+                        index <- index + 1.usize()
+                        continue
+                    keep: mutable bool = true
+                    if is_parent:
+                        keep <- false
+                        if depth > 0.usize():
+                            top_is_parent: bool = lengths[depth - 1.usize()] == 2.usize() and path[starts[depth - 1.usize()]] == 46 and path[starts[depth - 1.usize()] + 1.usize()] == 46
+                            if not top_is_parent:
+                                depth <- depth - 1.usize()
+                            else:
+                                keep <- true
+                        else:
+                            # A leading `..` is dropped on a rooted path (Go: `/..` is `/`)
+                            # and kept on a relative one, where it is meaningful.
+                            keep <- not rooted
+                    if keep:
+                        if depth < starts.count:
+                            starts[depth] <- segment_start
+                            lengths[depth] <- length
+                        else:
+                            starts <- starts.push(segment_start)
+                            lengths <- lengths.push(length)
+                        depth <- depth + 1.usize()
+                    segment_start <- index + 1.usize()
+                index <- index + 1.usize()
+            out: mutable darray[u8] = []
+            out.push(47) if rooted
+            for segment in 0..<depth |out, starts, lengths, path, rooted|:
+                out.push(47) if segment > 0.usize() or (out.count > 0.usize() and not rooted)
+                bytes_extend_span(&out, path, starts[segment], lengths[segment])
+            if out.count == 0.usize():
+                out.push(46)
+            return out
+
+
+
+    # filepath.Join: concatenate the non-empty elements with `/`, then Clean.
+    def path_join(base: darray[u8]&, leaf: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            joined: mutable darray[u8] = []
+            bytes_extend(&joined, base)
+            if joined.count > 0.usize() and leaf.count > 0.usize():
+                joined.push(47)
+            bytes_extend(&joined, leaf)
+            return path_clean(joined)
+
+
+
+    def path_join_view(base: darray[u8]&, leaf: sview) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            piece: darray[u8] = bytes_from_view(leaf)
+            return path_join(base, piece)
+
+
+
+    # The directory part, Cleaned — Go's filepath.Dir.
+    def path_dir(path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            last_slash: mutable i64 = -1
+            for index in 0..<path.count |last_slash, path|:
+                last_slash <- index.i64() if path[index] == 47
+            out: mutable darray[u8] = []
+            if last_slash < 0:
+                out.push(46)
+                return out
+            if last_slash == 0:
+                out.push(47)
+                return out
+            bytes_extend_span(&out, path, 0.usize(), last_slash.usize())
+            return path_clean(out)
+
+
+
+    # stage0's projectRelativePath: absolute paths pass through, relative ones join onto the
+    # project root.
+    def path_relative_to(root: darray[u8]&, path: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            if path_is_absolute(path):
+                return bytes_copy(path)
+            return path_join(root, path)
+
+
+
+    def strlist_copy(list: StrList&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            result <- strlist_extend(result, list)
+            return result
+
+
+
+    # Every entry made absolute against `root` — stage0 maps projectRelativePath over the
+    # include, foreign and easm lists of both the project and each manifest.
+    def strlist_relative_to(root: darray[u8]&, list: StrList&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            for index in 0..<list.starts.count |result, list, root|:
+                entry: darray[u8] = strlist_entry_copy(list, index)
+                resolved: darray[u8] = path_relative_to(root, entry)
+                result <- strlist_push(result, resolved)
+            return result

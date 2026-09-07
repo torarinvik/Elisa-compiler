@@ -1,0 +1,138 @@
+# Stage1 backend — the TARGET predefines a `static if` selects on, and which branch bodies are
+# therefore live. The parser keeps every branch; this decides which ones the backend sees.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+            # Seed the TARGET predefines a `static if` selects on. Mirrors stage0's
+            # populateTargetConstValues (semantic/target_consts.go). The stage1 CLI carries an
+            # explicit target marker that keeps static platform branches (especially the stdlib
+            # arena backend) in lockstep with the LLVM module instead of silently compiling
+            # WASM with the host mmap/libc branch.
+        def target_triple_is_wasm() -> bool can[Abort.Panic]:
+            true return if getenv("ELISA_STAGE1_WASM") is wasm_target
+            return false
+
+
+
+        # A host predicate the wrapper exports as an environment flag (presence is truth).
+        def host_env_flag(name: cstr) -> bool can[Abort.Panic]:
+            true return if getenv(name) is present
+            return false
+
+
+
+        def register_target_consts(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            bool_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+            # Registered for the HOST by default; `target_triple_is_wasm()` flips the wasm rows.
+            #
+            # The last three names are APPENDED so the index-based flips below keep addressing
+            # the same rows. They exist for STAGE PARITY: stage0 defines ELISA_TARGET_OS_WASI
+            # and the ELISA_TARGET_ARCH_WASM32/WASM64/WASM family, so a program guarded by
+            # `static if ELISA_TARGET_OS_WASI` must resolve here too -- otherwise it compiles
+            # under one compiler and fails to resolve under the other. WASI and WASM are both
+            # true on a wasm target (stage0 maps a wasm triple's OS to "wasi"); WASM64 stays
+            # false because stage1 emits wasm32.
+            wasm_target: bool = target_triple_is_wasm()
+            # The HOST is not always macOS/arm64 (Phase T: a Linux x86_64 gate box). The wrapper
+            # exports ELISA_HOST_LINUX=1 / ELISA_HOST_X86_64=1 from `uname`; stage0 answers the
+            # same predicates from runtime.GOOS/GOARCH. Without this every stage1-built product
+            # on Linux took the macOS mmap flags in elisacore_std/arena.elisa and aborted at
+            # startup (measured 2026-09-06: parse_report and the gen2 compiler both SIGABRT).
+            linux_host: bool = host_env_flag("ELISA_HOST_LINUX")
+            x86_host: bool = host_env_flag("ELISA_HOST_X86_64")
+            names: darray[sview] = ["ELISA_TARGET_OS_MACOS", "ELISA_TARGET_OS_LINUX", "ELISA_TARGET_OS_WINDOWS", "ELISA_TARGET_OS_FREEBSD", "ELISA_TARGET_OS_POSIX", "ELISA_TARGET_OS_WASM", "ELISA_TARGET_ARCH_X86_64", "ELISA_TARGET_ARCH_ARM64", "ELISA_TARGET_ARCH_WASM32", "PLATFORM_WINDOWS", "PLATFORM_APPLE", "PLATFORM_DARWIN", "PLATFORM_LINUX", "PLATFORM_FREEBSD", "PLATFORM_WASM", "ARCH_X86_64", "ARCH_ARM64", "ARCH_WASM32", "ELISA_TARGET_OS_WASI", "ELISA_TARGET_ARCH_WASM64", "ELISA_TARGET_ARCH_WASM"]
+            values: mutable darray[i64] = [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+            if linux_host:
+                values[0] <- 0
+                values[1] <- 1
+                values[10] <- 0
+                values[11] <- 0
+                values[12] <- 1
+            if x86_host:
+                values[6] <- 1
+                values[7] <- 0
+                values[15] <- 1
+                values[16] <- 0
+            if wasm_target:
+                values[0] <- 0
+                values[4] <- 0
+                values[5] <- 1
+                values[7] <- 0
+                values[8] <- 1
+                values[10] <- 0
+                values[11] <- 0
+                values[14] <- 1
+                values[16] <- 0
+                values[17] <- 1
+                values[18] <- 1
+                values[20] <- 1
+            for index in 0..<names.count |structs, names, values, bool_type|:
+                continue if const_index_of(structs, names[index]) >= 0
+                structs.const_names <- structs.const_names.push(names[index])
+                # Target predicates are top-level, never a module's.
+                structs.const_owners <- structs.const_owners.push("")
+                structs.const_types <- structs.const_types.push(bool_type)
+                structs.const_values <- structs.const_values.push(values[index])
+                structs.const_resolved <- structs.const_resolved.push(true)
+                structs.const_float_text <- structs.const_float_text.push("")
+                # EVERY const column must grow together. A short column is indexed by the
+                # same const_index as the rest, so leaving one behind is an out-of-bounds
+                # read waiting for the first target predicate that reaches that branch.
+                structs.const_cstr_text <- structs.const_cstr_text.push("")
+                structs.const_float_values <- structs.const_float_values.push(0.0)
+                structs.const_float_ok <- structs.const_float_ok.push(false)
+                structs.const_globals <- structs.const_globals.push(zeroed)
+                structs.const_global_ok <- structs.const_global_ok.push(false)
+
+
+
+
+        # Which `static if` BRANCH bodies are live. The parser keeps every branch (a name
+        # declared in two branches is not a duplicate), so without this the backend sees a
+        # per-target `const ARENA_BACKEND` declared once per branch -- and everything reading
+        # one declines. Returns the head lines of the branches to KEEP.
+        #
+        # Rows are in source order and carry a kind: 0 opens a chain, 1 continues it, 2 is the
+        # fallback. A chain takes its FIRST true branch; `static else` is taken only when no
+        # earlier branch in the same chain was. A condition that will not fold is treated as
+        # FALSE rather than guessed -- the same decline-don't-invent rule fold_const_expr uses.
+        def selected_static_if_lines(file: Ast::File&, structs: mutable StructTable&) -> darray[u32] can[Abort.Panic, Memory.Allocate]:
+            taken: mutable darray[u32] = []
+            chain_satisfied: mutable bool = false
+            for row in 0..<file.static_if_lines.count |taken, chain_satisfied, file, structs|:
+                chain_satisfied <- false if file.static_if_kinds[row] == 0
+                continue if chain_satisfied
+                if file.static_if_kinds[row] == 2:
+                    taken.push(file.static_if_lines[row])
+                    chain_satisfied <- true
+                    continue
+                condition_ok: mutable bool = true
+                condition_value: i64 = fold_const_expr(file.static_if_conds[row], structs, condition_ok)
+                continue if not condition_ok or condition_value == 0
+                taken.push(file.static_if_lines[row])
+                chain_satisfied <- true
+            return taken
+
+
+
+
+        def flatten_static_branches(decls: darray[Decl]&, branch_lines: darray[u32]&, taken_lines: darray[u32]&, out: mutable darray[Decl]&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                for declaration in decls |out, branch_lines, taken_lines|:
+                    if declaration is Decl.Scoped(scoped_body, scoped_line):
+                        is_branch: bool = static_branch_is_taken(branch_lines, scoped_line.line)
+                        keep: bool = static_branch_is_taken(taken_lines, scoped_line.line) if is_branch else true
+                        flatten_static_branches(scoped_body, branch_lines, taken_lines, out) if keep
+                        continue
+                    out.push(declaration)
+
+
+
+
+        def static_branch_is_taken(taken_lines: darray[u32]&, line: u32) -> bool can[Abort.Panic]:
+            for taken_line in taken_lines |line|:
+                true return if taken_line == line
+            return false

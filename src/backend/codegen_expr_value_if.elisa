@@ -1,0 +1,129 @@
+# Stage1 backend — a value `if` (`a if cond else b`) and a dict LITERAL. Both thread the
+# expected type down rather than producing a type of their own, which is why they sit beside
+# the value `match` in codegen_expr_match_aggregates.elisa rather than with the other
+# literals. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_expression_if_and_dict(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A value `if`: `a if cond else b`. Only ONE arm is evaluated, so it uses the
+            # same result-slot lowering as `and`/`or`.
+            match expression:
+                Expr.If(ternary_condition, then_expression, else_expression, ternary_line):
+                    null return if expected.kind == TypeKind.Unmodeled
+                    # `if` is also used as a value-shaped mutation expression, for example
+                    # `parser <- parse_list() if bracketed else parse_one()`, where both arms
+                    # return void and mutate the lmut receiver. A void LLVM type cannot have an
+                    # alloca/result slot; emit the two side-effect arms directly and join them.
+                    if expected.kind == TypeKind.Void:
+                        if emit_condition(ternary_condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is void_condition_bit:
+                            void_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                            void_then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, void_function, "ifv.then")
+                            void_else_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, void_function, "ifv.else")
+                            void_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, void_function, "ifv.done")
+                            _ = LLVMBuildCondBr(builder, void_condition_bit, void_then_block, void_else_block)
+                            LLVMPositionBuilderAtEnd(builder, void_then_block)
+                            if emit_expression(then_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is void_then_value:
+                                _ = void_then_value
+                                _ = LLVMBuildBr(builder, void_done_block)
+                                LLVMPositionBuilderAtEnd(builder, void_else_block)
+                                if emit_expression(else_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is void_else_value:
+                                    _ = void_else_value
+                                    _ = LLVMBuildBr(builder, void_done_block)
+                                    LLVMPositionBuilderAtEnd(builder, void_done_block)
+                                    # The caller only uses the presence of a value to recognize
+                                    # successful emission; this sentinel is never stored or returned.
+                                    return LLVMConstNull(LLVMPointerTypeInContext(ctx, 0))
+                        return null
+                    ternary_type: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                    result_slot: LLVMValueRef = LLVMBuildAlloca(builder, ternary_type, "if.result")
+                    if emit_condition(ternary_condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is condition_bit:
+                        function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                        then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.then")
+                        else_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.else")
+                        done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "ifx.done")
+                        _ = LLVMBuildCondBr(builder, condition_bit, then_block, else_block)
+
+                        # A ternary's ARMS narrow exactly like a statement `if`'s: the condition
+                        # is proven true in the then arm and false in the else arm. Without
+                        # this, `node.next <- null if state.workers == null else
+                        # state.workers.cast[heap Node&]` declined — the else arm could not see
+                        # that the `== null` test had failed, so the cast had no narrowing
+                        # proof. stage0 REJECTS that cast unguarded (verified: "invalid cast
+                        # from mutable void&? to heap Node&"), so the proof is genuinely
+                        # required, not a formality to skip.
+                        #
+                        # Snapshot/restore around each arm so a proof that only holds inside one
+                        # arm does not leak past the join.
+                        ternary_saved_owners: mutable darray[sview] = []
+                        ternary_saved_fields: mutable darray[sview] = []
+                        snapshot_narrowings(structs, ternary_saved_owners, ternary_saved_fields)
+
+                        LLVMPositionBuilderAtEnd(builder, then_block)
+                        record_null_guards(ternary_condition, structs)
+                        if emit_expression(then_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is then_value:
+                            restore_narrowings(structs, ternary_saved_owners, ternary_saved_fields)
+                            _ = LLVMBuildStore(builder, then_value, result_slot)
+                            _ = LLVMBuildBr(builder, done_block)
+                            LLVMPositionBuilderAtEnd(builder, else_block)
+                            record_null_guard_negation(ternary_condition, structs)
+                            # An `else` is mandatory in a value position; an Absent else
+                            # declines (no value on one path).
+                            if emit_expression(else_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is else_value:
+                                restore_narrowings(structs, ternary_saved_owners, ternary_saved_fields)
+                                _ = LLVMBuildStore(builder, else_value, result_slot)
+                                _ = LLVMBuildBr(builder, done_block)
+                                LLVMPositionBuilderAtEnd(builder, done_block)
+                                return LLVMBuildLoad2(builder, ternary_type, result_slot, "ifx")
+                            restore_narrowings(structs, ternary_saved_owners, ternary_saved_fields)
+                    return null
+                _:
+                    pass
+            # `[10, 30, 2]` — a fixed-array literal. Built in a temporary slot element by
+            # element, then loaded back; SROA turns it into registers/constants at -O2.
+            # The array is zero-initialized first, so a short literal deterministically
+            # leaves omitted trailing elements at their zero value.
+            # `{}` initializing a dict: the zero value of its DynDict struct (null items, 0
+            # count/used/capacity, null arena) — stage0 emits `store %DynDict zeroinitializer`.
+            # `{k: v, …}` — a zeroed DynDict in a slot, then `arena_dict_put_or_panic(arena, &m,
+            # key, value)` per entry (the std's frictionless, panic-on-OOM insert; the analogue of
+            # the non-empty set literal below). Needs the std + the DynDict K/V types from
+            # `expected`'s instantiation args.
+            match expression:
+                Expr.DictLit(dict_entries, dict_literal_line):
+                    null return if expected.kind != TypeKind.Struct
+                    dict_lit_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                    if dict_entries.count == 0:
+                        return LLVMConstNull(dict_lit_llvm)
+                    dict_lit_base: mutable sview = ""
+                    dict_lit_arg_start: mutable usize = 0
+                    dict_lit_arg_count: mutable usize = 0
+                    dict_lit_has_inst: bool = generic_struct_instantiation_of(structs, expected, dict_lit_base, dict_lit_arg_start, dict_lit_arg_count)
+                    null return if not dict_lit_has_inst or dict_lit_base != "DynDict" or dict_lit_arg_count != 2
+                    dict_lit_key_type: ValueType = copied_type(structs.generic_struct_inst_args[dict_lit_arg_start])
+                    dict_lit_value_type: ValueType = copied_type(structs.generic_struct_inst_args[dict_lit_arg_start + 1.usize()])
+                    dict_lit_type_args: mutable darray[ValueType] = [dict_lit_key_type, dict_lit_value_type]
+                    if instantiate_generic("arena_dict_put_or_panic", dict_lit_type_args, generics, structs, m, ctx) is dict_put_target:
+                        dict_lit_slot: LLVMValueRef = LLVMBuildAlloca(builder, dict_lit_llvm, "dict.literal")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(dict_lit_llvm), dict_lit_slot)
+                        dict_put_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(dict_put_target)
+                        dict_lit_declined: mutable bool = false
+                        for dict_entry in dict_entries |dict_lit_declined, dict_lit_key_type, dict_lit_value_type, dict_lit_slot, dict_put_target, dict_put_fn_type, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            continue if dict_lit_declined
+                            if emit_expression(dict_entry.key, dict_lit_key_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dict_entry_key_value:
+                                if emit_expression(dict_entry.value, dict_lit_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dict_entry_value_value:
+                                    dict_put_args: mutable darray[LLVMValueRef] = [runtime.arena, dict_lit_slot, dict_entry_key_value, dict_entry_value_value]
+                                    dict_put_args_pointer: void& = (&dict_put_args[0]).cast[void&] can Unsafe.PointerCast
+                                    _ = LLVMBuildCall2(builder, dict_put_fn_type, dict_put_target, dict_put_args_pointer, 4, "dict.put")
+                                else:
+                                    dict_lit_declined <- true
+                            else:
+                                dict_lit_declined <- true
+                        null return if dict_lit_declined
+                        return LLVMBuildLoad2(builder, dict_lit_llvm, dict_lit_slot, "dict.literal.value")
+                    return null
+                _:
+                    pass
+            handled <- false
+            return null
+

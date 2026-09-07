@@ -1,0 +1,253 @@
+# `-emit test-runner` — stage0's synthesized test driver: the unit's source, then a generated
+# `main` that calls each `@test` the `-filter` substring selects, in declaration order.
+
+
+# `-emit test-runner` — stage0's synthesized test driver: the unit's source, then a
+# `ctx_test_main` that calls each `@test` function in declaration order and reports it.
+#
+# `-filter` selects tests by SUBSTRING of the name (measured against stage0: `checks`
+# matches both `checks_one` and `checks_two`; `one` matches only `checks_one`).
+
+
+# The source path as an ABSOLUTE path, which is what stage0's `#line` directive carries
+# (filepath.Abs). ELISA_STAGE1_SRC is passed through as the caller wrote it, so a relative
+# path is joined onto the working directory.
+def push_absolute_source_path(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    given: mutable darray[u8] = []
+    _ = push_source_path(&given)
+    return if given.count == 0
+    if given[0] == 47:
+        for absolute_index in 0..<given.count |buffer, given|:
+            buffer.push(given[absolute_index])
+        return
+    # $PWD FIRST, then getcwd(3). Go's os.Getwd — which is what stage0's filepath.Abs uses
+    # — returns the LOGICAL working directory from $PWD when it names the same place, while
+    # getcwd(3) returns the PHYSICAL one. On macOS that is the difference between `/tmp` and
+    # `/private/tmp`, and it is visible in the `#line` directive.
+    pwd_storage: mutable darray[u8] = []
+    for pwd_flag_index in 0..<sview_len("PWD") |pwd_storage|:
+        pwd_storage.push(sview_at("PWD", pwd_flag_index))
+    pwd_storage.push(0)
+    pwd_name: cstr = (&pwd_storage[0]).cast[cstr] can Unsafe.PointerCast
+    wrote_directory: mutable bool = false
+    if getenv(pwd_name) is pwd_bytes:
+        pwd_cursor: mutable i64 = 0
+        pwd_scanning: mutable bool = true
+        while pwd_scanning |pwd_cursor, pwd_scanning, buffer, wrote_directory, pwd_bytes|:
+            pwd_ref: u8& = pwd_bytes + pwd_cursor
+            pwd_byte: u8 = pwd_ref
+            if pwd_byte == 0:
+                pwd_scanning <- false
+            else:
+                buffer.push(pwd_byte)
+                wrote_directory <- true
+                pwd_cursor <- pwd_cursor + 1
+    if not wrote_directory:
+        cwd_storage: mutable darray[u8] = [0 for _ in 0..<4096]
+        cwd_pointer: void& = (&cwd_storage[0]).cast[void&] can Unsafe.PointerCast
+        _ = getcwd(cwd_pointer, 4096)
+        for cwd_index in 0..<cwd_storage.count |buffer, cwd_storage|:
+            break if cwd_storage[cwd_index] == 0
+            buffer.push(cwd_storage[cwd_index])
+    buffer.push(47)
+    # A leading `./` is redundant once the directory is prefixed — filepath.Abs cleans it.
+    skip: usize = 2 if given.count >= 2 and given[0] == 46 and given[1] == 47 else 0
+    for relative_index in skip..<given.count |buffer, given|:
+        buffer.push(given[relative_index])
+
+
+
+
+# LLVM's module identifier and source filename are code-generation inputs on some targets.
+# Keep them stable across relative and absolute invocations while retaining the full absolute
+# path for generated `#line` directives and frontend diagnostics.
+def push_stable_module_source_name(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    absolute: mutable darray[u8] = []
+    push_absolute_source_path(&absolute)
+    if absolute.count == 0:
+        emit_tokens_push_sview(buffer, "module.elisa")
+        return
+    basename_start: mutable usize = 0
+    for path_index in 0..<absolute.count |absolute, basename_start|:
+        basename_start <- path_index + 1 if absolute[path_index] == 47
+    for basename_index in basename_start..<absolute.count |buffer, absolute|:
+        buffer.push(absolute[basename_index])
+
+
+
+
+# The `-filter` value from ELISA_STAGE1_FILTER, or "" when unset.
+def push_test_filter(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    flag_storage: mutable darray[u8] = []
+    for flag_index in 0..<sview_len("ELISA_STAGE1_FILTER") |flag_storage|:
+        flag_storage.push(sview_at("ELISA_STAGE1_FILTER", flag_index))
+    flag_storage.push(0)
+    flag_name: cstr = (&flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+    if getenv(flag_name) is filter_bytes:
+        cursor: mutable i64 = 0
+        scanning: mutable bool = true
+        while scanning |cursor, scanning, buffer, filter_bytes|:
+            byte_ref: u8& = filter_bytes + cursor
+            filter_byte: u8 = byte_ref
+            if filter_byte == 0:
+                scanning <- false
+            else:
+                buffer.push(filter_byte)
+                cursor <- cursor + 1
+
+
+
+
+# Does `name` contain `needle`? stage0's filter is a SUBSTRING test, not an exact match.
+def test_name_matches(name: sview, needle: darray[u8]&) -> bool can[Abort.Panic]:
+    true return if needle.count == 0
+    false return if needle.count > sview_len(name)
+    for start in 0..<(sview_len(name) - needle.count + 1) |name, needle|:
+        matched: mutable bool = true
+        for probe in 0..<needle.count |matched, name, needle, start|:
+            matched <- false if sview_at(name, start + probe) != needle[probe]
+        true return if matched
+    return false
+
+
+
+
+# Every `@test`-decorated function name, in declaration order, that the filter selects.
+def test_collect_names(declarations: darray[Ast::Decl]&, needle: darray[u8]&, names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    for declaration in declarations |needle, names|:
+        if declaration is Decl.Module(test_m_name, test_m_body, test_m_line):
+            test_collect_names(test_m_body, needle, names)
+            continue
+        if declaration is Decl.Scoped(test_s_body, test_s_line):
+            test_collect_names(test_s_body, needle, names)
+            continue
+        if declaration is Decl.Func(test_f_name, test_f_params, test_f_ret, test_f_body, test_f_effects, test_f_decorators, test_f_line):
+            is_test: mutable bool = false
+            for test_f_decorator in test_f_decorators |is_test|:
+                is_test <- true if test_f_decorator.name == "test"
+            names.push(test_f_name) if is_test and test_name_matches(test_f_name, needle)
+
+
+
+
+# The generated test runner calls each selected test directly, so its signature and local
+# grant must include every declared effect of those tests. Keep the order stable: Console.Write
+# is emitted first, followed by each effect in selected declaration order, with duplicates removed.
+def test_name_selected(name: sview, names: darray[sview]&) -> bool:
+    for selected in names:
+        return true if selected == name
+    return false
+
+
+
+
+def test_collect_effects(declarations: darray[Ast::Decl]&, names: darray[sview]&, effects: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+    for declaration in declarations |names, effects|:
+        if declaration is Decl.Module(test_e_m_name, test_e_m_body, test_e_m_line):
+            test_collect_effects(test_e_m_body, names, effects)
+            continue
+        if declaration is Decl.Scoped(test_e_s_body, test_e_s_line):
+            test_collect_effects(test_e_s_body, names, effects)
+            continue
+        if declaration is Decl.Func(test_e_f_name, test_e_f_params, test_e_f_ret, test_e_f_body, test_e_f_effects, test_e_f_decorators, test_e_f_line):
+            continue if not test_name_selected(test_e_f_name, names)
+            is_test: mutable bool = false
+            for test_e_f_decorator in test_e_f_decorators |is_test|:
+                is_test <- true if test_e_f_decorator.name == "test"
+            continue if not is_test
+            for test_e_f_effect in test_e_f_effects |effects|:
+                seen: mutable bool = false
+                for known_effect in effects |seen, test_e_f_effect|:
+                    seen <- true if known_effect == test_e_f_effect
+                effects.push(test_e_f_effect) if not seen
+
+
+
+
+# One `puts("<prefix><name>".cast[u8&])` line, TAB-indented to `depth` — stage0's
+# synthesized body uses tabs, not spaces.
+def test_push_puts(buffer: mutable darray[u8]&, depth: i64, prefix: sview, name: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    for tab_index in 0..<depth |buffer|:
+        buffer.push(9)
+    emit_tokens_push_sview(buffer, "puts(\"")
+    emit_tokens_push_sview(buffer, prefix)
+    emit_tokens_push_sview(buffer, name)
+    emit_tokens_push_sview(buffer, "\".cast[u8&])\n")
+
+
+
+
+def emit_test_runner_report(file: Ast::File&, source: u8&, source_len: usize) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    needle: mutable darray[u8] = []
+    push_test_filter(&needle)
+    names: mutable darray[sview] = []
+    test_collect_names(file.top_decls, needle, &names)
+    effects: mutable darray[sview] = ["Console.Write"]
+    test_collect_effects(file.top_decls, names, &effects)
+
+    buffer: mutable darray[u8] = []
+    # The unit's source, attributed to the original file. For a SINGLE-FILE unit this is
+    # byte-identical to stage0. For an include-bearing unit stage0's echo also carries a
+    # directive per spliced file, which stage1's flattening does not emit; the emitted
+    # runner still compiles and runs. See the emit-mode-port-order note for why emitting
+    # those directives upstream currently breaks the line-keyed token recovery.
+    # With the directives spliced, the unit already opens with stage0's own `#line 1`:
+    # stage0's runner emitter adds none of its own over the expanded buffer.
+    if not line_directives_enabled():
+        emit_tokens_push_sview(&buffer, "#line 1 ")
+        push_absolute_source_path(&buffer)
+        buffer.push(10)
+    for source_index in 0..<source_len |buffer, source|:
+        byte_ref: u8& = source + source_index.i64()
+        buffer.push(byte_ref)
+    buffer.push(10) if buffer.count > 0 and buffer[buffer.count - 1] != 10
+
+    buffer.push(10)
+    # stage0 declares `puts` only when the unit does not already (a substring test over the
+    # expanded source — an included prelude that declares it counts).
+    declares_puts: mutable bool = false
+    puts_needle: sview = "extern puts("
+    puts_needle_len: usize = sview_len(puts_needle)
+    if source_len >= puts_needle_len:
+        for probe in 0..<(source_len - puts_needle_len + 1.usize()) |declares_puts, source, puts_needle, puts_needle_len|:
+            break if declares_puts
+            matched: mutable bool = true
+            for puts_needle_index in 0..<puts_needle_len |matched, source, puts_needle, probe|:
+                break if not matched
+                probe_ref: u8& = source + (probe + puts_needle_index).i64()
+                matched <- false if probe_ref != sview_at(puts_needle, puts_needle_index)
+            declares_puts <- true if matched
+    emit_tokens_push_sview(&buffer, "extern puts(text: u8&) -> int can[Console.Write]\n\n") if not declares_puts
+    emit_tokens_push_sview(&buffer, "def ctx_test_main() -> int can[")
+    for effect_index in 0..<effects.count |buffer, effects|:
+        emit_tokens_push_sview(&buffer, ", ") if effect_index > 0
+        emit_tokens_push_sview(&buffer, effects[effect_index])
+    emit_tokens_push_sview(&buffer, "]:\n")
+    if names.count == 0:
+        # ONE tab, and the grant sits on the CALL rather than a surrounding block.
+        emit_tokens_push_sview(&buffer, "\tputs(\"[ NO TESTS ] no @test functions matched filter \\\"")
+        for needle_index in 0..<needle.count |buffer, needle|:
+            buffer.push(needle[needle_index])
+        emit_tokens_push_sview(&buffer, "\\\"\".cast[u8&]) can Console.Write\n\treturn 1\n")
+    else:
+        emit_tokens_push_sview(&buffer, "\tcan ")
+        for effect_index in 0..<effects.count |buffer, effects|:
+            emit_tokens_push_sview(&buffer, ", ") if effect_index > 0
+            emit_tokens_push_sview(&buffer, effects[effect_index])
+        emit_tokens_push_sview(&buffer, ":\n")
+        for test_name in names |buffer|:
+            test_push_puts(&buffer, 2, "[ RUN      ] ", test_name)
+            buffer.push(9)
+            buffer.push(9)
+            emit_tokens_push_sview(&buffer, test_name)
+            emit_tokens_push_sview(&buffer, "()\n")
+            test_push_puts(&buffer, 2, "[       OK ] ", test_name)
+        buffer.push(9)
+        buffer.push(9)
+        emit_tokens_push_sview(&buffer, "puts(\"[ SUMMARY  ] ")
+        append_decimal(&buffer, names.count.u32())
+        emit_tokens_push_sview(&buffer, " test(s) selected; runnable=")
+        append_decimal(&buffer, names.count.u32())
+        emit_tokens_push_sview(&buffer, " skipped=0 failed=0\".cast[u8&])\n\t\treturn 0\n")
+    emit_tokens_push_sview(&buffer, "\nexport fn main() -> int = ctx_test_main\n")
+    return emit_tokens_flush(buffer)

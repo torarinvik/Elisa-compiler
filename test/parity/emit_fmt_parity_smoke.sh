@@ -2,10 +2,9 @@
 # `-emit fmt` BYTE PARITY, RATCHETED: the unparser port is landing arm by arm, and every
 # unported shape prints a loud <fmt-*-todo> marker — so the honest gate is a RATCHET on
 # the count of fixtures that round-trip byte-identically against stage0. Going below the
-# baseline fails; raising it is a one-line commit when new arms land. Known ceiling: a
-# container-declaring body prints stage0's internal `__auto_N` region counter, which is
-# not source-derivable (see stage1-parity-status memory) — those fixtures stay above the
-# ratchet until an upstream stable-name change.
+# baseline fails; raising it is a one-line commit when new arms land. (`__auto_<N>` is no
+# longer a ceiling: N is the `def` token's byte offset in stage0's directive-bearing
+# expansion, and since the driver splices the same directives the offset is stage1's own.)
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

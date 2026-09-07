@@ -1,0 +1,117 @@
+# Stage1 backend — OPTIONAL values: wrapping a payload into `T?` in either the niche (a null
+# pointer) or the tagged (`{i1, payload}`) representation, and reading the presence bit and
+# payload back out. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+            # Whether an expression is the `null` literal (an IDENT named "null" in the AST).
+        def is_null_literal(expression: Expr) -> bool can[Abort.Panic]:
+            return match expression:
+                Expr.Ident(name, line): name == "null"
+                _: false
+
+
+
+
+            # Whether an expression is the `zeroed` literal — an IDENT, exactly like `null`.
+            # Both are UNTYPED: they take the context type, so a comparison against one
+            # arrives at the backend with the other operand's type and Unmodeled.
+        def is_zeroed_literal(expression: Expr) -> bool can[Abort.Panic]:
+            return match expression:
+                Expr.Ident(zeroed_name, zeroed_line): zeroed_name == "zeroed"
+                _: false
+
+
+
+
+        # Wrap `value` (of type `payload`) into a `T?` — `{true, value}`.
+        #
+        # Built through a slot rather than insertvalue: the tag and payload are two plain
+        # stores, and SROA collapses it at -O2 exactly the same. An Elisa expression of
+        # payload type in an optional context is implicitly wrapped — the language has no
+        # `some(x)`, so this is where that happens.
+        # `force_null_test` — derive the tag from `value != null` even when the payload type
+        # says the reference cannot be null. A REINTERPRET (`heapptr.cast[u8&?]`) is exactly
+        # that case: the payload annotation is a plain `u8&`, but the value came from a raw
+        # pointer that may well be null, and a constant `true` tag would hand the program a
+        # null it believes is a real reference.
+        # NICHE-OPTIMIZED: an optional whose payload is a POINTER needs no separate tag,
+        # because null already means absent. stage0 lowers `T&?` / `heap T&?` / `cstr?` to a
+        # BARE pointer, and stage1 must too — this is not an internal choice. A `{i1, ptr}`
+        # differs in SIZE, so every struct with such a field puts its later fields at
+        # different offsets than the stage0-compiled runtime expects (measured: `count`
+        # after a `heap T&?` sits at 8 in stage0, 16 in stage1). The bootstrap fixpoint
+        # cannot see it — it only proves stage1 agrees with itself.
+        # THE SWITCH. Returning true here (with the matching early return in
+        # llvm_type_of) niche-optimizes optional pointers and fixes the ABI. It is ON:
+        # the earlier self-host segfault this comment used to describe was resolved
+        # during the 2026-08-02 struct-layout work, and both probe shapes (a struct
+        # field after an optional-ref member, and an optional-ref array stride) have
+        # matched stage0 since — pinned by test/repro/optional_ref_niche_layout.elisa.
+        # Everything else is already routed through optional_tag_of /
+        # optional_payload_value_of.
+        def optional_is_niche(optional_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                false return if optional_type.kind != TypeKind.Optional
+                niche_payload: ValueType = optional_payload_of(optional_type, structs)
+                return niche_payload.kind == TypeKind.Ref or niche_payload.kind == TypeKind.CStr or niche_payload.kind == TypeKind.Fn or niche_payload.kind == TypeKind.PyObject
+
+
+
+
+            # The PRESENCE bit of an optional VALUE. Niche form: a null test on the pointer.
+        def optional_tag_of(optional_value: LLVMValueRef, optional_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic:
+                if optional_is_niche(optional_type, structs):
+                    return LLVMBuildICmp(builder, 33, optional_value, LLVMConstNull(LLVMPointerTypeInContext(ctx, 0)), "opt.present")
+                return LLVMBuildExtractValue(builder, optional_value, 0, "opt.tag")
+
+
+
+
+            # The PAYLOAD of an optional VALUE. Niche form: the value IS the payload.
+        def optional_payload_value_of(optional_value: LLVMValueRef, optional_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic:
+                optional_value return if optional_is_niche(optional_type, structs)
+                return LLVMBuildExtractValue(builder, optional_value, 1, "opt.payload")
+
+
+
+
+        def wrap_optional_tagged(value: LLVMValueRef, optional_type: ValueType, force_null_test: bool, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # Niche form: the pointer IS the optional. No tag to compute, and the
+            # force_null_test / heap-ref distinction disappears with it — absence is
+            # exactly null, which is what stage0 emits.
+            value return if optional_is_niche(optional_type, structs)
+            optional_llvm: LLVMTypeRef = llvm_type_of(optional_type, structs, ctx)
+            slot: LLVMValueRef = LLVMBuildAlloca(builder, optional_llvm, "opt")
+            tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, slot, 0, "opt.tag.ptr")
+            # A HEAP pointer carries its own absence: null IS the empty case, which is how
+            # stage0 represents `heap T&?` (a bare `ptr`, tested with `icmp ne ptr, null`).
+            # Wrapping one with a hardcoded `true` tag would report a FAILED `malloc` as
+            # present and hand the program a null it believes is real. An ordinary `T&` is
+            # never null, so it keeps the constant tag.
+            payload_type: ValueType = optional_payload_of(optional_type, structs)
+            # An opaque extern handle (`LLVMBasicBlockRef`, modeled as CStr) and a `cstr`
+            # are BARE pointers whose absence is null — an extern declared `-> T?` returns
+            # exactly that. A constant `true` tag turned `LLVMGetFirstBasicBlock` on a
+            # body-less function into `Some(null)`, and the caller then handed null to
+            # LLVMDeleteBasicBlock.
+            if force_null_test or payload_type.kind == TypeKind.CStr or (payload_type.kind == TypeKind.Ref and ref_is_heap_ref(payload_type, structs)):
+                null_pointer: LLVMValueRef = LLVMConstNull(LLVMPointerTypeInContext(ctx, 0))
+                _ = LLVMBuildStore(builder, LLVMBuildICmp(builder, 33, value, null_pointer, "opt.present"), tag_pointer)
+            else:
+                _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, 0), tag_pointer)
+            value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, optional_llvm, slot, 1, "opt.value.ptr")
+            _ = LLVMBuildStore(builder, value, value_pointer)
+            return LLVMBuildLoad2(builder, optional_llvm, slot, "opt.wrapped")
+
+
+
+
+        # The ordinary wrap: the payload TYPE decides whether the tag is a null test.
+        def wrap_optional(value: LLVMValueRef, optional_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return wrap_optional_tagged(value, optional_type, false, structs, ctx, builder)

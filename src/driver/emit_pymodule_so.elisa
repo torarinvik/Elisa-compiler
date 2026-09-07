@@ -1,0 +1,218 @@
+# `-emit pymodule-so` — the complete Python extension pipeline, in the driver (§4.5).
+#
+# The compiler already owns every language-facing piece: the export manifest, the CPython C
+# shim and the native object are all produced in-process by the emitters this file calls.
+# What is left is the PLATFORM toolchain, plus three facts that only the TARGET INTERPRETER
+# can answer — its extension suffix, the set of suffixes its import machinery recognises,
+# and where its headers live. Those are read by spawning that interpreter, exactly as
+# scripts/elisac_stage1.sh did: rederiving EXT_SUFFIX here would be guessing at the very
+# thing the two-interpreter mismatch guard exists to catch, and the guess would be wrong on
+# the first free-threaded or PyPy build someone points at it.
+#
+# The work directory is per-process and removed on the way out. The object is emitted into
+# it by main() before this runs, because the FINAL output name is not known until the module
+# name and the interpreter's suffix are both in hand.
+
+def pymodule_so_error(message: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    line: mutable darray[u8] = []
+    emit_tokens_push_sview(&line, "-emit pymodule-so ")
+    for index in 0..<message.count |line, message|:
+        line.push(message[index])
+    emit_tokens_push_sview(&line, "\n")
+    write_stderr(line)
+    return 2
+
+
+
+
+# The module name the manifest carries, read off the same annotation row the manifest
+# emitter reads. The driver never parses its own JSON back.
+def pymodule_so_module_name(file: Ast::File&) -> sview can[Abort.Panic, Memory.Allocate]:
+    name: mutable sview = ""
+    for annotation in file.enum_annotations |name|:
+        name <- annotation.owner if annotation.name == "__export_pymodule" and name == ""
+    return name
+
+
+
+
+# `$TMPDIR/elisa-pymodule-<pid>`, created. Per-process so two concurrent builds of the same
+# source cannot overwrite each other's shim.
+def pymodule_so_work_dir(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    tmp: mutable darray[u8] = []
+    if env_value("TMPDIR", &tmp) and tmp.count > 0:
+        for index in 0..<tmp.count |buffer, tmp|:
+            buffer.push(tmp[index])
+        buffer.pop() if buffer.count > 0.usize() and buffer[buffer.count - 1.usize()] == 47
+    else:
+        emit_tokens_push_sview(buffer, "/tmp")
+    emit_tokens_push_sview(buffer, "/elisa-pymodule-")
+    append_decimal_i64(buffer, elisa_stage1_getpid())
+    make_directory(buffer)
+
+
+
+
+def pymodule_so_join(buffer: mutable darray[u8]&, directory: darray[u8]&, leaf: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    for index in 0..<directory.count |buffer, directory|:
+        buffer.push(directory[index])
+    buffer.push(47)
+    emit_tokens_push_sview(buffer, leaf)
+
+
+
+
+# Run `command`, sending its stdout to a file in `work`, and read that file back with the
+# trailing newline removed. Answers false when the command failed OR printed nothing, which
+# is what every caller here wants: an interpreter that cannot answer is not an answer.
+def pymodule_so_capture(command: darray[u8]&, work: darray[u8]&, out: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    capture_path: mutable darray[u8] = []
+    pymodule_so_join(&capture_path, work, "capture.txt")
+    line: mutable darray[u8] = [entry for entry in command]
+    emit_tokens_push_sview(&line, " > ")
+    carchive_push_quoted(&line, capture_path)
+    line.push(0)
+    status: i64 = system((&line[0]).cast[cstr] can Unsafe.PointerCast) / 256
+    false return if status != 0
+    capture_path.push(0)
+    contents: darray[u8] = read_file((&capture_path[0]).cast[cstr] can Unsafe.PointerCast)
+    for index in 0..<contents.count |out, contents|:
+        out.push(contents[index])
+    while out.count > 0.usize() and (out[out.count - 1.usize()] == 10 or out[out.count - 1.usize()] == 13) |out|:
+        out.pop()
+    return out.count > 0.usize()
+
+
+
+
+# The interpreter to build against: PYTHON_BIN when the host names one, else `python3` from
+# PATH. A bare name is left bare so the shell resolves it, matching the wrapper.
+def pymodule_so_python(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    wasm_push_env_or(buffer, "ELISA_STAGE1_PYTHON", "")
+    return if buffer.count > 0.usize()
+    wasm_push_env_or(buffer, "PYTHON_BIN", "python3")
+
+
+
+
+# clang from the SAME LLVM installation the product was built against, because a newer
+# Homebrew LLVM emits attributes an older Apple clang cannot parse.
+def pymodule_so_clang(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    explicit: mutable darray[u8] = []
+    if env_value("ELISA_CLANG", &explicit) and explicit.count > 0:
+        for index in 0..<explicit.count |buffer, explicit|:
+            buffer.push(explicit[index])
+        return
+    llvm_bin: mutable darray[u8] = []
+    pymodule_so_llvm_bin_dir(&llvm_bin)
+    if llvm_bin.count > 0:
+        candidate: mutable darray[u8] = [entry for entry in llvm_bin]
+        emit_tokens_push_sview(&candidate, "/clang")
+        if wasm_executable(candidate):
+            for index in 0..<candidate.count |buffer, candidate|:
+                buffer.push(candidate[index])
+            return
+    emit_tokens_push_sview(buffer, "clang")
+
+
+
+
+# The LLVM installation whose C API the product was built against. `ELISA_LLVM_BIN_DIR` when
+# the host names one; otherwise the directory of `LLVM_CONFIG`, and finally Homebrew's, which
+# is where every other default in this repo points. Apple clang can link ordinary objects but
+# may not parse textual IR from a newer LLVM, so the two must match.
+def pymodule_so_llvm_bin_dir(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    explicit: mutable darray[u8] = []
+    if env_value("ELISA_LLVM_BIN_DIR", &explicit) and explicit.count > 0:
+        for index in 0..<explicit.count |buffer, explicit|:
+            buffer.push(explicit[index])
+        return
+    config: mutable darray[u8] = []
+    if env_value("LLVM_CONFIG", &config) and config.count > 0:
+        directory: darray[u8] = path_directory(config)
+        if directory.count > 0:
+            for index in 0..<directory.count |buffer, directory|:
+                buffer.push(directory[index])
+            buffer.pop() if buffer.count > 0.usize() and buffer[buffer.count - 1.usize()] == 47
+            return
+    emit_tokens_push_sview(buffer, "/opt/homebrew/opt/llvm/bin")
+
+
+
+
+# An LLVM binutil (`llvm-nm`, `llvm-objcopy`) beside the clang the product uses, or "" when
+# the host has none. Both audits below are SKIPPED rather than failed when it is missing —
+# the wrapper behaved the same way, and a host without llvm-nm can still produce a working
+# extension.
+def pymodule_so_llvm_tool(name: sview, override_name: sview, buffer: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    explicit: mutable darray[u8] = []
+    if env_value(override_name, &explicit) and explicit.count > 0 and wasm_executable(explicit):
+        for index in 0..<explicit.count |buffer, explicit|:
+            buffer.push(explicit[index])
+        return true
+    llvm_bin: mutable darray[u8] = []
+    pymodule_so_llvm_bin_dir(&llvm_bin)
+    false return if llvm_bin.count == 0
+    candidate: mutable darray[u8] = [entry for entry in llvm_bin]
+    candidate.push(47)
+    emit_tokens_push_sview(&candidate, name)
+    false return if not wasm_executable(candidate)
+    for index in 0..<candidate.count |buffer, candidate|:
+        buffer.push(candidate[index])
+    return true
+
+
+
+
+# The prebuilt Elisa runtime object every extension links against.
+def pymodule_so_runtime_object(root: darray[u8]&, buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    explicit: mutable darray[u8] = []
+    if env_value("ELISA_RUNTIME_OBJ", &explicit) and explicit.count > 0:
+        for index in 0..<explicit.count |buffer, explicit|:
+            buffer.push(explicit[index])
+        return
+    for index in 0..<root.count |buffer, root|:
+        buffer.push(root[index])
+    emit_tokens_push_sview(buffer, "/build/runtime/elisacore_runtime.o")
+
+
+
+
+# Does `text` end with `suffix`?
+def pymodule_so_ends_with(text: darray[u8]&, suffix: darray[u8]&, start: usize, stop: usize) -> bool can[Abort.Panic]:
+    length: usize = stop - start
+    false return if length == 0.usize() or length > text.count
+    base: usize = text.count - length
+    for index in 0..<length |text, suffix, base, start|:
+        false return if text[base + index] != suffix[start + index]
+    return true
+
+
+
+
+# One `\n`-separated line of `text` at a time, as (start, stop) into it.
+def pymodule_so_line_stop(text: darray[u8]&, start: usize) -> usize can[Abort.Panic]:
+    stop: mutable usize = start
+    while stop < text.count and text[stop] != 10 |stop, text|:
+        stop <- stop + 1.usize()
+    return stop
+
+
+
+
+# The basename of `path`, as a start offset into it.
+def pymodule_so_basename_start(path: darray[u8]&) -> usize can[Abort.Panic]:
+    start: mutable usize = 0.usize()
+    for index in 0..<path.count |start, path|:
+        start <- index + 1.usize() if path[index] == 47
+    return start
+
+
+
+
+# The host the extension is being linked for. `ELISA_HOST_LINUX` is the same signal
+# ProjectSystem::host_platform_name reads — the one place in the port that is specialised to
+# the machine the compiler was built for.
+def host_platform_is_darwin() -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    marker: mutable darray[u8] = []
+    return not (env_value("ELISA_HOST_LINUX", &marker) and marker.count > 0)

@@ -1,0 +1,580 @@
+# Stage1 backend — the CALL-shaped expression statements, the longest of the statement forms:
+# a method call on a container, a store operation, a submitted task, and every other call
+# emitted for its effect rather than its value. The chain's last link, so this is where
+# `handled <- false` finally declines. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_statement_expr_calls(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match statement:
+                Stmt.Expr(statement_expression, statement_expression_line):
+                    # `pass` parses to Stmt.Expr(Expr.Invalid) — a deliberate no-op, so emit nothing
+                    # and stay open (emitting Expr.Invalid as a value would decline the function).
+                    match statement_expression:
+                        Expr.Invalid:
+                            return EmitStatus.Open
+                        _:
+                            pass
+                    # `f(a) if COND else g(b)` — a TERNARY in STATEMENT position, where both arms
+                    # are side-effecting CALLS rather than values (semantic_api_message picks
+                    # between two `buffer.extend(...)` calls this way). Emitting it as a VALUE
+                    # declines: the arms are void. Lower it as an if/else over the two arms run as
+                    # STATEMENTS, which is what it means.
+                    match statement_expression:
+                        Expr.If(ternary_condition, ternary_then, ternary_else, ternary_line):
+                            match ternary_else:
+                                Expr.Absent:
+                                    pass
+                                _:
+                                    if emit_condition(ternary_condition, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ternary_bit:
+                                        ternary_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                        ternary_then_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ternary_function, "ternary.then")
+                                        ternary_else_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ternary_function, "ternary.else")
+                                        ternary_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ternary_function, "ternary.done")
+                                        _ = LLVMBuildCondBr(builder, ternary_bit, ternary_then_block, ternary_else_block)
+                                        LLVMPositionBuilderAtEnd(builder, ternary_then_block)
+                                        ternary_then_status: EmitStatus = emit_statement((Stmt.Expr(ternary_then, ternary_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                        EmitStatus.Declined return if ternary_then_status == EmitStatus.Declined
+                                        branch_if_open(ternary_then_status, builder, ternary_done_block)
+                                        LLVMPositionBuilderAtEnd(builder, ternary_else_block)
+                                        ternary_else_status: EmitStatus = emit_statement((Stmt.Expr(ternary_else, ternary_line)), return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                        EmitStatus.Declined return if ternary_else_status == EmitStatus.Declined
+                                        branch_if_open(ternary_else_status, builder, ternary_done_block)
+                                        LLVMPositionBuilderAtEnd(builder, ternary_done_block)
+                                        return EmitStatus.Open
+                                    return EmitStatus.Declined
+                        _:
+                            pass
+                    # A bare IDENT as a statement is the accumulator yield of a capture-listed loop,
+                    # restated per branch: `for d in ds |table| -> table:` whose match arms each end
+                    # in `table`. The loop's own `-> table` is already treated as a no-op annotation
+                    # below (captures mutate in place), and these per-arm restatements are the same
+                    # annotation — evaluating an identifier has no effect, so emit nothing.
+                    #
+                    # Only when the name is a LOCAL IN SCOPE. That is what keeps this from
+                    # resurrecting the THREADING form `|n = 0| -> n + x`, where the yield really does
+                    # feed the next iteration and discarding it would be a silent wrong answer:
+                    # stage0 gives that form a shadowing loop-local (verified — the outer `n` is
+                    # unchanged), stage1 models no such local and declines the whole `for` before
+                    # reaching the body. A non-Ident yield is not matched here at all.
+                    match statement_expression:
+                        Expr.Ident(bare_stmt_name, bare_stmt_line):
+                            EmitStatus.Open return if lookup_type(local_scope, bare_stmt_name).kind != TypeKind.Unmodeled
+                        _:
+                            pass
+                    # A bare LITERAL as a statement (`0` on its own line) is a no-op stage0 accepts
+                    # and emits nothing for. It reaches here as an ordinary value expression and
+                    # declined the whole function — which mattered because it is the natural way to
+                    # end a `catch` arm, where stage0 REQUIRES an expression tail.
+                    match statement_expression:
+                        Expr.IntLit:
+                            return EmitStatus.Open
+                        Expr.BoolLit:
+                            return EmitStatus.Open
+                        Expr.FloatLit:
+                            return EmitStatus.Open
+                        _:
+                            pass
+                    # A capture-listed loop (`for … |m, total|:`) parses as
+                    # Stmt.Expr(Expr.Block([accumulator decls…, the loop], yield, captures)).
+                    # In STATEMENT position with no yield the block is just its statements —
+                    # captures are annotations, and the accumulator declarations are emitted as
+                    # ordinary VarDecls in the ENCLOSING scope. A block WITH a yield is a value
+                    # position and stays unmodeled here.
+                    #
+                    # WARNING: enclosing-scope emission is only sound for a capture WITHOUT an
+                    # initializer (`|acc|`), which names an existing outer local and mutates it in
+                    # place. An INITIALIZED capture (`|n = 0|`) is a different thing: stage0 gives
+                    # it a SHADOWING loop-local, so the outer `n` is untouched after the loop.
+                    # Measured, not assumed — this comment previously claimed "stage0 scopes them
+                    # the same way" and that is FALSE: for
+                    #     n: mutable i64 = 100
+                    #     for x in xs |n = 0|: n <- n + x
+                    #     return n
+                    # stage0 returns 100, while emitting the decl into the enclosing scope returns
+                    # the accumulated 4. The initialized form is kept DECLINING for exactly this
+                    # reason (its untyped decl fails to resolve a type, which is what stops it
+                    # today); do not "fix" that type inference without also giving the accumulator
+                    # its own scope, or the loop silently returns the wrong variable.
+                    match statement_expression:
+                        Expr.Block(block_statements, block_value, block_captures, block_line):
+                            # A submitted task is represented as an empty value block too, but it is
+                            # still a STATEMENT semantically. Route it through emit_expression so the
+                            # pool submission lowering runs instead of treating the non-invalid tail as
+                            # an unsupported value-block statement.
+                            if block_statements.count == 0:
+                                for submit_marker in structs.fn_return_lines |structs, block_line|:
+                                    if submit_marker == block_line.line:
+                                        if fn_return_head_at(block_line.line, structs) == "__wait_all":
+                                            wait_all_arguments: mutable darray[Expr] = [block_value]
+                                            if emit_call(Expr.Ident("task_group_wait_all", block_line), wait_all_arguments, [], local_scope, fns, structs, generics, runtime, m, ctx, builder) is waited_all:
+                                                _ = waited_all
+                                                return EmitStatus.Open
+                                            return EmitStatus.Declined
+                                        if emit_expression(statement_expression, ValueType{kind: TypeKind.Void, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is submitted_statement:
+                                            _ = submitted_statement
+                                            return EmitStatus.Open
+                                        return EmitStatus.Declined
+                            # Loop headers `for … |cap| -> cap:` yield the capture back for rebinding.
+                            # In statement position lmut/captures already mutate in place, so a yield
+                            # that is just the capture Ident is a no-op annotation — emit the body.
+                            # (Lexer `for _ in count..>0 |lexer| -> lexer:` is this form.)
+                            # In STATEMENT position the yield is a no-op annotation: bare captures
+                            # mutate in place, and an initialized accumulator is a block-scoped local
+                            # whose value has nowhere to go. Accept a bare capture ident, an accumulator
+                            # this block declares, and a TUPLE of those — `for s in xs |a, b| -> a, b:`
+                            # is how the semantic layer's multi-accumulator walkers are written, and the
+                            # tuple form declined outright.
+                            #
+                            # Restricted to names this block BINDS. A yield naming anything else would be
+                            # a real value being discarded, which is not safe to assume.
+                            yield_ok: mutable bool = block_value is Expr.Invalid
+                            match block_value:
+                                Expr.Ident(yield_name, yield_line):
+                                    yield_ok <- block_yield_name_is_bound(yield_name, block_captures, block_statements)
+                                _:
+                                    pass
+                            match block_value:
+                                Expr.Tuple(yield_elements, yield_tuple_line):
+                                    yield_all_bound: mutable bool = yield_elements.count > 0
+                                    for yield_element in yield_elements |yield_all_bound, block_captures, block_statements|:
+                                        match yield_element:
+                                            Expr.Ident(yield_el_name, _):
+                                                yield_all_bound <- false if not block_yield_name_is_bound(yield_el_name, block_captures, block_statements)
+                                            _:
+                                                yield_all_bound <- false
+                                    yield_ok <- yield_all_bound
+                                _:
+                                    pass
+                            EmitStatus.Declined return if not yield_ok
+                            # An INITIALIZED capture (`|n = 0|`) desugars to an untyped VarDecl named by
+                            # the capture list. stage0 gives it a SHADOWING loop-local, so it must NOT
+                            # survive into the enclosing scope — emitting it there makes the loop mutate
+                            # the caller's variable of the same name (measured: 4 where stage0 gives 100,
+                            # see the WARNING above). Emit the whole block scoped so the accumulator dies
+                            # with it.
+                            #
+                            # Only when such a decl is actually present: an UNINITIALIZED capture
+                            # (`|acc|`) names an existing outer local that the body mutates in place, and
+                            # scoping that would be wrong in the other direction — the mutation has to
+                            # outlive the loop.
+                            block_has_accumulator_decl: mutable bool = false
+                            for acc_stmt in block_statements |block_has_accumulator_decl, block_captures|:
+                                match acc_stmt:
+                                    Stmt.VarDecl(acc_name, acc_type, acc_value, acc_line):
+                                        # Typed (`|position: usize = 0|`) as well as untyped: an INITIALIZED
+                                        # capture shadows either way, so both must be block-scoped.
+                                        block_has_accumulator_decl <- true
+                                    _:
+                                        pass
+                            if block_has_accumulator_decl:
+                                return emit_statements_scoped(block_statements, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                            return emit_statements(block_statements, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                        _:
+                            pass
+                    match statement_expression:
+                        Expr.Call(push_callee, push_arguments, push_argument_names, push_call_line):
+                            # A C callback stored in a struct field is an indirect function
+                            # value, not UFCS: `hooks.deallocate(ptr)` and
+                            # `buffer.hooks.reallocate(old, n)` must use the same raw/closure
+                            # lowering as an indirect local call. This check belongs before the
+                            # darray/UFCS statement dispatch, which otherwise tries to resolve
+                            # `deallocate` as a named Elisa function and declines the whole
+                            # enclosing C function.
+                            statement_callee_type: ValueType = expression_type(push_callee, local_scope, fns, structs, generics)
+                            statement_callee_callable: mutable bool = statement_callee_type.kind == TypeKind.Fn
+                            if statement_callee_type.kind == TypeKind.Optional:
+                                statement_callee_callable <- optional_payload_of(statement_callee_type, structs).kind == TypeKind.Fn
+                            if statement_callee_callable:
+                                statement_call_result: ValueType = expression_type(statement_expression, local_scope, fns, structs, generics)
+                                if emit_fn_value_call(push_callee, push_arguments, statement_call_result, local_scope, fns, structs, generics, runtime, m, ctx, builder) is statement_fn_result:
+                                    _ = statement_fn_result
+                                    return EmitStatus.Open
+                                return EmitStatus.Declined
+                            match push_callee:
+                                Expr.Field(push_object, push_method, push_method_line):
+                                    # Receiver may be a bare Ident (`xs.push`) or a struct field holding a
+                                    # darray (`b.items.push`), both resolved by the _expr helpers.
+                                    push_type: ValueType = darray_type_behind_expr(push_object, local_scope, structs)
+                                    # `rows.push(a, b)` / `rows.reserve(n)` on a `layout(soa)` aggregate --
+                                    # ROW-level operations that fan out over the columns. One argument per
+                                    # column for push (in declaration order); reserve takes one count and
+                                    # applies it to every column.
+                                    soa_recv: ValueType = expression_type(push_object, local_scope, fns, structs, generics)
+                                    if soa_recv.kind == TypeKind.Struct and struct_declares_soa_layout(structs, structs.names[soa_recv.bits.usize()]):
+                                        soa_slot: usize = soa_recv.bits.usize()
+                                        soa_columns: usize = structs.field_count[soa_slot]
+                                        if push_method == "push" and push_arguments.count == soa_columns and soa_columns > 0.usize():
+                                            if struct_chain_address(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_push_address:
+                                                soa_push_llvm: LLVMTypeRef = llvm_type_of(soa_recv, structs, ctx)
+                                                soa_push_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                                soa_push_declined: mutable bool = false
+                                                for soa_push_index in 0..<soa_columns |soa_push_declined, soa_push_address, soa_push_llvm, soa_slot, push_arguments, local_scope, fns, structs, generics, soa_push_runtime, m, ctx, builder|:
+                                                    soa_push_column: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_push_llvm, soa_push_address, soa_push_index.u32(), "soa.push.col")
+                                                    soa_push_type: ValueType = copied_type(structs.field_types[structs.field_start[soa_slot] + soa_push_index])
+                                                    soa_push_declined <- true if not emit_darray_push(soa_push_column, soa_push_type, push_arguments[soa_push_index], local_scope, fns, structs, generics, soa_push_runtime, m, ctx, builder)
+                                                EmitStatus.Declined return if soa_push_declined
+                                                return EmitStatus.Open
+                                            return EmitStatus.Declined
+                                        if push_method == "reserve" and push_arguments.count == 1 and soa_columns > 0.usize():
+                                            if struct_chain_address(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_res_address:
+                                                if emit_expression(push_arguments[0], ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_res_needed:
+                                                    soa_res_llvm: LLVMTypeRef = llvm_type_of(soa_recv, structs, ctx)
+                                                    soa_res_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                                    soa_res_declined: mutable bool = false
+                                                    for soa_res_index in 0..<soa_columns |soa_res_declined, soa_res_address, soa_res_llvm, soa_slot, soa_res_needed, structs, soa_res_runtime, m, ctx, builder|:
+                                                        soa_res_column: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_res_llvm, soa_res_address, soa_res_index.u32(), "soa.reserve.col")
+                                                        soa_res_type: ValueType = copied_type(structs.field_types[structs.field_start[soa_slot] + soa_res_index])
+                                                        soa_res_declined <- true if not emit_darray_reserve(soa_res_column, soa_res_type, soa_res_needed, structs, soa_res_runtime, m, ctx, builder)
+                                                    EmitStatus.Declined return if soa_res_declined
+                                                    return EmitStatus.Open
+                                            return EmitStatus.Declined
+                                    # `xs.push([72, 105])` — an ARRAY-LITERAL argument pushes EVERY element,
+                                    # which is a bulk extend: stage0 lowers it through its
+                                    # `darray.extend.*` path, not as a single push. emit_darray_push takes
+                                    # ONE element, so the literal form declined.
+                                    #
+                                    # Pushed element-by-element here, the same way the extend path already
+                                    # handles a literal source. The elements are known at compile time, so
+                                    # there is no loop to build.
+                                    # NOT when the ELEMENT is itself an array: for `darray[array[i64, 2]]`
+                                    # the literal IS one element, not a list of them, and splitting it
+                                    # would push two i64s into a slot expecting one pair. The
+                                    # darray_of_fixed_array_push regression case catches exactly that.
+                                    push_lit_element_type: ValueType = darray_element_of(push_type, structs) if push_type.kind == TypeKind.DArray else unmodeled_type()
+                                    if push_type.kind == TypeKind.DArray and push_method == "push" and push_arguments.count == 1 and push_lit_element_type.kind != TypeKind.Array:
+                                        match push_arguments[0]:
+                                            Expr.Array(push_lit_elements, _):
+                                                if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is push_lit_slot:
+                                                    push_lit_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                                    push_lit_declined: mutable bool = false
+                                                    for push_lit_element in push_lit_elements |push_lit_declined, push_lit_slot, push_type, local_scope, fns, structs, generics, push_lit_runtime, m, ctx, builder|:
+                                                        push_lit_declined <- true if not emit_darray_push(push_lit_slot, push_type, push_lit_element, local_scope, fns, structs, generics, push_lit_runtime, m, ctx, builder)
+                                                    EmitStatus.Declined return if push_lit_declined
+                                                    return EmitStatus.Open
+                                                return EmitStatus.Declined
+                                            _:
+                                                pass
+                                    if push_type.kind == TypeKind.DArray and push_method == "push" and push_arguments.count == 1:
+                                        if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is push_slot:
+                                            push_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                            if emit_darray_push(push_slot, push_type, push_arguments[0], local_scope, fns, structs, generics, push_growth_runtime, m, ctx, builder):
+                                                return EmitStatus.Open
+                                        return EmitStatus.Declined
+                                    # `xs.clear()` — logically empty the darray by zeroing its count (the
+                                    # backing/capacity are retained, matching stage0). No element teardown is
+                                    # needed: darray elements are plain values in an arena.
+                                    if push_type.kind == TypeKind.DArray and push_method == "clear" and push_arguments.count == 0:
+                                        if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is clear_slot:
+                                            clear_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                            clear_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, clear_header, clear_slot, 1, "clear.cnt.ptr")
+                                            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), clear_count_ptr)
+                                            return EmitStatus.Open
+                                        return EmitStatus.Declined
+                                    # `xs.reserve(n)` — ensure capacity >= n without changing count or
+                                    # storing an element (see emit_darray_reserve). Works for any element
+                                    # type, so the IndexMap ctor's `map.entries.reserve(cap)` lowers here.
+                                    if push_type.kind == TypeKind.DArray and push_method == "reserve" and push_arguments.count == 1:
+                                        if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is reserve_slot:
+                                            if emit_expression(push_arguments[0], ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is reserve_n:
+                                                if emit_darray_reserve(reserve_slot, push_type, reserve_n, structs, runtime, m, ctx, builder):
+                                                    return EmitStatus.Open
+                                        return EmitStatus.Declined
+                                    # `xs.truncate(n)` — SHRINK to at most n elements: count becomes min(count,
+                                    # n). A no-op when n >= count. Pure count clamp, like clear; the backing is
+                                    # retained and growth is never triggered (truncate only shrinks).
+                                    if push_type.kind == TypeKind.DArray and push_method == "truncate" and push_arguments.count == 1:
+                                        if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is trunc_slot:
+                                            trunc_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                            if emit_expression(push_arguments[0], ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is trunc_n:
+                                                trunc_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                                trunc_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, trunc_header, trunc_slot, 1, "trunc.cnt.ptr")
+                                                trunc_count: LLVMValueRef = LLVMBuildLoad2(builder, trunc_i64, trunc_count_ptr, "trunc.cnt")
+                                                # min(count, n) via an unsigned compare (counts are non-negative).
+                                                trunc_smaller: LLVMValueRef = LLVMBuildICmp(builder, 36, trunc_n, trunc_count, "trunc.lt")
+                                                trunc_new: LLVMValueRef = LLVMBuildSelect(builder, trunc_smaller, trunc_n, trunc_count, "trunc.new")
+                                                _ = LLVMBuildStore(builder, trunc_new, trunc_count_ptr)
+                                                return EmitStatus.Open
+                                        return EmitStatus.Declined
+                                    # `xs.resize(n)` — set the length to exactly n: zero-fill new tail elements
+                                    # when growing, drop the tail when shrinking. Lowered by pushing a ZERO
+                                    # element while count < n (reusing emit_darray_push's growth), then storing
+                                    # n as the final count (which also performs the shrink case). Restricted to
+                                    # scalar element types so a `0` literal is a valid fill value.
+                                    if push_type.kind == TypeKind.DArray and push_method == "resize" and push_arguments.count == 1:
+                                        rz_elem: ValueType = darray_element_of(push_type, structs)
+                                        EmitStatus.Declined return if rz_elem.kind == TypeKind.Unmodeled
+                                        # The fill value. A SCALAR element takes the `0` literal it always
+                                        # did; anything else (a view, a struct, a nested container) takes
+                                        # `zeroed`, the language's own zero value. Restricting the whole
+                                        # method to scalars meant `darray[view[u8]].resize(n)` declined
+                                        # even though the growth loop below is element-type agnostic --
+                                        # only the fill literal ever was not.
+                                        rz_is_scalar: bool = rz_elem.kind == TypeKind.Signed or rz_elem.kind == TypeKind.Unsigned or rz_elem.kind == TypeKind.Float
+                                        rz_fill: Expr = (Expr.IntLit(0)) if rz_is_scalar else (Expr.Ident("zeroed", push_call_line))
+                                        if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rz_slot:
+                                            rz_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                            rz_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                            rz_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, rz_header, rz_slot, 1, "resize.cnt.ptr")
+                                            if emit_expression(push_arguments[0], ValueType{kind: TypeKind.Unsigned, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rz_n:
+                                                rz_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                                rz_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, rz_function, "resize.cond")
+                                                rz_push_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, rz_function, "resize.push")
+                                                rz_after: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, rz_function, "resize.after")
+                                                _ = LLVMBuildBr(builder, rz_cond)
+                                                LLVMPositionBuilderAtEnd(builder, rz_cond)
+                                                # Grow only while count < n; the ULT stops exactly at n. If the
+                                                # array is already >= n the loop body never runs.
+                                                rz_cur: LLVMValueRef = LLVMBuildLoad2(builder, rz_i64, rz_count_ptr, "resize.cur")
+                                                rz_more: LLVMValueRef = LLVMBuildICmp(builder, 36, rz_cur, rz_n, "resize.more")
+                                                _ = LLVMBuildCondBr(builder, rz_more, rz_push_block, rz_after)
+                                                LLVMPositionBuilderAtEnd(builder, rz_push_block)
+                                                rz_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                                if emit_darray_push(rz_slot, push_type, rz_fill, local_scope, fns, structs, generics, rz_growth_runtime, m, ctx, builder):
+                                                    _ = LLVMBuildBr(builder, rz_cond)
+                                                    LLVMPositionBuilderAtEnd(builder, rz_after)
+                                                    # Final count is exactly n: a no-op after growth, the shrink
+                                                    # (drop the tail) when the array started longer than n.
+                                                    _ = LLVMBuildStore(builder, rz_n, rz_count_ptr)
+                                                    return EmitStatus.Open
+                                                return EmitStatus.Declined
+                                        return EmitStatus.Declined
+                                    # `xs.extend(ys)` — append every element of the source darray to the
+                                    # target. Lowered as a push loop over the source's elements (behaviourally
+                                    # identical to stage0's grow+copy; exit-code-verified). The per-element
+                                    # value rides as a synthesized `ys[__extend_idx]` index expression so it
+                                    # reuses emit_darray_push (which handles growth) and the index-read path.
+                                    if push_type.kind == TypeKind.DArray and push_method == "extend" and push_arguments.count == 1:
+                                        ext_source_type: mutable ValueType = darray_type_behind_expr(push_arguments[0], local_scope, structs)
+                                        ext_source_type <- expression_type(push_arguments[0], local_scope, fns, structs, generics) if ext_source_type.kind == TypeKind.Unmodeled
+                                        # `darray[u8].extend(sview)` is the byte-copy form used by the
+                                        # compiler's header/parser tooling (`out.extend(text)`). A string
+                                        # view is not a darray, so the darray-only path below would decline
+                                        # every such helper and leave its body as an unresolved declaration.
+                                        # A STRING-LITERAL source (`domain_storage.extend("elisa.disjoint.")`)
+                                        # emits as an sview `{ptr, len}` at expected SView, so it reuses this path.
+                                        ext_source_is_strlit: mutable bool = false
+                                        match push_arguments[0]:
+                                            Expr.StringLit(ext_strlit_text):
+                                                ext_source_is_strlit <- true
+                                            _:
+                                                pass
+                                        # A LITERAL source (`sb.extend([0.u8()])`, how the std terminates a
+                                        # string builder). A literal has no address, so both loop paths below
+                                        # declined on darray_address_of_expr. There is nothing to loop over
+                                        # either — the element count is known here, so push each element
+                                        # expression straight through emit_darray_push (which handles growth).
+                                        match push_arguments[0]:
+                                            Expr.Array(ext_lit_elements, ext_lit_line):
+                                                if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_lit_target_slot:
+                                                    ext_lit_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                                    ext_lit_declined: mutable bool = false
+                                                    for ext_lit_element in ext_lit_elements |ext_lit_declined, ext_lit_target_slot, push_type, local_scope, fns, structs, generics, ext_lit_growth_runtime, m, ctx, builder|:
+                                                        ext_lit_declined <- true if not emit_darray_push(ext_lit_target_slot, push_type, ext_lit_element, local_scope, fns, structs, generics, ext_lit_growth_runtime, m, ctx, builder)
+                                                    EmitStatus.Declined return if ext_lit_declined
+                                                    return EmitStatus.Open
+                                                return EmitStatus.Declined
+                                            _:
+                                                pass
+                                        # `xs.extend(v)` where v is a `view[T]` — a VIEW source. Same shape
+                                        # as the sview byte-copy below (loop the length, push `src[i]`),
+                                        # but element-typed rather than fixed to u8, and the element types
+                                        # must agree. Indexing a view is already lowered, so the loop
+                                        # reuses it exactly as the sview path does.
+                                        if ext_source_type.kind == TypeKind.View and push_type.kind == TypeKind.DArray:
+                                            ext_view_element: ValueType = view_element_of(ext_source_type, structs)
+                                            ext_view_target_element: ValueType = darray_element_of(push_type, structs)
+                                            EmitStatus.Declined return if ext_view_element.kind == TypeKind.Unmodeled or ext_view_target_element.kind == TypeKind.Unmodeled
+                                            EmitStatus.Declined return if ext_view_element.kind != ext_view_target_element.kind or ext_view_element.bits != ext_view_target_element.bits
+                                            ext_view_struct: ValueType = view_struct_type(ext_source_type, structs)
+                                            EmitStatus.Declined return if ext_view_struct.kind == TypeKind.Unmodeled
+                                            if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_view_target_slot:
+                                                ext_view_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                                if emit_expression(push_arguments[0], ext_view_struct, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_view_value:
+                                                    ext_view_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                                    ext_view_len: LLVMValueRef = LLVMBuildExtractValue(builder, ext_view_value, 1, "extend.view.len")
+                                                    ext_view_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, ext_view_i64, "extend.view.i")
+                                                    _ = LLVMBuildStore(builder, LLVMConstInt(ext_view_i64, 0, 0), ext_view_index_slot)
+                                                    declare_local(local_scope, "__extend_view_idx", ext_view_index_slot, ValueType{kind: TypeKind.Signed, bits: 64})
+                                                    ext_view_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                                    ext_view_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_view_function, "extend.view.cond")
+                                                    ext_view_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_view_function, "extend.view.body")
+                                                    ext_view_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_view_function, "extend.view.done")
+                                                    _ = LLVMBuildBr(builder, ext_view_cond)
+                                                    LLVMPositionBuilderAtEnd(builder, ext_view_cond)
+                                                    ext_view_index: LLVMValueRef = LLVMBuildLoad2(builder, ext_view_i64, ext_view_index_slot, "extend.view.cur")
+                                                    ext_view_more: LLVMValueRef = LLVMBuildICmp(builder, 36, ext_view_index, ext_view_len, "extend.view.more")
+                                                    _ = LLVMBuildCondBr(builder, ext_view_more, ext_view_body, ext_view_done)
+                                                    LLVMPositionBuilderAtEnd(builder, ext_view_body)
+                                                    ext_view_index_expr: Expr = Expr.Index(push_arguments[0], Expr.Ident("__extend_view_idx", push_call_line), push_call_line)
+                                                    if emit_darray_push(ext_view_target_slot, push_type, ext_view_index_expr, local_scope, fns, structs, generics, ext_view_growth_runtime, m, ctx, builder):
+                                                        ext_view_next: LLVMValueRef = LLVMBuildAdd(builder, ext_view_index, LLVMConstInt(ext_view_i64, 1, 0), "extend.view.next")
+                                                        _ = LLVMBuildStore(builder, ext_view_next, ext_view_index_slot)
+                                                        _ = LLVMBuildBr(builder, ext_view_cond)
+                                                        LLVMPositionBuilderAtEnd(builder, ext_view_done)
+                                                        return EmitStatus.Open
+                                                    return EmitStatus.Declined
+                                            return EmitStatus.Declined
+                                        if (ext_source_type.kind == TypeKind.SView or ext_source_is_strlit) and push_type.kind == TypeKind.DArray:
+                                            ext_byte_element: ValueType = darray_element_of(push_type, structs)
+                                            EmitStatus.Declined return if ext_byte_element.kind != TypeKind.Unsigned or ext_byte_element.bits != 8
+                                            ext_sview_source_type: ValueType = ValueType{kind: TypeKind.SView, bits: 0}
+                                            if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_sview_target_slot:
+                                                ext_sview_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                                if emit_expression(push_arguments[0], ext_sview_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_sview_value:
+                                                    ext_sview_len: LLVMValueRef = LLVMBuildExtractValue(builder, ext_sview_value, 1, "extend.sview.len")
+                                                    ext_sview_index_slot: LLVMValueRef = LLVMBuildAlloca(builder, LLVMInt64TypeInContext(ctx), "extend.sview.i")
+                                                    _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), ext_sview_index_slot)
+                                                    declare_local(local_scope, "__extend_sview_idx", ext_sview_index_slot, ValueType{kind: TypeKind.Signed, bits: 64})
+                                                    ext_sview_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                                    ext_sview_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_sview_function, "extend.sview.cond")
+                                                    ext_sview_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_sview_function, "extend.sview.body")
+                                                    ext_sview_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_sview_function, "extend.sview.done")
+                                                    _ = LLVMBuildBr(builder, ext_sview_cond)
+                                                    LLVMPositionBuilderAtEnd(builder, ext_sview_cond)
+                                                    ext_sview_index: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), ext_sview_index_slot, "extend.sview.cur")
+                                                    ext_sview_more: LLVMValueRef = LLVMBuildICmp(builder, 36, ext_sview_index, ext_sview_len, "extend.sview.more")
+                                                    _ = LLVMBuildCondBr(builder, ext_sview_more, ext_sview_body, ext_sview_done)
+                                                    LLVMPositionBuilderAtEnd(builder, ext_sview_body)
+                                                    ext_sview_index_expr: Expr = Expr.Index(push_arguments[0], Expr.Ident("__extend_sview_idx", push_call_line), push_call_line)
+                                                    if emit_darray_push(ext_sview_target_slot, push_type, ext_sview_index_expr, local_scope, fns, structs, generics, ext_sview_growth_runtime, m, ctx, builder):
+                                                        ext_sview_next: LLVMValueRef = LLVMBuildAdd(builder, ext_sview_index, LLVMConstInt(LLVMInt64TypeInContext(ctx), 1, 0), "extend.sview.next")
+                                                        _ = LLVMBuildStore(builder, ext_sview_next, ext_sview_index_slot)
+                                                        _ = LLVMBuildBr(builder, ext_sview_cond)
+                                                        LLVMPositionBuilderAtEnd(builder, ext_sview_done)
+                                                        return EmitStatus.Open
+                                                    return EmitStatus.Declined
+                                            return EmitStatus.Declined
+                                        # `dst.extend([x for x in xs])` — a COMPREHENSION source, the shape the
+                                        # semantic layer's scope walkers use (`bound.extend([p for p in params])`).
+                                        # A comprehension is a VALUE with no address, so the darray path below
+                                        # could not take one and declined. Materializing it matters beyond just
+                                        # getting an address: the loop re-emits the source expression once per
+                                        # iteration as `src[__extend_idx]`, so handing it the comprehension
+                                        # directly would REBUILD THE WHOLE LIST on every element — quadratic,
+                                        # and each rebuild allocates. Emit it ONCE into a temp local and let the
+                                        # ordinary loop read that local by name.
+                                        # Only an Ident / Field / Index names storage we can take the address
+                                        # of. Every other darray-valued argument is a VALUE — a comprehension
+                                        # (`bound.extend([p for p in params])`), a call (`buffer.extend(f"...")`,
+                                        # since an f-string desugars to `__fstr(chunks…)` returning darray[u8]),
+                                        # a ternary between two f-strings, a block. Those all declined here.
+                                        #
+                                        # Materializing matters beyond just getting an address: the loop below
+                                        # re-emits its source once per element as `src[__extend_idx]`, so passing
+                                        # a value expression straight through would RE-EVALUATE IT PER BYTE —
+                                        # quadratic, allocating each time, and calling any side-effecting callee
+                                        # once per element. Emit it ONCE into a temp local instead.
+                                        ext_src_expr: mutable Expr = push_arguments[0]
+                                        ext_addressable: mutable bool = false
+                                        match push_arguments[0]:
+                                            Expr.Ident(ext_a_name, ext_a_line):
+                                                ext_addressable <- true
+                                            _:
+                                                pass
+                                        match push_arguments[0]:
+                                            Expr.Field(ext_f_head, ext_f_name, ext_f_line):
+                                                ext_addressable <- true
+                                            _:
+                                                pass
+                                        match push_arguments[0]:
+                                            Expr.Index(ext_i_obj, ext_i_idx, ext_i_line):
+                                                ext_addressable <- true
+                                            _:
+                                                pass
+                                        if not ext_addressable:
+                                            ext_value_type: mutable ValueType = expression_type(push_arguments[0], local_scope, fns, structs, generics)
+                                            ext_value_type <- push_type if ext_value_type.kind != TypeKind.DArray
+                                            if ext_value_type.kind == TypeKind.DArray:
+                                                if emit_expression(push_arguments[0], ext_value_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_materialized:
+                                                    ext_tmp_slot: LLVMValueRef = LLVMBuildAlloca(builder, darray_llvm_type(structs, ctx), "extend.value.tmp")
+                                                    _ = LLVMBuildStore(builder, ext_materialized, ext_tmp_slot)
+                                                    declare_local(local_scope, "__extend_value", ext_tmp_slot, ext_value_type)
+                                                    ext_src_expr <- Expr.Ident("__extend_value", push_call_line)
+                                                    ext_source_type <- ext_value_type
+                                                else:
+                                                    return EmitStatus.Declined
+                                        EmitStatus.Declined return if ext_source_type.kind != TypeKind.DArray
+                                        if darray_address_of_expr(push_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_target_slot:
+                                            if darray_address_of_expr(ext_src_expr, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ext_source_slot:
+                                                ext_growth_runtime: Runtime = growth_runtime_for(push_object, local_scope, runtime)
+                                                ext_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                                ext_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                                # Snapshot the source count before the loop (a self-extend then
+                                                # copies only the original elements, matching a grow+copy).
+                                                ext_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, ext_header, ext_source_slot, 1, "extend.src.cnt.ptr")
+                                                ext_count: LLVMValueRef = LLVMBuildLoad2(builder, ext_i64, ext_count_ptr, "extend.src.cnt")
+                                                ext_idx_slot: LLVMValueRef = LLVMBuildAlloca(builder, ext_i64, "extend.i")
+                                                _ = LLVMBuildStore(builder, LLVMConstInt(ext_i64, 0, 0), ext_idx_slot)
+                                                declare_local(local_scope, "__extend_idx", ext_idx_slot, ValueType{kind: TypeKind.Signed, bits: 64})
+                                                ext_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                                ext_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_function, "extend.cond")
+                                                ext_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_function, "extend.body")
+                                                ext_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, ext_function, "extend.done")
+                                                _ = LLVMBuildBr(builder, ext_cond)
+                                                LLVMPositionBuilderAtEnd(builder, ext_cond)
+                                                ext_cur: LLVMValueRef = LLVMBuildLoad2(builder, ext_i64, ext_idx_slot, "extend.cur")
+                                                ext_more: LLVMValueRef = LLVMBuildICmp(builder, 40, ext_cur, ext_count, "extend.more")
+                                                _ = LLVMBuildCondBr(builder, ext_more, ext_bodyb, ext_done)
+                                                LLVMPositionBuilderAtEnd(builder, ext_bodyb)
+                                                ext_index_expr: Expr = Expr.Index(ext_src_expr, Expr.Ident("__extend_idx", push_call_line), push_call_line)
+                                                if emit_darray_push(ext_target_slot, push_type, ext_index_expr, local_scope, fns, structs, generics, ext_growth_runtime, m, ctx, builder):
+                                                    _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, ext_cur, LLVMConstInt(ext_i64, 1, 0), "extend.next"), ext_idx_slot)
+                                                    _ = LLVMBuildBr(builder, ext_cond)
+                                                    LLVMPositionBuilderAtEnd(builder, ext_done)
+                                                    return EmitStatus.Open
+                                                return EmitStatus.Declined
+                                            return EmitStatus.Declined
+                                        return EmitStatus.Declined
+                                _:
+                                    pass
+                            # `try f(args)` (statement, propagating — the parser strips the `try` head,
+                            # leaving a bare call to an ERROR fn). It uses the error ABI (out-slot + i32
+                            # status), and on a NONZERO status propagates: unwind and return that code
+                            # from THIS (error-returning) function. The std dict's `try arena_dict_reserve
+                            # (…)` is exactly this. Without it the call omits the out-param and every
+                            # later argument shifts left (m gets a scalar → null-deref crash).
+                            match push_callee:
+                                Expr.Ident(propagate_name, propagate_name_line):
+                                    if error_callee_is(fns, generics, propagate_name):
+                                        return emit_propagating_try(propagate_name, push_arguments, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                                _:
+                                    pass
+                            # The same statement, with EXPLICIT type arguments (`try arena_dict_reserve
+                            # [cstr[key_shape], i64](…)`): the bracket makes the callee an Index/IndexN,
+                            # so the Ident branch above never fires and the inference-based helper has
+                            # no argument to recover K/V from.
+                            stmt_gtry_base: mutable sview = ""
+                            stmt_gtry_ok: mutable bool = false
+                            stmt_gtry_types: darray[ValueType] = generic_callee_type_args(push_callee, &stmt_gtry_base, &stmt_gtry_ok, structs)
+                            if stmt_gtry_ok:
+                                if emit_propagating_generic_try_value(stmt_gtry_base, stmt_gtry_types, push_arguments, false, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) is stmt_gtry_slot:
+                                    return EmitStatus.Open
+                            # Any other call in STATEMENT position — typically a `-> void` call like
+                            # `bump(c)`. The result (if any) is simply discarded; `expected` is Void
+                            # because a statement wants no value.
+                            if emit_call(push_callee, push_arguments, push_argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder) is discarded_result:
+                                return EmitStatus.Open
+                            return EmitStatus.Declined
+                        _:
+                            pass
+                    # A DISCARDED expression statement — a bare `n + 1`, which stage0 evaluates
+                    # and throws the value away. Everything above handles a SHAPE (a call, a
+                    # ternary of calls, a capture block); this is the general case, and without
+                    # it the whole function DROPPED (measured on
+                    # test/fixtures/diagnostics/unused_expression.pos.elisa, which stage0
+                    # compiles). Emitting for value and ignoring the result IS the semantics.
+                    # A shape whose type cannot be inferred, or that the expression emitter
+                    # cannot model, still declines — this widens what compiles, never what is
+                    # silently guessed.
+                    discard_type: ValueType = expression_type(statement_expression, local_scope, fns, structs, generics)
+                    if discard_type.kind != TypeKind.Unmodeled:
+                        if emit_expression(statement_expression, discard_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is discarded_statement_value:
+                            _ = discarded_statement_value
+                            return EmitStatus.Open
+                    return EmitStatus.Declined
+                _:
+                    pass
+            handled <- false
+            return EmitStatus.Declined
+

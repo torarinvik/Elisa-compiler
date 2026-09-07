@@ -1,0 +1,515 @@
+# `-emit pymodule` — the generated CPython extension module itself: the whole C source,
+# assembled from the type names, converters, defaults and cleanup pieces above.
+
+
+include "./elisac_pymodule_c_tables.elisa"
+include "./elisac_pymodule_c_function.elisa"
+
+def emit_pymodule_c_report(file: mutable Ast::File&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    pymodule_expand_wildcard_exports(file)
+    module_name: mutable sview = ""
+    for annotation in file.enum_annotations |module_name|:
+        module_name <- annotation.owner if annotation.name == "__export_pymodule" and module_name == ""
+    if module_name == "":
+        message: mutable darray[u8] = []
+        emit_tokens_push_sview(&message, "error: -emit pymodule-c requires `export pymodule NAME:`\n")
+        write_stderr(message)
+        return 1
+    return 1 if not pymodule_validate_reserved_export_names(file, "pymodule-c")
+    error_families: darray[sview] = pymodule_error_families(file)
+    buffer: mutable darray[u8] = []
+    emit_tokens_push_sview(&buffer, "#define PY_SSIZE_T_CLEAN\n#include <Python.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n\ntypedef struct { const char *data; int64_t len; } ElisaSView;\ntypedef struct { void *items; int64_t count; int64_t capacity; } ElisaDArray;\ntypedef struct { void *base; void *tail; int64_t reserved; int64_t strategy; } ElisaArena;\nextern void arena_free(void *arena);\n\nstatic PyObject *elisa_error_type = NULL;\nstatic PyObject *elisa_pymodule_error_message(const char *function_name, int32_t code, PyObject *payload) {\n    PyObject *payload_repr = payload == NULL ? NULL : PyObject_Repr(payload);\n    if (payload != NULL && payload_repr == NULL) return NULL;\n    PyObject *message = payload == NULL\n        ? PyUnicode_FromFormat(\"Elisa function '%s' failed with error code %d\", function_name, (int)code)\n        : PyUnicode_FromFormat(\"Elisa function '%s' failed with error code %d (payload: %U)\", function_name, (int)code, payload_repr);\n    Py_XDECREF(payload_repr);\n    return message;\n}\nstatic PyObject *elisa_raise_error(const char *function_name, int32_t code) {\n    if (elisa_error_type == NULL) {\n        PyErr_Format(PyExc_RuntimeError, \"Elisa function '%s' failed with error code %d\", function_name, (int)code);\n        return NULL;\n    }\n    PyObject *message = elisa_pymodule_error_message(function_name, code, NULL);\n    if (message == NULL) return NULL;\n    PyObject *error = PyObject_CallFunctionObjArgs(elisa_error_type, message, NULL);\n    Py_DECREF(message);\n    if (error == NULL) return NULL;\n    PyObject *code_object = PyLong_FromLong((long)code);\n    if (code_object == NULL || PyObject_SetAttrString(error, \"code\", code_object) < 0) {\n        Py_XDECREF(code_object); Py_DECREF(error); return NULL;\n    }\n    Py_DECREF(code_object);\n    PyObject *function_object = PyUnicode_FromString(function_name);\n    if (function_object == NULL || PyObject_SetAttrString(error, \"function\", function_object) < 0) {\n        Py_XDECREF(function_object); Py_DECREF(error); return NULL;\n    }\n    Py_DECREF(function_object);\n    PyErr_SetObject(elisa_error_type, error);\n    Py_DECREF(error);\n    return NULL;\n}\n\n")
+    emit_tokens_push_sview(&buffer, "/* Prefix Python argument failures with the exported Elisa function. PyArg_ParseTupleAndKeywords already names the offending argument when it can; preserving the original exception class and detail keeps normal Python validation behavior while making the boundary obvious in tracebacks and logs. */\nstatic void elisa_pymodule_annotate_argument_error(const char *function_name, const char *parameter_name) {\n    if (!PyErr_Occurred()) return;\n    PyObject *error_type = NULL;\n    PyObject *error_value = NULL;\n    PyObject *error_traceback = NULL;\n    PyErr_Fetch(&error_type, &error_value, &error_traceback);\n    if (error_value == NULL) {\n        PyErr_Restore(error_type, error_value, error_traceback);\n        return;\n    }\n    PyObject *detail = PyObject_Str(error_value);\n    if (detail == NULL) {\n        PyErr_Restore(error_type, error_value, error_traceback);\n        return;\n    }\n    PyObject *message = parameter_name == NULL\n        ? PyUnicode_FromFormat(\"Elisa function '%s' argument error: %U\", function_name, detail)\n        : PyUnicode_FromFormat(\"Elisa function '%s' argument '%s': %U\", function_name, parameter_name, detail);\n    Py_DECREF(detail);\n    if (message == NULL) {\n        PyErr_Restore(error_type, error_value, error_traceback);\n        return;\n    }\n    if (error_type == NULL) error_type = PyExc_TypeError;\n    PyErr_SetObject(error_type, message);\n    Py_DECREF(message);\n    Py_XDECREF(error_type);\n    Py_XDECREF(error_value);\n    Py_XDECREF(error_traceback);\n}\n\n")
+    emit_tokens_push_sview(&buffer, "/* Keep text inputs consistent at every boundary. Python's scalar `s#` parser accepts Unicode and bytes, while this helper extends the same rule to lists, sets, mappings, views, and struct fields. Bytes are validated as UTF-8 while their original storage remains owned by the Python container for the duration of the call. */\nstatic int elisa_pymodule_validate_utf8(const char *data, Py_ssize_t size) {\n    if (size <= 0) return 0;\n    if (data == NULL) { PyErr_SetString(PyExc_ValueError, \"text input has null storage\"); return -1; }\n    PyObject *validated = PyUnicode_DecodeUTF8(data, size, \"strict\");\n    if (validated == NULL) return -1;\n    Py_DECREF(validated);\n    return 0;\n}\nstatic const char *elisa_pymodule_text_data(PyObject *object, Py_ssize_t *size) {\n    if (PyUnicode_Check(object)) return PyUnicode_AsUTF8AndSize(object, size);\n    if (PyBytes_Check(object)) {\n        char *data = NULL;\n        if (PyBytes_AsStringAndSize(object, &data, size) < 0) return NULL;\n        if (elisa_pymodule_validate_utf8(data, *size) < 0) return NULL;\n        return data;\n    }\n    PyErr_SetString(PyExc_TypeError, \"expected str or bytes\");\n    return NULL;\n}\n#define PyUnicode_AsUTF8AndSize elisa_pymodule_text_data\n\n")
+    emit_tokens_push_sview(&buffer, "typedef struct { PyObject **items; Py_ssize_t count; Py_ssize_t capacity; } ElisaPyRefs;\nstatic int elisa_pymodule_retain(PyObject *value, ElisaPyRefs *refs) {\n    if (refs->count == refs->capacity) {\n        Py_ssize_t next = refs->capacity == 0 ? 8 : refs->capacity * 2;\n        if (next < refs->capacity || next > PY_SSIZE_T_MAX / (Py_ssize_t)sizeof(PyObject *)) { PyErr_NoMemory(); return -1; }\n        PyObject **grown = (PyObject **)PyMem_Realloc(refs->items, (size_t)next * sizeof(PyObject *));\n        if (grown == NULL) { PyErr_NoMemory(); return -1; }\n        refs->items = grown; refs->capacity = next;\n    }\n    Py_INCREF(value); refs->items[refs->count++] = value; return 0;\n}\nstatic void elisa_pymodule_struct_refs_free(ElisaPyRefs *refs) {\n    for (Py_ssize_t index = 0; index < refs->count; ++index) Py_DECREF(refs->items[index]);\n    PyMem_Free(refs->items); refs->items = NULL; refs->count = 0; refs->capacity = 0;\n}\n\n")
+    emit_tokens_push_sview(&buffer, "static PyObject *elisa_raise_error_with_payload(const char *function_name, int32_t code, PyObject *payload) {\n    if (elisa_error_type == NULL) { Py_XDECREF(payload); PyErr_Format(PyExc_RuntimeError, \"Elisa function '%s' failed with error code %d\", function_name, (int)code); return NULL; }\n    PyObject *message = PyUnicode_FromFormat(\"Elisa function '%s' failed with error code %d\", function_name, (int)code);\n    if (message == NULL) { Py_XDECREF(payload); return NULL; }\n    PyObject *error = PyObject_CallFunctionObjArgs(elisa_error_type, message, NULL); Py_DECREF(message);\n    if (error == NULL) { Py_XDECREF(payload); return NULL; }\n    PyObject *code_object = PyLong_FromLong((long)code);\n    if (code_object == NULL || PyObject_SetAttrString(error, \"code\", code_object) < 0) { Py_XDECREF(code_object); Py_XDECREF(payload); Py_DECREF(error); return NULL; }\n    Py_DECREF(code_object);\n    PyObject *function_object = PyUnicode_FromString(function_name);\n    if (function_object == NULL || PyObject_SetAttrString(error, \"function\", function_object) < 0) { Py_XDECREF(function_object); Py_XDECREF(payload); Py_DECREF(error); return NULL; }\n    Py_DECREF(function_object);\n    if (payload != NULL && PyObject_SetAttrString(error, \"payload\", payload) < 0) { Py_DECREF(payload); Py_DECREF(error); return NULL; }\n    Py_XDECREF(payload); PyErr_SetObject(elisa_error_type, error); Py_DECREF(error); return NULL;\n}\n\n")
+    emit_tokens_push_sview(&buffer, "typedef struct { const char *name; PyObject *type; } ElisaPymoduleErrorEntry;\nstatic ElisaPymoduleErrorEntry elisa_pymodule_error_entries[] = {\n")
+    for error_family in error_families |buffer|:
+        emit_tokens_push_sview(&buffer, "    {\"")
+        emit_tokens_push_sview(&buffer, error_family)
+        emit_tokens_push_sview(&buffer, "\", NULL},\n")
+    emit_tokens_push_sview(&buffer, "    {NULL, NULL}\n};\nstatic bool elisa_pymodule_error_name_equal(const char *left, const char *right) { if (left == NULL || right == NULL) return false; while (*left != '\\0' && *right != '\\0') { if (*left != *right) return false; ++left; ++right; } return *left == *right; }\nstatic PyObject *elisa_pymodule_error_type_for_family(const char *family) { if (family != NULL) { for (ElisaPymoduleErrorEntry *entry = elisa_pymodule_error_entries; entry->name != NULL; ++entry) if (elisa_pymodule_error_name_equal(entry->name, family)) return entry->type; } return elisa_error_type; }\nstatic PyObject *elisa_raise_error_family(const char *function_name, const char *family, int32_t code, PyObject *payload) { PyObject *error_type = elisa_pymodule_error_type_for_family(family); if (error_type == NULL) { Py_XDECREF(payload); PyErr_Format(PyExc_RuntimeError, \"Elisa function '%s' failed with error code %d\", function_name, (int)code); return NULL; } PyObject *message = PyUnicode_FromFormat(\"Elisa function '%s' failed with error code %d\", function_name, (int)code); if (message == NULL) { Py_XDECREF(payload); return NULL; } PyObject *error = PyObject_CallFunctionObjArgs(error_type, message, NULL); Py_DECREF(message); if (error == NULL) { Py_XDECREF(payload); return NULL; } PyObject *code_object = PyLong_FromLong((long)code); if (code_object == NULL || PyObject_SetAttrString(error, \"code\", code_object) < 0) { Py_XDECREF(code_object); Py_XDECREF(payload); Py_DECREF(error); return NULL; } Py_DECREF(code_object); PyObject *function_object = PyUnicode_FromString(function_name); if (function_object == NULL || PyObject_SetAttrString(error, \"function\", function_object) < 0) { Py_XDECREF(function_object); Py_XDECREF(payload); Py_DECREF(error); return NULL; } Py_DECREF(function_object); if (payload != NULL && PyObject_SetAttrString(error, \"payload\", payload) < 0) { Py_DECREF(payload); Py_DECREF(error); return NULL; } Py_XDECREF(payload); PyErr_SetObject(error_type, error); Py_DECREF(error); return NULL; }\n\n")
+    emit_tokens_push_sview(&buffer, "typedef struct { void *items; int64_t count; int64_t used; int64_t capacity; void *arena; } ElisaDict;\ntypedef struct { void *items; int64_t count; int64_t used; int64_t capacity; void *arena; } ElisaSet;\nextern void *arena_alloc(void *arena, int64_t size_bytes);\nextern uint64_t ctx_hash_u64(uint64_t value);\nextern uint64_t ctx_hash_cstr(const char *value);\nstatic uint64_t elisa_pymodule_hash_sview(ElisaSView value) { uint64_t hash = UINT64_C(0xcbf29ce484222325); for (int64_t index = 0; index < value.len; ++index) { hash ^= (uint64_t)(uint8_t)value.data[index]; hash *= UINT64_C(0x100000001b3); } return hash; }\n\n")
+    emit_tokens_push_sview(&buffer, "/* Value optionals mirror stage1's `{i1, T}` ABI exactly. */\ntypedef struct { bool has_value; int8_t value; } ElisaOptionalI8;\ntypedef struct { bool has_value; int16_t value; } ElisaOptionalI16;\ntypedef struct { bool has_value; int32_t value; } ElisaOptionalI32;\ntypedef struct { bool has_value; int64_t value; } ElisaOptionalI64;\ntypedef struct { bool has_value; intptr_t value; } ElisaOptionalInt;\ntypedef struct { bool has_value; uint8_t value; } ElisaOptionalU8;\ntypedef struct { bool has_value; uint16_t value; } ElisaOptionalU16;\ntypedef struct { bool has_value; uint32_t value; } ElisaOptionalU32;\ntypedef struct { bool has_value; uint64_t value; } ElisaOptionalU64;\ntypedef struct { bool has_value; uintptr_t value; } ElisaOptionalUSize;\ntypedef struct { bool has_value; bool value; } ElisaOptionalBool;\ntypedef struct { bool has_value; float value; } ElisaOptionalF32;\ntypedef struct { bool has_value; double value; } ElisaOptionalF64;\ntypedef struct { bool has_value; ElisaSView value; } ElisaOptionalSView;\n\n")
+    emit_tokens_push_sview(&buffer, "typedef struct { void *data; int64_t len; } ElisaView;\n")
+    emit_tokens_push_sview(&buffer, "static PyObject *elisa_pymodule_get_field(PyObject *object, const char *name) { PyObject *key = PyUnicode_FromString(name); if (key == NULL) return NULL; if (PyMapping_Check(object)) { PyObject *value = PyObject_GetItem(object, key); Py_DECREF(key); return value; } Py_DECREF(key); return PyObject_GetAttrString(object, name); }\n\n")
+    # Keep named structs useful at runtime as well as in the generated stub.  A
+    # TypedDict constructor is intentionally a thin dict-producing factory, which
+    # matches the bridge's mapping representation while making `module.Point(...)`
+    # and `from module import Point` work naturally.  The companion Input alias is
+    # exposed for symmetry with the stub's structural protocol.
+    emit_tokens_push_sview(&buffer, "static bool elisa_pymodule_struct_alias_conflicts(PyObject *module, PyObject *candidate) { const char *name = PyUnicode_AsUTF8(candidate); if (name == NULL) { PyErr_Clear(); return true; } if (PyObject_HasAttrString(module, name)) return true; PyObject *input = PyUnicode_FromFormat(\"%sInput\", name); if (input == NULL) return true; const char *input_name = PyUnicode_AsUTF8(input); bool conflicts = input_name == NULL || PyObject_HasAttrString(module, input_name); Py_DECREF(input); return conflicts; }\nstatic PyObject *elisa_pymodule_choose_struct_alias(PyObject *module, const char *preferred, int index, bool preferred_is_identifier) { PyObject *candidate = NULL; if (preferred_is_identifier) { candidate = PyUnicode_FromString(preferred); if (candidate == NULL) return NULL; if (!elisa_pymodule_struct_alias_conflicts(module, candidate)) return candidate; Py_DECREF(candidate); } candidate = PyUnicode_FromFormat(\"_ElisaStruct_%d\", index); if (candidate == NULL) return NULL; if (!elisa_pymodule_struct_alias_conflicts(module, candidate)) return candidate; Py_DECREF(candidate); for (int suffix = 1; suffix < 2147483647; ++suffix) { candidate = PyUnicode_FromFormat(\"_ElisaStruct_%d_%d\", index, suffix); if (candidate == NULL) return NULL; if (!elisa_pymodule_struct_alias_conflicts(module, candidate)) return candidate; Py_DECREF(candidate); } PyErr_SetString(PyExc_RuntimeError, \"could not allocate a unique Python struct alias\"); return NULL; }\nstatic PyObject *elisa_pymodule_make_struct_type(const char *name, const char *const *field_names) { PyObject *typing = PyImport_ImportModule(\"typing\"); if (typing == NULL) return NULL; PyObject *typed_dict = PyObject_GetAttrString(typing, \"TypedDict\"); PyObject *any = PyObject_GetAttrString(typing, \"Any\"); PyObject *fields = PyDict_New(); if (typed_dict == NULL || any == NULL || fields == NULL) { Py_XDECREF(typed_dict); Py_XDECREF(any); Py_XDECREF(fields); Py_DECREF(typing); return NULL; } for (const char *const *field = field_names; *field != NULL; ++field) { if (PyDict_SetItemString(fields, *field, any) < 0) { Py_DECREF(fields); Py_DECREF(any); Py_DECREF(typed_dict); Py_DECREF(typing); return NULL; } } PyObject *name_object = PyUnicode_FromString(name); PyObject *result = name_object == NULL ? NULL : PyObject_CallFunctionObjArgs(typed_dict, name_object, fields, NULL); Py_XDECREF(name_object); Py_DECREF(fields); Py_DECREF(any); Py_DECREF(typed_dict); Py_DECREF(typing); return result; }\n\n")
+    # The static stub marks defaulted/nullable fields as NotRequired. Mirror that
+    # metadata on runtime TypedDict factories so introspection exposes the same
+    # required/optional key sets. On Python versions before 3.11, use the paired
+    # `typing_extensions.TypedDict`/`NotRequired` implementation when available;
+    # mixing the extension marker with stdlib TypedDict silently loses that metadata.
+    emit_tokens_push_sview(&buffer, "static PyObject *elisa_pymodule_make_struct_type_with_optional(const char *name, const char *const *field_names, const bool *optional_fields) { PyObject *typing = PyImport_ImportModule(\"typing\"); if (typing == NULL) return NULL; PyObject *typed_dict = PyObject_GetAttrString(typing, \"TypedDict\"); PyObject *any = PyObject_GetAttrString(typing, \"Any\"); PyObject *not_required = PyObject_GetAttrString(typing, \"NotRequired\"); PyObject *fields = PyDict_New(); if (typed_dict == NULL || any == NULL || not_required == NULL || fields == NULL) { Py_XDECREF(typed_dict); Py_XDECREF(any); Py_XDECREF(not_required); Py_XDECREF(fields); Py_DECREF(typing); return NULL; } for (Py_ssize_t field_index = 0; field_names[field_index] != NULL; ++field_index) { PyObject *field_type = NULL; if (optional_fields != NULL && optional_fields[field_index]) field_type = PyObject_GetItem(not_required, any); else { field_type = any; Py_INCREF(field_type); } if (field_type == NULL || PyDict_SetItemString(fields, field_names[field_index], field_type) < 0) { Py_XDECREF(field_type); Py_DECREF(fields); Py_DECREF(not_required); Py_DECREF(any); Py_DECREF(typed_dict); Py_DECREF(typing); return NULL; } Py_DECREF(field_type); } PyObject *name_object = PyUnicode_FromString(name); PyObject *result = name_object == NULL ? NULL : PyObject_CallFunctionObjArgs(typed_dict, name_object, fields, NULL); Py_XDECREF(name_object); Py_DECREF(fields); Py_DECREF(not_required); Py_DECREF(any); Py_DECREF(typed_dict); Py_DECREF(typing); return result; }\n\n")
+    emit_tokens_push_sview(&buffer, "static PyObject *elisa_pymodule_choose_generated_name(PyObject *module, const char *preferred) { PyObject *candidate = PyUnicode_FromString(preferred); if (candidate == NULL) return NULL; const char *name = PyUnicode_AsUTF8(candidate); if (name == NULL) { Py_DECREF(candidate); return NULL; } if (!PyObject_HasAttrString(module, name)) return candidate; Py_DECREF(candidate); for (int suffix = 1; suffix < 2147483647; ++suffix) { candidate = PyUnicode_FromFormat(\"%s_%d\", preferred, suffix); if (candidate == NULL) return NULL; name = PyUnicode_AsUTF8(candidate); if (name == NULL) { Py_DECREF(candidate); return NULL; } if (!PyObject_HasAttrString(module, name)) return candidate; Py_DECREF(candidate); } PyErr_SetString(PyExc_RuntimeError, \"could not allocate a unique generated Python name\"); return NULL; }\nstatic int elisa_pymodule_stamp_type_module(PyObject *module, PyObject *type) { PyObject *module_name = PyUnicode_FromString(PyModule_GetName(module)); if (module_name == NULL) return -1; int result = PyObject_SetAttrString(type, \"__module__\", module_name); Py_DECREF(module_name); return result; }\n\n")
+    # Struct field defaults are materialized before the struct conversion helpers are emitted so
+    # every generated `*_from_py` function can call a complete static builder without a forward
+    # declaration. Builders are deliberately per-field and return a fresh object on every call.
+    for struct_default_decl in file.top_decls |buffer, file|:
+        if struct_default_decl is Decl.Struct(struct_default_name, struct_default_members, struct_default_affinity, struct_default_named_states, struct_default_derive, struct_default_invariants, struct_default_pos):
+            for struct_default_member in struct_default_members |buffer, file, struct_default_name|:
+                continue if not struct_default_member.has_default
+                continue if not pymodule_default_is_container(struct_default_member.default_value)
+                continue if pymodule_default_is_empty_container(struct_default_member.default_value)
+                struct_default_type_name: sview = pymodule_alias_type_name(file, struct_default_member.type_expression)
+                continue if not pymodule_struct_default_supported(file, struct_default_type_name, struct_default_member.default_value)
+                struct_default_builder_name_storage: mutable darray[u8] = []
+                emit_pymodule_struct_default_builder_symbol(&struct_default_builder_name_storage, struct_default_name, struct_default_member.name)
+                emit_pymodule_default_python_builder(&buffer, file, sview(&struct_default_builder_name_storage[0], 0, struct_default_builder_name_storage.count), struct_default_type_name, struct_default_member.default_value)
+    emitted_struct_names: mutable darray[sview] = []
+    for struct_annotation in file.enum_annotations |buffer, file, module_name, emitted_struct_names|:
+        continue if struct_annotation.name != "__pymodule_fn"
+        struct_target_name: mutable sview = ""
+        for struct_target_annotation in file.enum_annotations |struct_target_name, struct_annotation|:
+            struct_target_name <- struct_target_annotation.owner if struct_target_annotation.name == "__pymodule_target_ref" and struct_target_annotation.line == struct_annotation.line
+        struct_target_decl: Ast::Decl? = pymodule_find_function_in(file.top_decls, struct_target_name)
+        if struct_target_decl is struct_target_function:
+            if struct_target_function is Decl.Func(struct_function_name, struct_source_params, struct_return, struct_body, struct_effects, struct_decorators, struct_pos):
+                struct_params: darray[Ast::ParamDecl] = pymodule_alias_normalize_params(file, struct_source_params)
+                for struct_parameter in struct_params |buffer, file, emitted_struct_names|:
+                    struct_parameter_type: sview = pymodule_alias_type_name(file, struct_parameter.type_expression)
+                    named_parameter_struct_type: sview = pymodule_named_struct_leaf_for_pymodule(file, struct_parameter_type, true)
+                    if named_parameter_struct_type != "":
+                        emit_pymodule_struct_typedef_and_helpers(&buffer, file, named_parameter_struct_type, emitted_struct_names)
+                    elif pymodule_struct_input_supported(file, struct_parameter_type):
+                        emit_pymodule_struct_typedef_and_helpers(&buffer, file, struct_parameter_type, emitted_struct_names)
+                    elif pymodule_is_darray_type(struct_parameter_type) or pymodule_is_view_type(struct_parameter_type):
+                        struct_element_type: sview = pymodule_darray_element_name(struct_parameter_type) if pymodule_is_darray_type(struct_parameter_type) else pymodule_view_element_name(struct_parameter_type)
+                        if pymodule_is_darray_type(struct_element_type):
+                            nested_struct_type: sview = pymodule_darray_leaf_name(struct_element_type)
+                            if pymodule_struct_input_supported(file, nested_struct_type):
+                                emit_pymodule_struct_typedef_and_helpers(&buffer, file, nested_struct_type, emitted_struct_names)
+                        elif pymodule_is_dict_type(struct_element_type):
+                            darray_dict_struct_type: sview = pymodule_dict_value_name(struct_element_type)
+                            if pymodule_struct_input_supported(file, darray_dict_struct_type):
+                                emit_pymodule_struct_typedef_and_helpers(&buffer, file, darray_dict_struct_type, emitted_struct_names)
+                            elif pymodule_is_dict_type(darray_dict_struct_type):
+                                darray_dict_nested_struct_type: sview = pymodule_dict_value_name(darray_dict_struct_type)
+                                if pymodule_struct_input_supported(file, darray_dict_nested_struct_type):
+                                    emit_pymodule_struct_typedef_and_helpers(&buffer, file, darray_dict_nested_struct_type, emitted_struct_names)
+                        elif pymodule_struct_input_supported(file, struct_element_type):
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, struct_element_type, emitted_struct_names)
+                    elif pymodule_is_dict_type(struct_parameter_type):
+                        struct_dict_value_type: sview = pymodule_dict_value_name(struct_parameter_type)
+                        if pymodule_struct_input_supported(file, struct_dict_value_type):
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, struct_dict_value_type, emitted_struct_names)
+                        elif pymodule_is_darray_type(struct_dict_value_type) and pymodule_struct_input_supported(file, pymodule_darray_element_name(struct_dict_value_type)):
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, pymodule_darray_element_name(struct_dict_value_type), emitted_struct_names)
+                        elif pymodule_is_view_type(struct_dict_value_type) and pymodule_struct_input_supported(file, pymodule_view_element_name(struct_dict_value_type)):
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, pymodule_view_element_name(struct_dict_value_type), emitted_struct_names)
+                        elif pymodule_is_dict_type(struct_dict_value_type):
+                            struct_dict_nested_struct_type: sview = pymodule_dict_value_name(struct_dict_value_type)
+                            if pymodule_struct_input_supported(file, struct_dict_nested_struct_type):
+                                emit_pymodule_struct_typedef_and_helpers(&buffer, file, struct_dict_nested_struct_type, emitted_struct_names)
+                if struct_return is struct_declared_return:
+                    struct_return_type: sview = pymodule_alias_type_name(file, struct_declared_return)
+                    named_return_struct_type: sview = pymodule_named_struct_leaf_for_pymodule(file, struct_return_type, false)
+                    if named_return_struct_type != "":
+                        emit_pymodule_struct_typedef_and_helpers(&buffer, file, named_return_struct_type, emitted_struct_names)
+                    elif pymodule_struct_return_supported(file, struct_return_type):
+                        emit_pymodule_struct_typedef_and_helpers(&buffer, file, struct_return_type, emitted_struct_names)
+                    elif pymodule_is_darray_type(struct_return_type) or pymodule_is_view_type(struct_return_type):
+                        struct_element_type_return: sview = pymodule_darray_element_name(struct_return_type) if pymodule_is_darray_type(struct_return_type) else pymodule_view_element_name(struct_return_type)
+                        if pymodule_is_darray_type(struct_element_type_return):
+                            nested_struct_type_return: sview = pymodule_darray_leaf_name(struct_element_type_return)
+                            if pymodule_struct_return_supported(file, nested_struct_type_return):
+                                emit_pymodule_struct_typedef_and_helpers(&buffer, file, nested_struct_type_return, emitted_struct_names)
+                        elif pymodule_is_dict_type(struct_element_type_return):
+                            darray_dict_struct_type_return: sview = pymodule_dict_value_name(struct_element_type_return)
+                            if pymodule_struct_return_supported(file, darray_dict_struct_type_return):
+                                emit_pymodule_struct_typedef_and_helpers(&buffer, file, darray_dict_struct_type_return, emitted_struct_names)
+                            elif pymodule_is_dict_type(darray_dict_struct_type_return):
+                                darray_dict_nested_struct_type_return: sview = pymodule_dict_value_name(darray_dict_struct_type_return)
+                                if pymodule_struct_return_supported(file, darray_dict_nested_struct_type_return):
+                                    emit_pymodule_struct_typedef_and_helpers(&buffer, file, darray_dict_nested_struct_type_return, emitted_struct_names)
+                        elif pymodule_struct_return_supported(file, struct_element_type_return):
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, struct_element_type_return, emitted_struct_names)
+                    elif pymodule_is_dict_type(struct_return_type):
+                        struct_dict_value_type_return: sview = pymodule_dict_value_name(struct_return_type)
+                        if pymodule_struct_return_supported(file, struct_dict_value_type_return):
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, struct_dict_value_type_return, emitted_struct_names)
+                        elif pymodule_is_darray_type(struct_dict_value_type_return) and pymodule_struct_return_supported(file, pymodule_darray_element_name(struct_dict_value_type_return)):
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, pymodule_darray_element_name(struct_dict_value_type_return), emitted_struct_names)
+                        elif pymodule_is_view_type(struct_dict_value_type_return) and pymodule_struct_return_supported(file, pymodule_view_element_name(struct_dict_value_type_return)):
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, pymodule_view_element_name(struct_dict_value_type_return), emitted_struct_names)
+                        elif pymodule_is_dict_type(struct_dict_value_type_return):
+                            struct_dict_nested_struct_type_return: sview = pymodule_dict_value_name(struct_dict_value_type_return)
+                            if pymodule_struct_return_supported(file, struct_dict_nested_struct_type_return):
+                                emit_pymodule_struct_typedef_and_helpers(&buffer, file, struct_dict_nested_struct_type_return, emitted_struct_names)
+    # Materialize non-empty literal defaults through fresh Python objects on each
+    # wrapper call.  The builders live before the wrapper declarations and never
+    # cache mutable state, so omitted arguments behave like ordinary Python
+    # defaults without the shared-list/dict/set trap.
+    for default_builder_annotation in file.enum_annotations |buffer, file, module_name|:
+        continue if default_builder_annotation.name != "__pymodule_fn"
+        default_builder_target: mutable sview = ""
+        for default_builder_target_annotation in file.enum_annotations |default_builder_target, default_builder_annotation|:
+            default_builder_target <- default_builder_target_annotation.owner if default_builder_target_annotation.name == "__pymodule_target_ref" and default_builder_target_annotation.line == default_builder_annotation.line
+        default_builder_decl: Ast::Decl? = pymodule_find_function_in(file.top_decls, default_builder_target)
+        if default_builder_decl is default_builder_function:
+            if default_builder_function is Decl.Func(default_builder_function_name, default_builder_params_source, default_builder_return, default_builder_body, default_builder_effects, default_builder_decorators, default_builder_pos):
+                default_builder_params: darray[Ast::ParamDecl] = pymodule_alias_normalize_params(file, default_builder_params_source)
+                for default_builder_parameter_index in 0..<default_builder_params.count |buffer, file, module_name, default_builder_annotation, default_builder_params|:
+                    continue if not default_builder_params[default_builder_parameter_index].has_default
+                    continue if not pymodule_default_is_container(default_builder_params[default_builder_parameter_index].default_value)
+                    continue if pymodule_default_is_empty_container(default_builder_params[default_builder_parameter_index].default_value)
+                    default_builder_type_name: sview = pymodule_alias_type_name(file, default_builder_params[default_builder_parameter_index].type_expression)
+                    continue if not pymodule_default_supported(file, default_builder_type_name, default_builder_params[default_builder_parameter_index].default_value)
+                    default_builder_name_storage: mutable darray[u8] = []
+                    emit_pymodule_default_builder_symbol(&default_builder_name_storage, module_name, default_builder_annotation.owner, default_builder_parameter_index)
+                    emit_pymodule_default_python_builder(&buffer, file, sview(&default_builder_name_storage[0], 0, default_builder_name_storage.count), default_builder_type_name, default_builder_params[default_builder_parameter_index].default_value)
+    emit_tokens_push_sview(&buffer, "\n")
+    # First pass: declarations for the stable native symbols.
+    emitted_error_payload_names: mutable darray[sview] = []
+    emitted_error_nested_payload_suffixes: mutable darray[sview] = []
+    for annotation in file.enum_annotations |buffer, file, module_name|:
+        continue if annotation.name != "__pymodule_fn"
+        target_name: mutable sview = ""
+        for target_annotation in file.enum_annotations |target_name, annotation|:
+            target_name <- target_annotation.owner if target_annotation.name == "__pymodule_target_ref" and target_annotation.line == annotation.line
+        target_decl: Ast::Decl? = pymodule_find_function_in(file.top_decls, target_name)
+        if target_decl is target_function:
+            if target_function is Decl.Func(target_function_name, source_params, target_return, target_body, target_effects, target_decorators, target_pos):
+                target_params: mutable darray[Ast::ParamDecl] = pymodule_alias_normalize_params(file, source_params)
+                saw_optional_parameter: mutable bool = false
+                for default_parameter in target_params |buffer, target_name, saw_optional_parameter|:
+                    default_parameter_type_name: sview = pymodule_alias_type_name(file, default_parameter.type_expression)
+                    if default_parameter.has_default:
+                        if not pymodule_default_supported(file, default_parameter_type_name, default_parameter.default_value):
+                            message: mutable darray[u8] = []
+                            emit_tokens_push_sview(&message, "error: -emit pymodule-c supports only literal scalar/text or recursively literal container defaults (target `")
+                            emit_tokens_push_sview(&message, target_name)
+                            emit_tokens_push_sview(&message, "`, parameter `")
+                            emit_tokens_push_sview(&message, default_parameter.name)
+                            emit_tokens_push_sview(&message, "`)\n")
+                            write_stderr(message)
+                            return 1
+                        saw_optional_parameter <- true
+                    elif pymodule_parameter_is_implicit_optional(default_parameter_type_name):
+                        saw_optional_parameter <- true
+                    elif saw_optional_parameter:
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c requires default/nullable parameters to be trailing (target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "`)\n")
+                        write_stderr(message)
+                        return 1
+                is_error: bool = pymodule_function_is_error(file, target_name)
+                error_family: sview = pymodule_function_error_family(file, target_name) if is_error else ""
+                has_payload_error: bool = is_error and pymodule_error_set_has_payload_in(file.top_decls, error_family)
+                payload_type_name: sview = pymodule_error_payload_type_in(file, file.top_decls, error_family) if has_payload_error else ""
+                structured_payload_error: bool = has_payload_error and pymodule_error_payload_is_structured_in(file.top_decls, error_family)
+                structured_payload_supported: bool = structured_payload_error and pymodule_error_payload_structured_supported_in(file, file.top_decls, error_family)
+                if has_payload_error and ((not structured_payload_error and (payload_type_name == "" or not pymodule_error_payload_supported(file, payload_type_name))) or (structured_payload_error and not structured_payload_supported)):
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c supports scalar/text/object, darray, view, and dictionary payload fields for error set `")
+                    emit_tokens_push_sview(&message, error_family)
+                    emit_tokens_push_sview(&message, "` on target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "`; unsupported aggregate payload fields remain unavailable\n")
+                    write_stderr(message)
+                    return 1
+                if has_payload_error:
+                    if not structured_payload_error:
+                        named_payload_struct_type: sview = pymodule_named_struct_leaf_for_pymodule(file, payload_type_name, false)
+                        if named_payload_struct_type != "":
+                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, named_payload_struct_type, emitted_struct_names)
+                    else:
+                        payload_decl: Ast::Decl? = pymodule_error_decl_in(file.top_decls, error_family)
+                        if payload_decl is payload_enum:
+                            if payload_enum is Decl.Enum(payload_error_name, payload_variants, payload_const, payload_storage, payload_pos):
+                                for payload_variant in payload_variants:
+                                    for payload_field in payload_variant.fields:
+                                        payload_field_type: sview = pymodule_alias_type_name(file, payload_field)
+                                        named_payload_field_struct_type: sview = pymodule_named_struct_leaf_for_pymodule(file, payload_field_type, false)
+                                        if named_payload_field_struct_type != "":
+                                            emit_pymodule_struct_typedef_and_helpers(&buffer, file, named_payload_field_struct_type, emitted_struct_names)
+                if structured_payload_error:
+                    already_emitted: mutable bool = false
+                    for emitted_error_payload_name in emitted_error_payload_names |already_emitted, error_family|:
+                        already_emitted <- true if emitted_error_payload_name == error_family
+                    if not already_emitted:
+                        emit_pymodule_error_payload_struct_typedef(&buffer, file, file.top_decls, error_family)
+                        emitted_error_payload_names.push(error_family)
+                if has_payload_error:
+                    emit_pymodule_error_nested_darray_helpers(&buffer, file, file.top_decls, error_family, emitted_error_nested_payload_suffixes)
+                return_type_name: mutable sview = "void"
+                if target_return is declared_return:
+                    return_type_name <- pymodule_alias_type_name(file, declared_return)
+                for struct_parameter_probe in target_params |buffer, file, target_name, struct_parameter_probe|:
+                    struct_parameter_probe_type: sview = pymodule_alias_type_name(file, struct_parameter_probe.type_expression)
+                    unsupported_dict_key: sview = pymodule_unsupported_dict_key_in_type(file, struct_parameter_probe_type)
+                    if unsupported_dict_key != "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c dictionary key type `")
+                        emit_tokens_push_sview(&message, unsupported_dict_key)
+                        emit_tokens_push_sview(&message, "` is not supported by Python interop (use a scalar hashable key such as an integer, bool, cstr, or sview)\n")
+                        write_stderr(message)
+                        return 1
+                    unsupported_set_element: sview = pymodule_unsupported_set_element_in_type(file, struct_parameter_probe_type)
+                    if unsupported_set_element != "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c set element type `")
+                        emit_tokens_push_sview(&message, unsupported_set_element)
+                        emit_tokens_push_sview(&message, "` is not supported by Python interop (use a scalar hashable element such as an integer, bool, cstr, or sview)\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_view_type(struct_parameter_probe_type) and not pymodule_view_input_supported(file, struct_parameter_probe_type):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c cannot represent parameter `")
+                        emit_tokens_push_sview(&message, struct_parameter_probe.name)
+                        emit_tokens_push_sview(&message, "` on target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "`: the view element contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                    parameter_struct_probe_decl: Ast::Decl? = pymodule_find_struct_in(file.top_decls, struct_parameter_probe_type)
+                    if parameter_struct_probe_decl is parameter_struct and not pymodule_struct_input_supported(file, struct_parameter_probe_type):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c cannot represent parameter `")
+                        emit_tokens_push_sview(&message, struct_parameter_probe.name)
+                        emit_tokens_push_sview(&message, "` on target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "`: the named struct contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                    if not pymodule_nested_dict_values_supported_in_type(file, struct_parameter_probe_type, 0.usize()):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c supports nested darray dictionary values up to eight levels with representable aggregate elements (target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "` parameter)\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_darray_type(struct_parameter_probe_type) and not pymodule_top_level_darray_input_supported(file, struct_parameter_probe_type):
+                        message: mutable darray[u8] = []
+                        if pymodule_darray_nesting_depth(struct_parameter_probe_type) >= 2.usize():
+                            emit_tokens_push_sview(&message, "error: -emit pymodule-c supports nested darrays up to eight levels for scalar/text/object/struct elements (target `")
+                            emit_tokens_push_sview(&message, target_name)
+                            emit_tokens_push_sview(&message, "` parameter)\n")
+                        else:
+                            emit_tokens_push_sview(&message, "error: -emit pymodule-c cannot represent parameter `")
+                            emit_tokens_push_sview(&message, struct_parameter_probe.name)
+                            emit_tokens_push_sview(&message, "` on target `")
+                            emit_tokens_push_sview(&message, target_name)
+                            emit_tokens_push_sview(&message, "`: the darray element contains an unsupported Python aggregate shape\n")
+                        write_stderr(message)
+                        return 1
+                unsupported_return_dict_key: sview = pymodule_unsupported_dict_key_in_type(file, return_type_name)
+                if unsupported_return_dict_key != "":
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c dictionary key type `")
+                    emit_tokens_push_sview(&message, unsupported_return_dict_key)
+                    emit_tokens_push_sview(&message, "` is not supported by Python interop (use a scalar hashable key such as an integer, bool, cstr, or sview)\n")
+                    write_stderr(message)
+                    return 1
+                unsupported_return_set_element: sview = pymodule_unsupported_set_element_in_type(file, return_type_name)
+                if unsupported_return_set_element != "":
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c set element type `")
+                    emit_tokens_push_sview(&message, unsupported_return_set_element)
+                    emit_tokens_push_sview(&message, "` is not supported by Python interop (use a scalar hashable element such as an integer, bool, cstr, or sview)\n")
+                    write_stderr(message)
+                    return 1
+                if pymodule_is_view_type(return_type_name) and not pymodule_view_return_supported(file, return_type_name):
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c cannot represent the return type on target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "`: the view element contains an unsupported Python aggregate shape\n")
+                    write_stderr(message)
+                    return 1
+                return_struct_probe_decl: Ast::Decl? = pymodule_find_struct_in(file.top_decls, return_type_name)
+                if return_struct_probe_decl is return_struct and not pymodule_struct_return_supported(file, return_type_name):
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c cannot represent the return type on target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "`: the named struct contains an unsupported Python aggregate shape\n")
+                    write_stderr(message)
+                    return 1
+                if not pymodule_nested_dict_values_supported_in_type(file, return_type_name, 0.usize()):
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c supports nested darray dictionary values up to eight levels with representable aggregate elements (target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "` return)\n")
+                    write_stderr(message)
+                    return 1
+                if pymodule_is_darray_type(return_type_name) and not pymodule_top_level_darray_return_supported(file, return_type_name):
+                    message: mutable darray[u8] = []
+                    if pymodule_darray_nesting_depth(return_type_name) >= 2.usize():
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c supports nested darrays up to eight levels for scalar/text/object/struct elements (target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "` return)\n")
+                    else:
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c cannot represent the return type on target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "`: the darray element contains an unsupported Python aggregate shape\n")
+                    write_stderr(message)
+                    return 1
+                has_darray_param: mutable bool = false
+                for darray_probe in target_params |has_darray_param|:
+                    has_darray_param <- true if pymodule_is_darray_type(pymodule_alias_type_name(file, darray_probe.type_expression))
+                has_darray_ref_param: mutable bool = false
+                for darray_ref_probe in target_params |has_darray_ref_param|:
+                    darray_ref_type_name: sview = pymodule_alias_type_name(file, darray_ref_probe.type_expression)
+                    has_darray_ref_param <- true if pymodule_darray_ref_parameter(darray_ref_type_name, darray_ref_probe.type_expression)
+                has_dict_param: mutable bool = false
+                for dict_probe in target_params |has_dict_param|:
+                    dict_probe_type: sview = pymodule_alias_type_name(file, dict_probe.type_expression)
+                    if pymodule_is_dict_type(dict_probe_type):
+                        has_dict_param <- true
+                        dict_probe_value: sview = pymodule_dict_value_name(dict_probe_type)
+                        if pymodule_is_darray_type(dict_probe_value) and pymodule_darray_nesting_depth(dict_probe_value) >= 2.usize() and not pymodule_top_level_nested_darray_input_supported(file, dict_probe_value):
+                            message: mutable darray[u8] = []
+                            emit_tokens_push_sview(&message, "error: -emit pymodule-c supports nested darray dictionary values up to eight levels with representable aggregate elements (target `")
+                            emit_tokens_push_sview(&message, target_name)
+                            emit_tokens_push_sview(&message, "` parameter)\n")
+                            write_stderr(message)
+                            return 1
+                has_dict_return: bool = pymodule_is_dict_type(return_type_name)
+                if has_dict_return:
+                    dict_return_probe_value: sview = pymodule_dict_value_name(return_type_name)
+                    if pymodule_is_darray_type(dict_return_probe_value) and pymodule_darray_nesting_depth(dict_return_probe_value) >= 2.usize() and not pymodule_top_level_nested_darray_return_supported(file, dict_return_probe_value):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c supports nested darray dictionary values up to eight levels with representable aggregate elements (target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "` return)\n")
+                        write_stderr(message)
+                        return 1
+                has_set_return: bool = pymodule_is_set_type(return_type_name)
+                has_view_return: bool = pymodule_is_view_type(return_type_name)
+                has_optional_return: bool = pymodule_is_optional_scalar_type(return_type_name)
+                has_struct_return: bool = pymodule_struct_return_supported(file, return_type_name)
+                has_fixed_array_return: bool = pymodule_fixed_array_return_supported(return_type_name)
+                has_payload_arena: bool = has_payload_error and pymodule_error_payload_needs_arena_in(file, file.top_decls, error_family)
+                has_output_arena: bool = pymodule_is_darray_type(return_type_name) or has_dict_return or has_set_return or (has_struct_return and pymodule_struct_return_contains_darray(file, return_type_name)) or has_payload_arena
+                has_return_arena: bool = has_output_arena or has_darray_ref_param
+                if is_error and has_struct_return:
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c does not support struct returns for error targets (target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "`)\n")
+                    write_stderr(message)
+                    return 1
+                if is_error and has_fixed_array_return:
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c does not support fixed-array returns for error targets (target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "`)\n")
+                    write_stderr(message)
+                    return 1
+                c_return_type: mutable sview = "void" if has_dict_return or has_set_return else pymodule_c_type_name_for(file, return_type_name)
+                c_return_type <- pymodule_darray_c_element_type(pymodule_fixed_array_element_name(return_type_name)) if has_fixed_array_return
+                c_return_type <- return_type_name if c_return_type == "" and has_struct_return
+                if c_return_type == "":
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c supports scalar, string, numeric/text/object-list, bytes, dictionaries, sets, views, and `py::Object` parameters/returns (target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "`)\n")
+                    write_stderr(message)
+                    return 1
+                emit_tokens_push_sview(&buffer, "extern ")
+                emit_tokens_push_sview(&buffer, "int32_t" if is_error else ("void" if has_struct_return or has_fixed_array_return or pymodule_is_darray_type(return_type_name) or has_dict_return or has_set_return or has_optional_return else c_return_type))
+                emit_tokens_push_sview(&buffer, " elisa_pymodule_")
+                emit_tokens_push_sview(&buffer, module_name)
+                emit_tokens_push_sview(&buffer, "_")
+                emit_tokens_push_sview(&buffer, annotation.owner)
+                # A darray return is itself the error function's hidden success slot. Keep
+                # that pointer first for both ordinary and error bridges; scalar error targets
+                # retain the standalone `void *error_out` parameter.
+                if pymodule_is_darray_type(return_type_name):
+                    emit_tokens_push_sview(&buffer, "(ElisaDArray *out")
+                elif has_dict_return or has_set_return:
+                    emit_tokens_push_sview(&buffer, "(ElisaDict *out" if has_dict_return else "(ElisaSet *out")
+                elif has_optional_return:
+                    emit_tokens_push_sview(&buffer, "(")
+                    emit_tokens_push_sview(&buffer, c_return_type)
+                    emit_tokens_push_sview(&buffer, " *out")
+                elif has_struct_return:
+                    emit_tokens_push_sview(&buffer, "(")
+                    emit_tokens_push_sview(&buffer, c_return_type)
+                    emit_tokens_push_sview(&buffer, " *out")
+                elif has_fixed_array_return:
+                    emit_tokens_push_sview(&buffer, "(")
+                    emit_tokens_push_sview(&buffer, c_return_type)
+                    emit_tokens_push_sview(&buffer, " *out")
+                elif has_view_return and is_error:
+                    emit_tokens_push_sview(&buffer, "(ElisaView *out")
+                elif is_error:
+                    emit_tokens_push_sview(&buffer, "(void *error_out")
+                else:
+                    emit_tokens_push_sview(&buffer, "(")
+                emit_tokens_push_sview(&buffer, ", void *payload_out") if has_payload_error
+                for parameter_index in 0..<target_params.count |buffer, target_params|:
+                    parameter_type_name: sview = pymodule_alias_type_name(file, target_params[parameter_index].type_expression)
+                    if pymodule_is_darray_type(parameter_type_name) and pymodule_type_contains_mutable(target_params[parameter_index].type_expression):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c does not support mutable darray references because Python inputs use temporary copied storage (target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "` parameter)\n")
+                        write_stderr(message)
+                        return 1
+                    if pymodule_is_darray_type(parameter_type_name) and pymodule_is_darray_type(pymodule_darray_element_name(parameter_type_name)) and not pymodule_top_level_nested_darray_input_supported(file, parameter_type_name):
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c supports nested darrays up to eight levels for scalar/text/object/struct elements (target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "` parameter)\n")
+                        write_stderr(message)
+                        return 1
+                    fixed_array_parameter: bool = pymodule_fixed_array_input_supported(file, parameter_type_name, target_params[parameter_index].type_expression)
+                    c_parameter_type: mutable sview = "ElisaDict *" if pymodule_is_dict_type(parameter_type_name) else ("ElisaSet *" if pymodule_is_set_type(parameter_type_name) else (pymodule_darray_c_element_type(pymodule_fixed_array_element_name(parameter_type_name)) if fixed_array_parameter else pymodule_c_type_name_for(file, parameter_type_name)))
+                    c_parameter_type <- parameter_type_name if c_parameter_type == "" and pymodule_struct_input_supported(file, parameter_type_name)
+                    if c_parameter_type == "":
+                        message: mutable darray[u8] = []
+                        emit_tokens_push_sview(&message, "error: -emit pymodule-c supports scalar, string, numeric/text/object-list, bytes, dictionaries, sets, views, and `py::Object` parameters/returns (target `")
+                        emit_tokens_push_sview(&message, target_name)
+                        emit_tokens_push_sview(&message, "`)\n")
+                        write_stderr(message)
+                        return 1
+                    emit_tokens_push_sview(&buffer, ", ") if parameter_index > 0 or has_struct_return or has_fixed_array_return or pymodule_is_darray_type(return_type_name) or has_dict_return or has_set_return or has_optional_return or is_error
+                    emit_tokens_push_sview(&buffer, c_parameter_type)
+                    emit_tokens_push_sview(&buffer, " *") if pymodule_struct_input_supported(file, parameter_type_name) or pymodule_is_darray_type(parameter_type_name) or pymodule_is_view_type(parameter_type_name) or pymodule_is_optional_scalar_type(parameter_type_name) or fixed_array_parameter
+                if has_return_arena:
+                    emit_tokens_push_sview(&buffer, ", ElisaArena *")
+                emit_tokens_push_sview(&buffer, ");\n")
+    # Constants use the same stable accessor symbols as the object backend. Scalar values use
+    # zero-argument returns; byte constants use a caller-provided darray out slot so the shim can
+    # copy static storage into an immutable Python bytes object without borrowing an Elisa arena.
+    for annotation in file.enum_annotations |buffer, file, module_name|:
+        continue if annotation.name != "__pymodule_const"
+        target_name: mutable sview = ""
+        for target_annotation in file.enum_annotations |target_name, annotation|:
+            target_name <- target_annotation.owner if target_annotation.name == "__pymodule_const_target_ref" and target_annotation.line == annotation.line
+        target_decl: Ast::Decl? = pymodule_find_const_in(file.top_decls, target_name)
+        if target_decl is target_const:
+            if target_const is Decl.Const(target_const_name, target_const_type, target_const_value, target_const_mutable, target_const_pos):
+                if pymodule_target_is_qualified(target_name) and pymodule_const_leaf_count(file.top_decls, target_name) > 1:
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c cannot disambiguate qualified constant target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "` because multiple constants share its leaf name; use a unique target leaf or export an accessor\n")
+                    write_stderr(message)
+                    return 1
+                type_name: sview = pymodule_const_decl_type_name(file, target_const_type, target_const_value)
+                c_type: sview = pymodule_c_type_name(type_name)
+                if c_type == "" or c_type == "void" or type_name == "py::Object" or type_name == "py::Object?":
+                    message: mutable darray[u8] = []
+                    emit_tokens_push_sview(&message, "error: -emit pymodule-c supports scalar, text, and byte constants (target `")
+                    emit_tokens_push_sview(&message, target_name)
+                    emit_tokens_push_sview(&message, "`)\n")
+                    write_stderr(message)
+                    return 1
+                emit_tokens_push_sview(&buffer, "extern void ") if pymodule_darray_is_bytes(type_name) else emit_tokens_push_sview(&buffer, "extern ")
+                emit_tokens_push_sview(&buffer, c_type) if not pymodule_darray_is_bytes(type_name)
+                emit_tokens_push_sview(&buffer, "elisa_pymodule_" if pymodule_darray_is_bytes(type_name) else " elisa_pymodule_")
+                emit_tokens_push_sview(&buffer, module_name)
+                emit_tokens_push_sview(&buffer, "_")
+                emit_tokens_push_sview(&buffer, annotation.owner)
+                emit_tokens_push_sview(&buffer, "(ElisaDArray *out);\n") if pymodule_darray_is_bytes(type_name) else emit_tokens_push_sview(&buffer, "(void);\n")
+    emit_tokens_push_sview(&buffer, "\n")
+    # Second pass: Python-callable functions and method metadata.
+    for annotation in file.enum_annotations |buffer, file, module_name|:
+        emit_pymodule_c_function(&buffer, file, module_name, annotation)
+    return emit_pymodule_c_tables(&buffer, file, module_name)

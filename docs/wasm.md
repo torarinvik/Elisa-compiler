@@ -95,7 +95,13 @@ imports always win over generated defaults.
 
 ## Tooling and targets
 
-The wrapper locates `wasm-ld` next to `llvm-config`, on `PATH`, or through `WASM_LD` (or the
+`-emit wasm` is the compiler's own: it emits the `wasm32` object, builds the portable
+runtime object, runs the linker, and writes the manifest and the JS/TS facade itself. No
+Python is involved (`scripts/wasm_build.py` remains only as the packager for stage0, which
+has no `-emit wasm` of its own; `test/parity/wasm_python_parity_smoke.sh` holds the two
+byte-identical).
+
+The compiler locates `wasm-ld` next to `llvm-config`, on `PATH`, or through `WASM_LD` (or the
 explicit `--wasm-ld` option). The current product target is `wasm32-unknown-unknown`; pass
 another `wasm32-*` triple with `-target-triple` when a host/runtime profile needs one.
 

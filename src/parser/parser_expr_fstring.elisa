@@ -1,0 +1,133 @@
+# Stage1 parser — the F-STRING desugar (mirrors stage0's parser_fstring.go). The FString token
+# spans the raw source text; this walks it, emits each literal run as a raw-span StringLit and
+# sub-lexes + sub-parses each `{EXPR}` interpolation. Continues parser_expr_literals.elisa.
+
+extend Parser:
+    private:
+
+
+        # f-string desugar (mirrors stage0's parser_fstring.go): the FString token spans
+        # the RAW interior of `f"...{EXPR}..."`. Split it into literal chunks and embedded
+        # expression spans, sub-lex/sub-parse each `{EXPR}` over the SAME source buffer
+        # (absolute offsets, so views and LSP positions stay valid), and build
+        # `__fstr(chunk, expression, chunk, ...)`. Chunks are kept as their raw spans (stage1
+        # never materializes decoded text — it does no codegen, and resolution does not
+        # read chunk contents). A no-interpolation f-string collapses to a StringLit.
+        # A view over an arbitrary [start,end) span of the parser's source, built via a
+        # synthetic token (u8& slicing is not available here; text_or_empty is).
+        def fstring_span_view(parser: Parser&, token: Token, span_start: usize, span_end: usize) -> sview:
+            position: mutable LexerPosition = zeroed
+            position.line <- token.line.int()
+            position.column <- token.column.int()
+            span_token: Token = Lexer::Token(TokenKind.StringLit, position, span_start, span_end)
+            return Lexer::text_or_empty(span_token, parser.source)
+
+
+
+
+        # Flush a pending literal chunk [chunk_start, end) as a raw-span StringLit, skipping
+        # empty spans. Extracted so the machine arm below stays straight-line (arms forbid `if`).
+        def fstring_flush_chunk(parser: Parser&, token: Token, chunk_start: usize, end: usize, arguments: mutable darray[Ast::Expr]&) -> void can[Memory.Allocate, Abort.Panic]:
+            arguments.push((Ast::Expr.StringLit(parser.fstring_span_view(token, chunk_start, end)))) if end > chunk_start
+
+
+
+        # Close one `{EXPR}` interpolation: `close_pos` is the matching `}`. Sub-lex + sub-parse
+        # the span [expr_start, close_pos), append its expression (or an ExpectedExpression error)
+        # to `arguments`, forward sub-parse errors, and reopen the next literal chunk after the
+        # `}` (chunk_start <- close_pos + 1). Extracted so the arm body stays straight-line
+        # (machine arms forbid the `if`/`for` this contains).
+        def fstring_close_interp(parser: lmut Parser, token: Token, expr_start: usize, close_pos: usize, arguments: mutable darray[Ast::Expr]&, chunk_start: mutable usize&) -> void can[Memory.Allocate, Abort.Panic]:
+            parser <- parser.error_at(Ast::ParseErrorKind.ExpectedExpression, token) if close_pos <= expr_start
+            chunk_start <- close_pos + 1
+            return if close_pos <= expr_start
+            sub_tokens: darray[Token] = Lexer::frontend_tokenize_span("", parser.source, expr_start, close_pos)
+            sub_parser: mutable Parser = Parser(parser.source, sub_tokens)
+            rebind part_opt: Ast::Expr?, sub_parser = sub_parser.expression()
+            if part_opt is part:
+                arguments.push(part)
+            for sub_error in sub_parser.errors |parser|:
+                parser.errors <- parser.errors.push(sub_error)
+
+
+
+        def fstring_expression(parser: lmut Parser, token: Token) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                start_offset: usize = token.start.usize()
+                end_offset: usize = start_offset + token.length.usize()
+                arguments: mutable darray[Ast::Expr] = []
+                scan_index: mutable usize = start_offset
+                chunk_start: mutable usize = start_offset
+                # docs/123 §3's own worked example: the f-string scanner as a three-phase
+                # `machine`. `depth` stays >= 1 by construction (only `Expr(depth), '{'` raises
+                # it and the sole exit to Text is `Expr(1..1), '}'`), so the plain `usize` local
+                # never underflows — the type-level `where depth > 0` is left to the design doc.
+                # `chunk_start`/`arguments` are outer locals the arms grow through helper calls
+                # (a statement-form machine, like the original `while`, may mutate them freely);
+                # the machine's own payloads are just the interpolation state (expr_start, depth).
+                # Explicit three-state scanner (Text / Expr / StringInExpr). This is what the
+                # docs/123 §3 `machine over` form lowers to; written out because the machine
+                # statement is not yet in the emitted subset. NOTE: `expr_start` is a flat local
+                # here, so it SURVIVES a `"..."` inside an interpolation — the machine spelling
+                # had StringInExpr carry only `depth` and then re-entered `Expr(expr_start, depth)`
+                # with `expr_start` unbound, losing the interpolation's start offset.
+                fs_text: i64 = 0
+                fs_expr: i64 = 1
+                fs_string: i64 = 2
+                fs_state: mutable i64 = fs_text
+                expr_start: mutable usize = start_offset
+                depth: mutable usize = 0
+                while scan_index < end_offset |parser, scan_index, chunk_start, arguments, fs_state, expr_start, depth, token, end_offset, fs_text, fs_expr, fs_string|:
+                    ch: i64 = parser.source[scan_index].char()
+                    if fs_state == fs_text:
+                        # `{{`/`}}`/`\` escapes stay put; a lone `{` opens an interpolation.
+                        if ch == '{' and scan_index + 1 < end_offset and parser.source[scan_index + 1].char() == '{':
+                            scan_index <- scan_index + 2
+                        elif ch == '}' and scan_index + 1 < end_offset and parser.source[scan_index + 1].char() == '}':
+                            scan_index <- scan_index + 2
+                        elif ch == '\\':
+                            scan_index <- scan_index + 2
+                        elif ch == '{':
+                            parser.fstring_flush_chunk(token, chunk_start, scan_index, arguments)
+                            scan_index <- scan_index + 1
+                            expr_start <- scan_index
+                            depth <- 1
+                            fs_state <- fs_expr
+                        else:
+                            scan_index <- scan_index + 1
+                    elif fs_state == fs_expr:
+                        # Balance braces; a `"` hands off to the string sub-state; the matching
+                        # `}` at depth 1 sub-parses [expr_start, scan_index) and reopens Text.
+                        if ch == '{':
+                            scan_index <- scan_index + 1
+                            depth <- depth + 1
+                        elif ch == '}' and depth == 1:
+                            parser <- parser.fstring_close_interp(token, expr_start, scan_index, arguments, chunk_start)
+                            scan_index <- scan_index + 1
+                            fs_state <- fs_text
+                        elif ch == '}':
+                            scan_index <- scan_index + 1
+                            depth <- depth - 1
+                        elif ch == '"':
+                            scan_index <- scan_index + 1
+                            fs_state <- fs_string
+                        else:
+                            scan_index <- scan_index + 1
+                    else:
+                        # A `"..."` embedded in the interpolation — never count braces.
+                        if ch == '\\':
+                            scan_index <- scan_index + 2
+                        elif ch == '"':
+                            scan_index <- scan_index + 1
+                            fs_state <- fs_expr
+                        else:
+                            scan_index <- scan_index + 1
+                # Flush the trailing literal chunk (chunk_start tracks the last reopened position).
+                parser.fstring_flush_chunk(token, chunk_start, end_offset, arguments)
+                # docs/119 gap #3: every f-string lowers through __fstr, so `f"…"` has one
+                # type (the owned formatted string) whether or not it interpolates — no
+                # static-literal shortcut for the no-interpolation case (which broke
+                # match/if-expression arm unification). An empty f"" gets one empty part.
+                arguments.push((Ast::Expr.StringLit(sview("", 0, 0)))) if arguments.count == 0
+                names: darray[sview] = []
+                return (Ast::Expr.Call((Ast::Expr.Ident("__fstr", Ast::pos_of_token(token))), arguments, names, Ast::pos_of_token(token)))

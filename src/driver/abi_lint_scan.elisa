@@ -1,0 +1,295 @@
+# `project abi-lint` — SCANNING a native source. Finds each inline-asm block (lines accumulate
+# until the parentheses balance), runs the twelve matchers over it, collects the
+# `ELISA_ABI_CONTRACT` payloads and the quoted includes, and accumulates the issues in the order
+# stage0 reports them. Continues abi_lint.elisa.
+
+extend ProjectSystem:
+
+    # ---- issues ------------------------------------------------------------------------------
+    #
+    # Issues are FOUR entries per row in one flat StrList (severity, code, file, message) plus
+    # a parallel line column, rather than a struct of four StrLists.
+    #
+    # Not a style choice: `lmut` threading only works on the PARAMETER itself. Writing
+    # `issues.severity <- strlist_push_view(issues.severity, …)` on a struct FIELD is rejected
+    # ("cannot assign void"), so a struct of lists cannot be appended to at all through the
+    # one form the mutability rules allow. A single list threaded as the lmut param can.
+
+    # The message is an sview, not a built darray: this returns void and so has no region to
+    # allocate one in. The one rule whose message varies passes one of two constants.
+    def abi_push_issue(fields: lmut StrList, severity: sview, code: sview, file: darray[u8]&, message: sview) -> void:
+        can Memory.Allocate, Abort.Panic:
+            fields <- strlist_push_view(fields, severity)
+            fields <- strlist_push_view(fields, code)
+            fields <- strlist_push(fields, file)
+            fields <- strlist_push_view(fields, message)
+
+
+
+    # Append to the LAST entry rather than adding a new one. The read-failure message has to
+    # embed a PATH, and this function has no region to concatenate one in, so the message is
+    # assembled directly in the list's backing buffer instead.
+    def abi_extend_last(fields: lmut StrList, value: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            return if fields.lengths.count == 0.usize()
+            for index in 0..<value.count |fields, value|:
+                fields.data <- fields.data.push(value[index])
+            last: usize = fields.lengths.count - 1.usize()
+            fields.lengths[last] <- fields.lengths[last] + value.count
+
+
+
+    def abi_extend_last_view(fields: lmut StrList, text: sview) -> void:
+        can Memory.Allocate, Abort.Panic:
+            return if fields.lengths.count == 0.usize()
+            for index in 0..<sview_len(text) |fields, text|:
+                fields.data <- fields.data.push(sview_at(text, index))
+            last: usize = fields.lengths.count - 1.usize()
+            fields.lengths[last] <- fields.lengths[last] + sview_len(text)
+
+
+
+    def abi_issue_count(fields: StrList&) -> usize:
+        return strlist_count(fields) / 4.usize()
+
+
+
+    # `ELISA_ABI_CONTRACT\s+([^\n*/]+)`, trimmed — the payload stops at a newline or at the
+    # `*/` that closes the comment it usually sits in.
+    def abi_collect_contracts(text: darray[u8]&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            # The brace literal, not strlist_new(): a StrList-RETURNING call pins the local's
+            # region and the `lmut` thread below can then no longer infer one (same note as
+            # strlist_dedupe in project.elisa).
+            found: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            marker: sview = "ELISA_ABI_CONTRACT"
+            index: mutable usize = 0.usize()
+            while index < text.count |index, found, text, marker|:
+                if not abi_span_is(text, index, marker):
+                    index <- index + 1.usize()
+                    continue
+                cursor: mutable usize = index + sview_len(marker)
+                spaces: mutable usize = 0.usize()
+                while cursor < text.count |cursor, spaces, text|:
+                    break if not (text[cursor] == 32 or text[cursor] == 9)
+                    cursor <- cursor + 1.usize()
+                    spaces <- spaces + 1.usize()
+                if spaces == 0.usize():
+                    index <- index + sview_len(marker)
+                    continue
+                value_start: usize = cursor
+                while cursor < text.count |cursor, text|:
+                    break if text[cursor] == 10 or text[cursor] == 42 or text[cursor] == 47
+                    cursor <- cursor + 1.usize()
+                value_stop: mutable usize = cursor
+                # TrimSpace on the captured payload.
+                while value_stop > value_start |value_stop, text|:
+                    break if not (text[value_stop - 1.usize()] == 32 or text[value_stop - 1.usize()] == 9 or text[value_stop - 1.usize()] == 13)
+                    value_stop <- value_stop - 1.usize()
+                found <- strlist_push_span(found, text, value_start, value_stop - value_start) if value_stop > value_start
+                index <- cursor
+            return found
+
+
+
+    # The asm block starting at `start_line`: lines are accumulated until parentheses balance
+    # on a line containing `;`, or 80 lines pass. Returns the END line (inclusive).
+    def abi_asm_block_end(text: darray[u8]&, line_starts: darray[usize]&, start_line: usize) -> usize:
+        depth: mutable i64 = 0
+        saw_paren: mutable bool = false
+        result: mutable usize = line_starts.count - 1.usize()
+        settled: mutable bool = false
+        for line_index in start_line..<line_starts.count |depth, saw_paren, result, settled, text, line_starts, start_line|:
+            continue if settled
+            stop: usize = line_starts[line_index + 1.usize()] - 1.usize() if line_index + 1.usize() < line_starts.count else text.count
+            semicolon: mutable bool = false
+            for byte_index in line_starts[line_index]..<stop |depth, saw_paren, semicolon, text|:
+                if text[byte_index] == 40:
+                    depth <- depth + 1
+                    saw_paren <- true
+                elif text[byte_index] == 41 and depth > 0:
+                    depth <- depth - 1
+                elif text[byte_index] == 59:
+                    semicolon <- true
+            if saw_paren and depth == 0 and semicolon:
+                result <- line_index
+                settled <- true
+            elif line_index - start_line >= 80.usize():
+                result <- line_index
+                settled <- true
+        return result
+
+
+
+    # 1-based start offset of every line in `text`.
+    def abi_line_starts(text: darray[u8]&) -> darray[usize]:
+        can Memory.Allocate, Abort.Panic:
+            starts: mutable darray[usize] = [0.usize()]
+            for index in 0..<text.count |starts, text|:
+                starts <- starts.push(index + 1.usize()) if text[index] == 10
+            return starts
+
+
+
+    # Is this a C/C++ source or header? stage0 scans only these, by lowercased extension.
+    def abi_is_native_source(path: darray[u8]&) -> bool:
+        dot: mutable usize = path.count
+        for index in 0..<path.count |dot, path|:
+            dot <- index if path[index] == 46
+        false return if dot >= path.count
+        extension: mutable darray[u8] = []
+        for index in dot..<path.count |extension, path|:
+            extension.push(abi_lower(path[index]))
+        true return if bytes_equal_view(extension, ".c")
+        true return if bytes_equal_view(extension, ".cc")
+        true return if bytes_equal_view(extension, ".cpp")
+        true return if bytes_equal_view(extension, ".cxx")
+        true return if bytes_equal_view(extension, ".h")
+        true return if bytes_equal_view(extension, ".hpp")
+        true return if bytes_equal_view(extension, ".hh")
+        return false
+
+
+
+    # `^\s*#\s*include\s+"([^"]+)"` — the QUOTED include on this line, or empty.
+    def abi_quoted_include(text: darray[u8]&, line_start: usize, line_stop: usize) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            empty: mutable darray[u8] = []
+            cursor: mutable usize = line_start
+            while cursor < line_stop |cursor, text|:
+                break if not (text[cursor] == 32 or text[cursor] == 9)
+                cursor <- cursor + 1.usize()
+            empty return if cursor >= line_stop or text[cursor] != 35
+            cursor <- cursor + 1.usize()
+            while cursor < line_stop |cursor, text|:
+                break if not (text[cursor] == 32 or text[cursor] == 9)
+                cursor <- cursor + 1.usize()
+            empty return if not abi_span_is(text, cursor, "include")
+            cursor <- cursor + 7.usize()
+            spaces: mutable usize = 0.usize()
+            while cursor < line_stop |cursor, spaces, text|:
+                break if not (text[cursor] == 32 or text[cursor] == 9)
+                cursor <- cursor + 1.usize()
+                spaces <- spaces + 1.usize()
+            empty return if spaces == 0.usize()
+            empty return if cursor >= line_stop or text[cursor] != 34
+            cursor <- cursor + 1.usize()
+            captured: mutable darray[u8] = []
+            while cursor < line_stop |cursor, captured, text|:
+                break if text[cursor] == 34
+                captured.push(text[cursor])
+                cursor <- cursor + 1.usize()
+            empty return if cursor >= line_stop or text[cursor] != 34
+            return captured
+
+
+
+    # stage0's lintNativeAsmBlock, over `block` = six lines of leading CONTEXT plus the asm
+    # block itself. The context matters: `guestish` is usually the enclosing function's name,
+    # which is above the `__asm__` line, not inside it.
+    def abi_lint_asm_block(fields: lmut StrList, lines: mutable darray[u32]&, file: darray[u8]&, start_line: u32, block: darray[u8]&) -> void:
+        can Memory.Allocate, Abort.Panic:
+            guestish: bool = abi_is_guestish(block)
+            touches_args: bool = abi_has_arg_register(block)
+            touches_stack: bool = abi_has_stack_mutation(block)
+            uses_positional: bool = abi_has_positional_operand(block)
+            uses_call: bool = abi_has_indirect(block, "call")
+            uses_jump: bool = abi_has_indirect(block, "jmp")
+            noreturnish: bool = abi_is_noreturnish(block)
+            has_memory_clobber: bool = abi_has_memory_clobber(block)
+            has_scratch: bool = abi_has_scratch_parking(block)
+
+            if uses_positional and (touches_args or touches_stack) and not abi_lint_allowed(block, "inline-asm-positional-abi-operands"):
+                fields <- abi_push_issue(fields, "warning", "inline-asm-positional-abi-operands", file, "inline asm touches ABI stack/argument registers while using positional operands like %0/%1; prefer named operands parked in scratch registers before clobbering rdi/rsi/rsp")
+                lines.push(start_line)
+            if touches_stack and not has_memory_clobber and not abi_lint_allowed(block, "inline-asm-stack-without-memory-clobber"):
+                fields <- abi_push_issue(fields, "warning", "inline-asm-stack-without-memory-clobber", file, "inline asm mutates stack state but does not declare a memory clobber; this can hide ABI-sensitive stack setup from the optimizer")
+                lines.push(start_line)
+            if guestish and uses_call and touches_stack and not abi_lint_allowed(block, "guest-entry-call-mangles-stack"):
+                # stage0 appends " and this block is not marked noreturn" when the block does
+                # not look noreturn. Spelled as TWO constants rather than a built string: this
+                # function returns void, so it has no region to concatenate in.
+                if noreturnish:
+                    fields <- abi_push_issue(fields, "error", "guest-entry-call-mangles-stack", file, "guest-entry inline asm prepares a synthetic process stack but uses call *; C++ shadPS4 uses a no-return jmp for real guest entry so call will push a host return address")
+                else:
+                    fields <- abi_push_issue(fields, "error", "guest-entry-call-mangles-stack", file, "guest-entry inline asm prepares a synthetic process stack but uses call *; C++ shadPS4 uses a no-return jmp for real guest entry so call will push a host return address and this block is not marked noreturn")
+                lines.push(start_line)
+            if guestish and uses_jump and touches_stack and not noreturnish and not abi_lint_allowed(block, "guest-entry-jump-not-noreturn"):
+                fields <- abi_push_issue(fields, "warning", "guest-entry-jump-not-noreturn", file, "guest-entry inline asm jumps into guest code but the surrounding helper does not look noreturn; add a noreturn attribute or builtin unreachable")
+                lines.push(start_line)
+            if guestish and touches_args and touches_stack and not has_scratch and not abi_lint_allowed(block, "guest-entry-no-scratch-register-parking"):
+                fields <- abi_push_issue(fields, "warning", "guest-entry-no-scratch-register-parking", file, "guest-entry inline asm sets ABI argument registers and stack without obvious r9/r10/r11 scratch parking; operand allocation can alias registers that the asm later overwrites")
+                lines.push(start_line)
+
+
+
+    # One source: every asm block linted, plus the contracts it declares. `scanned` carries
+    # the seen-set (absolute paths) so a diamond of includes is walked once.
+    def abi_scan_source(path: darray[u8]&, fields: lmut StrList, lines: mutable darray[u32]&, contracts: mutable StrList&, scanned: mutable StrList&, depth: i64) -> void:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return if depth > 32
+            absolute: darray[u8] = absolute_path(path)
+            return if strlist_contains(scanned, absolute)
+            scanned <- strlist_push(scanned, absolute)
+            text: darray[u8] = read_file_bytes(absolute)
+            # stage0 reports a read failure as an issue rather than aborting the report.
+            if text.count == 0.usize() and not file_exists(absolute):
+                # Go's os.ReadFile error text, verbatim: `open PATH: no such file or
+                # directory`. stage0 puts err.Error() straight into the message.
+                fields <- abi_push_issue(fields, "error", "native-source-read-failed", absolute, "open ")
+                fields <- abi_extend_last(fields, absolute)
+                fields <- abi_extend_last_view(fields, ": no such file or directory")
+                lines.push(0)
+                return
+            declared: StrList = abi_collect_contracts(text)
+            for contract_index in 0..<strlist_count(&declared) |contracts, declared|:
+                contracts <- strlist_push_span(contracts, declared.data, declared.starts[contract_index], declared.lengths[contract_index])
+            starts: darray[usize] = abi_line_starts(text)
+            if abi_is_native_source(absolute):
+                for line_index in 0..<starts.count |fields, lines, text, starts, absolute, line_index|:
+                    line_stop: usize = starts[line_index + 1.usize()] - 1.usize() if line_index + 1.usize() < starts.count else text.count
+                    continue if not abi_word_in_span(text, starts[line_index], line_stop, "__asm__") and not abi_word_in_span(text, starts[line_index], line_stop, "asm")
+                    end_line: usize = abi_asm_block_end(text, starts, line_index)
+                    # stage0 prepends SIX lines of context so the enclosing function's name is
+                    # visible to the `guestish` probe.
+                    context_line: usize = line_index - 6.usize() if line_index >= 6.usize() else 0.usize()
+                    block_stop: usize = starts[end_line + 1.usize()] if end_line + 1.usize() < starts.count else text.count
+                    block: mutable darray[u8] = []
+                    for byte_index in starts[context_line]..<block_stop |block, text|:
+                        block.push(text[byte_index])
+                    fields <- abi_lint_asm_block(fields, lines, absolute, (line_index + 1.usize()).u32(), block)
+            # Recurse through QUOTED includes that name a C/C++ file which exists.
+            directory: darray[u8] = path_directory(absolute)
+            for include_index in 0..<starts.count |fields, lines, contracts, scanned, text, starts, directory, depth, include_index|:
+                include_stop: usize = starts[include_index + 1.usize()] - 1.usize() if include_index + 1.usize() < starts.count else text.count
+                quoted: darray[u8] = abi_quoted_include(text, starts[include_index], include_stop)
+                continue if quoted.count == 0.usize()
+                combined: darray[u8] = path_join(directory, quoted)
+                joined: darray[u8] = path_clean(combined)
+                continue if not abi_is_native_source(joined)
+                continue if not file_exists(joined)
+                fields <- abi_scan_source(joined, fields, lines, contracts, scanned, depth + 1)
+
+
+
+    # An index permutation putting `list`'s entries in byte order (Go's sort.Strings). The
+    # entries themselves are not moved: the issue columns are positional, so reordering the
+    # backing data would desynchronise them.
+    def abi_sorted_order(list: StrList&) -> darray[usize]:
+        can Memory.Allocate, Abort.Panic:
+            order: mutable darray[usize] = []
+            for index in 0..<strlist_count(list) |order|:
+                order <- order.push(index)
+            # Insertion sort: these lists are a handful of paths, and it is stable, which
+            # keeps equal entries in discovery order the way Go's sort.Strings leaves them.
+            for outer in 1..<order.count |order, list|:
+                position: mutable usize = outer
+                while position > 0.usize() |position, order, list|:
+                    left: darray[u8] = strlist_entry_copy(list, order[position - 1.usize()])
+                    right: darray[u8] = strlist_entry_copy(list, order[position])
+                    break if not bytes_less(right, left)
+                    swap: usize = order[position - 1.usize()]
+                    order[position - 1.usize()] <- order[position]
+                    order[position] <- swap
+                    position <- position - 1.usize()
+            return order

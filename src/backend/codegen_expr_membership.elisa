@@ -1,0 +1,169 @@
+# Stage1 backend — MEMBERSHIP: `x in [a, b, …]` over a literal array lowers to an or-chain of
+# equality compares, and `x in lo..hi` to a range test. The chain's last link, so this is
+# where `handled <- false` finally declines. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_expression_membership(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if expression is Expr.Binary(in_left, in_operator, in_right, in_line):
+                if in_operator == TokenKind.In:
+                    # `x in lo..hi` / `x in lo..=hi` / `x in lo..<hi` — range membership.
+                    # `..` (TokenKind.Range) is inclusive on both ends for membership (stage0
+                    # lowers `c in '0'..'9'` to sge/sle); `..<` exclusive high; `..=` inclusive high.
+                    if in_right is Expr.Binary(range_lo, range_op, range_hi, range_line):
+                        if range_op == TokenKind.Range or range_op == TokenKind.RangeLt or range_op == TokenKind.RangeLe:
+                            in_operand_type: ValueType = expression_type(in_left, local_scope, fns, structs, generics)
+                            if is_numeric_type(in_operand_type) or in_operand_type.kind == TypeKind.Signed or in_operand_type.kind == TypeKind.Unsigned:
+                                if emit_expression(in_left, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_left_value:
+                                    if emit_expression(range_lo, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_lo_value:
+                                        if emit_expression(range_hi, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_hi_value:
+                                            signed_cmp: bool = in_operand_type.kind == TypeKind.Signed
+                                            lo_pred: u32 = 39 if signed_cmp else 35
+                                            inclusive_hi: bool = range_op == TokenKind.Range or range_op == TokenKind.RangeLe
+                                            hi_pred: u32 = 41 if signed_cmp and inclusive_hi else (40 if signed_cmp else (37 if inclusive_hi else 36))
+                                            lo_ok: LLVMValueRef = LLVMBuildICmp(builder, lo_pred, in_left_value, in_lo_value, "in.range.lo")
+                                            hi_ok: LLVMValueRef = LLVMBuildICmp(builder, hi_pred, in_left_value, in_hi_value, "in.range.hi")
+                                            return LLVMBuildAnd(builder, lo_ok, hi_ok, "in.range")
+                                        return null
+                                    return null
+                                return null
+                    # `x in s` over a SET — the RHS is a DynSet expression (not an array
+                    # literal). Lowers to `arena_set_contains[T](&s, x) -> bool` (std). Checked
+                    # before the array-literal path below.
+                    in_right_type: ValueType = expression_type(in_right, local_scope, fns, structs, generics)
+                    if in_right_type.kind == TypeKind.Struct:
+                        set_mem_base: mutable sview = ""
+                        set_mem_arg_start: mutable usize = 0
+                        set_mem_arg_count: mutable usize = 0
+                        set_mem_has_inst: bool = generic_struct_instantiation_of(structs, in_right_type, set_mem_base, set_mem_arg_start, set_mem_arg_count)
+                        if set_mem_has_inst and set_mem_base == "DynSet" and set_mem_arg_count == 1:
+                            set_mem_elem_type: ValueType = copied_type(structs.generic_struct_inst_args[set_mem_arg_start])
+                            set_mem_type_args: mutable darray[ValueType] = [set_mem_elem_type]
+                            if instantiate_generic("arena_set_contains", set_mem_type_args, generics, structs, m, ctx) is set_contains_target:
+                                if struct_chain_address(in_right, local_scope, fns, structs, generics, runtime, m, ctx, builder) is set_mem_address:
+                                    if emit_expression(in_left, set_mem_elem_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is set_mem_key:
+                                        set_contains_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(set_contains_target)
+                                        set_contains_args: mutable darray[LLVMValueRef] = [set_mem_address, set_mem_key]
+                                        # The TRAILING region argument, if THIS instantiation carries
+                                        # one — the same per-instantiation decision the set LITERAL
+                                        # path gets wrong when hardcoded. Calling a 3-parameter
+                                        # `arena_set_contains__T` with 2 arguments is not something
+                                        # `opt -passes=verify` rejects: under OPAQUE POINTERS a call
+                                        # whose signature disagrees with the callee is undefined, not
+                                        # invalid. So it read clean and still killed the -O3 pipeline
+                                        # inside ArgumentPromotion, which rewrites arguments from the
+                                        # callee's REAL signature and walked off the end of the list.
+                                        set_contains_args.push(runtime.arena) if instantiation_wants_arena("arena_set_contains", set_mem_type_args, generics, structs)
+                                        set_contains_args_pointer: void& = (&set_contains_args[0]).cast[void&] can Unsafe.PointerCast
+                                        return LLVMBuildCall2(builder, set_contains_fn_type, set_contains_target, set_contains_args_pointer, set_contains_args.count.u32(), "set.contains")
+                                    return null
+                                return null
+                    # The RHS may be an ARRAY literal (`x in [a, b]`) or a BRACE SET
+                    # (`x in {Kind.A, Kind.B}`, which the parser gives as Expr.SetLit). Both are
+                    # a fixed list of candidates and lower identically to the OR-chain below;
+                    # only Expr.Array was matched, so every brace-set membership declined. The
+                    # semantic layer uses the brace form heavily
+                    # (`operator in {TokenKind.EqEq, TokenKind.BangEq, …}`).
+                    in_candidates: mutable darray[Expr] = []
+                    in_has_candidate_list: mutable bool = false
+                    if in_right is Expr.Array(in_elements, in_array_line):
+                        in_has_candidate_list <- true
+                        in_candidates.extend(in_elements)
+                    if in_right is Expr.SetLit(in_set_items, in_set_literal_line):
+                        in_has_candidate_list <- true
+                        in_candidates.extend(in_set_items)
+                    if in_has_candidate_list:
+                        in_operand_type: mutable ValueType = expression_type(in_left, local_scope, fns, structs, generics)
+                        # A LITERAL left operand (`5 in [1, 2, 3]`, `"y" in {"a", "b"}`) has no
+                        # type of its own to report, and both branches below need one — the
+                        # numeric path bails on Unmodeled and the string path only knows SView,
+                        # so a literal LHS declined the whole function. Give it the type the
+                        # rest of the backend gives such a literal: an int literal defers to its
+                        # context and defaults signed-64, and a string literal compares as a
+                        # VIEW so the comparison goes through sview_eq rather than an ICmp on
+                        # two cstr POINTERS, which would answer "not equal" for equal text.
+                        #
+                        # Both are gated on the LITERAL shape. A cstr-typed VARIABLE keeps its
+                        # cstr type and keeps declining: retyping THAT to a view would be a
+                        # wrong answer rather than a drop.
+                        if in_operand_type.kind == TypeKind.Unmodeled and in_left is Expr.IntLit(in_lit_text):
+                            in_operand_type <- ValueType{kind: TypeKind.Signed, bits: 64}
+                        if in_operand_type.kind == TypeKind.CStr and in_left is Expr.StringLit(in_str_text):
+                            in_operand_type <- ValueType{kind: TypeKind.SView, bits: 0}
+                        # `name in {"i8", "i16", …}` — membership over STRING candidates. The
+                        # numeric path below compares with ICmp, which on an sview would compare
+                        # the {ptr,len} aggregate and answer "equal" only for the same pointer —
+                        # a wrong answer, not a decline. Compare through the runtime's sview_eq
+                        # (nonzero = equal), OR-chained the same way. The semantic layer's type
+                        # predicates (is_primitive_type, literal_fits_in_type) are all this shape.
+                        if in_operand_type.kind == TypeKind.SView:
+                            in_s_bool: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
+                            in_s_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                            if emit_expression(in_left, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_s_left:
+                                in_s_result: mutable LLVMValueRef = LLVMConstInt(in_s_bool, 0, 0)
+                                in_s_declined: mutable bool = false
+                                for in_s_element in in_candidates |in_s_result, in_s_declined, in_s_left, in_operand_type, in_s_bool, in_s_i64, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                    continue if in_s_declined
+                                    if emit_expression(in_s_element, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_s_cand:
+                                        in_s_args: mutable darray[LLVMValueRef] = [in_s_left, in_s_cand]
+                                        in_s_args_pointer: void& = (&in_s_args[0]).cast[void&] can Unsafe.PointerCast
+                                        in_s_code: LLVMValueRef = LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, in_s_args_pointer, 2, "in.sview.eq")
+                                        in_s_hit: LLVMValueRef = LLVMBuildICmp(builder, 33, in_s_code, LLVMConstInt(in_s_i64, 0, 0), "in.sview.hit")
+                                        in_s_result <- LLVMBuildOr(builder, in_s_result, in_s_hit, "in.sview.or")
+                                    else:
+                                        in_s_declined <- true
+                                null return if in_s_declined
+                                return in_s_result
+                            return null
+                        null return if not is_numeric_type(in_operand_type)
+                        in_bool_type: LLVMTypeRef = LLVMInt1TypeInContext(ctx)
+                        if emit_expression(in_left, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_left_value:
+                            in_result: mutable LLVMValueRef = LLVMConstInt(in_bool_type, 0, 0)
+                            in_declined: mutable bool = false
+                            for in_element in in_candidates |in_result, in_declined, in_left, in_left_value, in_bool_type, in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                continue if in_declined
+                                # A RANGE candidate (`x in {1..=3, 8..<10}`) is not a scalar to
+                                # compare with ICmp -- emit_expression declines it, which killed
+                                # the whole OR-chain and every membership set containing a range.
+                                # Test it as `x >= lo and x <(=) hi` instead, OR-ed in like any
+                                # other candidate.
+                                #
+                                # Synthesized as EXPRESSIONS and routed back through
+                                # emit_expression rather than picking ICmp predicates here: the
+                                # comparison path already gets signed-vs-unsigned right for the
+                                # operand type, and duplicating that choice is how a `u64`
+                                # membership test would silently get a signed compare.
+                                in_is_range: mutable bool = false
+                                if in_element is Expr.Binary(in_range_lo, in_range_operator, in_range_hi, in_range_line):
+                                    if in_range_operator == TokenKind.RangeLt or in_range_operator == TokenKind.RangeLe:
+                                        in_is_range <- true
+                                        in_upper_operator: TokenKind = TokenKind.LtEq if in_range_operator == TokenKind.RangeLe else TokenKind.Lt
+                                        # Range BOUNDS may themselves be the leading-dot shorthand
+                                        # (`kind in {.IF..=IDENT}`); resolve each to `Enum.Variant`.
+                                        # The bounds may be the leading-dot shorthand (`.IF`) or,
+                                        # for the SECOND bound, an UNQUALIFIED member name
+                                        # (`.IF..=IDENT`) -- the spelling stage0 accepts and the
+                                        # one that kept this whole set declining.
+                                        in_lower_test: Expr = (Expr.Binary(in_left, TokenKind.GtEq, resolved_bare_enum_member(resolved_shorthand_member(in_range_lo, structs), local_scope, structs), in_range_line))
+                                        in_upper_test: Expr = (Expr.Binary(in_left, in_upper_operator, resolved_bare_enum_member(resolved_shorthand_member(in_range_hi, structs), local_scope, structs), in_range_line))
+                                        in_range_test: Expr = (Expr.Binary(in_lower_test, TokenKind.And, in_upper_test, in_range_line))
+                                        if emit_expression(in_range_test, ValueType{kind: TypeKind.Bool, bits: 1}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_range_value:
+                                            in_result <- LLVMBuildOr(builder, in_result, in_range_value, "in.range.or")
+                                        else:
+                                            in_declined <- true
+                                continue if in_is_range
+                                # A scalar candidate may be the leading-dot shorthand too
+                                # (`kind in {.IF, .LET}`); emit_expression only knows the
+                                # qualified `Enum.Variant` spelling.
+                                if emit_expression(resolved_shorthand_member(in_element, structs), in_operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is in_element_value:
+                                    in_eq: LLVMValueRef = LLVMBuildICmp(builder, 32, in_left_value, in_element_value, "in.eq")
+                                    in_result <- LLVMBuildOr(builder, in_result, in_eq, "in.or")
+                                else:
+                                    in_declined <- true
+                            null return if in_declined
+                            return in_result
+                        return null
+                    return null
+            handled <- false
+            return null
+

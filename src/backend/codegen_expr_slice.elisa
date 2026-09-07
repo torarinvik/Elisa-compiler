@@ -1,0 +1,181 @@
+# Stage1 backend — `base[lo:hi]`: a slice expression, which turns a byte pointer and two bounds
+# into an sview. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_expression_slice(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.Slice(slice_object, slice_start_expr, slice_end_expr, slice_line):
+                    # A container slice assigned to `view[T]` is a fat view over the darray's
+                    # element storage, not a byte `sview`. The old CStr path attempted a GEP of
+                    # i8 directly on the darray header, producing invalid LLVM (`getelementptr`
+                    # on `{ptr,i64,i64}`) before clone(view) even ran.
+                    # A slice in a position with NO annotation (`make_array()[1:3][0]` — the inner
+                    # slice is only ever indexed) arrives with an Unmodeled `expected`, so the
+                    # view-building branch below never fired and the whole expression declined.
+                    # The slice's OWN resolved type is a view either way, so use it as the target
+                    # when the context supplies none.
+                    slice_view_expected: mutable ValueType = copied_type(expected)
+                    if slice_view_expected.kind != TypeKind.View:
+                        slice_own_type: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+                        slice_view_expected <- slice_own_type if slice_own_type.kind == TypeKind.View
+                    if slice_view_expected.kind == TypeKind.View:
+                        slice_source_type: mutable ValueType = expression_type(slice_object, local_scope, fns, structs, generics)
+                        # A BORROWED darray (`xs: darray[i64]&`) types as a Ref, so this branch
+                        # missed it and the slice fell through to paths that decline it — a
+                        # `view[T]` over a darray PARAMETER was unreachable, while the same slice
+                        # over a local compiled.
+                        if slice_source_type.kind == TypeKind.Ref:
+                            slice_source_pointee: ValueType = ref_target_of(slice_source_type, structs)
+                            slice_source_type <- slice_source_pointee if slice_source_pointee.kind == TypeKind.DArray
+                        if slice_source_type.kind == TypeKind.DArray:
+                            if emit_expression(slice_object, slice_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slice_source_value:
+                                if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_slice_start:
+                                    if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_slice_end:
+                                        source_items: LLVMValueRef = LLVMBuildExtractValue(builder, slice_source_value, 0, "view.slice.items")
+                                        source_element: ValueType = darray_element_of(slice_source_type, structs)
+                                        element_llvm: LLVMTypeRef = llvm_type_of(source_element, structs, ctx)
+                                        view_indices: mutable darray[LLVMValueRef] = [view_slice_start]
+                                        view_indices_pointer: void& = (&view_indices[0]).cast[void&] can Unsafe.PointerCast
+                                        view_data: LLVMValueRef = LLVMBuildGEP2(builder, element_llvm, source_items, view_indices_pointer, 1, "view.slice.data")
+                                        view_len: LLVMValueRef = LLVMBuildSub(builder, view_slice_end, view_slice_start, "view.slice.len")
+                                        view_llvm: LLVMTypeRef = llvm_type_of(slice_view_expected, structs, ctx)
+                                        view_result: mutable LLVMValueRef = LLVMGetUndef(view_llvm)
+                                        view_result <- LLVMBuildInsertValue(builder, view_result, view_data, 0, "view.slice.ins0")
+                                        view_result <- LLVMBuildInsertValue(builder, view_result, view_len, 1, "view.slice.ins1")
+                                        return view_result
+                        # A FIXED ARRAY source (`text[1:3]` on a `u8[4]`). Unlike a darray there is
+                        # no items pointer to extract: the array IS the storage, so the view points
+                        # into the array's own slot. That is stage0's lowering too -- it GEPs the
+                        # parameter's alloca -- so the resulting view has exactly the same lifetime
+                        # as stage0 gives it.
+                        # A REF to a fixed array (`values: i32[4]&`) is the same slice, but the
+                        # value in hand is ALREADY the array's address, so no temp is needed.
+                        slice_ref_array: ValueType = ref_target_of(slice_source_type, structs) if slice_source_type.kind == TypeKind.Ref else unmodeled_type()
+                        if slice_ref_array.kind == TypeKind.Array:
+                            if emit_expression(slice_object, slice_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ref_slice_base:
+                                if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ref_slice_start:
+                                    if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ref_slice_end:
+                                        ref_slice_llvm: LLVMTypeRef = llvm_type_of(slice_ref_array, structs, ctx)
+                                        ref_slice_indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), ref_slice_start]
+                                        ref_slice_indices_pointer: void& = (&ref_slice_indices[0]).cast[void&] can Unsafe.PointerCast
+                                        ref_slice_data: LLVMValueRef = LLVMBuildGEP2(builder, ref_slice_llvm, ref_slice_base, ref_slice_indices_pointer, 2, "arrayslice.ref.data")
+                                        ref_slice_len: LLVMValueRef = LLVMBuildSub(builder, ref_slice_end, ref_slice_start, "arrayslice.ref.len")
+                                        ref_slice_view_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                                        ref_slice_result: mutable LLVMValueRef = LLVMGetUndef(ref_slice_view_llvm)
+                                        ref_slice_result <- LLVMBuildInsertValue(builder, ref_slice_result, ref_slice_data, 0, "arrayslice.ref.ins0")
+                                        ref_slice_result <- LLVMBuildInsertValue(builder, ref_slice_result, ref_slice_len, 1, "arrayslice.ref.ins1")
+                                        return ref_slice_result
+                            return null
+                        if slice_source_type.kind == TypeKind.Array:
+                            if emit_expression(slice_object, slice_source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is array_slice_value:
+                                if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is array_slice_start:
+                                    if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is array_slice_end:
+                                        array_slice_llvm: LLVMTypeRef = llvm_type_of(slice_source_type, structs, ctx)
+                                        array_slice_slot: LLVMValueRef = LLVMBuildAlloca(builder, array_slice_llvm, "arrayslice.storage")
+                                        _ = LLVMBuildStore(builder, array_slice_value, array_slice_slot)
+                                        array_slice_element: ValueType = array_element_of(slice_source_type, structs)
+                                        array_slice_element_llvm: LLVMTypeRef = llvm_type_of(array_slice_element, structs, ctx)
+                                        array_slice_indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), array_slice_start]
+                                        array_slice_indices_pointer: void& = (&array_slice_indices[0]).cast[void&] can Unsafe.PointerCast
+                                        array_slice_data: LLVMValueRef = LLVMBuildGEP2(builder, array_slice_llvm, array_slice_slot, array_slice_indices_pointer, 2, "arrayslice.data")
+                                        array_slice_len: LLVMValueRef = LLVMBuildSub(builder, array_slice_end, array_slice_start, "arrayslice.len")
+                                        _ = array_slice_element_llvm
+                                        array_slice_view_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                                        array_slice_result: mutable LLVMValueRef = LLVMGetUndef(array_slice_view_llvm)
+                                        array_slice_result <- LLVMBuildInsertValue(builder, array_slice_result, array_slice_data, 0, "arrayslice.ins0")
+                                        array_slice_result <- LLVMBuildInsertValue(builder, array_slice_result, array_slice_len, 1, "arrayslice.ins1")
+                                        return array_slice_result
+                            return null
+                    # A CONTAINER receiver that did not take the fat-view path above must DECLINE
+                    # here, not fall through to the cstr byte-slice path below. That fallthrough
+                    # byte-GEPs the container HEADER — `getelementptr i8, { ptr, i64, i64 } %hdr`
+                    # — and then inserts the header aggregate into an sview's `ptr` field. LLVM
+                    # does not reject it; it MISCOMPILES:
+                    #   `ys = xs[1:3]; return ys[0]`  answered 0 where stage0 answers 20,
+                    # and with a non-literal start the same IR crashed LLVM's SelectionDAG
+                    # outright (exit 139). A silent wrong answer is the worst outcome available
+                    # here, so this declines instead — loud, as an undefined symbol at link.
+                    #
+                    # It reaches this point only when the destination is not `view[T]`: an
+                    # UNANNOTATED `ys = xs[lo:hi]`, because expression_type types every slice as
+                    # SView regardless of receiver (codegen_scope.elisa). stage0 types a darray
+                    # slice as DynArrayView instead. Fixing that inference — and supporting
+                    # `view[T]` indexing, which stage1 also declines today — is what turns this
+                    # decline back into working code.
+                    slice_receiver_type: ValueType = expression_type(slice_object, local_scope, fns, structs, generics)
+                    null return if slice_receiver_type.kind == TypeKind.DArray or slice_receiver_type.kind == TypeKind.Array
+                    # A BORROWED container (`values: darray[i64]&`) types as a Ref, not a DArray,
+                    # so it slipped past the guard above and fell into the cstr BYTE-slice path
+                    # below -- which took the address of the darray HEADER as the data pointer.
+                    # The resulting view pointed at `{items, count, cap}` and read those three
+                    # words as ELEMENTS. Nothing consumed such a view before (every other path
+                    # declined it), so the defect was invisible until a new consumer accepted one.
+                    # Decline the borrowed forms too, exactly as the by-value forms already do.
+                    slice_receiver_pointee: ValueType = ref_target_of(slice_receiver_type, structs) if slice_receiver_type.kind == TypeKind.Ref else unmodeled_type()
+                    null return if slice_receiver_pointee.kind == TypeKind.DArray or slice_receiver_pointee.kind == TypeKind.Array
+                    # An sview is already a `{data, len}` aggregate, not the raw pointer used by
+                    # cstr. Extract its data field before doing byte-pointer arithmetic; feeding
+                    # the aggregate directly to GEP produces `getelementptr i8, {ptr, i64} ...`.
+                    if slice_receiver_type.kind == TypeKind.SView:
+                        if emit_expression(slice_object, ValueType{kind: TypeKind.SView, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_slice_base:
+                            sview_slice_data: LLVMValueRef = LLVMBuildExtractValue(builder, sview_slice_base, 0, "sview.slice.data")
+                            if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_slice_start:
+                                if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_slice_end:
+                                    sview_slice_llvm: LLVMTypeRef = llvm_type_of(ValueType{kind: TypeKind.SView, bits: 0}, structs, ctx)
+                                    sview_slice_len: LLVMValueRef = LLVMBuildSub(builder, sview_slice_end, sview_slice_start, "byteslice.len")
+                                    sview_slice_indices: mutable darray[LLVMValueRef] = [sview_slice_start]
+                                    sview_slice_indices_pointer: void& = (&sview_slice_indices[0]).cast[void&] can Unsafe.PointerCast
+                                    sview_slice_data_at: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), sview_slice_data, sview_slice_indices_pointer, 1, "byteslice.data")
+                                    sview_slice_result: mutable LLVMValueRef = LLVMGetUndef(sview_slice_llvm)
+                                    sview_slice_result <- LLVMBuildInsertValue(builder, sview_slice_result, sview_slice_data_at, 0, "byteslice.ins0")
+                                    sview_slice_result <- LLVMBuildInsertValue(builder, sview_slice_result, sview_slice_len, 1, "byteslice.ins1")
+                                    return sview_slice_result
+                    # A `view[T]` receiver: like the sview case it is a `{data, len}` AGGREGATE, so
+                    # its data field must be extracted before any pointer arithmetic -- falling
+                    # through to the cstr path below fed the whole aggregate to GEP and produced
+                    # `getelementptr i8, %DynArrayView %load, i64 0`, which is malformed IR. It
+                    # survived at -O0 and became a WRONG ANSWER at -O2 (255 where stage0 says 230).
+                    #
+                    # The offset is in ELEMENTS, not bytes: `whole[4:8]` starts four T's along, so
+                    # the GEP walks the element type. The cstr/sview forms are byte-addressed and
+                    # keep their i8 walk.
+                    if slice_receiver_type.kind == TypeKind.View:
+                        view_slice_element: ValueType = view_element_of(slice_receiver_type, structs)
+                        null return if view_slice_element.kind == TypeKind.Unmodeled
+                        if emit_expression(slice_object, slice_receiver_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_slice_base:
+                            view_slice_data: LLVMValueRef = LLVMBuildExtractValue(builder, view_slice_base, 0, "view.slice.data")
+                            if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_slice_start:
+                                if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is view_slice_end:
+                                    view_slice_llvm: LLVMTypeRef = llvm_type_of(slice_receiver_type, structs, ctx)
+                                    view_slice_len: LLVMValueRef = LLVMBuildSub(builder, view_slice_end, view_slice_start, "view.slice.len")
+                                    view_slice_indices: mutable darray[LLVMValueRef] = [view_slice_start]
+                                    view_slice_indices_pointer: void& = (&view_slice_indices[0]).cast[void&] can Unsafe.PointerCast
+                                    view_slice_data_at: LLVMValueRef = LLVMBuildGEP2(builder, llvm_type_of(view_slice_element, structs, ctx), view_slice_data, view_slice_indices_pointer, 1, "view.slice.data.at")
+                                    view_slice_result: mutable LLVMValueRef = LLVMGetUndef(view_slice_llvm)
+                                    view_slice_result <- LLVMBuildInsertValue(builder, view_slice_result, view_slice_data_at, 0, "view.slice.ins0")
+                                    view_slice_result <- LLVMBuildInsertValue(builder, view_slice_result, view_slice_len, 1, "view.slice.ins1")
+                                    return view_slice_result
+                            return null
+                        return null
+                    if emit_expression(slice_object, ValueType{kind: TypeKind.CStr, bits: 0}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slice_base:
+                        if emit_expression(slice_start_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slice_start:
+                            if emit_expression(slice_end_expr, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is slice_end:
+                                sview_type: ValueType = ValueType{kind: TypeKind.SView, bits: 0}
+                                sview_llvm: LLVMTypeRef = llvm_type_of(sview_type, structs, ctx)
+                                slice_len: LLVMValueRef = LLVMBuildSub(builder, slice_end, slice_start, "byteslice.len")
+                                slice_gep_indices: mutable darray[LLVMValueRef] = [slice_start]
+                                slice_gep_ptr: void& = (&slice_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                                slice_data: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(ctx), slice_base, slice_gep_ptr, 1, "byteslice.data")
+                                slice_agg: mutable LLVMValueRef = LLVMGetUndef(sview_llvm)
+                                slice_agg <- LLVMBuildInsertValue(builder, slice_agg, slice_data, 0, "byteslice.ins0")
+                                slice_agg <- LLVMBuildInsertValue(builder, slice_agg, slice_len, 1, "byteslice.ins1")
+                                return slice_agg
+                            return null
+                        return null
+                    return null
+                _:
+                    pass
+            # `xs[i]` — an index READ. Only a local array receiver is modeled: the address
+            # comes from the local's slot, so no temporary spill is needed.
+            return emit_expression_index_read(expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder, handled)

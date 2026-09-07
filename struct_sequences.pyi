@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+from typing import Any, Final, Generic, Iterable, Literal, Mapping, Protocol, Sequence, TypedDict, TypeVar
+import sys
+if sys.version_info >= (3, 11):
+    from typing import NotRequired
+else:
+    try:
+        from typing_extensions import NotRequired  # type: ignore
+    except ImportError:
+        # Keep generated stubs importable on Python versions whose stdlib typing
+        # predates NotRequired and where typing_extensions is not installed. Type
+        # checkers that understand the marker still get the precise form above; older
+        # checkers see a regular generic compatibility marker instead of an import error.
+        _ElisaNotRequiredT = TypeVar("_ElisaNotRequiredT")
+        class NotRequired(Generic[_ElisaNotRequiredT]):
+            pass
+
+
+
+class ElisaError(RuntimeError):
+    code: int
+    function: str
+    parameter: str | None
+    expected: str | None
+    path: str | None
+    payload: Any
+
+class Point(TypedDict):
+    x: int
+    label: str
+    payload: Any
+
+class PointInput(Protocol):
+    x: int
+    label: str | bytes
+    payload: Any
+
+def roundtrip_points(points: Sequence[Point | PointInput]) -> list[Point]: ...
+
+def count_points(points: Sequence[Point | PointInput]) -> int: ...
+
+def identity_points(points: Sequence[Point | PointInput]) -> list[Point]: ...
+
+__all__: list[str] = ["roundtrip_points", "count_points", "identity_points", "ElisaError", "Point"]

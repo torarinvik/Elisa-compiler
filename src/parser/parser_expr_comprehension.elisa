@@ -1,0 +1,115 @@
+# Stage1 parser — the shared COMPREHENSION TAIL `for VAR in ITER (if|where COND)? CLOSE`, used by
+# the list, dict and set literal forms alike, plus the optional filter clause and the extra
+# binder a projection query records. Continues parser_expr_literals.elisa.
+
+extend Parser:
+    private:
+
+
+        # Parse an optional comprehension filter — a trailing `if COND` or `where COND`
+        # — returning the condition, or Invalid when neither is present. Shared by the
+        # list/dict/set comprehension forms. `if` and `where` are mutually exclusive:
+        # once `if` is consumed its expression is the filter, never a following `where`.
+        # Leading-guard helper for the `if`-filter branch of `parse_comprehension_filter`:
+        # null when `if` was not accepted, so the caller reaches it via a valued-return
+        # guard instead of a ternary over two lmut-Parser-threading calls (docs/125 §6b).
+        def try_if_filter_condition(parser: lmut Parser, accepted_if: bool) -> Ast::Expr?:
+            null return if not accepted_if
+            rebind condition: Ast::Expr, parser = parser.comprehension_filter_condition()
+            return condition
+
+
+
+        def parse_comprehension_filter(parser: lmut Parser) -> Ast::Expr:
+            filter_token: Token = parser.cursor()
+            rebind accepted_if: bool, parser = parser.accept(TokenKind.If)
+            rebind maybe_if_filter: Ast::Expr?, parser = parser.try_if_filter_condition(accepted_if)
+            if maybe_if_filter is if_filter_condition:
+                return if_filter_condition
+            has_where: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(filter_token, parser.source) == "where"
+            # Neither `if` nor `where` — the filter is legitimately omitted.
+            (Ast::Expr.Absent) return if not has_where
+            # A COMPREHENSION filter is spelled `if`, never `where`: stage0 parses
+            # `[i for i in 0..<4 where i > 0]` as an unterminated list and reports
+            # `expected ], got "where"`, while stage1 accepted it. `where` is the QUERY
+            # form's filter (`count x in xs where …`), which has its own parser.
+            # Reported and then consumed anyway, so the rest of the expression still parses
+            # and the error list stays short — the same shape as the `in OWNER` guard below.
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, filter_token)
+            parser, _ <- parser.advance()
+            rebind where_condition: Ast::Expr, parser = parser.comprehension_filter_condition()
+            return where_condition
+
+
+
+        # The condition expression after a consumed `if`/`where` filter keyword —
+        # the parsed expression, or Invalid when the keyword's expression failed
+        # to parse (a real error, unlike the legitimately omitted Absent).
+        def comprehension_filter_condition(parser: lmut Parser) -> Ast::Expr:
+            rebind condition_opt: Ast::Expr?, parser = parser.expression()
+            if condition_opt is condition:
+                return condition
+            return (Ast::Expr.Invalid)
+
+
+
+        # The shared `for VAR in ITER (if|where COND)? CLOSE` tail of the list/dict/set
+        # comprehension forms, entered with the contextual `for` still unconsumed.
+        # ITER is parsed at the binary level (no ternary post-processing) so a trailing
+        # `if COND` reads as the filter, not a `ITER if … else …` conditional. Reuses the
+        # Comprehension node; the resolver binds VAR and walks iterable/condition/body.
+        def finish_comprehension_tail(parser: lmut Parser, close: TokenKind, token: Token, body: Ast::Expr) -> Ast::Expr?:
+            can Abort.Panic:
+                parser, _ <- parser.advance()                       # `for`
+                rebind comprehension_variable_token: Token, parser = parser.expect(TokenKind.Ident)
+                # Extra binders (`[v for k, v in d]`) — first canonical on the node, the rest
+                # line-paired `__query_binder` markers so the resolver scopes them.
+                machine over parser.position while parser.peek() == TokenKind.Comma:
+                    state More
+                    start More
+
+                    More, _:
+                        parser.position <- parser.position + 1
+                        rebind comprehension_extra_binder: Token, parser = parser.expect(TokenKind.Ident)
+                        parser <- parser.record_projection_extra_binder(comprehension_extra_binder, token.line)
+                        -> More
+                parser, _ <- parser.expect(TokenKind.In)
+                rebind comprehension_iterable_left: Ast::Expr, parser = get parser.unary_expression()
+                rebind comprehension_iterable: Ast::Expr, parser = parser.binary_expression_at_level(comprehension_iterable_left, 1)
+                rebind comprehension_condition: Ast::Expr, parser = parser.parse_comprehension_filter()
+                # Optional `by par` marker on a list-map comprehension (docs/79 Part IV).
+                # Comprehension is an intentionally compact shared AST node for queries and
+                # collection builders, so retain this execution-mode bit in the file-level
+                # annotation side table keyed by the node's source line. The backend drains
+                # it into its own line-keyed registry before emitting bodies.
+                by_token: Token = parser.cursor()
+                if parser.peek() == TokenKind.Ident and Lexer::text_or_empty(by_token, parser.source) == "by":
+                    parser, _ <- parser.advance()
+                    rebind by_mode_token: Token, parser = parser.expect(TokenKind.Ident)
+                    by_mode: sview = Lexer::text_or_empty(by_mode_token, parser.source)
+                    if by_mode == "par":
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__parallel_comprehension", name: "__parallel", line: token.line})
+                    else:
+                        parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, by_mode_token)
+                parser, _ <- parser.expect(close)
+                # `[… for x in xs] in OWNER` — an EXPRESSION owner on a comprehension. stage0
+                # rejects it (an owner belongs on the binding, not the comprehension); stage1
+                # read the trailing `in` as an ordinary membership test and accepted it.
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor()) if parser.peek() == TokenKind.In
+                return (Ast::Expr.Comprehension(Lexer::text_or_empty(comprehension_variable_token, parser.source), comprehension_iterable, comprehension_condition, body, Ast::pos_of_token(token)))
+
+
+
+        def record_projection_extra_binder(parser: lmut Parser, binder: Token, line: u32) -> void:
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(binder, parser.source), name: "__query_binder", line: line})
+
+
+
+            # Leading-guard helper: null when `is_match` is false, so callers reach
+            # `finish_comprehension_tail` via a valued-return guard instead of a ternary
+            # over two lmut-Parser-threading calls (docs/125 §6b).
+        def try_finish_comprehension_tail(parser: lmut Parser, close: TokenKind, token: Token, body: Ast::Expr, is_match: bool) -> Ast::Expr?:
+            can Abort.Panic:
+                null return if not is_match
+                rebind result: Ast::Expr?, parser = parser.finish_comprehension_tail(close, token, body)
+                return result

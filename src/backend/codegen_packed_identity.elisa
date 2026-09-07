@@ -1,0 +1,276 @@
+# Stage1 backend — IDENTIFYING a packed enum: its index, its profile, its hierarchy root and
+# tag base, whether it is the compiler's own AST root or a dynamic AoS store, and how two
+# variant slots compare. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        def packed_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.packed_names.count |index, structs, name|:
+                index.i64() return if structs.packed_names[index] == name
+                index <- index + 1
+            return -1
+
+
+
+        # Packed profile ABI: canonical uses the existing variant-sparse runtime; retained_reads
+        # uses the dense index/SOA runtime. build_heavy remains reserved for the AoS path below.
+        def packed_profile_mode(annotations: darray[Ast::EnumAnnotation]&) -> i32 can[Abort.Panic]:
+            for annotation in annotations:
+                2 return if annotation.name == "__aos" and annotation.line == 3900000042
+                # Recursive values and sealed hierarchies need stable rows because a child
+                # value is consumed through its root type. stage0 selects canonical AoS for
+                # these automatically; leaving them in variant-sparse mode loses the root row
+                # ABI before codegen can reason about the hierarchy.
+                2 return if annotation.name == "__recursive_field" or annotation.name == "__ast_refinement"
+                if annotation.line == 3900000041:
+                    1 return if annotation.name == "retained_reads"
+                    2 return if annotation.name == "build_heavy"
+            return 0
+
+
+
+
+        # Whether this packed enum is the COMPILER'S OWN AST root, whose store row has a fixed
+        # hard-coded shape (`{i32, [32 x i32]}`, 132 bytes). That is a different question from
+        # "does this enum use the AoS store machinery" -- packed_is_ast_root, which every other
+        # site asks and which is deliberately broader.
+        #
+        # Conflating the two made a USER packed enum report the AST root's 132-byte row: its
+        # store was created with the wrong stride and every payload read back as 0 (stage0
+        # answers 5, stage1 answered 0). Two names, two meanings.
+        def packed_is_ast_root_row(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            false return if structs.packed_variant_count[enum_index.usize()] != 0.usize()
+            # Generic user hierarchies use the same zero-variant placeholder shape, but their
+            # rows are dynamically sized. Only the parser's dedicated compiler-AST marker may
+            # select the historical Node row; testing the generic hierarchy marker here made
+            # every user root look like the compiler's 132-byte AST store.
+            return packed_is_ast_refinement(structs, enum_index)
+
+
+
+
+        def packed_is_ast_root(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            name: sview = structs.packed_names[enum_index.usize()]
+            # Whether this packed enum uses the AoS store layout. Historically this was
+            # `name == "Node" and variant_count == 0` -- the compiler's own AST-root
+            # PLACEHOLDER row -- which scoped the whole AoS subsystem to self-hosting and was
+            # believed to be what blocked every user `packed enum`.
+            #
+            # MEASURED: relaxing it moves exactly ONE of the 21 packed corpus files
+            # (backend_packed_zero_payload_object, which then runs correctly -- 7, matching
+            # stage0). The other 20 still decline for their own reasons, so the note claiming
+            # this one gate explained the cluster was wrong.
+            #
+            # Kept because it is measured safe -- self-host, the 303-program adversarial suite
+            # and the semantic gates are all green with it -- and because the placeholder-row
+            # test was never the real rule: a packed enum with variants of its own uses the
+            # same store machinery.
+            true return if name == "Node" and structs.packed_variant_count[enum_index.usize()] == 0
+            # A sealed hierarchy ROOT uses the store machinery too, and it is written
+            # variant-less (`enum Widget: pass`), so the variant-count test below cannot see
+            # it. Without this a match on ANY member of a user hierarchy declined: the
+            # statement-match emitter resolves the scrutinee to its ROOT and then asks
+            # whether that root uses the AoS store. Asked STRUCTURALLY here -- this is store
+            # membership, not the AST's row layout, which packed_is_ast_root_row owns.
+            true return if structs.packed_variant_count[enum_index.usize()] == 0.usize() and packed_name_is_hierarchy_root(structs, name)
+            return structs.packed_variant_count[enum_index.usize()] > 0.usize()
+
+
+
+
+        # Whether this packed enum uses the measured dynamic AoS row shape. Unlike
+        # packed_is_ast_root, this includes a flat recursive enum (`Tree`) and every member of
+        # a user sealed hierarchy. Compiler AST rows retain the historical 32-slot floor, while
+        # user rows are sized from their actual widest payload.
+        def packed_is_dynamic_aos_enum(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            name: sview = structs.packed_names[enum_index.usize()]
+            for dynamic_name in structs.aos_dynamic_names |name|:
+                true return if dynamic_name == name
+            return false
+
+
+
+
+        # The name at the top of `name`'s `is` chain — itself when it has no parent. The step
+        # budget is the edge count: a well-formed hierarchy is a tree, so a longer walk means
+        # a cycle from malformed input and must terminate rather than hang.
+        def packed_hierarchy_root_name(structs: StructTable&, name: sview) -> sview can[Abort.Panic]:
+            can Abort.Panic:
+                cursor: mutable sview = name
+                steps: mutable usize = 0
+                while steps < structs.hierarchy_child.count |cursor, steps|:
+                    parent: mutable sview = ""
+                    for edge_index in 0..<structs.hierarchy_child.count |parent|:
+                        parent <- structs.hierarchy_parent[edge_index] if structs.hierarchy_child[edge_index] == cursor
+                    break if parent == ""
+                    cursor <- parent
+                    steps <- steps + 1
+                return cursor
+
+
+
+
+        # The tag space of a sealed hierarchy is shared by all refinements. A child enum's
+        # local variant ordinal therefore starts after every earlier declaration in the same
+        # hierarchy; treating it as a standalone packed enum makes `Button.Push` collide with
+        # `Control.Label` (both become tag 0) and is invisible until a match crosses that edge.
+        # Flat packed enums retain their local zero-based tags.
+        def packed_hierarchy_tag_base(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
+            return 0 if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            own_name: sview = structs.packed_names[enum_index.usize()]
+            root_name: sview = packed_hierarchy_root_name(structs, own_name)
+            is_hierarchy: bool = root_name != own_name or packed_name_is_hierarchy_root(structs, own_name)
+            return 0 if not is_hierarchy
+            base: mutable i64 = 0
+            for prior in 0..<enum_index.usize() |base, structs, root_name|:
+                prior_root: sview = packed_hierarchy_root_name(structs, structs.packed_names[prior])
+                base <- base + structs.packed_variant_count[prior].i64() if prior_root == root_name
+            return base
+
+
+
+
+        # The packed-enum index of the store that owns `enum_index` — the root of its sealed
+        # hierarchy. This resolved to the literal name "Node" before, which is why a user
+        # hierarchy type-checked and then declined in the backend: its root is not called
+        # Node, so the lookup returned -1 and every store query failed.
+        def packed_root_index_of(structs: StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                enum_index return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+                own_name: sview = structs.packed_names[enum_index.usize()]
+                root_name: sview = packed_hierarchy_root_name(structs, own_name)
+                # User hierarchies are generic packed/AoS values, not compiler-AST
+                # refinements, but their descendants still share the root's store.
+                if root_name != own_name:
+                    hierarchy_root_index: i64 = packed_index_of(structs, root_name)
+                    hierarchy_root_index return if hierarchy_root_index >= 0
+                # A flat recursive enum has no variant-less hierarchy anchor, but it still owns
+                # a store: its self-referential handles cannot be indexed into a compiler AST
+                # store (and there is no Node fallback in a user program).
+                enum_index return if packed_is_dynamic_aos_enum(structs, enum_index) and root_name == own_name
+                # Trust the edge walk only when it actually resolves a hierarchy: either it
+                # MOVED (this enum has a parent) or this enum is itself a root something
+                # refines. The auxiliary StructTables (the C-header and debug paths build
+                # their own) carry no edges, and there the walk returns the enum's own name —
+                # which for `Expr` is a REGISTERED packed name, so trusting it silently made
+                # Expr its own store root instead of Node and broke the gen3 fixpoint. The
+                # compiler's own AST must keep resolving to Node in exactly that case.
+                if packed_is_ast_refinement(structs, enum_index) and (root_name != own_name or packed_name_is_hierarchy_root(structs, own_name)):
+                    hierarchy_root_index: i64 = packed_index_of(structs, root_name)
+                    hierarchy_root_index return if hierarchy_root_index >= 0
+                return enum_index
+
+
+
+
+            # Two packed variant slots have the SAME payload FIELD layout — identical field count and
+            # each field's kind+bits. Structurally-identical payloads (`Pattern.Variant{sview,darray}`
+            # vs `Pattern.Struct{sview,darray}`) may intern to DIFFERENT aggregate payload slots, so an
+            # OR arm binding across them must compare field SPANS, not the aggregate ValueType.
+        def packed_slots_same_field_layout(a: i64, b: i64, structs: StructTable&) -> bool can[Abort.Panic]:
+            false return if a < 0 or b < 0
+            count_a: usize = structs.packed_field_type_count[a.usize()]
+            count_b: usize = structs.packed_field_type_count[b.usize()]
+            false return if count_a != count_b
+            start_a: usize = structs.packed_field_type_start[a.usize()]
+            start_b: usize = structs.packed_field_type_start[b.usize()]
+            same: mutable bool = true
+            for offset in 0..<count_a |same, start_a, start_b, structs|:
+                type_a: ValueType = structs.packed_field_types[start_a + offset]
+                type_b: ValueType = structs.packed_field_types[start_b + offset]
+                same <- false if type_a.kind != type_b.kind or type_a.bits != type_b.bits
+            return same
+
+
+
+
+        def packed_is_ast_refinement(structs: StructTable&, enum_index: i64) -> bool can[Abort.Panic]:
+            false return if enum_index < 0 or enum_index.usize() >= structs.packed_names.count
+            name: sview = structs.packed_names[enum_index.usize()]
+            # `Pattern` is `enum Pattern is Node` too (docs/122) — a Node refinement sharing the
+            # Node store with hierarchy-global tags, like Expr/Stmt/Decl. Omitting it here (every
+            # OTHER refinement list already names it) made packed_root_index_of(Pattern) wrong, so
+            # every `match pattern:` / `p is Pattern.X` failed the Node-store-active check.
+            for refinement_name in structs.ast_refinement_names |name|:
+                true return if refinement_name == name
+            return false
+
+
+
+        def packed_constructor_enum_name(head: Expr) -> sview:
+            match head:
+                Expr.Ident(name, _):
+                    return name
+                Expr.Scope(base, name, _):
+                    match base:
+                        Expr.Ident(_, _):
+                            return name
+                        _:
+                            pass
+                _:
+                    pass
+            return sview("", 0, 0)
+
+
+
+
+        def packed_variant_index(structs: StructTable&, enum_index: i64, variant_name: sview) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                start: usize = structs.packed_variant_start[enum_index.usize()]
+                count: usize = structs.packed_variant_count[enum_index.usize()]
+                packed_tag_base: i64 = packed_hierarchy_tag_base(structs, enum_index)
+                offset: mutable usize = 0
+                while offset < count |offset, structs, start, variant_name|:
+                    (packed_tag_base + offset.i64()) return if structs.packed_variants[start + offset] == variant_name
+                    offset <- offset + 1
+                return -1
+
+
+
+
+            # A variant's ordinal within its own refinement, used only to index the
+            # refinement-local payload pools. `packed_variant_index` deliberately returns the
+            # hierarchy-wide tag used in the shared AST row.
+        def packed_variant_local_index(structs: StructTable&, enum_index: i64, variant_name: sview) -> i64 can[Abort.Panic]:
+            start: usize = structs.packed_variant_start[enum_index.usize()]
+            count: usize = structs.packed_variant_count[enum_index.usize()]
+            offset: mutable usize = 0
+            while offset < count |offset, structs, start, variant_name|:
+                offset.i64() return if structs.packed_variants[start + offset] == variant_name
+                offset <- offset + 1
+            return -1
+
+
+
+
+        # A store row's size in bytes: the `{i32, [N x i64]}` handle laid out at i64
+        # alignment, so the tag's 4 bytes pad to 8. stage0 passes 16 for a one-word payload
+        # (`state_new_variant_sparse(ptr %owner, i64 16)`), which this reproduces.
+        # Whether this compilation carries the compiler's OWN AST: an `Expr`/`Stmt`/`Decl`/
+        # `Pattern` that exists as a real declaration with variants, not merely as the header
+        # reserve_ast_packed_headers places in EVERY program. That reservation is what made
+        # the reserved `Node` header answer packed_is_ast_root_row for a user program too --
+        # so a user hierarchy's store was created at the AST's fixed 132-byte stride while
+        # its rows were laid out at their real width. Anything under 132 bytes merely wasted
+        # space (every elisa-ui widget row was 132 bytes); a row past it overran the next
+        # node: a 15-common chain lost half its links and a 14-common one segfaulted, while
+        # stage0 kept every node.
+        def packed_program_has_ast_refinements(structs: StructTable&) -> bool can[Abort.Panic]:
+            # A refinement counts only when its hierarchy root IS the reserved `Node`:
+            # user hierarchy members are registered through the same refinement list
+            # (that is how `is`-chains resolve), so "any refinement with variants" was
+            # true for every widget program and the gate never closed.
+            ast_root: i64 = packed_index_of(structs, "Node")
+            false return if ast_root < 0
+            for refinement_name in structs.ast_refinement_names |structs, ast_root|:
+                refinement_index: i64 = packed_index_of(structs, refinement_name)
+                continue if refinement_index < 0 or refinement_index == ast_root
+                continue if structs.packed_variant_count[refinement_index.usize()] == 0
+                true return if packed_root_index_of(structs, refinement_index) == ast_root
+            return false

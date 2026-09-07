@@ -1,0 +1,416 @@
+# Stage1 backend — building a FUNCTION DECLARATION: its LLVM parameter types, the hidden
+# packed-store and region slots, `Self` in an impl member, and the earlier `extern` a later
+# definition must agree with. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+            # Declare `def name(a: T, …) -> R` in the module WITHOUT a body, recording its
+            # types in `fns`. Null when the signature is outside the modeled subset.
+            #
+            # Signature types are REAL now: any modeled scalar width/signedness, not just i64.
+        def function_is_variadic(annotations: darray[Ast::EnumAnnotation]&, line: u32) -> bool can[Abort.Panic]:
+            for annotation in annotations |line|:
+                true return if annotation.owner == "__variadic" and annotation.line == line
+            return false
+
+
+
+
+        # `Self` in an impl member's signature or body is the impl's receiver type. The
+        # parser leaves the name alone and record_impl_member_lines keys every member's
+        # LINE to its receiver, so bind it the way a generic binds `T` -- for exactly the
+        # declaration and the body of that member. stage0 resolves it in its analyzer;
+        # stage1 declined `self: Self` in every impl until now, for struct and scalar
+        # receivers alike (the std never trips it because it writes `Self` only in the
+        # protocol). Returns the count pushed, to pop with pop_type_bindings.
+        def push_self_binding(structs: mutable StructTable&, line: u32) -> usize can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<structs.impl_member_lines.count |structs, line|:
+                continue if structs.impl_member_lines[index] != line
+                receiver_name: sview = structs.impl_member_types[index]
+                receiver_struct: i64 = struct_index_of(structs, receiver_name)
+                receiver: ValueType = ValueType{kind: TypeKind.Struct, bits: receiver_struct.u64()} if receiver_struct >= 0 else scalar_type_of_name(receiver_name)
+                0 return if receiver.kind == TypeKind.Unmodeled
+                structs.binding_names <- structs.binding_names.push("Self")
+                structs.binding_types <- structs.binding_types.push(receiver)
+                return 1
+            return 0
+
+
+
+
+        def declare_function(declaration: Decl, owner: sview, error_lines: darray[u32]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                    self_bound: usize = push_self_binding(structs, line.line)
+                    handle: LLVMValueRef? = declare_function_impl(function_name, params, return_type_opt, body, effects, decorators, line.line, owner, function_is_variadic(annotations, line.line), error_lines, annotation_args, fns, structs, generics, m, ctx)
+                    pop_type_bindings(structs, self_bound)
+                    return handle
+                return null
+
+
+
+
+        def declared_function_name(owner: sview, function_name: sview, overload_count: i64, arity: usize, name_storage: mutable darray[u8]&) -> cstr can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if overload_count > 0:
+                if sview_len(owner) > 0:
+                    for oi in 0..<sview_len(owner) |name_storage, owner|:
+                        name_storage.push(sview_at(owner, oi))
+                    name_storage.push(46)
+                for ni in 0..<sview_len(function_name) |name_storage, function_name|:
+                    name_storage.push(sview_at(function_name, ni))
+                name_storage.push(46)
+                arity_digits: mutable darray[u8] = []
+                arity_n: mutable i64 = arity.i64()
+                arity_digits.push(48) if arity_n == 0
+                while arity_n > 0 |arity_n, arity_digits|:
+                    arity_digits.push((48 + (arity_n % 10)).u8())
+                    arity_n <- arity_n / 10
+                di: mutable i64 = arity_digits.count.i64() - 1
+                while di >= 0 |di, arity_digits, name_storage|:
+                    name_storage.push(arity_digits[di.usize()])
+                    di <- di - 1
+                name_storage.push(0)
+                return (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            return qualified_name_cstr(owner, function_name, name_storage)
+
+
+
+
+        # The store a BODY should treat as active: the root of the first packed enum in the
+        # function's recorded signature. A user packed enum's value is a u32 handle into the
+        # CALLER's store, so the body has to name that type's root — and a flat recursive
+        # enum has no variant-less root row at all, which is why the program-root helper
+        # below answers -1 for it. Falls back to the program root (the AST's `Node`) when a
+        # signature mentions no packed type directly.
+        # A parameter's packed-enum type, seen through `?` and `&`. An optional handle is
+        # exactly the shape a linked-tree walker takes, and a bare `&` is how a reader
+        # borrows one, so neither may hide the hierarchy the body reads commons from.
+        def parameter_packed_enum_type(declared: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic]:
+            inner: mutable ValueType = copied_type(declared)
+            inner <- optional_payload_of(inner, structs) if inner.kind == TypeKind.Optional
+            inner <- copied_type(structs.ref_targets[inner.bits.usize()]) if inner.kind == TypeKind.Ref and inner.bits.usize() < structs.ref_targets.count
+            return inner
+
+
+
+
+        # The store predicate of declare_function_from_types, from a declaration's own
+        # parameter annotations (resolved under whatever type bindings are active).
+        def declaration_signature_needs_store(params: darray[ParamDecl]&, return_value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                for parameter in params |structs|:
+                    true return if type_is_or_contains_packed_ast(parameter_value_type(parameter.type_expression, structs), 0, structs)
+                return type_is_or_contains_packed_ast(return_value_type, 0, structs)
+
+
+
+
+        def body_store_root_index(declaration: Decl, fns: FnTable&, structs: mutable StructTable&) -> i64 can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                name: sview = function_name_of(declaration)
+                line: u32 = function_line_of(declaration)
+                for index in 0..<fns.names.count |fns, name, line, structs|:
+                    continue if fns.names[index] != name or fns.lines[index] != line
+                    start: usize = fns.param_start[index]
+                    for offset in 0..<fns.param_count[index] |fns, structs, start|:
+                        # Through `?` and `&`: a body that only READS a packed value it was
+                        # handed (`def f(w: Widget?)` then `if w is node: node.pressed`) still
+                        # needs the root index recorded, or the common-read path's ambient-store
+                        # gate never opens and the read declines -- even though the hidden store
+                        # parameter it would have used is right there. The same code with the
+                        # value in a LOCAL compiled, which is what made this look like a
+                        # parameter-vs-local difference rather than a missing unwrap.
+                        param_type: ValueType = parameter_packed_enum_type(fns.param_types[start + offset], structs)
+                        continue if param_type.kind != TypeKind.PackedEnum
+                        param_root: i64 = packed_root_index_of(structs, param_type.bits.i64())
+                        param_root return if param_root >= 0
+                    signature_return: ValueType = fns.returns[index]
+                    if signature_return.kind == TypeKind.PackedEnum:
+                        return_root: i64 = packed_root_index_of(structs, signature_return.bits.i64())
+                        return_root return if return_root >= 0
+                # A generic INSTANTIATION has no fns row, so the scan above finds nothing and
+                # fell through to the PROGRAM root -- a different hierarchy than the
+                # parameter's, so the ambient-store gate never opened for the body's reads.
+                # Resolve it from the declaration's own annotations instead.
+                if declaration is Decl.Func(instantiation_name, instantiation_params, instantiation_return, instantiation_body, instantiation_effects, instantiation_decorators, instantiation_line):
+                    for instantiation_parameter in instantiation_params |structs|:
+                        instantiation_packed: ValueType = parameter_packed_enum_type(parameter_value_type(instantiation_parameter.type_expression, structs), structs)
+                        continue if instantiation_packed.kind != TypeKind.PackedEnum
+                        instantiation_root: i64 = packed_root_index_of(structs, instantiation_packed.bits.i64())
+                        instantiation_root return if instantiation_root >= 0
+                return program_hierarchy_root_index(structs)
+
+
+
+
+        # The program's sealed hierarchy root — the reserved variant-less row every
+        # refinement shares. The AST's root is `Node`; a user program has exactly one such
+        # row per hierarchy, and `main` creates the store for it.
+        def program_hierarchy_root_index(structs: StructTable&) -> i64 can[Abort.Panic]:
+            can Abort.Panic:
+                ast_root: i64 = packed_index_of(structs, "Node")
+                ast_root return if packed_is_ast_root_row(structs, ast_root)
+                for enum_index in 0..<structs.packed_names.count |structs|:
+                    true_index: i64 = enum_index.i64()
+                    true_index return if packed_is_ast_root_row(structs, true_index)
+                return -1
+
+
+
+
+        def declared_parameter_llvm_types(declared_param_types: darray[ValueType], arena_count: usize, wants_store: bool, sret_return: bool, structs: mutable StructTable&, ctx: LLVMContextRef) -> darray[LLVMTypeRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            llvm_param_types: mutable darray[LLVMTypeRef] = []
+            llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0)) if sret_return
+            for declared_param_type in declared_param_types |llvm_param_types, structs, ctx|:
+                if value_type_uses_indirect_aggregate(declared_param_type, structs, ctx):
+                    llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0))
+                else:
+                    llvm_param_types.push(llvm_type_of(declared_param_type, structs, ctx))
+            if wants_store:
+                ast_store_type: ValueType = ValueType{kind: TypeKind.PackedStore, bits: 0}
+                llvm_param_types.push(llvm_type_of(ast_store_type, structs, ctx))
+            for _arena_index in 0..<arena_count:
+                llvm_param_types.push(LLVMPointerTypeInContext(ctx, 0))
+            return llvm_param_types
+
+
+
+
+        def add_declared_function_with_params(fn_name: cstr, params_pointer: void&?, total_params: u32, variadic: bool, llvm_return: LLVMTypeRef, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fn_type: LLVMTypeRef = LLVMFunctionType(llvm_return, params_pointer, total_params, 1 if variadic else 0)
+            return LLVMAddFunction(m, fn_name, fn_type)
+
+
+
+
+        def build_declared_function(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, overload_count: i64, force_ast_store: bool, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, existing_handle: LLVMValueRef?, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            name_storage: mutable darray[u8] = []
+            # A method declared inside `impl I for C:` is emitted as `__impl__I__C__method`,
+            # which is what stage0 names it. Only the EMITTED SYMBOL changes: the FnTable
+            # still records the bare name and owner, so every call site resolves exactly as
+            # before (and intra-module calls use the handle, not the name).
+            impl_storage: mutable darray[u8] = []
+            impl_symbol: mutable bool = impl_member_symbol(structs, function_name, line, impl_storage)
+            impl_symbol <- constructor_symbol(structs, function_name, return_value_type, line, impl_storage) if not impl_symbol
+            impl_storage.push(0) if impl_symbol
+            # Keep the two name paths as an explicit branch. The stage1 bootstrap emitter
+            # historically dropped the call-valued `else` arm of a conditional initializer,
+            # which passed a null name to LLVMAddFunction in gen2 for ordinary functions.
+            fn_name: mutable cstr = ""
+            if impl_symbol:
+                fn_name <- (&impl_storage[0]).cast[cstr] can Unsafe.PointerCast
+            else:
+                decorated_link_name: sview = function_decorator_link_name(decorators, annotation_args, function_name)
+                if decorated_link_name != "":
+                    for decorated_name_index in 0..<decorated_link_name.len |name_storage, decorated_link_name|:
+                        name_storage.push(sview_at(decorated_link_name, decorated_name_index))
+                    name_storage.push(0)
+                    fn_name <- (&name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                else:
+                    fn_name <- declared_function_name(owner, function_name, overload_count, params.count, name_storage)
+            wants_store: bool = function_needs_ast_store(owner, function_name, structs) or force_ast_store or params_include_packed_ast(declared_param_types, structs) or type_is_or_contains_packed_ast(return_value_type, 0, structs)
+            is_error_fn: bool = line_is_error_returning(error_lines, line)
+            sret_return: bool = not is_error_fn and value_type_uses_sret(return_value_type, structs, ctx)
+            error_set_name: sview = resolved_error_family(line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, line), structs) if is_error_fn else ""
+            # Parser/Lexer functions construct opaque AST handles whose nested side
+            # tables are not visible in the source signature. Keep their allocations
+            # in the caller's region just like an explicit darray return.
+            signature_arena_slots: mutable usize = signature_arena_count(params, return_value_type, body, line, structs)
+            signature_arena_slots <- 0.usize() if generic_helper_uses_explicit_allocator(function_name)
+            signature_arena_slots <- signature_arena_slots + 1.usize() if error_set_payload_needs_arena(structs, error_set_name)
+            arena_count: usize = frontend_arena_count(owner, function_name, signature_arena_slots, wants_store)
+            llvm_param_types: mutable darray[LLVMTypeRef] = declared_parameter_llvm_types(declared_param_types, arena_count, wants_store, sret_return, structs, ctx)
+            if is_error_fn:
+                error_out_param: mutable darray[LLVMTypeRef] = []
+                error_out_param.push(LLVMPointerTypeInContext(ctx, 0))
+                error_out_param.extend(llvm_param_types)
+                llvm_param_types <- error_out_param
+            llvm_return: mutable LLVMTypeRef = llvm_type_of(return_value_type, structs, ctx)
+            llvm_return <- LLVMInt32TypeInContext(ctx) if is_error_fn
+            llvm_return <- LLVMVoidTypeInContext(ctx) if sret_return
+            # `main` is a C ABI entry point even when its Elisa return type is `void`.
+            # A C process entry point must return an integer status; leaving it as LLVM
+            # `void` makes crt0 observe an arbitrary register value, which surfaced as
+            # stage1-only exit-code drift under optimization. The FnTable remains `void`
+            # so source-level calls and type checking keep Elisa semantics.
+            llvm_return <- LLVMInt32TypeInContext(ctx) if owner == "" and function_name == "main" and return_value_type.kind == TypeKind.Void and not is_error_fn and not sret_return
+            # A set with a PAYLOAD-carrying variant returns the `%ErrSet__E` struct instead of
+            # the bare i32 code — stage0's ABI, measured. A fieldless set keeps the i32, which
+            # is every error set in this compiler's own source, so self-hosting is untouched.
+            llvm_return <- error_set_llvm_type(structs, error_set_name, ctx) if is_error_fn and error_set_has_payload(structs, error_set_name)
+            # LLVM accepts a null parameter array when the count is zero.  Indexing
+            # an empty darray here used to trap while declaring ordinary zero-arg
+            # functions, hiding the actual source diagnostic behind SIGTRAP.
+            params_pointer: mutable void&? = null
+            if llvm_param_types.count > 0:
+                params_pointer <- (&llvm_param_types[0]).cast[void&] can Unsafe.PointerCast
+            handle: mutable LLVMValueRef = zeroed
+            if existing_handle is prior_handle:
+                handle <- prior_handle
+            else:
+                handle <- add_declared_function_with_params(fn_name, params_pointer, llvm_param_types.count.u32(), variadic, llvm_return, m, ctx)
+            apply_function_decorators(handle, decorators, annotation_args, true, ctx)
+            add_type_parameter_attribute(handle, 1, "sret", llvm_type_of(return_value_type, structs, ctx), ctx) if sret_return
+            declared_param_base: u32 = (1 if is_error_fn else 0) + (1 if sret_return else 0)
+            for declared_param_index in 0..<declared_param_types.count |declared_param_base, declared_param_types, structs, ctx, handle|:
+                declared_param_type: ValueType = declared_param_types[declared_param_index]
+                if value_type_uses_indirect_aggregate(declared_param_type, structs, ctx):
+                    add_type_parameter_attribute(handle, declared_param_base + declared_param_index.u32() + 1, "byval", llvm_type_of(declared_param_type, structs, ctx), ctx)
+            apply_noalias_parameter_attributes(handle, params, 1 + (1 if is_error_fn else 0) + (1 if sret_return else 0), structs, ctx)
+            return handle
+
+
+
+
+        # A project include can emit `extern f(...)` in one source module and `def f(...)`
+        # in a later one. C treats those as one declaration/definition pair; Elisa overloads
+        # must still keep genuinely different signatures separate. Match only a prior
+        # callable extern with the complete modeled signature, then let the definition fill
+        # that existing LLVM declaration instead of creating `f.1`.
+        def prior_extern_is_pointer_type(value_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            true return if value_type.kind == TypeKind.Ref or value_type.kind == TypeKind.Fn
+            if value_type.kind == TypeKind.Optional:
+                optional_payload: ValueType = optional_payload_of(value_type, structs)
+                return optional_payload.kind == TypeKind.Ref
+            return false
+
+
+
+
+        def prior_extern_type_matches(prior_type: ValueType, current_type: ValueType, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            # C pointers and function pointers all use LLVM's opaque `ptr` ABI. Their
+            # source-side referent IDs can differ when declarations are discovered through
+            # different headers, even when the declarations are the same C symbol. The
+            # definition must still attach to the prior declaration; comparing the referent
+            # table index here would recreate the cross-file `f.1` failure for pointer APIs.
+            true return if prior_extern_is_pointer_type(prior_type, structs) and prior_extern_is_pointer_type(current_type, structs)
+            return prior_type.kind == current_type.kind and prior_type.bits == current_type.bits
+
+
+
+
+        def prior_extern_index_of(fns: FnTable&, owner: sview, name: sview, declared_param_types: darray[ValueType], return_value_type: ValueType, variadic: bool, structs: mutable StructTable&) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.names.count |fns, owner, name, declared_param_types, return_value_type, variadic, structs|:
+                continue if not fns.is_extern[index]
+                continue if fns.names[index] != name or fns.owners[index] != owner
+                continue if fns.param_count[index] != declared_param_types.count
+                prior_return: ValueType = fns.returns[index]
+                continue if not prior_extern_type_matches(prior_return, return_value_type, structs)
+                matched: mutable bool = true
+                for parameter_index in 0..<declared_param_types.count |matched, fns, index, declared_param_types|:
+                    prior_param: ValueType = fns.param_types[fns.param_start[index] + parameter_index]
+                    current_param: ValueType = declared_param_types[parameter_index]
+                    matched <- false if not prior_extern_type_matches(prior_param, current_param, structs)
+                return index.i64() if matched
+            return -1
+
+
+
+
+        def declare_function_from_types(function_name: sview, params: darray[ParamDecl], return_value_type: ValueType, body: darray[Stmt], declared_param_types: darray[ValueType], decorators: darray[Ast::Annotation], line: u32, owner: sview, force_ast_store: bool, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                overload_count: mutable i64 = 0
+                for oi in 0..<fns.names.count |oi, fns, owner, function_name, overload_count|:
+                    overload_count <- overload_count + 1 if fns.names[oi] == function_name and fns.owners[oi] == owner
+                wants_store: bool = function_needs_ast_store(owner, function_name, structs) or force_ast_store or params_include_packed_ast(declared_param_types, structs) or type_is_or_contains_packed_ast(return_value_type, 0, structs)
+                declaration_error_set_name: sview = line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, line) if line_is_error_returning(error_lines, line) else ""
+                signature_arena_slots: mutable usize = signature_arena_count(params, return_value_type, body, line, structs)
+                signature_arena_slots <- 0.usize() if generic_helper_uses_explicit_allocator(function_name)
+                signature_arena_slots <- signature_arena_slots + 1.usize() if error_set_payload_needs_arena(structs, declaration_error_set_name)
+                arena_count: usize = frontend_arena_count(owner, function_name, signature_arena_slots, wants_store)
+                is_error_fn: bool = line_is_error_returning(error_lines, line)
+                decorated_link_name: sview = function_decorator_link_name(decorators, annotation_args, function_name)
+                prior_extern_index: i64 = prior_extern_index_of(fns, owner, function_name, declared_param_types, return_value_type, variadic, structs)
+                existing_handle: mutable LLVMValueRef? = null
+                existing_handle <- fns.handles[prior_extern_index.usize()] if prior_extern_index >= 0
+                # If a preceding project module contributed `extern foo`, its
+                # handle must adopt the implementation spelling before the
+                # definition reuses it. Otherwise the later public `foo`
+                # wrapper collides with that declaration in LLVM's module.
+                if existing_handle is prior_handle and decorated_link_name != "":
+                    decorated_name_storage: mutable darray[u8] = []
+                    for decorated_name_index in 0..<decorated_link_name.len |decorated_name_storage, decorated_link_name|:
+                        decorated_name_storage.push(sview_at(decorated_link_name, decorated_name_index))
+                    decorated_name_cstr: cstr = (&decorated_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    LLVMSetValueName2(existing_handle, decorated_name_cstr, decorated_link_name.len)
+                handle: LLVMValueRef = build_declared_function(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, overload_count, force_ast_store, variadic, error_lines, annotation_args, existing_handle, structs, m, ctx)
+                fns.names <- fns.names.push(function_name)
+                fns.lines <- fns.lines.push(line)
+                fns.owners <- fns.owners.push(owner)
+                fns.needs_arena <- fns.needs_arena.push(arena_count > 0)
+                fns.arena_counts <- fns.arena_counts.push(arena_count)
+                fns.needs_store <- fns.needs_store.push(wants_store)
+                fns.is_error <- fns.is_error.push(is_error_fn)
+                fns.returns_nullable <- fns.returns_nullable.push(false)
+                fns.is_variadic <- fns.is_variadic.push(variadic)
+                fns.is_extern <- fns.is_extern.push(false)
+                fns.handles <- fns.handles.push(handle)
+                fns.returns <- fns.returns.push(return_value_type)
+                fns.param_start <- fns.param_start.push(fns.param_types.count)
+                fns.param_count <- fns.param_count.push(params.count)
+                region_flags: mutable darray[bool] = []
+                region_flags_for_function(params, body, line, structs, region_flags)
+                for parameter_index in 0..<declared_param_types.count |fns, params|:
+                    fns.param_names <- fns.param_names.push(params[parameter_index].name)
+                    fns.param_defaults <- fns.param_defaults.push(params[parameter_index].default_value)
+                    fns.param_types <- fns.param_types.push(declared_param_types[parameter_index])
+                    fns.param_region_slots <- fns.param_region_slots.push(region_flags[parameter_index])
+                return handle
+
+
+
+
+        def declare_function_impl(function_name: sview, params: darray[ParamDecl], return_type_opt: Expr?, body: darray[Stmt], effects: darray[sview], decorators: darray[Ast::Annotation], line: u32, owner: sview, variadic: bool, error_lines: darray[u32]&, annotation_args: darray[sview]&, fns: mutable FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if true:
+                # The owning module, for the whole of this SIGNATURE's resolution. Set here as
+                # well as in emit_function_body: a module member's return and parameter types
+                # are written BARE (`-> Grade` inside `module InTheDark:`), and with the owner
+                # unset they resolved against whichever module's `Grade` came first.
+                #
+                # It miscompiled rather than declining. nw-core has four modules declaring a
+                # `Grade`, and `InTheDark::grade_at` was declared as returning `%Maze.Grade` --
+                # five fields where the real one has six -- so the call stored 40 bytes into a
+                # 48-byte local and the sixth field read back 0. Both structs were emitted
+                # correctly and every other field was right; only the one past Maze's end was
+                # wrong. Restored below, on every path.
+                declared_owner_saved: sview = structs.current_owner
+                structs.current_owner <- owner
+                # An implicit-void function (no `-> T`) must STILL be declared — gating the whole
+                # declaration on a present return type left every `def f(…):` (void, e.g. a
+                # mutating helper) undeclared, so its calls/body all declined. Default to void.
+                declared_return_type: mutable ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+                if return_type_opt is return_type:
+                    declared_return_type <- annotation_value_type(return_type, structs)
+                    if declared_return_type.kind == TypeKind.Unmodeled:
+                        structs.current_owner <- declared_owner_saved
+                        return null
+                if true:
+                    return_value_type: ValueType = declared_return_type
+
+                    declared_param_types: mutable darray[ValueType] = []
+                    declined_parameter: mutable bool = false
+                    for parameter in params |declared_param_types, declined_parameter, structs|:
+                        parameter_type: ValueType = parameter_value_type(parameter.type_expression, structs)
+                        declined_parameter <- true if parameter_type.kind == TypeKind.Unmodeled
+                        declared_param_types.push(parameter_type)
+                    if declined_parameter:
+                        structs.current_owner <- declared_owner_saved
+                        return null
+                    # The owner is restored BEFORE the call, not after: declare_function_from_types
+                    # resolves nothing further from a bare name, and leaving it set past the
+                    # return would carry this module into the next declaration.
+                    structs.current_owner <- declared_owner_saved
+                    # Constructing AST nodes forces the hidden store parameter -- UNLESS the
+                    # body creates a store of its own, in which case the rows are its own and
+                    # the caller has nothing to hand over. Without the second half, a helper
+                    # that opened its own store required one from every caller, and an
+                    # ordinary `main` (which has none) declined the call rather than the
+                    # helper: the error named the caller, and the helper looked innocent.
+                    forces_ast_store: bool = statements_mention_ast_store_call(body, structs) and not statements_declare_local_packed_store(body, structs)
+                    return declare_function_from_types(function_name, params, return_value_type, body, declared_param_types, decorators, line, owner, forces_ast_store, variadic, error_lines, annotation_args, fns, structs, m, ctx)
+
+                structs.current_owner <- declared_owner_saved
+                return null
+            return null

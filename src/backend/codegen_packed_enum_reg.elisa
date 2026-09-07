@@ -1,0 +1,441 @@
+# Stage1 backend — REGISTERING a `packed enum`: its variant rows, the placeholder a forward
+# reference reserves, the names the backend must treat as packed, and a variant's tag within
+# its own enum. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        def register_packed_variant_rows_flat(enum_name: sview, variant_names: darray[sview]&, variant_fields: darray[Ast::Expr]&, variant_field_names: darray[sview]&, variant_field_starts: darray[usize]&, variant_field_counts: darray[usize]&, variant_start: usize, variant_count: usize, commons: u32, start: usize, packed_field_pool_start: usize, declined: mutable bool&, widest: mutable u32&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for variant_index in 0..<variant_count |structs, declined, widest, commons, variant_start|:
+                row: usize = variant_start + variant_index
+                field_start: usize = variant_field_starts[row]
+                field_count: usize = variant_field_counts[row]
+                declined <- true if field_count.u32() < commons
+                payload_fields: mutable darray[ValueType] = []
+                payload_names: mutable darray[sview] = []
+                for common_index in 0..<commons.usize() |structs, declined, variant_fields, field_start, variant_index|:
+                    continue if common_index >= field_count
+                    common_type: ValueType = annotation_value_type(variant_fields[field_start + common_index], structs)
+                    declined <- true if common_type.kind == TypeKind.Unmodeled
+                    # Keep the type. Every variant of an enum carries the same common
+                    # prefix, so the first variant's types are the enum's.
+                    structs.packed_common_types <- structs.packed_common_types.push(copied_type(common_type)) if variant_index == 0
+                for payload_index in commons.usize()..<field_count |payload_fields, payload_names, structs, variant_fields, variant_field_names, field_start, field_start|:
+                    payload_type: ValueType = annotation_value_type(variant_fields[field_start + payload_index], structs)
+                    declined <- true if payload_type.kind == TypeKind.Unmodeled
+                    payload_fields.push(payload_type)
+                    payload_names.push(variant_field_names[field_start + payload_index])
+                payload: mutable ValueType = unmodeled_type()
+                if payload_fields.count == 1:
+                    payload <- copied_type(payload_fields[0])
+                    widest <- 1 if widest == 0
+                elif payload_fields.count > 1:
+                    payload <- register_packed_payload_struct(enum_name, variant_names[row], payload_fields, payload_names, structs)
+                    widest <- payload_fields.count.u32() if payload_fields.count.u32() > widest
+                field_name: mutable sview = ""
+                field_name <- payload_names[0] if payload_fields.count == 1
+                structs.packed_variants <- structs.packed_variants.push(variant_names[row])
+                structs.packed_payloads <- structs.packed_payloads.push(payload)
+                structs.packed_has_payload <- structs.packed_has_payload.push(payload_fields.count > 0)
+                structs.packed_field_names <- structs.packed_field_names.push(field_name)
+                packed_field_start: usize = structs.packed_field_types.count
+                for payload_index in 0..<payload_fields.count |structs, payload_fields, payload_names|:
+                    structs.packed_field_types <- structs.packed_field_types.push(copied_type(payload_fields[payload_index]))
+                    structs.packed_field_flat_names <- structs.packed_field_flat_names.push(payload_names[payload_index])
+                structs.packed_field_type_start <- structs.packed_field_type_start.push(packed_field_start)
+                structs.packed_field_type_count <- structs.packed_field_type_count.push(payload_fields.count)
+
+
+
+
+        # Register a `packed enum`. Same per-variant subset as register_payload_enum (at most
+        # one SCALAR payload field), but into the packed pools: the representation is a store
+        # row, not inline data.
+        def register_packed_enum(declaration: Decl, packed_enum_names: darray[sview]&, common_owners: darray[sview]&, common_counts: darray[u32]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                match declaration:
+                    Decl.Module(module_name, module_body, module_line):
+                        for nested in module_body |packed_enum_names, common_owners, common_counts, structs|:
+                            register_packed_enum(nested, packed_enum_names, common_owners, common_counts, structs)
+                        return
+                    _:
+                        pass
+                match declaration:
+                    Decl.Scoped(scoped_body, scoped_line):
+                        for nested in scoped_body |packed_enum_names, common_owners, common_counts, structs|:
+                            register_packed_enum(nested, packed_enum_names, common_owners, common_counts, structs)
+                        return
+                    _:
+                        pass
+                match declaration:
+                    Decl.Enum(enum_name, variants, is_const, storage_type, enum_line):
+                        return if is_const
+                        is_packed: mutable bool = false
+                        for packed_name in packed_enum_names |is_packed, enum_name|:
+                            is_packed <- true if packed_name == enum_name
+                        return if not is_packed
+                        existing_index: i64 = packed_index_of(structs, enum_name)
+                        return if existing_index >= 0 and structs.packed_variant_count[existing_index.usize()] > 0
+                        # The sealed AST root is represented by `enum Node: pass`; depending on
+                        # parser normalization, `pass` may arrive as zero variants. Reserve the
+                        # root slot before the ordinary empty-enum rejection so refinements can
+                        # still share the one compiler-internal store.
+                        if packed_name_is_hierarchy_root(structs, enum_name) and variants.count == 0:
+                            return
+                        return if variants.count == 0
+                        # The sealed AST root is a type-only hierarchy anchor. `pass` is not a
+                        # runtime constructor, so it contributes no tag; its refinements share a
+                        # single tag column beneath it.
+                        if packed_name_is_hierarchy_root(structs, enum_name) and variants.count == 1 and variants[0].name == "pass":
+                            return
+                        # How many of each variant's leading fields are COMMON.
+                        #
+                        # This reads 0 TODAY for every enum, because the count never reaches the AST:
+                        # the parser sets `parser.captured_enum_common_count` (parser_types.elisa
+                        # ~838) but nothing transfers it into `File.enum_common_owners` /
+                        # `enum_common_counts` -- the side table is declared, copied onward to the
+                        # semantic table, and never populated. So a `common:` enum arrives here
+                        # looking like a plain one whose variants have an extra leading field, and
+                        # DECLINES on the arity check rather than mis-reading the layout. The layout
+                        # code below is correct and dormant: it starts working the moment the count
+                        # is carried through.
+                        commons: mutable u32 = 0
+                        for owner_index in 0..<common_owners.count |commons, enum_name, common_owners, common_counts|:
+                            commons <- common_counts[owner_index] if common_owners[owner_index] == enum_name
+                        # Recursive AST payloads may mention their own refinement (`Expr` in
+                        # an Expr field). Reserve the registry slot before resolving fields so
+                        # annotation_value_type can see the handle during this pass.
+                        placeholder_index: mutable i64 = -1
+                        if is_packed:
+                            placeholder_index <- packed_index_of(structs, enum_name)
+                            if placeholder_index < 0:
+                                structs.packed_names <- structs.packed_names.push(enum_name)
+                                structs.packed_variant_start <- structs.packed_variant_start.push(structs.packed_variants.count)
+                                structs.packed_variant_count <- structs.packed_variant_count.push(0)
+                                structs.packed_payload_words <- structs.packed_payload_words.push(0)
+                                structs.packed_common_counts <- structs.packed_common_counts.push(0)
+                                placeholder_index <- (structs.packed_names.count - 1).i64()
+                        start: usize = structs.packed_variants.count
+                        packed_field_pool_start: usize = structs.packed_field_types.count
+                        declined: mutable bool = false
+                        widest: mutable u32 = 0
+                        register_packed_variant_rows(enum_name, variants, commons, start, packed_field_pool_start, declined, widest, structs)
+                        if declined:
+                            while structs.packed_variants.count > start |structs|:
+                                _ = structs.packed_variants.pop()
+                                _ = structs.packed_payloads.pop()
+                                _ = structs.packed_has_payload.pop()
+                                _ = structs.packed_field_names.pop()
+                                _ = structs.packed_field_type_start.pop()
+                                _ = structs.packed_field_type_count.pop()
+                            while structs.packed_field_types.count > packed_field_pool_start |structs|:
+                                _ = structs.packed_field_types.pop()
+                                _ = structs.packed_field_flat_names.pop()
+                            if placeholder_index >= 0:
+                                structs.packed_variant_start[placeholder_index.usize()] <- structs.packed_variants.count
+                                structs.packed_variant_count[placeholder_index.usize()] <- 0
+                                structs.packed_payload_words[placeholder_index.usize()] <- 0
+                                structs.packed_common_counts[placeholder_index.usize()] <- 0
+                            return
+                        if placeholder_index >= 0:
+                            structs.packed_variant_start[placeholder_index.usize()] <- start
+                            structs.packed_variant_count[placeholder_index.usize()] <- variants.count
+                            structs.packed_payload_words[placeholder_index.usize()] <- widest
+                            structs.packed_common_counts[placeholder_index.usize()] <- commons
+                        else:
+                            structs.packed_names <- structs.packed_names.push(enum_name)
+                            structs.packed_variant_start <- structs.packed_variant_start.push(start)
+                            structs.packed_variant_count <- structs.packed_variant_count.push(variants.count)
+                            structs.packed_payload_words <- structs.packed_payload_words.push(widest)
+                            structs.packed_common_counts <- structs.packed_common_counts.push(commons)
+
+
+                    _:
+                        pass
+
+
+            # Metadata-only equivalent of register_packed_enum. The old declaration walker
+            # remains as a reference for ordinary AST traversal, but cannot be used by the
+            # self-hosted product because matching Decl.Enum recursively pulls the entire node
+            # hierarchy into the lowering of this registration pass.
+        def register_packed_enum_entry(enum_name: sview, variants: darray[Ast::EnumVariant]&, is_const: bool, packed_enum_names: darray[sview]&, common_owners: darray[sview]&, common_counts: darray[u32]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return if is_const
+                is_packed: mutable bool = false
+                for packed_name in packed_enum_names |is_packed, enum_name|:
+                    is_packed <- true if packed_name == enum_name
+                return if not is_packed or variants.count == 0
+                existing_index: i64 = packed_index_of(structs, enum_name)
+                return if existing_index >= 0 and structs.packed_variant_count[existing_index.usize()] > 0
+                if packed_name_is_hierarchy_root(structs, enum_name) and variants.count == 1 and variants[0].name == "pass":
+                    return
+                commons: mutable u32 = 0
+                for owner_index in 0..<common_owners.count |commons, enum_name, common_owners, common_counts|:
+                    commons <- common_counts[owner_index] if common_owners[owner_index] == enum_name
+                placeholder_index: mutable i64 = packed_index_of(structs, enum_name)
+                if placeholder_index < 0:
+                    structs.packed_names <- structs.packed_names.push(enum_name)
+                    structs.packed_variant_start <- structs.packed_variant_start.push(structs.packed_variants.count)
+                    structs.packed_variant_count <- structs.packed_variant_count.push(0)
+                    structs.packed_payload_words <- structs.packed_payload_words.push(0)
+                    structs.packed_common_counts <- structs.packed_common_counts.push(0)
+                    placeholder_index <- (structs.packed_names.count - 1).i64()
+                start: usize = structs.packed_variants.count
+                packed_field_pool_start: usize = structs.packed_field_types.count
+                declined: mutable bool = false
+                widest: mutable u32 = 0
+                register_packed_variant_rows(enum_name, variants, commons, start, packed_field_pool_start, declined, widest, structs)
+                if declined:
+                    while structs.packed_variants.count > start |structs|:
+                        _ = structs.packed_variants.pop()
+                        _ = structs.packed_payloads.pop()
+                        _ = structs.packed_has_payload.pop()
+                        _ = structs.packed_field_names.pop()
+                        _ = structs.packed_field_type_start.pop()
+                        _ = structs.packed_field_type_count.pop()
+                    while structs.packed_field_types.count > packed_field_pool_start |structs|:
+                        _ = structs.packed_field_types.pop()
+                        _ = structs.packed_field_flat_names.pop()
+                    structs.packed_variant_start[placeholder_index.usize()] <- structs.packed_variants.count
+                    structs.packed_variant_count[placeholder_index.usize()] <- 0
+                    structs.packed_payload_words[placeholder_index.usize()] <- 0
+                    structs.packed_common_counts[placeholder_index.usize()] <- 0
+                    return
+                structs.packed_variant_start[placeholder_index.usize()] <- start
+                structs.packed_variant_count[placeholder_index.usize()] <- variants.count
+                structs.packed_payload_words[placeholder_index.usize()] <- widest
+                structs.packed_common_counts[placeholder_index.usize()] <- commons
+
+
+
+
+        def register_packed_enum_entry_flat(enum_name: sview, variant_names: darray[sview]&, variant_fields: darray[Ast::Expr]&, variant_field_names: darray[sview]&, variant_field_starts: darray[usize]&, variant_field_counts: darray[usize]&, variant_start: usize, variant_count: usize, is_const: bool, packed_enum_names: darray[sview]&, common_owners: darray[sview]&, common_counts: darray[u32]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                return if is_const
+                is_packed: mutable bool = false
+                for packed_name in packed_enum_names |is_packed, enum_name|:
+                    is_packed <- true if packed_name == enum_name
+                return if not is_packed or variant_count == 0
+                existing_index: i64 = packed_index_of(structs, enum_name)
+                return if existing_index >= 0 and structs.packed_variant_count[existing_index.usize()] > 0
+                if packed_name_is_hierarchy_root(structs, enum_name) and variant_count == 1 and variant_names[variant_start] == "pass":
+                    return
+                commons: mutable u32 = 0
+                for owner_index in 0..<common_owners.count |commons, enum_name, common_owners, common_counts|:
+                    commons <- common_counts[owner_index] if common_owners[owner_index] == enum_name
+                placeholder_index: mutable i64 = packed_index_of(structs, enum_name)
+                if placeholder_index < 0:
+                    structs.packed_names <- structs.packed_names.push(enum_name)
+                    structs.packed_variant_start <- structs.packed_variant_start.push(structs.packed_variants.count)
+                    structs.packed_variant_count <- structs.packed_variant_count.push(0)
+                    structs.packed_payload_words <- structs.packed_payload_words.push(0)
+                    structs.packed_common_counts <- structs.packed_common_counts.push(0)
+                    placeholder_index <- (structs.packed_names.count - 1).i64()
+                start: usize = structs.packed_variants.count
+                packed_field_pool_start: usize = structs.packed_field_types.count
+                declined: mutable bool = false
+                widest: mutable u32 = 0
+                register_packed_variant_rows_flat(enum_name, variant_names, variant_fields, variant_field_names, variant_field_starts, variant_field_counts, variant_start, variant_count, commons, start, packed_field_pool_start, declined, widest, structs)
+                register_packed_common_names(enum_name, variant_fields, variant_field_names, variant_field_starts, variant_start, variant_count, commons, structs)
+                if declined:
+                    while structs.packed_variants.count > start |structs|:
+                        _ = structs.packed_variants.pop()
+                        _ = structs.packed_payloads.pop()
+                        _ = structs.packed_has_payload.pop()
+                        _ = structs.packed_field_names.pop()
+                        _ = structs.packed_field_type_start.pop()
+                        _ = structs.packed_field_type_count.pop()
+                    while structs.packed_field_types.count > packed_field_pool_start |structs|:
+                        _ = structs.packed_field_types.pop()
+                        _ = structs.packed_field_flat_names.pop()
+                    structs.packed_variant_start[placeholder_index.usize()] <- structs.packed_variants.count
+                    structs.packed_variant_count[placeholder_index.usize()] <- 0
+                    structs.packed_payload_words[placeholder_index.usize()] <- 0
+                    structs.packed_common_counts[placeholder_index.usize()] <- 0
+                    return
+                structs.packed_variant_start[placeholder_index.usize()] <- start
+                structs.packed_variant_count[placeholder_index.usize()] <- variant_count
+                structs.packed_payload_words[placeholder_index.usize()] <- widest
+                structs.packed_common_counts[placeholder_index.usize()] <- commons
+
+
+
+
+        # The names the backend must treat as PACKED: those the user actually declared
+        # `packed`, PLUS the compiler's own Node-hierarchy refinements, which the parser
+        # marks with an `__ast_refinement` annotation.
+        #
+        # Keyed on the ANNOTATION, never on the bare name. Six sites here used to hard-code
+        # `Node`/`Expr`/`Stmt`/`Decl`/`Pattern`, which made those five names effectively
+        # RESERVED: an ordinary user `enum Expr:` was registered as a packed AoS enum (and
+        # excluded from the payload-enum path), so every construction and match against it
+        # declined -- renaming the enum to `Shape` compiled the byte-identical program.
+        #
+        # The parser already draws the distinction correctly (parser_types_aggregate: the
+        # name fallback applies only when the declaration really sits in a Node hierarchy --
+        # a parent, or the sealed variant-less root), so the marker is precisely the signal
+        # the backend was missing. Dropping the hard-coded names WITHOUT this augmentation
+        # breaks self-hosting: the compiler declares `enum Node layout(handle: u32)` and
+        # `enum Expr is Node:`, never the `packed` keyword, so packed_enum_names alone does
+        # not contain them (measured).
+        def packed_or_ast_enum_names(file: Ast::File&, names: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+            names.extend(file.packed_enum_names)
+            for annotation in file.enum_annotations |names|:
+                # An `is` edge alone no longer means the store: only a store-backed
+                # hierarchy (see hierarchy_is_store_backed) registers as packed.
+                edge_is_store: bool = annotation.line == 3900000008 and hierarchy_is_store_backed(file, annotation.owner)
+                mark_is_store: bool = (annotation.name == "__ast_refinement" or annotation.name == "__aos") and hierarchy_is_store_backed(file, annotation.owner)
+                include_owner: bool = annotation.name == "__recursive_field" or mark_is_store or edge_is_store
+                if include_owner:
+                    already_owner: mutable bool = false
+                    for existing_owner in names |already_owner, annotation|:
+                        already_owner <- true if existing_owner == annotation.owner
+                    names.push(annotation.owner) if not already_owner and annotation.owner != ""
+                if edge_is_store:
+                    already_parent: mutable bool = false
+                    for existing_parent in names |already_parent, annotation|:
+                        already_parent <- true if existing_parent == annotation.name
+                    names.push(annotation.name) if not already_parent and annotation.name != ""
+
+
+
+        # Reserve a variant-less PLACEHOLDER row for a packed enum name, so a payload field
+        # referring to it resolves even before its own declaration is registered.
+        # register_packed_enum_entry_flat already reuses a placeholder (it only early-returns
+        # on an entry that has variants), so this changes registration ORDER sensitivity only.
+        def reserve_packed_placeholder(enum_name: sview, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            return if packed_index_of(structs, enum_name) >= 0
+            structs.packed_names <- structs.packed_names.push(enum_name)
+            structs.packed_variant_start <- structs.packed_variant_start.push(structs.packed_variants.count)
+            structs.packed_variant_count <- structs.packed_variant_count.push(0)
+            structs.packed_payload_words <- structs.packed_payload_words.push(0)
+            structs.packed_common_counts <- structs.packed_common_counts.push(0)
+
+
+
+        def register_packed_decl_from_metadata(file: Ast::File&, enum_index: usize, packed_or_ast: darray[sview]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            start: usize = file.enum_decl_variant_starts[enum_index]
+            count: usize = file.enum_decl_variant_counts[enum_index]
+            variants: mutable darray[Ast::EnumVariant] = []
+            for variant_index in 0..<count |variants, file, start|:
+                variants.push(Ast::EnumVariant{name: file.enum_decl_variant_names[start + variant_index], fields: [], field_names: [], value_expr: (Ast::Expr.Absent)})
+            register_packed_enum_entry(file.enum_decl_names[enum_index], variants, file.enum_decl_is_const[enum_index], packed_or_ast, file.enum_common_owners, file.enum_common_counts, structs)
+
+
+
+
+        def register_packed_enums_from_metadata(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            packed_or_ast: mutable darray[sview] = []
+            packed_or_ast_enum_names(file, &packed_or_ast)
+            # Reserve every packed/AoS declaration in SOURCE order before filling payload
+            # rows. A sealed hierarchy's root is often a variant-less ordinary `enum` and
+            # therefore absent from payload metadata; reserving only payload entries made
+            # the root disappear from reports and left descendants before their store owner.
+            for reserve_enum_index in 0..<file.enum_decl_names.count |file, packed_or_ast, structs|:
+                reserve_enum_name: sview = file.enum_decl_names[reserve_enum_index]
+                reserve_is_packed: mutable bool = false
+                for reserve_packed_name in packed_or_ast |reserve_is_packed, reserve_enum_name|:
+                    reserve_is_packed <- true if reserve_packed_name == reserve_enum_name
+                reserve_packed_placeholder(reserve_enum_name, structs) if reserve_is_packed
+            register_packed_common_storage_from_metadata(file.enum_annotations, structs)
+            register_packed_common_names_from_metadata(file.payload_enum_names, file.payload_enum_variant_starts, file.payload_enum_variant_counts, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.enum_common_owners, file.enum_common_counts, structs)
+            register_packed_common_names_from_common_metadata(file.enum_common_owners, file.enum_common_counts, file.enum_common_starts, file.enum_common_fields, file.enum_common_field_names, structs)
+            # Registration walks declarations in SOURCE order, and a payload field whose type
+            # is a packed enum declared LATER resolved to Unmodeled -- which declined the whole
+            # referring enum, so every match and construction over it went with it. stage0 has
+            # no such order dependence: moving the two declarations past each other compiled the
+            # byte-identical program. Reserving the names first removes the asymmetry.
+            for enum_index in 0..<file.payload_enum_names.count |file, packed_or_ast, structs|:
+                enum_name: sview = file.payload_enum_names[enum_index]
+                continue if file.payload_enum_is_const[enum_index] or file.payload_enum_variant_counts[enum_index] == 0
+                is_packed: mutable bool = false
+                for packed_name in packed_or_ast |is_packed, enum_name|:
+                    is_packed <- true if packed_name == enum_name
+                reserve_packed_placeholder(enum_name, structs) if is_packed
+            for enum_index in 0..<file.payload_enum_names.count |file, packed_or_ast, structs|:
+                register_packed_enum_entry_flat(file.payload_enum_names[enum_index], file.payload_enum_variant_names, file.payload_enum_variant_fields, file.payload_enum_variant_field_names, file.payload_enum_variant_field_starts, file.payload_enum_variant_field_counts, file.payload_enum_variant_starts[enum_index], file.payload_enum_variant_counts[enum_index], file.payload_enum_is_const[enum_index], packed_or_ast, file.enum_common_owners, file.enum_common_counts, structs)
+            # A hierarchy ROOT is declared variant-less, so registration gives it a row of
+            # size zero -- but every one of its refinements' rows lives in ITS store, so the
+            # stride has to cover the widest of them. Propagate that here, after every member
+            # is registered. Without it the store was created with a zero-word row and the
+            # first construction wrote past it.
+            for root_index in 0..<structs.packed_names.count |structs|:
+                continue if structs.packed_variant_count[root_index] != 0.usize()
+                continue if not packed_name_is_hierarchy_root(structs, structs.packed_names[root_index])
+                widest_words: mutable u32 = 0
+                widest_commons: mutable u32 = 0
+                for member_index in 0..<structs.packed_names.count |widest_words, widest_commons, structs, root_index|:
+                    continue if member_index == root_index
+                    continue if packed_hierarchy_root_name(structs, structs.packed_names[member_index]) != structs.packed_names[root_index]
+                    widest_words <- structs.packed_payload_words[member_index] if structs.packed_payload_words[member_index] > widest_words
+                    widest_commons <- structs.packed_common_counts[member_index] if structs.packed_common_counts[member_index] > widest_commons
+                structs.packed_payload_words[root_index] <- widest_words
+                structs.packed_common_counts[root_index] <- widest_commons
+                # ...and the common field NAMES. register_packed_common_names reads them off
+                # a variant's field list, so a variant-less root registers none -- and then
+                # reading a common field through the ROOT type (`w.x` where w: Widget) found
+                # no entry and silently produced the wrong word. The members all inherit the
+                # root's commons, so any member's list is the root's list.
+                copied_names: mutable bool = false
+                for donor_index in 0..<structs.packed_names.count |copied_names, structs, root_index, widest_commons|:
+                    continue if copied_names or donor_index == root_index
+                    continue if packed_hierarchy_root_name(structs, structs.packed_names[donor_index]) != structs.packed_names[root_index]
+                    continue if structs.packed_common_counts[donor_index] != widest_commons or widest_commons == 0
+                    donor_seen: mutable u32 = 0
+                    # The body appends inherited metadata to packed_common_owners. Capture the
+                    # source bound before walking it, otherwise a multi-common hierarchy makes
+                    # the compiler chase its own newly appended tail indefinitely.
+                    donor_probe_limit: usize = structs.packed_common_owners.count
+                    for probe in 0..<donor_probe_limit |donor_seen, structs, donor_index, root_index|:
+                        continue if structs.packed_common_owners[probe] != structs.packed_names[donor_index]
+                        structs.packed_common_owners <- structs.packed_common_owners.push(structs.packed_names[root_index])
+                        structs.packed_common_names <- structs.packed_common_names.push(structs.packed_common_names[probe])
+                        structs.packed_common_types <- structs.packed_common_types.push(copied_type(structs.packed_common_types[probe])) if probe < structs.packed_common_types.count
+                        donor_seen <- donor_seen + 1
+                    copied_names <- true if donor_seen > 0
+            for enum_index in 0..<file.enum_decl_names.count |file, packed_or_ast, structs|:
+                register_packed_decl_from_metadata(file, enum_index, packed_or_ast, structs)
+
+
+
+
+        def penum_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable usize = 0
+            while index < structs.penum_names.count |index, structs, name|:
+                index.i64() return if structs.penum_names[index] == name
+                index <- index + 1
+            # A refinement of an INLINE hierarchy is an alias of its root's payload enum.
+            alias_slot: i64 = alias_index_of(structs, name)
+            if alias_slot >= 0:
+                aliased: ValueType = structs.alias_types[alias_slot.usize()]
+                aliased.bits.i64() return if aliased.kind == TypeKind.PayloadEnum
+            return -1
+
+
+
+
+        # A variant's TAG is its index within its own enum's span, matching stage0, where the
+        # tag compare is `icmp eq i32 %tag, <declaration ordinal>`. -1 when unknown.
+        # `Owner.V` inside a payload enum's span: the row DECLARED by `owner` (a refinement
+        # of an inline hierarchy, or the enum itself) named `variant_name`. Falls back to a
+        # name-only match, which is what a plain enum needs and what the old lookup did.
+        def penum_variant_index_owned(structs: StructTable&, enum_index: i64, owner: sview, variant_name: sview) -> i64 can[Abort.Panic]:
+            start: usize = structs.penum_variant_start[enum_index.usize()]
+            count: usize = structs.penum_variant_count[enum_index.usize()]
+            for offset in 0..<count |structs, start, owner, variant_name|:
+                slot: usize = start + offset
+                continue if structs.penum_variants[slot] != variant_name
+                offset.i64() return if slot >= structs.penum_variant_owners.count or structs.penum_variant_owners[slot] == owner
+            return penum_variant_index(structs, enum_index, variant_name)
+
+
+
+        def penum_variant_index(structs: StructTable&, enum_index: i64, variant_name: sview) -> i64 can[Abort.Panic]:
+            start: usize = structs.penum_variant_start[enum_index.usize()]
+            count: usize = structs.penum_variant_count[enum_index.usize()]
+            offset: mutable usize = 0
+            while offset < count |offset, structs, start, variant_name|:
+                offset.i64() return if structs.penum_variants[start + offset] == variant_name
+                offset <- offset + 1
+            return -1

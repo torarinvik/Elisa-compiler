@@ -1,0 +1,217 @@
+# Stage1 backend — `recv.name(args)` where the receiver is the leading argument: UFCS calls,
+# module-qualified names, and the scope-resolved spellings. The chain's last link, so this is
+# where a call that matches nothing finally declines.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_call_receiver(callee: Expr, arguments: darray[Expr]&, argument_names: darray[sview], local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+
+            # UFCS: `p.get(a)` IS `get(p, a)`. A postfix call unifies casts and UFCS —
+            # `recv.Name()` where Name is a TYPE name is a conversion (handled on the cast
+            # path), and where Name is a FUNCTION it is an ordinary call with the receiver
+            # as the leading argument. Only the latter is resolved here; a name that is
+            # neither declines rather than inventing a call.
+            if callee is Expr.Field(receiver, method_name, method_line):
+                method_as_type: ValueType = scalar_type_of_name(method_name)
+                null return if method_as_type.kind != TypeKind.Unmodeled
+                # A dict or set receiver's `.get`/`.put`/`.add`/… are SYNTHESIZED calls to std
+                # generics, not UFCS to a user function. Detected before the ordinary UFCS
+                # lookup because no `get`/`put`/`add` function exists to find — and a set's
+                # `.add` did reach that lookup, bound to an unrelated generic named `add`, and
+                # emitted `store void` over the receiver.
+                # `v.reduce_sum(f)` — the METHOD spelling of the fold. Rewritten to the
+                # function form so there is one implementation; stage0 lowers both identically.
+                if method_name == "reduce_sum" and arguments.count >= 1:
+                    reduce_method_recv: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+                    if reduce_method_recv.kind == TypeKind.View:
+                        reduce_method_args: mutable darray[Expr] = [receiver]
+                        for reduce_method_extra in arguments |reduce_method_args|:
+                            reduce_method_args.push(reduce_method_extra)
+                        return emit_call((Expr.Ident("reduce_sum", method_line)), reduce_method_args, [], local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # `rows.valid(r)` / `rows.push(a, b)` in VALUE position on a `layout(soa)`
+                # aggregate. `valid` is `r < rowCount`; `push` fans out over the columns (the
+                # STATEMENT form does the same) and yields the new row's index, which stage0
+                # narrows to i32 -- a RowId is an i32 handle (`%row = alloca i32`).
+                soa_call_recv: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+                if soa_call_recv.kind == TypeKind.Struct and struct_declares_soa_layout(structs, structs.names[soa_call_recv.bits.usize()]):
+                    soa_call_slot: usize = soa_call_recv.bits.usize()
+                    soa_call_columns: usize = structs.field_count[soa_call_slot]
+                    if soa_call_columns > 0.usize():
+                        soa_call_llvm: LLVMTypeRef = llvm_type_of(soa_call_recv, structs, ctx)
+                        if method_name == "valid" and arguments.count == 1:
+                            if struct_chain_address(receiver, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_valid_base:
+                                if emit_expression(arguments[0], ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_valid_row:
+                                    soa_valid_column: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_call_llvm, soa_valid_base, 0, "soa.valid.col")
+                                    soa_valid_count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_valid_column, 1, "soa.valid.count.ptr")
+                                    soa_valid_count: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), soa_valid_count_pointer, "soa.valid.count")
+                                    # 40 = SLT.
+                                    return LLVMBuildICmp(builder, 40, soa_valid_row, soa_valid_count, "soa.valid")
+                            return null
+                        if method_name == "push" and arguments.count == soa_call_columns:
+                            if struct_chain_address(receiver, local_scope, fns, structs, generics, runtime, m, ctx, builder) is soa_pv_base:
+                                soa_pv_first: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_call_llvm, soa_pv_base, 0, "soa.pushv.col0")
+                                soa_pv_count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), soa_pv_first, 1, "soa.pushv.count.ptr")
+                                soa_pv_before: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), soa_pv_count_pointer, "soa.pushv.before")
+                                soa_pv_runtime: Runtime = growth_runtime_for(receiver, local_scope, runtime)
+                                soa_pv_declined: mutable bool = false
+                                for soa_pv_index in 0..<soa_call_columns |soa_pv_declined, soa_pv_base, soa_call_llvm, soa_call_slot, arguments, local_scope, fns, structs, generics, soa_pv_runtime, m, ctx, builder|:
+                                    soa_pv_column: LLVMValueRef = LLVMBuildStructGEP2(builder, soa_call_llvm, soa_pv_base, soa_pv_index.u32(), "soa.pushv.col")
+                                    soa_pv_type: ValueType = copied_type(structs.field_types[structs.field_start[soa_call_slot] + soa_pv_index])
+                                    soa_pv_declined <- true if not emit_darray_push(soa_pv_column, soa_pv_type, arguments[soa_pv_index], local_scope, fns, structs, generics, soa_pv_runtime, m, ctx, builder)
+                                null return if soa_pv_declined
+                                return LLVMBuildTrunc(builder, soa_pv_before, LLVMInt32TypeInContext(ctx), "soa.rowid")
+                            return null
+                # `d.entry(k).insert(v)` / `.get_or_insert(v)` — the ENTRY api's mutating
+                # members, whose receiver is the `entry` call itself rather than the dict.
+                # Checked before the dict dispatch below, which would see a receiver with no
+                # dict type and fall through to UFCS.
+                if method_name == "insert" or method_name == "get_or_insert":
+                    if emit_dict_entry_member(receiver, method_name, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dict_entry_value:
+                        return dict_entry_value
+                dict_args: darray[ValueType] = dict_type_args_of(receiver, local_scope, fns, structs, generics)
+                if dict_args.count != 0:
+                    container_base: sview = container_receiver_base(receiver, local_scope, fns, structs, generics)
+                    dict_helper: sview = resolved_container_helper(container_base, method_name, generics)
+                    if dict_helper != "":
+                        dict_arena_leading: bool = container_method_is_mutating(container_base, method_name)
+                        return emit_dict_method_call(dict_helper, dict_args, receiver, arguments, dict_arena_leading, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # `recv.f(a)` where `f` is a GENERIC user function (`f[T](self: Slice[T], …)`) —
+                # the receiver is parameter 0. Try EVERY template slot named `f` and pick the one
+                # whose parameter 0 unifies with THIS receiver (the wrong overload leaves a type
+                # param unbound → infer returns empty). The selected slot is threaded through
+                # instantiation so an overloaded name emits the correct body. This is what the whole
+                # UFCS surface of Slice/Deque/IndexMap/InlineVec needs. Checked before the
+                # non-generic lookup, which only finds monomorphic functions.
+                if generic_index_of(generics, method_name) >= 0:
+                    ufcs_chosen_slot: mutable i64 = -1
+                    ufcs_chosen_args: mutable darray[ValueType] = []
+                    for ufcs_cand_slot in 0..<generics.names.count |ufcs_chosen_slot, ufcs_chosen_args, method_name, receiver, arguments, local_scope, fns, structs, generics|:
+                        continue if ufcs_chosen_slot >= 0 or generics.names[ufcs_cand_slot] != method_name
+                        ufcs_cand_args: darray[ValueType] = infer_generic_args_ufcs(ufcs_cand_slot, receiver, arguments, local_scope, fns, structs, generics)
+                        if ufcs_cand_args.count != 0:
+                            ufcs_chosen_slot <- ufcs_cand_slot.i64()
+                            ufcs_chosen_args <- ufcs_cand_args
+                    if ufcs_chosen_slot >= 0:
+                        return emit_generic_ufcs_call(ufcs_chosen_slot.usize(), ufcs_chosen_args, receiver, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    return null
+                # `items.push(7)` where `extern push[T](box: mutable MethodBox[T]&, item: T)`.
+                # A generic extern cannot be declared at DECLARATION time — its parameter types
+                # mention `T` — so it is instantiated HERE, per call, from the receiver's
+                # concrete instantiation: stage0 emits `declare void @push__i64(ptr, i64)` and
+                # calls it, mangling `<name>__<typearg>`.
+                #
+                # Deliberately narrow: exactly one type parameter, a receiver that IS a generic
+                # struct instantiation, and a VOID return. The argument LLVM types come from the
+                # arguments actually emitted, so no substitution machinery is needed; anything
+                # outside that shape keeps declining rather than inventing a signature.
+                if generic_extern_param_of(structs, method_name) != "":
+                    gx_receiver: ValueType = expression_type(receiver, local_scope, fns, structs, generics)
+                    gx_base: mutable sview = ""
+                    gx_arg_start: mutable usize = 0
+                    gx_arg_count: mutable usize = 0
+                    if generic_struct_instantiation_of(structs, gx_receiver, gx_base, gx_arg_start, gx_arg_count) and gx_arg_count >= 1:
+                        gx_type_arg: ValueType = copied_type(structs.generic_struct_inst_args[gx_arg_start])
+                        gx_suffix: sview = stage0_scalar_type_name(gx_type_arg)
+                        if gx_suffix != "":
+                            if struct_chain_address(receiver, local_scope, fns, structs, generics, runtime, m, ctx, builder) is gx_receiver_address:
+                                gx_values: mutable darray[LLVMValueRef] = [gx_receiver_address]
+                                gx_types: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+                                gx_declined: mutable bool = false
+                                for gx_argument in arguments |gx_declined, gx_values, gx_types, gx_type_arg, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                    continue if gx_declined
+                                    if emit_expression(gx_argument, gx_type_arg, local_scope, fns, structs, generics, runtime, m, ctx, builder) is gx_argument_value:
+                                        gx_values.push(gx_argument_value)
+                                        gx_types.push(llvm_type_of(gx_type_arg, structs, ctx))
+                                    else:
+                                        gx_declined <- true
+                                null return if gx_declined
+                                gx_name_storage: mutable darray[u8] = []
+                                for gx_index in 0..<sview_len(method_name) |gx_name_storage, method_name|:
+                                    gx_name_storage.push(sview_at(method_name, gx_index))
+                                gx_name_storage.push(95)
+                                gx_name_storage.push(95)
+                                for gx_index in 0..<sview_len(gx_suffix) |gx_name_storage, gx_suffix|:
+                                    gx_name_storage.push(sview_at(gx_suffix, gx_index))
+                                gx_name_storage.push(0)
+                                gx_mangled: cstr = (&gx_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                                gx_types_pointer: void& = (&gx_types[0]).cast[void&] can Unsafe.PointerCast
+                                gx_fn_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), gx_types_pointer, gx_types.count.u32(), 0)
+                                gx_target: LLVMValueRef = declare_or_get_named(m, gx_mangled, gx_fn_type)
+                                gx_values_pointer: void& = (&gx_values[0]).cast[void&] can Unsafe.PointerCast
+                                return LLVMBuildCall2(builder, gx_fn_type, gx_target, gx_values_pointer, gx_values.count.u32(), "")
+                    return null
+                ufcs_target_opt: LLVMValueRef? = lookup_function(fns, "", method_name)
+                if ufcs_target_opt is ufcs_target:
+                    return emit_direct_call("", method_name, receiver, true, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # Module methods (`module Lexer: def is_digit`) are stored under their owner
+                # (`@Lexer.is_digit`). UFCS `c.is_digit()` must still find them. Prefer a
+                # unique bare name; when several owners share the name (Lexer.peek vs
+                # Parser.peek), disambiguate by UFCS arity (receiver + explicit args) so
+                # product meta-compile does not decline the whole callee.
+                ufcs_total_arity: usize = arguments.count + 1
+                ufcs_owner: mutable sview = ""
+                ufcs_hits: mutable i64 = 0
+                ufcs_arity_owner: mutable sview = ""
+                ufcs_arity_hits: mutable i64 = 0
+                for ufcs_scan in 0..<fns.names.count |ufcs_owner, ufcs_hits, ufcs_arity_owner, ufcs_arity_hits, method_name, ufcs_total_arity, fns|:
+                    if fns.names[ufcs_scan] == method_name:
+                        ufcs_hits <- ufcs_hits + 1
+                        ufcs_owner <- fns.owners[ufcs_scan]
+                        if fns.param_count[ufcs_scan] == ufcs_total_arity:
+                            ufcs_arity_hits <- ufcs_arity_hits + 1
+                            ufcs_arity_owner <- fns.owners[ufcs_scan]
+                if ufcs_hits == 1 and ufcs_owner != "":
+                    return emit_direct_call(ufcs_owner, method_name, receiver, true, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                if ufcs_arity_hits == 1 and ufcs_arity_owner != "":
+                    return emit_direct_call(ufcs_arity_owner, method_name, receiver, true, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                return null
+            # `M::get(a)` — a MODULE-qualified call. `::` parses to Expr.Scope, a node kind
+            # distinct from Expr.Field, so a qualified call is never confused with UFCS.
+            if callee is Expr.Scope(scope_head, scope_name, scope_line):
+                if scope_head is Expr.Ident(module_name, module_name_line):
+                    # A generic reached through its module, with the type arguments INFERRED
+                    # from the call: `M::f(x)`. Same bare-name rule as the bracketed forms,
+                    # and checked before the direct call because a direct call has no
+                    # template to instantiate and would decline.
+                    # NOT gated on exact_overload_exists, unlike the bare-name path above: a
+                    # generic declared inside a module is ALSO recorded in the function
+                    # table under that module, so the overload probe always succeeds and
+                    # would skip the template every time. The generic table is the
+                    # narrower fact here -- a name is in it only if it really is one.
+                    if generic_index_of(generics, scope_name) >= 0:
+                        if arguments.count > 0:
+                            scope_generic_slot: usize = generic_index_of(generics, scope_name).usize()
+                            scope_inferred_args: darray[ValueType] = infer_generic_args(scope_generic_slot, arguments, local_scope, fns, structs, generics)
+                            if scope_inferred_args.count > 0:
+                                return emit_generic_call(scope_name, scope_inferred_args, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    # `Inner::f()` written INSIDE `module Outer:`: the nested module is
+                    # registered as `Outer::Inner`, so a bare head that names no owner of
+                    # its own resolves against the enclosing owner (stage0 scopes it so).
+                    if function_index_of(fns, module_name, scope_name) < 0:
+                        if qualified_owner_of(fns, structs.current_owner, module_name) is enclosing_owner:
+                            return emit_direct_call(enclosing_owner, scope_name, callee, false, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                    # `using Mod as M` makes `M::f` mean `Mod::f`; the name is unchanged when
+                    # it is not an alias, so this is a no-op for an ordinary qualified call.
+                    return emit_direct_call(module_alias_target(module_name, structs), scope_name, callee, false, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                # `A::B::get(a)` — a module declared with a QUALIFIED name is registered
+                # VERBATIM ("A::B", the parser captures the whole chain as one source span),
+                # while its USE nests Scope inside Scope. Recover the registered owner by
+                # matching the two parts against the recorded names rather than by joining
+                # them: joining would allocate a name just to look one up, and the recorded
+                # sview is exactly what the FnTable compares against.
+                if scope_head is Expr.Scope(nested_head, nested_mid, nested_line):
+                    if nested_head is Expr.Ident(nested_root, nested_root_line):
+                        if qualified_owner_of(fns, nested_root, nested_mid) is qualified_owner:
+                            return emit_direct_call(qualified_owner, scope_name, callee, false, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                return null
+            return null
+
+
+        # Emit a call to a NON-generic function by name. UFCS passes its receiver as a
+        # SEPARATE leading argument rather than prepending it to a list: building a local
+        # `darray[Expr]` of receiver-then-arguments CRASHES stage0 (SIGTRAP inside cgo —
+        # bisected to the darray construction itself, a darray of packed-enum node handles
+        # built in this function). Threading the receiver is the only spelling that
+        # compiles, not a style preference. `receiver` is ignored when `has_receiver` is
+        # false; callers pass the callee node itself rather than synthesize a dummy.

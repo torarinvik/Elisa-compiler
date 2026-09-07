@@ -1,0 +1,468 @@
+# Stage1 backend — ONE ARM of a `match` over a packed store node: test the row's tag (and any
+# nested sub-pattern) against the arm's pattern, bind the payload fields the arm names, and
+# emit its body into the block the caller opened. The three flags travel by reference because
+# the caller folds them across every arm: whether any arm declined, whether a default was
+# seen, and whether any arm left control open.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_packed_match_arm(spm_arm: MatchArm, spm_index_value: LLVMValueRef, spm_dynamic_aos: bool, spm_state: LLVMValueRef, spm_arena: LLVMValueRef, spm_type: ValueType, spm_record: LLVMValueRef, spm_row_type: LLVMTypeRef, spm_tag: LLVMValueRef, spm_function: LLVMValueRef, spm_done: LLVMBasicBlockRef, spm_declined: mutable bool&, spm_saw_default: mutable bool&, spm_any_open: mutable bool&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A `mutable bool&` cannot be an operand of `or`; read both first.
+            spm_arm_declined: bool = spm_declined
+            spm_arm_saw_default: bool = spm_saw_default
+            return if spm_arm_declined or spm_arm_saw_default
+            if arm_has_guard(spm_arm.guard) and is_catch_all_pattern(spm_arm.pattern):
+                spm_declined <- true
+                return
+            spm_arm_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.arm")
+            if is_catch_all_pattern(spm_arm.pattern):
+                _ = LLVMBuildBr(builder, spm_arm_block)
+                LLVMPositionBuilderAtEnd(builder, spm_arm_block)
+                spm_default_status: EmitStatus = emit_statements_scoped(spm_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                spm_declined <- true if spm_default_status == EmitStatus.Declined
+                spm_any_open <- true if spm_default_status == EmitStatus.Open
+                branch_if_open(spm_default_status, builder, spm_done)
+                spm_saw_default <- true if spm_default_status != EmitStatus.Declined
+                return
+            spm_ordinals: mutable darray[i64] = []
+            spm_slot: mutable i64 = -1
+            spm_fields: mutable darray[Pattern] = []
+            spm_arm_ok: mutable bool = false
+            # `Expr.Unary(op, operand, line) as whole:` — docs/122 §5.4
+            # as-binding on a packed-AST-node variant arm. The parser only ever
+            # wraps a single Variant (never an Or) in Pattern.As, so unwrapping
+            # it here — before the single-variant classification below — and
+            # leaving the Or-arm classification on the ORIGINAL `spm_arm.pattern`
+            # (which then simply never matches Pattern.Or for an As-wrapped arm,
+            # same as today) covers it with no change to the OR/nested-subpattern
+            # paths at all.
+            spm_as_name: mutable sview = ""
+            spm_pattern: mutable Pattern = spm_arm.pattern
+            if spm_arm.pattern is Pattern.As(spm_as_outer_name, spm_as_inner):
+                if spm_as_inner.count == 1 and spm_as_inner[0] is Pattern.Variant(_, _):
+                    spm_as_name <- spm_as_outer_name
+                    spm_pattern <- spm_as_inner[0]
+            if spm_pattern is Pattern.Variant(spm_path, spm_v_fields):
+                spm_v_ord: i64 = packed_variant_index_of_path(spm_path, structs)
+                spm_v_slot: i64 = packed_slot_of_path(spm_path, structs)
+                if spm_v_ord >= 0 and spm_v_slot >= 0:
+                    spm_ordinals.push(spm_v_ord)
+                    spm_slot <- spm_v_slot
+                    spm_fields <- spm_v_fields
+                    spm_arm_ok <- true
+            if spm_arm.pattern is Pattern.Or(spm_or_opts):
+                spm_or_ok: mutable bool = spm_or_opts.count > 0
+                spm_ref_payload: mutable ValueType = unmodeled_type()
+                spm_ref_slot: mutable i64 = -1
+                for spm_opt in spm_or_opts |spm_or_ok, spm_ordinals, spm_slot, spm_fields, spm_ref_payload, spm_ref_slot, structs|:
+                    if spm_opt is Pattern.Variant(spm_opt_path, spm_opt_fields):
+                        spm_opt_ord: i64 = packed_variant_index_of_path(spm_opt_path, structs)
+                        spm_opt_slot: i64 = packed_slot_of_path(spm_opt_path, structs)
+                        if spm_opt_ord < 0 or spm_opt_slot < 0 or not structs.packed_has_payload[spm_opt_slot.usize()]:
+                            spm_or_ok <- false
+                        else:
+                            spm_opt_payload: ValueType = copied_type(structs.packed_payloads[spm_opt_slot.usize()])
+                            if spm_ref_payload.kind == TypeKind.Unmodeled:
+                                spm_ref_payload <- spm_opt_payload
+                                spm_ref_slot <- spm_opt_slot
+                                spm_slot <- spm_opt_slot
+                                spm_fields <- spm_opt_fields
+                            else:
+                                spm_or_ok <- false if not packed_slots_same_field_layout(spm_ref_slot, spm_opt_slot, structs)
+                            spm_ordinals.push(spm_opt_ord)
+                    else:
+                        spm_or_ok <- false
+                spm_arm_ok <- true if spm_or_ok and spm_slot >= 0
+            if not spm_arm_ok:
+                spm_declined <- true
+                return
+            if true:
+                # A payload field may itself be a VARIANT pattern
+                # (`Expr.Call(Expr.Ident(name, line), args, names, line)`).
+                # Permitted only in the multi-field shape, which is every
+                # occurrence in the semantic layer; a nested pattern in a
+                # single-field payload still declines.
+                spm_has_nested: mutable bool = false
+                spm_all_binders: mutable bool = true
+                for spm_bf in spm_fields |spm_all_binders, spm_has_nested|:
+                    if spm_bf is Pattern.Variant(spm_bf_path, spm_bf_sub):
+                        spm_has_nested <- true
+                    # A string LITERAL sub-pattern — `Stmt.Block("region", clause,
+                    # binding, body, line)`, how the region walkers select one block
+                    # kind. The field is an sview and the test is a content compare,
+                    # emitted with the nested tests below.
+                    elif spm_bf is Pattern.Literal(spm_bf_lit):
+                        spm_has_nested <- true
+                    # A LABELLED binder (`Both(left: left, right: right)`) is a
+                    # Field wrapping a Binding. It binds exactly like the bare
+                    # spelling -- only the ORDER is given by the label instead
+                    # of by position, which the payload read resolves.
+                    elif spm_bf is Pattern.Field(spm_bf_label, spm_bf_inner):
+                        spm_all_binders <- false if not (spm_bf_inner.count == 1 and spm_bf_inner[0] is Pattern.Binding(spm_bf_sub))
+                    elif not (spm_bf is Pattern.Binding(spm_bf_name)) and not (spm_bf is Pattern.Wildcard):
+                        spm_all_binders <- false
+                # A NESTED variant in a SINGLE-field payload
+                # (`Expr.Wrap(inner: Expr.Lit(value: v))`) is now lowered below:
+                # the payload IS the child's handle, so its tag is read from the
+                # store exactly as the outer tag was and compared against the
+                # nested variant's ordinal. Only the labelled spelling and only
+                # when the field is itself a packed node; anything else still
+                # declines rather than binding without testing.
+                spm_nested_single: mutable bool = false
+                if spm_fields.count == 1:
+                    if spm_fields[0] is Pattern.Field(spm_ns_label, spm_ns_inner):
+                        if spm_ns_inner.count == 1 and spm_ns_inner[0] is Pattern.Variant(spm_ns_path, spm_ns_sub):
+                            spm_nested_single <- true
+                spm_all_binders <- true if spm_nested_single
+                spm_all_binders <- false if spm_has_nested and spm_fields.count <= 1 and not spm_nested_single
+                if not spm_all_binders:
+                    spm_declined <- true
+                    return
+                spm_next_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.next")
+                spm_hit: mutable LLVMValueRef = zeroed
+                spm_hit_first: mutable bool = true
+                for spm_ord in spm_ordinals |spm_hit, spm_hit_first, spm_tag, ctx, builder|:
+                    spm_cmp: LLVMValueRef = LLVMBuildICmp(builder, 32, spm_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), spm_ord.u64(), 0), "spm.cmp")
+                    if spm_hit_first:
+                        spm_hit <- spm_cmp
+                        spm_hit_first <- false
+                    else:
+                        spm_hit <- LLVMBuildOr(builder, spm_hit, spm_cmp, "spm.or")
+                _ = LLVMBuildCondBr(builder, spm_hit, spm_arm_block, spm_next_block)
+                LLVMPositionBuilderAtEnd(builder, spm_arm_block)
+                if spm_as_name != "":
+                    spm_whole_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_type, structs, ctx), "spm.whole")
+                    _ = LLVMBuildStore(builder, spm_index_value, spm_whole_slot)
+                    declare_local(local_scope, spm_as_name, spm_whole_slot, spm_type)
+                if spm_fields.count > 0 and structs.packed_has_payload[spm_slot.usize()]:
+                    spm_payload: ValueType = copied_type(structs.packed_payloads[spm_slot.usize()])
+                    if spm_payload.kind == TypeKind.Unmodeled:
+                        spm_declined <- true
+                    else:
+                        spm_payload_value: mutable LLVMValueRef = zeroed
+                        if runtime.packed_mode == 2:
+                            # The AoS row is `{i32 tag, <commons x i64>, [N x i64] payload}`,
+                            # so the payload sits at `1 + commons`, not at 1. With a
+                            # common declared, index 1 IS the common: `Expr.Int(value: 3)`
+                            # with `span: 7` read back 7 for `value` -- a silent wrong
+                            # answer (77 where stage0 says 37), not a decline.
+                            spm_aos_commons: u32 = packed_aos_common_count(structs, spm_type.bits.i64()) if spm_dynamic_aos else structs.packed_common_counts[spm_type.bits.usize()]
+                            if spm_dynamic_aos:
+                                if packed_dynamic_row_load_value(spm_payload, packed_variant_row_slots(structs, spm_slot.usize()), structs, spm_type.bits.i64(), spm_record, ctx, builder) is spm_dynamic_payload_value:
+                                    spm_payload_value <- spm_dynamic_payload_value
+                                else:
+                                    spm_declined <- true
+                            else:
+                                spm_payload_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, spm_row_type, spm_record, (1 + spm_aos_commons), "spm.payload.ptr")
+                                spm_payload_value <- LLVMBuildLoad2(builder, llvm_type_of(spm_payload, structs, ctx), spm_payload_pointer, "spm.payload")
+                        elif spm_fields.count > 1:
+                            # A MULTI-FIELD payload is read field by field
+                            # below; the single-word read here would try to
+                            # convert one i64 into the whole payload STRUCT and
+                            # decline before that ran.
+                            pass
+                        else:
+                            # Word 0 is the tag and words 1..commons are the
+                            # common fields, so the first payload word is
+                            # `1 + commons` -- the same index the expression
+                            # emitter uses.
+                            spm_commons: u32 = structs.packed_common_counts[spm_type.bits.usize()]
+                            spm_word_args: mutable darray[LLVMValueRef] = [spm_index_value, spm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + spm_commons).u64(), 0)]
+                            spm_word_args <- [spm_arena, spm_index_value, spm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + spm_commons).u64(), 0)] if runtime.packed_mode == 1
+                            spm_word_pointer: void& = (&spm_word_args[0]).cast[void&] can Unsafe.PointerCast
+                            spm_payload_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_word_pointer, spm_word_args.count.u32(), "packed.word")
+                            if spm_payload.kind == TypeKind.PackedEnum:
+                                # A payload that is ITSELF a node (`Wrap(child: Expr)`)
+                                # is stored as its i32 handle, so the word is
+                                # truncated rather than converted -- emit_conversion
+                                # models scalars and would decline a PackedEnum
+                                # target, taking the whole arm with it.
+                                spm_payload_value <- LLVMBuildTrunc(builder, spm_payload_word, LLVMInt32TypeInContext(ctx), "packed.child.handle")
+                            elif emit_conversion(spm_payload_word, ValueType{kind: TypeKind.Signed, bits: 64}, spm_payload, structs, ctx, builder) is spm_payload_converted:
+                                spm_payload_value <- spm_payload_converted
+                            else:
+                                spm_declined <- true
+                        spm_field_start: usize = structs.packed_field_type_start[spm_slot.usize()]
+                        # MULTI-FIELD payload under the variant-sparse profile:
+                        # each field is its OWN word, at `1 + commons + i`. The
+                        # AoS profile keeps one aggregate load and extracts, so
+                        # only mode 0 needs the per-field reads. A binder may be
+                        # LABELLED (`Both(left: left, right: right)`), which
+                        # arrives as Pattern.Field -- resolved to its declared
+                        # index so the word read matches the binder.
+                        spm_declined_at_1: bool = spm_declined
+                        if runtime.packed_mode != 2 and spm_fields.count > 1 and not spm_declined_at_1:
+                            spm_mf_commons: u32 = structs.packed_common_counts[spm_type.bits.usize()]
+                            spm_mf_count: usize = structs.packed_field_type_count[spm_slot.usize()]
+                            for spm_mf_index in 0..<spm_fields.count |spm_declined, spm_fields, spm_field_start, spm_mf_commons, spm_mf_count, spm_slot, spm_index_value, spm_state, structs, local_scope, runtime, ctx, builder|:
+                                spm_mf_name: mutable sview = ""
+                                spm_mf_position: mutable usize = spm_mf_index
+                                if spm_fields[spm_mf_index] is Pattern.Binding(spm_mf_bound):
+                                    spm_mf_name <- spm_mf_bound
+                                if spm_fields[spm_mf_index] is Pattern.Field(spm_mf_label, spm_mf_inner):
+                                    spm_mf_found: mutable i64 = -1
+                                    for spm_mf_probe in 0..<spm_mf_count |spm_mf_found, spm_mf_label, spm_field_start, structs|:
+                                        spm_mf_found <- spm_mf_probe.i64() if structs.packed_field_flat_names[spm_field_start + spm_mf_probe] == spm_mf_label
+                                    if spm_mf_found < 0 or spm_mf_inner.count != 1:
+                                        spm_declined <- true
+                                    else:
+                                        spm_mf_position <- spm_mf_found.usize()
+                                        spm_mf_name <- spm_mf_sub if spm_mf_inner[0] is Pattern.Binding(spm_mf_sub) else ""
+                                spm_declined_at_2: bool = spm_declined
+                                return if spm_mf_name == "" or spm_declined_at_2
+                                spm_mf_type: ValueType = copied_type(structs.packed_field_types[spm_field_start + spm_mf_position])
+                                # The payload is stored as ONE AGGREGATE at word
+                                # `1 + commons` -- `%__packed_payload_N = type { i32, i32 }`
+                                # for `Add(left: Expr, right: Expr)`, both handles inside a
+                                # SINGLE word. Reading field `i` from word `1 + commons + i`
+                                # therefore got field 0 right (it aliases the aggregate's low
+                                # half) and read field 1 out of a word NOTHING EVER WROTE:
+                                # `right` came back 0, which resolves to node index 0, so
+                                # `right.span` silently returned the FIRST node's span.
+                                # stage0 answers 13, stage1 answered 11.
+                                #
+                                # Two 32-bit fields share a word, so field `i` lives in word
+                                # `1 + commons + i/2` at bit `(i%2)*32`. Only that layout is
+                                # handled: a payload whose fields are not all 32-bit needs
+                                # real offset arithmetic (there is no size/offset helper in
+                                # this backend), and guessing it would be another silent
+                                # wrong answer -- so it DECLINES, which is what it did before.
+                                spm_mf_all32: mutable bool = true
+                                for spm_mf_wprobe in 0..<spm_mf_count |spm_mf_all32, spm_field_start, structs|:
+                                    spm_mf_wtype: ValueType = copied_type(structs.packed_field_types[spm_field_start + spm_mf_wprobe])
+                                    # A nested node is an i32 HANDLE; anything else must be a
+                                    # 32-bit scalar to share a word.
+                                    spm_mf_is32: bool = spm_mf_wtype.kind == TypeKind.PackedEnum or ((spm_mf_wtype.kind == TypeKind.Signed or spm_mf_wtype.kind == TypeKind.Unsigned) and spm_mf_wtype.bits == 32)
+                                    spm_mf_all32 <- false if not spm_mf_is32
+                                # A payload of FULL-WIDTH fields really does occupy one
+                                # word each, which is what this path always assumed and
+                                # what it still does -- declining those would have taken
+                                # away working cases (it did: coverage 273 -> 271 on the
+                                # first attempt at this fix).
+                                spm_mf_wordindex: usize = (1 + spm_mf_commons).usize() + (spm_mf_position / 2.usize() if spm_mf_all32 else spm_mf_position)
+                                spm_mf_args: mutable darray[LLVMValueRef] = [spm_index_value, spm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), spm_mf_wordindex.u64(), 0)]
+                                spm_mf_args <- [spm_arena, spm_index_value, spm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), spm_mf_wordindex.u64(), 0)] if runtime.packed_mode == 1
+                                spm_mf_pointer: void& = (&spm_mf_args[0]).cast[void&] can Unsafe.PointerCast
+                                spm_mf_raw: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_mf_pointer, spm_mf_args.count.u32(), "packed.word")
+                                spm_mf_word: mutable LLVMValueRef = spm_mf_raw
+                                if spm_mf_all32 and spm_mf_position % 2.usize() == 1.usize():
+                                    spm_mf_word <- LLVMBuildLShr(builder, spm_mf_raw, LLVMConstInt(LLVMInt64TypeInContext(ctx), 32, 0), "packed.word.hi")
+                                # A payload field that is ITSELF a node (`Add(left: Expr,
+                                # right: Expr)`) is stored as its i32 handle. emit_conversion
+                                # models scalars and declines a PackedEnum target, taking the
+                                # whole arm with it -- so the recursive shape stage0's own
+                                # packed programs use could bind nothing.
+                                if spm_mf_type.kind == TypeKind.PackedEnum:
+                                    spm_mf_handle: LLVMValueRef = LLVMBuildTrunc(builder, spm_mf_word, LLVMInt32TypeInContext(ctx), "packed.field.handle")
+                                    spm_mf_hstorage: mutable darray[u8] = []
+                                    spm_mf_hslot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_mf_type, structs, ctx), sview_to_cstr(spm_mf_name, spm_mf_hstorage))
+                                    _ = LLVMBuildStore(builder, spm_mf_handle, spm_mf_hslot)
+                                    declare_local(local_scope, spm_mf_name, spm_mf_hslot, spm_mf_type)
+                                elif emit_conversion(spm_mf_word, ValueType{kind: TypeKind.Signed, bits: 64}, spm_mf_type, structs, ctx, builder) is spm_mf_value:
+                                    spm_mf_storage: mutable darray[u8] = []
+                                    spm_mf_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_mf_type, structs, ctx), sview_to_cstr(spm_mf_name, spm_mf_storage))
+                                    _ = LLVMBuildStore(builder, spm_mf_value, spm_mf_slot)
+                                    declare_local(local_scope, spm_mf_name, spm_mf_slot, spm_mf_type)
+                                else:
+                                    spm_declined <- true
+                        elif spm_fields.count == 1:
+                            # A single payload field may be written LABELLED
+                            # (`Expr.Int(value: value)`) -- the form stage0's own
+                            # packed test programs use. It arrives as Pattern.Field,
+                            # which only the MULTI-field loop above resolved, so the
+                            # binder was never declared and the arm body declined on
+                            # an unknown name. Resolve the label against the single
+                            # declared field and bind its inner name.
+                            spm_single_label: mutable sview = ""
+                            if spm_fields[0] is Pattern.Field(spm_sf_label, spm_sf_inner):
+                                if spm_sf_inner.count == 1 and structs.packed_field_type_count[spm_slot.usize()] == 1.usize() and structs.packed_field_flat_names[spm_field_start] == spm_sf_label:
+                                    spm_single_label <- spm_sf_sub if spm_sf_inner[0] is Pattern.Binding(spm_sf_sub) else ""
+                                # A NESTED sub-pattern has no binder at THIS
+                                # level; it is tested and bound below.
+                                if spm_single_label == "" and not spm_nested_single:
+                                    spm_declined <- true
+                            if spm_single_label != "":
+                                spm_label_storage: mutable darray[u8] = []
+                                spm_label_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_payload, structs, ctx), sview_to_cstr(spm_single_label, spm_label_storage))
+                                _ = LLVMBuildStore(builder, spm_payload_value, spm_label_slot)
+                                declare_local(local_scope, spm_single_label, spm_label_slot, spm_payload)
+                            if spm_fields[0] is Pattern.Binding(spm_single_name):
+                                spm_single_storage: mutable darray[u8] = []
+                                spm_single_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_payload, structs, ctx), sview_to_cstr(spm_single_name, spm_single_storage))
+                                _ = LLVMBuildStore(builder, spm_payload_value, spm_single_slot)
+                                declare_local(local_scope, spm_single_name, spm_single_slot, spm_payload)
+                            # The NESTED sub-pattern: test the child's tag, then
+                            # bind the child's own single field. A miss falls
+                            # through to the next arm, so first-wins order and
+                            # the sibling arms are unaffected.
+                            if spm_nested_single:
+                                if spm_payload.kind != TypeKind.PackedEnum:
+                                    spm_declined <- true
+                                elif spm_fields[0] is Pattern.Field(spm_nn_label, spm_nn_inner):
+                                    if spm_nn_inner[0] is Pattern.Variant(spm_nn_path, spm_nn_sub):
+                                        spm_nn_ordinal: i64 = packed_variant_index_of_path(spm_nn_path, structs)
+                                        spm_nn_slot: i64 = packed_slot_of_path(spm_nn_path, structs)
+                                        if spm_nn_ordinal < 0 or spm_nn_slot < 0 or spm_nn_sub.count > 1.usize():
+                                            spm_declined <- true
+                                        else:
+                                            spm_nn_enum: usize = spm_payload.bits.usize()
+                                            spm_nn_dynamic_aos: bool = runtime.packed_mode == 2 and packed_is_dynamic_aos_enum(structs, spm_nn_enum.i64())
+                                            spm_nn_commons: u32 = packed_aos_common_count(structs, spm_nn_enum.i64()) if spm_nn_dynamic_aos else structs.packed_common_counts[spm_nn_enum]
+                                            spm_nn_row: LLVMTypeRef = packed_row_llvm_type(structs, spm_nn_enum.i64(), ctx)
+                                            spm_nn_tag: mutable LLVMValueRef = zeroed
+                                            spm_nn_record: mutable LLVMValueRef = zeroed
+                                            if runtime.packed_mode == 2:
+                                                spm_nn_index64: LLVMValueRef = LLVMBuildZExt(builder, spm_payload_value, LLVMInt64TypeInContext(ctx), "spm.nn.index")
+                                                spm_nn_record_args: mutable darray[LLVMValueRef] = [spm_state, spm_nn_index64]
+                                                spm_nn_record_pointer: void& = (&spm_nn_record_args[0]).cast[void&] can Unsafe.PointerCast
+                                                spm_nn_record <- LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_nn_record_pointer, 2, "spm.nn.record")
+                                                spm_nn_tag <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), LLVMBuildStructGEP2(builder, spm_nn_row, spm_nn_record, 0, "spm.nn.tag.ptr"), "spm.nn.tag")
+                                            else:
+                                                spm_nn_tag_args: mutable darray[LLVMValueRef] = [spm_state, spm_payload_value]
+                                                spm_nn_tag_pointer: void& = (&spm_nn_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                                                spm_nn_tag <- LLVMBuildCall2(builder, runtime.packed_read_tag_type, runtime.packed_read_tag, spm_nn_tag_pointer, 2, "spm.nn.tag")
+                                            spm_nn_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.nested.ok")
+                                            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 32, spm_nn_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), spm_nn_ordinal.u64(), 0), "spm.nn.cmp"), spm_nn_body, spm_next_block)
+                                            LLVMPositionBuilderAtEnd(builder, spm_nn_body)
+                                            if spm_nn_sub.count == 1:
+                                                spm_nn_bind: mutable sview = ""
+                                                if spm_nn_sub[0] is Pattern.Binding(spm_nn_bare):
+                                                    spm_nn_bind <- spm_nn_bare
+                                                if spm_nn_sub[0] is Pattern.Field(spm_nn_flabel, spm_nn_finner):
+                                                    spm_nn_bind <- spm_nn_fsub if spm_nn_finner.count == 1 and spm_nn_finner[0] is Pattern.Binding(spm_nn_fsub) else ""
+                                                if spm_nn_bind == "":
+                                                    spm_declined <- true
+                                                else:
+                                                    spm_nn_payload: ValueType = copied_type(structs.packed_payloads[spm_nn_slot.usize()])
+                                                    if spm_nn_payload.kind == TypeKind.Unmodeled:
+                                                        spm_declined <- true
+                                                    else:
+                                                        spm_nn_value: mutable LLVMValueRef = zeroed
+                                                        spm_nn_ok: mutable bool = true
+                                                        if runtime.packed_mode == 2:
+                                                            if spm_nn_dynamic_aos:
+                                                                if packed_dynamic_row_load_value(spm_nn_payload, packed_variant_row_slots(structs, spm_nn_slot.usize()), structs, spm_nn_enum.i64(), spm_nn_record, ctx, builder) is spm_nn_dynamic_value:
+                                                                    spm_nn_value <- spm_nn_dynamic_value
+                                                                else:
+                                                                    spm_nn_ok <- false
+                                                            else:
+                                                                spm_nn_value <- LLVMBuildLoad2(builder, llvm_type_of(spm_nn_payload, structs, ctx), LLVMBuildStructGEP2(builder, spm_nn_row, spm_nn_record, (1 + spm_nn_commons), "spm.nn.payload.ptr"), "spm.nn.payload")
+                                                        else:
+                                                            spm_nn_word_args: mutable darray[LLVMValueRef] = [spm_payload_value, spm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + spm_nn_commons).u64(), 0)]
+                                                            spm_nn_word_args <- [spm_arena, spm_payload_value, spm_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), (1 + spm_nn_commons).u64(), 0)] if runtime.packed_mode == 1
+                                                            spm_nn_word_pointer: void& = (&spm_nn_word_args[0]).cast[void&] can Unsafe.PointerCast
+                                                            spm_nn_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, spm_nn_word_pointer, spm_nn_word_args.count.u32(), "spm.nn.word")
+                                                            if spm_nn_payload.kind == TypeKind.PackedEnum:
+                                                                spm_nn_value <- LLVMBuildTrunc(builder, spm_nn_word, LLVMInt32TypeInContext(ctx), "spm.nn.handle")
+                                                            elif emit_conversion(spm_nn_word, ValueType{kind: TypeKind.Signed, bits: 64}, spm_nn_payload, structs, ctx, builder) is spm_nn_converted:
+                                                                spm_nn_value <- spm_nn_converted
+                                                            else:
+                                                                spm_nn_ok <- false
+                                                        if spm_nn_ok:
+                                                            spm_nn_storage: mutable darray[u8] = []
+                                                            spm_nn_slot_alloca: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_nn_payload, structs, ctx), sview_to_cstr(spm_nn_bind, spm_nn_storage))
+                                                            _ = LLVMBuildStore(builder, spm_nn_value, spm_nn_slot_alloca)
+                                                            declare_local(local_scope, spm_nn_bind, spm_nn_slot_alloca, spm_nn_payload)
+                                                        else:
+                                                            spm_declined <- true
+                        if spm_fields.count > 1 and runtime.packed_mode == 2:
+                            for spm_bind_index in 0..<spm_fields.count |spm_fields, spm_field_start, spm_payload_value, structs, local_scope, ctx, builder|:
+                                # The binder may be LABELLED (`Add(left: left, right: right)`),
+                                # which arrives as Pattern.Field. Only the word-reading (mode 0)
+                                # loop resolved labels, so under the AoS profile a labelled
+                                # multi-field arm bound NOTHING and the body declined on the
+                                # unknown names.
+                                spm_multi_label: mutable sview = ""
+                                spm_multi_slot_index: mutable usize = spm_bind_index
+                                if spm_fields[spm_bind_index] is Pattern.Field(spm_ml_label, spm_ml_inner):
+                                    if spm_ml_inner.count == 1:
+                                        spm_ml_found: mutable i64 = -1
+                                        for spm_ml_probe in 0..<structs.packed_field_type_count[spm_slot.usize()] |spm_ml_found, spm_ml_label, spm_field_start, structs|:
+                                            spm_ml_found <- spm_ml_probe.i64() if structs.packed_field_flat_names[spm_field_start + spm_ml_probe] == spm_ml_label
+                                        if spm_ml_found >= 0:
+                                            spm_multi_slot_index <- spm_ml_found.usize()
+                                            spm_multi_label <- spm_ml_sub if spm_ml_inner[0] is Pattern.Binding(spm_ml_sub) else ""
+                                if spm_multi_label != "":
+                                    spm_ml_type: ValueType = copied_type(structs.packed_field_types[spm_field_start + spm_multi_slot_index])
+                                    spm_ml_raw: LLVMValueRef = LLVMBuildExtractValue(builder, spm_payload_value, spm_multi_slot_index.u32(), "spm.field")
+                                    spm_ml_value: LLVMValueRef = LLVMBuildTrunc(builder, spm_ml_raw, LLVMInt32TypeInContext(ctx), "packed.field.handle") if spm_ml_type.kind == TypeKind.PackedEnum else spm_ml_raw
+                                    spm_ml_storage: mutable darray[u8] = []
+                                    spm_ml_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_ml_type, structs, ctx), sview_to_cstr(spm_multi_label, spm_ml_storage))
+                                    _ = LLVMBuildStore(builder, spm_ml_value, spm_ml_slot)
+                                    declare_local(local_scope, spm_multi_label, spm_ml_slot, spm_ml_type)
+                                if spm_fields[spm_bind_index] is Pattern.Binding(spm_multi_name):
+                                    spm_multi_type: ValueType = copied_type(structs.packed_field_types[spm_field_start + spm_bind_index])
+                                    spm_multi_raw: LLVMValueRef = LLVMBuildExtractValue(builder, spm_payload_value, spm_bind_index.u32(), "spm.field")
+                                    # Same node-handle narrowing as the word path: the row
+                                    # holds i64 words, a packed handle is i32.
+                                    spm_multi_field: LLVMValueRef = LLVMBuildTrunc(builder, spm_multi_raw, LLVMInt32TypeInContext(ctx), "packed.field.handle") if spm_multi_type.kind == TypeKind.PackedEnum else spm_multi_raw
+                                    spm_multi_storage: mutable darray[u8] = []
+                                    spm_multi_slot: LLVMValueRef = LLVMBuildAlloca(builder, llvm_type_of(spm_multi_type, structs, ctx), sview_to_cstr(spm_multi_name, spm_multi_storage))
+                                    _ = LLVMBuildStore(builder, spm_multi_field, spm_multi_slot)
+                                    declare_local(local_scope, spm_multi_name, spm_multi_slot, spm_multi_type)
+                            # NESTED sub-patterns, after the plain binds. Each one
+                            # reads its sub-node's record, tests that node's tag and
+                            # falls through to spm_next_block on a mismatch — the arm
+                            # only matches when every nested test holds — then binds
+                            # the sub-pattern's own fields from its own payload.
+                            for spm_nest_index in 0..<spm_fields.count |spm_fields, spm_payload_value, spm_declined, spm_function, spm_next_block, spm_field_start, structs, local_scope, runtime, ctx, builder|:
+                                # A string LITERAL sub-pattern: the field is an
+                                # sview and the test is a CONTENT compare through
+                                # the runtime, not a tag read. Same fall-through
+                                # shape as the variant tests below.
+                                if spm_fields[spm_nest_index] is Pattern.Literal(spm_lit_text):
+                                    spm_lit_type: ValueType = copied_type(structs.packed_field_types[spm_field_start + spm_nest_index])
+                                    if spm_lit_type.kind != TypeKind.SView:
+                                        spm_declined <- true
+                                    else:
+                                        spm_lit_field: LLVMValueRef = LLVMBuildExtractValue(builder, spm_payload_value, spm_nest_index.u32(), "spm.nest.lit.field")
+                                        if sview_literal_hit(spm_lit_text, spm_lit_field, spm_lit_type, structs, runtime, ctx, builder) is spm_lit_hit:
+                                            spm_lit_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.nest.lit.cont")
+                                            _ = LLVMBuildCondBr(builder, spm_lit_hit, spm_lit_cont, spm_next_block)
+                                            LLVMPositionBuilderAtEnd(builder, spm_lit_cont)
+                                        else:
+                                            spm_declined <- true
+                                if spm_fields[spm_nest_index] is Pattern.Variant(spm_nest_path, spm_nest_fields):
+                                    # RECURSIVE: also handles a nested variant that
+                                    # itself contains one. The previous inline code
+                                    # bound only Pattern.Binding sub-fields and
+                                    # silently SKIPPED a deeper Variant, leaving its
+                                    # names unbound so the arm body then declined —
+                                    # `Expr.Unary(op, Expr.Field(Expr.Ident(o, l), f, fl), al)`
+                                    # is the shape that needs depth 2.
+                                    spm_nest_handle: LLVMValueRef = LLVMBuildExtractValue(builder, spm_payload_value, spm_nest_index.u32(), "spm.nest.handle")
+                                    # A CONST-ENUM sub-pattern (`Expr.Unary(TokenKind.Minus, …)`)
+                                    # is NOT a packed node: the field holds the variant's ordinal
+                                    # directly, so the test is an integer compare rather than a
+                                    # store read. Payloadless only, and the field's registered
+                                    # type must really be an integer.
+                                    spm_nest_const: i64 = ordinal_of_dotted_path(spm_nest_path, structs)
+                                    if packed_slot_of_path(spm_nest_path, structs) < 0 and spm_nest_const >= 0 and spm_nest_fields.count == 0:
+                                        spm_const_type: ValueType = copied_type(structs.packed_field_types[spm_field_start + spm_nest_index])
+                                        if not is_integer_type(spm_const_type):
+                                            spm_declined <- true
+                                        else:
+                                            spm_const_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, spm_nest_handle, LLVMConstInt(llvm_type_of(spm_const_type, structs, ctx), spm_nest_const.u64(), 0), "spm.nest.const.cmp")
+                                            spm_const_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.nest.const.cont")
+                                            _ = LLVMBuildCondBr(builder, spm_const_hit, spm_const_cont, spm_next_block)
+                                            LLVMPositionBuilderAtEnd(builder, spm_const_cont)
+                                    else:
+                                        spm_declined <- true if not emit_packed_subpattern_test(spm_nest_path, spm_nest_fields, spm_nest_handle, spm_next_block, spm_function, local_scope, structs, runtime, ctx, builder)
+                spm_declined_at_3: bool = spm_declined
+                if not spm_declined_at_3 and arm_has_guard(spm_arm.guard):
+                    if emit_condition(spm_arm.guard, local_scope, fns, structs, generics, runtime, m, ctx, builder) is spm_guard_bit:
+                        spm_guard_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spm_function, "spm.guard")
+                        _ = LLVMBuildCondBr(builder, spm_guard_bit, spm_guard_body, spm_next_block)
+                        LLVMPositionBuilderAtEnd(builder, spm_guard_body)
+                    else:
+                        spm_declined <- true
+                spm_declined_at_4: bool = spm_declined
+                if spm_declined_at_4:
+                    LLVMPositionBuilderAtEnd(builder, spm_next_block)
+                else:
+                    spm_arm_status: EmitStatus = emit_statements_scoped(spm_arm.body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                    spm_declined <- true if spm_arm_status == EmitStatus.Declined
+                    spm_any_open <- true if spm_arm_status == EmitStatus.Open
+                    branch_if_open(spm_arm_status, builder, spm_done)
+                    LLVMPositionBuilderAtEnd(builder, spm_next_block)

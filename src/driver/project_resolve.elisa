@@ -1,0 +1,528 @@
+# Project system — RESOLUTION: find the project file, pick the target, load every manifest
+# reachable from it and order them post-order so a dependency is built before its dependent,
+# then resolve the target itself — every path absolute, every list deduped. The ORDER of the
+# steps is stage0's, because the dedupes at each step are order-sensitive.
+# Continues project.elisa.
+
+extend ProjectSystem:
+
+    # ---- resolution ------------------------------------------------------------------------
+
+    # One dependency after its manifest has been read and its paths made absolute.
+    struct ResolvedManifest:
+        name: mutable darray[u8]
+        dir: mutable darray[u8]
+        manifest_path: mutable darray[u8]
+        entry_path: mutable darray[u8]
+        interface_path: mutable darray[u8]
+        include_dirs: mutable StrList
+        foreign: mutable StrList
+        easm: mutable StrList
+        link_flags: mutable StrList
+        exec: mutable StrList
+        dependencies: mutable StrList
+
+
+
+    # The manifests reachable from a target, plus the post-order the build must follow.
+    # `failed` carries the first error rather than aborting, so `project view` can report it
+    # the way stage0's `error: ...` line does.
+    struct ManifestGraph:
+        items: mutable darray[ResolvedManifest]
+        order: mutable darray[usize]
+        failed: mutable bool
+        error_text: mutable darray[u8]
+
+
+
+    def manifest_graph_new() -> ManifestGraph:
+        can Memory.Allocate, Abort.Panic:
+            return ManifestGraph{items: [], order: [], failed: false, error_text: []}
+
+
+
+    # The index of `name` in the loaded table, or the table size when it is absent.
+    def graph_index_of(graph: ManifestGraph&, name: darray[u8]&) -> usize:
+        for index in 0..<graph.items.count |graph, name|:
+            index return if bytes_equal(graph.items[index].name, name)
+        return graph.items.count
+
+
+
+    # stage0's findManifestPath: `<search>/<name>.elisalib/manifest.json` first, then
+    # `<search>/<name>/manifest.json`, in search-path order. Returns the DIRECTORY; the
+    # manifest path is that plus `/manifest.json`.
+    def find_manifest_dir(search_paths: StrList&, name: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            for index in 0..<search_paths.starts.count |search_paths, name|:
+                base: darray[u8] = strlist_entry_copy(search_paths, index)
+                suffixed: mutable darray[u8] = []
+                bytes_extend(&suffixed, name)
+                bytes_extend_view(&suffixed, ".elisalib")
+                library_dir: darray[u8] = path_join(base, suffixed)
+                library_manifest: darray[u8] = path_join_view(library_dir, "manifest.json")
+                library_dir return if file_exists(library_manifest)
+                plain_dir: darray[u8] = path_join(base, name)
+                plain_manifest: darray[u8] = path_join_view(plain_dir, "manifest.json")
+                plain_dir return if file_exists(plain_manifest)
+            empty: mutable darray[u8] = []
+            return empty
+
+
+
+    # stage0 refuses an entry or interface that is not surface source.
+    def is_surface_source(path: darray[u8]&) -> bool:
+        true return if bytes_ends_with_view(path, ".elisa")
+        return bytes_ends_with_view(path, ".elisai")
+
+
+
+    # Load every manifest reachable from `names`, breadth-first. Loading is separated from
+    # ordering because ordering is pure index arithmetic once the table exists, and a void
+    # ordering pass cannot allocate — see the region note at the top of this file.
+    def load_manifest_graph(search_paths: StrList&, names: StrList&) -> ManifestGraph:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            graph: mutable ManifestGraph = manifest_graph_new()
+            pending: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            pending <- strlist_extend(pending, names)
+            cursor_index: mutable usize = 0.usize()
+            while cursor_index < pending.starts.count |cursor_index, graph, pending, search_paths|:
+                name: darray[u8] = strlist_entry_copy(&pending, cursor_index)
+                cursor_index <- cursor_index + 1.usize()
+                trimmed: darray[u8] = bytes_trimmed(name)
+                continue if trimmed.count == 0.usize()
+                continue if graph_index_of(&graph, trimmed) < graph.items.count
+                directory: darray[u8] = find_manifest_dir(search_paths, trimmed)
+                if directory.count == 0.usize():
+                    if not graph.failed:
+                        graph.failed <- true
+                        message: mutable darray[u8] = []
+                        bytes_extend_view(&message, "dependency \"")
+                        bytes_extend(&message, trimmed)
+                        bytes_extend_view(&message, "\" could not be found in ")
+                        joined: darray[u8] = strlist_join_comma(search_paths)
+                        bytes_extend(&message, joined)
+                        graph.error_text <- message
+                    continue
+                manifest_path: darray[u8] = path_join_view(directory, "manifest.json")
+                raw: darray[u8] = read_file_bytes(manifest_path)
+                manifest_cursor: mutable JsonCursor = JsonCursor{position: 0.usize(), ok: true, bad_key_start: 0.usize(), bad_key_length: 0.usize()}
+                definition: ManifestDef = parse_manifest(raw, &manifest_cursor)
+                if not manifest_cursor.ok:
+                    if not graph.failed:
+                        graph.failed <- true
+                        message: mutable darray[u8] = []
+                        bytes_extend_view(&message, "invalid json in ")
+                        bytes_extend(&message, manifest_path)
+                        graph.error_text <- message
+                    continue
+                if not bytes_equal(definition.provides, trimmed):
+                    if not graph.failed:
+                        graph.failed <- true
+                        message: mutable darray[u8] = []
+                        bytes_extend_view(&message, "manifest ")
+                        bytes_extend(&message, manifest_path)
+                        bytes_extend_view(&message, " provides \"")
+                        bytes_extend(&message, definition.provides)
+                        bytes_extend_view(&message, "\" but was requested as \"")
+                        bytes_extend(&message, trimmed)
+                        bytes_extend_view(&message, "\"")
+                        graph.error_text <- message
+                    continue
+                resolved: mutable ResolvedManifest = ResolvedManifest{name: bytes_copy(trimmed), dir: bytes_copy(directory), manifest_path: bytes_copy(manifest_path), entry_path: [], interface_path: [], include_dirs: StrList{data: [], starts: [], lengths: []}, foreign: StrList{data: [], starts: [], lengths: []}, easm: StrList{data: [], starts: [], lengths: []}, link_flags: strlist_copy(&definition.link_flags), exec: strlist_copy(&definition.exec), dependencies: strlist_copy(&definition.dependencies)}
+                if not bytes_is_blank(definition.entry):
+                    resolved.entry_path <- path_relative_to(directory, definition.entry)
+                if not bytes_is_blank(definition.interface_path):
+                    resolved.interface_path <- path_relative_to(directory, definition.interface_path)
+                resolved.include_dirs <- strlist_relative_to(directory, &definition.include_dirs)
+                resolved.foreign <- strlist_relative_to(directory, &definition.foreign)
+                resolved.easm <- strlist_relative_to(directory, &definition.easm)
+                graph.items <- graph.items.push(resolved)
+                pending <- strlist_extend(pending, definition.dependencies)
+            return graph
+
+
+
+    # Depth-first post-order over the loaded table: a dependency is emitted before whatever
+    # needs it, and each name once.
+    #
+    # A CYCLE IS NOT AN ERROR HERE. stage0's visit() marks a manifest seen BEFORE recursing
+    # into its dependencies, so `a -> b -> a` simply stops at the second `a` and orders as
+    # `b, a`. Reporting a cycle instead made stage1 reject a project stage0 views happily.
+    # `state` is 0 unvisited / 1 reached / 2 emitted.
+    def order_manifest_graph(graph: ManifestGraph&, roots: StrList&) -> ManifestGraph:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable ManifestGraph = manifest_graph_new()
+            for index in 0..<graph.items.count |result, graph|:
+                result.items <- result.items.push(graph.items[index])
+            result.failed <- graph.failed
+            result.error_text <- bytes_copy(graph.error_text)
+            state: mutable darray[u8] = []
+            state.resize(graph.items.count)
+            for index in 0..<graph.items.count |state|:
+                state[index] <- 0
+            # An explicit stack of (node, child cursor) rather than recursion, so the walk
+            # can push results in post-order without a region-polymorphic helper.
+            # The stack height is an explicit counter and the slots are OVERWRITTEN rather
+            # than popped. That began as a workaround: `pile <- pile.resize(n)` used to make
+            # stage1's backend decline the whole unit. It no longer does — the assign form of
+            # `resize`/`clear` is lowered in codegen_stmt_assign_flow and pinned by
+            # darray_resize_assign_* in backend_native_smoke — so this shape is now a plain
+            # preference (no reallocation per pop), not a constraint.
+            stack_node: mutable darray[usize] = []
+            stack_child: mutable darray[usize] = []
+            depth: mutable usize = 0.usize()
+            for root in 0..<roots.starts.count |result, state, stack_node, stack_child, depth, graph, roots|:
+                root_name: darray[u8] = strlist_entry_copy(roots, root)
+                trimmed_root: darray[u8] = bytes_trimmed(root_name)
+                continue if trimmed_root.count == 0.usize()
+                start_index: usize = graph_index_of(graph, trimmed_root)
+                continue if start_index >= graph.items.count
+                continue if state[start_index] != 0
+                if depth < stack_node.count:
+                    stack_node[depth] <- start_index
+                    stack_child[depth] <- 0.usize()
+                else:
+                    stack_node <- stack_node.push(start_index)
+                    stack_child <- stack_child.push(0.usize())
+                depth <- depth + 1.usize()
+                state[start_index] <- 1
+                while depth > 0.usize() |result, state, stack_node, stack_child, depth, graph|:
+                    top: usize = depth - 1.usize()
+                    node: usize = stack_node[top]
+                    child: usize = stack_child[top]
+                    if child >= graph.items[node].dependencies.starts.count:
+                        state[node] <- 2
+                        result.order <- result.order.push(node)
+                        depth <- top
+                        continue
+                    stack_child[top] <- child + 1.usize()
+                    child_name: darray[u8] = strlist_entry_copy(&graph.items[node].dependencies, child)
+                    trimmed_child: darray[u8] = bytes_trimmed(child_name)
+                    continue if trimmed_child.count == 0.usize()
+                    child_index: usize = graph_index_of(graph, trimmed_child)
+                    continue if child_index >= graph.items.count
+                    continue if state[child_index] != 0
+                    state[child_index] <- 1
+                    if depth < stack_node.count:
+                        stack_node[depth] <- child_index
+                        stack_child[depth] <- 0.usize()
+                    else:
+                        stack_node <- stack_node.push(child_index)
+                        stack_child <- stack_child.push(0.usize())
+                    depth <- depth + 1.usize()
+            return result
+
+
+
+    # stage0's normalizeEmitMode. The canonical spellings pass through, the documented
+    # aliases fold onto them, and anything unrecognised is returned trimmed and unchanged —
+    # so an unknown mode reaches the caller intact rather than becoming an error here.
+    def normalize_emit_mode(value: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic:
+            lowered: mutable darray[u8] = []
+            trimmed: darray[u8] = bytes_trimmed(value)
+            for index in 0..<trimmed.count |lowered, trimmed|:
+                byte: u8 = trimmed[index]
+                lowered.push(byte + 32 if byte >= 65 and byte <= 90 else byte)
+            bytes_from_view("lowered") return if bytes_equal_view(lowered, "lower") or bytes_equal_view(lowered, "lowering") or bytes_equal_view(lowered, "grammar-lowered")
+            bytes_from_view("semantic") return if bytes_equal_view(lowered, "sema") or bytes_equal_view(lowered, "semantics") or bytes_equal_view(lowered, "lowered-semantic") or bytes_equal_view(lowered, "typed-report")
+            bytes_from_view("facts") return if bytes_equal_view(lowered, "fact") or bytes_equal_view(lowered, "fact-trace") or bytes_equal_view(lowered, "trace-facts")
+            bytes_from_view("unsafe") return if bytes_equal_view(lowered, "unsafe-summary") or bytes_equal_view(lowered, "unsafe-report")
+            bytes_from_view("progress") return if bytes_equal_view(lowered, "progress-summary") or bytes_equal_view(lowered, "progress-report")
+            bytes_from_view("fmt") return if bytes_equal_view(lowered, "format") or bytes_equal_view(lowered, "formatter")
+            bytes_from_view("doc") return if bytes_equal_view(lowered, "docs") or bytes_equal_view(lowered, "reference")
+            bytes_from_view("iface") return if bytes_equal_view(lowered, "interface") or bytes_equal_view(lowered, "api")
+            bytes_from_view("deps") return if bytes_equal_view(lowered, "dep") or bytes_equal_view(lowered, "dependencies")
+            bytes_from_view("deps-json") return if bytes_equal_view(lowered, "depsjson") or bytes_equal_view(lowered, "dependencies-json")
+            bytes_from_view("ir") return if bytes_equal_view(lowered, "frontend-ir") or bytes_equal_view(lowered, "bundle")
+            bytes_from_view("interpret") return if bytes_equal_view(lowered, "run") or bytes_equal_view(lowered, "interp")
+            bytes_from_view("serve") return if bytes_equal_view(lowered, "server")
+            bytes_from_view("tests") return if bytes_equal_view(lowered, "test-list")
+            bytes_from_view("benches") return if bytes_equal_view(lowered, "bench-list")
+            bytes_from_view("fixtures") return if bytes_equal_view(lowered, "fixture-list")
+            bytes_from_view("test") return if bytes_equal_view(lowered, "run-test") or bytes_equal_view(lowered, "run-tests")
+            bytes_from_view("test-runner") return if bytes_equal_view(lowered, "runner")
+            bytes_from_view("packed") return if bytes_equal_view(lowered, "packed-info") or bytes_equal_view(lowered, "packedinfo")
+            bytes_from_view("c-bind-check") return if bytes_equal_view(lowered, "cbind-check") or bytes_equal_view(lowered, "c-bind") or bytes_equal_view(lowered, "cbind")
+            bytes_from_view("c-bind-check-json") return if bytes_equal_view(lowered, "cbind-check-json") or bytes_equal_view(lowered, "c-bind-json") or bytes_equal_view(lowered, "cbind-json") or bytes_equal_view(lowered, "ffi-manifest") or bytes_equal_view(lowered, "abi-manifest")
+            bytes_from_view("bc") return if bytes_equal_view(lowered, "bitcode")
+            bytes_from_view("obj") return if bytes_equal_view(lowered, "object")
+            bytes_from_view("c-archive") return if bytes_equal_view(lowered, "carchive") or bytes_equal_view(lowered, "archive") or bytes_equal_view(lowered, "static-archive") or bytes_equal_view(lowered, "staticlib") or bytes_equal_view(lowered, "static-lib")
+            bytes_from_view("tokens") return if bytes_equal_view(lowered, "token") or bytes_equal_view(lowered, "token-kinds") or bytes_equal_view(lowered, "lex")
+            # A canonical spelling reaches here unchanged, as does anything unrecognised —
+            # stage0's default branch returns the trimmed input rather than failing.
+            lowered return if bytes_equal_view(lowered, "ast") or bytes_equal_view(lowered, "lowered") or bytes_equal_view(lowered, "semantic") or bytes_equal_view(lowered, "facts") or bytes_equal_view(lowered, "unsafe") or bytes_equal_view(lowered, "progress") or bytes_equal_view(lowered, "fmt") or bytes_equal_view(lowered, "doc") or bytes_equal_view(lowered, "iface") or bytes_equal_view(lowered, "deps") or bytes_equal_view(lowered, "deps-json") or bytes_equal_view(lowered, "ir") or bytes_equal_view(lowered, "interpret") or bytes_equal_view(lowered, "serve") or bytes_equal_view(lowered, "tests") or bytes_equal_view(lowered, "benches") or bytes_equal_view(lowered, "fixtures") or bytes_equal_view(lowered, "test") or bytes_equal_view(lowered, "test-runner") or bytes_equal_view(lowered, "llvm") or bytes_equal_view(lowered, "packed") or bytes_equal_view(lowered, "c-bind-check") or bytes_equal_view(lowered, "c-bind-check-json") or bytes_equal_view(lowered, "header") or bytes_equal_view(lowered, "bc") or bytes_equal_view(lowered, "obj") or bytes_equal_view(lowered, "c-archive") or bytes_equal_view(lowered, "tokens")
+            return trimmed
+
+
+
+    # stage0's parseOptimizationArg: an optional leading `O`, then 0, 2 or 3. Returns -1 for
+    # anything else, which the caller reports the way stage0's error does.
+    def parse_opt_level(value: darray[u8]&) -> i64:
+        trimmed_start: usize = bytes_trim_start(value)
+        trimmed_end: usize = bytes_trim_end(value)
+        first: mutable usize = trimmed_start
+        first <- first + 1.usize() if first < trimmed_end and (value[first] == 79 or value[first] == 111)
+        -1 return if trimmed_end - first != 1.usize()
+        digit: u8 = value[first]
+        0 return if digit == 48
+        # `1` was missing while 0/2/3 were accepted, so a project.json with
+        # {"opt":"O1"} was rejected by stage1 and accepted by stage0 -- the exact
+        # mirror of the stage0 CLI gap this port already fixed. Caught by
+        # test/parity/project_report_smoke.sh (err/badopt), whose fixture uses
+        # "O1" as its example of a BAD option and is therefore now stale too.
+        1 return if digit == 49
+        2 return if digit == 50
+        3 return if digit == 51
+        return -1
+
+
+
+    # A target resolved against its project: every path absolute, every list deduped, and
+    # the dependency order fixed. This is what both `view` and `deps` report on.
+    struct ResolvedTarget:
+        project_file: mutable darray[u8]
+        project_root: mutable darray[u8]
+        name: mutable darray[u8]
+        entry_path: mutable darray[u8]
+        emit: mutable darray[u8]
+        run_emit: mutable darray[u8]
+        output_path: mutable darray[u8]
+        target_triple: mutable darray[u8]
+        include_dirs: mutable StrList
+        dependency_search_paths: mutable StrList
+        foreign: mutable StrList
+        easm: mutable StrList
+        link_flags: mutable StrList
+        project_exec: mutable StrList
+        target_exec: mutable StrList
+        opt_level: mutable i64
+        has_opt_level: mutable bool
+        strict_policy: mutable bool
+        perf_strict: mutable bool
+        concurrency_strict: mutable bool
+        failed: mutable bool
+        error_text: mutable darray[u8]
+
+
+
+    def resolved_target_new() -> ResolvedTarget:
+        can Memory.Allocate, Abort.Panic:
+            return ResolvedTarget{project_file: [], project_root: [], name: [], entry_path: [], emit: [], run_emit: [], output_path: [], target_triple: [], include_dirs: StrList{data: [], starts: [], lengths: []}, dependency_search_paths: StrList{data: [], starts: [], lengths: []}, foreign: StrList{data: [], starts: [], lengths: []}, easm: StrList{data: [], starts: [], lengths: []}, link_flags: StrList{data: [], starts: [], lengths: []}, project_exec: StrList{data: [], starts: [], lengths: []}, target_exec: StrList{data: [], starts: [], lengths: []}, opt_level: 0, has_opt_level: false, strict_policy: false, perf_strict: false, concurrency_strict: false, failed: false, error_text: []}
+
+
+
+    # stage0's defaultProjectTargetName: "default" wins; a lone target is taken whatever it
+    # is called; otherwise the alphabetically first name.
+    def default_target_index(project: ProjectDef&) -> usize:
+        count: usize = project.targets.count
+        count return if count == 0.usize()
+        for index in 0..<count |project|:
+            index return if bytes_equal_view(project.targets[index].name, "default")
+        0 return if count == 1.usize()
+        best: mutable usize = 0.usize()
+        for index in 1..<count |best, project|:
+            best <- index if bytes_less(project.targets[index].name, project.targets[best].name)
+        return best
+
+
+
+    # The index of the target `requested` names, or the target count when it is absent.
+    # Returns a scalar, so it has no inferred region: the trimmed copy of `requested` needs
+    # an explicit `region` scope to live in.
+    def select_target_index(project: ProjectDef&, requested: darray[u8]&) -> usize:
+        can Memory.Allocate, Abort.Panic:
+            default_target_index(project) return if bytes_is_blank(requested)
+            found: mutable usize = project.targets.count
+            region pick(4096):
+                wanted: darray[u8] = bytes_trimmed(requested)
+                for index in 0..<project.targets.count |found, project, wanted|:
+                    found <- index if bytes_equal(project.targets[index].name, wanted)
+            return found
+
+
+
+    # `dependency-search-paths`, defaulted, made absolute and deduped.
+    def resolved_search_paths(project: ProjectDef&, root: darray[u8]&) -> StrList:
+        can Memory.Allocate, Abort.Panic:
+            configured: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            if strlist_is_empty(&project.dependency_search_paths):
+                configured <- strlist_push_view(configured, "lib")
+            else:
+                configured <- strlist_extend(configured, &project.dependency_search_paths)
+            absolute: StrList = strlist_relative_to(root, &configured)
+            return strlist_dedupe(&absolute)
+
+
+
+    # The dependency graph for a target, resolved and ordered. Built by the CALLER and passed
+    # into `resolve_project_target` rather than stored on the ResolvedTarget it returns.
+    def build_dependency_graph(project: ProjectDef&, project_file: darray[u8]&, requested: darray[u8]&) -> ManifestGraph:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            root: darray[u8] = path_dir(project_file)
+            search_paths: StrList = resolved_search_paths(project, root)
+            names: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            names <- strlist_extend(names, &project.dependencies)
+            selected: usize = select_target_index(project, requested)
+            if selected < project.targets.count:
+                names <- strlist_extend(names, &project.targets[selected].dependencies)
+            loaded: ManifestGraph = load_manifest_graph(&search_paths, &names)
+            ordered: ManifestGraph = order_manifest_graph(&loaded, &names)
+            return ordered
+
+
+
+    # stage0's resolveProjectTarget, in its order — the order matters, because the dedupes at
+    # the end keep FIRST occurrences and so the project's own entries must precede each
+    # dependency's.
+    def resolve_project_target(project: ProjectDef&, project_file: darray[u8]&, requested: darray[u8]&, graph: ManifestGraph&) -> ResolvedTarget:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            resolved: mutable ResolvedTarget = resolved_target_new()
+            resolved.project_file <- bytes_copy(project_file)
+            root: darray[u8] = path_dir(project_file)
+            resolved.project_root <- bytes_copy(root)
+            selected: mutable usize = project.targets.count
+            if bytes_is_blank(requested):
+                selected <- default_target_index(project)
+            else:
+                wanted: darray[u8] = bytes_trimmed(requested)
+                for index in 0..<project.targets.count |selected, project, wanted|:
+                    selected <- index if bytes_equal(project.targets[index].name, wanted)
+            if selected >= project.targets.count:
+                resolved.failed <- true
+                message: mutable darray[u8] = []
+                bytes_extend_view(&message, "project target \"")
+                bytes_extend(&message, requested)
+                bytes_extend_view(&message, "\" was not found in ")
+                bytes_extend(&message, project_file)
+                resolved.error_text <- message
+                return resolved
+            definition: TargetDef& = &project.targets[selected]
+            resolved.name <- bytes_copy(definition.name)
+            if bytes_is_blank(definition.entry):
+                resolved.failed <- true
+                message: mutable darray[u8] = []
+                bytes_extend_view(&message, "project target \"")
+                bytes_extend(&message, definition.name)
+                bytes_extend_view(&message, "\" is missing an entry")
+                resolved.error_text <- message
+                return resolved
+            resolved.entry_path <- path_relative_to(root, definition.entry)
+            if not is_surface_source(resolved.entry_path):
+                resolved.failed <- true
+                message: mutable darray[u8] = []
+                bytes_extend_view(&message, "project target \"")
+                bytes_extend(&message, definition.name)
+                bytes_extend_view(&message, "\" entry ")
+                bytes_extend(&message, resolved.entry_path)
+                bytes_extend_view(&message, " must be a .elisa or .elisai source file in the current MVP")
+                resolved.error_text <- message
+                return resolved
+            # `dependency-search-paths` defaults to a single "lib".
+            search_source: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            if strlist_is_empty(&project.dependency_search_paths):
+                search_source <- strlist_push_view(search_source, "lib")
+            else:
+                search_source <- strlist_extend(search_source, &project.dependency_search_paths)
+            absolute_search: StrList = strlist_relative_to(root, &search_source)
+            resolved.dependency_search_paths <- strlist_dedupe(&absolute_search)
+            if graph.failed:
+                resolved.failed <- true
+                resolved.error_text <- bytes_copy(graph.error_text)
+                return resolved
+            include_source: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            include_source <- strlist_extend(include_source, &project.include_dirs)
+            include_source <- strlist_extend(include_source, &definition.include_dirs)
+            include_dirs: mutable StrList = strlist_relative_to(root, &include_source)
+            # `inherit-project-native` false drops the PROJECT-level native inputs only; the
+            # target's own and its dependencies' are unaffected.
+            inherit: bool = definition.inherit_native or not definition.has_inherit_native
+            foreign_source: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            easm_source: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            link_flags: mutable StrList = StrList{data: [], starts: [], lengths: []}
+            if inherit:
+                foreign_source <- strlist_extend(foreign_source, &project.foreign)
+                easm_source <- strlist_extend(easm_source, &project.easm)
+                link_flags <- strlist_extend(link_flags, &project.link_flags)
+            foreign_source <- strlist_extend(foreign_source, &definition.foreign)
+            easm_source <- strlist_extend(easm_source, &definition.easm)
+            foreign_files: mutable StrList = strlist_relative_to(root, &foreign_source)
+            easm_files: mutable StrList = strlist_relative_to(root, &easm_source)
+            # Link flags are NOT paths and are never resolved against the root.
+            link_flags <- strlist_extend(link_flags, &definition.link_flags)
+            link_flags <- strlist_extend(link_flags, &definition.platform_link_flags)
+            for position in 0..<graph.order.count |include_dirs, foreign_files, easm_files, link_flags, graph|:
+                slot: usize = graph.order[position]
+                include_dirs <- strlist_extend(include_dirs, &graph.items[slot].include_dirs)
+                foreign_files <- strlist_extend(foreign_files, &graph.items[slot].foreign)
+                easm_files <- strlist_extend(easm_files, &graph.items[slot].easm)
+                link_flags <- strlist_extend(link_flags, &graph.items[slot].link_flags)
+            resolved.include_dirs <- strlist_dedupe(&include_dirs)
+            resolved.foreign <- strlist_dedupe(&foreign_files)
+            resolved.easm <- strlist_dedupe(&easm_files)
+            resolved.link_flags <- strlist_dedupe(&link_flags)
+            resolved.emit <- bytes_from_view("llvm")
+            if not bytes_is_blank(definition.emit):
+                resolved.emit <- normalize_emit_mode(definition.emit)
+            resolved.run_emit <- bytes_from_view("interpret")
+            if not bytes_is_blank(definition.run_emit):
+                resolved.run_emit <- normalize_emit_mode(definition.run_emit)
+            if not bytes_is_blank(definition.output):
+                resolved.output_path <- path_relative_to(root, definition.output)
+            resolved.target_triple <- bytes_trimmed(definition.target_triple)
+            if not bytes_is_blank(definition.packed_abi):
+                resolved.failed <- true
+                message: mutable darray[u8] = []
+                bytes_extend_view(&message, "project target \"")
+                bytes_extend(&message, definition.name)
+                bytes_extend_view(&message, "\" uses removed packed-abi override; use canonical packed lowering or enum-level @packed_profile(...) instead")
+                resolved.error_text <- message
+                return resolved
+            if not bytes_is_blank(definition.opt):
+                level: i64 = parse_opt_level(definition.opt)
+                if level < 0:
+                    resolved.failed <- true
+                    message: mutable darray[u8] = []
+                    bytes_extend_view(&message, "project target \"")
+                    bytes_extend(&message, definition.name)
+                    bytes_extend_view(&message, "\": unsupported optimization level \"")
+                    bytes_extend(&message, definition.opt)
+                    # O1 is listed because it is now ACCEPTED (see parse_opt_level). stage0 already
+                    # said "O0, O1, O2, or O3"; the two messages are compared verbatim by
+                    # test/parity/project_report_smoke.sh, so accepting the level without
+                    # updating the text still fails parity.
+                    bytes_extend_view(&message, "\" (expected O0, O1, O2, or O3)")
+                    resolved.error_text <- message
+                    return resolved
+                resolved.opt_level <- level
+                resolved.has_opt_level <- true
+            resolved.project_exec <- strlist_copy(&project.exec)
+            resolved.target_exec <- strlist_copy(&definition.exec)
+            resolved.strict_policy <- definition.warn_strict
+            resolved.perf_strict <- definition.warn_strict or definition.warn_perf
+            resolved.concurrency_strict <- definition.warn_strict or definition.warn_concurrency
+            return resolved
+
+
+
+    # stage0's findProjectFile: a path naming project.json is taken as is, otherwise walk up
+    # from the directory until one is found.
+    def find_project_file(start: darray[u8]&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            empty: mutable darray[u8] = []
+            base: mutable darray[u8] = bytes_trimmed(start)
+            if base.count == 0.usize():
+                base <- working_directory()
+            absolute: darray[u8] = absolute_path(base)
+            named: darray[u8] = path_join_view(absolute, "project.json")
+            absolute return if bytes_ends_with_view(absolute, "/project.json") and file_exists(absolute)
+            named return if file_exists(named)
+            directory: mutable darray[u8] = bytes_copy(absolute)
+            for _step in 0..<256 |directory, empty|:
+                candidate: darray[u8] = path_join_view(directory, "project.json")
+                candidate return if file_exists(candidate)
+                parent: darray[u8] = path_dir(directory)
+                break if bytes_equal(parent, directory)
+                directory <- parent
+            return empty

@@ -51,11 +51,17 @@ out=$(printf 'def f(src: mutable darray[i64]&) -> void:\n    v: view[i64] = src[
 grep -q "mutable iteration requires a writable view" <<< "$out" || fail "readonly mutable iteration not flagged: $out"
 
 # 3. 0 findings across frontend + stdlib (self-contained resolution set).
+#
+# Scanned one DIRECTORY at a time, not one file at a time. A `global mutable` is declared in
+# one part file and assigned in its siblings — they are all `include`d into the same unit, so
+# per-file scanning reports an "undefined assignment target" for every such write even though
+# the unit resolves. Per-directory is both closer to what the compiler actually sees and still
+# catches the thing this guards: a `<-` to a name nothing in the unit declares.
 t=0
-while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "undefined assignment target|invalid assignment target" || true)
+while IFS= read -r d; do
+  c=$(cat "$d"/*.elisa 2>/dev/null | "$RPT" 2>/dev/null | grep -cE "undefined assignment target|invalid assignment target" || true)
   t=$((t + c))
-done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
+done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -type d | sort)
 [ "$t" -eq 0 ] || fail "$t assignment-target findings across frontend+stdlib"
 
 echo "assign-target smoke OK: flags undeclared <-/compound, call-target, const write; silent on declared-mutable + global mutable; 0 across frontend+stdlib"

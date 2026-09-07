@@ -1,0 +1,204 @@
+# `-emit c-archive` — the C ABI delivery bundle: a static library plus its audit sidecars. Every
+# path is shell-quoted, because the archive step runs through a shell.
+
+
+# `-emit c-archive` — the C ABI delivery bundle: a static library plus its audit sidecars.
+#
+#   <base>.a               module object + the Elisa runtime, via `ar rcs`
+#   <base>.h               the generated C header  (same generator as `-emit header`)
+#   <base>.unsafe.txt      the capability audit    (same builder as `-emit unsafe`)
+#   <base>.elisa-abi.json  a manifest naming all of the above
+#
+# stage0 runs the unsafe audit BEFORE writing anything, so a rejected program leaves no
+# linkable artifact behind — its own comment records that emitting first meant a refused
+# program still produced a complete `.a` that linked and ran.
+
+
+# The exported entities, in declaration order, for the manifest.
+def carchive_push_export_list(buffer: mutable darray[u8]&, file: Ast::File&, marker: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    first: mutable bool = true
+    for annotation in file.enum_annotations |buffer, first, marker|:
+        continue if annotation.name != marker
+        emit_tokens_push_sview(buffer, ",") if not first
+        emit_tokens_push_sview(buffer, "\n    \"")
+        emit_tokens_push_sview(buffer, annotation.owner)
+        buffer.push(34)
+        first <- false
+    emit_tokens_push_sview(buffer, "\n  ") if not first
+
+
+
+
+# A shell-quoted path. Single quotes, so a space or a shell metacharacter in a directory
+# name cannot split the argument.
+def carchive_push_quoted(buffer: mutable darray[u8]&, path: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+    buffer.push(39)
+    for index in 0..<path.count |buffer, path|:
+        buffer.push(path[index])
+    buffer.push(39)
+
+
+
+
+def carchive_push_path(buffer: mutable darray[u8]&, path: darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+    for index in 0..<path.count |buffer, path|:
+        buffer.push(path[index])
+
+
+
+
+# `<archive>.a` -> `<archive>` (stage0's cArchiveSidecarBase), the stem every sidecar hangs off.
+def carchive_sidecar_base(out_path: darray[u8]&) -> darray[u8] can[Abort.Panic, Memory.Allocate]:
+    base: mutable darray[u8] = []
+    # The driver's out_path carries a TRAILING NUL (main appends one so the buffer can be
+    # handed to C directly). Copying it into a derived path embeds a NUL mid-string, and
+    # every command built from it truncates there — `ar rcs <archive>\0<member>` reached ar
+    # as an archive with NO members.
+    stop: mutable usize = out_path.count
+    while stop > 0 and out_path[stop - 1] == 0 |stop, out_path|:
+        stop <- stop - 1
+    if stop >= 2 and out_path[stop - 2] == 46 and out_path[stop - 1] == 97:
+        stop <- stop - 2
+    for index in 0..<stop |base, out_path|:
+        base.push(out_path[index])
+    return base
+
+
+
+
+# The Elisa runtime object to bundle, from ELISA_RUNTIME_OBJ. Empty when unset, in which
+# case the archive holds the module object alone and the manifest says runtime_included:false.
+def push_runtime_object_path(buffer: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    flag_storage: mutable darray[u8] = []
+    for flag_index in 0..<sview_len("ELISA_RUNTIME_OBJ") |flag_storage|:
+        flag_storage.push(sview_at("ELISA_RUNTIME_OBJ", flag_index))
+    flag_storage.push(0)
+    flag_name: cstr = (&flag_storage[0]).cast[cstr] can Unsafe.PointerCast
+    if getenv(flag_name) is runtime_bytes:
+        cursor: mutable i64 = 0
+        scanning: mutable bool = true
+        while scanning |cursor, scanning, buffer, runtime_bytes|:
+            byte_ref: u8& = runtime_bytes + cursor
+            runtime_byte: u8 = byte_ref
+            if runtime_byte == 0:
+                scanning <- false
+            else:
+                buffer.push(runtime_byte)
+                cursor <- cursor + 1
+
+
+
+
+def emit_c_archive(file: Ast::File&, tokens: darray[Lexer::Token]&, source: u8&, out_path: darray[u8]&) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Console]:
+    base: darray[u8] = carchive_sidecar_base(out_path)
+    header_path: mutable darray[u8] = []
+    carchive_push_path(&header_path, base)
+    emit_tokens_push_sview(&header_path, ".h")
+    unsafe_path: mutable darray[u8] = []
+    carchive_push_path(&unsafe_path, base)
+    emit_tokens_push_sview(&unsafe_path, ".unsafe.txt")
+    manifest_path: mutable darray[u8] = []
+    carchive_push_path(&manifest_path, base)
+    emit_tokens_push_sview(&manifest_path, ".elisa-abi.json")
+
+    # AUDIT FIRST — nothing is written until the header can be generated, so a unit with an
+    # exported type that has no C ABI form leaves no half-built archive.
+    guard: mutable darray[u8] = []
+    push_header_guard(&guard)
+    guard.push(0)
+    header_ctx: LLVMContextRef = LLVMContextCreate()
+    header_module: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_archive_header", header_ctx)
+    header_triple_storage: mutable darray[u8] = []
+    header_machine: LLVMTargetMachineRef = Backend::configure_module_target_for(header_module, requested_target_triple(&header_triple_storage))
+    header_target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(header_machine)
+    # The cast is its OWN statement: an inline `.cast[T] can Effect` inside an argument list
+    # does not parse in this dialect.
+    guard_cstr: cstr = (&guard[0]).cast[cstr] can Unsafe.PointerCast
+    header_bytes: darray[u8] = Backend::generate_c_header_for_file(file, header_module, header_ctx, sview(guard_cstr, 0, guard.count - 1), header_target_data)
+    if header_bytes.count == 0:
+        message: mutable darray[u8] = []
+        emit_tokens_push_sview(&message, "error: -emit c-archive: an exported type has no C ABI representation\n")
+        write_stderr(message)
+        return 1
+
+    # The module object, beside the archive so the temporary shares its filesystem.
+    # `ar` records a member by its BASENAME, so the object must literally be named
+    # `elisacore_module.o` — writing `<base>.elisacore_module.o` beside the archive produced a
+    # member called `lib.elisacore_module.o`. stage0 uses a temp DIR for the same reason.
+    work_dir: mutable darray[u8] = []
+    emit_tokens_push_sview(&work_dir, "/tmp/elisa-c-archive-stage1")
+    make_directory(work_dir)
+    object_path: darray[u8] = joined_path(work_dir, "elisacore_module.o")
+    _ = setenv("ELISA_STAGE1_OUT", "", 1)
+    ctx: LLVMContextRef = LLVMContextCreate()
+    module_handle: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1", ctx)
+    stamp_module_source_path(module_handle)
+    triple_storage: mutable darray[u8] = []
+    machine: LLVMTargetMachineRef = Backend::configure_module_target_for(module_handle, requested_target_triple(&triple_storage))
+    target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(machine)
+    archive_builder: LLVMBuilderRef = LLVMCreateBuilderInContext(ctx)
+    emitted: i64 = Backend::emit_module(file, module_handle, ctx, archive_builder, target_data)
+    2 return if emitted <= 0 and unit_declares_function(file.top_decls)
+    object_c: mutable darray[u8] = []
+    carchive_push_path(&object_c, object_path)
+    object_c.push(0)
+    object_cstr: cstr = (&object_c[0]).cast[cstr] can Unsafe.PointerCast
+    4 return if not Backend::emit_object(machine, module_handle, object_cstr)
+
+    # `ar rcs <archive> <module.o> <runtime.o>` — the runtime object is the one the build
+    # already produces for `-emit exe`.
+    archive_command: mutable darray[u8] = []
+    # Every path is QUOTED: this repo lives under a directory with a SPACE in its name
+    # ("Coding Projects"), so an unquoted runtime path split into two ar arguments and the
+    # archive gained a bogus member called `Coding`.
+    emit_tokens_push_sview(&archive_command, "ar rcs ")
+    archive_path: mutable darray[u8] = []
+    for out_index in 0..<out_path.count |archive_path, out_path|:
+        archive_path.push(out_path[out_index]) if out_path[out_index] != 0
+    carchive_push_quoted(&archive_command, archive_path)
+    archive_command.push(32)
+    carchive_push_quoted(&archive_command, object_path)
+    runtime_object: mutable darray[u8] = []
+    push_runtime_object_path(&runtime_object)
+    runtime_included: bool = runtime_object.count > 0 and not unit_defines_default_runtime(file.top_decls)
+    if runtime_included:
+        archive_command.push(32)
+        carchive_push_quoted(&archive_command, runtime_object)
+    if cbind_run(archive_command) != 0:
+        message: mutable darray[u8] = []
+        emit_tokens_push_sview(&message, "error: -emit c-archive: ar failed\n")
+        write_stderr(message)
+        return 1
+    _ = unlink(object_cstr)
+
+    header_body: mutable darray[u8] = []
+    for index in 0..<header_bytes.count |header_body, header_bytes|:
+        header_body.push(header_bytes[index]) if header_bytes[index] != 0
+    _ = write_file_bytes(&header_path, header_body)
+    unsafe_bytes: darray[u8] = build_unsafe_report(file, tokens, source)
+    _ = write_file_bytes(&unsafe_path, unsafe_bytes)
+
+    manifest: mutable darray[u8] = []
+    emit_tokens_push_sview(&manifest, "{\n  \"source\": \"")
+    _ = push_source_path(&manifest)
+    emit_tokens_push_sview(&manifest, "\",\n  \"archive\": \"")
+    carchive_push_path(&manifest, archive_path)
+    emit_tokens_push_sview(&manifest, "\",\n  \"objects\": [\n    \"elisacore_module.o\"")
+    emit_tokens_push_sview(&manifest, ",\n    \"elisacore_runtime.o\"") if runtime_included
+    emit_tokens_push_sview(&manifest, "\n  ],\n  \"runtime_included\": ")
+    emit_tokens_push_sview(&manifest, "true" if runtime_included else "false")
+    emit_tokens_push_sview(&manifest, ",\n  \"runtime_object\": \"")
+    emit_tokens_push_sview(&manifest, "elisacore_runtime.o") if runtime_included
+    emit_tokens_push_sview(&manifest, "\",\n  \"header_audit\": \"")
+    carchive_push_path(&manifest, header_path)
+    emit_tokens_push_sview(&manifest, "\",\n  \"unsafe_report\": \"")
+    carchive_push_path(&manifest, unsafe_path)
+    emit_tokens_push_sview(&manifest, "\",\n  \"exported_functions\": [")
+    carchive_push_export_list(&manifest, file, "__export_fn")
+    emit_tokens_push_sview(&manifest, "],\n  \"exported_globals\": [")
+    carchive_push_export_list(&manifest, file, "__export_global")
+    emit_tokens_push_sview(&manifest, "],\n  \"exported_types\": [")
+    carchive_push_export_list(&manifest, file, "__export_type")
+    emit_tokens_push_sview(&manifest, "],\n  \"generated_by\": \"elisacore -emit c-archive\",\n  \"abi_contract\": \"checked-in C/C++ headers are the build contract; generated headers are audit artifacts\"\n}\n")
+    _ = write_file_bytes(&manifest_path, manifest)
+    return 0

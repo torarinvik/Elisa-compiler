@@ -1,0 +1,172 @@
+# Stage1 backend — AGGREGATE LITERALS in expression position: `{…}` set literals (including the
+# empty one, which also parses as a set), `[…]` arrays, and `(a, b)` tuples.
+# Reached from codegen_expr_index_fields.elisa; `handled` keeps the original try order.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_expression_aggregate_literals(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.SetLit(set_elements, set_literal_line):
+                    null return if expected.kind != TypeKind.Struct
+                    set_lit_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                    # An empty set `{}` is a zeroed DynSet (null items, 0 counts) — no allocation.
+                    if set_elements.count == 0:
+                        return LLVMConstNull(set_lit_llvm)
+                    # `{a, b, …}` — a zeroed DynSet in a slot, then `arena_set_add_or_panic(arena,
+                    # &set, elem)` per element (the std's frictionless, panic-on-OOM insert; the
+                    # error-returning `arena_set_add` is avoided so no error out-param is needed).
+                    # Needs the std + the DynSet element type from `expected`'s instantiation args.
+                    set_lit_base: mutable sview = ""
+                    set_lit_arg_start: mutable usize = 0
+                    set_lit_arg_count: mutable usize = 0
+                    set_lit_has_inst: bool = generic_struct_instantiation_of(structs, expected, set_lit_base, set_lit_arg_start, set_lit_arg_count)
+                    null return if not set_lit_has_inst or set_lit_base != "DynSet" or set_lit_arg_count != 1
+                    set_lit_elem_type: ValueType = copied_type(structs.generic_struct_inst_args[set_lit_arg_start])
+                    set_lit_type_args: mutable darray[ValueType] = [set_lit_elem_type]
+                    if instantiate_generic("arena_set_add_or_panic", set_lit_type_args, generics, structs, m, ctx) is set_add_target:
+                        set_lit_slot: LLVMValueRef = LLVMBuildAlloca(builder, set_lit_llvm, "set.literal")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(set_lit_llvm), set_lit_slot)
+                        set_add_fn_type: LLVMTypeRef = LLVMGlobalGetValueType(set_add_target)
+                        set_lit_declined: mutable bool = false
+                        for set_element in set_elements |set_lit_declined, set_lit_elem_type, set_lit_slot, set_add_target, set_add_fn_type, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            continue if set_lit_declined
+                            if emit_expression(set_element, set_lit_elem_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is set_element_value:
+                                set_add_args: mutable darray[LLVMValueRef] = [runtime.arena, set_lit_slot, set_element_value]
+                                # The TRAILING region argument, if THIS instantiation carries one.
+                                # The leading arena above is the helper's own declared `a: Arena&`;
+                                # the trailing one is stage1's region threading, and it is decided
+                                # per instantiation. Hardcoding 3 arguments emitted a call whose
+                                # arity disagreed with the callee's own definition — malformed IR
+                                # that -O0 carried through to the object and that made the -O1
+                                # pass pipeline die with SIGBUS. The same set built by `.add`
+                                # (which goes through emit_dict_method_call) passed 4, so a program
+                                # with BOTH spellings held two contradictory calls to one symbol.
+                                set_add_args.push(runtime.arena) if instantiation_wants_arena("arena_set_add_or_panic", set_lit_type_args, generics, structs)
+                                set_add_args_pointer: void& = (&set_add_args[0]).cast[void&] can Unsafe.PointerCast
+                                _ = LLVMBuildCall2(builder, set_add_fn_type, set_add_target, set_add_args_pointer, set_add_args.count.u32(), "set.add")
+                            else:
+                                set_lit_declined <- true
+                        null return if set_lit_declined
+                        return LLVMBuildLoad2(builder, set_lit_llvm, set_lit_slot, "set.literal.value")
+                    return null
+                _:
+                    pass
+            match expression:
+                Expr.Array(array_elements, array_literal_line):
+                    # Darray literals use the same allocation/growth path as `.push(...)`.
+                    if expected.kind == TypeKind.DArray:
+                        if array_elements.count == 0:
+                            return LLVMConstNull(darray_llvm_type(structs, ctx))
+                        element_type: ValueType = darray_element_of(expected, structs)
+                        null return if element_type.kind == TypeKind.Unmodeled
+                        header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                        temporary: LLVMValueRef = LLVMBuildAlloca(builder, header, "darray.literal")
+                        _ = LLVMBuildStore(builder, LLVMConstNull(header), temporary)
+                        declined: mutable bool = false
+                        for element_expression in array_elements |declined, temporary, expected, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                            # `[first, ...rest]` — a SPREAD element appends every item of another
+                            # darray. The `...` arrives as a unary Ellipsis, which the element loop
+                            # pushed as if it were one value, so the whole literal declined.
+                            #
+                            # Lowered as a copy LOOP that reuses emit_darray_push per item: bind the
+                            # source and an index to hidden locals, then push `src[i]`. Growth,
+                            # element conversion and the header update are then exactly the same code
+                            # the ordinary elements take.
+                            match element_expression:
+                                Expr.Unary(spread_operator, spread_operand, spread_line):
+                                    if spread_operator == TokenKind.Ellipsis:
+                                        spread_type: ValueType = expression_type(spread_operand, local_scope, fns, structs, generics)
+                                        if spread_type.kind != TypeKind.DArray:
+                                            declined <- true
+                                        elif emit_expression(spread_operand, spread_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is spread_value:
+                                            spread_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                            spread_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                            spread_source: LLVMValueRef = LLVMBuildAlloca(builder, spread_header, "spread.src")
+                                            _ = LLVMBuildStore(builder, spread_value, spread_source)
+                                            declare_local(local_scope, "__spread_src", spread_source, spread_type)
+                                            spread_index: LLVMValueRef = LLVMBuildAlloca(builder, spread_i64, "spread.i")
+                                            _ = LLVMBuildStore(builder, LLVMConstInt(spread_i64, 0, 0), spread_index)
+                                            declare_local(local_scope, "__spread_i", spread_index, ValueType{kind: TypeKind.Signed, bits: 64})
+                                            spread_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                            spread_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spread_function, "spread.cond")
+                                            spread_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spread_function, "spread.body")
+                                            spread_done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, spread_function, "spread.done")
+                                            _ = LLVMBuildBr(builder, spread_cond)
+                                            LLVMPositionBuilderAtEnd(builder, spread_cond)
+                                            spread_count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, spread_header, spread_source, 1, "spread.count.ptr")
+                                            spread_count: LLVMValueRef = LLVMBuildLoad2(builder, spread_i64, spread_count_pointer, "spread.count")
+                                            spread_at: LLVMValueRef = LLVMBuildLoad2(builder, spread_i64, spread_index, "spread.at")
+                                            # 40 = SLT.
+                                            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 40, spread_at, spread_count, "spread.more"), spread_body, spread_done)
+                                            LLVMPositionBuilderAtEnd(builder, spread_body)
+                                            spread_item: Expr = Expr.Index(Expr.Ident("__spread_src", spread_line), Expr.Ident("__spread_i", spread_line), spread_line)
+                                            declined <- true if not emit_darray_push(temporary, expected, spread_item, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                            spread_next: LLVMValueRef = LLVMBuildLoad2(builder, spread_i64, spread_index, "spread.at.next")
+                                            _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, spread_next, LLVMConstInt(spread_i64, 1, 0), "spread.inc"), spread_index)
+                                            _ = LLVMBuildBr(builder, spread_cond)
+                                            LLVMPositionBuilderAtEnd(builder, spread_done)
+                                        else:
+                                            declined <- true
+                                        continue
+                                _:
+                                    pass
+                            if emit_darray_push(temporary, expected, element_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder):
+                                declined <- declined
+                            else:
+                                declined <- true
+                        null return if declined
+                        return LLVMBuildLoad2(builder, header, temporary, "darray.literal.value")
+                    null return if expected.kind != TypeKind.Array
+                    slot_index: usize = expected.bits.usize()
+                    null return if array_elements.count > structs.array_extents[slot_index].usize()
+                    element_type: ValueType = structs.array_elements[slot_index]
+                    array_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                    temporary: LLVMValueRef = LLVMBuildAlloca(builder, array_llvm, "array")
+                    _ = LLVMBuildStore(builder, LLVMConstNull(array_llvm), temporary)
+                    declined: mutable bool = false
+                    position: mutable u32 = 0
+                    for element_expression in array_elements |declined, position, element_type, array_llvm, temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), LLVMConstInt(LLVMInt64TypeInContext(ctx), position.u64(), 0)]
+                        indices_pointer: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+                        pointer: LLVMValueRef = LLVMBuildGEP2(builder, array_llvm, temporary, indices_pointer, 2, "init.ptr")
+                        if emit_expression_coerced(element_expression, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_value:
+                            _ = LLVMBuildStore(builder, element_value, pointer)
+                        else:
+                            declined <- true
+                        position <- position + 1
+                    null return if declined
+                    return LLVMBuildLoad2(builder, array_llvm, temporary, "arrayval")
+
+                _:
+                    pass
+            # Named-tuple VALUE `(a, b, …)` — construct positionally into the EXPECTED tuple
+            # struct (a synthesized anonymous struct; register_tuple_types resolved its type).
+            match expression:
+                Expr.Tuple(tuple_value_elements, tuple_value_line):
+                    null return if expected.kind != TypeKind.Struct
+                    tuple_value_slot: usize = expected.bits.usize()
+                    null return if structs.field_count[tuple_value_slot] != tuple_value_elements.count
+                    tuple_value_llvm: LLVMTypeRef = llvm_type_of(expected, structs, ctx)
+                    tuple_value_temporary: LLVMValueRef = LLVMBuildAlloca(builder, tuple_value_llvm, "tuple")
+                    tuple_value_field_start: usize = structs.field_start[tuple_value_slot]
+                    tuple_value_declined: mutable bool = false
+                    tuple_value_position: mutable u32 = 0
+                    for tuple_value_element in tuple_value_elements |tuple_value_declined, tuple_value_position, tuple_value_field_start, tuple_value_llvm, tuple_value_temporary, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                        tuple_value_field_type: ValueType = copied_type(structs.field_types[tuple_value_field_start + tuple_value_position.usize()])
+                        tuple_value_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, tuple_value_llvm, tuple_value_temporary, tuple_value_position, "tuple.field.ptr")
+                        if emit_expression_coerced(tuple_value_element, tuple_value_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is tuple_value_field:
+                            _ = LLVMBuildStore(builder, tuple_value_field, tuple_value_pointer)
+                        else:
+                            tuple_value_declined <- true
+                        tuple_value_position <- tuple_value_position + 1
+                    null return if tuple_value_declined
+                    return LLVMBuildLoad2(builder, tuple_value_llvm, tuple_value_temporary, "tupleval")
+
+                _:
+                    pass
+            # `x.cast[T]` — a REINTERPRET cast (parsed as Index(Field(x,"cast"), T), no call).
+            # Only pointer<->pointer is modeled (a ref/cstr/void& is a `ptr`, and opaque
+            # pointers make it a no-op) — that is all the std alloc helpers need
+            # (`ptr.cast[mutable T&]`). A non-pointer reinterpret declines.
+            return emit_expression_cast_and_generic_index(expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder, handled)

@@ -1,0 +1,184 @@
+# Stage1 backend — registering the TEMPLATES the monomorphizer works from: generic functions,
+# generic structs, and the per-handler clones effect specialization creates.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+
+
+        # An abstract-effect helper is a compile-time template. Its source body is retained
+        # for semantic checking and AST tooling, but only its statically specialized clones
+        # are emitted. Emitting the template would leave an unresolved abstract operation and
+        # would force a runtime dispatch representation, violating the zero-overhead contract.
+        def declaration_is_effect_template(file: Ast::File&, declaration: Decl) -> bool can[Abort.Panic]:
+            if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                return any annotation in file.enum_annotations where annotation.owner == "__effect_template" and annotation.name == function_name and annotation.line == line.line
+            return false
+
+
+
+        # Effect templates can live inside module/impl scopes. Their concrete clones are
+        # emitted as ordinary file-scope declarations, so remove nested source templates while
+        # preserving the surrounding declaration tree for the normal module emitter.
+        def declaration_without_effect_templates(file: Ast::File&, declaration: Decl) -> Decl can[Abort.Panic, Memory.Allocate]:
+            match declaration:
+                Decl.Module(module_name, module_body, module_pos):
+                    filtered_module: mutable darray[Decl] = []
+                    for nested in module_body |filtered_module, file|:
+                        filtered_module.push(declaration_without_effect_templates(file, nested)) if not declaration_is_effect_template(file, nested)
+                    return Decl.Module(module_name, filtered_module, module_pos)
+                Decl.Scoped(scoped_body, scoped_pos):
+                    filtered_scope: mutable darray[Decl] = []
+                    for nested_scope in scoped_body |filtered_scope, file|:
+                        filtered_scope.push(declaration_without_effect_templates(file, nested_scope)) if not declaration_is_effect_template(file, nested_scope)
+                    return Decl.Scoped(filtered_scope, scoped_pos)
+                _:
+                    return declaration
+
+
+
+
+        # Is the declaration AT `line` a generic TEMPLATE? The body-emission passes used to
+        # ask "is this NAME generic" instead, and the difference is a silent WRONG ANSWER:
+        #     def f(x: i64) -> i64: return 1
+        #     def f[T](x: T)  -> i64: return 2
+        #     def main() -> i64: return f(5)
+        # stage0 answers 1 (the exact overload wins); stage1 answered 2. The non-generic `f`
+        # was DECLARED fine, but every emit loop skipped its body because a generic shared
+        # the name — no decline, no link error, just a missing symbol and a call that bound
+        # to the instantiation. It is also why the std's `print` was unusable: `def
+        # print(value: cstr)` was skipped, the generic instantiated at cstr, and that body
+        # declines, so every program calling `print` linked against an undefined symbol.
+        #
+        # The line table is the same one record_generic_func_metadata keys on: a row with
+        # the high bit SET is a BOUND (`[T: Ord]`), not a type parameter.
+        def decl_line_is_generic(file: Ast::File&, line: u32) -> bool can[Abort.Panic]:
+            for row in 0..<file.generic_param_lines.count |file, line|:
+                continue if file.generic_param_lines[row] >= 2147483648
+                true return if file.generic_param_lines[row] == line
+            # An `errorset R` parameter is intentionally absent from the ordinary generic
+            # rows: it is an effect-family selector, not a runtime/type argument. It still
+            # makes the declaration a template and must be kept out of the monomorphic
+            # declaration/body passes, or the unspecialized function can win overload lookup
+            # and be emitted with the wrong ABI.
+            for annotation in file.enum_annotations |line|:
+                true return if annotation.owner == "__errorset_param" and annotation.line == line
+            return false
+
+
+
+
+        # A legacy typestate's hidden constructor is an ordinary synthesized function whose
+        # source position is intentionally the typestate header. That header also records the
+        # phantom `state` generic, so line-only generic filtering would silently omit the
+        # constructor from FnTable and leave every `T.new(...)` call unresolved.
+        def declaration_is_generated_typestate(file: Ast::File&, name: sview, line: u32) -> bool can[Abort.Panic]:
+            for annotation in file.enum_annotations |name, line|:
+                true return if annotation.owner == name and annotation.name == "__typestate_generated" and annotation.line == line
+            return false
+
+
+
+
+        # Register generic function templates from parser side tables, avoiding recursive
+        # packed Decl.Func matching in the backend's discovery pass.
+        def register_generics(file: Ast::File&, top: darray[Decl]&, generics: mutable GenericTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic:
+                for generic_index in 0..<file.generic_func_decls.count |generic_index, generics, file|:
+                    function_name: sview = file.generic_func_decl_names[generic_index]
+                    line: u32 = file.generic_func_decl_lines[generic_index]
+                    error_param: mutable sview = ""
+                    for annotation in file.enum_annotations |error_param, line|:
+                        error_param <- annotation.name if error_param == "" and annotation.owner == "__errorset_param" and annotation.line == line
+                    start: usize = generics.params.count
+                    for row in 0..<file.generic_param_lines.count |generics, file, line|:
+                        # High bit set => a BOUND row (`[T: Ord]`), not a type parameter.
+                        continue if file.generic_param_lines[row] >= 2147483648
+                        continue if file.generic_param_lines[row] != line
+                        generics.params <- generics.params.push(file.generic_param_names[row])
+                    added: usize = generics.params.count - start
+                    # An errorset-only generic such as `f[errorset R](...)` has no ordinary
+                    # type arguments, but it is still a real template and must be registered.
+                    continue if added == 0 and error_param == ""
+                    generics.names <- generics.names.push(function_name)
+                    generics.decls <- generics.decls.push(file.generic_func_decls[generic_index])
+                    generics.param_start <- generics.param_start.push(start)
+                    generics.param_count <- generics.param_count.push(added)
+                    generics.is_error <- generics.is_error.push(line_is_error_returning(file.error_set_func_lines, line))
+                    generics.error_params <- generics.error_params.push(error_param)
+                    # Parallel to `names`: the module this template was written in. The body is
+                    # emitted from a drain queue, so this is the only surviving record of it.
+                    generics.owners <- generics.owners.push(file.generic_func_decl_owners[generic_index])
+
+
+
+
+        # Effect specialization creates a new function name for each installed handler. When
+        # the source helper is generic, that clone is still a generic TEMPLATE: the call site
+        # must infer its ordinary type arguments and the normal instantiation worklist must emit
+        # its body. It is not present in the parser's source generic side table, because that
+        # table intentionally describes only source declarations, so register it from the final
+        # declaration list using the clone-name marker.
+        def register_effect_generic_clones(file: Ast::File&, top: darray[Decl]&, generics: mutable GenericTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                for declaration in top |generics, file|:
+                    if declaration is Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                        clone: mutable bool = false
+                        source_line: u32 = line.line
+                        for annotation in file.enum_annotations |clone, function_name, source_line|:
+                            clone <- true if annotation.owner == "__effect_clone_name" and annotation.name == function_name and annotation.line == source_line
+                        continue if not clone or not decl_line_is_generic(file, source_line)
+                        error_param: mutable sview = ""
+                        for annotation in file.enum_annotations |error_param, source_line|:
+                            error_param <- annotation.name if error_param == "" and annotation.owner == "__errorset_param" and annotation.line == source_line
+                        start: usize = generics.params.count
+                        for row in 0..<file.generic_param_lines.count |generics, file, source_line|:
+                            continue if file.generic_param_lines[row] >= 2147483648
+                            continue if file.generic_param_lines[row] != source_line
+                            generics.params <- generics.params.push(file.generic_param_names[row])
+                        added: usize = generics.params.count - start
+                        continue if added == 0 and error_param == ""
+                        generics.names <- generics.names.push(function_name)
+                        generics.decls <- generics.decls.push(declaration)
+                        generics.param_start <- generics.param_start.push(start)
+                        generics.param_count <- generics.param_count.push(added)
+                        generics.is_error <- generics.is_error.push(line_is_error_returning(file.error_set_func_lines, source_line))
+                        generics.error_params <- generics.error_params.push(error_param)
+                        # Clones are emitted at file scope, even when their source helper lived in
+                        # a module. Their body has already had all effectful helper calls rewritten
+                        # to clone names, so the empty owner is the correct lookup context.
+                        generics.owners <- generics.owners.push("")
+
+
+
+
+            # Pass 1: create the NAMED (empty) LLVM type for a struct declaration and record
+            # its name. Bodies are set separately so declaration order never matters.
+            # Index of a registered generic struct TEMPLATE by base name (-1 = none).
+        def generic_struct_index_of(structs: StructTable&, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<structs.generic_struct_names.count |structs, name|:
+                index.i64() return if structs.generic_struct_names[index] == name
+            return -1
+
+
+
+
+        # Register generic struct templates from parser side tables. The declaration payload is
+        # retained for later field-body instantiation, while this pass avoids packed Decl matching.
+        def register_generic_structs(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for generic_index in 0..<file.generic_struct_decls.count |generic_index, structs, file|:
+                struct_name: sview = file.generic_struct_decl_names[generic_index]
+                struct_line: u32 = file.generic_struct_decl_lines[generic_index]
+                start: usize = structs.generic_struct_param_names.count
+                row: mutable usize = 0
+                while row < file.generic_param_lines.count |row, structs, file, struct_line|:
+                    # High-bit rows are constraint metadata, not fresh params.
+                    if file.generic_param_lines[row] < 2147483648 and file.generic_param_lines[row] == struct_line:
+                        structs.generic_struct_param_names <- structs.generic_struct_param_names.push(file.generic_param_names[row])
+                    row <- row + 1
+                param_count: usize = structs.generic_struct_param_names.count - start
+                continue if param_count == 0
+                structs.generic_struct_names <- structs.generic_struct_names.push(struct_name)
+                structs.generic_struct_decls <- structs.generic_struct_decls.push(file.generic_struct_decls[generic_index])
+                structs.generic_struct_param_start <- structs.generic_struct_param_start.push(start)
+                structs.generic_struct_param_count <- structs.generic_struct_param_count.push(param_count)

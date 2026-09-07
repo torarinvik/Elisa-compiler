@@ -1,0 +1,143 @@
+# Stage1 backend — EXPRESSION STATEMENTS: a bare call, a ternary in statement position, `pass`,
+# and the container-mutating method calls that only make sense for their effect. Reached from
+# codegen_stmt_blocks_exprs.elisa after the prefix-block and contract forms.
+# Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_statement_expr(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # `requires PRED` / `ensure PRED` — a design-by-contract check. stage0 lowers it
+            # to `if not PRED: <panic>`: evaluate the predicate and, on failure, abort. A
+            # provably-true predicate is optimized away (stage0's -O2 drops it entirely), so
+            # the success path costs nothing after the optimizer runs.
+            #
+            # `requires` (a PRECONDITION over the parameters) is checked HERE. `ensure` is a
+            # postcondition over `result`, which is not bound until the return -- so it is
+            # only RECORDED here and checked on every return path (emit_ensure_checks),
+            # which is where stage0 checks it too.
+            # The fail path calls libc `abort()` rather than reproducing stage0's
+            # printf+backtrace panic verbatim -- the SUCCESS path (predicate holds) is then
+            # bit-identical to stage0, and a FAILING contract aborts in both.
+            match statement:
+                Stmt.Contract(contract_kind, contract_pred, contract_line):
+                    declined_contract: EmitStatus = EmitStatus.Declined
+                    # `decreases` is a loop-variant termination obligation the frontend
+                    # discharges — NO runtime lowering, so skip it. (The std dict probe loops
+                    # carry `decreases`.)
+                    EmitStatus.Open return if contract_kind == "decreases" or contract_kind == "decreases*"
+                    # `ensure` is a POSTCONDITION: record it and check it at every return, where
+                    # `result` exists. Recording (rather than a pre-scan in emit_function_body)
+                    # keeps the clause's meaning lexical — a return placed BEFORE it is not
+                    # governed by it, which is also how stage0 reads the prologue.
+                    if contract_kind == "ensure":
+                        structs.pending_ensures.push(contract_pred)
+                        return EmitStatus.Open
+                    # `requires` (precondition) and `assert` both lower to a runtime check that
+                    # aborts on a false predicate — bit-identical to stage0 on the success path.
+                    declined_contract return if contract_kind != "requires" and contract_kind != "assert"
+                    bool_type_c: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                    if emit_expression(contract_pred, bool_type_c, local_scope, fns, structs, generics, runtime, m, ctx, builder) is contract_value:
+                        emit_contract_guard(contract_value, m, ctx, builder)
+                        # Past the guard the predicate HOLDS, so `assert p != null` narrows `p`
+                        # for the rest of the function -- stage0's rule, which the std dict
+                        # relies on to read `m.items` as a plain ref.
+                        record_null_assert(contract_pred, structs)
+                        return EmitStatus.Open
+                    return declined_contract
+
+                _:
+                    pass
+            # `raise MyErr.Bad` — parses to Call(Ident("raise"), [E.Variant]). It TERMINATES:
+            # store a zero into the error out-param (the success value is unused on the error
+            # path) and return the i32 code `ordinal + 1` (0 is reserved for success).
+            match statement:
+                Stmt.Expr(raise_stmt_expr, raise_stmt_line):
+                    match raise_stmt_expr:
+                        Expr.Call(raise_callee, raise_args, raise_arg_names, raise_call_line):
+                            match raise_callee:
+                                Expr.Ident(raise_name, raise_name_line):
+                                    if raise_name == "raise" and runtime.in_error_fn and raise_args.count == 1:
+                                        # `raise E.Variant(a, b)` — a PAYLOAD-carrying variant, which parses
+                                        # as a Call rather than a dotted path, so ordinal_of_dotted_path_expr
+                                        # answered -1 and the whole raise declined. Its set returns the
+                                        # `%ErrSet__E` STRUCT: field 0 is the tag, and the variant's fields sit
+                                        # at `1 + (preceding variants' field counts) + i`, with every other
+                                        # variant's slot left undef (measured from stage0's IR).
+                                        match raise_args[0]:
+                                            Expr.Call(raise_payload_callee, raise_payload_args, raise_payload_names, raise_payload_line):
+                                                raise_set_name: mutable sview = runtime.error_fn_family if runtime.error_fn_family != "" else line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, runtime.error_fn_line)
+                                                raise_set_name <- resolved_error_family(raise_set_name, structs)
+                                                if error_set_has_payload(structs, raise_set_name):
+                                                    raise_set_index: i64 = penum_index_of(structs, raise_set_name)
+                                                    raise_payload_ordinal: i64 = ordinal_of_dotted_path_expr(raise_payload_callee, structs)
+                                                    if raise_set_index >= 0 and raise_payload_ordinal >= 0:
+                                                        raise_slot_base: usize = error_set_variant_field_base(structs, raise_set_index, raise_payload_ordinal.usize())
+                                                        raise_field_start: usize = structs.penum_field_type_start[structs.penum_variant_start[raise_set_index.usize()] + raise_payload_ordinal.usize()]
+                                                        raise_field_span: usize = structs.penum_field_type_count[structs.penum_variant_start[raise_set_index.usize()] + raise_payload_ordinal.usize()]
+                                                        if raise_payload_args.count == raise_field_span:
+                                                            EmitStatus.Declined return if not emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder)
+                                                            emit_region_unwind(regions, runtime, builder)
+                                                            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), runtime.error_out)
+                                                            raise_set_llvm: LLVMTypeRef = error_set_llvm_type(structs, raise_set_name, ctx)
+                                                            raise_value: mutable LLVMValueRef = LLVMGetUndef(raise_set_llvm)
+                                                            raise_value <- LLVMBuildInsertValue(builder, raise_value, LLVMConstInt(LLVMInt32TypeInContext(ctx), (raise_payload_ordinal + 1).u64(), 0), 0, "errset.tag")
+                                                            raise_payload_declined: mutable bool = false
+                                                            for raise_payload_index in 0..<raise_field_span |raise_value, raise_payload_declined, raise_payload_args, raise_field_start, raise_slot_base, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                                                                raise_field_type: ValueType = copied_type(structs.penum_field_types[raise_field_start + raise_payload_index])
+                                                                if emit_expression(raise_payload_args[raise_payload_index], raise_field_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is raise_field_value:
+                                                                    raise_value <- LLVMBuildInsertValue(builder, raise_value, raise_field_value, (raise_slot_base + raise_payload_index).u32(), "errset.payload")
+                                                                else:
+                                                                    raise_payload_declined <- true
+                                                            EmitStatus.Declined return if raise_payload_declined
+                                                            _ = LLVMBuildRet(builder, raise_value)
+                                                            return EmitStatus.Terminated
+                                            _:
+                                                pass
+                                        raise_ordinal: i64 = ordinal_of_dotted_path_expr(raise_args[0], structs)
+                                        if raise_ordinal >= 0:
+                                            # A `raise` is a function EXIT, so it unwinds `defer` exactly
+                                            # as `return` does. It did not, so a deferred block was simply
+                                            # dropped on the error path — the one path where cleanup
+                                            # matters most.
+                                            EmitStatus.Declined return if not emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder)
+                                            emit_region_unwind(regions, runtime, builder)
+                                            # The out-param slot is a pointer; zero its first word so a
+                                            # later spurious read is deterministic (stage0 stores 0).
+                                            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0), runtime.error_out)
+                                            # A FIELDLESS variant of a set that has payloads elsewhere still
+                                            # returns the struct — the ABI is per-SET, not per-variant, so
+                                            # `raise BackendError.Other` must build `{ i32 2, undef, undef }`
+                                            # rather than a bare i32 the signature no longer declares.
+                                            bare_set_name: mutable sview = runtime.error_fn_family if runtime.error_fn_family != "" else line_error_set_name(structs.error_fn_lines, structs.error_fn_set_names, runtime.error_fn_line)
+                                            bare_set_name <- resolved_error_family(bare_set_name, structs)
+                                            if error_set_has_payload(structs, bare_set_name):
+                                                bare_set_llvm: LLVMTypeRef = error_set_llvm_type(structs, bare_set_name, ctx)
+                                                bare_value: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetUndef(bare_set_llvm), LLVMConstInt(LLVMInt32TypeInContext(ctx), (raise_ordinal + 1).u64(), 0), 0, "errset.tag")
+                                                _ = LLVMBuildRet(builder, bare_value)
+                                                return EmitStatus.Terminated
+                                            _ = LLVMBuildRet(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), (raise_ordinal + 1).u64(), 0))
+                                            return EmitStatus.Terminated
+                                    # `panic(MESSAGE)` — REPORT, then abort. TERMINATES the block.
+                                    #
+                                    # This used to lower to a bare `abort()`, on the reasoning that the
+                                    # success path never reaches a panic so the difference was
+                                    # unobservable. It is observable at exactly the moment it matters:
+                                    # a stage0-compiled program prints
+                                    # `panic at FILE:LINE:COL: MESSAGE` and a backtrace, while a
+                                    # stage1-compiled one died in silence — no message, no location,
+                                    # just SIGABRT. `-emit test` is where it showed: stage0 replays the
+                                    # panic text under `[ STDOUT   ]` and stage1 had nothing to replay.
+                                    if raise_name == "panic":
+                                        emit_panic_report(raise_args, structs, runtime, m, ctx, builder, raise_call_line.line)
+                                        panic_abort_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), null, 0, 0)
+                                        panic_abort_fn: LLVMValueRef = declare_or_get_abort(m, panic_abort_type)
+                                        _ = LLVMBuildCall2(builder, panic_abort_type, panic_abort_fn, null, 0, "")
+                                        _ = LLVMBuildUnreachable(builder)
+                                        return EmitStatus.Terminated
+                                _:
+                                    pass
+                        _:
+                            pass
+                _:
+                    pass
+            return emit_statement_expr_calls(statement, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder, handled)

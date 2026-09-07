@@ -1,0 +1,373 @@
+# Stage1 backend — FIELD READS: a bitset flag out of a packed byte, a common field of a packed
+# store row, a SoA column, and the ordinary struct projection. The chain's last link, so this
+# is where `handled <- false` finally declines. Part of `module Backend` (see codegen.elisa).
+
+extend Backend:
+    private:
+        def emit_expression_field_read(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.Field(flag_container, flag_name, flag_line):
+                    match flag_container:
+                        Expr.Field(flag_owner, flag_field, flag_field_line):
+                            # ANY named member of a `bitset:` / `bitfield:` group. Only two names were
+                            # handled before (`has_suffix`/`has_prefix`, the ones the self-host Token
+                            # struct uses), so every other flag declined. The offset and width come from
+                            # the group's recorded member list, so a one-bit bitset flag reads as a bool
+                            # and a wider bitfield member reads as its own integer.
+                            bg_owner_type: mutable ValueType = expression_type(flag_owner, local_scope, fns, structs, generics)
+                            bg_owner_type <- ref_target_of(bg_owner_type, structs) if bg_owner_type.kind == TypeKind.Ref
+                            if bg_owner_type.kind == TypeKind.Struct:
+                                bg_row: i64 = bit_group_member_index(structs, bg_owner_type.bits.usize(), flag_field, flag_name)
+                                if bg_row >= 0:
+                                    bg_pack_type: ValueType = expression_type(flag_container, local_scope, fns, structs, generics)
+                                    if bg_pack_type.kind == TypeKind.Unsigned:
+                                        if emit_expression(flag_container, bg_pack_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is bg_pack:
+                                            bg_llvm: LLVMTypeRef = llvm_type_of(bg_pack_type, structs, ctx)
+                                            bg_offset: u32 = structs.bitgroup_offsets[bg_row.usize()]
+                                            bg_width: u32 = structs.bitgroup_widths[bg_row.usize()]
+                                            bg_shifted: LLVMValueRef = LLVMBuildLShr(builder, bg_pack, LLVMConstInt(bg_llvm, bg_offset.u64(), 0), "bitgroup.shr")
+                                            bg_mask: u64 = (1.u64() << bg_width.u64()) - 1.u64()
+                                            bg_value: LLVMValueRef = LLVMBuildAnd(builder, bg_shifted, LLVMConstInt(bg_llvm, bg_mask, 0), "bitgroup.and")
+                                            # A ONE-BIT member is a bool; a wider one keeps its integer
+                                            # value and converts to whatever the context wants.
+                                            if structs.bitgroup_is_flag[bg_row.usize()] and (expected.kind == TypeKind.Bool or expected.kind == TypeKind.Unmodeled):
+                                                return LLVMBuildICmp(builder, 33, bg_value, LLVMConstInt(bg_llvm, 0, 0), "bitgroup.test")
+                                            return emit_conversion(bg_value, bg_pack_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != bg_pack_type.kind or expected.bits != bg_pack_type.bits) else bg_value
+                                        return null
+                            if flag_name == "has_suffix" or flag_name == "has_prefix":
+                                flag_bit: u64 = 0 if flag_name == "has_suffix" else 1
+                                flag_pack_type: ValueType = expression_type(flag_container, local_scope, fns, structs, generics)
+                                if flag_pack_type.kind == TypeKind.Unsigned:
+                                    if emit_expression(flag_container, flag_pack_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is flag_pack:
+                                        flag_mask: LLVMValueRef = LLVMConstInt(llvm_type_of(flag_pack_type, structs, ctx), 1.u64() << flag_bit, 0)
+                                        flag_bits: LLVMValueRef = LLVMBuildAnd(builder, flag_pack, flag_mask, "bitset.and")
+                                        flag_zero: LLVMValueRef = LLVMConstInt(llvm_type_of(flag_pack_type, structs, ctx), 0, 0)
+                                        return LLVMBuildICmp(builder, 33, flag_bits, flag_zero, "bitset.test")
+                                    return null
+                        _:
+                            pass
+                _:
+                    pass
+            # `d.entry(k).found` / `.value` — the ENTRY api's READ members. The receiver is
+            # the `entry` call, which has no ValueType of its own, so the ordinary field
+            # paths below cannot reach it. See emit_dict_entry_member for the lowering.
+            match expression:
+                Expr.Field(dict_entry_head, dict_entry_member, dict_entry_line):
+                    if dict_entry_member == "found" or dict_entry_member == "value":
+                        dict_entry_no_args: darray[Expr] = []
+                        if emit_dict_entry_member(dict_entry_head, dict_entry_member, dict_entry_no_args, local_scope, fns, structs, generics, runtime, m, ctx, builder) is dict_entry_read:
+                            return dict_entry_read
+                _:
+                    pass
+            # `Color.Green` / `Lexer::TokenKind.Ident` — a CONST ENUM member is a constant of
+            # the enum's backing type: its declaration-order ordinal.
+            match expression:
+                Expr.Field(enum_object, enum_variant, enum_field_line):
+                    enum_type_name: mutable sview = ""
+                    match enum_object:
+                        Expr.Ident(enum_ident_name, enum_ident_line):
+                            enum_type_name <- enum_ident_name
+                        _:
+                            pass
+                    match enum_object:
+                        Expr.Scope(enum_mod_head, enum_mod_name, enum_mod_line):
+                            enum_type_name <- enum_mod_name
+                        _:
+                            pass
+                    if enum_type_name != "":
+                        enum_slot: i64 = enum_index_of(structs, enum_type_name)
+                        if enum_slot >= 0:
+                            # The member's VALUE, not its ordinal — `Lo = 2` is 2, not 0.
+                            member_value: i64 = enum_value_of(structs, enum_slot.usize(), enum_variant)
+                            null return if enum_ordinal_of(structs, enum_slot.usize(), enum_variant) < 0
+                            backing: ValueType = copied_type(structs.enum_backings[enum_slot.usize()])
+                            return LLVMConstInt(llvm_type_of(backing, structs, ctx), member_value.u64(), 0)
+                        # `Opt.None` — a PAYLOAD-FREE variant of a payload enum, used as a bare
+                        # value rather than called. It is still the tagged union: the tag, with
+                        # the payload slot left zeroed.
+                        penum_slot_index: i64 = penum_index_of(structs, enum_type_name)
+                        if penum_slot_index >= 0:
+                            penum_tag: i64 = penum_variant_index(structs, penum_slot_index, enum_variant)
+                            null return if penum_tag < 0
+                            # A variant WITH a payload is a constructor and must be called; a
+                            # bare mention of one is not a value.
+                            null return if structs.penum_has_payload[structs.penum_variant_start[penum_slot_index.usize()] + penum_tag.usize()]
+                            penum_value_type: ValueType = ValueType{kind: TypeKind.PayloadEnum, bits: penum_slot_index.u32()}
+                            penum_llvm: LLVMTypeRef = llvm_type_of(penum_value_type, structs, ctx)
+                            penum_ctor_slot: LLVMValueRef = LLVMBuildAlloca(builder, penum_llvm, "enum.ctor")
+                            _ = LLVMBuildStore(builder, LLVMConstNull(penum_llvm), penum_ctor_slot)
+                            penum_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, penum_llvm, penum_ctor_slot, 0, "enum.tag.ptr")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), penum_tag.u64(), 0), penum_tag_pointer)
+                            return LLVMBuildLoad2(builder, penum_llvm, penum_ctor_slot, "enum.value")
+                        # A payload-free recursive AST refinement variant (`Ast::Pattern.Wildcard`,
+                        # `Ast::Expr.Invalid`). Payload-bearing packed variants remain constructors
+                        # and must be called with their fields.
+                        #
+                        # This MUST allocate a store row, exactly as the constructor path does. A
+                        # packed value is an AoS row INDEX, and every reader resolves it with
+                        # `ctx_aos_store_record(state, handle)` before reading the tag. Returning the
+                        # variant's ORDINAL as if it were a handle — which is what this did — made
+                        # `Ast::Pattern.Wildcard` evaluate to 57, so readers fetched record #57: a
+                        # row that was never written, whose zeroed tag 0 matched no arm. The
+                        # exhaustive 14-arm match in `Parser.when_atom_pattern_illegal` then fell off
+                        # its end into the `unreachable`, which is why gen2 trapped on ANY `when`.
+                        packed_slot_index: i64 = packed_index_of(structs, enum_type_name)
+                        if packed_slot_index >= 0:
+                            packed_tag: i64 = packed_variant_index(structs, packed_slot_index, enum_variant)
+                            null return if packed_tag < 0
+                            packed_variant_slot: usize = structs.packed_variant_start[packed_slot_index.usize()] + packed_variant_local_index(structs, packed_slot_index, enum_variant).usize()
+                            null return if structs.packed_has_payload[packed_variant_slot]
+                            bare_store_index: i64 = packed_root_index_of(structs, packed_slot_index)
+                            null return if bare_store_index < 0
+                            null return if runtime.active_store_enum != bare_store_index
+                            bare_arena: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 0, "packed.arena")
+                            bare_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "packed.state")
+                            bare_alloc_args: mutable darray[LLVMValueRef] = [bare_arena, bare_state, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0)]
+                            if runtime.packed_mode == 2:
+                                bare_alloc_args <- [bare_arena, bare_state]
+                            bare_alloc_pointer: void& = (&bare_alloc_args[0]).cast[void&] can Unsafe.PointerCast
+                            bare_alloc_result: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_alloc_type, runtime.packed_alloc, bare_alloc_pointer, 2 if runtime.packed_mode == 2 else 3, "packed.variant.alloc")
+                            bare_row: LLVMValueRef = LLVMBuildExtractValue(builder, bare_alloc_result, 0, "packed.alloc.ptr")
+                            bare_handle_llvm: LLVMTypeRef = packed_row_llvm_type(structs, packed_slot_index, ctx)
+                            _ = LLVMBuildStore(builder, LLVMConstNull(bare_handle_llvm), bare_row)
+                            bare_tag_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, bare_handle_llvm, bare_row, 0, "packed.tag.ptr")
+                            _ = LLVMBuildStore(builder, LLVMConstInt(LLVMInt32TypeInContext(ctx), packed_tag.u64(), 0), bare_tag_pointer)
+                            return LLVMBuildExtractValue(builder, bare_alloc_result, 1, "packed.alloc.index")
+
+                _:
+                    pass
+            # `xs.count` — read the darray header's count field.
+            # `node.left` after `if node is Expr.Pair:` — reading a payload field through the
+            # NARROWED variant view, with no binding pattern to introduce the name. stage0
+            # lowers it as a plain payload GEP + extract in the proven branch; stage1 had no
+            # case for a payload-enum receiver in field position at all.
+            #
+            # The variant is chosen by FIELD NAME, and only when exactly ONE variant declares
+            # it. That is what makes the read safe without re-deriving the narrowing: with two
+            # variants sharing a field name the offsets can differ and the branch the read sits
+            # in decides which is right — information this emitter does not have, so it
+            # declines rather than pick. The semantic layer has already proven the narrowing;
+            # a program that reads the wrong variant's field never reaches here.
+            # `node.span` — a packed enum's COMMON field. There was no packed common-field read
+            # path at all.
+            #
+            # Read INLINE, at word `1 + commonIndex`: word 0 is the tag and the commons follow
+            # it, which is exactly where stage1's own constructor WRITES them
+            # (`getelementptr {i32, i64, [N x i64]}, …, 1`). stage0 instead keeps commons in a
+            # SIDE TABLE and builds the store with
+            # `ctx_packed_store_state_new_variant_sparse_with_side_words` -- a different layout,
+            # but not an observable one, since stores never cross compilers. Reading with
+            # stage0's convention against stage1's writer is what a first attempt did, and the
+            # compiled program segfaulted on an uninitialised side table.
+            #
+            # Resolved by OWNER NAME rather than by enum index: four separate paths push a
+            # `packed_names` row, so an index-parallel pool goes out of step -- that mistake
+            # segfaulted the compiler on the first attempt at this.
+            match expression:
+                Expr.Field(pcf_object, pcf_field, pcf_field_line):
+                    pcf_receiver: ValueType = expression_type(pcf_object, local_scope, fns, structs, generics)
+                    # `frozen[key].span` OUTSIDE any `in frozen:` block: there is no ambient
+                    # store, so the state comes from the store BEING INDEXED. stage0 does the
+                    # same (it reads the side word off that store's state). Without this the
+                    # whole read declined on the `active_store_enum >= 0` gate below.
+                    pcf_owner_store: mutable LLVMValueRef = zeroed
+                    pcf_has_owner: mutable bool = false
+                    match pcf_object:
+                        Expr.Index(pcf_ix_object, pcf_ix_argument, pcf_ix_line):
+                            pcf_ix_type: ValueType = expression_type(pcf_ix_object, local_scope, fns, structs, generics)
+                            if pcf_ix_type.kind == TypeKind.PackedStore and runtime.packed_mode != 2:
+                                if emit_expression(pcf_ix_object, pcf_ix_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pcf_ix_store_value:
+                                    pcf_owner_store <- pcf_ix_store_value
+                                    pcf_has_owner <- true
+                        _:
+                            pass
+                    if pcf_receiver.kind == TypeKind.PackedEnum and (pcf_has_owner or (runtime.active_store_enum >= 0 and runtime.active_store_is_block)):
+                        # Common fields are inherited by every hierarchy member and physically
+                        # live in the shared root row. `packed_common_index_of` resolves the
+                        # member/root name pair, while row registration and stride measurement
+                        # use the same canonical root layout. Keep root-typed reads enabled;
+                        # refusing them made a fully registered hierarchy unusable through its
+                        # public base type.
+                        if pcf_receiver.bits.usize() < structs.packed_names.count:
+                            pcf_index: i64 = packed_common_index_of(structs.packed_names[pcf_receiver.bits.usize()], pcf_field, structs)
+                            if pcf_index >= 0:
+                                # Preserve the declared type. Legacy row readers still return
+                                # eight-byte words, so the non-AoS branch reconstructs the value
+                                # through a typed temporary below.
+                                pcf_dynamic_aos: bool = runtime.packed_mode == 2 and packed_is_dynamic_aos_enum(structs, pcf_receiver.bits.i64())
+                                pcf_word_type: ValueType = packed_common_type_at(structs, structs.packed_names[pcf_receiver.bits.usize()], pcf_index.u32())
+                                if emit_expression(pcf_object, pcf_receiver, local_scope, fns, structs, generics, runtime, m, ctx, builder) is pcf_handle:
+                                    pcf_state: LLVMValueRef = LLVMBuildExtractValue(builder, pcf_owner_store if pcf_has_owner else runtime.active_store, 2, "packed.state")
+                                    pcf_word: mutable LLVMValueRef = zeroed
+                                    if runtime.packed_mode == 2 and pcf_dynamic_aos:
+                                        if packed_common_is_inline(structs, structs.packed_names[pcf_receiver.bits.usize()], pcf_index.u32()):
+                                            # An explicitly inline common is a typed member of
+                                            # the AoS row, not a side-table column. Decode the row
+                                            # through the handle and load its exact field type.
+                                            pcf_index64: LLVMValueRef = LLVMBuildZExt(builder, pcf_handle, LLVMInt64TypeInContext(ctx), "packed.common.index")
+                                            pcf_record_args: mutable darray[LLVMValueRef] = [pcf_state, pcf_index64]
+                                            pcf_record_pointer: void& = (&pcf_record_args[0]).cast[void&] can Unsafe.PointerCast
+                                            pcf_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, pcf_record_pointer, 2, "packed.common.record")
+                                            pcf_row_type: LLVMTypeRef = packed_row_llvm_type(structs, pcf_receiver.bits.i64(), ctx)
+                                            pcf_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pcf_row_type, pcf_record, packed_dynamic_common_row_field_index(structs, pcf_receiver.bits.i64(), pcf_index.u32()), "packed.common.ptr")
+                                            pcf_word <- LLVMBuildLoad2(builder, llvm_type_of(pcf_word_type, structs, ctx), pcf_field_pointer, "packed.common.value")
+                                        else:
+                                            pcf_side_slots: u32 = packed_common_side_word_count(pcf_word_type, structs)
+                                            pcf_side_offset: u32 = packed_common_side_word_offset(structs, structs.packed_names[pcf_receiver.bits.usize()], pcf_index.u32())
+                                            if packed_side_table_load_value(pcf_word_type, pcf_side_slots, pcf_state, pcf_handle, pcf_side_offset, runtime, structs, ctx, builder) is pcf_side_value:
+                                                pcf_word <- pcf_side_value
+                                            else:
+                                                return null
+                                    elif runtime.packed_mode == 2:
+                                        # Under the AoS profile there IS no word reader: `packed_read_word`
+                                        # is `ctx_aos_store_record`, which takes (state, handle) and hands
+                                        # back the ROW POINTER. Calling it with the word-reader's three
+                                        # arguments produced a `ptr` where an i64 was wanted -- which is
+                                        # why a BARE `return node.span` declined on the return path's
+                                        # type-identity check while `node.span + 0` silently accepted the
+                                        # pointer as an operand. Read the common out of the row instead,
+                                        # at the common's word-aligned row slot, exactly where the constructor
+                                        # writes it.
+                                        pcf_index64: LLVMValueRef = LLVMBuildZExt(builder, pcf_handle, LLVMInt64TypeInContext(ctx), "packed.common.index")
+                                        pcf_record_args: mutable darray[LLVMValueRef] = [pcf_state, pcf_index64]
+                                        pcf_record_pointer: void& = (&pcf_record_args[0]).cast[void&] can Unsafe.PointerCast
+                                        pcf_record: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, pcf_record_pointer, 2, "packed.common.record")
+                                        pcf_row_type: LLVMTypeRef = packed_row_llvm_type(structs, pcf_receiver.bits.i64(), ctx)
+                                        pcf_field_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, pcf_row_type, pcf_record, packed_common_row_field_index(structs, pcf_receiver.bits.i64(), pcf_index.u32()), "packed.common.ptr")
+                                        pcf_word <- LLVMBuildLoad2(builder, llvm_type_of(pcf_word_type, structs, ctx), pcf_field_pointer, "packed.common.value")
+                                    else:
+                                        # The INDEX profile's word reader leads with the ARENA
+                                        # (`ctx_packed_store_read_index_word(arena, index, state, word)`);
+                                        # the variant-sparse one takes three arguments. This site emitted
+                                        # the three-argument shape unconditionally, so a common read under
+                                        # `@packed_profile(retained_reads)` called a four-parameter
+                                        # declaration with three -- which is what SEGFAULTED the two
+                                        # earlier attempts at admitting a common-carrying index enum, and
+                                        # was misread at the time as the side-table layout difference.
+                                        pcf_args: mutable darray[LLVMValueRef] = [pcf_handle, pcf_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), 1 + pcf_index.u64(), 0)]
+                                        if runtime.packed_mode == 1:
+                                            pcf_arena: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 0, "packed.common.arena")
+                                            pcf_args <- [pcf_arena, pcf_handle, pcf_state, LLVMConstInt(LLVMInt64TypeInContext(ctx), 1 + pcf_index.u64(), 0)]
+                                        pcf_pointer: void& = (&pcf_args[0]).cast[void&] can Unsafe.PointerCast
+                                        pcf_word <- LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, pcf_pointer, pcf_args.count.u32(), "packed.common.word")
+                                        pcf_slots: u32 = packed_common_side_word_count(pcf_word_type, structs)
+                                        return null if pcf_slots != 1
+                                        pcf_raw_storage: LLVMValueRef = LLVMBuildAlloca(builder, runtime_size_llvm_type(ctx), "packed.common.raw")
+                                        _ = LLVMBuildStore(builder, pcf_word, pcf_raw_storage)
+                                        if packed_raw_words_load_value(pcf_word_type, pcf_slots, pcf_raw_storage, 0, structs, ctx, builder) is pcf_typed_value:
+                                            pcf_word <- pcf_typed_value
+                                        else:
+                                            return null
+                                    return emit_conversion(pcf_word, pcf_word_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != pcf_word_type.kind or expected.bits != pcf_word_type.bits) else pcf_word
+                                return null
+                _:
+                    pass
+            match expression:
+                Expr.Field(pev_object, pev_field, pev_field_line):
+                    pev_receiver: ValueType = expression_type(pev_object, local_scope, fns, structs, generics)
+                    if pev_receiver.kind == TypeKind.PayloadEnum:
+                        pev_enum: usize = pev_receiver.bits.usize()
+                        pev_match_slot: mutable i64 = -1
+                        pev_match_offset: mutable usize = 0
+                        pev_matches: mutable i64 = 0
+                        for pev_variant in 0..<structs.penum_variant_count[pev_enum] |pev_match_slot, pev_match_offset, pev_matches, pev_enum, pev_field, structs|:
+                            pev_slot: usize = structs.penum_variant_start[pev_enum] + pev_variant
+                            pev_start: usize = structs.penum_field_type_start[pev_slot]
+                            for pev_index in 0..<structs.penum_field_type_count[pev_slot] |pev_match_slot, pev_match_offset, pev_matches, pev_start, pev_slot, pev_field, structs|:
+                                if structs.penum_field_flat_names[pev_start + pev_index] == pev_field:
+                                    pev_match_slot <- pev_slot.i64()
+                                    pev_match_offset <- pev_index
+                                    pev_matches <- pev_matches + 1
+                        if pev_matches == 1:
+                            pev_slot_index: usize = pev_match_slot.usize()
+                            pev_field_type: ValueType = copied_type(structs.penum_field_types[structs.penum_field_type_start[pev_slot_index] + pev_match_offset])
+                            if pev_field_type.kind != TypeKind.Unmodeled:
+                                # A by-value enum LOCAL/param is its own slot; anything else goes
+                                # through the chain resolver. Failure FALLS THROUGH to the branches
+                                # below rather than declining -- this case must not claim a field
+                                # read it cannot serve.
+                                pev_slot_opt: mutable LLVMValueRef? = null
+                                match pev_object:
+                                    Expr.Ident(pev_name, _):
+                                        pev_slot_opt <- lookup_slot(local_scope, pev_name)
+                                    _:
+                                        pev_slot_opt <- struct_chain_address(pev_object, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                if pev_slot_opt is pev_address:
+                                    pev_enum_llvm: LLVMTypeRef = llvm_type_of(pev_receiver, structs, ctx)
+                                    pev_payload_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, pev_enum_llvm, pev_address, 1, "enum.payload.ptr")
+                                    pev_value: mutable LLVMValueRef = zeroed
+                                    if structs.penum_field_type_count[pev_slot_index] > 1.usize():
+                                        pev_tuple: LLVMTypeRef = penum_field_tuple_type(pev_slot_index, structs, ctx)
+                                        pev_loaded: LLVMValueRef = LLVMBuildLoad2(builder, pev_tuple, pev_payload_ptr, "enum.payload")
+                                        pev_value <- LLVMBuildExtractValue(builder, pev_loaded, pev_match_offset.u32(), "enum.payload.field")
+                                    else:
+                                        pev_value <- LLVMBuildLoad2(builder, llvm_type_of(pev_field_type, structs, ctx), pev_payload_ptr, "enum.payload.field")
+                                    return emit_conversion(pev_value, pev_field_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != pev_field_type.kind or expected.bits != pev_field_type.bits) else pev_value
+                _:
+                    pass
+            match expression:
+                Expr.Field(darray_object, darray_field, darray_field_line):
+                    if true:
+                        darray_type: mutable ValueType = darray_type_behind_expr(darray_object, local_scope, structs)
+                        # The ordinary expression typer already resolves a darray field through
+                        # references and generic-struct bindings. Use it as a fallback for the
+                        # header accessor too; this keeps `map.entries.count` aligned with the
+                        # working `map.entries.reserve()` path.
+                        darray_type <- expression_type(darray_object, local_scope, fns, structs, generics) if darray_type.kind != TypeKind.DArray
+                        # `darray_read_slot`, not `darray_address_of_expr`: a header read also has
+                        # to work on a CALL RESULT (`easm_parse_params(line).count`), which has no
+                        # address and must be spilled. Reads only — a mutator still needs the real
+                        # address or its write lands in the spilled copy.
+                        if darray_type.kind == TypeKind.DArray and darray_field == "capacity":
+                            if darray_read_slot(darray_object, darray_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is darray_cap_slot:
+                                capacity_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), darray_cap_slot, 2, "darray.capacity.ptr")
+                                return LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), capacity_pointer, "darray.capacity")
+                        if darray_type.kind == TypeKind.DArray and darray_field == "count":
+                            if darray_read_slot(darray_object, darray_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is darray_slot:
+                                count_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), darray_slot, 1, "darray.count.ptr")
+                                return LLVMBuildLoad2(builder, LLVMInt64TypeInContext(ctx), count_pointer, "darray.count")
+                        # `xs.items` — the header's ELEMENT-STORAGE pointer (field 0), which the
+                        # std asserts against null before indexing (`assert s.indices.items != null`).
+                        # Without it the whole assert declined and took its function with it.
+                        if darray_type.kind == TypeKind.DArray and darray_field == "items":
+                            if darray_read_slot(darray_object, darray_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is darray_items_slot:
+                                items_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, darray_llvm_type(structs, ctx), darray_items_slot, 0, "darray.items.ptr")
+                                return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), items_pointer, "darray.items")
+
+                _:
+                    pass
+            # `s.len` on a CSTR — a bare pointer has no length field, so stage0 CALLS
+            # `ctx_strlen(s)`. Emitted like the `s[i]` -> `ctx_string_index` lowering
+            # alongside it: the pointer is passed by value and the result is an i64.
+            match expression:
+                Expr.Field(cstr_len_object, cstr_len_field, cstr_len_line):
+                    if cstr_len_field == "len" and expression_type(cstr_len_object, local_scope, fns, structs, generics).kind == TypeKind.CStr:
+                        cstr_len_recv_type: ValueType = ValueType{kind: TypeKind.CStr, bits: 0}
+                        if emit_expression(cstr_len_object, cstr_len_recv_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is cstr_len_recv:
+                            cstr_len_param_types: mutable darray[LLVMTypeRef] = [LLVMPointerTypeInContext(ctx, 0)]
+                            cstr_len_param_pointer: void& = (&cstr_len_param_types[0]).cast[void&] can Unsafe.PointerCast
+                            cstr_len_fn_type: LLVMTypeRef = LLVMFunctionType(LLVMInt64TypeInContext(ctx), cstr_len_param_pointer, 1, 0)
+                            cstr_len_fn: LLVMValueRef = declare_or_get_named(m, "ctx_strlen", cstr_len_fn_type)
+                            cstr_len_args: mutable darray[LLVMValueRef] = [cstr_len_recv]
+                            cstr_len_args_pointer: void& = (&cstr_len_args[0]).cast[void&] can Unsafe.PointerCast
+                            cstr_len_value: LLVMValueRef = LLVMBuildCall2(builder, cstr_len_fn_type, cstr_len_fn, cstr_len_args_pointer, 1, "cstr.len")
+                            cstr_len_result: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                            return emit_conversion(cstr_len_value, cstr_len_result, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != cstr_len_result.kind or expected.bits != cstr_len_result.bits) else cstr_len_value
+                        return null
+                _:
+                    pass
+            # `s.len` on an sview — field 1 of `{ptr, i64}`. (stage0 exposes `.len`, not
+            # `.count`, on a string view.)
+            match expression:
+                Expr.Field(sview_object, sview_field, sview_field_line):
+                    sview_recv_type: ValueType = expression_type(sview_object, local_scope, fns, structs, generics)
+                    if sview_recv_type.kind == TypeKind.SView and (sview_field == "data" or sview_field == "len"):
+                        if emit_expression(sview_object, sview_recv_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sview_value:
+                            if sview_field == "data":
+                                return LLVMBuildExtractValue(builder, sview_value, 0, "sview.data")
+                            return LLVMBuildExtractValue(builder, sview_value, 1, "sview.len")
+                _:
+                    pass
+            handled <- false
+            return null
+
