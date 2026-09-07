@@ -42,7 +42,6 @@ compare() {
 
 # Single-file corpus fixtures: the "no @test matched" path.
 for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa; do
-    grep -q '^[[:space:]]*include "' "$src" && continue
     compare "$(basename "$src" .elisa)" "$src"
 done
 
