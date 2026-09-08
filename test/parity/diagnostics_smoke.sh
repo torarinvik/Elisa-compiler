@@ -188,6 +188,7 @@ NAMES=(
     local_view_escape
     array_literal_element_return
     array_literal_element_void_return
+    try_propagation_module_scope
 )
 EXPECTS=(
     "comparison is always vacuous for u8"
@@ -342,6 +343,7 @@ EXPECTS=(
     "view of local \"scratch\" escapes via return; the array dies at scope exit"
     "array literal element expects i64, got static u8"
     "array literal element expects void, got int"
+    "cannot propagate AErr from a function returning BErr"
 )
 
 total=0

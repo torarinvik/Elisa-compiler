@@ -1,13 +1,60 @@
 extend Semantic:
     private:
-        def callable_returns_error(annotations: darray[Ast::EnumAnnotation]&, name: sview, lexical_module_id: u32 = 0) -> bool:
+        # The module a fallible function was declared in, keyed by the declaration's byte
+        # offset (the same key the destination side already uses).
+        # Matched by OFFSET when both sides carry one and by LINE otherwise — the same rule
+        # the destination (`__error_set_family`) lookup uses. Offset alone silently missed
+        # every enclosing function the symbol table recorded without one.
+        def fallible_fn_module(annotations: darray[Ast::EnumAnnotation]&, declaration_offset: u32, declaration_line: u32) -> sview:
+            for module_annotation in annotations |declaration_offset, declaration_line|:
+                if module_annotation.owner == "__fn_module":
+                    matched: bool = module_annotation.offset == declaration_offset if declaration_offset != 0 and module_annotation.offset != 0 else module_annotation.line == declaration_line
+                    module_annotation.name return if matched
+            return ""
+
+        # The LAST `::` segment of a module path (`WasmBrowser::Delivery` -> `Delivery`), so a
+        # qualified call's written qualifier can be compared without rebuilding the spelling.
+        def module_last_segment(module_name: sview) -> sview:
+            can Abort.Panic:
+                cut: mutable usize = 0
+                start: mutable usize = 0
+                while cut + 1.usize() < sview_len(module_name) |cut, start|:
+                    start <- cut + 2.usize() if sview_at(module_name, cut) == 58 and sview_at(module_name, cut + 1.usize()) == 58
+                    cut <- cut + 1.usize()
+                return module_name[start:sview_len(module_name)]
+
+        # Does this candidate row belong to the module the call resolves to? An explicit
+        # qualifier (`Mods::B::step`) names it; a bare call means the ENCLOSING module.
+        def callable_row_in_scope(annotations: darray[Ast::EnumAnnotation]&, declaration_offset: u32, declaration_line: u32, enclosing_module: sview, callee_qualifier: sview) -> bool:
+            can Abort.Panic:
+                candidate_module: sview = fallible_fn_module(annotations, declaration_offset, declaration_line)
+                return module_last_segment(candidate_module) == callee_qualifier if callee_qualifier != ""
+                return candidate_module == enclosing_module
+
+        # Two modules may each declare `step`. Matching by NAME alone returned whichever was
+        # parsed first, so `WasmBrowser::Permissions::probe` was told its own `step` propagated
+        # `DeliveryTransitionError`. Prefer the row whose module the call actually resolves to,
+        # and fall back to the first match when no provenance was recorded (extern callables).
+        def callable_returns_error(annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview) -> bool:
+            for scoped_annotation in annotations |name, enclosing_module, callee_qualifier, annotations|:
+                if scoped_annotation.owner == name and scoped_annotation.name == "__error_return":
+                    true return if callable_row_in_scope(annotations, scoped_annotation.offset, scoped_annotation.line, enclosing_module, callee_qualifier)
             for annotation in annotations:
-                true return if annotation.owner == name and annotation.name == "__error_return" and annotation.identity_id == lexical_module_id
+                true return if annotation.owner == name and annotation.name == "__error_return"
             return false
 
-        def callable_error_family(annotations: darray[Ast::EnumAnnotation]&, name: sview, lexical_module_id: u32 = 0) -> sview:
+        def callable_error_family(annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview) -> sview:
+            for scoped_annotation in annotations |name, enclosing_module, callee_qualifier, annotations|:
+                if scoped_annotation.owner == name and scoped_annotation.name != "__error_return" and scoped_annotation.name != "__export_array":
+                    scoped_annotation.name return if callable_row_in_scope(annotations, scoped_annotation.offset, scoped_annotation.line, enclosing_module, callee_qualifier)
             for annotation in annotations:
-                annotation.name return if annotation.owner == name and annotation.name != "__error_return" and annotation.name != "__export_array" and annotation.identity_id == lexical_module_id
+                annotation.name return if annotation.owner == name and annotation.name != "__error_return" and annotation.name != "__export_array"
+            return ""
+
+        # The module qualifier written at a `try` call site, "" for a bare call.
+        def try_callee_qualifier(annotations: darray[Ast::EnumAnnotation]&, try_offset: u32) -> sview:
+            for qualifier_annotation in annotations:
+                qualifier_annotation.name return if qualifier_annotation.owner == "__try_callee_module" and qualifier_annotation.offset == try_offset
             return ""
 
         # The function enclosing a `try`: by BYTE OFFSET when both sides carry one — lines
@@ -39,9 +86,11 @@ extend Semantic:
 
         def check_try_propagation_row(annotation: Ast::EnumAnnotation&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                source: sview = callable_error_family(annotations, annotation.owner, annotation.identity_id)
-                return if source == ""
                 enclosing: (line: u32, offset: u32) = enclosing_try_function(table, annotation.line, annotation.offset)
+                enclosing_module: sview = fallible_fn_module(annotations, enclosing.offset, enclosing.line)
+                callee_qualifier: sview = try_callee_qualifier(annotations, annotation.offset)
+                source: sview = callable_error_family(annotations, annotation.owner, enclosing_module, callee_qualifier)
+                return if source == ""
                 function_line: u32 = enclosing.line
                 destinations: mutable darray[sview] = []
                 destinations.extend([destination_row.name for destination_row in annotations if destination_row.owner == "__error_set_family" and (destination_row.offset == enclosing.offset if enclosing.offset != 0 and destination_row.offset != 0 else destination_row.line == function_line)])
@@ -61,15 +110,20 @@ extend Semantic:
 
         def check_try_fallible_rows(annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for annotation in annotations |table|:
+                for annotation in annotations |table, annotations|:
+                    # Resolve the callee ONCE per row: which module the call lands in decides
+                    # both whether it is fallible and which family it propagates.
+                    row_enclosing: (line: u32, offset: u32) = enclosing_try_function(table, annotation.line, annotation.offset)
+                    row_module: sview = fallible_fn_module(annotations, row_enclosing.offset, row_enclosing.line)
+                    row_qualifier: sview = try_callee_qualifier(annotations, annotation.offset)
                     # A callee that is not a declared function (a fn-typed parameter or
                     # local, e.g. `try f(x)` with `f: fn(...) -> T error[R]`) may be
                     # fallible through its TYPE — unknowable here, so stay silent.
-                    if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and (annotation.owner == "__noncall" or direct_function_count(table, annotation.owner) > 0) and not callable_returns_error(annotations, annotation.owner, annotation.identity_id):
+                    if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and (annotation.owner == "__noncall" or direct_function_count(table, annotation.owner) > 0) and not callable_returns_error(annotations, annotation.owner, row_module, row_qualifier):
                         return_type_id: u32 = function_return_type_id(table, annotation.owner)
                         reason: sview = "optional" if interned_kind(return_type_id, table) == SemTypeKind.Optional else "nonfallible"
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryRequiresFallible, name: annotation.owner, line: annotation.line, expected: reason, actual: ""})
-                    table <- check_try_propagation_row(annotation, annotations, table) if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and callable_returns_error(annotations, annotation.owner, annotation.identity_id)
+                    table <- check_try_propagation_row(annotation, annotations, table) if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and callable_returns_error(annotations, annotation.owner, row_module, row_qualifier)
 
     public:
         def check_try_fallible(file: Ast::File&, table: lmut SymbolTable) -> void:
