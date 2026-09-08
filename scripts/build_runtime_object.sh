@@ -31,15 +31,41 @@ SRC="$ROOT/elisacore_std/native_runtime_support.elisa"
 # Freshness against the REAL stage0: in the gate STAGE0_BIN is the tools/s0cache wrapper,
 # whose own mtime says nothing about the compiler.
 REAL_STAGE0="${ELISA_S0_REAL:-$STAGE0_BIN}"
-if [[ -s "$OUT" && ! "$SRC" -nt "$OUT" && ! "$BUILD_SCRIPT" -nt "$OUT" && ! "$REAL_STAGE0" -nt "$OUT" && "${ELISA_RUNTIME_FORCE:-0}" != 1 ]]; then
-  exit 0
+if command -v sha256sum >/dev/null 2>&1; then
+  HASH_COMMAND=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+  HASH_COMMAND=(shasum -a 256)
+else
+  echo "missing SHA-256 tool (sha256sum or shasum)" >&2
+  exit 2
+fi
+runtime_input_digest() {
+  # Conservatively cover the entire runtime source tree, including interfaces.
+  # Content and path hashing detects edited, added, deleted, and backdated
+  # includes; the tiny entrypoint's mtime cannot establish runtime freshness.
+  {
+    find "$ROOT/elisacore_std" -type f \( -name '*.elisa' -o -name '*.elisai' \) \
+      -exec "${HASH_COMMAND[@]}" {} + || return
+    "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$STAGE0_BIN" "$REAL_STAGE0" "$ELISA_CLANG_TOOL" || return
+  } | LC_ALL=C sort | "${HASH_COMMAND[@]}" | awk '{print $1}'
+}
+runtime_object_digest() {
+  "${HASH_COMMAND[@]}" < "$1" | awk '{print $1}'
+}
+INPUT_DIGEST="$(runtime_input_digest)"
+STAMP="$OUT.inputs.sha256"
+if [[ -s "$OUT" && -f "$STAMP" && "${ELISA_RUNTIME_FORCE:-0}" != 1 ]]; then
+  if [[ "$(< "$STAMP")" == "$INPUT_DIGEST $(runtime_object_digest "$OUT")" ]]; then
+    exit 0
+  fi
 fi
 TMP="$OUT.$$.tmp"
 RUNTIME_TMP="$OUT.runtime.$$.tmp"
 HOOK_SOURCE="$OUT.hooks.$$.c"
 HOOK_OBJECT="$OUT.hooks.$$.o"
+STAMP_TMP="$STAMP.$$.tmp"
 cleanup_runtime_build() {
-  rm -f "$TMP" "$RUNTIME_TMP" "$HOOK_SOURCE" "$HOOK_OBJECT"
+  rm -f "$TMP" "$RUNTIME_TMP" "$HOOK_SOURCE" "$HOOK_OBJECT" "$STAMP_TMP"
 }
 trap cleanup_runtime_build EXIT
 "$STAGE0_BIN" -emit obj -O0 -o "$RUNTIME_TMP" "$SRC"
@@ -56,5 +82,11 @@ printf '%s\n' \
   '}' >"$HOOK_SOURCE"
 "$ELISA_CLANG_TOOL" -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
 "$ELISA_CLANG_TOOL" -r -o "$TMP" "$RUNTIME_TMP" "$HOOK_OBJECT"
+if [[ "$INPUT_DIGEST" != "$(runtime_input_digest)" ]]; then
+  echo "runtime inputs changed during build; keeping the previous runtime object" >&2
+  exit 2
+fi
+printf '%s %s\n' "$INPUT_DIGEST" "$(runtime_object_digest "$TMP")" > "$STAMP_TMP"
 mv -f "$TMP" "$OUT"
+mv -f "$STAMP_TMP" "$STAMP"
 echo "wrote $OUT"
