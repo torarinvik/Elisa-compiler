@@ -42,6 +42,21 @@ explicit list of *decisions*:
 If one of these is ever wanted, it is a NEW feature with its own justification — not a parity
 debt.
 
+## Opt-in frame-pointer retention
+
+`-fno-omit-frame-pointer` adds LLVM's `"frame-pointer"="all"` policy to emitted
+function bodies, including generated helpers and EASM bodies. It does not add
+attributes to external declarations, enable trace callbacks, or change the
+default build policy. `-fomit-frame-pointer` restores the default policy; the
+last explicit option wins. The internal process setting is
+`ELISA_STAGE1_KEEP_FRAME_POINTER=1` (only the exact value `1` enables it).
+
+This is a prerequisite for native profiler experiments, not a guarantee of
+complete source-level stacks: inlining, tail calls, foreign code and externally
+linked runtime objects still require separate unwind/attribution handling.
+The profiler integration gate verifies the policy and executable answers at
+O0–O3, plus actual ARM64 main-function frame setup on macOS.
+
 ## Optimisation levels and `-emit llvm` — in scope and honoured (2026-08-03)
 
 `-O1`, `-O2` and `-O3` run LLVM's `default<O{n}>` pass pipeline in the driver; `-O0`
