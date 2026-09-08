@@ -5,7 +5,7 @@
 # Sourced by elisac_stage1.sh, which owns ROOT/BIN and the toolchain variables this reads.
 
 seed_build() {
-  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object
+  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_profile_hook_source
   # A newly-created Git worktree has no ignored build directory yet. Create the
   # local output roots before taking the per-worktree lock; otherwise `mkdir`
   # cannot create the nested lock path and every first seed fails as if a stale
@@ -84,14 +84,19 @@ seed_build() {
   # seed is still running. Keeping the temporary name private also makes an RSS-guarded
   # termination recoverable without leaving a misleading apparently-valid artifact.
   seed_object="$ROOT/build/elisac_stage1.o.tmp.$$"
+  seed_profile_hook_source="$ROOT/build/elisac_stage1_profile_hooks.tmp.$$.c"
   ELISA_SEED_OUTPUT="$seed_output"
   ELISA_SEED_OBJECT="$seed_object"
+  ELISA_SEED_PROFILE_HOOK_SOURCE="$seed_profile_hook_source"
   cleanup_seed_lock() {
     if [[ -n "${ELISA_SEED_OUTPUT:-}" ]]; then
       rm -f "$ELISA_SEED_OUTPUT"
     fi
     if [[ -n "${ELISA_SEED_OBJECT:-}" ]]; then
       rm -f "$ELISA_SEED_OBJECT"
+    fi
+    if [[ -n "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}" ]]; then
+      rm -f "$ELISA_SEED_PROFILE_HOOK_SOURCE"
     fi
     rm -f "$ELISA_SEED_LOCK_DIR/pid"
     rmdir "$ELISA_SEED_LOCK_DIR" 2>/dev/null || true
@@ -172,9 +177,21 @@ seed_build() {
   # the compiler itself and are provided only when linking an executable/runtime
   # consumer.  Dead-strip those sections here, matching the other self-host
   # product links, instead of requiring unrelated host runtime symbols.
-  "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$seed_output" "$seed_object" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
+  printf '%s\n' \
+    '#include <stddef.h>' \
+    '#include <stdint.h>' \
+    '#if defined(__GNUC__) || defined(__clang__)' \
+    '#define ELISA_WEAK __attribute__((weak))' \
+    '#else' \
+    '#define ELISA_WEAK' \
+    '#endif' \
+    'ELISA_WEAK void elisa_profile_allocation_event(uint32_t kind, uintptr_t address, size_t size, uintptr_t old_address, size_t old_size, uintptr_t arena, size_t region) {' \
+    '  (void)kind; (void)address; (void)size; (void)old_address; (void)old_size; (void)arena; (void)region;' \
+    '}' >"$seed_profile_hook_source"
+  "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
   mv -f "$seed_output" "$BIN"
   mv -f "$seed_object" "$ROOT/build/elisac_stage1.o"
   ELISA_SEED_OUTPUT=""
+  ELISA_SEED_PROFILE_HOOK_SOURCE=""
   echo "seed: wrote $BIN" >&2
 }
