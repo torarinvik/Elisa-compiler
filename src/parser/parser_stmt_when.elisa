@@ -103,6 +103,38 @@ extend Parser:
             rebind arms: darray[Ast::MatchArm], parser = parser.parse_when_arms(expected_columns)
             return (Ast::Expr.Match(scrutinee, arms, Ast::pos_of_token(when_token)))
 
+        # A string/char literal token's `start`/`length` cover its CONTENT, so the source
+        # extent is one column wider at each end. Without this an arm span read `u8", _`.
+        def when_token_start(token: Token&) -> usize:
+            return token.start.usize() - 1.usize() if token.kind == TokenKind.StringLit or token.kind == TokenKind.CharLit
+            return token.start.usize()
+
+        def when_token_end(token: Token&) -> usize:
+            return token.start.usize() + token.length.usize() + 1.usize() if token.kind == TokenKind.StringLit or token.kind == TokenKind.CharLit
+            return token.start.usize() + token.length.usize()
+
+        # The line of the FIRST `_` default row, or 0 when the table has none. Read here
+        # rather than carried in a machine state: an indexed read of a darray inside an arm
+        # does not observe the arm's own index reliably (it returned the NEXT row's line).
+        def when_first_default_line(patterns: darray[Ast::Pattern], lines: darray[u32]) -> u32:
+            for index in 0..<patterns.count:
+                return lines[index] if when_pattern_full_wild(patterns[index])
+            return 0
+
+        # The source spelling of one `when` row's pattern columns: from the row's first
+        # token up to (not including) its `->`. stage0 quotes exactly this inside `arm (...)`.
+        def when_row_span(parser: Parser&, head_index: usize) -> sview:
+            index: mutable usize = head_index
+            depth: mutable int = 0
+            while index < parser.tokens.count |index, depth|:
+                kind: TokenKind = parser.tokens[index].kind
+                break if depth == 0 and (kind == TokenKind.Newline or kind == TokenKind.Eof or kind == TokenKind.Dedent)
+                return parser.span_view(when_token_start(parser.tokens[head_index]), when_token_end(parser.tokens[index - 1])) if depth == 0 and kind == TokenKind.Arrow and index > head_index
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace
+                depth <- depth - 1 if depth > 0 and (kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace)
+                index <- index + 1.usize()
+            return ""
+
         # `: NEWLINE INDENT (ROW)* DEDENT`, each ROW a `PATTERN-COLUMNS -> BODY` arm.
         # The `_` default row is emitted LAST (order-independence: a mid-table default
         # must not shadow later arms under match's first-wins), matching stage0.
@@ -116,15 +148,28 @@ extend Parser:
             # docs/125 §4 R1: every row's pattern + head token, in source order, for the
             # stage1-owned disjointness check once the whole table is parsed.
             check_patterns: mutable darray[Ast::Pattern] = []
-            check_tokens: mutable darray[Token] = []
-            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, arms, defaults, check_patterns, check_tokens|:
+            # Row head INDICES (to anchor an error at a row) and each row's LINE, which
+            # stage0's overlap sentence NAMES. Both are recorded here rather than recovered
+            # later, because after the table is parsed the cursor no longer stands on any row.
+            check_heads: mutable darray[usize] = []
+            check_lines: mutable darray[u32] = []
+            # Each row's pattern columns AS WRITTEN — stage0's overlap sentence quotes them.
+            check_spans: mutable darray[sview] = []
+            while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof |parser, arms, defaults, check_patterns, check_heads, check_lines, check_spans|:
                 parser <- parser.skip_newlines()
                 break if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof
 
-                row_head: Token = parser.cursor()
+                row_head_index: usize = parser.position
+                row_head_token: Token = parser.tokens[row_head_index]
+                # A BUFFER line. The renderer maps it to a source line before printing it --
+                # a raw one reads a line off the file whenever includes were expanded.
+                row_head_line: u32 = row_head_token.line
+                row_span: sview = parser.when_row_span(row_head_index)
                 rebind arm: Ast::MatchArm, parser = parser.parse_when_row()
                 check_patterns.push(arm.pattern)
-                check_tokens.push(row_head)
+                check_heads.push(row_head_index)
+                check_lines.push(row_head_line)
+                check_spans.push(row_span)
                 # A MULTI-COLUMN default is `_, _`, which is a Tuple of wildcards — not a bare
                 # `Pattern.Wildcard`. Testing only for the bare form left a mid-table `_, _`
                 # row in place instead of moving it last, so the later specific rows became
@@ -133,7 +178,7 @@ extend Parser:
                 # stage0 answers 33. A silent wrong answer, and one no fixture had.
                 is_default: bool = when_pattern_full_wild(arm.pattern)
                 actual_columns: usize = when_pattern_column_count(arm.pattern)
-                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, row_head) if not is_default and actual_columns != expected_columns
+                parser <- parser.error_named_at(Ast::ParseErrorKind.WhenColumnCount, row_head_index, "", "", actual_columns.u32(), expected_columns.u32()) if not is_default and actual_columns != expected_columns
                 defaults.push(arm) if is_default
                 # Stage0 fans a single-column `A | B` row out into sibling match
                 # arms.  Multi-column rows retain the per-column Or because the
@@ -146,7 +191,7 @@ extend Parser:
                             arms.push(arm)
             parser, _ <- parser.expect(TokenKind.Dedent)
 
-            parser <- parser.check_when_disjoint(check_patterns, check_tokens)
+            parser <- parser.check_when_disjoint(check_patterns, check_heads, check_lines, check_spans)
 
             arms.extend(defaults)
             return arms
@@ -569,53 +614,20 @@ extend Parser:
 
         # Report R1: a duplicate `_` default row, and any pair of overlapping non-default
         # rows. Errors anchor at the offending (later) row's head token.
-        def check_when_disjoint(parser: lmut Parser, patterns: darray[Ast::Pattern], tokens: darray[Token]) -> void:
-            saved_position: usize = parser.position
-            machine over parser.position while true:
-                state Scan(index: usize, default_seen: bool)
-                start Scan(0, false)
+        def check_when_disjoint(parser: lmut Parser, patterns: darray[Ast::Pattern], heads: darray[usize], lines: darray[u32], spans: darray[sview]) -> void:
+            first_default_line: u32 = when_first_default_line(patterns, lines)
+            default_seen: mutable bool = false
+            for index in 0..<patterns.count |parser, default_seen|:
+                is_default: bool = when_pattern_full_wild(patterns[index])
+                parser <- parser.error_named_at(Ast::ParseErrorKind.WhenDuplicateDefaultRow, heads[index], "", "", first_default_line, 0) if is_default and default_seen
+                default_seen <- true if is_default
+            for row in 0..<patterns.count |parser|:
+                parser <- parser.check_when_overlap_row(patterns, heads, lines, spans, row) if not when_pattern_full_wild(patterns[row])
 
-                Scan(index, _), _ if index >= patterns.count:
-                    break
-
-                Scan(index, true), _ if when_pattern_full_wild(patterns[index]):
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, tokens[index])
-                    parser.position <- saved_position + index + 1
-                    -> Scan(index + 1, true)
-
-                Scan(index, false), _ if when_pattern_full_wild(patterns[index]):
-                    parser.position <- saved_position + index + 1
-                    -> Scan(index + 1, true)
-
-                Scan(index, default_seen), _:
-                    parser.position <- saved_position + index + 1
-                    -> Scan(index + 1, default_seen)
-            parser.position <- saved_position
-            machine over parser.position while true:
-                state Scan(index: usize)
-                start Scan(0)
-
-                Scan(index), _ if index >= patterns.count:
-                    break
-
-                Scan(index), _ if when_pattern_full_wild(patterns[index]):
-                    -> Scan(index + 1)
-
-                Scan(index), _:
-                    parser <- parser.check_when_overlap_row(patterns, tokens, index)
-                    -> Scan(index + 1)
-
-        def check_when_overlap_row(parser: lmut Parser, patterns: darray[Ast::Pattern], tokens: darray[Token], row: usize) -> void:
-            machine over parser.position while true:
-                state Scan(index: usize)
-                start Scan(row + 1)
-
-                Scan(index), _ if index >= patterns.count:
-                    break
-
-                Scan(index), _ if not when_pattern_full_wild(patterns[index]) and when_patterns_overlap(patterns[row], patterns[index]):
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, tokens[index])
-                    -> Scan(index + 1)
-
-                Scan(index), _:
-                    -> Scan(index + 1)
+        def check_when_overlap_row(parser: lmut Parser, patterns: darray[Ast::Pattern], heads: darray[usize], lines: darray[u32], spans: darray[sview], row: usize) -> void:
+            # stage0's sentence names the EARLIER arm and the line it sits on, so both come
+            # from `row`, never from the arm being tested.
+            row_line: u32 = lines[row]
+            row_span: sview = spans[row]
+            for index in (row + 1)..<patterns.count |parser|:
+                parser <- parser.error_named_at(Ast::ParseErrorKind.WhenArmOverlap, heads[index], spans[index], row_span, row_line, 0) if not when_pattern_full_wild(patterns[index]) and when_patterns_overlap(patterns[row], patterns[index])
