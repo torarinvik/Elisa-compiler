@@ -34,6 +34,13 @@ for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elis
     s0="$(timeout 25 "$ELISACORE_BIN" -emit interpret "$src" </dev/null 2>&1)"; rc0=$?
     [ "$rc0" -ne 0 ] && { skipped=$((skipped + 1)); continue; }
     s1="$(timeout 120 bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit interpret -o /dev/null "$src" 2>&1)"; rc1=$?
+    # A 124 is retried with a wider budget before it is believed (the corpus harness's
+    # rule): on a host running the 800 s native smoke beside this one, a paging stall
+    # fabricates a DIFF for a product that answers in a second when idle. A genuine
+    # runaway expires both budgets and is still reported.
+    if [ "$rc1" -eq 124 ]; then
+        s1="$(timeout 300 bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit interpret -o /dev/null "$src" 2>&1)"; rc1=$?
+    fi
     if [ "$s0" == "$s1" ] && [ "$rc0" == "$rc1" ]; then
         same=$((same + 1)); continue
     fi
