@@ -16,7 +16,7 @@ extend FmtUnparse:
                 for fmt_ar_probe in fmt_ar_range.start..<fmt_ar_range.stop |tokens, source|:
                     if tokens[fmt_ar_probe].kind == Lexer::TokenKind.Ident:
                         false return if Lexer::text_or_empty(tokens[fmt_ar_probe], source) == "Arena"
-                return fmt_declares_regionless_container(statements, tokens)
+                return fmt_declares_regionless_container(statements, tokens, true)
 
 
 
@@ -62,12 +62,23 @@ extend FmtUnparse:
         # side table the decl walker does not carry, and a global `darray` side channel
         # for them bus-errors (a container value in a global is the arena-identity
         # hazard); the `@` is on the declaration LINE either way.
-        def fmt_declares_regionless_container(statements: darray[Ast::Stmt], tokens: darray[Lexer::Token]&) -> bool:
+        #
+        # PLACEMENT (MEASURED 2026-09-08, one-feature probes): a container declared DIRECTLY
+        # in a for/while body wraps THAT LOOP BODY (`for d in …:` / `with arena __auto_N as :`,
+        # N = the body's first statement) and not the function; one under an `if` inside the
+        # loop wraps the FUNCTION; nested loops wrap the innermost; an explicit `region r(…):`
+        # block is never re-wrapped. `direct` is false for a loop body's own statements —
+        # those are the loop's business — and true again inside any nested `if`.
+        def fmt_declares_regionless_container(statements: darray[Ast::Stmt], tokens: darray[Lexer::Token]&, direct: bool) -> bool:
             can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
-                for fmt_rc_statement in statements |tokens, statements|:
+                for fmt_rc_statement in statements |tokens, statements, direct|:
                     match fmt_rc_statement:
                         Stmt.VarDecl(fmt_rc_name, fmt_rc_type, fmt_rc_value, fmt_rc_line):
-                            if emit_ast_expr_head_is_container(fmt_rc_type) and fmt_value_is_allocating_literal(fmt_rc_value):
+                            continue if not direct
+                            # A set/dict LITERAL local always wraps (`s: set[i64] = {}`, `{2, 4}`,
+                            # `d: dict[i64, i64] = {1: 2}` — MEASURED 2026-09-08, forwarded or not).
+                            fmt_rc_set_or_dict: bool = (fmt_rc_value is Expr.SetLit(_, _)) or (fmt_rc_value is Expr.DictLit(_, _))
+                            if emit_ast_expr_head_is_container(fmt_rc_type) and (fmt_value_is_allocating_literal(fmt_rc_value) or fmt_rc_set_or_dict):
                                 # A container REFERENCE binding (`h: darray[u32]& = f(s)`)
                                 # allocates nothing — stage0 does not wrap for it. The `&`
                                 # lives in the line's type span, not the head expr.
@@ -90,22 +101,79 @@ extend FmtUnparse:
                                     if fmt_rc_callee is Expr.Ident(fmt_rc_callee_name, _):
                                         if fmt_ident_is_capitalized(fmt_rc_callee_name):
                                             true return if fmt_body_forwards_local(statements, fmt_rc_name)
+                                    # A module-qualified constructor (`w: M::W = M::W(4)` then
+                                    # `M::bump(&w, 2)`) is the same rule on the LAST segment.
+                                    if fmt_rc_callee is Expr.Scope(_, fmt_rc_scope_name, _):
+                                        if fmt_ident_is_capitalized(fmt_rc_scope_name):
+                                            true return if fmt_body_forwards_local(statements, fmt_rc_name)
+                                    if fmt_rc_callee is Expr.Field(_, fmt_rc_field_name, _):
+                                        if fmt_ident_is_capitalized(fmt_rc_field_name):
+                                            true return if fmt_body_forwards_local(statements, fmt_rc_name)
                                 _:
                                     pass
                         Stmt.If(_, fmt_rc_then, fmt_rc_else, _):
-                            true return if fmt_declares_regionless_container(fmt_rc_then, tokens)
-                            true return if fmt_declares_regionless_container(fmt_rc_else, tokens)
+                            true return if fmt_declares_regionless_container(fmt_rc_then, tokens, true)
+                            true return if fmt_declares_regionless_container(fmt_rc_else, tokens, true)
                         Stmt.While(_, fmt_rc_wbody, _):
-                            true return if fmt_declares_regionless_container(fmt_rc_wbody, tokens)
+                            true return if fmt_declares_regionless_container(fmt_rc_wbody, tokens, false)
                         Stmt.For(_, _, _, fmt_rc_fbody, _):
-                            true return if fmt_declares_regionless_container(fmt_rc_fbody, tokens)
-                        Stmt.Block(_, _, _, fmt_rc_bbody, _):
-                            true return if fmt_declares_regionless_container(fmt_rc_bbody, tokens)
+                            true return if fmt_declares_regionless_container(fmt_rc_fbody, tokens, false)
+                        Stmt.Block(fmt_rc_bkind, _, _, fmt_rc_bbody, _):
+                            continue if fmt_rc_bkind == "region"
+                            true return if fmt_declares_regionless_container(fmt_rc_bbody, tokens, direct)
                         _:
                             pass
                 return false
 
 
+
+        # A LOOP BODY wraps itself when one of its own statements (through a non-region
+        # block, not through an `if`) declares a region-less container; see the placement
+        # note on fmt_declares_regionless_container.
+        def fmt_loop_body_needs_auto_region(body: darray[Ast::Stmt], tokens: darray[Lexer::Token]&) -> bool:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                for fmt_lb_statement in body |tokens, body|:
+                    match fmt_lb_statement:
+                        Stmt.VarDecl(_, _, _, _):
+                            fmt_lb_one: darray[Ast::Stmt] = [fmt_lb_statement]
+                            # forwarding is judged against the whole body, so re-check with it
+                            true return if fmt_declares_regionless_container(fmt_lb_one, tokens, true) or fmt_loop_vardecl_forwarded(fmt_lb_statement, body, tokens)
+                        Stmt.Block(fmt_lb_kind, _, _, fmt_lb_body, _):
+                            continue if fmt_lb_kind == "region"
+                            true return if fmt_loop_body_needs_auto_region(fmt_lb_body, tokens)
+                        _:
+                            pass
+                return false
+
+        # The constructed-local-forwarded half of the VarDecl rule, judged against BODY.
+        def fmt_loop_vardecl_forwarded(statement: Ast::Stmt, body: darray[Ast::Stmt], tokens: darray[Lexer::Token]&) -> bool:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                if statement is Stmt.VarDecl(fmt_lv_name, _, fmt_lv_value, _):
+                    match fmt_lv_value:
+                        Expr.Construct(_, _, _):
+                            return fmt_body_forwards_local(body, fmt_lv_name)
+                        Expr.Call(fmt_lv_callee, _, _, _):
+                            if fmt_lv_callee is Expr.Ident(fmt_lv_n, _):
+                                return fmt_body_forwards_local(body, fmt_lv_name) if fmt_ident_is_capitalized(fmt_lv_n) else false
+                            if fmt_lv_callee is Expr.Scope(_, fmt_lv_s, _):
+                                return fmt_body_forwards_local(body, fmt_lv_name) if fmt_ident_is_capitalized(fmt_lv_s) else false
+                            if fmt_lv_callee is Expr.Field(_, fmt_lv_f, _):
+                                return fmt_body_forwards_local(body, fmt_lv_name) if fmt_ident_is_capitalized(fmt_lv_f) else false
+                        _:
+                            pass
+                return false
+
+        # Print BODY as a loop body, wrapped in stage0's per-iteration region when it needs one.
+        def fmt_loop_body(buffer: mutable darray[u8]&, body: darray[Ast::Stmt], indent: i64, tokens: darray[Lexer::Token]&, source: u8&) -> void:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+                if body.count > 0 and fmt_loop_body_needs_auto_region(body, tokens):
+                    fmt_indent(buffer, indent)
+                    fmt_push(buffer, "with arena __auto_")
+                    fmt_push_decimal(buffer, fmt_auto_region_number(fmt_stmt_source_line(body[0]), fmt_stmt_source_offset(body[0]), tokens))
+                    fmt_push(buffer, " as :\n")
+                    fmt_stmts(buffer, body, indent + 4, tokens, source)
+                    return
+                fmt_stmts(buffer, body, indent, tokens, source)
 
         # Does any statement in the list pass NAME (bare or by `&`) as a call argument?
         def fmt_body_forwards_local(statements: darray[Ast::Stmt], name: sview) -> bool:
@@ -163,8 +231,13 @@ extend FmtUnparse:
                             match fmt_fn_inner:
                                 Expr.Ident(fmt_fn_in, _):
                                     true return if fmt_fn_in == name
+                                Expr.Call(_, _, _, _) | Expr.Paren(_, _):
+                                    # `add(sum(v), 1)` forwards v (MEASURED 2026-09-08).
+                                    true return if fmt_expr_forwards_name(fmt_fn_inner, name)
                                 _:
                                     pass
+                    Expr.Paren(fmt_fn_paren_inner, _):
+                        return fmt_expr_forwards_name(fmt_fn_paren_inner, name)
                     _:
                         pass
                 return false
