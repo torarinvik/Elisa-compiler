@@ -12,9 +12,14 @@ BUILD_SCRIPT="$ROOT/scripts/build_runtime_object.sh"
 ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
 STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 OUT="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+ELISA_CLANG_TOOL="${ELISA_CLANG:-$(command -v clang || true)}"
 
 [[ -x "$STAGE0_BIN" ]] || {
   echo "missing stage0 compiler: $STAGE0_BIN" >&2
+  exit 2
+}
+[[ -x "$ELISA_CLANG_TOOL" ]] || {
+  echo "missing clang for profiler hook fallback: $ELISA_CLANG_TOOL" >&2
   exit 2
 }
 mkdir -p "$(dirname "$OUT")"
@@ -30,6 +35,26 @@ if [[ -s "$OUT" && ! "$SRC" -nt "$OUT" && ! "$BUILD_SCRIPT" -nt "$OUT" && ! "$RE
   exit 0
 fi
 TMP="$OUT.$$.tmp"
-"$STAGE0_BIN" -emit obj -O0 -o "$TMP" "$SRC" || { rm -f "$TMP"; exit 1; }
+RUNTIME_TMP="$OUT.runtime.$$.tmp"
+HOOK_SOURCE="$OUT.hooks.$$.c"
+HOOK_OBJECT="$OUT.hooks.$$.o"
+cleanup_runtime_build() {
+  rm -f "$TMP" "$RUNTIME_TMP" "$HOOK_SOURCE" "$HOOK_OBJECT"
+}
+trap cleanup_runtime_build EXIT
+"$STAGE0_BIN" -emit obj -O0 -o "$RUNTIME_TMP" "$SRC"
+printf '%s\n' \
+  '#include <stddef.h>' \
+  '#include <stdint.h>' \
+  '#if defined(__GNUC__) || defined(__clang__)' \
+  '#define ELISA_WEAK __attribute__((weak))' \
+  '#else' \
+  '#define ELISA_WEAK' \
+  '#endif' \
+  'ELISA_WEAK void elisa_profile_allocation_event(uint32_t kind, uintptr_t address, size_t size, uintptr_t old_address, size_t old_size, uintptr_t arena, size_t region) {' \
+  '  (void)kind; (void)address; (void)size; (void)old_address; (void)old_size; (void)arena; (void)region;' \
+  '}' >"$HOOK_SOURCE"
+"$ELISA_CLANG_TOOL" -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
+"$ELISA_CLANG_TOOL" -r -o "$TMP" "$RUNTIME_TMP" "$HOOK_OBJECT"
 mv -f "$TMP" "$OUT"
 echo "wrote $OUT"
