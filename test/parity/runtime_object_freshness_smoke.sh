@@ -74,6 +74,13 @@ build
 expect_compiles 9
 build
 expect_compiles 9
+for tool in "$ELISACORE_BIN" "$ELISA_CLANG" "$FIXTURE/scripts/build_runtime_object.sh"; do
+  cp -p "$tool" "$WORK/old-tool"
+  printf '\n# backdated tool edit\n' >> "$tool"
+  touch -r "$WORK/old-tool" "$tool"
+  build
+done
+expect_compiles 12
 if find "$WORK/output" -type f ! -name runtime.o ! -name runtime.o.inputs.sha256 | read -r unused; then
   echo 'runtime build leaked temporary files' >&2
   exit 1
