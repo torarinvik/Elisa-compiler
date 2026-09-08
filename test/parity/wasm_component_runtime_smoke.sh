@@ -28,6 +28,10 @@ build_fixture() {
 }
 
 build_fixture \
+    "$ROOT/test/fixtures/wasm/component_const_width.wit" \
+    "$ROOT/test/fixtures/wasm/component_const_width.elisa" \
+    const_width
+build_fixture \
     "$ROOT/test/fixtures/wasm/component_cabi_realloc.wit" \
     "$ROOT/test/fixtures/wasm/component_cabi_realloc.elisa" \
     component
