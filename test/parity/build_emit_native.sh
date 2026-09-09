@@ -17,7 +17,7 @@ mkdir -p "$(dirname -- "$EMIT_NATIVE")"
 _en_fresh=""
 if [[ -x "$EMIT_NATIVE" ]]; then
   _en_fresh=1
-  for _en_src in "$REPO_ROOT/test/breadth/emit_native.elisa" "$ELISACORE_BIN"; do
+  for _en_src in "$REPO_ROOT/test/breadth/emit_native.elisa" "$REPO_ROOT/test/parity/profile_hooks.c" "$ELISACORE_BIN"; do
     [[ -e "$_en_src" && "$_en_src" -nt "$EMIT_NATIVE" ]] && _en_fresh=""
   done
 fi
@@ -25,15 +25,19 @@ if [[ -n "$_en_fresh" ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
-_en_obj="$EMIT_NATIVE.$$.o"; _en_tmp="$EMIT_NATIVE.$$"; _en_log="$EMIT_NATIVE.$$.log"
+_en_obj="$EMIT_NATIVE.$$.o"; _en_hooks="$EMIT_NATIVE.$$.hooks.o"; _en_tmp="$EMIT_NATIVE.$$"; _en_log="$EMIT_NATIVE.$$.log"
 if ! "$ELISACORE_BIN" -emit obj -O2 -o "$_en_obj" "$REPO_ROOT/test/breadth/emit_native.elisa" 2>"$_en_log"; then
   echo "build_emit_native: stage0 could not compile emit_native.elisa" >&2; sed -n '1,10p' "$_en_log" >&2
-  rm -f "$_en_obj" "$_en_log"; return 1 2>/dev/null || exit 1
+  rm -f "$_en_obj" "$_en_hooks" "$_en_log"; return 1 2>/dev/null || exit 1
 fi
 _en_libdir="$("$LLVM_CONFIG" --libdir)"
-if ! clang -o "$_en_tmp" "$_en_obj" -L"$_en_libdir" -lLLVM -Wl,-rpath,"$_en_libdir" 2>"$_en_log"; then
+if ! clang -c -o "$_en_hooks" "$REPO_ROOT/test/parity/profile_hooks.c" 2>"$_en_log"; then
+  echo "build_emit_native: could not compile profile hook fallback" >&2; sed -n '1,10p' "$_en_log" >&2
+  rm -f "$_en_obj" "$_en_hooks" "$_en_log"; return 1 2>/dev/null || exit 1
+fi
+if ! clang -o "$_en_tmp" "$_en_obj" "$_en_hooks" -L"$_en_libdir" -lLLVM -Wl,-rpath,"$_en_libdir" 2>"$_en_log"; then
   echo "build_emit_native: could not link emit_native" >&2; sed -n '1,10p' "$_en_log" >&2
-  rm -f "$_en_obj" "$_en_tmp" "$_en_log"; return 1 2>/dev/null || exit 1
+  rm -f "$_en_obj" "$_en_hooks" "$_en_tmp" "$_en_log"; return 1 2>/dev/null || exit 1
 fi
 mv -f "$_en_tmp" "$EMIT_NATIVE"
-rm -f "$_en_obj" "$_en_log"
+rm -f "$_en_obj" "$_en_hooks" "$_en_log"
