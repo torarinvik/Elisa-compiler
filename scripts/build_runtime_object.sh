@@ -46,7 +46,7 @@ runtime_input_digest() {
   {
     find "$ROOT/elisacore_std" -type f \( -name '*.elisa' -o -name '*.elisai' \) \
       -exec "${HASH_COMMAND[@]}" {} + || return
-    "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$STAGE0_BIN" "$REAL_STAGE0" "$ELISA_CLANG_TOOL" || return
+    "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$STAGE0_BIN" "$REAL_STAGE0" "$ELISA_CLANG_TOOL" || return
   } | LC_ALL=C sort | "${HASH_COMMAND[@]}" | awk '{print $1}'
 }
 runtime_object_digest() {
@@ -69,20 +69,7 @@ cleanup_runtime_build() {
 }
 trap cleanup_runtime_build EXIT
 "$STAGE0_BIN" -emit obj -O0 -o "$RUNTIME_TMP" "$SRC"
-printf '%s\n' \
-  '#include <stddef.h>' \
-  '#include <stdint.h>' \
-  '#if defined(__GNUC__) || defined(__clang__)' \
-  '#define ELISA_WEAK __attribute__((weak))' \
-  '#else' \
-  '#define ELISA_WEAK' \
-  '#endif' \
-  'ELISA_WEAK uint32_t elisa_profile_allocation_negotiate(uint32_t version) { (void)version; return 0; }' \
-  'ELISA_WEAK uint32_t elisa_profile_region_layout_negotiate(uint32_t version) { (void)version; return 0; }' \
-  'ELISA_WEAK void elisa_profile_region_layout_v1(uintptr_t arena, size_t region, uintptr_t header, uintptr_t data, size_t capacity) { (void)arena; (void)region; (void)header; (void)data; (void)capacity; }' \
-  'ELISA_WEAK void elisa_profile_allocation_event_v1(uint32_t kind, uintptr_t address, size_t size, uintptr_t old_address, size_t old_size, uintptr_t arena, size_t region) {' \
-  '  (void)kind; (void)address; (void)size; (void)old_address; (void)old_size; (void)arena; (void)region;' \
-  '}' >"$HOOK_SOURCE"
+bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$HOOK_SOURCE"
 "$ELISA_CLANG_TOOL" -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
 "$ELISA_CLANG_TOOL" -r -o "$TMP" "$RUNTIME_TMP" "$HOOK_OBJECT"
 if [[ "$INPUT_DIGEST" != "$(runtime_input_digest)" ]]; then

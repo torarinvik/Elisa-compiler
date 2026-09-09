@@ -56,7 +56,12 @@ fi
 # it because a darray's backing comes from the Elisa runtime (arena_alloc/realloc/free) —
 # the backend is no longer self-contained once containers are in play. Scalar programs
 # simply do not reference these symbols, so linking it unconditionally is harmless.
-RUNTIME_DIR="$BUILD/runtime"
+# NOT build/runtime: that directory holds the digest-stamped runtime object that
+# build_runtime_object.sh maintains and every downstream project (elisa-ui among them)
+# links against. This extraction used to land there too, so each run of this smoke
+# silently replaced the stamped object with a stage0 c-archive's copy -- a runtime from a
+# different compiler than the product beside it, and one whose stamp no longer matched.
+RUNTIME_DIR="$BUILD/backend_smoke_runtime"
 mkdir -p "$RUNTIME_DIR"
 printf 'def main() -> i64:\n    s: mutable darray[u8] = []\n    s.push(1)\n    return s.count.i64() - 1\n' > "$RUNTIME_DIR/probe.elisa"
 if "$ELISACORE_BIN" -emit c-archive -o "$RUNTIME_DIR/probe.a" "$RUNTIME_DIR/probe.elisa" 2>/dev/null; then
