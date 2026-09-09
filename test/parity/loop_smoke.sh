@@ -77,7 +77,7 @@ EOF
 "$ELISACORE_BIN" -emit header -o "$WORK/loop_smoke.h" "$FIX" >/dev/null
 "$ELISACORE_BIN" -emit obj -permissive -O2 -o "$WORK/loop_smoke.o" "$FIX" >/dev/null
 
-link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/loop_smoke.o" -o "$WORK/run")
+link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/loop_smoke.o" "$REPO_ROOT/test/parity/profile_hooks.c" -o "$WORK/run")
 [[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
 [[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")
 clang "${link_flags[@]}"

@@ -66,7 +66,12 @@ case "$(uname -s)" in
   Darwin) _pr_link_flags=(-Wl,-undefined,dynamic_lookup) ;;
   Linux)  _pr_link_flags=(-no-pie) ;;
 esac
-if ! clang -O2 "${_pr_link_flags[@]}" "$_pr_obj" "$RUNTIME_OBJ" -o "$_pr_tmp" 2>"$REPO_ROOT/build/parse_report.$$.link.err"; then
+# The generated frontend may contain the optional allocation/region profiling ABI even when
+# the reporter itself does not enable profiling.  Keep the fallback in this link so an absent
+# user profiler is a deliberate no-op rather than a null call at the first arena allocation.
+# Pass the C source directly to clang (instead of a shared fixed object) so parallel checks do
+# not race on another build artifact.
+if ! clang -O2 "${_pr_link_flags[@]}" "$_pr_obj" "$RUNTIME_OBJ" "$REPO_ROOT/test/parity/profile_hooks.c" -o "$_pr_tmp" 2>"$REPO_ROOT/build/parse_report.$$.link.err"; then
   cat "$REPO_ROOT/build/parse_report.$$.link.err" >&2
   rm -f "$_pr_obj" "$_pr_tmp" "$REPO_ROOT/build/parse_report.$$.link.err"
   echo "error: failed to link parse_report" >&2
