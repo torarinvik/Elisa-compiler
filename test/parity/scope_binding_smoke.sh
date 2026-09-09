@@ -28,7 +28,8 @@
 # Every compiled binary runs under a timeout: a scope bug can produce a spinning loop
 # rather than a wrong answer, and an untimed gate hangs with it.
 RUN() {
-    if command -v timeout >/dev/null 2>&1; then timeout 10 "$@"; else "$@"; fi
+    local limit="${ELISA_SCOPE_TIMEOUT:-10}"
+    if command -v timeout >/dev/null 2>&1; then timeout "$limit" "$@"; else "$@"; fi
 }
 set -u
 
@@ -41,7 +42,13 @@ RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -x "$STAGE1" ] || { echo "scope_binding_smoke SKIP: no stage1 seed at $STAGE1"; exit 0; }
 [ -f "$RUNTIME_OBJ" ] || { echo "scope_binding_smoke SKIP: no runtime object at $RUNTIME_OBJ"; exit 0; }
 
-WORK="$(mktemp -d)"
+# macOS may reclaim long-running directories below `/tmp` while this suite is
+# compiling 80 cases. Keep the default scratch parent in the ignored build
+# tree so every case sees the same live directory; callers can override it
+# explicitly.
+WORK_ROOT="${ELISA_SCOPE_WORK_ROOT:-$ROOT/build/scope-binding-smoke}"
+mkdir -p "$WORK_ROOT"
+WORK="$(mktemp -d "$WORK_ROOT/elisa-scope-binding.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 pass=0
 fail=0
@@ -49,6 +56,10 @@ fail=0
 # Compile `$2` with BOTH compilers, run both, and require stage1 == stage0 == `$3`.
 differential() {
     local name="$1" src="$2" want="$3"
+    # A host cleanup can remove scratch directories during a long run. Recreate
+    # the exact generated directory before each case so that cannot masquerade
+    # as a stage0/stage1 compiler failure.
+    mkdir -p "$WORK"
     printf '%s' "$src" > "$WORK/$name.elisa"
 
     if ! "$ELISACORE_BIN" -emit obj -o "$WORK/$name.s0.o" "$WORK/$name.elisa" >"$WORK/$name.s0.log" 2>&1; then
