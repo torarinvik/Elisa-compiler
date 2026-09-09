@@ -51,6 +51,19 @@ else
     trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 fi
 
+# Objects that include the Elisa runtime may call the optional profiler hooks even when
+# profiling is disabled.  On Darwin an omitted hook is a null dynamic-lookup target, and a
+# corpus oracle then either fails to link or crashes before it can arbitrate stage1.  Build
+# the same weak hook shim used by the backend smoke tests once in the parent work directory;
+# workers only read this immutable object.
+PROFILE_HOOK_OBJ="$WORK/profile_hooks.o"
+if [[ ! -f "$PROFILE_HOOK_OBJ" ]]; then
+    clang -c -O2 -o "$PROFILE_HOOK_OBJ" "$ROOT/test/parity/profile_hooks.c" || {
+        echo "differential_corpus FAILED: could not compile profiler hooks" >&2
+        exit 2
+    }
+fi
+
 # A program that loops forever is a FAILURE, not a hang: bound every run. Compilation is
 # bounded too — a backend that diverges would otherwise stall the gate.
 # A 124 is retried with a wider budget before it is believed: on a loaded host a paging
@@ -103,10 +116,10 @@ LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 LLVM_LIBDIR="$("$LLVM_CONFIG" --libdir 2>/dev/null || true)"
 link_program() {
     local out="$1" obj="$2"
-    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" >/dev/null 2>&1 && return 0
-    clang -Wl,-dead_strip -o "$out" "$obj" >/dev/null 2>&1 && return 0
+    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && return 0
+    clang -Wl,-dead_strip -o "$out" "$obj" "$PROFILE_HOOK_OBJ" >/dev/null 2>&1 && return 0
     [ -n "$LLVM_LIBDIR" ] || return 1
-    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" \
+    clang -Wl,-dead_strip -o "$out" "$obj" "$RUNTIME_OBJ" "$PROFILE_HOOK_OBJ" \
         -L"$LLVM_LIBDIR" -lLLVM -Wl,-rpath,"$LLVM_LIBDIR" >/dev/null 2>&1 && return 0
     return 1
 }
