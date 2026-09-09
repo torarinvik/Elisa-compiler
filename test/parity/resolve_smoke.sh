@@ -329,7 +329,13 @@ EOF
 "$ELISACORE_BIN" -emit header -o "$WORK/resolve_smoke.h" "$FIX" >/dev/null
 "$ELISACORE_BIN" -emit obj -permissive -O2 -o "$WORK/resolve_smoke.o" "$FIX" >/dev/null
 
-link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/resolve_smoke.o" -o "$WORK/run")
+# The generated runtime calls optional profiler hooks on allocation. Keep this
+# standalone resolver driver safe even on Darwin, where dynamic_lookup turns an
+# omitted hook definition into a null call target at runtime.
+PROFILE_HOOKS="$REPO_ROOT/test/parity/profile_hooks.c"
+clang -c -O2 -o "$WORK/profile_hooks.o" "$PROFILE_HOOKS"
+
+link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/resolve_smoke.o" "$WORK/profile_hooks.o" -o "$WORK/run")
 [[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
 [[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")
 clang "${link_flags[@]}"
