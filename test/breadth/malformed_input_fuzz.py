@@ -41,6 +41,9 @@ REGRESSIONS = [
     # Not a crash — INVALID IR that the object path tolerated: `ret ptr` from an `-> i64`
     # function. stage0 says "return type expects i64, got fn(i64) -> i64".
     ("fn_value_returned_as_scalar", "def apply(f: fn(i64) -> i64, n: i64) -> i64:\n    return f\n"),
+    # A typed local in an assert must be rejected as non-bool before codegen. Without the
+    # local-type-aware contract check, stage1 emitted `br i64` and LLVM rejected the IR.
+    ("nonbool_assert_local", "def main() -> i64:\n    n: i64 = 1\n    assert n\n    return 0\n"),
     # A left-nested `1 + 1 + 1 + ...` chain (adversarial, not anything real code writes) SIGSEGV'd
     # the backend: `expression_type` (codegen_scope.elisa) re-walked the whole remaining left
     # spine from scratch at EVERY one of the N levels of the emitter's own recursion into
