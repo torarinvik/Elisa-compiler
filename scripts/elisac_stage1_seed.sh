@@ -185,10 +185,10 @@ seed_build() {
   ELISA_SEED_OUTPUT=""
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
   echo "seed: wrote $BIN" >&2
-  # The runtime object is built from the same std the product just embedded, so a seed
-  # that leaves it behind hands every consumer a product/runtime pair from two different
-  # sources. It went unrefreshed for a week that way -- the std grew the profiler hooks,
-  # the object still lacked them -- and nothing noticed until a link failed. Digest-guarded,
-  # so this is a no-op when the object already matches its inputs.
-  ELISACORE_BIN="$STAGE0_BIN" bash "$ROOT/scripts/build_runtime_object.sh"
+  # The runtime object is built BY the product just written, from the same std it
+  # embeds: one compiler for the program and its runtime. A seed that left the object
+  # behind handed every consumer a pair from two different sources -- it went unrefreshed
+  # for a week that way and nothing noticed until a link failed. Digest-guarded (the
+  # product is one of the inputs), so this is a no-op when the object already matches.
+  ELISA_STAGE1_BIN="$BIN" bash "$ROOT/scripts/build_runtime_object.sh"
 }
