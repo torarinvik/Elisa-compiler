@@ -120,7 +120,7 @@ seed_build() {
   # raise ELISA_STAGE1_SEED_MAX_RSS_KB deliberately on a host sized for a larger build.
   seed_max_rss_kb="${ELISA_STAGE1_SEED_MAX_RSS_KB:-4194304}"
   seed_rss_poll_seconds="${ELISA_STAGE1_RSS_POLL_SECONDS:-0.05}"
-  seed_opt_level="${ELISA_STAGE1_SEED_OPT_LEVEL:--O2}"
+  seed_opt_level="${ELISA_STAGE1_SEED_OPT_LEVEL:--O3}"
   case "$seed_opt_level" in
     -O0|-O1|-O2|-O3) ;;
     *)
