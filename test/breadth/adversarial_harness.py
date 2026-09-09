@@ -24,6 +24,12 @@ WRAP = os.path.join(ROOT, "scripts/elisac_stage1.sh")
 RT = os.environ.get("ELISA_RUNTIME_OBJ",
                     os.path.join(ROOT, "build/runtime/elisacore_runtime.o"))
 
+# Programs that include the runtime inline (the stage0 object path) still reference the
+# optional profiler ABI.  The runtime object used by stage1 carries the weak no-op hooks,
+# but an inline-runtime object is linked without RT in the second recipe below.  Keep the
+# arbitration fair and runnable by supplying the same weak shim to both link shapes.
+PROFILE_HOOKS = os.path.join(ROOT, "test/parity/profile_hooks.c")
+
 STD = os.path.join(ROOT, "elisacore_std/elisacore_runtime.elisa")
 
 ENV = dict(os.environ)
@@ -74,8 +80,11 @@ def _attempt(src_path, work, tag, run_timeout, scale=1):
         return (TIMEOUT, None)
     if r.returncode != 0:
         return (DECLINED, None)
-    # Same three link recipes the differential corpus uses, in the same order.
-    for extra in ([RT], [], [RT, "-L/opt/homebrew/opt/llvm/lib", "-lLLVM"]):
+    # Same three link recipes the differential corpus uses, in the same order.  The weak
+    # profiler shim is present in every recipe because an inline runtime has no RT object
+    # to provide the optional ABI, while the ordinary stage1 object may need it as well.
+    for extra in ([RT, PROFILE_HOOKS], [PROFILE_HOOKS],
+                  [RT, PROFILE_HOOKS, "-L/opt/homebrew/opt/llvm/lib", "-lLLVM"]):
         if run(["clang", "-Wl,-dead_strip", "-o", exe, obj] + extra).returncode == 0:
             break
     else:
@@ -217,4 +226,3 @@ def main(generators):
     # names what happened — "timed out" sends you to the host or to a hang, "declined" sent
     # you hunting an acceptance gap that was never there.
     return 1 if results["MISMATCH"] or results["O2_MISMATCH"] or results["O2_DECLINE"] or results["DECLINE"] or results["PERMISSIVE"] or results["TIMEOUT"] else 0
-
