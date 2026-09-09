@@ -88,6 +88,20 @@ def find_wasm_component_ld(explicit: str | None) -> str:
     if discovered:
         candidates.append(Path(discovered))
 
+    # rustup installs the component linker in Cargo's bin directory on hosts
+    # where the active rustc comes from another installation (for example
+    # Homebrew). Resolve that standard location directly instead of requiring
+    # every caller to add ~/.cargo/bin to PATH.
+    cargo_bin = Path.home() / ".cargo" / "bin" / "wasm-component-ld"
+    candidates.append(cargo_bin)
+    rustup_home = os.environ.get("RUSTUP_HOME")
+    if rustup_home:
+        candidates.extend(
+            Path(rustup_home).expanduser().glob(
+                "toolchains/*/lib/rustlib/*/bin/wasm-component-ld"
+            )
+        )
+
     # rustup commonly keeps wasm-component-ld inside the active toolchain but
     # does not put that directory on PATH. Resolve that installation directly.
     rustc_candidates: list[str] = []
