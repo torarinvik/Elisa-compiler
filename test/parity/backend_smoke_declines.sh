@@ -315,6 +315,12 @@ diff_case variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() ->
 # A label that is NOT the payload field's declared name must decline rather than be emitted
 # as this constructor -- it names a different program.
 decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(bogus: 42)\n    return match s:\n        Shape.Circle(r): r\n'
+# An explicit `new[NAME]` selector must resolve to an arena/region owner or a packed store.
+# The backend used to treat an unknown selector as transparent and emit the operand value,
+# silently changing a reference-producing allocation into a scalar expression. Keep this
+# backend-only gate because it protects callers that invoke the emitter without the CLI's
+# semantic diagnostics.
+decline_case new_unknown_region_selector 'def main() -> i64:\n    return new[missing] 7\n'
 # A FILTERED comprehension declines: the output count is not known up front, so the presized
 # form does not apply -- and stage0 itself says only the filter-free form auto-vectorizes.
 run_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n' 4
