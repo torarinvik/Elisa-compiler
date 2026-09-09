@@ -10,6 +10,10 @@ LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 BUILD="$ROOT/build/header_smoke"
 mkdir -p "$BUILD"
 LIBDIR="$($LLVM_CONFIG --libdir)"
+FALLBACK_OBJ="$BUILD/runtime_fallback.o"
+clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
+PROFILE_OBJ="$BUILD/profile_hooks.o"
+clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 
 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/driver.o" "$ROOT/test/breadth/emit_header.elisa" \
     >"$BUILD/build.log" 2>&1
@@ -22,7 +26,7 @@ clang -x c -c -o "$BUILD/puts_shim.o" - <<'EOF'
 int elisa_header_puts(const char *s) __asm__("___ovl__puts__cstr__puts");
 int elisa_header_puts(const char *s) { return puts(s); }
 EOF
-clang -o "$BUILD/emit_header" "$BUILD/driver.o" "$BUILD/puts_shim.o" \
+clang -o "$BUILD/emit_header" "$BUILD/driver.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" "$BUILD/puts_shim.o" \
     -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
 
 # The structs are `layout(c)`: stage0 REFUSES to export a type that is not

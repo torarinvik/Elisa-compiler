@@ -10,9 +10,15 @@ LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 BUILD="$ROOT/build/packed_profile_smoke"
 mkdir -p "$BUILD"
 LIBDIR="$($LLVM_CONFIG --libdir)"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+[ -f "$RUNTIME_OBJ" ] || { echo "backend packed profile smoke SKIP: no runtime object"; exit 0; }
 
 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/driver.o" "$ROOT/test/breadth/emit_native.elisa" >/dev/null 2>&1
-clang -o "$BUILD/driver" "$BUILD/driver.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
+FALLBACK_DRIVER_OBJ="$BUILD/driver_runtime_fallback.o"
+clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_DRIVER_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
+PROFILE_DRIVER_OBJ="$BUILD/driver_profile_hooks.o"
+clang -c -O2 -o "$PROFILE_DRIVER_OBJ" "$ROOT/test/parity/profile_hooks.c"
+clang -o "$BUILD/driver" "$BUILD/driver.o" "$FALLBACK_DRIVER_OBJ" "$PROFILE_DRIVER_OBJ" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
 
 src=$'@packed_profile(retained_reads)\npacked enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        n: Node = new Node.Leaf(v: 42)\n        result <- match n:\n            Node.Leaf(v): v\n            Node.Tag(t): t\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
 printf '%s' "$src" | "$BUILD/driver" > "$BUILD/profile.ll"
@@ -20,7 +26,6 @@ grep -q 'declare ptr @ctx_packed_store_state_new(ptr, i64)' "$BUILD/profile.ll"
 grep -q 'declare.*@ctx_packed_store_alloc_fixed_tagged_index_result' "$BUILD/profile.ll"
 grep -q 'call i64 @ctx_packed_store_read_index_word(ptr .* i32 .* i64 1)' "$BUILD/profile.ll"
 "${LLC:-/opt/homebrew/opt/llvm/bin/llc}" -filetype=obj -o "$BUILD/profile.o" "$BUILD/profile.ll"
-RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 RUNTIME_LINK_INPUTS=("$BUILD/profile.o" "$RUNTIME_OBJ")
 # The native callback and varargs hooks are intentionally unresolved in the shared
 # runtime. This standalone executable has no embedding host, so provide the same

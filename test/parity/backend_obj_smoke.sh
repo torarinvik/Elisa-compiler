@@ -23,10 +23,14 @@ LLVM_DIS="$("$LLVM_CONFIG" --bindir)/llvm-dis"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
 [ -f "$RUNTIME_OBJ" ] || { echo "backend_obj_smoke SKIP: no runtime object"; exit 0; }
+FALLBACK_OBJ="$BUILD/runtime_fallback.o"
+clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
+PROFILE_OBJ="$BUILD/profile_hooks.o"
+clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 
 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj.o" "$ROOT/test/breadth/emit_obj.elisa" 2>/dev/null \
   || { echo "backend_obj_smoke FAILED: could not compile emit_obj.elisa"; exit 1; }
-clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null \
+clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null \
   || { echo "backend_obj_smoke FAILED: could not link emit_obj"; exit 1; }
 
 pass=0; total=0

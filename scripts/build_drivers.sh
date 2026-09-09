@@ -14,6 +14,21 @@ LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 
+# The compiler drivers embed the Elisa runtime's callback/varargs ABI and the optional
+# profiler hooks.  Those symbols are supplied by a host in normal compiler invocations,
+# but a standalone driver must still link them weakly so that resolver and backend smoke
+# tests cannot start with null dynamic-lookup call targets or fail at link time.
+FALLBACK_OBJ="$BUILD/runtime_fallback.o"
+PROFILE_OBJ="$BUILD/profile_hooks.o"
+if ! clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"; then
+    echo "build_drivers FAILED: could not compile runtime fallback" >&2
+    exit 1
+fi
+if ! clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"; then
+    echo "build_drivers FAILED: could not compile profiler hooks" >&2
+    exit 1
+fi
+
 status=0
 for driver in emit_native emit_obj; do
     log="$BUILD/$driver.buildlog"
@@ -26,7 +41,7 @@ for driver in emit_native emit_obj; do
     # recurses once per AST level — see the depth guard in codegen_scope.elisa's
     # expression_type and scripts/elisac_stage1.sh's seed_build for the same flag on the
     # product binary.
-    if ! clang -o "$BUILD/$driver" "$BUILD/$driver.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000 2>>"$log"; then
+    if ! clang -o "$BUILD/$driver" "$BUILD/$driver.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000 2>>"$log"; then
         echo "build_drivers FAILED: could not link $driver"; status=1; continue
     fi
     echo "build_drivers ok: $driver"
