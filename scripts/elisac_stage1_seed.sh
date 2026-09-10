@@ -132,6 +132,14 @@ seed_build() {
   seed_pid=$!
   seed_peak_rss_kb=0
   while kill -0 "$seed_pid" 2>/dev/null; do
+    # `kill -0` also succeeds for a zombie on macOS. A completed stage0 child
+    # can therefore leave this loop spinning forever instead of reaching the
+    # explicit `wait` below. Treat an absent or zombie process as terminal;
+    # `wait` still collects the authoritative exit status.
+    seed_process_stat="$(ps -o stat= -p "$seed_pid" 2>/dev/null)" || seed_process_stat=""
+    if [[ -z "$seed_process_stat" || "$seed_process_stat" == Z* ]]; then
+      break
+    fi
     # The child may exit between kill(0) and ps(1). With `set -euo pipefail`, the
     # resulting non-zero ps status used to abort the seed shell before `wait` could
     # collect the child's successful status, making a completed seed look failed.
