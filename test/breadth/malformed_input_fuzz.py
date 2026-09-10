@@ -18,7 +18,7 @@ NOT to crash is otherwise invisible (the object path tolerates it; see llvm_veri
 It found `ret ptr` from an `-> i64` function, from returning a `fn` value that stage0 rejects
 outright.
 """
-import os, random, subprocess, sys
+import os, random, signal, subprocess, sys
 
 ROOT = os.environ["REPO_ROOT"]
 WRAP = os.path.join(ROOT, "scripts/elisac_stage1.sh")
@@ -67,6 +67,27 @@ REGRESSIONS = [
 
 OPT = os.path.join(os.path.dirname(os.environ.get("LLVM_CONFIG", "/opt/homebrew/opt/llvm/bin/llvm-config")), "opt")
 
+def run_bounded(args, timeout, stdout, stderr):
+    """Run one compiler/tool process and kill its entire process group on timeout.
+
+    The stage1 wrapper supervises a native child. `subprocess.run(..., timeout=...)` only
+    kills the wrapper shell, leaving that child orphaned; a retry then ran concurrently with
+    the first attempt and raced on the same output path. A new session makes the timeout
+    boundary cover the wrapper and every descendant, so every retry is independent.
+    """
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                               start_new_session=True)
+    try:
+        output, error = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(args, process.returncode, output, error)
+
 def compile_rc(path, work):
     # A genuine HANG must come back as an ordinary (abnormal) return code, not an uncaught
     # TimeoutExpired — an uncaught exception here crashes this script instead of reporting the
@@ -81,9 +102,8 @@ def compile_rc(path, work):
     budget = int(os.environ.get("ELISA_MALFORMED_TIMEOUT", "120"))
     for attempt in (budget, budget * int(os.environ.get("ELISA_TIMEOUT_ESCALATE", "6"))):
         try:
-            r = subprocess.run(["bash", WRAP, "-o", os.path.join(work, "out.o"), path],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               stdin=subprocess.DEVNULL, timeout=attempt)
+            r = run_bounded(["bash", WRAP, "-o", os.path.join(work, "out.o"), path], attempt,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return r.returncode
         except subprocess.TimeoutExpired:
             continue
@@ -102,17 +122,16 @@ def invalid_ir(path, work):
     r = None
     for attempt in (budget, budget * int(os.environ.get("ELISA_TIMEOUT_ESCALATE", "6"))):
         try:
-            r = subprocess.run(["bash", WRAP, "-emit", "llvm", "-o", ll, path],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               stdin=subprocess.DEVNULL, timeout=attempt)
+            r = run_bounded(["bash", WRAP, "-emit", "llvm", "-o", ll, path], attempt,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             break
         except subprocess.TimeoutExpired:
             continue
     if r is None or r.returncode != 0:
         return None
     try:
-        v = subprocess.run([OPT, "-passes=verify", "-disable-output", ll],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=budget)
+        v = run_bounded([OPT, "-passes=verify", "-disable-output", ll], budget,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except subprocess.TimeoutExpired:
         return None
     if v.returncode == 0:
