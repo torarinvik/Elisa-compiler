@@ -31,11 +31,13 @@ ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/b
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 STAGE0_RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 SUPPORT="$ROOT/elisacore_std/native_runtime_support.elisa"
+PROFILE_HOOKS="$ROOT/test/parity/profile_hooks.c"
 
 [ -x "$ELISACORE_BIN" ] || { echo "self_host_runtime SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
 [ -x "$STAGE1" ]        || { echo "self_host_runtime SKIP: no stage1 seed at $STAGE1"; exit 0; }
 [ -f "$STAGE0_RUNTIME" ]|| { echo "self_host_runtime SKIP: no stage0 runtime at $STAGE0_RUNTIME"; exit 0; }
 [ -f "$SUPPORT" ]       || { echo "self_host_runtime SKIP: no $SUPPORT"; exit 0; }
+[ -f "$PROFILE_HOOKS" ] || { echo "self_host_runtime SKIP: no $PROFILE_HOOKS"; exit 0; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -76,8 +78,24 @@ if ! "$ELISACORE_BIN" -emit obj -o "$WORK/prog.o" "$WORK/prog.elisa" >"$WORK/pro
     exit 1
 fi
 
+# The stage1 source object intentionally leaves the optional profiling ABI to its embedding
+# link. The complete runtime-object builder supplies weak fallbacks, but this smoke links the
+# raw stage1-produced support object directly; provide the same hook surface here so a missing
+# test fixture does not masquerade as a stage1 runtime code-generation failure.
+if ! clang -c -O2 -o "$WORK/profile_hooks.o" "$PROFILE_HOOKS" >"$WORK/hooks.log" 2>&1; then
+    echo "self_host_runtime FAILED: could not compile profiler hook fallbacks"
+    sed -n '1,6p' "$WORK/hooks.log"
+    exit 1
+fi
+
 link_and_run() {
     local runtime="$1" out="$2"
+    if [ "$#" -ge 3 ]; then
+        if ! clang -Wl,-dead_strip -o "$out" "$WORK/prog.o" "$runtime" "$3" >"$WORK/link.log" 2>&1; then
+            echo "  link failed against $runtime"; sed -n '1,6p' "$WORK/link.log"; return 255
+        fi
+        RUN "$out"; return $?
+    fi
     if ! clang -Wl,-dead_strip -o "$out" "$WORK/prog.o" "$runtime" >"$WORK/link.log" 2>&1; then
         echo "  link failed against $runtime"; sed -n '1,6p' "$WORK/link.log"; return 255
     fi
@@ -85,7 +103,7 @@ link_and_run() {
 }
 
 link_and_run "$STAGE0_RUNTIME" "$WORK/prog.rt0"; want=$?
-link_and_run "$WORK/rt_stage1.o" "$WORK/prog.rt1"; got=$?
+link_and_run "$WORK/rt_stage1.o" "$WORK/prog.rt1" "$WORK/profile_hooks.o"; got=$?
 
 # 139 = SIGSEGV, 124 = timeout (a HANG, which is what the arena_alloc region-walk bug produced).
 if [ "$want" -eq 139 ] || [ "$want" -eq 124 ] || [ "$want" -eq 255 ]; then
