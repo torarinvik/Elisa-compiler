@@ -43,7 +43,7 @@ pass=0; total=0
 slice_case() {
     local name="$1" body="$2" want="$3"; total=$((total + 1))
     local src="$BUILD/slicereal_$name.elisa" ll="$BUILD/slicereal_$name.ll" obj="$BUILD/slicereal_$name.o" exe="$BUILD/slicereal_$name"
-    python3 - "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" "$STD/elisacore_runtime_slice.elisa" > "$src" <<PY
+    python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" "$STD/elisacore_runtime_slice.elisa" > "$src" <<PY
 import sys, re
 out = []
 for path in sys.argv[1:]:

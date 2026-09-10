@@ -40,7 +40,7 @@ pass=0; total=0
 iv_case() {
     local name="$1" body="$2" want="$3"; total=$((total + 1))
     local src="$BUILD/ivreal_$name.elisa" ll="$BUILD/ivreal_$name.ll" obj="$BUILD/ivreal_$name.o" exe="$BUILD/ivreal_$name"
-    python3 - "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
+    python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
 import sys, re
 out = []
 for path in sys.argv[1:]:

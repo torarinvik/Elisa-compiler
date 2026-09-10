@@ -41,7 +41,7 @@ pass=0; total=0
 imap_case() {
     local name="$1" body="$2" want="$3"; total=$((total + 1))
     local src="$BUILD/imapreal_$name.elisa" ll="$BUILD/imapreal_$name.ll" obj="$BUILD/imapreal_$name.o" exe="$BUILD/imapreal_$name"
-    python3 - "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
+    python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
 import sys, re
 out = []
 for path in sys.argv[1:]:

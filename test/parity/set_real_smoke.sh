@@ -63,7 +63,7 @@ set_case() {
     local name="$1" body="$2" want="$3"; total=$((total + 1))
     local src="$BUILD/setreal_$name.elisa" s1="$BUILD/setreal_${name}_s1.elisa"
     local ll="$BUILD/setreal_$name.ll" obj="$BUILD/setreal_$name.o" exe="$BUILD/setreal_$name"
-    python3 - "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
+    python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
 import sys, re
 out = []
 for path in sys.argv[1:]:
