@@ -48,11 +48,10 @@ REGRESSIONS = [
     # the backend: `expression_type` (codegen_scope.elisa) re-walked the whole remaining left
     # spine from scratch at EVERY one of the N levels of the emitter's own recursion into
     # `binary_left` — O(N^2) time, and the combined recursion depth also exceeded the default
-    # ~8MB native stack. stage0 (and gen0 unoptimized) compile this instantly. Fixed by capping
-    # `expression_type`'s own recursion depth (falls back to Unmodeled, the same answer a bare
-    # literal already gives, past 200 levels — far deeper than any genuine expression) and by
-    # linking the product binary with a 512MB stack (scripts/elisac_stage1.sh, build_drivers.sh,
-    # self_host_gen2.sh). 5000 is comfortably past the depth that used to crash (~15000-20000)
+    # ~8MB native stack. stage0 (and gen0 unoptimized) compile this instantly. The backend's
+    # type walk is capped at 200, and the parser now refuses more than 2000 continuations at
+    # one precedence level before codegen. The 512MB product stack remains defense in depth
+    # for other deeply nested, valid shapes. 5000 is comfortably past the old crash threshold
     # while keeping this regression's own runtime short.
     ("deep_left_binary_chain", "def main() -> i64:\n    return " + "1" + " + 1" * 5000 + "\n"),
     # A chain of just 30 nested `not`s hung the compiler indefinitely (confirmed exponential:
