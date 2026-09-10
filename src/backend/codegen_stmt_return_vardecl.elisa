@@ -93,6 +93,24 @@ extend Backend:
             return true
 
 
+        # A place already contains the source bytes for a large aggregate. Copy it directly to
+        # the caller's sret destination instead of first materializing a first-class aggregate;
+        # the latter makes LLVM legalize a multi-kilobyte SSA value and can explode at codegen.
+        # Memmove preserves the old load-then-store behavior even if a caller deliberately aliases
+        # an input reference with the result destination.
+        def emit_sret_return_address(source: LLVMValueRef, return_type: ValueType, runtime: Runtime&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            false return if runtime.in_error_fn or not value_type_uses_sret(return_type, structs, ctx)
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            destination: LLVMValueRef = LLVMGetParam(function, 0)
+            aggregate_llvm_type: LLVMTypeRef = llvm_type_of(return_type, structs, ctx)
+            alignment: mutable u32 = LLVMABIAlignmentOfType(structs.target_data, aggregate_llvm_type)
+            alignment <- 1 if alignment == 0
+            size: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), LLVMABISizeOfType(structs.target_data, aggregate_llvm_type), 0)
+            _ = LLVMBuildMemMove(builder, destination, alignment, source, alignment, size)
+            _ = LLVMBuildRetVoid(builder)
+            return true
+
+
         def emit_statement_return_vardecl(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             handled <- true
             if statement is Stmt.Return(return_value_opt, return_line):
@@ -392,6 +410,48 @@ extend Backend:
                                     _ = LLVMBuildStore(builder, forwarded_payload, runtime.error_out)
                                     _ = LLVMBuildRet(builder, forwarded_status)
                                     return EmitStatus.Terminated
+                    # A direct large-aggregate call can write straight into this function's
+                    # hidden sret destination. Keeping the result in memory avoids a temporary
+                    # aggregate load/store, and the tri-state helper prevents a partially
+                    # emitted call from being evaluated again by the fallback path.
+                    if structs.pending_ensures.count == 0 and value_type_uses_sret(return_type, structs, ctx):
+                        return_destination: LLVMValueRef = LLVMGetParam(LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder)), 0)
+                        if return_operand is Expr.Construct(_, _, _):
+                            return_construct_status: i64 = emit_construct_into_sret(return_operand, return_type, return_destination, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                            if return_construct_status == 1:
+                                EmitStatus.Declined return if not emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder)
+                                emit_region_unwind(regions, runtime, builder)
+                                _ = LLVMBuildRetVoid(builder)
+                                return EmitStatus.Terminated
+                            EmitStatus.Declined return if return_construct_status < 0
+                        if return_operand is Expr.Call(return_callee, return_arguments, return_argument_names, return_call_line):
+                            match return_callee:
+                                Expr.Ident(return_name, return_name_line):
+                                    return_call_status: i64 = emit_direct_call_into_sret("", return_name, return_callee, false, return_arguments, return_argument_names, return_destination, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                    if return_call_status == 1:
+                                        EmitStatus.Declined return if not emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder)
+                                        emit_region_unwind(regions, runtime, builder)
+                                        _ = LLVMBuildRetVoid(builder)
+                                        return EmitStatus.Terminated
+                                    EmitStatus.Declined return if return_call_status < 0
+                                Expr.Scope(return_scope_head, return_name, return_scope_line):
+                                    if return_scope_head is Expr.Ident(return_module, return_module_line):
+                                        return_call_status: i64 = emit_direct_call_into_sret(module_alias_target(return_module, structs), return_name, return_callee, false, return_arguments, return_argument_names, return_destination, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+                                        if return_call_status == 1:
+                                            EmitStatus.Declined return if not emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder)
+                                            emit_region_unwind(regions, runtime, builder)
+                                            _ = LLVMBuildRetVoid(builder)
+                                            return EmitStatus.Terminated
+                                        EmitStatus.Declined return if return_call_status < 0
+                                _:
+                                    pass
+                    # A large aggregate returned from an addressable place can stay in memory all
+                    # the way to the sret destination. Contracts need a value, so only take this
+                    # fast path when no postcondition remains to inspect.
+                    if structs.pending_ensures.count == 0 and indirect_aggregate_argument_address(return_operand, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is return_address:
+                        EmitStatus.Declined return if not emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder)
+                        emit_region_unwind(regions, runtime, builder)
+                        EmitStatus.Terminated return if emit_sret_return_address(return_address, return_type, runtime, structs, ctx, builder)
                     emitted: LLVMValueRef? = emit_expression_coerced(return_operand, return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder)
                     if emitted is return_constant:
                         # `return helper()` where `helper` is `-> void`, from a `-> void`
