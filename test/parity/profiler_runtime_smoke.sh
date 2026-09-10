@@ -7,6 +7,16 @@ STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$(command -v elisac-stage1 || true)}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
+# The installer puts a host-facing shell wrapper on PATH. Passing that wrapper back
+# through ELISA_STAGE1_BIN makes the wrapper export its own path and recursively invoke
+# itself. Resolve the snapshot's actual product binary before invoking it.
+if [[ -f "$STAGE1_BIN" ]] && grep -q 'exec bash ' "$STAGE1_BIN" 2>/dev/null; then
+    STAGE1_SCRIPT="$(sed -n 's/.*exec bash "\(.*\)\/scripts\/elisac_stage1\.sh".*/\1\/scripts\/elisac_stage1.sh/p' "$STAGE1_BIN" | head -n 1)"
+    if [[ -n "$STAGE1_SCRIPT" && -x "$STAGE1_SCRIPT" ]]; then
+        STAGE1_BIN="${STAGE1_SCRIPT%/scripts/elisac_stage1.sh}/bin/elisac-stage1"
+    fi
+fi
+
 if [[ ! -x "$STAGE0_BIN" || -z "$STAGE1_BIN" || ! -x "$STAGE1_BIN" ]]; then
     echo "profiler runtime smoke SKIP: stage0/stage1 compiler unavailable"
     exit 0
