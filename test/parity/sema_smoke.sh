@@ -57,7 +57,14 @@ EOF
 "$ELISACORE_BIN" -emit header -o "$WORK/sema_smoke.h" "$FIX" >/dev/null
 "$ELISACORE_BIN" -emit obj -permissive -O2 -o "$WORK/sema_smoke.o" "$FIX" >/dev/null
 
-link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/sema_smoke.o" -o "$WORK/run")
+# The generated runtime keeps profiler policy in the host ABI. Supply the
+# documented weak no-op implementation so a standalone smoke executable never
+# turns an optional hook into a null call target on Darwin's dynamic_lookup
+# link, while a real collector can still override it in profiler tests.
+PROFILE_HOOKS="$REPO_ROOT/test/parity/profile_hooks.c"
+clang -c -O2 -o "$WORK/profile_hooks.o" "$PROFILE_HOOKS"
+
+link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/sema_smoke.o" "$WORK/profile_hooks.o" -o "$WORK/run")
 [[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
 [[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")
 clang "${link_flags[@]}"
