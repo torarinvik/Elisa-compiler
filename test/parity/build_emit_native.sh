@@ -20,6 +20,12 @@ if [[ -x "$EMIT_NATIVE" ]]; then
   for _en_src in "$REPO_ROOT/test/breadth/emit_native.elisa" "$REPO_ROOT/test/parity/profile_hooks.c" "$ELISACORE_BIN"; do
     [[ -e "$_en_src" && "$_en_src" -nt "$EMIT_NATIVE" ]] && _en_fresh=""
   done
+  # emit_native imports the backend directly. Its source dependency is the complete
+  # compiler tree, not just the small driver fixture; otherwise a backend fix leaves
+  # the cached stage1 emitter silently generating pre-fix IR.
+  if [[ -n "$_en_fresh" ]] && find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -type f -newer "$EMIT_NATIVE" -print -quit | grep -q .; then
+    _en_fresh=""
+  fi
 fi
 if [[ -n "$_en_fresh" ]]; then
   return 0 2>/dev/null || exit 0
