@@ -200,6 +200,10 @@ export function createElisaImports(options = {{}}) {{
     snprintf() {{ return -1; }},
     backtrace() {{ return 0; }},
     backtrace_symbols_fd() {{}},
+    elisa_profile_allocation_negotiate() {{ return 0; }},
+    elisa_profile_region_layout_negotiate() {{ return 0; }},
+    elisa_profile_region_layout_v1() {{}},
+    elisa_profile_allocation_event_v1() {{}},
     wasm_memory_size() {{ return memory.buffer.byteLength / PAGE_SIZE; }},
     wasm_memory_grow(index, pages) {{ try {{ return memory.grow(Number(pages)); }} catch {{ return -1; }} }},
     abort() {{ throw new Error("Elisa WASM aborted"); }},
@@ -302,5 +306,4 @@ export function createElisaImports(options?: ElisaWasmLoadOptions): WebAssembly.
 export function loadWasm(source?: WasmSource, options?: ElisaWasmLoadOptions): Promise<{interface_name}>;
 export default loadWasm;
 '''
-
 
