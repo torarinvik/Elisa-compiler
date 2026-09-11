@@ -13,7 +13,7 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_template_analysis_smoke
     sed -n '1,20p' "$ROOT/build/easm_template_analysis_smoke.log"
     exit 1
 fi
-if ! clang -o "$ROOT/build/easm_template_analysis_smoke" "$ROOT/build/easm_template_analysis_smoke.o" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
+if ! clang -o "$ROOT/build/easm_template_analysis_smoke" "$ROOT/build/easm_template_analysis_smoke.o" "$ROOT/test/parity/profile_hooks.c" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
     echo "easm_template_analysis_smoke FAILED: could not link verifier test"
     exit 1
 fi

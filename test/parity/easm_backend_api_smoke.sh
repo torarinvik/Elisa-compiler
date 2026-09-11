@@ -13,7 +13,7 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_backend_api_smoke.o" "$
     rg -n "error:" "$ROOT/build/easm_backend_api_smoke.log" | tail -20
     exit 1
 fi
-if ! clang -o "$ROOT/build/easm_backend_api_smoke" "$ROOT/build/easm_backend_api_smoke.o" -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
+if ! clang -o "$ROOT/build/easm_backend_api_smoke" "$ROOT/build/easm_backend_api_smoke.o" "$ROOT/test/parity/profile_hooks.c" -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
     echo "easm_backend_api_smoke FAILED: could not link backend API test"
     exit 1
 fi

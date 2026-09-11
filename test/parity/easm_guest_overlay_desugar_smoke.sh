@@ -13,7 +13,7 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_guest_overlay_desugar_s
     sed -n '1,40p' "$ROOT/build/easm_guest_overlay_desugar_smoke.log"
     exit 1
 fi
-if ! clang -o "$ROOT/build/easm_guest_overlay_desugar_smoke" "$ROOT/build/easm_guest_overlay_desugar_smoke.o" -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
+if ! clang -o "$ROOT/build/easm_guest_overlay_desugar_smoke" "$ROOT/build/easm_guest_overlay_desugar_smoke.o" "$ROOT/test/parity/profile_hooks.c" -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
     echo "easm_guest_overlay_desugar_smoke FAILED: could not link desugar test"
     exit 1
 fi

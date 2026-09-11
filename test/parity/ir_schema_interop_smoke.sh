@@ -37,7 +37,7 @@ if ! "$EC" -emit obj -o "$BUILD/probe.o" "$ROOT/test/parity/ir_reader_probe.elis
     grep -v "warning:" "$BUILD/compile.log" | head -10
     exit 1
 fi
-if ! clang -o "$BUILD/probe" "$BUILD/probe.o" 2>"$BUILD/link.log"; then
+if ! clang -o "$BUILD/probe" "$BUILD/probe.o" "$ROOT/test/parity/profile_hooks.c" 2>"$BUILD/link.log"; then
     echo "FAIL: could not link the Elisa reader probe"
     head -10 "$BUILD/link.log"
     exit 1

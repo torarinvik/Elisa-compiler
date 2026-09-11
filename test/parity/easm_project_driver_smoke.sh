@@ -27,7 +27,7 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_project_driver.o" "$ROO
     sed -n '1,30p' "$ROOT/build/easm_project_driver.log"
     exit 1
 fi
-if ! clang -o "$ROOT/build/easm_project_driver" "$ROOT/build/easm_project_driver.o" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
+if ! clang -o "$ROOT/build/easm_project_driver" "$ROOT/build/easm_project_driver.o" "$ROOT/test/parity/profile_hooks.c" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
     echo "easm_project_driver_smoke FAILED: project driver did not link"
     exit 1
 fi

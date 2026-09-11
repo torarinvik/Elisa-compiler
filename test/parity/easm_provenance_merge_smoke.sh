@@ -13,7 +13,7 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_provenance_merge_smoke.
     rg -n "error:" "$ROOT/build/easm_provenance_merge_smoke.log" | tail -20
     exit 1
 fi
-if ! clang -o "$ROOT/build/easm_provenance_merge_smoke" "$ROOT/build/easm_provenance_merge_smoke.o" -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
+if ! clang -o "$ROOT/build/easm_provenance_merge_smoke" "$ROOT/build/easm_provenance_merge_smoke.o" "$ROOT/test/parity/profile_hooks.c" -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
     echo "easm_provenance_merge_smoke FAILED: could not link provenance merge test"
     exit 1
 fi

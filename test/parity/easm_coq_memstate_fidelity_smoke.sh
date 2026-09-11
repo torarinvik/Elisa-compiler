@@ -17,6 +17,7 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_coq_memstate_fidelity_s
 fi
 if ! clang -o "$ROOT/build/easm_coq_memstate_fidelity_smoke" \
     "$ROOT/build/easm_coq_memstate_fidelity_smoke.o" \
+    "$ROOT/test/parity/profile_hooks.c" \
     -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)"; then
     echo "easm_coq_memstate_fidelity_smoke FAILED: could not link lattice mirror"
     exit 1

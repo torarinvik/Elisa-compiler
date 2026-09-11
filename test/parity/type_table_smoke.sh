@@ -50,7 +50,8 @@ EOF
 "$ELISACORE_BIN" -emit header -o "$WORK/type_table_smoke.h" "$FIX" >/dev/null
 "$ELISACORE_BIN" -emit obj -O2 -o "$WORK/type_table_smoke.o" "$FIX" >/dev/null
 
-clang -O2 -I "$WORK" "$WORK/driver.c" "$WORK/type_table_smoke.o" -o "$WORK/run"
+clang -O2 -I "$WORK" "$WORK/driver.c" "$WORK/type_table_smoke.o" \
+  "$REPO_ROOT/test/parity/profile_hooks.c" -o "$WORK/run"
 
 OUT="$("$WORK/run")"
 read -r PASSED TOTAL <<<"$OUT"

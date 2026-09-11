@@ -13,7 +13,7 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_guest_overlay_api_smoke
     sed -n '1,30p' "$ROOT/build/easm_guest_overlay_api_smoke.log"
     exit 1
 fi
-if ! clang -o "$ROOT/build/easm_guest_overlay_api_smoke" "$ROOT/build/easm_guest_overlay_api_smoke.o" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
+if ! clang -o "$ROOT/build/easm_guest_overlay_api_smoke" "$ROOT/build/easm_guest_overlay_api_smoke.o" "$ROOT/test/parity/profile_hooks.c" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
     echo "easm_guest_overlay_api_smoke FAILED: could not link resolver test"
     exit 1
 fi

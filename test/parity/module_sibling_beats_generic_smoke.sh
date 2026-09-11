@@ -17,11 +17,12 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Each stage is built the way this project actually builds it: the fixture
 # INCLUDES elisacore_runtime.elisa, and stage0 emits that runtime into its own
-# object (so a bare `cc` links it, and adding build/runtime/elisacore_runtime.o
-# would give 40 duplicate symbols), while stage1 does not (so its object alone
-# leaves _arena_free unresolved) and its driver script owns the link.
+# object. The runtime calls optional profiler hooks, so link the weak no-op test
+# hooks as well; the canonical profiler runtime supplies the real hooks in
+# production links. Stage1 does not emit the runtime and its driver owns the
+# complete link.
 "$STAGE0" -emit obj -O2 -o "$TMP_DIR/stage0.o" "$FIXTURE" >/dev/null 2>&1
-cc "$TMP_DIR/stage0.o" -o "$TMP_DIR/stage0"
+cc "$TMP_DIR/stage0.o" "$ROOT/test/parity/profile_hooks.c" -o "$TMP_DIR/stage0"
 "$STAGE1" -emit exe -O2 -o "$TMP_DIR/stage1" "$FIXTURE" >/dev/null 2>&1
 
 # A declined function is the failure mode this guards, and stage1 can still
