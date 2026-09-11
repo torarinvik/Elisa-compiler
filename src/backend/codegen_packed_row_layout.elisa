@@ -5,6 +5,8 @@
 extend Backend:
     private:
 
+        const PACKED_AST_ROW_MIN_SLOTS: u32 = 36
+        const PACKED_U32_SIZE_BYTES: u64 = 4
 
         # The AoS row's payload area, in u32 slots.
         #
@@ -80,20 +82,20 @@ extend Backend:
                         widest_align <- member_align if member_align > widest_align
                 0 return if unsized
                 offset <- offset + (widest_align - (offset % widest_align)) if offset % widest_align != 0
-                return ((offset + 3) / 4).u32()
+                return ((offset + PACKED_U32_SIZE_BYTES - 1) / PACKED_U32_SIZE_BYTES).u32()
 
 
 
 
         # The AST root row's payload slots: the widest variant across every Node refinement.
         #
-        # Floored at the historical 32 so a hierarchy this pass cannot fully size can only
-        # ever WIDEN the row, never shrink it below what already shipped. The floor is not a
-        # substitute for measuring — `packed_ast_row_slots_smoke.sh` asserts this number
-        # against the `[N x i32]` stage0 emits for the same source.
+        # Floored at the minimum width required by the current compiler AST so a hierarchy this
+        # pass cannot fully size can only WIDEN the row, never shrink it below the published ABI.
+        # The floor is not a substitute for measuring — the AST row smoke test compares it with
+        # stage0's layout for the same source.
         def packed_ast_row_slots(structs: mutable StructTable&) -> u32 can[Abort.Panic]:
             can Abort.Panic:
-                widest: mutable u32 = 32
+                widest: mutable u32 = PACKED_AST_ROW_MIN_SLOTS
                 for enum_slot in 0..<structs.packed_names.count |widest, structs|:
                     continue if not packed_is_ast_refinement(structs, enum_slot.i64())
                     variant_start: usize = structs.packed_variant_start[enum_slot]
@@ -140,10 +142,9 @@ extend Backend:
                 # remain in the side table do not occupy a row field at all.
                 row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx)]
                 dynamic_commons: u32 = packed_aos_common_count(structs, enum_index)
-                dynamic_name: sview = structs.packed_names[enum_index.usize()] if enum_index >= 0 and enum_index.usize() < structs.packed_names.count else ""
-                for common_index in 0..<dynamic_commons.usize() |row_fields, common_index, dynamic_name, structs, ctx|:
-                    if packed_common_is_inline(structs, dynamic_name, common_index.u32()):
-                        common_type: ValueType = packed_common_type_at(structs, dynamic_name, common_index.u32())
+                for common_index in 0..<dynamic_commons.usize() |row_fields, common_index, structs, enum_index, ctx|:
+                    if packed_common_is_inline_at_slot(structs, enum_index, common_index.u32()):
+                        common_type: ValueType = packed_common_type_at_slot(structs, enum_index, common_index.u32())
                         row_fields.push(llvm_type_of(common_type, structs, ctx))
                 row_fields.push(LLVMArrayType(LLVMInt32TypeInContext(ctx), packed_dynamic_aos_row_slots(structs, enum_index)))
                 row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
@@ -152,28 +153,35 @@ extend Backend:
             layout_index <- enum_index if layout_index < 0
             words: u32 = structs.packed_payload_words[layout_index.usize()]
             commons: u32 = structs.packed_common_counts[layout_index.usize()]
-            # `{i32 tag, <commons>, [N x i64] payload}` — commons sit BETWEEN the tag and
-            # the payload, which is why every payload index shifts by `commons`. Keep each
-            # common at its declared LLVM type; the old hardcoded i64 row was only correct for
-            # the compiler's own integer commons and rejected user hierarchies with f32/etc.
+            # `{i32 tag, <inline commons>, [N x i64] payload}` — LLVM's natural struct
+            # layout supplies any alignment padding between fields. The former implementation
+            # materialized artificial four-byte padding fields, which changed a `{i32, f32,
+            # payload}` row from the stage0 ABI's 16 bytes to 24 bytes and made GEP indices
+            # differ from the actual row type.
             row_fields: mutable darray[LLVMTypeRef] = [LLVMInt32TypeInContext(ctx)]
-            row_fields.push(LLVMArrayType(LLVMInt8TypeInContext(ctx), 4)) if commons > 0
             for common_index in 0..<commons.usize() |row_fields, common_index, structs, layout_index, ctx|:
-                common_type: ValueType = packed_common_type_at(structs, structs.packed_names[layout_index.usize()], common_index.u32())
+                continue if not packed_common_is_inline_at_slot(structs, layout_index, common_index.u32())
+                common_type: ValueType = packed_common_type_at_slot(structs, layout_index, common_index.u32())
                 common_llvm_type: LLVMTypeRef = llvm_type_of(common_type, structs, ctx)
                 row_fields.push(common_llvm_type)
-                common_bytes: u64 = LLVMABISizeOfType(structs.target_data, common_llvm_type)
-                row_fields.push(LLVMArrayType(LLVMInt8TypeInContext(ctx), (8 - common_bytes).u32())) if common_bytes > 0 and common_bytes < 8
             row_fields.push(LLVMArrayType(LLVMInt64TypeInContext(ctx), words))
             row_pointer: void& = (&row_fields[0]).cast[void&] can Unsafe.PointerCast
-            # The explicit four-byte alignment fillers are real LLVM fields, so the
-            # field count is larger than `2 + commons` whenever a common is narrower
-            # than one runtime word. Passing the logical count truncated the row type
-            # before the payload and made later GEPs either read the wrong field or
-            # walk past the LLVM struct for multiple i32 commons.
             return LLVMStructTypeInContext(ctx, row_pointer, row_fields.count.u32(), 0)
 
 
+
+
+        # Variant-sparse and index packed readers address the legacy row as machine words.
+        # The payload does NOT necessarily start at `1 + common_count`: side-table commons
+        # have no physical row member, and natural LLVM alignment may insert padding before
+        # the payload array. Derive the word offset from the actual row type so every reader
+        # agrees with the constructor and the runtime allocator.
+        def packed_legacy_payload_word_offset(structs: mutable StructTable&, enum_index: i64) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            row_type: LLVMTypeRef = packed_row_llvm_type(structs, enum_index, structs.context)
+            payload_field: u32 = packed_payload_row_field_index(structs, enum_index)
+            word_bytes: u64 = target_pointer_bits().u64() / 8
+            return 0 if word_bytes == 0
+            return (LLVMOffsetOfElement(structs.target_data, row_type, payload_field) / word_bytes).u32()
 
 
         # Dynamic AoS rows use the canonical stage0 representation `{i32, [N x i32]}`.
@@ -192,10 +200,10 @@ extend Backend:
 
         def packed_row_bytes(structs: mutable StructTable&, enum_index: i64) -> i64 can[Abort.Panic]:
             can Abort.Panic:
-                # 4 (u32 tag) + 4 per u32 payload slot — 132 while the row was [32 x i32].
+                # 4 (u32 tag) + 4 per u32 payload slot — 148 while the current row is [36 x i32].
                 # ONLY when the AST is really here; see packed_program_has_ast_refinements.
                 resolved_root: i64 = packed_root_index_of(structs, enum_index)
-                if packed_is_ast_root_row(structs, resolved_root) and packed_program_has_ast_refinements(structs):
+                if packed_is_ast_root_row(structs, resolved_root) and (packed_program_has_ast_refinements(structs) or (resolved_root >= 0 and packed_owner_at(structs, resolved_root.usize()) == "Ast")):
                     return (4 + 4 * packed_ast_row_slots(structs).i64())
                 if packed_is_ast_root_row(structs, resolved_root):
                     # A reserved AST header can still be the lookup result in a small user

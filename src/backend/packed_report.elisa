@@ -6,28 +6,28 @@ extend Backend:
     public:
 
 
-        # The `common:` block's fields for a packed enum, from the ABI metadata. Dynamic AoS
-        # rows keep default common fields in a side table, so the report must describe their
-        # word offsets instead of pretending that every field is an inline i64.
-        def packed_emit_common_fields(top: darray[Decl]&, enum_name: sview, commons: u32, out: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # The `common:` block's fields for a packed enum, from the ABI metadata. Unannotated
+        # commons use the cold side table in every dense packed ABI; explicit inline fields
+        # are the only common fields that become row members.
+        def packed_emit_common_fields(top: darray[Decl]&, enum_name: sview, target_owner: sview, current_owner: sview, commons: u32, structs: mutable StructTable&, enum_index: i64, out: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                for declaration in top |enum_name, commons, out|:
+                for declaration in top |enum_name, target_owner, current_owner, commons, out|:
                     match declaration:
                         Decl.Module(pcf_mod_name, pcf_mod_body, pcf_mod_line):
-                            packed_emit_common_fields(pcf_mod_body, enum_name, commons, out)
+                            packed_emit_common_fields(pcf_mod_body, enum_name, target_owner, pcf_mod_name, commons, structs, enum_index, out)
                             continue
                         _:
                             pass
                     match declaration:
                         Decl.Scoped(pcf_scoped_body, pcf_scoped_line):
-                            packed_emit_common_fields(pcf_scoped_body, enum_name, commons, out)
+                            packed_emit_common_fields(pcf_scoped_body, enum_name, target_owner, current_owner, commons, structs, enum_index, out)
                             continue
                         _:
                             pass
                     match declaration:
                         Decl.Enum(pcf_name, pcf_variants, pcf_const, pcf_storage, pcf_line):
-                            continue if pcf_name != enum_name or pcf_variants.count == 0
-                            for common_index in 0..<commons.usize() |out, pcf_variants|:
+                            continue if pcf_name != enum_name or current_owner != target_owner or pcf_variants.count == 0
+                            for common_index in 0..<commons.usize() |out, pcf_variants, structs, enum_index|:
                                 break if common_index >= pcf_variants[0].field_names.count
                                 header_push(out, "    - ")
                                 header_push(out, pcf_variants[0].field_names[common_index])
@@ -37,8 +37,14 @@ extend Backend:
                                         header_push(out, pcf_type_name)
                                     _:
                                         header_push(out, "<type>")
-                                header_push(out, " inline row_field=")
-                                header_push_int(out, (1 + common_index).i64())
+                                if packed_common_is_inline_at_slot(structs, enum_index, common_index.u32()):
+                                    header_push(out, " inline row_field=")
+                                    header_push_int(out, packed_inline_common_row_field_index_at_slot(structs, enum_index, common_index.u32()).i64())
+                                else:
+                                    header_push(out, " side_table word_offset=")
+                                    header_push_int(out, packed_side_common_word_offset_at_slot(structs, enum_index, common_index.u32()).i64())
+                                    header_push(out, " words=")
+                                    header_push_int(out, packed_common_side_word_count(packed_common_type_at_slot(structs, enum_index, common_index.u32()), structs).i64())
                                 out.push(10)
                             return
 
@@ -91,6 +97,55 @@ extend Backend:
 
 
 
+        def packed_report_side_common_words(structs: mutable StructTable&, slot: usize, commons: u32) -> u32 can[Abort.Panic]:
+            return packed_side_common_word_count_at_slot(structs, slot.i64(), commons)
+
+
+
+        # The flat payload metadata is the source of truth for a packed row's payload width.
+        # Do not infer it by walking `Decl`: the self-hosting parser may retain a nested module
+        # wrapper or a synthesized declaration shape that is intentionally different from the
+        # backend's flattened variant pools. Match the metadata entry by the concrete variant
+        # names already registered for this slot; bare enum names alone are ambiguous across
+        # modules. Common fields are prepended to every variant, so remove exactly that prefix.
+        def packed_report_payload_words_from_metadata(file: Ast::File&, structs: StructTable&, slot: usize, commons: u32) -> i64 can[Abort.Panic]:
+            name: sview = structs.packed_names[slot]
+            packed_start: usize = structs.packed_variant_start[slot]
+            packed_count: usize = structs.packed_variant_count[slot]
+            selected: mutable i64 = -1
+            selected_score: mutable usize = 0
+            selected_ties: mutable usize = 0
+            for enum_index in 0..<file.payload_enum_names.count |file, structs, slot, name, packed_start, packed_count, selected, selected_score, selected_ties|:
+                continue if file.payload_enum_names[enum_index] != name
+                source_start: usize = file.payload_enum_variant_starts[enum_index]
+                source_count: usize = file.payload_enum_variant_counts[enum_index]
+                score: mutable usize = 0
+                for packed_offset in 0..<packed_count |score, file, structs, packed_start, source_start, source_count, packed_offset|:
+                    packed_variant: usize = packed_start + packed_offset
+                    continue if packed_variant >= structs.packed_variants.count
+                    for source_offset in 0..<source_count |score, file, structs, packed_variant, source_start|:
+                        source_variant: usize = source_start + source_offset
+                        score <- score + 1 if source_variant < file.payload_enum_variant_names.count and structs.packed_variants[packed_variant] == file.payload_enum_variant_names[source_variant]
+                continue if score == 0
+                if score > selected_score:
+                    selected <- enum_index
+                    selected_score <- score
+                    selected_ties <- 1
+                elif score == selected_score:
+                    selected_ties <- selected_ties + 1
+            return -1 if selected_ties != 1 or selected < 0
+            widest: mutable u32 = 0
+            variant_start: usize = file.payload_enum_variant_starts[selected.usize()]
+            variant_count: usize = file.payload_enum_variant_counts[selected.usize()]
+            for variant_offset in 0..<variant_count |file, variant_start, commons, widest|:
+                variant_index: usize = variant_start + variant_offset
+                continue if variant_index >= file.payload_enum_variant_field_counts.count
+                field_count: usize = file.payload_enum_variant_field_counts[variant_index]
+                payload_count: u32 = (field_count - commons.usize()).u32() if field_count >= commons.usize() else 0
+                widest <- payload_count if payload_count > widest
+            return widest.i64()
+
+
         # Lexicographic `a < b`, for the sorted variant list.
         def packed_name_less(a: sview, b: sview) -> bool can[Abort.Panic]:
             limit: usize = sview_len(a) if sview_len(a) < sview_len(b) else sview_len(b)
@@ -132,20 +187,33 @@ extend Backend:
         # `-emit packed` — the packed lowering profile, and every packed enum's ROW LAYOUT.
         #
         # Reports the canonical stage0 layout. Explicit `@storage(inline)` remains an inline
-        # common block; default common fields in dynamic AoS rows use the side table.
+        # common block; unannotated common fields use the side table.
         def generate_packed_report(file: Ast::File&, m: LLVMModuleRef, ctx: LLVMContextRef, target_data: LLVMTargetDataRef) -> darray[u8] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             structs: mutable StructTable = register_types_for_abi(file, ctx, target_data)
             top: mutable darray[Decl] = file.top_decls
-            for declaration in top |structs|:
-                register_packed_enum(declaration, file.packed_enum_names, file.enum_common_owners, file.enum_common_modules, file.enum_common_counts, &structs)
             out: mutable darray[u8] = []
             header_push(out, "packed lowering\n  contract: canonical-compiler-graph\n  canonical: variant-sparse\n  readonly publication gate: Frozen\n")
             reported: mutable usize = 0
-            for slot in 0..<structs.packed_names.count |out, structs, reported|:
+            reported_names: mutable darray[sview] = []
+            reported_owners: mutable darray[sview] = []
+            for slot in 0..<structs.packed_names.count |out, structs, reported, reported_names, reported_owners|:
                 # A placeholder row carries no variants; only a fully registered enum is a
                 # packed enum for reporting purposes, except for a sealed-hierarchy root whose
                 # descendants share its store and therefore make the root ABI observable.
                 continue if structs.packed_variant_count[slot] == 0 and not (packed_is_dynamic_aos_enum(structs, slot.i64()) and packed_name_is_hierarchy_root(structs, structs.packed_names[slot]))
+                report_owner: mutable sview = packed_owner_at(structs, slot)
+                ast_report_row: bool = packed_program_has_ast_refinements(structs) and (structs.packed_names[slot] == "Node" or packed_is_ast_refinement(structs, slot.i64()))
+                # The self-hosting metadata pass can leave both the canonical ownerless AST
+                # rows and an owner-qualified copy. Stage0 exposes one `Ast.*` row per type;
+                # suppress the duplicate and label the canonical row with its source module.
+                continue if ast_report_row and report_owner != ""
+                report_owner <- "Ast" if ast_report_row
+                already_reported: mutable bool = false
+                for reported_index in 0..<reported_names.count |already_reported, reported_names, reported_owners, report_owner, slot|:
+                    already_reported <- true if reported_names[reported_index] == structs.packed_names[slot] and reported_owners[reported_index] == report_owner
+                continue if already_reported
+                reported_names.push(structs.packed_names[slot])
+                reported_owners.push(report_owner)
                 reported <- reported + 1
                 dynamic_aos: bool = packed_is_dynamic_aos_enum(structs, slot.i64())
                 root_name: sview = packed_hierarchy_root_name(structs, structs.packed_names[slot])
@@ -156,18 +224,29 @@ extend Backend:
                 # many WORDS the side table actually holds, which counts only the commons that
                 # are not inline.
                 all_commons: u32 = packed_aos_common_count(structs, slot.i64()) if dynamic_aos else 0
-                side_words: u32 = packed_aos_side_common_count(structs, slot.i64()) if dynamic_aos else 0
                 is_dynamic_root: bool = dynamic_aos and root_slot == slot.i64()
                 commons: u32 = all_commons if dynamic_aos and is_dynamic_root else (structs.packed_common_counts[slot] if not dynamic_aos else 0)
+                if not dynamic_aos:
+                    declared_payload_words: i64 = packed_report_payload_words_from_metadata(file, structs, slot, commons)
+                    structs.packed_payload_words[slot] <- declared_payload_words.u32() if declared_payload_words >= 0
+                side_words: u32 = packed_aos_side_common_count(structs, slot.i64()) if dynamic_aos else packed_report_side_common_words(structs, slot, commons)
                 out.push(10)
+                header_push(out, report_owner)
+                header_push(out, ".") if report_owner != ""
                 header_push(out, structs.packed_names[slot])
                 header_push(out, "\n  effective abi: aos\n  row bytes: ") if dynamic_aos
                 header_push(out, "\n  effective abi: variant-sparse\n  row bytes: ") if not dynamic_aos
                 header_push_int(out, packed_row_bytes(structs, slot.i64()))
                 header_push(out, "\n  common prefix words: ")
-                # stage0 reports ONE prefix word whenever a root declares commons, whatever
-                # their storage: the prefix is the tag's word, which inline commons pack into.
-                header_push_int(out, (1 if is_dynamic_root and all_commons > 0 else (commons.i64())).i64())
+                # Report the physical boundary before the payload. A narrow inline common
+                # such as `f32` shares the tag's first machine word, while an aligned `i64`
+                # starts at the second; logical common counts cannot express that distinction.
+                prefix_words: mutable u32 = packed_legacy_payload_word_offset(structs, slot.i64()) if not dynamic_aos else 0
+                if dynamic_aos:
+                    prefix_row_type: LLVMTypeRef = packed_row_llvm_type(structs, slot.i64(), structs.context)
+                    prefix_field: u32 = packed_dynamic_payload_row_field_index(structs, slot.i64())
+                    prefix_words <- (LLVMOffsetOfElement(structs.target_data, prefix_row_type, prefix_field) / PACKED_U32_SIZE_BYTES).u32()
+                header_push_int(out, prefix_words.i64() if commons > 0 else 0)
                 header_push(out, "\n  side-table common words: ")
                 header_push_int(out, side_words.i64())
                 header_push(out, "\n  variants: ")
@@ -201,7 +280,7 @@ extend Backend:
                 # registered pool holds only the PAYLOAD fields — reading index 0 there
                 # returned the first payload field (`x`) where the common (`t`) was wanted.
                 packed_emit_common_fields_side_table(root_name, commons, structs, out) if dynamic_aos and is_dynamic_root
-                packed_emit_common_fields(top, structs.packed_names[slot], commons, out) if not dynamic_aos
+                packed_emit_common_fields(top, structs.packed_names[slot], packed_owner_at(structs, slot), "", commons, structs, slot.i64(), out) if not dynamic_aos
             header_push(out, "  enums: none\n") if reported == 0
             out.push(0)
             return out
