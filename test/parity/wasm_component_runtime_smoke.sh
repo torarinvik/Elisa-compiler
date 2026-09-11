@@ -32,6 +32,10 @@ build_fixture \
     "$ROOT/test/fixtures/wasm/component_const_width.elisa" \
     const_width
 build_fixture \
+    "$ROOT/test/fixtures/wasm/component_bounds_guard_width.wit" \
+    "$ROOT/test/fixtures/wasm/component_bounds_guard_width.elisa" \
+    bounds_guard_width
+build_fixture \
     "$ROOT/test/fixtures/wasm/component_cabi_realloc.wit" \
     "$ROOT/test/fixtures/wasm/component_cabi_realloc.elisa" \
     component
