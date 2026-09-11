@@ -57,6 +57,9 @@ fi
 # the project system's platform key (see register_target_consts / host_platform_name). stage0
 # reads runtime.GOOS; the self-hosted compiler reads these flags, exported once here.
 if [[ "$(uname -s)" == "Linux" ]]; then export ELISA_HOST_LINUX=1; fi
+# Set by hand to CROSS-compile for Windows; exported here too so a compiler built
+# under MSYS/MinGW answers its own platform rather than macOS.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export ELISA_HOST_WINDOWS=1 ;; esac
 if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
 # Include expansion is a host-side Python step. Resolve the same interpreter selected by
 # `PYTHON_BIN` (including a command name such as `python3.14`) before any emit mode runs so
