@@ -1,0 +1,187 @@
+# A container literal allocates, so it needs a REGION, and its region is inferred from its
+# DESTINATION. A literal written directly as a call argument has no destination of its own:
+#
+#     def take(xs: darray[i64]) -> i64: ...
+#     take([1, 2, 3])        # stage0: darray literal has no region to allocate in; ...
+#
+# stage0 checks this in its analyzer; stage1 had NO check — it accepted the darray form outright
+# and reached a bare backend DECLINE (exit 2, no diagnostic) for dict and set.
+#
+# SOUND SUBSET. `[...]` does NOT always need a region: it infers to a fixed `array[T, N]` (stack,
+# no region) just as readily as to a darray, and three adversarial programs proved the difference
+# matters — `values = [1, 2, 3, 4]` sliced into a view, `Wide.First([1, 2, 3, 4])` filling an
+# `array[i64, 4]` payload, and `m.push([1, 2])` into a `darray[i64[2]]` are all ACCEPTED by
+# stage0. Nothing syntactic distinguishes those from the region-bearing case, so this check
+# fires ONLY where the destination type is written down and is region-bearing:
+#
+#   * the callee must be a plain identifier naming a DECLARED function — which excludes enum
+#     constructors (`Wide.First(...)`) and method calls (`m.push(...)`), whose destination is a
+#     payload or element type this pass cannot see;
+#   * that function's parameter AT THIS POSITION must be annotated `darray[...]`, `dict[...]`
+#     or `set[...]`; a fixed `array[T, N]` parameter is stack-allocated and needs no region;
+#   * the literal's own shape must agree with it (`[...]`->darray, `{k: v}`->dict, `{a}`->set).
+#
+# An INFERRED binding (`xs = [...]`) is deliberately NOT flagged: whether it becomes a darray or
+# a fixed array depends on how it is later used, which is exactly the inference this pass lacks.
+extend Semantic:
+    private:
+        # "darray" / "dict" / "set" for a NON-EMPTY container literal, "" for anything else.
+        # An EMPTY literal allocates nothing, so it needs no region and stage0 accepts it in
+        # every position (`take([])` is fine where `take([1, 2, 3])` is not). stage1's own
+        # source passes `[]` as an argument in several places, which is how this was caught.
+        def clr_literal_kind(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Array(elements, array_pos):
+                        return "darray" if elements.count > 0 else sview("", 0, 0)
+                    Expr.DictLit(entries, dict_pos):
+                        return "dict" if entries.count > 0 else sview("", 0, 0)
+                    Expr.SetLit(elements_set, set_pos):
+                        return "set" if elements_set.count > 0 else sview("", 0, 0)
+                    _:
+                        return sview("", 0, 0)
+
+        def clr_literal_pos(expression: Ast::Expr) -> Ast::Pos:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Array(elements, array_pos):
+                        return array_pos
+                    Expr.DictLit(entries, dict_pos):
+                        return dict_pos
+                    Expr.SetLit(elements_set, set_pos):
+                        return set_pos
+                    _:
+                        return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+
+        # The region-bearing container head of a TYPE annotation — "darray"/"dict"/"set", or ""
+        # for anything else. A fixed `array[T, N]` and a bare `i64[2]` are stack storage and
+        # deliberately do not count.
+        def clr_container_head(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                head: mutable sview = ""
+                match type_expression:
+                    Expr.Index(object, index, index_line):
+                        head <- ident_name_of(object)
+                    Expr.IndexN(object_n, arguments_n, indexn_line):
+                        head <- ident_name_of(object_n)
+                    Expr.Unary(operator, operand, unary_line):
+                        return clr_container_head(operand)
+                    Expr.Paren(inner, paren_line):
+                        return clr_container_head(inner)
+                    _:
+                        pass
+                return when head:
+                    "darray" | "dict" | "set" -> head
+                    _ -> sview("", 0, 0)
+
+        # Parameter table: one row per (function name, parameter index) whose annotation is a
+        # region-bearing container.
+        def clr_collect_params(declarations: darray[Ast::Decl], names: mutable darray[sview]&, indices: mutable darray[u32]&, heads: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |names, indices, heads|:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            while position < parameters.count |position: usize = 0|:
+                                head: sview = clr_container_head(parameters[position].type_expression)
+                                if head != "":
+                                    names.push(function_name)
+                                    indices.push(position.u32())
+                                    heads.push(head)
+                                position <- position + 1
+                        Decl.Module(module_name, module_body, module_line):
+                            clr_collect_params(module_body, names, indices, heads)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            clr_collect_params(scoped_body, names, indices, heads)
+                        _:
+                            pass
+
+        def clr_param_head(names: darray[sview]&, indices: darray[u32]&, heads: darray[sview]&, callee: sview, position: u32) -> sview:
+            can Abort.Panic:
+                while index < names.count |index: usize = 0|:
+                    heads[index] return if names[index] == callee and indices[index] == position
+                    index <- index + 1
+                return sview("", 0, 0)
+
+        def clr_check_expression(expression: Ast::Expr, names: darray[sview]&, indices: darray[u32]&, heads: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        # A PLAIN identifier callee only: `Wide.First(...)` and `m.push(...)`
+                        # carry their destination in a payload/element type this pass cannot see.
+                        callee_name: mutable sview = ""
+                        match callee:
+                            Expr.Ident(ident_name, ident_pos):
+                                callee_name <- ident_name
+                            _:
+                                pass
+                        while position < arguments.count |position: usize = 0, table| -> table:
+                            argument: Ast::Expr = arguments[position]
+                            literal_kind: sview = clr_literal_kind(argument)
+                            if callee_name != "" and literal_kind != "":
+                                expected_head: sview = clr_param_head(names, indices, heads, callee_name, position.u32())
+                                if expected_head == literal_kind:
+                                    literal_pos: Ast::Pos = clr_literal_pos(argument)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ContainerLiteralNoRegion, name: literal_kind, line: literal_pos.line, pos: literal_pos, expected: "", actual: ""})
+                            table <- clr_check_expression(argument, names, indices, heads, table)
+                            position <- position + 1
+                    Expr.Binary(left, binary_operator, right, binary_pos):
+                        table <- clr_check_expression(left, names, indices, heads, table)
+                        table <- clr_check_expression(right, names, indices, heads, table)
+                    Expr.Unary(unary_operator, operand, unary_pos):
+                        table <- clr_check_expression(operand, names, indices, heads, table)
+                    Expr.Paren(inner, paren_pos):
+                        table <- clr_check_expression(inner, names, indices, heads, table)
+                    _:
+                        pass
+
+        def clr_check_statements(statements: darray[Ast::Stmt], in_region: bool, names: darray[sview]&, indices: darray[u32]&, heads: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            table <- clr_check_expression(expression, names, indices, heads, table) if not in_region
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- clr_check_expression(value, names, indices, heads, table) if not in_region
+                        Stmt.Assign(target, assign_operator, value, line):
+                            table <- clr_check_expression(value, names, indices, heads, table) if not in_region
+                        Stmt.Return(value, line):
+                            table <- clr_check_expression(returned, names, indices, heads, table) if value is returned and not in_region
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- clr_check_expression(condition, names, indices, heads, table) if not in_region
+                            table <- clr_check_statements(then_body, in_region, names, indices, heads, table)
+                            table <- clr_check_statements(else_body, in_region, names, indices, heads, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- clr_check_expression(condition, names, indices, heads, table) if not in_region
+                            table <- clr_check_statements(while_body, in_region, names, indices, heads, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- clr_check_statements(for_body, in_region, names, indices, heads, table)
+                        Stmt.Block(block_kind, clause, binding, body, block_line):
+                            # `in <region>:` supplies an ambient region to everything inside it.
+                            table <- clr_check_statements(body, in_region or block_kind == "in", names, indices, heads, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table| -> table:
+                                table <- clr_check_statements(arm.body, in_region, names, indices, heads, table)
+                        _:
+                            pass
+
+        def clr_check_declarations(declarations: darray[Ast::Decl], names: darray[sview]&, indices: darray[u32]&, heads: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- clr_check_statements(body, false, names, indices, heads, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- clr_check_declarations(module_body, names, indices, heads, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- clr_check_declarations(scoped_body, names, indices, heads, table)
+                        _:
+                            pass
+
+    public:
+        def check_container_literal_region(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                indices: mutable darray[u32] = []
+                heads: mutable darray[sview] = []
+                clr_collect_params(file.top_decls, names, indices, heads)
+                table <- clr_check_declarations(file.top_decls, names, indices, heads, table)

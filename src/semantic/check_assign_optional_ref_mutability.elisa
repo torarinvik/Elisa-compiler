@@ -1,0 +1,131 @@
+# Rebinding a LOCAL optional reference (`T&?`) must not widen the pointee's mutability.
+#
+#     dst: mutable heap u8&? = null
+#     src: heap u8&? = malloc(32)
+#     dst <- src            # stage0: cannot assign heap u8&? to heap mutable u8&?
+#
+# An optional reference is a nullable POINTER, so `<-` over one assigns the pointer itself
+# rather than writing through it. Storing a readonly-pointee pointer into a slot typed
+# mutable-pointee would hand out write access the source never had.
+#
+# SCOPE, derived from stage0 by probe rather than assumed:
+#   * only when the TARGET is a LOCAL (`Stmt.VarDecl`). A ref PARAMETER auto-dereferences on
+#     `<-` (it writes through), so `def f(dst: mutable heap u8&?, src: heap u8&?)` with
+#     `dst <- src` is ACCEPTED by stage0 and must stay accepted.
+#   * only for OPTIONAL refs. Scalar (`mutable i64&`) and non-optional heap refs auto-deref
+#     too; stage0 accepts both.
+#   * heap and non-heap alike (`mutable i64&?` <- `i64&?` is rejected the same way).
+# The SOURCE may be a local or a parameter; both are rejected by stage0.
+extend Semantic:
+    private:
+        # The decoration flags for stage0's canonical optional-reference spelling,
+        # `[heap ][mutable ]BASE&?` — note stage0 normalizes `mutable heap u8&?` to
+        # `heap mutable u8&?`, heap first. Passed as a small bitset and rendered in
+        # diagnostic_message rather than built here: a check has nowhere to own a
+        # constructed sview, which is why the sibling checks pass bare names too.
+        #   bit 0 = heap, bit 1 = mutable
+        def aorm_flags(type_expression: Ast::Expr) -> u32:
+            can Memory.Allocate, Abort.Panic:
+                flags: mutable u32 = 0
+                flags <- flags | 1 if type_marker_present_here(type_expression, TokenKind.Heap)
+                flags <- flags | 2 if type_marker_present_here(type_expression, TokenKind.Mutable)
+                return flags
+
+        # The pointee's bare name. bare_type_name_through_ref has no `Question` case, so it
+        # returns "" for an OPTIONAL reference (`u8&?` renders as `&?`); strip every type
+        # marker down to the identifier instead. Safe to be this permissive because the only
+        # callers below have already established the expression IS an optional reference.
+        def aorm_base_name(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        return aorm_base_name(operand)
+                    Expr.Paren(inner, paren_line):
+                        return aorm_base_name(inner)
+                    Expr.Ident(name, ident_line):
+                        return name
+                    _:
+                        return bare_type_name_through_ref(type_expression)
+
+        def aorm_is_optional_ref(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return type_marker_present_here(type_expression, TokenKind.Ampersand) and type_marker_present_here(type_expression, TokenKind.Question)
+
+        # Name -> declared type, for parameters and for locals introduced so far.
+        def aorm_lookup(names: darray[sview]&, type_expressions: darray[Ast::Expr]&, name: sview) -> (found: bool, type_expression: Ast::Expr):
+            can Abort.Panic:
+                while index < names.count |index: usize = 0|:
+                    (true, type_expressions[index]) return if names[index] == name and name != ""
+                    index <- index + 1
+                return (false, (Ast::Expr.Invalid))
+
+        # Was this name introduced by a LOCAL declaration (not a parameter)? Only locals rebind.
+        def aorm_is_local(local_names: darray[sview]&, name: sview) -> bool:
+            can Abort.Panic:
+                while index < local_names.count |index: usize = 0|:
+                    true return if local_names[index] == name and name != ""
+                    index <- index + 1
+                return false
+
+        def aorm_check_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, type_expressions: mutable darray[Ast::Expr]&, local_names: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, names, type_expressions, local_names| -> table:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            names.push(name)
+                            type_expressions.push(type_expression)
+                            local_names.push(name)
+                        Stmt.Assign(target, operator, value, line):
+                            if operator == TokenKind.LArrow:
+                                match target:
+                                    Expr.Ident(target_name, _):
+                                        match value:
+                                            Expr.Ident(value_name, _):
+                                                target_entry: (found: bool, type_expression: Ast::Expr) = aorm_lookup(names, type_expressions, target_name)
+                                                value_entry: (found: bool, type_expression: Ast::Expr) = aorm_lookup(names, type_expressions, value_name)
+                                                if target_entry.found and value_entry.found and aorm_is_local(local_names, target_name):
+                                                    target_widens: bool = aorm_is_optional_ref(target_entry.type_expression) and type_marker_present_here(target_entry.type_expression, TokenKind.Mutable)
+                                                    value_readonly: bool = aorm_is_optional_ref(value_entry.type_expression) and not type_marker_present_here(value_entry.type_expression, TokenKind.Mutable)
+                                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignOptionalRefMutability, name: target_name, line: line.line, pos: line, expected: aorm_base_name(target_entry.type_expression), actual: aorm_base_name(value_entry.type_expression), expected_count: aorm_flags(target_entry.type_expression), actual_count: aorm_flags(value_entry.type_expression)}) if target_widens and value_readonly
+                                            _:
+                                                pass
+                                    _:
+                                        pass
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            table <- aorm_check_statements(then_body, names, type_expressions, local_names, table)
+                            table <- aorm_check_statements(else_body, names, type_expressions, local_names, table)
+                        Stmt.While(condition, while_body, while_line):
+                            table <- aorm_check_statements(while_body, names, type_expressions, local_names, table)
+                        Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- aorm_check_statements(for_body, names, type_expressions, local_names, table)
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            table <- aorm_check_statements(body, names, type_expressions, local_names, table)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |table, names, type_expressions, local_names| -> table:
+                                table <- aorm_check_statements(arm.body, names, type_expressions, local_names, table)
+                        _:
+                            pass
+
+        def aorm_check_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            names: mutable darray[sview] = []
+                            type_expressions: mutable darray[Ast::Expr] = []
+                            local_names: mutable darray[sview] = []
+                            for parameter in parameters |names, type_expressions|:
+                                names.push(parameter.name)
+                                type_expressions.push(parameter.type_expression)
+                            table <- aorm_check_statements(body, names, type_expressions, local_names, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- aorm_check_declarations(module_body, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- aorm_check_declarations(scoped_body, table)
+                        _:
+                            pass
+
+    public:
+        def check_assign_optional_ref_mutability(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- aorm_check_declarations(file.top_decls, table)
