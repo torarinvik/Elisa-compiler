@@ -77,7 +77,14 @@ EOF
 "$ELISACORE_BIN" -emit header -o "$WORK/loop_smoke.h" "$FIX" >/dev/null
 "$ELISACORE_BIN" -emit obj -permissive -O2 -o "$WORK/loop_smoke.o" "$FIX" >/dev/null
 
-link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/loop_smoke.o" -o "$WORK/run")
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. These
+# links use -undefined,dynamic_lookup, which turns a missing one into a NULL
+# ADDRESS instead of a link error -- so the program built fine and then died with
+# SIGSEGV on the arena's first profiler call. Same cause 0b220f1a fixed for
+# resolve_smoke and check_self_hostable.
+source "$REPO_ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$WORK" "$REPO_ROOT"
+link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/loop_smoke.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$WORK/run")
 [[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
 [[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")
 clang "${link_flags[@]}"

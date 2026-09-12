@@ -21,7 +21,13 @@ if ! timeout 45 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/easm_effect_driver.o" 
     exit 1
 fi
 
-if ! timeout 45 "$CXX" "$BUILD/easm_effect_driver.o" -o "$BUILD/easm_effect_driver" \
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. The arena
+# calls the profiler ABI unconditionally, so without them this link fails on
+# _elisa_profile_* -- and here the error went to a log file, so the gate only ever
+# said "could not link".
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$BUILD" "$ROOT"
+if ! timeout 45 "$CXX" "$BUILD/easm_effect_driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$BUILD/easm_effect_driver" \
     -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)" \
     >"$BUILD/easm_effect_driver.linklog" 2>&1; then
     echo "easm_mc_effects_smoke FAILED: could not link effect driver"

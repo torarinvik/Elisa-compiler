@@ -26,7 +26,13 @@ RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
 
 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj.o" "$ROOT/test/breadth/emit_obj.elisa" 2>/dev/null \
   || { echo "backend_obj_smoke FAILED: could not compile emit_obj.elisa"; exit 1; }
-clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null \
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. The arena
+# calls the profiler ABI unconditionally, so without them this link fails on
+# _elisa_profile_* -- and here the error went to /dev/null, so the gate only ever
+# said "could not link".
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$BUILD" "$ROOT"
+clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null \
   || { echo "backend_obj_smoke FAILED: could not link emit_obj"; exit 1; }
 
 pass=0; total=0
@@ -259,7 +265,7 @@ debug_ir_case() {
     local dir="$BUILD/obj_dbgir"; mkdir -p "$dir"
     if [ ! -f "$BUILD/emit_obj_debug_ir" ]; then
         if ! "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj_debug_ir.o" "$ROOT/test/breadth/emit_obj_debug_ir.elisa" 2>/dev/null \
-           || ! clang -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
+           || ! clang -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
             echo "  FAIL obj_dbgir_$name: could not build emit_obj_debug_ir"; return
         fi
     fi
