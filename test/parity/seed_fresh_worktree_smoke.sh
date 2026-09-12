@@ -9,11 +9,21 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-seed-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 mkdir -p "$WORK/scripts" "$WORK/src/driver" "$WORK/core/compiler/bin" "$WORK/lib" "$WORK/tmp"
-# The wrapper sources its seed half, so the fixture worktree needs both files.
-for part in elisac_stage1.sh elisac_stage1_seed.sh; do
+# The wrapper sources its seed half, so the fixture worktree needs both files --
+# and the seed half shells out to write_profiler_hook_fallbacks.sh to refresh the
+# runtime's optional-hook object (3c7e6552), so that has to come along too or the
+# seed dies on a missing file in a worktree that is otherwise complete.
+for part in elisac_stage1.sh elisac_stage1_seed.sh write_profiler_hook_fallbacks.sh build_runtime_object.sh; do
   cp "$ROOT/scripts/$part" "$WORK/scripts/$part"
 done
 printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"
+# The seed builds the runtime object after the product (70589584), and that helper
+# reads elisacore_std/native_runtime_support.elisa and fingerprints the whole
+# directory. A clean worktree has one; this fixture stubs it, in keeping with the
+# stub stage0/clang above -- the gate is about lock and output ordering, not about
+# compiling a real runtime.
+mkdir -p "$WORK/elisacore_std"
+printf '%s\n' '# seed fixture runtime source' > "$WORK/elisacore_std/native_runtime_support.elisa"
 
 printf '%s\n' \
   '#!/usr/bin/env bash' \
