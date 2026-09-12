@@ -74,6 +74,24 @@ run_negative() {
     }
 }
 
+run_interpret_warning() {
+    local fixture="$1"
+    local expected="$2"
+    local stem="$(basename "$fixture" .elisa)"
+    "$ROOT/scripts/elisac_stage1.sh" -emit interpret \
+        "$ROOT/test/fixtures/effects/$fixture" \
+        >"$WORK/$stem.log" 2>&1 || {
+        echo "interpret failed for $fixture" >&2
+        sed -n '1,80p' "$WORK/$stem.log" >&2
+        return 1
+    }
+    grep -Fq "$expected" "$WORK/$stem.log" || {
+        echo "missing expected warning for $fixture: $expected" >&2
+        sed -n '1,80p' "$WORK/$stem.log" >&2
+        return 1
+    }
+}
+
 # These fixtures return distinct values so a wrong handler/module or swapped capture
 # can no longer pass merely because code generation succeeded.
 run_native_result() {
@@ -350,6 +368,7 @@ run_negative "handler_resume_non_tail.neg.elisa" 'handler "Bad" operation "ping"
 run_negative "handler_resume_nonvoid.neg.elisa" 'handler "Bad" operation "ping" is outside the zero-overhead resumable subset'
 run_negative "effectful_helper_unhandled.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
 run_negative "helper_mixed_unhandled.neg.elisa" 'effectful helper "emit_tick" requires an installed handler for abstract effect "Tick"'
+run_interpret_warning "deep_permission_alias_uncovered.warn.elisa" 'requires can[Deep00]'
 run_negative "helper_generic_specialization_mismatch.neg.elisa" 'abstract effect specialization mismatch'
 run_negative "helper_clone_private.neg.elisa" 'is private'
 
