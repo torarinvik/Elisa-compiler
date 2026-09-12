@@ -37,7 +37,12 @@ if ! "$EC" -emit obj -o "$BUILD/probe.o" "$ROOT/test/parity/ir_reader_probe.elis
     grep -v "warning:" "$BUILD/compile.log" | head -10
     exit 1
 fi
-if ! clang -o "$BUILD/probe" "$BUILD/probe.o" 2>"$BUILD/link.log"; then
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# Without them this link fails outright on _elisa_profile_* (the arena calls
+# the profiler ABI unconditionally), which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$BUILD" "$ROOT"
+if ! clang -o "$BUILD/probe" "$BUILD/probe.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" 2>"$BUILD/link.log"; then
     echo "FAIL: could not link the Elisa reader probe"
     head -10 "$BUILD/link.log"
     exit 1

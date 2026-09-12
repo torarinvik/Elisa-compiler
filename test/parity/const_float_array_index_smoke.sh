@@ -22,8 +22,13 @@ rg -q '@WEIGHTS = internal constant \[4 x double\]' "$TMP_DIR/stage1.ll"
 "$STAGE0" -emit obj -O0 -o "$TMP_DIR/stage0.o" "$FIXTURE" >/dev/null 2>&1
 "$STAGE1" -emit obj -O0 -o "$TMP_DIR/stage1.o" "$FIXTURE" >/dev/null 2>&1
 
-cc "$TMP_DIR/stage0.o" "$RUNTIME" -o "$TMP_DIR/stage0"
-cc "$TMP_DIR/stage1.o" "$RUNTIME" -o "$TMP_DIR/stage1"
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# The arena calls the profiler ABI unconditionally, so without them this link
+# fails on _elisa_profile_* -- which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$TMP_DIR" "$ROOT"
+cc "$TMP_DIR/stage0.o" "$RUNTIME" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$TMP_DIR/stage0"
+cc "$TMP_DIR/stage1.o" "$RUNTIME" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$TMP_DIR/stage1"
 set +e
 "$TMP_DIR/stage0"
 stage0_status=$?

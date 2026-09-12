@@ -27,8 +27,13 @@ EOF
 "$STAGE0" -emit obj -O2 -o "$TMP_DIR/stage0.o" "$FIXTURE" >"$TMP_DIR/stage0.log" 2>&1
 "$STAGE1" -emit obj -O2 -o "$TMP_DIR/stage1.o" "$FIXTURE" >"$TMP_DIR/stage1.log" 2>&1
 
-cc -std=c17 "$TMP_DIR/driver.c" "$TMP_DIR/stage0.o" "$RUNTIME" -o "$TMP_DIR/stage0"
-cc -std=c17 "$TMP_DIR/driver.c" "$TMP_DIR/stage1.o" "$RUNTIME" -o "$TMP_DIR/stage1"
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# The arena calls the profiler ABI unconditionally, so without them this link
+# fails on _elisa_profile_* -- which is what kept this gate red.
+source "$REPO_ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$TMP_DIR" "$REPO_ROOT"
+cc -std=c17 "$TMP_DIR/driver.c" "$TMP_DIR/stage0.o" "$RUNTIME" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$TMP_DIR/stage0"
+cc -std=c17 "$TMP_DIR/driver.c" "$TMP_DIR/stage1.o" "$RUNTIME" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$TMP_DIR/stage1"
 "$TMP_DIR/stage0"
 "$TMP_DIR/stage1"
 echo "conditional-postfix-i32-call smoke OK: stage0 and stage1 runtime results match at -O2"

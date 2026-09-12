@@ -12,7 +12,12 @@ mkdir -p "$BUILD"
 LIBDIR="$($LLVM_CONFIG --libdir)"
 
 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/driver.o" "$ROOT/test/breadth/emit_native.elisa" >/dev/null 2>&1
-clang -o "$BUILD/driver" "$BUILD/driver.o" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# Without them this link fails outright on _elisa_profile_* (the arena calls
+# the profiler ABI unconditionally), which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$BUILD" "$ROOT"
+clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
 
 src=$'@packed_profile(retained_reads)\npacked enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        n: Node = new Node.Leaf(v: 42)\n        result <- match n:\n            Node.Leaf(v): v\n            Node.Tag(t): t\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
 printf '%s' "$src" | "$BUILD/driver" > "$BUILD/profile.ll"

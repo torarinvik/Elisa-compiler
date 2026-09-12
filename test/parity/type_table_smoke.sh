@@ -50,7 +50,12 @@ EOF
 "$ELISACORE_BIN" -emit header -o "$WORK/type_table_smoke.h" "$FIX" >/dev/null
 "$ELISACORE_BIN" -emit obj -O2 -o "$WORK/type_table_smoke.o" "$FIX" >/dev/null
 
-clang -O2 -I "$WORK" "$WORK/driver.c" "$WORK/type_table_smoke.o" -o "$WORK/run"
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# The arena calls the profiler ABI unconditionally, so without them this link
+# fails on _elisa_profile_* -- which is what kept this gate red.
+source "$REPO_ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$WORK" "$REPO_ROOT"
+clang -O2 -I "$WORK" "$WORK/driver.c" "$WORK/type_table_smoke.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$WORK/run"
 
 OUT="$("$WORK/run")"
 read -r PASSED TOTAL <<<"$OUT"
