@@ -140,6 +140,66 @@ extend Parser:
             return sview(&parser.module_name_storage[start], 0, count)
 
 
+        # The pattern-path variant of normalize_module_name_separators: every separator
+        # but the LAST is a module separator (`Pack.Kind.A` -> `Pack::Kind.A`); the last one
+        # selects the variant and keeps its spelling.
+        def normalize_leading_module_separators[@r](parser: mutable Parser& @r, name: sview) -> sview:
+            length: usize = sview_len(name)
+            last_separator: mutable usize = length
+            scan: mutable usize = 0
+            while scan < length |scan, length, last_separator, name|:
+                byte: u8 = sview_at(name, scan)
+                last_separator <- scan if byte == 46 or (byte == 58 and (scan == 0 or sview_at(name, scan - 1.usize()) != 58))
+                scan <- scan + 1.usize()
+            name return if last_separator == length
+            parser.module_name_storage.reserve(parser.tokens.count * 64 + 4096) if parser.module_name_storage.count == 0
+            start: usize = parser.module_name_storage.count
+            index: mutable usize = 0
+            while index < length |index, length, last_separator, parser, name|:
+                if sview_at(name, index) == 46 and index != last_separator:
+                    parser.module_name_storage.push(58)
+                    parser.module_name_storage.push(58)
+                else:
+                    parser.module_name_storage.push(sview_at(name, index))
+                index <- index + 1.usize()
+            count: usize = parser.module_name_storage.count - start
+            return sview(&parser.module_name_storage[start], 0, count)
+
+
+        # Token index of the last identifier of the `Ident (. | ::) Ident ...` chain that
+        # starts at token `start` (== start when there is no chain).
+        def qualified_chain_end(parser: Parser&, start: usize) -> usize:
+            end: mutable usize = start
+            while end + 2.usize() < parser.tokens.count and (parser.tokens[end + 1.usize()].kind == TokenKind.Dot or parser.tokens[end + 1.usize()].kind == TokenKind.Scope) and parser.tokens[end + 2.usize()].kind == TokenKind.Ident |end, parser|:
+                end <- end + 2.usize()
+            return end
+
+
+        def qualified_chain_has_dot(parser: Parser&, start: usize, end: usize) -> bool:
+            index: mutable usize = start + 1.usize()
+            while index < end |index, end, parser|:
+                true return if parser.tokens[index].kind == TokenKind.Dot
+                index <- index + 2.usize()
+            return false
+
+
+        # A qualified name in a DECLARATION type position -- a generic bound, an `impl`
+        # interface, a protocol/enum parent, a `from` import source -- can only ever walk
+        # modules, so every separator must be `::`. Reported at the head identifier with the
+        # corrected spelling, the same sentence as `module A.B:` (stage0:
+        # parser.parseQualifiedDeclName). The chain itself is left for the caller's scan.
+        def reject_dotted_type_chain(parser: lmut Parser, start: usize) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if start >= parser.tokens.count or parser.tokens[start].kind != TokenKind.Ident
+                end: usize = qualified_chain_end(parser, start)
+                return if end == start or not qualified_chain_has_dot(parser, start, end)
+                head_token: Token = parser.tokens[start]
+                last_token: Token = parser.tokens[end]
+                spelled: sview = parser.span_view(head_token.start.usize(), last_token.start.usize() + last_token.length.usize())
+                corrected: sview = parser.normalize_module_name_separators(spelled)
+                parser <- parser.error_named(Ast::ParseErrorKind.ModulePathDotSeparator, head_token, corrected, "", 0, head_token.column + head_token.length)
+
+
         def module_name_is_qualified(name: sview) -> bool:
             for index in 0..<sview_len(name):
                 true return if sview_at(name, index) == 58 or sview_at(name, index) == 46
@@ -325,12 +385,33 @@ extend Parser:
             parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: alias_name, name: "__using_alias", line: alias_token.line, offset: alias_token.start})
             parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_module, name: "__using_alias_target", line: alias_token.line, offset: alias_token.start})
 
+        # A `using` target is a module path (`::` only -- a `.` is rejected like every
+        # other module path). stage0's rule (parser.parseUsingDecl): with an `as` alias the
+        # whole chain is the aliased module; otherwise a MULTI-segment chain is SELECTIVE --
+        # the last segment is the member, everything before it the module -- and a single
+        # name is a wildcard import. The previous version kept only the first token, so
+        # `using Pack::Sub::f` silently became a wildcard `using Pack`.
         def consume_using_target(parser: lmut Parser) -> void:
-            target_token: Token = parser.cursor()
-            target_module: sview = Lexer::text_or_empty(target_token, parser.source)
-            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: target_module, name: "__using", line: target_token.line, offset: target_token.start})
-            parser <- parser.skip_using_target()
-            parser <- parser.using_alias(target_module)
+            can Memory.Allocate, Abort.Panic:
+                target_token: Token = parser.cursor()
+                start: usize = parser.position
+                end: usize = qualified_chain_end(parser, start)
+                parser <- parser.reject_dotted_type_chain(start)
+                last_token: Token = parser.tokens[end]
+                full_text: sview = parser.span_view(target_token.start.usize(), last_token.start.usize() + last_token.length.usize())
+                alias_follows: bool = parser.tokens[end + 1.usize()].kind == TokenKind.As if end + 1.usize() < parser.tokens.count else false
+                if end > start and not alias_follows:
+                    module_last: Token = parser.tokens[end - 2.usize()]
+                    module_text: sview = parser.span_view(target_token.start.usize(), module_last.start.usize() + module_last.length.usize())
+                    member_text: sview = Lexer::text_or_empty(last_token, parser.source)
+                    parser <- parser.record_from_import_member(member_text, module_text, target_token.line)
+                    # The formatter prints this back as `using MODULE::member` (stage0 keeps a
+                    # UsingDecl with its Member); the `__from_*` rows above carry the import.
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: module_text, name: "__using_member", line: target_token.line, module: member_text, offset: target_token.start})
+                else:
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: full_text, name: "__using", line: target_token.line, offset: target_token.start})
+                parser <- parser.skip_using_target()
+                parser <- parser.using_alias(full_text)
 
         def using_declaration(parser: lmut Parser) -> void:
             parser, _ <- parser.advance()                       # `using`
@@ -361,6 +442,7 @@ extend Parser:
         # leading `from Mod import` header tokens are skipped; every identifier after the
         # `import` keyword is a brought-in member (commas separate them).
         def from_import_declaration(parser: lmut Parser) -> void:
+            from_token: Token = parser.cursor()
             parser, _ <- parser.advance()                       # `from`
             machine over parser.position while true:
                 state Scan(past_import: bool, source_module: sview)
@@ -380,9 +462,16 @@ extend Parser:
                     -> Scan(true, source_module)
 
                 Scan(false, source_module), _ if source_module == "" and parser.peek() == TokenKind.Ident:
+                    # The source module is the whole `::` chain (`from Pack::Sub import f`);
+                    # a `.` in it is rejected like every other module path.
                     source_token: Token = parser.cursor()
-                    source_text: sview = Lexer::text_or_empty(source_token, parser.source)
-                    parser.position <- parser.position + 1
+                    source_start: usize = parser.position
+                    chain_end: usize = qualified_chain_end(parser, source_start)
+                    chain_last: Token = parser.tokens[chain_end]
+                    source_text: sview = parser.span_view(source_token.start.usize(), chain_last.start.usize() + chain_last.length.usize())
+                    parser <- parser.reject_dotted_type_chain(source_start)
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: source_text, name: "__from_decl", line: source_token.line, offset: from_token.start})
+                    parser.position <- chain_end + 1.usize()
                     -> Scan(false, source_text)
 
                 Scan(past_import, source_module), _:

@@ -1,0 +1,299 @@
+# Module-path separator rule in TYPE position (owner ruling 2026-09-12): `::` is the only
+# way to walk a module, `.` reaches a value member or an enum variant. A type name spelled
+# `Pack.Item` where `Pack` is a module is therefore rejected -- byte-identical to stage0's
+# analyzer (rejectDotModulePath): `"Pack" is a namespace; write Pack::Item (...)` at the
+# head identifier's span. A `.` whose left side is a TYPE stays legal (`Expr.Store[...]`,
+# a packed enum's variant type), which is why this is a semantic check and not a parse
+# error: the parser cannot tell `Pack.Item` from `Kind.A`.
+#
+# Positions covered mirror stage0's resolveType: parameter, return, local, const, struct
+# field, enum payload and alias annotations, plus the element types inside `darray[..]`,
+# `T&`, `T?`, tuples and refinements. The value-position twin lives in resolve_expr_walk.
+
+extend Semantic:
+    private:
+        # Flatten an `Ident (. | ::) Ident ...` chain into its segments; `dotted[i]` says
+        # whether the separator BEFORE names[i + 1] was `.`. False for any other shape.
+        def type_path_collect(expression: Ast::Expr, names: mutable darray[sview]&, dotted: mutable darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(ident_name, ident_pos):
+                        names.push(ident_name)
+                        return true
+                    Expr.Field(field_object, field_name, field_pos):
+                        false return if not type_path_collect(field_object, names, dotted)
+                        names.push(field_name)
+                        dotted.push(true)
+                        return true
+                    Expr.Scope(scope_base, scope_name, scope_pos):
+                        false return if not type_path_collect(scope_base, names, dotted)
+                        names.push(scope_name)
+                        dotted.push(false)
+                        return true
+                    _:
+                        return false
+
+
+        def type_path_head_pos(expression: Ast::Expr) -> Ast::Pos:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(head_name, head_pos):
+                        return head_pos
+                    Expr.Field(head_field_object, head_field_name, head_field_pos):
+                        return type_path_head_pos(head_field_object)
+                    Expr.Scope(head_scope_base, head_scope_name, head_scope_pos):
+                        return type_path_head_pos(head_scope_base)
+                    _:
+                        return Ast::pos_at_line(0)
+
+
+        # `candidate == prefix ++ "::" ++ names[from] ++ "::" ++ ... ++ names[count - 1]`
+        # (the `prefix ++ "::"` part only when prefix is non-empty), compared piecewise so
+        # no name is allocated just to be looked up.
+        def module_symbol_matches(candidate: sview, prefix: sview, names: darray[sview]&, from: usize, count: usize) -> bool:
+            can Abort.Panic:
+                cursor: mutable usize = 0
+                candidate_length: usize = sview_len(candidate)
+                prefix_length: usize = sview_len(prefix)
+                if prefix_length > 0:
+                    for offset in 0..<prefix_length |cursor, candidate, candidate_length, prefix|:
+                        false return if cursor >= candidate_length or sview_at(candidate, cursor) != sview_at(prefix, offset)
+                        cursor <- cursor + 1.usize()
+                    false return if cursor + 2.usize() > candidate_length or sview_at(candidate, cursor) != 58 or sview_at(candidate, cursor + 1.usize()) != 58
+                    cursor <- cursor + 2.usize()
+                for index in from..<count |cursor, candidate, candidate_length, names, from|:
+                    if index > from:
+                        false return if cursor + 2.usize() > candidate_length or sview_at(candidate, cursor) != 58 or sview_at(candidate, cursor + 1.usize()) != 58
+                        cursor <- cursor + 2.usize()
+                    segment: sview = names[index]
+                    for offset in 0..<sview_len(segment) |cursor, candidate, candidate_length, segment|:
+                        false return if cursor >= candidate_length or sview_at(candidate, cursor) != sview_at(segment, offset)
+                        cursor <- cursor + 1.usize()
+                return cursor == candidate_length
+
+
+        # `candidate == ANCESTOR ++ "::" ++ path` where ANCESTOR is `enclosing` or any of
+        # its ancestors (`Outer::Mid` -> `Outer`): a module body may name a sibling module
+        # by its unqualified name, and stage0 resolves it against each enclosing namespace.
+        def module_symbol_matches_relative(candidate: sview, enclosing: sview, names: darray[sview]&, count: usize) -> bool:
+            can Abort.Panic:
+                path_length: mutable usize = 0
+                for index in 0..<count |path_length, names|:
+                    path_length <- path_length + sview_len(names[index]) + 2.usize()
+                path_length <- path_length - 2.usize()
+                candidate_length: usize = sview_len(candidate)
+                false return if candidate_length < path_length + 3.usize()
+                ancestor_length: usize = candidate_length - path_length - 2.usize()
+                false return if sview_at(candidate, ancestor_length) != 58 or sview_at(candidate, ancestor_length + 1.usize()) != 58
+                enclosing_length: usize = sview_len(enclosing)
+                false return if enclosing_length < ancestor_length
+                false return if enclosing_length > ancestor_length and (sview_at(enclosing, ancestor_length) != 58 or sview_at(enclosing, ancestor_length + 1.usize()) != 58)
+                for offset in 0..<ancestor_length |candidate, enclosing|:
+                    false return if sview_at(candidate, offset) != sview_at(enclosing, offset)
+                cursor: mutable usize = ancestor_length + 2.usize()
+                for index in 0..<count |cursor, candidate, candidate_length, names|:
+                    if index > 0:
+                        false return if cursor + 2.usize() > candidate_length or sview_at(candidate, cursor) != 58 or sview_at(candidate, cursor + 1.usize()) != 58
+                        cursor <- cursor + 2.usize()
+                    segment: sview = names[index]
+                    for offset in 0..<sview_len(segment) |cursor, candidate, candidate_length, segment|:
+                        false return if cursor >= candidate_length or sview_at(candidate, cursor) != sview_at(segment, offset)
+                        cursor <- cursor + 1.usize()
+                return cursor == candidate_length
+
+
+        # Does names[0..count) name a declared module -- absolutely, relative to the
+        # enclosing module chain, or through a `using M as A` alias at its head?
+        def type_path_prefix_is_module(names: darray[sview]&, count: usize, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                false return if count == 0
+                for symbol in table.symbols |names, count, enclosing, alias_names, alias_targets|:
+                    continue if symbol.kind != SymbolKind.Module
+                    true return if module_symbol_matches(symbol.name, sview("", 0, 0), names, 0, count)
+                    true return if enclosing != "" and module_symbol_matches_relative(symbol.name, enclosing, names, count)
+                    for alias_index in 0..<alias_names.count |symbol, names, count, alias_names, alias_targets|:
+                        continue if alias_names[alias_index] != names[0]
+                        true return if count == 1
+                        true return if module_symbol_matches(symbol.name, alias_targets[alias_index], names, 1, count)
+                # A bare alias with no matching module symbol still names the module.
+                true return if count == 1 and (any alias_name in alias_names where alias_name == names[0])
+                return false
+
+
+        # names[from..count) re-joined: separator i (before names[i + 1]) renders as `::`
+        # when i < scoped_below or it was spelled `::`, else as the `.` it was. Lives in
+        # table.text_storage; empty when the storage is exhausted.
+        def type_path_text(names: darray[sview]&, from: usize, count: usize, dotted: darray[bool]&, scoped_below: usize, table: lmut SymbolTable) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                needed: mutable usize = 0
+                for index in from..<count |needed, names|:
+                    needed <- needed + sview_len(names[index]) + 2.usize()
+                table.text_storage.reserve(65536) if table.text_storage.count == 0
+                sview("", 0, 0) return if table.text_storage.count + needed > 65536.usize()
+                start: usize = table.text_storage.count
+                for index in from..<count |table| -> table:
+                    if index > from:
+                        scoped: bool = index - 1.usize() < scoped_below or not dotted[index - 1.usize()]
+                        table.text_storage.push(58) if scoped
+                        table.text_storage.push(58) if scoped
+                        table.text_storage.push(46) if not scoped
+                    segment: sview = names[index]
+                    for offset in 0..<sview_len(segment) |table| -> table:
+                        table.text_storage.push(sview_at(segment, offset))
+                stop: usize = table.text_storage.count
+                return sview(&table.text_storage[start], 0, stop - start)
+
+
+        # The check proper for one chain. `module_depth` is the longest module prefix; a
+        # `.` inside it is the defect, reported once at the head with stage0's spelling:
+        # the FIRST module prefix followed by `.` is the quoted name, the whole corrected
+        # path the suggestion.
+        def check_type_path_chain(expression: Ast::Expr, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                dotted: mutable darray[bool] = []
+                return if not type_path_collect(expression, names, dotted)
+                return if names.count < 2
+                module_depth: mutable usize = 0
+                for count in 1..<names.count |module_depth, names, enclosing, alias_names, alias_targets, table|:
+                    module_depth <- count if type_path_prefix_is_module(names, count, enclosing, alias_names, alias_targets, table)
+                return if module_depth == 0
+                offending: mutable usize = names.count
+                for index in 0..<module_depth |offending, names, dotted|:
+                    offending <- index if offending == names.count and dotted[index]
+                return if offending == names.count
+                rebind prefix_text: sview, table = type_path_text(names, 0, offending + 1.usize(), dotted, module_depth, table)
+                rebind tail_text: sview, table = type_path_text(names, offending + 1.usize(), names.count, dotted, module_depth, table)
+                head: Ast::Pos = type_path_head_pos(expression)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NamespaceUsedAsValue, name: prefix_text, pos: head, line: head.line, expected: tail_text, actual: ""})
+
+
+        # A PATTERN-style path (`is Pack.Kind.A(x)`, `as Pack.Kind.A`): stage0 parses these
+        # and applies the syntactic rule -- every separator but the last is a module
+        # separator -- so the sentence is the parse error's, not the namespace one.
+        def check_pattern_path_chain(expression: Ast::Expr, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview] = []
+                dotted: mutable darray[bool] = []
+                return if not type_path_collect(expression, names, dotted)
+                return if names.count < 3
+                nonlast_dot: mutable bool = false
+                for index in 0..<(names.count - 2.usize()) |nonlast_dot, dotted|:
+                    nonlast_dot <- true if dotted[index]
+                return if not nonlast_dot
+                rebind corrected: sview, table = type_path_text(names, 0, names.count, dotted, names.count - 2.usize(), table)
+                head: Ast::Pos = type_path_head_pos(expression)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ModulePathDotSeparator, name: corrected, pos: head, line: head.line, expected: "", actual: ""})
+
+
+        # The `is` / `as` right-hand side, reached from the value walker. A payload pattern
+        # (`Pack.Kind.A(x)`) and every `as` target parse as patterns in stage0; a bare `is`
+        # target parses as a type.
+        def check_is_target_path(expression: Ast::Expr, is_as: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                no_aliases: darray[sview] = []
+                # Copied out first: `table` is linear-mutable, and naming a field of it in
+                # the same call that threads it would alias the binding.
+                enclosing: sview = table.current_module
+                match expression:
+                    Expr.Paren(paren_inner, paren_pos):
+                        table <- check_is_target_path(paren_inner, is_as, table)
+                    Expr.Call(call_callee, call_arguments, call_names, call_pos):
+                        table <- check_pattern_path_chain(call_callee, table)
+                    _:
+                        if is_as:
+                            table <- check_pattern_path_chain(expression, table)
+                        else:
+                            table <- check_type_path_chain(expression, enclosing, no_aliases, no_aliases, table)
+
+
+        # Descend a type annotation to every named-type position inside it.
+        def check_type_path_expression(expression: Ast::Expr, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(tp_field_object, tp_field_name, tp_field_pos):
+                        table <- check_type_path_chain(expression, enclosing, alias_names, alias_targets, table)
+                    Expr.Scope(tp_scope_base, tp_scope_name, tp_scope_pos):
+                        table <- check_type_path_chain(expression, enclosing, alias_names, alias_targets, table)
+                    Expr.Index(tp_index_object, tp_index_argument, tp_index_pos):
+                        table <- check_type_path_expression(tp_index_object, enclosing, alias_names, alias_targets, table)
+                        table <- check_type_path_expression(tp_index_argument, enclosing, alias_names, alias_targets, table)
+                    Expr.IndexN(tp_indexn_object, tp_indexn_arguments, tp_indexn_pos):
+                        table <- check_type_path_expression(tp_indexn_object, enclosing, alias_names, alias_targets, table)
+                        for tp_indexn_argument in tp_indexn_arguments |table| -> table:
+                            table <- check_type_path_expression(tp_indexn_argument, enclosing, alias_names, alias_targets, table)
+                    Expr.Unary(tp_unary_operator, tp_unary_operand, tp_unary_pos):
+                        table <- check_type_path_expression(tp_unary_operand, enclosing, alias_names, alias_targets, table)
+                    Expr.Paren(tp_paren_inner, tp_paren_pos):
+                        table <- check_type_path_expression(tp_paren_inner, enclosing, alias_names, alias_targets, table)
+                    Expr.Tuple(tp_tuple_elements, tp_tuple_pos):
+                        for tp_tuple_element in tp_tuple_elements |table| -> table:
+                            table <- check_type_path_expression(tp_tuple_element, enclosing, alias_names, alias_targets, table)
+                    Expr.Refinement(tp_refinement_base, tp_refinement_predicate, tp_refinement_pos):
+                        table <- check_type_path_expression(tp_refinement_base, enclosing, alias_names, alias_targets, table)
+                    _:
+                        pass
+
+
+        def check_type_paths_in_body(statements: darray[Ast::Stmt], enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table| -> table:
+                    match statement:
+                        Stmt.VarDecl(tp_var_name, tp_var_type, tp_var_value, tp_var_line):
+                            table <- check_type_path_expression(tp_var_type, enclosing, alias_names, alias_targets, table)
+                        Stmt.If(tp_if_condition, tp_then_body, tp_else_body, tp_if_line):
+                            table <- check_type_paths_in_body(tp_then_body, enclosing, alias_names, alias_targets, table)
+                            table <- check_type_paths_in_body(tp_else_body, enclosing, alias_names, alias_targets, table)
+                        Stmt.While(tp_while_condition, tp_while_body, tp_while_line):
+                            table <- check_type_paths_in_body(tp_while_body, enclosing, alias_names, alias_targets, table)
+                        Stmt.For(tp_for_bind, tp_for_variables, tp_for_iterable, tp_for_body, tp_for_line):
+                            table <- check_type_paths_in_body(tp_for_body, enclosing, alias_names, alias_targets, table)
+                        Stmt.Block(tp_block_kind, tp_block_clause, tp_block_binding, tp_block_body, tp_block_line):
+                            table <- check_type_paths_in_body(tp_block_body, enclosing, alias_names, alias_targets, table)
+                        Stmt.Match(tp_match_scrutinee, tp_match_arms, tp_match_line):
+                            for tp_arm in tp_match_arms |table| -> table:
+                                table <- check_type_paths_in_body(tp_arm.body, enclosing, alias_names, alias_targets, table)
+                        _:
+                            pass
+
+
+        def check_type_paths_in_declarations(declarations: darray[Ast::Decl], enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(tp_fn_name, tp_fn_params, tp_fn_return, tp_fn_body, tp_fn_effects, tp_fn_decorators, tp_fn_line):
+                            for tp_param in tp_fn_params |table| -> table:
+                                table <- check_type_path_expression(tp_param.type_expression, enclosing, alias_names, alias_targets, table)
+                            if tp_fn_return is tp_fn_return_expr:
+                                table <- check_type_path_expression(tp_fn_return_expr, enclosing, alias_names, alias_targets, table)
+                            table <- check_type_paths_in_body(tp_fn_body, enclosing, alias_names, alias_targets, table)
+                        Decl.Const(tp_const_name, tp_const_type, tp_const_value, tp_const_mutable, tp_const_line):
+                            table <- check_type_path_expression(tp_const_type, enclosing, alias_names, alias_targets, table)
+                        Decl.Struct(tp_struct_name, tp_struct_members, tp_struct_affinity, tp_struct_states, tp_struct_derive, tp_struct_invariants, tp_struct_line):
+                            for tp_member in tp_struct_members |table| -> table:
+                                table <- check_type_path_expression(tp_member.type_expression, enclosing, alias_names, alias_targets, table)
+                        Decl.Enum(tp_enum_name, tp_enum_variants, tp_enum_const, tp_enum_storage, tp_enum_line):
+                            for tp_variant in tp_enum_variants |table| -> table:
+                                for tp_payload in tp_variant.fields |table| -> table:
+                                    table <- check_type_path_expression(tp_payload, enclosing, alias_names, alias_targets, table)
+                        Decl.Alias(tp_alias_name, tp_alias_target, tp_alias_line):
+                            table <- check_type_path_expression(tp_alias_target, enclosing, alias_names, alias_targets, table)
+                        Decl.Module(tp_module_name, tp_module_body, tp_module_line):
+                            table <- check_type_paths_in_declarations(tp_module_body, tp_module_name, alias_names, alias_targets, table)
+                        Decl.Scoped(tp_scoped_body, tp_scoped_line):
+                            table <- check_type_paths_in_declarations(tp_scoped_body, enclosing, alias_names, alias_targets, table)
+                        _:
+                            pass
+
+    public:
+        def check_type_path_separator(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                alias_names: mutable darray[sview] = []
+                alias_targets: mutable darray[sview] = []
+                for target_row in file.enum_annotations |alias_names, alias_targets, file|:
+                    continue if target_row.name != "__using_alias_target"
+                    for alias_row in file.enum_annotations |alias_names, alias_targets, target_row|:
+                        if alias_row.name == "__using_alias" and alias_row.line == target_row.line:
+                            alias_names.push(alias_row.owner)
+                            alias_targets.push(target_row.owner)
+                table <- check_type_paths_in_declarations(file.top_decls, sview("", 0, 0), alias_names, alias_targets, table)
