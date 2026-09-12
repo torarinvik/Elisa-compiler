@@ -25,6 +25,9 @@ printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"
 mkdir -p "$WORK/elisacore_std"
 printf '%s\n' '# seed fixture runtime source' > "$WORK/elisacore_std/native_runtime_support.elisa"
 
+# The stubs write a BYTE, not an empty file: build_runtime_object.sh refuses to
+# publish a zero-length runtime object now, and a stub that produces nothing makes
+# the seed fail for a reason this gate is not about.
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -35,7 +38,7 @@ printf '%s\n' \
   '  [[ "$arg" == "-o" ]] && need_out=1' \
   'done' \
   '[[ -n "$out" ]]' \
-  ': > "$out"' \
+  'printf "fake product\\n" > "$out"' \
   > "$WORK/core/compiler/bin/elisac"
 chmod +x "$WORK/core/compiler/bin/elisac"
 
@@ -46,19 +49,35 @@ printf '%s\n' \
   > "$WORK/llvm-config"
 chmod +x "$WORK/llvm-config"
 
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'out=""' \
-  'need_out=0' \
-  'for arg in "$@"; do' \
-  '  if [[ "$need_out" == 1 ]]; then out="$arg"; need_out=0; continue; fi' \
-  '  [[ "$arg" == "-o" ]] && need_out=1' \
-  'done' \
-  '[[ -n "$out" ]]' \
-  ': > "$out"' \
-  'chmod +x "$out"' \
-  > "$WORK/clang"
+# The stage1 PRODUCT this stub "links" is executed by the seed to build the runtime
+# object, so it has to be a working script rather than a touched file -- and it has to
+# write a non-empty object, because build_runtime_object.sh refuses to publish a
+# zero-length one now. Written as a heredoc: the nested quoting of the printf-args form
+# was unreadable and got the escaping wrong twice.
+cat > "$WORK/clang" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+need_out=0
+for arg in "$@"; do
+  if [[ "$need_out" == 1 ]]; then out="$arg"; need_out=0; continue; fi
+  [[ "$arg" == "-o" ]] && need_out=1
+done
+[[ -n "$out" ]]
+cat > "$out" <<'PRODUCT'
+#!/usr/bin/env bash
+set -uo pipefail
+o=""
+n=0
+for a in "$@"; do
+  if [[ "$n" == 1 ]]; then o="$a"; n=0; continue; fi
+  [[ "$a" == "-o" ]] && n=1
+done
+[[ -n "$o" ]] && printf 'fake object\n' > "$o"
+exit 0
+PRODUCT
+chmod +x "$out"
+STUB
 chmod +x "$WORK/clang"
 
 FAKE_LLVM_LIBDIR="$WORK/lib" \
