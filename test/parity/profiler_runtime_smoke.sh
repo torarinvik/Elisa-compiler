@@ -54,4 +54,25 @@ clang -Wl,-dead_strip -o "$BUILD/stage1" \
     "$COLLECTOR_OBJ" "$BUILD/stage1.o" "$RUNTIME_OBJ"
 "$BUILD/stage1"
 
+FREE_COLLECTOR_OBJ="$BUILD/profile_arena_free_collector.o"
+clang -std=c11 -O2 -Wall -Wextra -Werror -c \
+    -o "$FREE_COLLECTOR_OBJ" "$ROOT/test/parity/profile_arena_free_collector.c"
+
+# This focused probe includes the vendored arena implementation so both compiler
+# stages exercise the same exact source and the collector can filter by arena ID.
+# Use c-archive for stage1 here to avoid linking a second copy of the runtime object.
+"$STAGE0_BIN" -emit c-archive -O2 \
+    -o "$BUILD/stage0_arena_free.a" "$ROOT/test/parity/profiler_arena_free_smoke.elisa" \
+    >"$BUILD/stage0_arena_free.log" 2>&1
+clang -Wl,-dead_strip -o "$BUILD/stage0_arena_free" \
+    "$FREE_COLLECTOR_OBJ" "$BUILD/stage0_arena_free.a"
+"$BUILD/stage0_arena_free"
+
+"$STAGE1_BIN" -emit c-archive -O2 \
+    -o "$BUILD/stage1_arena_free.a" "$ROOT/test/parity/profiler_arena_free_smoke.elisa" \
+    >"$BUILD/stage1_arena_free.log" 2>&1
+clang -Wl,-dead_strip -o "$BUILD/stage1_arena_free" \
+    "$FREE_COLLECTOR_OBJ" "$BUILD/stage1_arena_free.a"
+"$BUILD/stage1_arena_free"
+
 echo "profiler runtime smoke passed under stage0 and stage1"
