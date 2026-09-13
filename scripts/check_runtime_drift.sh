@@ -21,13 +21,16 @@ if [[ ! -d "$CANONICAL" ]]; then
 	exit 2
 fi
 
-if diff -rq "$CANONICAL" "$VENDORED" >/tmp/runtime_drift.txt 2>&1; then
+DRIFT_REPORT="$(mktemp "${TMPDIR:-/tmp}/elisa-runtime-drift.XXXXXX")"
+trap 'rm -f "$DRIFT_REPORT"' EXIT
+
+if diff -rq "$CANONICAL" "$VENDORED" >"$DRIFT_REPORT" 2>&1; then
 	echo "runtime in sync: vendored == canonical ($(ls "$VENDORED"/*.elisa | wc -l | tr -d ' ') files)"
 	exit 0
 fi
 
 echo "RUNTIME DRIFT DETECTED — vendored copy diverges from Elisa-core:" >&2
-cat /tmp/runtime_drift.txt >&2
+cat "$DRIFT_REPORT" >&2
 echo >&2
 # `diff -rq` compares EVERY file in the directory, so the fix has to copy every
 # file too. The old advice here was `*.elisa`, which silently skips the emitted
