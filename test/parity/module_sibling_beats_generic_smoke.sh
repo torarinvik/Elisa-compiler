@@ -22,7 +22,12 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # production links. Stage1 does not emit the runtime and its driver owns the
 # complete link.
 "$STAGE0" -emit obj -O2 -o "$TMP_DIR/stage0.o" "$FIXTURE" >/dev/null 2>&1
-cc "$TMP_DIR/stage0.o" "$ROOT/test/parity/profile_hooks.c" -o "$TMP_DIR/stage0"
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# The arena calls the profiler ABI unconditionally, so without them this link
+# fails on _elisa_profile_* -- which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$TMP_DIR" "$ROOT"
+cc "$TMP_DIR/stage0.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$TMP_DIR/stage0"
 "$STAGE1" -emit exe -O2 -o "$TMP_DIR/stage1" "$FIXTURE" >/dev/null 2>&1
 
 # A declined function is the failure mode this guards, and stage1 can still

@@ -26,7 +26,12 @@ clang -x c -c -o "$BUILD/puts_shim.o" - <<'EOF'
 int trace_puts(const char *s) __asm__("___ovl__puts__cstr__puts");
 int trace_puts(const char *s) { return puts(s); }
 EOF
-clang -o "$BUILD/emit_trace" "$BUILD/driver.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" "$BUILD/puts_shim.o" \
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# Without them this link fails outright on _elisa_profile_* (the arena calls
+# the profiler ABI unconditionally), which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$BUILD" "$ROOT"
+clang -o "$BUILD/emit_trace" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$BUILD/puts_shim.o" \
     -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
 
 src=$'def helper(x: i64) -> i64:\n    y: i64 = x + 1\n    return y\n\ndef main() -> i64:\n    return helper(41)\n'

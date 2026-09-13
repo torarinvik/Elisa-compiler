@@ -110,7 +110,14 @@ EOF
 "$ELISACORE_BIN" -emit header -o "$WORK/bench_harness.h" "$WORK/bench_harness.elisa" >/dev/null
 "$ELISACORE_BIN" -emit obj -O2 -o "$WORK/bench_harness.o" "$WORK/bench_harness.elisa" >/dev/null
 
-link_flags=(-O2 -I "$WORK" "$WORK/bench_driver.c" "$WORK/bench_harness.o" -o "$WORK/bench")
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. These
+# links use -undefined,dynamic_lookup, which turns a missing one into a NULL
+# ADDRESS instead of a link error -- so the program built fine and then died with
+# SIGSEGV on the arena's first profiler call. Same cause 0b220f1a fixed for
+# resolve_smoke and check_self_hostable.
+source "$REPO_ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$WORK" "$REPO_ROOT"
+link_flags=(-O2 -I "$WORK" "$WORK/bench_driver.c" "$WORK/bench_harness.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$WORK/bench")
 # See run_parity.sh: non-PIC Elisa objects need dynamic_lookup on macOS, -no-pie on Linux.
 [[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
 [[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")

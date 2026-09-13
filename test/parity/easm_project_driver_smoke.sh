@@ -27,7 +27,12 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_project_driver.o" "$ROO
     sed -n '1,30p' "$ROOT/build/easm_project_driver.log"
     exit 1
 fi
-if ! clang -o "$ROOT/build/easm_project_driver" "$ROOT/build/easm_project_driver.o" "$ROOT/test/parity/profile_hooks.c" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# Without them this link fails outright on _elisa_profile_* (the arena calls
+# the profiler ABI unconditionally), which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$ROOT/build" "$ROOT"
+if ! clang -o "$ROOT/build/easm_project_driver" "$ROOT/build/easm_project_driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
     echo "easm_project_driver_smoke FAILED: project driver did not link"
     exit 1
 fi

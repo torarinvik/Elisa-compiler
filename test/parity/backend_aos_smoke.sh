@@ -18,7 +18,12 @@ PROFILE_OBJ="$BUILD/profile_hooks.o"
 clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 
 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/driver.o" "$ROOT/test/breadth/emit_native.elisa" >/dev/null 2>&1
-clang -o "$BUILD/driver" "$BUILD/driver.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# Without them this link fails outright on _elisa_profile_* (the arena calls
+# the profiler ABI unconditionally), which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$BUILD" "$ROOT"
+clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR"
 "$BUILD/driver" < "$ROOT/test/breadth/packed_aos_fixture.elisa" > "$BUILD/aos.ll"
 grep -q 'declare ptr @ctx_aos_store_new(ptr, i64)' "$BUILD/aos.ll"
 grep -q 'declare.*@ctx_aos_store_alloc(ptr, ptr)' "$BUILD/aos.ll"

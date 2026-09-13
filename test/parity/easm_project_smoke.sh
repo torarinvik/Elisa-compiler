@@ -13,7 +13,12 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_project_smoke.o" "$ROOT
     sed -n '1,20p' "$ROOT/build/easm_project_smoke.log"
     exit 1
 fi
-if ! clang -o "$ROOT/build/easm_project_smoke" "$ROOT/build/easm_project_smoke.o" "$ROOT/test/parity/profile_hooks.c" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
+# Without them this link fails outright on _elisa_profile_* (the arena calls
+# the profiler ABI unconditionally), which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$ROOT/build" "$ROOT"
+if ! clang -o "$ROOT/build/easm_project_smoke" "$ROOT/build/easm_project_smoke.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$("$LLVM_CONFIG" --libdir)" -lLLVM -Wl,-rpath,"$("$LLVM_CONFIG" --libdir)"; then
     echo "easm_project_smoke FAILED: could not link stage1 project API test"
     exit 1
 fi

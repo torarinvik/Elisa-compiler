@@ -7,6 +7,9 @@ trap 'rm -rf "$WORK"' EXIT
 FIXTURE="$WORK/compiler with spaces"
 mkdir -p "$FIXTURE/scripts" "$FIXTURE/elisacore_std" "$FIXTURE/tools"
 cp "$ROOT/scripts/build_runtime_object.sh" "$FIXTURE/scripts/build_runtime_object.sh"
+# The helper fingerprints its own inputs, and write_profiler_hook_fallbacks.sh is
+# one of them (3c7e6552), so the fixture needs it present or sha256sum fails
+# before any rebuild decision is made.
 cp "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$FIXTURE/scripts/write_profiler_hook_fallbacks.sh"
 printf 'include "./arena.elisa"\n' > "$FIXTURE/elisacore_std/native_runtime_support.elisa"
 printf '# original include\n' > "$FIXTURE/elisacore_std/arena.elisa"
@@ -30,7 +33,13 @@ printf 'fake runtime object\n' > "$out"
 TOOL
 cp "$FIXTURE/tools/compiler" "$FIXTURE/tools/clang"
 chmod +x "$FIXTURE/tools/compiler" "$FIXTURE/tools/clang"
+export ELISACORE_BIN="$FIXTURE/tools/compiler"
+# The runtime object is built by the STAGE1 PRODUCT since 70589584, so the fake
+# toolchain has to stand in for that too -- otherwise the helper stops at
+# "missing stage1 product" before making a single rebuild decision, which is
+# the only thing this gate is actually measuring.
 export ELISA_STAGE1_BIN="$FIXTURE/tools/compiler"
+export ELISA_S0_REAL="$ELISACORE_BIN"
 export ELISA_CLANG="$FIXTURE/tools/clang"
 export ELISA_RUNTIME_OBJ="$WORK/output/runtime.o"
 export RUNTIME_TEST_LOG="$WORK/compiles"

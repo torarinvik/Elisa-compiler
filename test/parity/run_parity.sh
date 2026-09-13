@@ -159,11 +159,14 @@ int main(int argc, char **argv) {
 }
 EOF
 
-# The stage1 object embeds the runtime globals and helpers it needs.  It still
-# references the optional profiler ABI, so provide only the weak fallback
-# rather than the standalone runtime object (which would duplicate those
-# embedded globals and fail to link on macOS).
-stage1_link_flags=(-O2 -I "$WORK" "$WORK/stage1_lexer_harness.c" "$WORK/stage1_lexer_harness.o" "$REPO_ROOT/test/parity/profile_hooks.c" -o "$WORK/stage1_lexer_harness")
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. These
+# links use -undefined,dynamic_lookup, which turns a missing one into a NULL
+# ADDRESS instead of a link error -- so the program built fine and then died with
+# SIGSEGV on the arena's first profiler call. Same cause 0b220f1a fixed for
+# resolve_smoke and check_self_hostable.
+source "$REPO_ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$WORK" "$REPO_ROOT"
+stage1_link_flags=(-O2 -I "$WORK" "$WORK/stage1_lexer_harness.c" "$WORK/stage1_lexer_harness.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$WORK/stage1_lexer_harness")
 # Elisa codegen emits non-PIC objects: macOS needs dynamic_lookup for the runtime
 # symbols, Linux must link -no-pie (else GNU ld: "failed to set dynamic section
 # sizes"). Mirrors elisac's own native linker (native_exec.go).

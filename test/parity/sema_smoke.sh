@@ -57,14 +57,14 @@ EOF
 "$ELISACORE_BIN" -emit header -o "$WORK/sema_smoke.h" "$FIX" >/dev/null
 "$ELISACORE_BIN" -emit obj -permissive -O2 -o "$WORK/sema_smoke.o" "$FIX" >/dev/null
 
-# The generated runtime keeps profiler policy in the host ABI. Supply the
-# documented weak no-op implementation so a standalone smoke executable never
-# turns an optional hook into a null call target on Darwin's dynamic_lookup
-# link, while a real collector can still override it in profiler tests.
-PROFILE_HOOKS="$REPO_ROOT/test/parity/profile_hooks.c"
-clang -c -O2 -o "$WORK/profile_hooks.o" "$PROFILE_HOOKS"
-
-link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/sema_smoke.o" "$WORK/profile_hooks.o" -o "$WORK/run")
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. These
+# links use -undefined,dynamic_lookup, which turns a missing one into a NULL
+# ADDRESS instead of a link error -- so the program built fine and then died with
+# SIGSEGV on the arena's first profiler call. Same cause 0b220f1a fixed for
+# resolve_smoke and check_self_hostable.
+source "$REPO_ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$WORK" "$REPO_ROOT"
+link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/sema_smoke.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$WORK/run")
 [[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
 [[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")
 clang "${link_flags[@]}"

@@ -21,16 +21,13 @@ if ! timeout 45 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/easm_effect_driver.o" 
     exit 1
 fi
 
-# clang++ treats a .c input as C++ when it is passed in the same link command,
-# which mangles the weak hook names. Compile the C fallback with C linkage first.
-if ! timeout 45 "$CXX" -x c -c "$ROOT/test/parity/profile_hooks.c" \
-    -o "$BUILD/easm_profile_hooks.o" >"$BUILD/easm_profile_hooks.log" 2>&1; then
-    echo "easm_mc_effects_smoke FAILED: could not compile profiler hook fallback"
-    sed -n '1,80p' "$BUILD/easm_profile_hooks.log"
-    exit 1
-fi
-
-if ! timeout 45 "$CXX" "$BUILD/easm_effect_driver.o" "$BUILD/easm_profile_hooks.o" -o "$BUILD/easm_effect_driver" \
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. The arena
+# calls the profiler ABI unconditionally, so without them this link fails on
+# _elisa_profile_* -- and here the error went to a log file, so the gate only ever
+# said "could not link".
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$BUILD" "$ROOT"
+if ! timeout 45 "$CXX" "$BUILD/easm_effect_driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$BUILD/easm_effect_driver" \
     -L"$($LLVM_CONFIG --libdir)" -lLLVM -Wl,-rpath,"$($LLVM_CONFIG --libdir)" \
     >"$BUILD/easm_effect_driver.linklog" 2>&1; then
     echo "easm_mc_effects_smoke FAILED: could not link effect driver"

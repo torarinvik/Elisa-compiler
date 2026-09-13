@@ -83,6 +83,15 @@ if [[ "$INPUT_DIGEST" != "$(runtime_input_digest)" ]]; then
   echo "runtime inputs changed during build; keeping the previous runtime object" >&2
   exit 2
 fi
+# NEVER PUBLISH AN EMPTY OBJECT. The stamp beside the object is what makes the next
+# build a no-op, so a zero-byte product does not get retried -- it just sits there and
+# every downstream link fails with "file is empty", nowhere near this script. That is
+# how twenty-odd parity gates went red at once for a reason none of them could name.
+if [[ ! -s "$TMP" ]]; then
+  echo "refusing to publish an empty runtime object (compiler wrote 0 bytes to $TMP)" >&2
+  rm -f "$TMP" "$RUNTIME_TMP" "$STAMP_TMP"
+  exit 3
+fi
 printf '%s %s\n' "$INPUT_DIGEST" "$(runtime_object_digest "$TMP")" > "$STAMP_TMP"
 mv -f "$TMP" "$OUT"
 mv -f "$STAMP_TMP" "$STAMP"

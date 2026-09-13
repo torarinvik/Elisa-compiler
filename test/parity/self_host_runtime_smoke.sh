@@ -78,25 +78,15 @@ if ! "$ELISACORE_BIN" -emit obj -o "$WORK/prog.o" "$WORK/prog.elisa" >"$WORK/pro
     exit 1
 fi
 
-# The stage1 source object intentionally leaves the optional profiling ABI to its embedding
-# link. The complete runtime-object builder supplies weak fallbacks, but this smoke links the
-# raw stage1-produced support object directly; provide the same hook surface here so a missing
-# test fixture does not masquerade as a stage1 runtime code-generation failure.
-if ! clang -c -O2 -o "$WORK/profile_hooks.o" "$PROFILE_HOOKS" >"$WORK/hooks.log" 2>&1; then
-    echo "self_host_runtime FAILED: could not compile profiler hook fallbacks"
-    sed -n '1,6p' "$WORK/hooks.log"
-    exit 1
-fi
+# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. The arena
+# calls the profiler ABI unconditionally, so without them both links below fail on
+# _elisa_profile_* -- which is what kept this gate red.
+source "$ROOT/test/parity/native_optional_hook_objects.sh"
+elisa_native_optional_hook_objects "$WORK" "$ROOT"
 
 link_and_run() {
     local runtime="$1" out="$2"
-    if [ "$#" -ge 3 ]; then
-        if ! clang -Wl,-dead_strip -o "$out" "$WORK/prog.o" "$runtime" "$3" >"$WORK/link.log" 2>&1; then
-            echo "  link failed against $runtime"; sed -n '1,6p' "$WORK/link.log"; return 255
-        fi
-        RUN "$out"; return $?
-    fi
-    if ! clang -Wl,-dead_strip -o "$out" "$WORK/prog.o" "$runtime" >"$WORK/link.log" 2>&1; then
+    if ! clang -Wl,-dead_strip -o "$out" "$WORK/prog.o" "$runtime" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" >"$WORK/link.log" 2>&1; then
         echo "  link failed against $runtime"; sed -n '1,6p' "$WORK/link.log"; return 255
     fi
     RUN "$out"; return $?

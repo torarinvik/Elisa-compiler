@@ -86,12 +86,33 @@ extern write(fd: int, buf: void&, count: usize) -> isize can[Console]
 # include flattening, so gen2 selected the byte-reference overload for every cstr call.
 extern getenv(name: cstr) -> u8&?
 extern signal(sig: int, handler: void&?) -> void&?
-# `raise` is a reserved keyword in Elisa, so re-raise via kill(getpid(), sig).
-extern getpid() -> int
-extern kill(pid: int, sig: int) -> int
-# sigaction with SA_SIGINFO gives the handler the siginfo_t, which carries the faulting
-# address (si_addr) -- so the dump can report WHERE the fault touched memory.
-extern sigaction(sig: int, act: void&, oldact: void&?) -> int
+
+# WINDOWS HAS NEITHER kill NOR sigaction, and this file declared both with no
+# guard around them at all. That is one of the two things that kept a Windows
+# target from linking -- the other was a missing ELISA_HOST_WINDOWS, without
+# which a Windows triple never selected a Windows branch anywhere and the
+# resulting pile of POSIX undefineds read like a missing port.
+static if ELISA_TARGET_OS_WINDOWS:
+    # The CRT has `raise`, and `raise` is a reserved keyword in Elisa, so the
+    # symbol is bound under another name.
+    @link_name("raise")
+    extern crt_raise(sig: int) -> int
+
+    def elisa_trace_reraise(sig: int) -> void:
+        _ = signal(sig, null)
+        _ = crt_raise(sig)
+static else:
+    # `raise` is a reserved keyword in Elisa, so re-raise via kill(getpid(), sig).
+    extern getpid() -> int
+    extern kill(pid: int, sig: int) -> int
+    # sigaction with SA_SIGINFO gives the handler the siginfo_t, which carries the
+    # faulting address (si_addr) -- so the dump can report WHERE the fault touched
+    # memory.
+    extern sigaction(sig: int, act: void&, oldact: void&?) -> int
+
+    def elisa_trace_reraise(sig: int) -> void:
+        _ = signal(sig, null)
+        _ = kill(getpid(), sig)
 
 # Common signal numbers (consistent across macOS/Linux for these four).
 const ELISA_SIG_ILL: int = 4
@@ -195,24 +216,42 @@ def elisa_trace_count() -> u64:
 # SA_SIGINFO handler: (int sig, siginfo_t *info, void *uctx). Reads si_addr from info,
 # prints the faulting address + signal, dumps the recent trace, then restores the default
 # disposition and re-raises so the original crash still happens.
-def elisa_trace_fault_handler(sig: int, info: uintptr, uctx: uintptr) -> void:
-    si_addr: mutable uintptr = 0
-    if info != 0:
-        p: uintptr = info + ELISA_SIGINFO_ADDR_OFFSET_DARWIN.uintptr()
-        slot: uintptr& = p.cast[uintptr&]
-        si_addr <- slot
+def elisa_trace_report_fault(sig: int, si_addr: uintptr, has_address: bool) -> void:
     fbuf: mutable u8[96] = zeroed
-    fw: int = snprintf(fbuf[0], 96, "*** elisa fault: signal %lld at address 0x%llx ***\n", sig.i64(), si_addr.u64()) can Console.Format
+    fw: mutable int = 0
+    if has_address:
+        fw <- snprintf(fbuf[0], 96, "*** elisa fault: signal %lld at address 0x%llx ***\n", sig.i64(), si_addr.u64()) can Console.Format
+    else:
+        fw <- snprintf(fbuf[0], 96, "*** elisa fault: signal %lld (no faulting address here) ***\n", sig.i64()) can Console.Format
     write(2, (&fbuf[0]).cast[void&], fw.usize()) can Console if fw > 0
     elisa_trace_dump() can Console
-    _ = signal(sig, null)
-    _ = kill(getpid(), sig)
+    elisa_trace_reraise(sig)
 
-def elisa_trace_install_one(sig: int) -> void:
-    act: mutable ElisaSigaction = zeroed
-    act.handler <- elisa_trace_fault_handler.cast[void&?].uintptr()
-    act.flags <- ELISA_SA_SIGINFO
-    _ = sigaction(sig, (&act).cast[void&], null)
+static if ELISA_TARGET_OS_WINDOWS:
+    # NO SA_SIGINFO HERE. The CRT's signal() hands a handler the signal number
+    # and nothing else, so there is no faulting address to report and the dump
+    # says so rather than printing a zero dressed up as one.
+    # SetUnhandledExceptionFilter carries the address and is the upgrade this
+    # leaves open.
+    def elisa_trace_fault_handler(sig: int) -> void:
+        elisa_trace_report_fault(sig, 0, false) can Console
+
+    def elisa_trace_install_one(sig: int) -> void:
+        _ = signal(sig, elisa_trace_fault_handler.cast[void&?])
+static else:
+    def elisa_trace_fault_handler(sig: int, info: uintptr, uctx: uintptr) -> void:
+        si_addr: mutable uintptr = 0
+        if info != 0:
+            p: uintptr = info + ELISA_SIGINFO_ADDR_OFFSET_DARWIN.uintptr()
+            slot: uintptr& = p.cast[uintptr&]
+            si_addr <- slot
+        elisa_trace_report_fault(sig, si_addr, true) can Console
+
+    def elisa_trace_install_one(sig: int) -> void:
+        act: mutable ElisaSigaction = zeroed
+        act.handler <- elisa_trace_fault_handler.cast[void&?].uintptr()
+        act.flags <- ELISA_SA_SIGINFO
+        _ = sigaction(sig, (&act).cast[void&], null)
 
 # Install the fault handler for SIGSEGV/SIGABRT/SIGILL/SIGFPE. Callable directly (e.g. a
 # program -- or the emulator's own handler -- can opt in explicitly).
