@@ -64,7 +64,10 @@ one_case() {
     echo "SKIP $name (stage0 rejected it)"; return 0
   fi
   if ! bash "$STAGE1" -O0 -o "$WORK/$name.s1.o" "$source" >"$WORK/$name.s1.log" 2>&1; then
-    report_divergence "$name" "stage0 compiled it, stage1 did not"; return 0
+    # Carry the first line of stage1's own output: a wrapper REFUSAL (stale or dirty
+    # product) reads identically to a codegen decline without it, and one such refusal
+    # once reported the whole corpus as 89 codegen divergences.
+    report_divergence "$name" "stage0 compiled it, stage1 did not: $(head -n 1 "$WORK/$name.s1.log" | cut -c1-160)"; return 0
   fi
   # stage0 bundles the runtime into its object; stage1 links against the
   # separately built runtime object. A case that pulls in std collections still

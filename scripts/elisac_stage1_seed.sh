@@ -185,24 +185,18 @@ seed_build() {
   # the compiler itself and are provided only when linking an executable/runtime
   # consumer.  Dead-strip those sections here, matching the other self-host
   # product links, instead of requiring unrelated host runtime symbols.
-  printf '%s\n' \
-    '#include <stddef.h>' \
-    '#include <stdint.h>' \
-    '#if defined(__GNUC__) || defined(__clang__)' \
-    '#define ELISA_WEAK __attribute__((weak))' \
-    '#else' \
-    '#define ELISA_WEAK' \
-    '#endif' \
-    'ELISA_WEAK uint32_t elisa_profile_allocation_negotiate(uint32_t version) { (void)version; return 0; }' \
-    'ELISA_WEAK uint32_t elisa_profile_region_layout_negotiate(uint32_t version) { (void)version; return 0; }' \
-    'ELISA_WEAK void elisa_profile_region_layout_v1(uintptr_t arena, size_t region, uintptr_t header, uintptr_t data, size_t capacity) { (void)arena; (void)region; (void)header; (void)data; (void)capacity; }' \
-    'ELISA_WEAK void elisa_profile_allocation_event_v1(uint32_t kind, uintptr_t address, size_t size, uintptr_t old_address, size_t old_size, uintptr_t arena, size_t region) {' \
-    '  (void)kind; (void)address; (void)size; (void)old_address; (void)old_size; (void)arena; (void)region;' \
-    '}' >"$seed_profile_hook_source"
+  # The weak profiler-hook fallbacks, from the one shared source (see the script).
+  bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
   "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
   mv -f "$seed_output" "$BIN"
   mv -f "$seed_object" "$ROOT/build/elisac_stage1.o"
   ELISA_SEED_OUTPUT=""
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
   echo "seed: wrote $BIN" >&2
+  # The runtime object is built BY the product just written, from the same std it
+  # embeds: one compiler for the program and its runtime. A seed that left the object
+  # behind handed every consumer a pair from two different sources -- it went unrefreshed
+  # for a week that way and nothing noticed until a link failed. Digest-guarded (the
+  # product is one of the inputs), so this is a no-op when the object already matches.
+  ELISA_STAGE1_BIN="$BIN" bash "$ROOT/scripts/build_runtime_object.sh"
 }

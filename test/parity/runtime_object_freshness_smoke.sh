@@ -7,6 +7,7 @@ trap 'rm -rf "$WORK"' EXIT
 FIXTURE="$WORK/compiler with spaces"
 mkdir -p "$FIXTURE/scripts" "$FIXTURE/elisacore_std" "$FIXTURE/tools"
 cp "$ROOT/scripts/build_runtime_object.sh" "$FIXTURE/scripts/build_runtime_object.sh"
+cp "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$FIXTURE/scripts/write_profiler_hook_fallbacks.sh"
 printf 'include "./arena.elisa"\n' > "$FIXTURE/elisacore_std/native_runtime_support.elisa"
 printf '# original include\n' > "$FIXTURE/elisacore_std/arena.elisa"
 cat > "$FIXTURE/tools/compiler" <<'TOOL'
@@ -29,8 +30,7 @@ printf 'fake runtime object\n' > "$out"
 TOOL
 cp "$FIXTURE/tools/compiler" "$FIXTURE/tools/clang"
 chmod +x "$FIXTURE/tools/compiler" "$FIXTURE/tools/clang"
-export ELISACORE_BIN="$FIXTURE/tools/compiler"
-export ELISA_S0_REAL="$ELISACORE_BIN"
+export ELISA_STAGE1_BIN="$FIXTURE/tools/compiler"
 export ELISA_CLANG="$FIXTURE/tools/clang"
 export ELISA_RUNTIME_OBJ="$WORK/output/runtime.o"
 export RUNTIME_TEST_LOG="$WORK/compiles"
@@ -74,13 +74,13 @@ build
 expect_compiles 9
 build
 expect_compiles 9
-for tool in "$ELISACORE_BIN" "$ELISA_CLANG" "$FIXTURE/scripts/build_runtime_object.sh"; do
+for tool in "$ELISA_STAGE1_BIN" "$ELISA_CLANG" "$FIXTURE/scripts/build_runtime_object.sh" "$FIXTURE/scripts/write_profiler_hook_fallbacks.sh"; do
   cp -p "$tool" "$WORK/old-tool"
   printf '\n# backdated tool edit\n' >> "$tool"
   touch -r "$WORK/old-tool" "$tool"
   build
 done
-expect_compiles 12
+expect_compiles 13
 if find "$WORK/output" -type f ! -name runtime.o ! -name runtime.o.inputs.sha256 | read -r unused; then
   echo 'runtime build leaked temporary files' >&2
   exit 1

@@ -392,3 +392,11 @@ run_case optional_return  'def pick(flag: bool) -> i64?:\n    return 42 if flag 
 run_case optional_absent  'def pick(flag: bool) -> i64?:\n    return 42 if flag else null\n\ndef main() -> i64:\n    v: i64? = pick(false)\n    if v is found:\n        return found\n    return 42\n'  42
 # A non-i64 payload: the wrap must use the payload's own width.
 run_case optional_u8      'def main() -> i64:\n    v: u8? = 200\n    if v is found:\n        return found.i64() - 158\n    return 0\n'  42
+
+# A MODULE-QUALIFIED const under a postfix cast. Inference had no arm for `Module::NAME`
+# even though emission did, so the receiver typed as Unmodeled and the cast path took its
+# Signed-64 fallback: `Paint::WIDTH.f64()` on an f32 const emitted `sitofp float`, which llc
+# refuses (run_case reports that as "llc rejected the emitted IR"). Found by elisa-ui's
+# `UiPaint::HAIRLINE_WIDTH.f64()`, which took every AppKit canvas build down with it. The
+# integer const beside it pins the other direction of the same arm.
+run_case scoped_const_cast 'module Paint:\n    public:\n        const WIDTH: f32 = 1.0\n        const COUNT: i32 = 2\n\ndef main() -> i64:\n    direct: f64 = Paint::WIDTH.f64()\n    count: f64 = Paint::COUNT.f64()\n    return 1 if direct != 1.0 or count != 2.0\n    return 42\n' 42
