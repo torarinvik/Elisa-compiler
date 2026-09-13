@@ -66,6 +66,7 @@ compare_one() {
 }
 
 compare_one demo "$ROOT/test/repro/wasm_minimal.elisa"
+compare_one int-width "$ROOT/test/repro/int_width_abi.elisa"
 compare_one missing-import "$ROOT/test/repro/wasm_missing_import.elisa"
 
 if [ "$status" = 0 ]; then

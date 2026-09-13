@@ -30,8 +30,8 @@ export fn add_wasm(a: i32, b: i32) -> i32 = add
 
 The generated facade normalizes the awkward parts of the WebAssembly JavaScript ABI:
 
-- `i8`/`i16`/`i32` and `u8`/`u16`/`u32` use JavaScript `number` with correct signedness.
-- `i64`, `u64`, `int`, and `char` use JavaScript `bigint`.
+- `int`, `i8`/`i16`/`i32` and `u8`/`u16`/`u32` use JavaScript `number` with correct signedness.
+- `i64`, `u64`, and `char` use JavaScript `bigint`.
 - `usize`, `isize`, and `uintptr` are compiled as 32-bit WASM values; unsigned values
   arrive normalized with `>>> 0`.
 - `bool` is accepted as a JavaScript boolean and returned as a boolean.

@@ -19,7 +19,7 @@ def ts_type(type_text: str, target: str, *, parameter: bool = False) -> str:
     normalized = normalize_type(type_text)
     if normalized == "cstr":
         return "string | number" if parameter else "string"
-    if normalized in {"i64", "u64", "int", "char"}:
+    if normalized in {"i64", "u64", "char"}:
         return "bigint"
     if normalized in {"bool"}:
         return "boolean"
@@ -30,7 +30,7 @@ def ts_type(type_text: str, target: str, *, parameter: bool = False) -> str:
 
 def js_input(type_text: str, expression: str) -> str:
     normalized = normalize_type(type_text)
-    if normalized in {"i64", "u64", "int", "char"}:
+    if normalized in {"i64", "u64", "char"}:
         return f"BigInt({expression})"
     if normalized == "bool":
         return f"{expression} ? 1 : 0"

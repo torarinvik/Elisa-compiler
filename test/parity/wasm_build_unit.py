@@ -15,6 +15,15 @@ from scripts.wasm_build import WasmBuildError, js_bindings, parse_exports, type_
 
 
 class WasmBindingsTests(unittest.TestCase):
+    def test_int_is_a_wasm32_number_while_i64_stays_bigint(self) -> None:
+        exports = parse_exports("export fn word(value: int) -> int = word_impl\nexport fn wide(value: i64) -> i64 = wide_impl")
+        self.assertEqual(exports[0]["wasm_type"], "i32")
+        self.assertEqual(exports[0]["parameters"][0]["wasm_type"], "i32")
+        manifest = {"exports": exports, "target": "wasm32-unknown-unknown", "files": {"wasm": "demo.wasm"}}
+        declarations = type_declaration(manifest, "demo")
+        self.assertIn("word(value: number): number", declarations)
+        self.assertIn("wide(value: bigint): bigint", declarations)
+
     def test_cstr_is_a_high_level_string_binding(self) -> None:
         exports = parse_exports("export fn echo(value: cstr) -> cstr = echo_impl")
         self.assertEqual(exports[0]["parameters"][0]["binding"], "string")

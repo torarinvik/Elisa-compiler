@@ -23,7 +23,7 @@ SCALAR_TYPES = {
     "u32": "i32",
     "i64": "i64",
     "u64": "i64",
-    "int": "i64",
+    "int": "i32",
     "char": "i64",
     "isize": "i32",
     "usize": "i32",
