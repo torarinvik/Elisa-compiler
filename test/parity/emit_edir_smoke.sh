@@ -221,6 +221,118 @@ assert [struct.unpack_from("<Hqq", data, EDIR_HEADER_BYTES + index * EDIR_INSTRU
 ]
 PY
 
+# A statically bounded counted loop exercises compiler-emitted compare, branch,
+# backward jump, local updates, and source statement grouping.
+counted_loop_source="$ROOT/test/fixtures/edir/counted_loop.elisa"
+counted_loop_artifact="$WORK/counted-loop.edir"
+emit_edir "$ROOT" "$counted_loop_artifact" "$counted_loop_source"
+python3 - "$counted_loop_artifact" "$counted_loop_source" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+artifact_path, source_path = map(Path, sys.argv[1:])
+data = artifact_path.read_bytes()
+source = source_path.read_bytes()
+EDIR_HEADER_PREFIX_BYTES = 29
+EDIR_SOURCE_FILE_FIXED_BYTES = 36
+EDIR_INSTRUCTION_BYTES = 62
+EXPECTED_INSTRUCTION_COUNT = 16
+EXPECTED_LOCAL_COUNT = 2
+EXPECTED_LOOP_LIMIT = 5
+EXPECTED_LOOP_START = 4
+EXPECTED_LOOP_EXIT = 14
+CONDITION_LOAD_INSTRUCTION_INDEX = 4
+TOTAL_UPDATE_LOAD_INSTRUCTION_INDEX = 7
+COUNTER_UPDATE_LOAD_INSTRUCTION_INDEX = 10
+LOOP_BACK_EDGE_INSTRUCTION_INDEX = 13
+COUNTED_LOOP_HEADER_TEXT = b"while counter < 5:"
+COMPARISON_OPERATOR_TEXT = b"<"
+COMPARISON_OPERATOR_LENGTH = len(COMPARISON_OPERATOR_TEXT)
+source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
+EDIR_HEADER_BYTES = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
+assert len(data) == EDIR_HEADER_BYTES + EXPECTED_INSTRUCTION_COUNT * EDIR_INSTRUCTION_BYTES
+assert struct.unpack_from("<IIQQB", data) == (2, 1, EXPECTED_INSTRUCTION_COUNT, EXPECTED_LOCAL_COUNT, 1)
+
+def instruction(index):
+    return struct.unpack_from("<HqqQQQIIIII", data, EDIR_HEADER_BYTES + index * EDIR_INSTRUCTION_BYTES)
+
+def source_span_for_range(start, end):
+    prefix = source[:start].decode("ascii")
+    through = source[:end].decode("ascii")
+    start_line = prefix.count("\n") + 1
+    end_line = through.count("\n") + 1
+    start_column = len(prefix.rsplit("\n", 1)[-1]) + 1
+    end_column = len(through.rsplit("\n", 1)[-1]) + 1
+    return (1, start, end, start_line, start_column, end_line, end_column, 0)
+
+def source_span(start_text, end_text):
+    start = source.index(start_text.encode("ascii"))
+    end = source.index(end_text.encode("ascii"), start) + len(end_text.encode("ascii"))
+    return source_span_for_range(start, end)
+
+instructions = [instruction(index) for index in range(EXPECTED_INSTRUCTION_COUNT)]
+assert [item[:3] for item in instructions] == [
+    (1, 0, 0), (5, 0, 0), (1, 0, 0), (5, 1, 0),
+    (4, 0, 0), (15, EXPECTED_LOOP_LIMIT, 0), (17, EXPECTED_LOOP_EXIT, 0),
+    (4, 1, 0), (2, 2, 0), (5, 1, 0),
+    (4, 0, 0), (2, 1, 0), (5, 0, 0), (16, EXPECTED_LOOP_START, 0),
+    (4, 1, 0), (19, 0, 0),
+]
+assert instructions[0][3:] == source_span("counter: mutable i64 = 0", "counter: mutable i64 = 0")
+assert instructions[1][3:] == instructions[0][3:]
+assert instructions[2][3:] == source_span("total: mutable i64 = 0", "total: mutable i64 = 0")
+assert instructions[3][3:] == instructions[2][3:]
+loop_header_start = source.index(COUNTED_LOOP_HEADER_TEXT)
+condition_operator_start = source.index(COMPARISON_OPERATOR_TEXT, loop_header_start)
+condition_span = source_span_for_range(condition_operator_start, condition_operator_start + COMPARISON_OPERATOR_LENGTH)
+assert all(instructions[index][3:] == condition_span for index in range(CONDITION_LOAD_INSTRUCTION_INDEX, CONDITION_LOAD_INSTRUCTION_INDEX + 3))
+total_update_span = source_span("total <- total + 2", "total <- total + 2")
+assert all(instructions[index][3:] == total_update_span for index in range(TOTAL_UPDATE_LOAD_INSTRUCTION_INDEX, TOTAL_UPDATE_LOAD_INSTRUCTION_INDEX + 3))
+counter_update_span = source_span("counter <- counter + 1", "counter <- counter + 1")
+assert all(instructions[index][3:] == counter_update_span for index in range(COUNTER_UPDATE_LOAD_INSTRUCTION_INDEX, COUNTER_UPDATE_LOAD_INSTRUCTION_INDEX + 3))
+assert instructions[LOOP_BACK_EDGE_INSTRUCTION_INDEX][3:] == condition_span
+assert len({condition_span, total_update_span, counter_update_span}) == 3
+return_span = source_span("return total", "return total")
+assert instructions[14][3:] == return_span and instructions[15][3:] == return_span
+PY
+
+counted_loop_object="$WORK/counted-loop-native.o"
+counted_loop_program="$WORK/counted-loop-native"
+bash "$WRAPPER" -o "$counted_loop_object" "$counted_loop_source"
+clang -Wl,-dead_strip -o "$counted_loop_program" "$counted_loop_object" "$RUNTIME"
+set +e
+"$counted_loop_program"
+counted_loop_native_status=$?
+set -e
+COUNTED_LOOP_EXPECTED_EXIT=10
+[[ "$counted_loop_native_status" -eq "$COUNTED_LOOP_EXPECTED_EXIT" ]] || {
+  echo "emit_edir_smoke FAIL: counted-loop native exit $counted_loop_native_status, want $COUNTED_LOOP_EXPECTED_EXIT" >&2
+  exit 1
+}
+
+unsupported_loop_source="$WORK/unsupported-loop.elisa"
+unsupported_loop_artifact="$WORK/unsupported-loop.edir"
+printf 'stale artifact\n' >"$unsupported_loop_artifact"
+cat >"$unsupported_loop_source" <<'EOF'
+def main() -> i64:
+    counter: mutable i64 = 0
+    total: mutable i64 = 0
+    while counter < 5:
+        total <- total + 2
+        counter <- counter + 2
+    return total
+EOF
+if emit_edir "$WORK" "$unsupported_loop_artifact" "$unsupported_loop_source" >"$WORK/unsupported-loop.stdout" 2>"$WORK/unsupported-loop.stderr"; then
+  echo "emit_edir_smoke FAIL: unsupported counted-loop update was accepted" >&2
+  exit 1
+fi
+[[ ! -s "$unsupported_loop_artifact" ]] || {
+  echo "emit_edir_smoke FAIL: unsupported counted loop left a stale/non-empty artifact" >&2
+  exit 1
+}
+grep -q 'counted-loop body must use' "$WORK/unsupported-loop.stderr"
+
 # The same source still follows the native backend path and exits with the value
 # represented by the EDIR arithmetic slice.
 native_object="$WORK/native.o"
@@ -413,4 +525,4 @@ fi
 }
 grep -q 'could not open or truncate the requested -o path' "$WORK/write-failure.stderr"
 
-echo "emit_edir_smoke OK: literal/local/arithmetic EDIR, spans, native results, and fail-closed cases"
+echo "emit_edir_smoke OK: literal/local/arithmetic/counted-loop EDIR, spans, native results, and fail-closed cases"
