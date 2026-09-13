@@ -7,19 +7,43 @@ extend Parser:
             # private `draw_text` in one module hid a public `draw_text` in another.
             parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__private_member_module", name: parser.current_module, line: section_line})
 
-        # An indented `public:` / `private:` block. Visibility is a layout grouping
-        # only here; members are flattened into the enclosing declaration list.
+        # A `public:` / `private:` visibility section (indented block or flat label), or
+        # the `public def f(...)` prefix form. Visibility is a layout grouping only here;
+        # members are flattened into the enclosing declaration list, and each one is
+        # recorded in the annotations side table (`__section_public` / `__section_private`,
+        # keyed by member name and owning module) so the formatter can print the sections
+        # back -- dropping them turned every private member public.
         def visibility_section(parser: lmut Parser, out: mutable darray[Ast::Decl]&) -> void:
             can Abort.Panic, Memory.Allocate:
-                # A `private:` section's members are hidden outside their module; record each
-                # member name so the qualified-access check can reject `Module::hidden` from
-                # outside. (`public:` members are unrestricted.)
                 section_token: Token = parser.cursor()
                 is_private: bool = Lexer::text_or_empty(section_token, parser.source) == "private"
+                visibility_name: sview = "private" if is_private else "public"
+                # Prefix form: the keyword marks the ONE declaration that follows.
+                if parser.peek_at(1) != TokenKind.Colon:
+                    parser, _ <- parser.advance()
+                    rebind prefixed_name: sview = parser.private_name_ahead()
+                    parser <- parser.record_private_member_if(is_private, prefixed_name, section_token.line)
+                    parser <- parser.record_section_member(prefixed_name, visibility_name)
+                    # `private module M:` hides every member of M, not just the module name
+                    # (stage0: parseVisibilityPrefixedDecl sets NamespaceDecl.Private, and
+                    # isPrivateDecl then hides each member). The module body reads this.
+                    prefixed_head: sview = parser.header_token_text(0)
+                    parser.pending_private_module <- is_private and (prefixed_head == "module" or prefixed_head == "extend")
+                    parser <- parser.parse_declaration_unit(out)
+                    return
+                # stage0: a section is only valid inside a declaration block.
+                parser <- parser.error_named(Ast::ParseErrorKind.VisibilitySectionAtTopLevel, section_token, visibility_name, "", 0, section_token.column + section_token.length) if parser.decl_block_depth == 0
                 parser, _ <- parser.advance()                       # consume the public/private identifier
                 parser, _ <- parser.expect(TokenKind.Colon)
                 parser, _ <- parser.expect(TokenKind.Newline)
+                # Flat-label form: no indented block -- the visibility applies to the rest of
+                # the enclosing module body (consumed by the module-body loop).
+                if parser.peek() != TokenKind.Indent:
+                    parser.section_visibility <- visibility_name
+                    return
                 parser, _ <- parser.expect(TokenKind.Indent)
+                saved_section_visibility: sview = parser.section_visibility
+                parser.section_visibility <- ""
                 machine over parser.position while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
                     state Scan
                     state Parse(before: usize, member_count: usize, member_name: sview, private_section: bool)
@@ -31,6 +55,7 @@ extend Parser:
                         parser <- parser.skip_newlines()
                         rebind captured_name: sview = parser.private_name_ahead()
                         parser <- parser.record_private_member_if(is_private, captured_name, section_token.line)
+                        parser <- parser.record_section_member(captured_name, visibility_name)
                         -> Parse(parser.position, out.count, captured_name, is_private)
 
                     Parse(_, _, _, _), _ if parser.peek() == TokenKind.Dedent or parser.peek() == TokenKind.Eof:
@@ -39,9 +64,6 @@ extend Parser:
                     Parse(before, member_count, member_name, private_section), _:
                         parser <- parser.parse_declaration_unit(out)
                         -> Progress(before, member_count, member_name, private_section)
-
-                    Progress(before, member_count, member_name, true), _:
-                        -> Advance(before)
 
                     Progress(before, _, _, _), _:
                         -> Advance(before)
@@ -53,6 +75,20 @@ extend Parser:
                     Advance(_), _:
                         -> Scan
                 parser, _ <- parser.expect(TokenKind.Dedent)
+                parser.section_visibility <- saved_section_visibility
+
+        # Record ONE member of a `public:` / `private:` section, keyed by its declared name
+        # and owning module -- the same key the private-member rows already use, and captured
+        # BEFORE the member is parsed (the recorder runs in the section loop's scan state, so
+        # it never has to reach back into a declaration list the callee has since rebound).
+        def record_section_member(parser: lmut Parser, member_name: sview, visibility_name: sview) -> void:
+            can Abort.Panic, Memory.Allocate:
+                return if visibility_name == "" or member_name == ""
+                owning_module: sview = parser.current_module
+                # The visibility rides in the MARKER (the annotation has no spare string
+                # field); `name` is the member and `module` its owner.
+                section_marker: sview = "__section_private" if visibility_name == "private" else "__section_public"
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: section_marker, name: member_name, line: 0, module: owning_module})
 
 
             # Recover the member name before parsing consumes the declaration header.
@@ -261,8 +297,15 @@ extend Parser:
             # registered under an OWNER instead of landing in one flat name table with
             # every other module's. Saved and restored, so a nested module leaves the
             # outer one intact.
+            # Claimed by the `private module M:` prefix, and cleared so a NESTED module
+            # does not inherit it.
+            body_is_private: bool = parser.pending_private_module
+            parser.pending_private_module <- false
             saved_module: sview = parser.current_module
             parser.current_module <- name
+            saved_body_section: sview = parser.section_visibility
+            parser.section_visibility <- ""
+            parser.decl_block_depth <- parser.decl_block_depth + 1
             machine over parser.position while parser.peek() != TokenKind.Dedent and parser.peek() != TokenKind.Eof:
                 state Scan
                 state Classify(before: usize)
@@ -285,6 +328,15 @@ extend Parser:
                     -> Progress(before)
 
                 Classify(before), _:
+                    # A flat-label section (`public:` on its own line) in force covers this
+                    # member: record it exactly like a block-section member. The field is
+                    # copied out first -- naming it inside a call that also threads `parser`
+                    # would alias the linear binding.
+                    flat_visibility: sview = parser.section_visibility
+                    flat_line: u32 = parser.cursor().line
+                    rebind flat_name: sview = parser.private_name_ahead()
+                    parser <- parser.record_private_member_if(body_is_private or flat_visibility == "private", flat_name, flat_line)
+                    parser <- parser.record_section_member(flat_name, flat_visibility)
                     parser <- parser.parse_declaration_unit(body_items)
                     -> Progress(before)
 
@@ -296,6 +348,8 @@ extend Parser:
                     -> Scan
             parser, _ <- parser.expect(TokenKind.Dedent)
             parser.current_module <- saved_module
+            parser.section_visibility <- saved_body_section
+            parser.decl_block_depth <- parser.decl_block_depth - 1
 
             return (Ast::Decl.Module(name, body_items, Ast::pos_of_token(token)))
 
