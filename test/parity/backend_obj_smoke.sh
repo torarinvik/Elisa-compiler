@@ -36,7 +36,7 @@ clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 # said "could not link".
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null \
+clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null \
   || { echo "backend_obj_smoke FAILED: could not link emit_obj"; exit 1; }
 
 pass=0; total=0
@@ -258,6 +258,24 @@ dwarf_case names_the_function 'DW_AT_name.*"main"'
 dwarf_case base_type 'DW_TAG_base_type'
 dwarf_case names_i64 'DW_AT_name.*"i64"'
 dwarf_case subprogram_has_type 'DW_AT_type'
+
+# Native PC-to-source mapping depends on real line-table rows, not only function DIEs.
+# Use the same optimized object as above: the source statement on line 5 must remain
+# addressable after LLVM's O2 pipeline.
+total=$((total + 1))
+line_dump="$(dirname "$LLVM_CONFIG")/llvm-dwarfdump"
+line_table="$BUILD/obj_dwarf/line_table.txt"
+if [ -x "$line_dump" ] && [ -f "$BUILD/obj_dwarf/stage1_out.o" ]; then
+    "$line_dump" --debug-line "$BUILD/obj_dwarf/stage1_out.o" > "$line_table" 2>/dev/null
+    if grep -Eq '0x[[:xdigit:]]+[[:space:]]+5[[:space:]]+' "$line_table"; then
+        pass=$((pass + 1))
+    else
+        echo "  FAIL obj_dwarf_statement_line: optimized line table does not map source line 5"
+    fi
+else
+    echo "  SKIP obj_dwarf_statement_line: no llvm-dwarfdump"
+    total=$((total - 1))
+fi
 
 # Local-variable debug info, checked in the PRE-PASS IR rather than in the object.
 # `-O2` deletes it: stage0's own `-emit obj -O2 -g` has no DW_TAG_formal_parameter or
