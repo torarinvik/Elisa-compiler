@@ -3,15 +3,25 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from scripts.wasm_build import WasmBuildError, js_bindings, parse_exports, type_declaration
+from scripts.wasm_build import (
+    WasmBuildError,
+    js_bindings,
+    load_export_scan,
+    parse_exports,
+    type_declaration,
+)
+from scripts.wasm_export_scan_client import WasmExportScanClientError, _decode_build_payload
 
 
 class WasmBindingsTests(unittest.TestCase):
@@ -56,6 +66,75 @@ class WasmBindingsTests(unittest.TestCase):
         )
         self.assertEqual(exports[0]["name"], "start")
         self.assertEqual(exports[0]["link_name"], "example:window/guest@0.1.0#start")
+
+
+class WasmExportScanClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.row = {
+            "name": "answer",
+            "target": "answer_impl",
+            "parameters": [],
+            "return": "i32",
+            "binding": "scalar",
+            "wasm_type": "i32",
+            "line": 1,
+        }
+
+    def encode(self, *, version: object = 1) -> bytes:
+        payload = {
+            "version": version,
+            "flattened_source": "export fn answer() -> i32 = answer_impl\n",
+            "exports": [self.row],
+        }
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+
+    def test_decodes_ordered_versioned_build_payload(self) -> None:
+        source, exports = _decode_build_payload(self.encode())
+        self.assertEqual(source, "export fn answer() -> i32 = answer_impl\n")
+        self.assertEqual(exports, [self.row])
+
+    def test_rejects_boolean_payload_version(self) -> None:
+        with self.assertRaisesRegex(WasmExportScanClientError, "unsupported payload version"):
+            _decode_build_payload(self.encode(version=True))
+
+    def test_rejects_duplicate_json_keys(self) -> None:
+        payload = (
+            b'{"version":1,"version":1,"flattened_source":"x",'
+            b'"exports":[{"name":"answer","target":"answer_impl",'
+            b'"parameters":[],"return":"i32","binding":"scalar",'
+            b'"wasm_type":"i32","line":1}]}\n'
+        )
+        with self.assertRaisesRegex(WasmExportScanClientError, "invalid JSON"):
+            _decode_build_payload(payload)
+
+    def test_rejects_reordered_export_fields(self) -> None:
+        row = dict(reversed(list(self.row.items())))
+        payload = {
+            "version": 1,
+            "flattened_source": "export fn answer() -> i32 = answer_impl\n",
+            "exports": [row],
+        }
+        with self.assertRaisesRegex(WasmExportScanClientError, "field order"):
+            _decode_build_payload(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
+
+
+class ExportScannerSelectionTests(unittest.TestCase):
+    def test_default_keeps_the_python_scanner_path(self) -> None:
+        source_path = Path("/tmp/input.elisa")
+        flattened = "export fn answer() -> i32 = answer_impl\n"
+        exports = [{"name": "answer"}]
+        with (
+            patch("scripts.wasm_build.read_flat_source", return_value=flattened) as read_source,
+            patch("scripts.wasm_build.parse_exports", return_value=exports) as parse_source,
+        ):
+            self.assertEqual(load_export_scan(source_path, SimpleNamespace()), (flattened, exports))
+        read_source.assert_called_once_with(source_path)
+        parse_source.assert_called_once_with(flattened)
+
+    def test_opt_in_launcher_and_script_must_be_paired(self) -> None:
+        args = SimpleNamespace(export_scan_launcher="/bin/elisac")
+        with self.assertRaisesRegex(WasmBuildError, "must be supplied together"):
+            load_export_scan(Path("/tmp/input.elisa"), args)
 
 
 if __name__ == "__main__":

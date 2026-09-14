@@ -12,6 +12,11 @@ no ``-emit wasm``, and ``test/parity/wasm_component_runtime_smoke.sh`` drives th
 serves as the port's oracle: ``test/parity/wasm_python_parity_smoke.sh`` builds the same
 sources both ways and requires every artifact — module included — to be byte-identical.
 Change one side and that smoke tells you the other has drifted.
+
+An explicit `--export-scan-launcher` plus `--export-scan-script` pair can
+exercise the Elisascript scanner for source flattening and export parsing.
+The default remains the Python oracle; this opt-in does not replace the packager,
+runtime-source cache scan, or façade type normalization.
 """
 
 
@@ -38,6 +43,7 @@ from scripts.wasm_export_scan import (
     parse_exports,
     read_flat_source,
 )
+from scripts.wasm_export_scan_client import WasmExportScanClientError, run_export_scan
 from scripts.wasm_facade import js_bindings, type_declaration
 
 # Re-exported so `from scripts.wasm_build import ...` keeps working for the unit test and
@@ -156,6 +162,22 @@ def runtime_cache_path(root: Path, compiler: Path, target: str, runtime_source: 
     return root / "build" / "wasm-cache" / f"runtime-{digest.hexdigest()[:20]}.o"
 
 
+def load_export_scan(source: Path, args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
+    launcher = getattr(args, "export_scan_launcher", None)
+    scanner_script = getattr(args, "export_scan_script", None)
+    if (launcher is None) != (scanner_script is None):
+        raise WasmBuildError(
+            "--export-scan-launcher and --export-scan-script must be supplied together"
+        )
+    if launcher is None:
+        flat_source = read_flat_source(source)
+        return flat_source, parse_exports(flat_source)
+    try:
+        return run_export_scan(launcher, scanner_script, source)
+    except WasmExportScanClientError as error:
+        raise WasmBuildError(str(error)) from error
+
+
 
 def build(args: argparse.Namespace) -> None:
     source = Path(args.source).resolve()
@@ -164,8 +186,7 @@ def build(args: argparse.Namespace) -> None:
     target = args.target or "wasm32-unknown-unknown"
     if not target.startswith("wasm32"):
         raise WasmBuildError(f"-emit wasm currently targets wasm32 (got {target!r})")
-    flat_source = read_flat_source(source)
-    exports = parse_exports(flat_source)
+    flat_source, exports = load_export_scan(source, args)
     wasm_only = args.wasm_only or bool(args.component_types)
     module_name = output.name[:-5] if output.name.endswith(".wasm") else output.name
     manifest: dict[str, Any] = {
@@ -297,6 +318,14 @@ def main() -> int:
     parser.add_argument("--target")
     parser.add_argument("--wasm-ld")
     parser.add_argument("--wasm-component-ld")
+    parser.add_argument(
+        "--export-scan-launcher",
+        help="absolute Elisascript launcher path for the opt-in WASM export scan",
+    )
+    parser.add_argument(
+        "--export-scan-script",
+        help="absolute path to scripts/wasm_export_scan.elisascript",
+    )
     parser.add_argument("--component-type", dest="component_types", action="append", default=[])
     parser.add_argument("--wasm-only", action="store_true")
     parser.add_argument("--compiler-flag", dest="compiler_flags", action="append", default=[])
