@@ -383,12 +383,12 @@ echo "resolve smoke OK: loop-capture call initializers resolve without a danglin
 # The frontend calls a few libc externs (getenv, ...) that the STD declares, not
 # the frontend itself. Concatenating only src/lexer|parser|semantic therefore
 # reports those calls as unresolved -- a fact about this file list, not about the
-# resolver. debug_referee.elisa carries those declarations, so including it makes
-# the count mean "references nothing declares" again. Without it the measurement
-# read 1 (getenv, from src/lexer/lexer.elisa) against a ceiling of 0.
+# resolver. debug_referee.elisa declares getenv; collections.elisai declares
+# arena_free, used by frontend_parse to release parser scratch. Include the real
+# runtime interfaces so this counts missing references rather than omitted inputs.
 FRONTEND_FILES=()
 for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/semantic/*.elisa \
-         "$REPO_ROOT"/elisacore_std/debug_referee.elisa; do
+         "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai; do
 	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
 done
 if [[ ${#FRONTEND_FILES[@]} -gt 0 ]]; then
