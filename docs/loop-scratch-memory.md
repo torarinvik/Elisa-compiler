@@ -364,3 +364,101 @@ parser probes also produced byte-identical runtime output on `codegen_locals.eli
 `lexer_tokens.elisa`, and elisa-ui's `ui_text_measure_layout.elisa`, all with zero
 parse errors. This compares the probes' reported results, not a complete AST dump.
 No full-corpus or bootstrap-fixpoint result is claimed.
+
+## Field lifetimes, parser scratch, and speed-first policy (2026-09-14)
+
+Runtime speed is the primary objective. Lower memory use is a secondary benefit,
+not a reason to enable a slower allocation strategy. Full-mode allocation captures
+explain storage behavior; uninstrumented paired runs decide the speed policy.
+
+The experimental field-splitting pass and automatic scratch-trimming policy have
+been removed, including their environment flags. Early field reclamation measured
+about 2x slower; trimming demonstrated no speed benefit. Ordinary arena reset,
+reuse, and explicit `arena_trim` remain available.
+
+Two allocation-routing details are corrected. Replacing a growable output
+reference now records that parameter's caller region. Borrowed scalar references
+(such as source bytes) no longer override an explicit allocation scope merely
+because they are references; container-carrying references retain their existing
+routing. The one-shot `frontend_parse` uses a temporary arena for lexing and keeps
+AST construction in the caller's arena, then releases tokens and lexer working
+buffers. Source bytes must still outlive the returned AST. This separates tokens
+from the AST, not every temporary field within the parser itself.
+
+Inferred loop scratch retains backing for reuse.
+
+Explicit-region creation events now read actual capacity from the runtime header:
+a cache hit may supply a block larger than the requested size. The profiler's
+bounded allocation-site analysis follows stable header identities through
+adoption, rewind, and trim, rejects incomplete/ambiguous evidence, and reports
+capacity retained at reuse separately from a transient pre-trim reset total.
+These values are not RSS or committed physical pages.
+
+### Reproduction and speed evidence
+
+`test/parity/memory_decisions_smoke.sh` checks output-reference and parser runtime
+behavior against stage0, parser arena separation, and cached-capacity events.
+`test/parity/profile_memory_decisions.sh COMPILER OUT` captures the lifecycle
+workload, including explicit adoption, rewind, and trim.
+`test/parity/profile_parser_scratch.sh COMPILER OUT` compares ten surviving ASTs
+with shared versus temporary token storage.
+
+`test/parity/benchmark_memory_speed.sh COMPILER OUT` builds ordinary, untraced parser
+executables and uses elisa-profiler's `scripts/benchmark-native.py`. Compilation is
+excluded; pairs have randomized baseline/candidate order, two warmups, fifteen
+measured repetitions, identical output checks, and executable/input hashes.
+Each sample records CPU and wall time. The longer workloads repeat batches so
+process-launch overhead is not the whole measurement.
+
+Initial median child CPU times on this host, with identical `-O2` target settings
+and runtime object:
+
+| Policy/workload | Baseline | Candidate | Decision |
+| --- | ---: | ---: | --- |
+| Early field reclamation | 220.436 ms | 446.870 ms | Removed: about 2x slower |
+| Trim after a spike and small iteration | 22.658 ms | 22.924 ms | Removed: no speed gain shown |
+| Same trim policy, steady large iterations | 44.032 ms | 43.193 ms | Within run variation; no speedup claim |
+| Temporary parser tokens | 94.953 ms | 95.534 ms | Within run variation; no speedup claim |
+
+The field capture's peak logical live bytes fell from 6,659,072 to 171,008, but
+that memory improvement does not override the timing regression. Capture and
+timing artifacts live under `build/field-lifetimes-20260914/`; `eager-trim/` and
+`parser/` retain superseded experiments, while `final-policies/`, `parser-final/`,
+and `speed/` hold the final policy evidence. The earlier parser experiment had
+identical allocation metrics because source-reference routing defeated its arena
+switch; it is not evidence of an improvement.
+
+A separate 25-pair parser confirmation measured median CPU 84.140 ms versus
+83.912 ms (0.9973 candidate/baseline), again consistent with speed neutrality.
+The final five-run allocation capture reduced peak logical live bytes from
+2,335,728 to 1,931,952 (17.3%) while retaining the same 3 MiB peak observed backing
+capacity. Every capture returned 0 and had complete, usable lifetime evidence;
+allocation metrics were identical across the five repetitions. This is a memory
+bonus without a demonstrated speedup, and no RSS improvement is claimed.
+
+The output-assignment regression also fails with exit 1 under the prior installed
+compiler and passes with exit 0 under stage0 and the corrected stage1. Parser
+runtime tests inspect surviving names, parameter arrays, statements, and literal
+payloads after repeated temporary-arena reuse; an IR check additionally verifies
+that token construction and AST construction receive different arenas.
+
+Validation before policy removal: an optimized seed rebuilt the compiler without stage0; that
+self-hosted compiler passed the seven paired runtime fixtures in the new smoke
+suite, all fifteen existing loop/region runtime fixtures, returned-lexer-buffer
+lifetime checks, and 329 byte-identical token fixtures against stage0. The new
+suite also passed its proof/fallback IR, default-policy, physical-region reuse,
+actual cached-capacity, and distinct parser-arena assertions. The optimized
+installed product passed the new suite and 329 token fixtures again, and its
+`~/.elisac/elisac-stage1` wrapper executed the output-assignment regression with
+exit 0. Profiler collector, lifetime-analysis, and paired-timing tests passed.
+No full differential-corpus or bootstrap-fixpoint result is claimed. These source
+changes remain uncommitted.
+
+After removing the experimental policies, a fresh optimized seed and runtime were
+rebuilt. The compiler rebuilt itself successfully; that self-hosted compiler passed
+the two remaining paired lifetime regressions, all fifteen loop/region runtime
+fixtures and their IR checks, cached-capacity events, and parser arena separation.
+The optimized seed passed all 329 token byte-parity fixtures and was installed with
+the rebuilt runtime. Profiler lifetime-analysis and native benchmark tests passed.
+The removed policies and flags have no remaining references in source or tests.
+No new speed measurement or full-corpus result is claimed for this removal.
