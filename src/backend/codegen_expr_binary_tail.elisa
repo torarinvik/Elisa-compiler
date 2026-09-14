@@ -10,19 +10,24 @@ extend Backend:
         const SVIEW_EQUALITY_ARGUMENT_COUNT: u32 = 2
 
         # Operands are already evaluated. Unequal lengths need no runtime call.
-        def emit_sview_equality_code(left: LLVMValueRef, right: LLVMValueRef, structs: mutable StructTable&, runtime: Runtime&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # A real cstr may be compared with an sview; materialize its length before
+        # calling the by-value sview ABI. Opaque handles and all other mismatches
+        # decline instead of emitting a call with arguments of the wrong LLVM type.
+        def emit_sview_equality_code(left: LLVMValueRef, right: LLVMValueRef, left_source_type: ValueType, right_source_type: ValueType, structs: mutable StructTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             view_type: LLVMTypeRef = llvm_type_of(ValueType{kind: TypeKind.SView, bits: 0}, structs, ctx)
-            # Some legacy lowering paths do not materialize the canonical view
-            # aggregate. Preserve their existing call rather than extracting
-            # fields from a scalar or pointer LLVM value.
-            if LLVMTypeOf(left) != view_type or LLVMTypeOf(right) != view_type:
-                fallback_arguments: mutable darray[LLVMValueRef] = [left, right]
-                fallback_pointer: void& = (&fallback_arguments[0]).cast[void&] can Unsafe.PointerCast
-                return LLVMBuildIntCast2(builder, LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, fallback_pointer, SVIEW_EQUALITY_ARGUMENT_COUNT, "sview.eq"), LLVMInt64TypeInContext(ctx), 1, "string.eq.code")
+            view_pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
             int_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            left_value: mutable LLVMValueRef = left
+            right_value: mutable LLVMValueRef = right
+            if LLVMTypeOf(left_value) != view_type:
+                null return if left_source_type.kind != TypeKind.CStr or left_source_type.bits != 0 or LLVMTypeOf(left_value) != view_pointer_type
+                left_value <- emit_sview_from_parts(left_value, LLVMConstInt(int_type, 0, 0), LLVMConstInt(int_type, 18446744073709551615, 1), view_type, m, ctx, builder)
+            if LLVMTypeOf(right_value) != view_type:
+                null return if right_source_type.kind != TypeKind.CStr or right_source_type.bits != 0 or LLVMTypeOf(right_value) != view_pointer_type
+                right_value <- emit_sview_from_parts(right_value, LLVMConstInt(int_type, 0, 0), LLVMConstInt(int_type, 18446744073709551615, 1), view_type, m, ctx, builder)
             zero: LLVMValueRef = LLVMConstInt(int_type, 0, 0)
-            left_length: LLVMValueRef = LLVMBuildExtractValue(builder, left, SVIEW_EQUALITY_LENGTH_FIELD, "sveq.left.len")
-            right_length: LLVMValueRef = LLVMBuildExtractValue(builder, right, SVIEW_EQUALITY_LENGTH_FIELD, "sveq.right.len")
+            left_length: LLVMValueRef = LLVMBuildExtractValue(builder, left_value, SVIEW_EQUALITY_LENGTH_FIELD, "sveq.left.len")
+            right_length: LLVMValueRef = LLVMBuildExtractValue(builder, right_value, SVIEW_EQUALITY_LENGTH_FIELD, "sveq.right.len")
             same_length: LLVMValueRef = LLVMBuildICmp(builder, int_predicate_of(TokenKind.EqEq), left_length, right_length, "sveq.same.len")
             result_slot: LLVMValueRef = build_entry_alloca(builder, int_type, "sveq.result")
             _ = LLVMBuildStore(builder, zero, result_slot)
@@ -31,7 +36,7 @@ extend Backend:
             done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "sveq.done")
             _ = LLVMBuildCondBr(builder, same_length, compare_block, done_block)
             LLVMPositionBuilderAtEnd(builder, compare_block)
-            arguments: mutable darray[LLVMValueRef] = [left, right]
+            arguments: mutable darray[LLVMValueRef] = [left_value, right_value]
             arguments_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
             code: LLVMValueRef = LLVMBuildIntCast2(builder, LLVMBuildCall2(builder, runtime.sview_eq_type, runtime.sview_eq, arguments_pointer, SVIEW_EQUALITY_ARGUMENT_COUNT, "sview.eq"), LLVMInt64TypeInContext(ctx), 1, "string.eq.code")
             _ = LLVMBuildStore(builder, code, result_slot)
@@ -315,15 +320,18 @@ extend Backend:
                     # `sview == sview` / `!=`: reject unequal lengths locally,
                     # otherwise use runtime equality, then reduce `code <op> 0`.
                     if operand_type.kind == TypeKind.SView and (binary_operator == TokenKind.EqEq or binary_operator == TokenKind.BangEq):
+                        sveq_left_source_type: ValueType = expression_type(binary_left, local_scope, fns, structs, generics)
+                        sveq_right_source_type: ValueType = expression_type(binary_right, local_scope, fns, structs, generics)
                         if emit_expression(binary_left, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sveq_left:
                             if emit_expression(binary_right, operand_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is sveq_right:
-                                sveq_code: LLVMValueRef = emit_sview_equality_code(sveq_left, sveq_right, structs, runtime, ctx, builder)
-                                sveq_inner_op: TokenKind = TokenKind.BangEq if binary_operator == TokenKind.EqEq else TokenKind.EqEq
-                                sveq_zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)
-                                sveq_int64: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
-                                sveq_result_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
-                                if emit_binary(sveq_inner_op, sveq_code, sveq_zero, sveq_int64, structs, runtime.fast_math, m, ctx, builder) is sveq_value:
-                                    return emit_conversion(sveq_value, sveq_result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != sveq_result_type.kind or expected.bits != sveq_result_type.bits) else sveq_value
+                                if emit_sview_equality_code(sveq_left, sveq_right, sveq_left_source_type, sveq_right_source_type, structs, runtime, m, ctx, builder) is sveq_code:
+                                    sveq_inner_op: TokenKind = TokenKind.BangEq if binary_operator == TokenKind.EqEq else TokenKind.EqEq
+                                    sveq_zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), 0, 0)
+                                    sveq_int64: ValueType = ValueType{kind: TypeKind.Signed, bits: 64}
+                                    sveq_result_type: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                                    if emit_binary(sveq_inner_op, sveq_code, sveq_zero, sveq_int64, structs, runtime.fast_math, m, ctx, builder) is sveq_value:
+                                        return emit_conversion(sveq_value, sveq_result_type, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != sveq_result_type.kind or expected.bits != sveq_result_type.bits) else sveq_value
+                                    return null
                                 return null
                             return null
                         return null

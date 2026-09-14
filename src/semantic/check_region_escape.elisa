@@ -84,6 +84,14 @@ extend Semantic:
                         return return_type_is_owned_container(type_expression)
 
 
+        def region_escape_is_fresh_container_value(value: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match value:
+                    Expr.Array(_, _): true
+                    Expr.Comprehension(_, _, _, _, _): true
+                    _: false
+
+
 
         # Struct names that OWN inferred-region heap storage — a member is an owned container.
         # A function returning such a struct (built from container literals, no region param)
@@ -196,21 +204,17 @@ extend Semantic:
 
 
 
-        def region_escape_walk(statements: darray[Ast::Stmt], nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        def region_escape_walk(statements: darray[Ast::Stmt], nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, ref_params: darray[sview]&, outer_locals: darray[sview]&, view_fns: darray[sview]&, container_fns: darray[sview]&, taint_names: mutable darray[sview]&, taint_regions: mutable darray[sview]&, local_type_names: mutable darray[sview]&, local_type_exprs: mutable darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
+                local_type_mark: usize = local_type_names.count
+                taint_mark: usize = taint_names.count
                 # Locals visible from a child scope = the enclosing set plus every local declared
                 # directly at this level. Passed as the `outer_locals` of child region/control blocks
                 # so the outlives check can tell a region-enclosed value stored into an enclosing
                 # local (escape) from one stored into a region-body local (fine).
                 child_outer_locals: mutable darray[sview] = [name for name in outer_locals]
                 collect_level_local_names(statements, child_outer_locals)
-                # Value-taint accumulated within THIS statement list: a name maps to the region a
-                # value from that region flowed into it (a struct field-assigned or copied from a
-                # region-local). Local to this scope — the copy-launder escape occurs within one
-                # region block's body, so no cross-block threading is needed.
-                taint_names: mutable darray[sview] = []
-                taint_regions: mutable darray[sview] = []
-                for statement in statements |table, taint_names, taint_regions| -> table:
+                for statement in statements |table, taint_names, taint_regions, local_type_names, local_type_exprs| -> table:
                     match statement:
                         Stmt.Block(kind, clause, binding, body, line):
                             is_region_block: bool = kind == "region" and clause.count > 0
@@ -225,25 +229,45 @@ extend Semantic:
                             # compiler (every `can …:` is one), and each copy allocates into the
                             # walker's auto-region, so the pair cost an mmap and an munmap per
                             # block. Pass the originals when nothing changes.
+                            block_type_mark: usize = local_type_names.count
+                            if binding != "":
+                                local_type_names.push(binding)
+                                local_type_exprs.push(Ast::Expr.Absent)
                             if is_region_block or grants_stale:
                                 child_stack: mutable darray[sview] = [entry for entry in nesting]
                                 child_stack.push(region_label) if is_region_block
                                 granted_ref_params: darray[sview] = [] if grants_stale else [ref_name for ref_name in ref_params]
-                                table <- region_escape_walk(body, child_stack, annotations, mutable_globals, granted_ref_params, child_outer_locals, view_fns, container_fns, table)
+                                table <- region_escape_walk(body, child_stack, annotations, mutable_globals, granted_ref_params, child_outer_locals, view_fns, container_fns, taint_names, taint_regions, local_type_names, local_type_exprs, table)
                             else:
-                                table <- region_escape_walk(body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, table)
+                                table <- region_escape_walk(body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, taint_names, taint_regions, local_type_names, local_type_exprs, table)
+                            local_type_names <- local_type_names.truncate(block_type_mark) if local_type_names.count > block_type_mark
+                            local_type_exprs <- local_type_exprs.truncate(block_type_mark) if local_type_exprs.count > block_type_mark
                         Stmt.Expr(expression, line):
                             table <- region_escape_check_store(expression, line.line, nesting, annotations, view_fns, table)
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- region_escape_check_store(value, line.line, nesting, annotations, view_fns, table)
+                            declared_type: mutable Ast::Expr = type_expression
+                            if declared_type is Ast::Expr.Absent:
+                                match value:
+                                    Expr.Construct(inferred_construct_type, _, _):
+                                        declared_type <- inferred_construct_type
+                                    _:
+                                        pass
+                            local_type_names.push(name)
+                            local_type_exprs.push(declared_type)
                             # A local copied/derived from a region value carries that region's taint.
-                            var_region: sview = region_escape_stored_or_call_region(value, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line.line)
+                            var_region: mutable sview = region_escape_stored_or_call_region(value, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line.line)
+                            # A fresh local container created lexically inside a region block owns
+                            # storage from that block even when its empty literal has no borrowed
+                            # input from which provenance can be inferred.
+                            if var_region == "" and nesting.count > 0 and member_type_is_owned_container(type_expression) and region_escape_is_fresh_container_value(value):
+                                var_region <- nesting[nesting.count - 1]
                             if var_region != "":
                                 taint_names.push(name)
                                 taint_regions.push(var_region)
                         Stmt.Assign(target, operator, value, line):
                             table <- region_escape_check_store(value, line.line, nesting, annotations, view_fns, table)
-                            table <- region_escape_check_assign(target, value, line.line, nesting, annotations, mutable_globals, ref_params, outer_locals, view_fns, container_fns, taint_names, taint_regions, table)
+                            table <- region_escape_check_assign(target, value, line.line, nesting, annotations, mutable_globals, ref_params, outer_locals, view_fns, container_fns, taint_names, taint_regions, local_type_names, local_type_exprs, table)
                             # Storing a region value into a field of an aggregate taints the aggregate
                             # (`inner.xs <- v` taints `inner`); a whole-value store taints the target.
                             assign_region: sview = region_escape_stored_or_call_region(value, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line.line)
@@ -253,18 +277,30 @@ extend Semantic:
                                 taint_regions.push(assign_region)
                         Stmt.Return(value, line):
                             if value is returned:
-                                returned_region: sview = stored_value_region(returned, annotations, view_fns, line.line)
+                                returned_region: sview = region_escape_stored_or_call_region(returned, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line.line)
                                 returned_position: (found: bool, position: usize) = region_stack_position(nesting, returned_region)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionReturnEscape, name: "", line: line.line, expected: "", actual: returned_region}) if returned_region != "" and returned_position.found
+                                carries_region_handle: bool = region_escape_value_carries_handles(returned, annotations, line.line, local_type_names, local_type_exprs, table)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionReturnEscape, name: "", line: line.line, expected: "", actual: returned_region}) if returned_region != "" and returned_position.found and carries_region_handle
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- region_escape_walk(then_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, table)
-                            table <- region_escape_walk(else_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, table)
+                            table <- region_escape_walk(then_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, taint_names, taint_regions, local_type_names, local_type_exprs, table)
+                            table <- region_escape_walk(else_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, taint_names, taint_regions, local_type_names, local_type_exprs, table)
                         Stmt.While(condition, while_body, line):
-                            table <- region_escape_walk(while_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, table)
+                            table <- region_escape_walk(while_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, taint_names, taint_regions, local_type_names, local_type_exprs, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- region_escape_walk(for_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, table)
+                            loop_type_names: mutable darray[sview] = []
+                            loop_type_exprs: mutable darray[Ast::Expr] = []
+                            table <- region_escape_walk(for_body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, taint_names, taint_regions, loop_type_names, loop_type_exprs, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                arm_type_names: mutable darray[sview] = []
+                                arm_type_exprs: mutable darray[Ast::Expr] = []
+                                table <- region_escape_walk(arm.body, nesting, annotations, mutable_globals, ref_params, child_outer_locals, view_fns, container_fns, taint_names, taint_regions, arm_type_names, arm_type_exprs, table)
                         _:
                             pass
+                local_type_names <- local_type_names.truncate(local_type_mark) if local_type_names.count > local_type_mark
+                local_type_exprs <- local_type_exprs.truncate(local_type_mark) if local_type_exprs.count > local_type_mark
+                taint_names <- taint_names.truncate(taint_mark) if taint_names.count > taint_mark
+                taint_regions <- taint_regions.truncate(taint_mark) if taint_regions.count > taint_mark
 
 
 
@@ -277,9 +313,16 @@ extend Semantic:
                             ref_params: mutable darray[sview] = []
                             collect_forwardable_ref_params(parameters, ref_params)
                             empty_outer_locals: darray[sview] = []
-                            table <- region_escape_walk(body, empty_stack, annotations, mutable_globals, ref_params, empty_outer_locals, view_fns, container_fns, table)
+                            local_type_names: mutable darray[sview] = [parameter.name for parameter in parameters]
+                            local_type_exprs: mutable darray[Ast::Expr] = [parameter.type_expression for parameter in parameters]
+                            taint_names: mutable darray[sview] = []
+                            taint_regions: mutable darray[sview] = []
+                            table <- region_escape_walk(body, empty_stack, annotations, mutable_globals, ref_params, empty_outer_locals, view_fns, container_fns, taint_names, taint_regions, local_type_names, local_type_exprs, table)
                         Decl.Module(module_name, module_body, module_line):
+                            previous_module: sview = table.current_module
+                            table.current_module <- module_name
                             table <- check_region_escape_walk(module_body, annotations, mutable_globals, view_fns, container_fns, table)
+                            table.current_module <- previous_module
                         Decl.Scoped(scoped_body, scoped_line):
                             table <- check_region_escape_walk(scoped_body, annotations, mutable_globals, view_fns, container_fns, table)
                         _:

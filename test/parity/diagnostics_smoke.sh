@@ -171,6 +171,13 @@ NAMES=(
     tuple_var_arithmetic
     tuple_var_shift
     tuple_var_compound_assign
+    region_aggregate_return_escape
+    region_field_return_escape
+    region_branch_field_return_escape
+    region_match_return_escape
+    region_block_return_escape
+    region_index_return_escape
+    region_match_local_return_escape
     container_var_scalar_mismatch
     container_var_ordering
     optional_var_scalar_mismatch
@@ -326,6 +333,13 @@ EXPECTS=(
     "operator requires numeric operands"
     "operator requires numeric operands"
     "augmented assignment requires numeric operands"
+    "escapes via return; the region is freed at scope exit"
+    "escapes via return; the region is freed at scope exit"
+    "escapes via return; the region is freed at scope exit"
+    "escapes via return; the region is freed at scope exit"
+    "escapes via return; the region is freed at scope exit"
+    "escapes via return; the region is freed at scope exit"
+    "escapes via return; the region is freed at scope exit"
     "variable \"x\" expects i64, got darray[i64]"
     "comparison requires numeric operands"
     "variable \"y\" expects i64, got i64"
