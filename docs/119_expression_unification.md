@@ -133,3 +133,30 @@ test/parity/block_expressions_smoke.sh
 The implementation is in `src/parser/parser_core.elisa`,
 `src/parser/parser_stmt.elisa`, `src/parser/parser_stmt_control.elisa`, and
 `src/semantic/resolve_value_blocks.elisa`.
+
+## Collection updates in `with`
+
+`darray += element` appends exactly one element in place. It is a statement,
+not an expression returning a reference. Numeric `+=` retains numeric addition.
+Use `.extend(elements)` for multiple elements; `+=` never implicitly flattens
+an array-valued element or accepts a batch in place of a scalar element.
+
+Field updates support the same operation:
+
+```elisa
+structs <-
+    if structs.cond_bind_depth > 0:
+        structs with {
+            cond_bind_names += name,
+            cond_bind_slots += slot,
+            cond_bind_types += slot_type,
+        }
+    else:
+        structs
+```
+
+`with` yields its receiver; `<-` replaces a field, while `+=` updates it.
+Fields execute in source order. A complex statement receiver, such as
+`rows[next_index()] with {items += value}`, is evaluated once. Appending uses
+the collection's existing growth-region and mutability rules, including when
+it grows through a reference parameter. Bulk append requires explicit `extend`.

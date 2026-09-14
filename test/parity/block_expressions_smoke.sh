@@ -12,7 +12,7 @@ from pathlib import Path
 import re, subprocess, sys
 root, stage0, stage1, work = sys.argv[1:]
 work = Path(work)
-for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'block_reference_threading', 'block_state_threading'):
+for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'block_reference_threading', 'block_state_threading', 'with_collection_append'):
     outputs = []
     for stage, compiler in enumerate((stage0, stage1)):
         for level in ('-O0', '-O2'):
@@ -26,7 +26,7 @@ for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_exp
             outputs.append((result.stdout, result.stderr))
     assert all(output == outputs[0] for output in outputs), (fixture, outputs)
     print(f'{fixture}: stage0/stage1 O0/O2 runtime and byte parity PASS', flush=True)
-    if fixture in ('block_reference_threading', 'block_state_threading'):
+    if fixture in ('block_reference_threading', 'block_state_threading', 'with_collection_append'):
         function = 'forward' if fixture == 'block_reference_threading' else 'update'
         for compiler in (stage0, stage1):
             ir = work / f'{Path(compiler).name}-reference-threading.ll'
@@ -35,11 +35,18 @@ for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_exp
             match = re.search(rf'define[^\n]*@{function}\([^\n]*\)\s*#?\d*\s*\{{(.*?)\n\}}', text, re.S)
             assert match, (compiler, f'missing {function}() in LLVM IR')
             body = match.group(1)
+            if fixture == 'with_collection_append':
+                assert not re.search(r'\b(?:load|store)\s+%[^,\n]*State', body), (compiler, body)
+                continue
             assert not re.search(r'\b(?:load|store)\s+%[^,\n]*LargeState|@(?:llvm\.)?mem(?:cpy|move)', body), (compiler, body)
         print(f'{fixture}: O0 LLVM has no aggregate load/store', flush=True)
 # Keep lexical boundaries and capture checking enforced while widening valid forms.
 state_prefix = 'struct State:\n    value: mutable i64\n\n'
 for name, body in {
+    'append_region_escape': '    region outer(8192):\n        rows: mutable darray[darray[i64]] @outer = []\n        region short(4096):\n            row: darray[i64] @short = [1]\n            rows += row\n    return 0\n',
+    'append_bulk': '    xs: mutable darray[i64] = []\n    xs += [1, 2]\n    return 0\n',
+    'append_wrong_element': '    xs: mutable darray[i64] = []\n    xs += true\n    return 0\n',
+    'append_immutable': '    xs: darray[i64] = [1]\n    xs += 2\n    return 0\n',
     'state_unrelated_mutation': '    state: mutable State = zeroed\n    other: mutable i64 = 0\n    state <-\n        other <- 1\n        state.value <- 2\n        state\n    return 0\n',
     'state_mixed_result': '    state: mutable State = zeroed\n    other: State = zeroed\n    state <-\n        state.value <- 2\n        if state.value == 2:\n            state\n        else:\n            other\n    return 0\n',
     'state_leaked_local': '    state: mutable State = zeroed\n    state <-\n        hidden: i64 = 2\n        state.value <- hidden\n        state\n    return hidden\n',
