@@ -55,13 +55,18 @@ grep -q "index must be numeric, got sview" <<< "$out" || fail "sview darray inde
 out=$(printf 'def f(values: darray[i32], idx: i64) -> i32:\n    return values[idx]\n' | "$RPT")
 grep -qE "index must be (integral|numeric)" <<< "$out" && fail "false positive on integer darray index: $out"
 
-# 8. literal-zero for-range strides are rejected, nonzero strides are valid.
+# 8. An unknown target type cannot justify a nonnumeric-RHS error. A sibling module may own
+# the target's field declaration, so per-file semantic scans must keep this case Unknown.
+out=$(printf 'def append_unknown_field(target: MissingType&, name: sview) -> void:\n    target.names += name\n' | "$RPT")
+grep -q "augmented assignment requires numeric operands" <<< "$out" && fail "unknown target was treated as a numeric scalar: $out"
+
+# 9. literal-zero for-range strides are rejected, nonzero strides are valid.
 out=$(printf 'def f() -> void:\n    for i in 0..<10..0:\n        pass\n' | "$RPT")
 grep -q "for loop range step cannot be zero" <<< "$out" || fail "zero range step not flagged: $out"
 out=$(printf 'def f() -> void:\n    for i in 0..<10..2:\n        pass\n' | "$RPT")
 grep -q "for loop range step cannot be zero" <<< "$out" && fail "false positive on nonzero range step: $out"
 
-# 9. A long left-associated expression is parsed iteratively, but this semantic
+# 10. A long left-associated expression is parsed iteratively, but this semantic
 # pass recursively visits its AST. It must fail closed at its explicit safe bound
 # instead of overflowing the native stack or silently skipping the unvisited tail.
 deep_source="$(mktemp "${TMPDIR:-/tmp}/elisa-operator-depth.XXXXXX")"
@@ -80,7 +85,7 @@ PY
 out=$("$RPT" < "$deep_source")
 grep -q "expression nesting exceeds the safe semantic-analysis limit" <<< "$out" || fail "deep expression was not safely refused: $out"
 
-# 10. 0 FP across frontend + stdlib.
+# 11. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "requires bool operands|requires numeric operands|operator requires integral operands|index must be integral|range step cannot be zero|expression nesting exceeds the safe semantic-analysis limit" || true)
