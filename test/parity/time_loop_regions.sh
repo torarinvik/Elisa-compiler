@@ -5,12 +5,13 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BEFORE="${1:?baseline compiler required}"
 AFTER="${2:?candidate compiler required}"
 OUT="${3:?output directory required}"
+SOURCE="${4:-$ROOT/test/bench/loop_region_timing.elisa}"
 mkdir -p "$OUT"
 clang -c "$ROOT/test/parity/profile_hooks.c" -o "$OUT/hooks.o"
 for version in before after; do
     compiler="$BEFORE"
     [[ "$version" == before ]] || compiler="$AFTER"
-    "$compiler" -emit obj -O2 -o "$OUT/$version.o" "$ROOT/test/bench/loop_region_timing.elisa"
+    "$compiler" -emit obj -O2 -o "$OUT/$version.o" "$SOURCE"
     clang -Wl,-dead_strip -o "$OUT/$version" "$OUT/$version.o" "$OUT/hooks.o" \
         "${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 done

@@ -1,12 +1,12 @@
 # Conservative loop scratch inference. Every accepted use copies a scalar or performs
 # a known builtin operation on the one fresh local darray. Unknown syntax keeps the
-# original arena. In particular, no call summary, alias, view, or pointer is guessed.
+# original arena. Calls require a proven body summary; aliases, views, and pointers remain unknown.
 extend Backend:
     private:
         def loop_scratch_scalar_type(value_type: ValueType) -> bool:
             return value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned or value_type.kind == TypeKind.Float or value_type.kind == TypeKind.Bool
 
-        def loop_scratch_scalar(expression: Expr, name: sview, local_scope: mutable Scope&) -> bool can[Abort.Panic, Memory.Allocate]:
+        def loop_scratch_scalar(expression: Expr, name: sview, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
             match expression:
                 Expr.IntLit(value, pos):
                     return true
@@ -18,22 +18,38 @@ extend Backend:
                     return identifier != name and loop_scratch_scalar_type(lookup_type(local_scope, identifier))
                 Expr.Index(object, index, pos):
                     if object is Expr.Ident(identifier, identifier_pos):
-                        return identifier == name and loop_scratch_scalar(index, name, local_scope)
+                        return identifier == name and loop_scratch_scalar(index, name, local_scope, fns, structs)
                     return false
                 Expr.Field(object, field, pos):
                     if object is Expr.Ident(identifier, identifier_pos):
                         return identifier == name and (field == "count" or field == "capacity")
                     return false
+                Expr.Call(callee, arguments, labels, pos):
+                    return false if arguments.count != 1
+                    for label in labels:
+                        return false if label != ""
+                    if callee is Expr.Ident(callee_name, callee_pos):
+                        return false if lookup_type(local_scope, callee_name).kind != TypeKind.Unmodeled
+                        target: i64 = scratch_unique_global(callee_name, fns)
+                        return false if target < 0
+                        return false if target.usize() >= fns.scratch_readonly.count or not fns.scratch_readonly[target.usize()]
+                        argument: mutable Expr = arguments[0]
+                        if argument is Expr.Unary(operator, operand, argument_pos):
+                            return false if operator != TokenKind.Ampersand
+                            argument <- operand
+                        if argument is Expr.Ident(argument_name, argument_pos):
+                            return argument_name == name
+                    return false
                 Expr.Paren(inner, pos):
-                    return loop_scratch_scalar(inner, name, local_scope)
+                    return loop_scratch_scalar(inner, name, local_scope, fns, structs)
                 Expr.Unary(operator, operand, pos):
-                    return (operator == TokenKind.Minus or operator == TokenKind.Not or operator == TokenKind.Plus) and loop_scratch_scalar(operand, name, local_scope)
+                    return (operator == TokenKind.Minus or operator == TokenKind.Not or operator == TokenKind.Plus) and loop_scratch_scalar(operand, name, local_scope, fns, structs)
                 Expr.Binary(left, operator, right, pos):
-                    return loop_scratch_scalar(left, name, local_scope) and loop_scratch_scalar(right, name, local_scope)
+                    return loop_scratch_scalar(left, name, local_scope, fns, structs) and loop_scratch_scalar(right, name, local_scope, fns, structs)
                 _:
                     return false
 
-        def loop_scratch_statements(body: darray[Stmt]&, name: sview, local_scope: mutable Scope&, start: usize) -> bool can[Abort.Panic, Memory.Allocate]:
+        def loop_scratch_statements(body: darray[Stmt]&, name: sview, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, start: usize) -> bool can[Abort.Panic, Memory.Allocate]:
             for row in start..<body.count |body, name, local_scope|:
                 match body[row]:
                     Stmt.Expr(expression, pos):
@@ -41,19 +57,19 @@ extend Backend:
                             if callee is Expr.Field(object, method, field_pos):
                                 if object is Expr.Ident(identifier, object_pos):
                                     if identifier == name and (method == "push" or method == "reserve") and arguments.count == 1:
-                                        return false if not loop_scratch_scalar(arguments[0], name, local_scope)
+                                        return false if not loop_scratch_scalar(arguments[0], name, local_scope, fns, structs)
                                         continue
                         return false
                     Stmt.Assign(target, operator, value, pos):
                         if target is Expr.Ident(identifier, target_pos):
                             return false if identifier == name or not loop_scratch_scalar_type(lookup_type(local_scope, identifier))
-                            return false if not loop_scratch_scalar(value, name, local_scope)
+                            return false if not loop_scratch_scalar(value, name, local_scope, fns, structs)
                         else:
                             return false
                     Stmt.If(condition, then_body, else_body, pos):
-                        return false if not loop_scratch_scalar(condition, name, local_scope)
-                        return false if not loop_scratch_statements(then_body, name, local_scope, 0)
-                        return false if not loop_scratch_statements(else_body, name, local_scope, 0)
+                        return false if not loop_scratch_scalar(condition, name, local_scope, fns, structs)
+                        return false if not loop_scratch_statements(then_body, name, local_scope, fns, structs, 0)
+                        return false if not loop_scratch_statements(else_body, name, local_scope, fns, structs, 0)
                     Stmt.Break(label, pos):
                         return false if label != ""
                     Stmt.Continue(label, pos):
@@ -62,7 +78,7 @@ extend Backend:
                         return false
             return true
 
-        def loop_scratch_candidate(body: darray[Stmt]&, local_scope: mutable Scope&, structs: StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+        def loop_scratch_candidate(body: darray[Stmt]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate]:
             return false if body.count < 2
             return false if lookup_type(local_scope, "__loop_scratch").kind != TypeKind.Unmodeled
             if body[0] is Stmt.VarDecl(name, declared_type, initial, pos):
@@ -88,15 +104,70 @@ extend Backend:
                     return false
                 if initial is Expr.Array(elements, array_pos):
                     for value in elements |name, local_scope|:
-                        return false if not loop_scratch_scalar(value, name, local_scope)
+                        return false if not loop_scratch_scalar(value, name, local_scope, fns, structs)
                 else:
                     return false
-                return loop_scratch_statements(body, name, local_scope, 1)
+                return loop_scratch_statements(body, name, local_scope, fns, structs, 1)
             return false
 
         def emit_loop_statements_scoped(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            if loop_scratch_candidate(body, local_scope, structs):
+            if loop_scratch_candidate(body, local_scope, fns, structs):
                 if body[0] is Stmt.VarDecl(name, declared_type, initial, pos):
                     wrapper: mutable darray[Stmt] = [Stmt.Block("region", ["__loop_scratch"], "", [entry for entry in body], pos)]
                     return emit_statements_scoped(wrapper, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
             return emit_statements_scoped(body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+
+        # Require a unique name across all owners, including overloads. This intentionally
+        # avoids guessing the result of namespace, UFCS, or generic resolution.
+        def scratch_unique_global(name: sview, fns: FnTable&) -> i64 can[Abort.Panic]:
+            found: mutable i64 = -1
+            for row in 0..<fns.names.count |found, fns, name|:
+                if fns.names[row] == name:
+                    return -1 if found >= 0 or fns.owners[row] != ""
+                    found <- row.i64()
+            return found
+
+        def scratch_summarize_declarations(declarations: darray[Decl]&, all_declarations: darray[Decl]&, fns: mutable FnTable&, structs: mutable StructTable&, changed: mutable bool&) -> void can[Abort.Panic, Memory.Allocate]:
+            for declaration in declarations |fns, structs, changed|:
+                if declaration is Decl.Scoped(nested, pos):
+                    scratch_summarize_declarations(nested, all_declarations, fns, structs, changed)
+                elif declaration is Decl.Func(name, params, result, body, effects, decorators, pos):
+                    continue if params.count != 1 or body.count != 1 or decorators.count != 0
+                    continue if scratch_declaration_count(all_declarations, name) != 1
+                    row: i64 = scratch_unique_global(name, fns)
+                    continue if row < 0
+                    index: usize = row.usize()
+                    continue if fns.lines[index] != pos.line or fns.scratch_readonly[index]
+                    continue if not loop_scratch_scalar_type(fns.returns[index])
+                    continue if fns.is_error[index] or fns.is_variadic[index]
+                    continue if index < fns.is_extern.count and fns.is_extern[index]
+                    parameter: ValueType = fns.param_types[fns.param_start[index]]
+                    continue if parameter.kind != TypeKind.Ref
+                    pointee: ValueType = ref_target_of(parameter, structs)
+                    continue if pointee.kind != TypeKind.DArray
+                    continue if not loop_scratch_scalar_type(darray_element_of(pointee, structs))
+                    if body[0] is Stmt.Return(value, return_pos):
+                        if value is expression:
+                            # Empty scalar environment: globals and parameter-as-value escape
+                            # cannot pass the scalar-expression proof.
+                            summary_scope: mutable Scope = Scope{names: [], slots: [], types: [], pool_names: [], group_names: [], deferred: []}
+                            if loop_scratch_scalar(expression, params[0].name, summary_scope, fns, structs):
+                                fns.scratch_readonly[index] <- true
+                                changed <- true
+
+        def register_scratch_summaries(declarations: darray[Decl]&, fns: mutable FnTable&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for _ in 0..<fns.names.count |fns|:
+                fns.scratch_readonly.push(false)
+            changed: mutable bool = true
+            while changed |changed, declarations, fns, structs|:
+                changed <- false
+                scratch_summarize_declarations(declarations, declarations, fns, structs, changed)
+
+        def scratch_declaration_count(declarations: darray[Decl]&, name: sview) -> usize can[Abort.Panic, Memory.Allocate]:
+            count: mutable usize = 0
+            for declaration in declarations |count, name|:
+                if declaration is Decl.Func(candidate, params, result, body, effects, decorators, pos):
+                    count <- count + 1 if candidate == name
+                elif declaration is Decl.Scoped(nested, pos) or declaration is Decl.Module(module_name, nested, module_pos):
+                    count <- count + scratch_declaration_count(nested, name)
+            return count

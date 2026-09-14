@@ -10,7 +10,7 @@ mkdir -p "$OUT"
 export ELISA_COMPILER_ROOT="$ROOT" ELISA_COMPILER_SCRIPT="$ROOT/scripts/elisac_stage1.sh"
 export ELISA_ALLOW_STALE_STAGE1=1
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-for fixture in explicit inferred; do
+for fixture in explicit inferred helpers; do
     for version in before after; do
         export ELISA_STAGE1_BIN="$BEFORE"
         [[ "$version" == before ]] || export ELISA_STAGE1_BIN="$AFTER"
@@ -22,7 +22,7 @@ python3 - "$OUT" <<'PY'
 import collections, json, pathlib, statistics, sys
 root = pathlib.Path(sys.argv[1])
 rows = []
-for fixture in ('explicit', 'inferred'):
+for fixture in ('explicit', 'inferred', 'helpers'):
     for version in ('before', 'after'):
         p = json.loads((root / f'{fixture}-{version}.json').read_text())
         summary = p['summary']
