@@ -12,7 +12,7 @@ from pathlib import Path
 import re, subprocess, sys
 root, stage0, stage1, work = sys.argv[1:]
 work = Path(work)
-for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'block_reference_threading', 'block_state_threading', 'with_collection_append'):
+for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'block_reference_threading', 'block_state_threading', 'with_collection_append'):
     outputs = []
     for stage, compiler in enumerate((stage0, stage1)):
         for level in ('-O0', '-O2'):
@@ -41,12 +41,13 @@ for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_exp
             assert not re.search(r'\b(?:load|store)\s+%[^,\n]*LargeState|@(?:llvm\.)?mem(?:cpy|move)', body), (compiler, body)
         print(f'{fixture}: O0 LLVM has no aggregate load/store', flush=True)
 # Keep lexical boundaries and capture checking enforced while widening valid forms.
-state_prefix = 'struct State:\n    value: mutable i64\n\n'
+state_prefix = 'struct State:\n    value: mutable i64\n\nstruct Handle:\n    kind: i64\n\n'
 for name, body in {
     'append_region_escape': '    region outer(8192):\n        rows: mutable darray[darray[i64]] @outer = []\n        region short(4096):\n            row: darray[i64] @short = [1]\n            rows += row\n    return 0\n',
     'append_bulk': '    xs: mutable darray[i64] = []\n    xs += [1, 2]\n    return 0\n',
     'append_wrong_element': '    xs: mutable darray[i64] = []\n    xs += true\n    return 0\n',
     'append_immutable': '    xs: darray[i64] = [1]\n    xs += 2\n    return 0\n',
+    'optional_match_hole': '    v: Handle? = null\n    x: i64 =\n        match v:\n            b if b.kind > 0:\n                b.kind\n            b:\n                0\n    return x\n',
     'state_unrelated_mutation': '    state: mutable State = zeroed\n    other: mutable i64 = 0\n    state <-\n        other <- 1\n        state.value <- 2\n        state\n    return 0\n',
     'state_mixed_result': '    state: mutable State = zeroed\n    other: State = zeroed\n    state <-\n        state.value <- 2\n        if state.value == 2:\n            state\n        else:\n            other\n    return 0\n',
     'state_leaked_local': '    state: mutable State = zeroed\n    state <-\n        hidden: i64 = 2\n        state.value <- hidden\n        state\n    return hidden\n',
@@ -56,8 +57,12 @@ for name, body in {
 }.items():
     source = work / (name + '.elisa')
     source.write_text(state_prefix + 'def main() -> i64:\n' + body)
+    rejections = []
     for compiler in (stage0, stage1):
         result = subprocess.run([compiler, '-emit', 'obj', '-o', str(work/'invalid.o'), str(source)], capture_output=True, timeout=60)
         assert result.returncode == 1, (name, compiler, result.returncode, result.stderr)
+        rejections.append(result.stderr)
+    if name == 'optional_match_hole':
+        assert rejections[0] == rejections[1], rejections
     print(f'{name}: stage0/stage1 rejection PASS', flush=True)
 PY
