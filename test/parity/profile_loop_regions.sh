@@ -10,7 +10,7 @@ mkdir -p "$OUT"
 export ELISA_COMPILER_ROOT="$ROOT" ELISA_COMPILER_SCRIPT="$ROOT/scripts/elisac_stage1.sh"
 export ELISA_ALLOW_STALE_STAGE1=1
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-for fixture in explicit inferred helpers; do
+for fixture in explicit inferred helpers reduction output module; do
     for version in before after; do
         export ELISA_STAGE1_BIN="$BEFORE"
         [[ "$version" == before ]] || export ELISA_STAGE1_BIN="$AFTER"
@@ -22,7 +22,7 @@ python3 - "$OUT" <<'PY'
 import collections, json, pathlib, statistics, sys
 root = pathlib.Path(sys.argv[1])
 rows = []
-for fixture in ('explicit', 'inferred', 'helpers'):
+for fixture in ('explicit', 'inferred', 'helpers', 'reduction', 'output', 'module'):
     for version in ('before', 'after'):
         p = json.loads((root / f'{fixture}-{version}.json').read_text())
         summary = p['summary']
@@ -34,9 +34,9 @@ for fixture in ('explicit', 'inferred', 'helpers'):
             assert r['exit_code'] == 0 and r['capture_complete'] and not r['timed_out']
             assert r['allocation_events_dropped'] == 0
             c = collections.Counter(e['kind'] for e in r['allocation_events'])
-            assert c['alloc'] == 200, c
+            assert c['alloc'] == (201 if fixture == 'output' else 200), c
             if version == 'after':
-                assert c['region_create'] == 1 and c['region_reset'] == 200, c
+                assert c['region_create'] == (2 if fixture == 'output' else 1) and c['region_reset'] == 200, c
             counts.append(dict(c))
             rss.append(r['peak_rss_bytes']); cpu.append(r['cpu_ms']); wall.append(r['execution_ms'])
         assert all(c == counts[0] for c in counts)
