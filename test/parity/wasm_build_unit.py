@@ -117,6 +117,84 @@ class WasmExportScanClientTests(unittest.TestCase):
         with self.assertRaisesRegex(WasmExportScanClientError, "field order"):
             _decode_build_payload(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
 
+    def test_rejects_export_names_that_are_not_identifiers(self) -> None:
+        self.row["name"] = "answer);globalThis.pwned=("
+        with self.assertRaisesRegex(WasmExportScanClientError, r"exports\[0\].name"):
+            _decode_build_payload(self.encode())
+
+    def test_rejects_targets_that_are_not_scanner_identifiers(self) -> None:
+        self.row["target"] = "answer.impl"
+        with self.assertRaisesRegex(WasmExportScanClientError, r"exports\[0\].target"):
+            _decode_build_payload(self.encode())
+
+    def test_rejects_return_abi_inconsistent_with_return_type(self) -> None:
+        self.row["binding"] = "pointer"
+        with self.assertRaisesRegex(WasmExportScanClientError, "inconsistent scanner payload ABI"):
+            _decode_build_payload(self.encode())
+
+    def test_rejects_invalid_or_duplicate_parameter_names(self) -> None:
+        self.row["parameters"] = [
+            {
+                "name": "x,evil",
+                "type": "i32",
+                "default": None,
+                "binding": "scalar",
+                "wasm_type": "i32",
+            }
+        ]
+        with self.assertRaisesRegex(WasmExportScanClientError, r"parameters\[0\].name"):
+            _decode_build_payload(self.encode())
+
+        self.row["parameters"] = [
+            {
+                "name": "x",
+                "type": "i32",
+                "default": None,
+                "binding": "scalar",
+                "wasm_type": "i32",
+            },
+            {
+                "name": "x",
+                "type": "i32",
+                "default": None,
+                "binding": "scalar",
+                "wasm_type": "i32",
+            },
+        ]
+        with self.assertRaisesRegex(WasmExportScanClientError, "duplicate parameter name"):
+            _decode_build_payload(self.encode())
+
+    def test_rejects_parameter_abi_inconsistent_with_type(self) -> None:
+        self.row["parameters"] = [
+            {
+                "name": "value",
+                "type": "cstr",
+                "default": None,
+                "binding": "scalar",
+                "wasm_type": "i32",
+            }
+        ]
+        with self.assertRaisesRegex(WasmExportScanClientError, "inconsistent scanner payload ABI"):
+            _decode_build_payload(self.encode())
+
+    def test_rejects_non_utf8_parameter_defaults(self) -> None:
+        self.row["parameters"] = [
+            {
+                "name": "value",
+                "type": "i32",
+                "default": "\ud800",
+                "binding": "scalar",
+                "wasm_type": "i32",
+            }
+        ]
+        with self.assertRaisesRegex(WasmExportScanClientError, "invalid UTF-8 scanner payload field"):
+            _decode_build_payload(self.encode())
+
+    def test_empty_link_name_matches_scanner_schema(self) -> None:
+        self.row["link_name"] = ""
+        _source, exports = _decode_build_payload(self.encode())
+        self.assertEqual(exports[0]["link_name"], "")
+
 
 class ExportScannerSelectionTests(unittest.TestCase):
     def test_default_keeps_the_python_scanner_path(self) -> None:

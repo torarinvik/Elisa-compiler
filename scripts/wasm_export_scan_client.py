@@ -1,10 +1,16 @@
-"""Bounded client for the optional Elisascript WASM export scanner."""
+"""Time/output-bounded client for the optional Elisascript WASM export scanner.
+
+The subprocess output buffer is capped, but this client does not impose an RSS limit on the
+configured scanner process. POSIX cleanup targets its process group; detached descendants are
+outside that guarantee.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import threading
@@ -17,7 +23,31 @@ MAX_FLATTENED_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_EXPORTS = 65536
 MAX_PARAMETERS_PER_EXPORT = 4096
 PROCESS_TIMEOUT_SECONDS = 120
+PROCESS_KILL_WAIT_SECONDS = 5
+OUTPUT_DRAIN_GRACE_SECONDS = 1
 OUTPUT_CHUNK_BYTES = 64 * 1024
+
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
+_TARGET = re.compile(r"[A-Za-z_][A-Za-z0-9_:]*\Z", re.ASCII)
+_SCALAR_WASM_TYPES = {
+    "i8": "i32",
+    "u8": "i32",
+    "i16": "i32",
+    "u16": "i32",
+    "i32": "i32",
+    "u32": "i32",
+    "i64": "i64",
+    "u64": "i64",
+    "int": "i32",
+    "char": "i64",
+    "isize": "i32",
+    "usize": "i32",
+    "uintptr": "i32",
+    "f32": "f32",
+    "f64": "f64",
+    "bool": "i32",
+    "void": "void",
+}
 
 
 class WasmExportScanClientError(RuntimeError):
@@ -47,6 +77,32 @@ def _require_string(value: Any, label: str, *, nonempty: bool = False) -> str:
     return value
 
 
+def _require_identifier(value: Any, label: str) -> str:
+    identifier = _require_string(value, label, nonempty=True)
+    if _IDENTIFIER.fullmatch(identifier) is None:
+        raise WasmExportScanClientError(f"invalid scanner payload field: {label}")
+    return identifier
+
+
+def _abi_for_type(type_name: str) -> tuple[str, str] | None:
+    if type_name.endswith("?"):
+        return None
+    if type_name == "cstr":
+        return "string", "i32"
+    if type_name.endswith("&"):
+        return "pointer", "i32"
+    wasm_type = _SCALAR_WASM_TYPES.get(type_name)
+    if wasm_type is None:
+        return None
+    return "scalar", wasm_type
+
+
+def _validate_abi(type_name: str, binding: Any, wasm_type: Any, label: str) -> None:
+    expected = _abi_for_type(type_name)
+    if expected is None or (binding, wasm_type) != expected:
+        raise WasmExportScanClientError(f"inconsistent scanner payload ABI: {label}")
+
+
 def _validate_exports(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value or len(value) > MAX_EXPORTS:
         raise WasmExportScanClientError("invalid scanner payload field: exports")
@@ -65,9 +121,11 @@ def _validate_exports(value: Any) -> list[dict[str, Any]]:
         if list(row) != expected_keys:
             raise WasmExportScanClientError(f"invalid scanner payload field order: {label}")
 
-        name = _require_string(row["name"], f"{label}.name", nonempty=True)
-        _require_string(row["target"], f"{label}.target", nonempty=True)
-        _require_string(row["return"], f"{label}.return", nonempty=True)
+        name = _require_identifier(row["name"], f"{label}.name")
+        target = _require_string(row["target"], f"{label}.target", nonempty=True)
+        if _TARGET.fullmatch(target) is None:
+            raise WasmExportScanClientError(f"invalid scanner payload field: {label}.target")
+        return_type = _require_string(row["return"], f"{label}.return", nonempty=True)
         if name in seen_names:
             raise WasmExportScanClientError("duplicate export name in scanner payload")
         seen_names.add(name)
@@ -80,17 +138,20 @@ def _validate_exports(value: Any) -> list[dict[str, Any]]:
             "i32", "i64", "f32", "f64", "void"
         }:
             raise WasmExportScanClientError(f"invalid scanner payload field: {label}.wasm_type")
+        _validate_abi(return_type, row["binding"], row["wasm_type"], f"{label}.return")
         if type(row["line"]) is not int or row["line"] < 1:
             raise WasmExportScanClientError(f"invalid scanner payload field: {label}.line")
 
         if "link_name" in row:
-            _require_string(row["link_name"], f"{label}.link_name", nonempty=True)
+            # The scanner's source syntax permits an empty quoted link name.
+            _require_string(row["link_name"], f"{label}.link_name")
         if "implicit" in row and row["implicit"] is not True:
             raise WasmExportScanClientError(f"invalid scanner payload field: {label}.implicit")
 
         parameters = row["parameters"]
         if not isinstance(parameters, list) or len(parameters) > MAX_PARAMETERS_PER_EXPORT:
             raise WasmExportScanClientError(f"invalid scanner payload field: {label}.parameters")
+        seen_parameter_names: set[str] = set()
         for parameter_index, parameter in enumerate(parameters):
             parameter_label = f"{label}.parameters[{parameter_index}]"
             if not isinstance(parameter, dict) or list(parameter) != [
@@ -99,12 +160,19 @@ def _validate_exports(value: Any) -> list[dict[str, Any]]:
                 raise WasmExportScanClientError(
                     f"invalid scanner payload field order: {parameter_label}"
                 )
-            _require_string(parameter["name"], f"{parameter_label}.name", nonempty=True)
-            _require_string(parameter["type"], f"{parameter_label}.type", nonempty=True)
-            if parameter["default"] is not None and not isinstance(parameter["default"], str):
+            parameter_name = _require_identifier(
+                parameter["name"], f"{parameter_label}.name"
+            )
+            if parameter_name in seen_parameter_names:
                 raise WasmExportScanClientError(
-                    f"invalid scanner payload field: {parameter_label}.default"
+                    f"duplicate parameter name in scanner payload: {parameter_label}"
                 )
+            seen_parameter_names.add(parameter_name)
+            parameter_type = _require_string(
+                parameter["type"], f"{parameter_label}.type", nonempty=True
+            )
+            if parameter["default"] is not None:
+                _require_string(parameter["default"], f"{parameter_label}.default")
             if not isinstance(parameter["binding"], str) or parameter["binding"] not in {
                 "scalar", "string", "pointer"
             }:
@@ -117,6 +185,12 @@ def _validate_exports(value: Any) -> list[dict[str, Any]]:
                 raise WasmExportScanClientError(
                     f"invalid scanner payload field: {parameter_label}.wasm_type"
                 )
+            _validate_abi(
+                parameter_type,
+                parameter["binding"],
+                parameter["wasm_type"],
+                parameter_label,
+            )
         exports.append(row)
 
     return exports
@@ -179,6 +253,7 @@ def _capture_process_output(command: list[str]) -> tuple[int, bytes, bytes]:
             stderr=subprocess.PIPE,
             env=os.environ.copy(),
             start_new_session=(os.name == "posix"),
+            bufsize=0,
         )
     except (OSError, ValueError) as error:
         raise WasmExportScanClientError(f"unable to start Elisascript scanner: {error}") from error
@@ -194,8 +269,7 @@ def _capture_process_output(command: list[str]) -> tuple[int, bytes, bytes]:
     def drain(stream: Any, destination: bytearray) -> None:
         try:
             while True:
-                read = getattr(stream, "read1", stream.read)
-                chunk = read(OUTPUT_CHUNK_BYTES)
+                chunk = os.read(stream.fileno(), OUTPUT_CHUNK_BYTES)
                 if not chunk:
                     return
                 with lock:
@@ -211,52 +285,69 @@ def _capture_process_output(command: list[str]) -> tuple[int, bytes, bytes]:
         threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
         threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
     ]
-    for reader in readers:
-        reader.start()
-
     deadline = time.monotonic() + PROCESS_TIMEOUT_SECONDS
     timed_out = False
-    while process.poll() is None:
-        if overflow.is_set():
-            _kill_process_group(process)
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            _kill_process_group(process)
-            break
-        try:
-            process.wait(timeout=min(remaining, 0.05))
-        except subprocess.TimeoutExpired:
-            continue
-
     try:
-        returncode = process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        _kill_process_group(process)
-        returncode = process.wait()
-
-    for reader in readers:
-        reader.join(timeout=1)
-    if any(reader.is_alive() for reader in readers):
-        # A launcher must not leave descendants holding the captured pipes open.
-        _kill_process_group(process)
         for reader in readers:
-            reader.join(timeout=1)
-    process.stdout.close()
-    process.stderr.close()
+            reader.start()
 
-    if timed_out:
-        raise WasmExportScanClientError(
-            f"Elisascript scanner timed out after {PROCESS_TIMEOUT_SECONDS} seconds"
-        )
-    if overflow.is_set():
-        raise WasmExportScanClientError("Elisascript scanner exceeded the 64 MiB output limit")
-    if any(reader.is_alive() for reader in readers):
-        raise WasmExportScanClientError("unable to close Elisascript scanner output pipes")
-    if reader_errors:
-        raise WasmExportScanClientError("unable to read Elisascript scanner output") from reader_errors[0]
-    return returncode, bytes(stdout), bytes(stderr)
+        while process.poll() is None:
+            if overflow.is_set():
+                _kill_process_group(process)
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _kill_process_group(process)
+                break
+            try:
+                process.wait(timeout=min(remaining, 0.05))
+            except subprocess.TimeoutExpired:
+                continue
+
+        try:
+            returncode = process.wait(timeout=PROCESS_KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            _kill_process_group(process)
+            raise WasmExportScanClientError(
+                "unable to reap Elisascript scanner after termination"
+            ) from error
+
+        for reader in readers:
+            reader.join(timeout=OUTPUT_DRAIN_GRACE_SECONDS)
+        if any(reader.is_alive() for reader in readers):
+            # A launcher must not leave descendants holding captured pipes open.
+            _kill_process_group(process)
+            for reader in readers:
+                reader.join(timeout=OUTPUT_DRAIN_GRACE_SECONDS)
+
+        if timed_out:
+            raise WasmExportScanClientError(
+                f"Elisascript scanner timed out after {PROCESS_TIMEOUT_SECONDS} seconds"
+            )
+        if overflow.is_set():
+            raise WasmExportScanClientError("Elisascript scanner exceeded the 64 MiB output limit")
+        if any(reader.is_alive() for reader in readers):
+            # Do not close a pipe while a reader may be blocked in os.read: that
+            # can wait on a reader lock. Daemon readers keep their own descriptors.
+            raise WasmExportScanClientError(
+                "Elisascript scanner left descendants holding output pipes open"
+            )
+        if reader_errors:
+            raise WasmExportScanClientError(
+                "unable to read Elisascript scanner output"
+            ) from reader_errors[0]
+        return returncode, bytes(stdout), bytes(stderr)
+    finally:
+        if process.poll() is None:
+            _kill_process_group(process)
+            try:
+                process.wait(timeout=PROCESS_KILL_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        if not any(reader.is_alive() for reader in readers):
+            process.stdout.close()
+            process.stderr.close()
 
 
 def _scanner_failure(returncode: int, stdout: bytes, stderr: bytes) -> WasmExportScanClientError:
