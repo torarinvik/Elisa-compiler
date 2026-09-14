@@ -20,11 +20,13 @@ extend Semantic:
 
         # Whether RECEIVER's declared element type is itself a container (`darray[darray[u8]]`):
         # extending it copies region handles, not bytes.
-        def receiver_elements_are_containers(annotations: darray[Ast::LocalRegionAnnotation]&, receiver: sview, line: u32) -> bool:
+        def receiver_elements_are_containers(annotations: darray[Ast::LocalRegionAnnotation]&, receiver: sview, line: u32, local_names: darray[sview]&, local_types: darray[Ast::Expr]&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 annotation_lookup: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, receiver, line)
                 if annotation_lookup is annotation:
                     return container_element_is_container(annotation.type_expression)
+                local_type: (found: bool, type_expression: Ast::Expr) = region_escape_local_type_find(receiver, local_names, local_types)
+                return container_element_is_container(local_type.type_expression) if local_type.found
                 return false
 
 
@@ -53,21 +55,63 @@ extend Semantic:
 
         # Report a `container.push/extend(value)` whose value region is nested strictly
         # inside (shorter-lived than) the container region.
-        def region_escape_check_store(expression: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        def region_escape_growth_call_info(callee: Ast::Expr) -> (found: bool, receiver: sview, operation: sview):
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Field(object, method, field_line):
+                        may_grow: bool = method == "push" or method == "extend" or method == "reserve" or method == "resize" or method == "add" or method == "put" or method == "get_or_insert"
+                        return (true, region_escape_assign_target_root(object), method) if may_grow
+                        return (false, sview("", 0, 0), sview("", 0, 0))
+                    _:
+                        return (false, sview("", 0, 0), sview("", 0, 0))
+
+
+
+        # A mutating container operation inside a nested region uses that region's allocator
+        # unless the receiver carries a more specific owner. Growing a binding from an enclosing
+        # scope in the short-lived arena is unsafe even when the inserted element is a scalar: the
+        # container header itself will point at backing freed when the nested region exits.
+        def region_escape_outer_growth(callee: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, outer_locals: darray[sview]&, region_locals: darray[sview]&, region_local_regions: darray[sview]&) -> (found: bool, operation: sview, region: sview):
+            can Memory.Allocate, Abort.Panic:
+                growth: (found: bool, receiver: sview, operation: sview) = region_escape_growth_call_info(callee)
+                return (false, sview("", 0, 0), sview("", 0, 0)) if not growth.found or growth.receiver == "" or nesting.count == 0
+                receiver_has_owner: bool = local_region_name(annotations, growth.receiver, line) != "" or region_escape_local_owner_region(region_locals, region_local_regions, growth.receiver) != ""
+                return (false, sview("", 0, 0), sview("", 0, 0)) if receiver_has_owner
+                receiver_is_outer: bool = any name in outer_locals where name == growth.receiver
+                receiver_is_global: bool = any name in mutable_globals where name == growth.receiver
+                return (growth.found, growth.operation, nesting[nesting.count - 1]) if receiver_is_outer or receiver_is_global
+                return (false, sview("", 0, 0), sview("", 0, 0))
+
+
+
+        def region_escape_check_store(expression: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, container_fns: darray[sview]&, mutable_globals: darray[sview]&, outer_locals: darray[sview]&, region_locals: darray[sview]&, region_local_regions: darray[sview]&, taint_names: darray[sview]&, taint_regions: darray[sview]&, local_names: darray[sview]&, local_types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
+                        outer_growth: (found: bool, operation: sview, region: sview) = region_escape_outer_growth(callee, line, nesting, annotations, mutable_globals, outer_locals, region_locals, region_local_regions)
+                        if outer_growth.found:
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArenaGrowEscape, name: outer_growth.operation, line: line, expected: outer_growth.region, actual: ""})
+                            return
                         grow: (found: bool, receiver: sview, value_index: usize) = grow_call_info(callee)
                         return if not grow.found or grow.receiver == "" or grow.value_index >= arguments.count
                         # `extend` COPIES elements: safe for a SCALAR-element receiver, but a
                         # container-element receiver copies region HANDLES, which still escape.
                         is_extend: bool = grow_call_is_extend(callee)
-                        return if is_extend and not receiver_elements_are_containers(annotations, grow.receiver, line)
-                        container_region: sview = local_region_name(annotations, grow.receiver, line)
-                        value_region: sview = stored_value_region(arguments[grow.value_index], annotations, view_fns, line)
-                        return if container_region == "" or value_region == "" or container_region == value_region
-                        container_position: (found: bool, position: usize) = region_stack_position(nesting, container_region)
+                        return if is_extend and not receiver_elements_are_containers(annotations, grow.receiver, line, local_names, local_types)
+                        container_region: mutable sview = local_region_name(annotations, grow.receiver, line)
+                        container_region <- region_escape_local_owner_region(region_locals, region_local_regions, grow.receiver) if container_region == ""
+                        value_region: sview = region_escape_stored_or_call_region(arguments[grow.value_index], annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line)
+                        return if value_region == ""
+                        return if not region_escape_value_carries_handles(arguments[grow.value_index], annotations, line, local_names, local_types, table)
                         value_position: (found: bool, position: usize) = region_stack_position(nesting, value_region)
+                        target_is_outer_local: bool = any outer_name in outer_locals where outer_name == grow.receiver
+                        if container_region == "" and target_is_outer_local:
+                            container_region <- "__auto"
+                        if container_region == "__auto" and value_position.found:
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: container_region, actual: value_region})
+                            return
+                        return if container_region == "" or container_region == value_region
+                        container_position: (found: bool, position: usize) = region_stack_position(nesting, container_region)
                         escapes: bool = container_position.found and value_position.found and container_position.position < value_position.position
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionStoreEscape, name: "", line: line, expected: container_region, actual: value_region}) if escapes
                     _:
@@ -349,7 +393,7 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match callee:
                     Expr.Field(receiver, method, field_line):
-                        receiver_name: sview = ident_name_of(receiver)
+                        receiver_name: sview = region_escape_assign_target_root(receiver)
                         is_element_grow: bool = method == "push" or method == "extend" or method == "add"
                         is_map_put: bool = method == "put"
                         value_index: usize = 1 if is_map_put else 0

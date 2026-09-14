@@ -178,6 +178,8 @@ NAMES=(
     region_block_return_escape
     region_index_return_escape
     region_match_local_return_escape
+    region_branch_tainted_aggregate_return
+    region_nested_growth_escape
     container_var_scalar_mismatch
     container_var_ordering
     optional_var_scalar_mismatch
@@ -340,6 +342,8 @@ EXPECTS=(
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
+    "escapes via return; the region is freed at scope exit"
+    "darray push grows a non-local darray from local arena"
     "variable \"x\" expects i64, got darray[i64]"
     "comparison requires numeric operands"
     "variable \"y\" expects i64, got i64"
