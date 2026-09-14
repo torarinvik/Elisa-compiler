@@ -319,3 +319,48 @@ thread and truncation tests, ASan/UBSan collector checks, protocol recovery and
 offline round-trip tests, lifetime-analysis tests, and the generated HTML
 controller test with adjacent uint64 identities above JavaScript's safe range.
 Changes in both repositories remain uncommitted.
+
+## Reusing completed lexer buffers (2026-09-14)
+
+The previous compiler/profiler work was committed as compiler `3e0062d6` and
+profiler `b1c8616`. Continuing from the measured allocation sites, all three
+lexer entry points (`frontend_tokenize_with_length`, expanded-unit tokenization,
+and span tokenization) now return `lexer.machine_tokens` directly. They previously
+built an empty result array, extended it with every token, and returned the copy.
+The existing return-lifetime handling keeps the returned field's allocation alive;
+this change does not add a general automatic field-transfer optimization pass.
+
+The returned-buffer runtime test keeps normal, expanded-unit, and span results
+alive across 100 further lexer calls in resettable regions. It checks token data,
+absolute span offsets, line-directive behavior, EOF, and empty input. Both stage0
+and stage1 pass. Token reports from the modified compiler match stage0 byte for
+byte on 329 fixtures. A self-host rebuild succeeds; the resulting compiler passes
+the returned-buffer test and all 15 existing memory parity cases.
+
+Five before/after full-mode parser captures used the same pinned compiler,
+runtime object, input hash, and optimization level. All captures were complete,
+with zero drops and successful runtime exits. On `codegen_locals.elisa`:
+
+| Observed allocation measurement | Before | After |
+| --- | ---: | ---: |
+| Peak logical live bytes | 300,968 | 260,008 |
+| Allocation traffic, including positive in-place growth | 322,248 | 278,888 |
+| Allocation requests | 636 | 631 |
+| Peak observed backing capacity | 1,048,576 | 1,048,576 |
+
+Peak logical live allocation decreased 13.6%; traffic decreased 43,360 bytes
+(13.5%). The result-copy allocation site disappeared. The small RSS change is
+not treated as a meaningful OS-memory improvement, and no timing improvement is
+claimed. The arena still retains the same backing capacity.
+
+Captures and analyses are in `build/token-transfer-20260914/`, including
+`summary.json`, `{before,after}/parser.json`, and `{before,after}-sites.json`.
+`test/parity/profile_token_transfer.sh COMPILER OUT [INPUT]` reproduces the parser
+capture and bounded lifetime analysis for a chosen source revision.
+
+The optimized product was rebuilt and installed, then passed the returned-buffer
+lifetime test and all 329 token byte-parity fixtures. Stage0 and stage1 compiled
+parser probes also produced byte-identical runtime output on `codegen_locals.elisa`,
+`lexer_tokens.elisa`, and elisa-ui's `ui_text_measure_layout.elisa`, all with zero
+parse errors. This compares the probes' reported results, not a complete AST dump.
+No full-corpus or bootstrap-fixpoint result is claimed.
