@@ -9,10 +9,10 @@ trap 'rm -rf "$WORK"' EXIT
 clang -c "$ROOT/test/parity/profile_hooks.c" -o "$WORK/hooks.o"
 python3 - "$ROOT" "$STAGE0" "$STAGE1" "$WORK" <<'PY'
 from pathlib import Path
-import subprocess, sys
+import re, subprocess, sys
 root, stage0, stage1, work = sys.argv[1:]
 work = Path(work)
-for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple'):
+for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'block_reference_threading', 'block_state_threading'):
     outputs = []
     for stage, compiler in enumerate((stage0, stage1)):
         for level in ('-O0', '-O2'):
@@ -26,14 +26,29 @@ for fixture in ('block_expression_scope', 'block_expression_cleanup', 'block_exp
             outputs.append((result.stdout, result.stderr))
     assert all(output == outputs[0] for output in outputs), (fixture, outputs)
     print(f'{fixture}: stage0/stage1 O0/O2 runtime and byte parity PASS', flush=True)
+    if fixture in ('block_reference_threading', 'block_state_threading'):
+        function = 'forward' if fixture == 'block_reference_threading' else 'update'
+        for compiler in (stage0, stage1):
+            ir = work / f'{Path(compiler).name}-reference-threading.ll'
+            subprocess.run([compiler, '-emit', 'llvm', '-O0', '-o', str(ir), str(source)], check=True, timeout=60)
+            text = ir.read_text()
+            match = re.search(rf'define[^\n]*@{function}\([^\n]*\)\s*#?\d*\s*\{{(.*?)\n\}}', text, re.S)
+            assert match, (compiler, f'missing {function}() in LLVM IR')
+            body = match.group(1)
+            assert not re.search(r'\b(?:load|store)\s+%[^,\n]*LargeState|@(?:llvm\.)?mem(?:cpy|move)', body), (compiler, body)
+        print(f'{fixture}: O0 LLVM has no aggregate load/store', flush=True)
 # Keep lexical boundaries and capture checking enforced while widening valid forms.
+state_prefix = 'struct State:\n    value: mutable i64\n\n'
 for name, body in {
+    'state_unrelated_mutation': '    state: mutable State = zeroed\n    other: mutable i64 = 0\n    state <-\n        other <- 1\n        state.value <- 2\n        state\n    return 0\n',
+    'state_mixed_result': '    state: mutable State = zeroed\n    other: State = zeroed\n    state <-\n        state.value <- 2\n        if state.value == 2:\n            state\n        else:\n            other\n    return 0\n',
+    'state_leaked_local': '    state: mutable State = zeroed\n    state <-\n        hidden: i64 = 2\n        state.value <- hidden\n        state\n    return hidden\n',
     'leaked_local': '    value: i64 =\n        hidden: i64 = 42\n        hidden\n    return hidden\n',
     'uncaptured_mutation': '    outer: mutable i64 = 0\n    value: i64 =\n        outer <- 42\n        outer\n    return value\n',
     'immutable_capture': '    outer: i64 = 1\n    value: i64 = |outer|\n        outer <- 42\n        outer\n    return value\n',
 }.items():
     source = work / (name + '.elisa')
-    source.write_text('def main() -> i64:\n' + body)
+    source.write_text(state_prefix + 'def main() -> i64:\n' + body)
     for compiler in (stage0, stage1):
         result = subprocess.run([compiler, '-emit', 'obj', '-o', str(work/'invalid.o'), str(source)], capture_output=True, timeout=60)
         assert result.returncode == 1, (name, compiler, result.returncode, result.stderr)

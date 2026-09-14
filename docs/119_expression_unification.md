@@ -44,7 +44,8 @@ remaining <-
 Prefer a block when a value needs intermediate calculations or a local mutable
 accumulator. Keep those temporaries inside and expose the final result as an
 immutable binding. A simple expression does not need an extra block. Reading
-outer bindings is allowed; mutating them requires an explicit capture.
+outer bindings is allowed; mutation requires a capture or the state-threading
+assignment form below.
 
 The compiler's allocation decisions in `codegen_memory_speed.elisa` use this
 style for the permitted iterable, stack budget, and selected buffer name.
@@ -71,6 +72,35 @@ operator, not a header delimiter; recognition is structural and top-level.
 binding must exist and be mutable. Mutation of an uncaptured outer binding is
 rejected by the value-block checker. Captures are lexical names carried in the
 block expression's `captures` side-table.
+
+### In-place state-threading assignments
+
+A bare `<-` block can update fields of its assignment target and yield that
+same target on every branch:
+
+```elisa
+structs <-
+    structs.cond_bind_depth <- structs.cond_bind_depth - 1
+    if structs.cond_bind_depth == 0:
+        structs with {cond_bind_names <- [], cond_bind_slots <- [], cond_bind_types <- []}
+    else:
+        structs
+```
+
+This form implicitly captures `structs` for mutation. Its field writes execute
+in place; the identity result does not load or store the whole record, even at
+`-O0`. Block locals remain scoped and block cleanup runs once on exit. A bare
+identifier followed by `with { ... }` inside a value block updates its fields
+in source order and yields that identifier.
+
+Recognition requires a direct field update, identity results on all branches,
+and no shadowing declaration of the target. Leading statements currently
+support simple declarations, assignments, and defers. Other statement shapes
+and conditions introducing bindings are conservatively excluded. Other outer bindings still require captures.
+Explicitly captured blocks retain their ordinary value-assignment semantics;
+this rule does not turn arbitrary record-valued assignments into mutations.
+The condition-binding cleanup in `codegen_condition.elisa` and
+`codegen_stmt_match_switch.elisa` uses this form.
 
 ## 5. `rebind`
 
