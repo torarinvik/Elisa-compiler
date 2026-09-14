@@ -200,10 +200,13 @@ if [[ ${#corpus[@]} -eq 0 ]]; then
 	mk keywords.elisa     'def f:\n    if true:\n        continue\n    x <- offsetof\n    aligned <- 1\n    return x\n'
 fi
 
-# Three-byte BMP letters and decimal digits are classified from the same Unicode
-# tables as Stage0, not from a hand-selected script subset.
+# Multibyte letters and decimal digits are classified from the same Unicode tables
+# as Stage0, not from a hand-selected script subset.
 if [[ ${#corpus[@]} -gt 0 ]]; then
-	corpus+=("$REPO_ROOT/test/fixtures/lexer/unicode_bmp_identifiers.elisa")
+	corpus+=(
+		"$REPO_ROOT/test/fixtures/lexer/unicode_bmp_identifiers.elisa"
+		"$REPO_ROOT/test/fixtures/lexer/unicode_supplementary_identifiers.elisa"
+	)
 fi
 
 fail=0
