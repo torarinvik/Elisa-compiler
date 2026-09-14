@@ -6,6 +6,76 @@
 
 extend Backend:
     private:
+        # A tuple block evaluates every component before binding or updating targets.
+        # Flatten only consecutive tail blocks: they share one path to the tuple and
+        # their cleanup actions naturally unwind in reverse declaration order.
+        def emit_tuple_block_assignment(targets: darray[Expr]&, operator: TokenKind, value_expression: Expr, line: u32, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return EmitStatus.Declined if operator != TokenKind.Assign and operator != TokenKind.LArrow
+            target_names: mutable darray[sview] = []
+            target_types: mutable darray[ValueType] = []
+            target_slots: mutable darray[LLVMValueRef] = []
+            for target in targets |target_names, target_types, target_slots, local_scope|:
+                if target is Expr.Ident(target_name, _):
+                    target_names.push(target_name)
+                    target_types.push(lookup_type(local_scope, target_name) if operator == TokenKind.LArrow else unmodeled_type())
+                    target_slot: mutable LLVMValueRef = zeroed
+                    if operator == TokenKind.LArrow and target_name != "_":
+                        if lookup_slot(local_scope, target_name) is existing_slot:
+                            target_slot <- existing_slot
+                        else:
+                            return EmitStatus.Declined
+                    target_slots.push(target_slot)
+                else:
+                    return EmitStatus.Declined
+            leading: mutable darray[Stmt] = []
+            tuple_value: mutable Expr = value_expression
+            while tuple_value is Expr.Block(nested_statements, nested_value, _, _) |leading, tuple_value|:
+                leading.extend(nested_statements)
+                tuple_value <- nested_value
+            if tuple_value is Expr.Tuple(elements, _):
+                return EmitStatus.Declined if elements.count != targets.count
+                block_mark: usize = scope_mark(local_scope)
+                soa_mark: usize = structs.soa_row_binder_names.count
+                defer_mark: usize = local_scope.deferred.count
+                unused_type: mutable ValueType = unmodeled_type()
+                unused_value: mutable LLVMValueRef = zeroed
+                status: mutable EmitStatus = emit_statements_value(leading, Expr.Invalid, unused_type, &unused_value, false, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+                values: mutable darray[LLVMValueRef] = []
+                for index in 0..<elements.count |status, values, target_types, local_scope, structs, generics|:
+                    continue if status != EmitStatus.Open
+                    element_type: mutable ValueType = copied_type(target_types[index])
+                    if element_type.kind == TypeKind.Unmodeled:
+                        element_type <- expression_type(elements[index], local_scope, fns, structs, generics)
+                        if element_type.kind == TypeKind.Unmodeled and untyped_value_is_integer_literal_tree(elements[index]):
+                            element_type <- ValueType{kind: TypeKind.Signed, bits: 64}
+                    target_types[index] <- element_type
+                    if element_type.kind == TypeKind.Unmodeled:
+                        status <- EmitStatus.Declined
+                    elif emit_expression(elements[index], element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is element_value:
+                        values.push(element_value)
+                    else:
+                        status <- EmitStatus.Declined
+                status <- finish_statement_scope(local_scope, defer_mark, status, fns, structs, generics, runtime, m, ctx, builder)
+                scope_restore(local_scope, block_mark)
+                if structs.soa_row_binder_names.count > soa_mark:
+                    structs.soa_row_binder_names <- structs.soa_row_binder_names.truncate(soa_mark)
+                    structs.soa_row_binder_slots <- structs.soa_row_binder_slots.truncate(soa_mark)
+                    structs.soa_row_binder_bases <- structs.soa_row_binder_bases.truncate(soa_mark)
+                    structs.soa_row_binder_indexes <- structs.soa_row_binder_indexes.truncate(soa_mark)
+                return EmitStatus.Declined if status != EmitStatus.Open
+                for index in 0..<targets.count |local_scope, structs|:
+                    continue if target_names[index] == "_"
+                    if operator == TokenKind.LArrow:
+                        _ = LLVMBuildStore(builder, values[index], target_slots[index])
+                    else:
+                        name_storage: mutable darray[u8] = []
+                        slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(target_types[index], structs, ctx), sview_to_cstr(target_names[index], name_storage))
+                        _ = LLVMBuildStore(builder, values[index], slot)
+                        declare_local(local_scope, target_names[index], slot, target_types[index])
+                        register_drop_cleanup(target_names[index], target_types[index], slot, line, local_scope, structs, ctx, builder)
+                return EmitStatus.Open
+            return EmitStatus.Declined
+
         def emit_statement_assign_flow(statement: Stmt, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             handled <- true
             # `x <- value`. `<-` is Elisa's ASSIGNMENT operator; `=` is DECLARATION
@@ -168,56 +238,8 @@ extend Backend:
                         for par_store in 0..<par_temps.count |par_temps, par_slots, builder|:
                             _ = LLVMBuildStore(builder, par_temps[par_store], par_slots[par_store])
                         return EmitStatus.Open
-                    # `a, b = while COND |a: T = …, b: U = …| -> a, b:` — a LOOP-EXPRESSION with a
-                    # tuple yield. wrap_loop_header lowers it to `Assign(Array([a,b]), =, Block(decls +
-                    # loop, yield=(a,b), captures))`. Emit the block's statements (its capture decls
-                    # declare a/b as loop-carried locals and the loop runs), then bind each target
-                    # from the corresponding yield element (a copy; usually the same-named local).
                     if assign_value is Expr.Block(bv_statements, bv_value, bv_captures, bv_block_line):
-                        bv_status: EmitStatus = emit_statements(bv_statements, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                        EmitStatus.Declined return if bv_status == EmitStatus.Declined
-                        # `a, b =` NEWLINE INDENT `for … |accs…| -> a, b:` nests TWO blocks.
-                        # parse_bare_block_value takes the indented body's tail statement as the
-                        # block's VALUE, and that tail is the loop's OWN header block (built by
-                        # wrap_loop_header), so the outer block's statement list is EMPTY and its
-                        # value is another Block. Unwrap one level to reach the tuple; without
-                        # this the tuple test below saw a Block and declined every
-                        # `a, b, … = for …` in the semantic layer.
-                        #
-                        # The inner statements are emitted UNSCOPED on purpose: they declare the
-                        # accumulators, and the tuple yield reads them straight afterwards.
-                        bv_tuple: mutable Expr = bv_value
-                        match bv_value:
-                            Expr.Block(bvi_statements, bvi_value, bvi_captures, bvi_line):
-                                bvi_status: EmitStatus = emit_statements(bvi_statements, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
-                                EmitStatus.Declined return if bvi_status == EmitStatus.Declined
-                                bv_tuple <- bvi_value
-                            _:
-                                pass
-                        match bv_tuple:
-                            Expr.Tuple(bv_elements, bv_tuple_line):
-                                EmitStatus.Declined return if bv_elements.count != rebind_targets.count
-                                bv_declined: mutable bool = false
-                                for bv_i in 0..<bv_elements.count |bv_declined, rebind_targets, bv_elements, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
-                                    continue if bv_declined
-                                    if rebind_targets[bv_i] is Expr.Ident(bv_tname, bv_tline):
-                                        bv_el_type: ValueType = expression_type(bv_elements[bv_i], local_scope, fns, structs, generics)
-                                        if bv_el_type.kind == TypeKind.Unmodeled:
-                                            bv_declined <- true
-                                        elif emit_expression(bv_elements[bv_i], bv_el_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is bv_el_value:
-                                            bv_slot_storage: mutable darray[u8] = []
-                                            bv_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(bv_el_type, structs, ctx), sview_to_cstr(bv_tname, bv_slot_storage))
-                                            _ = LLVMBuildStore(builder, bv_el_value, bv_slot)
-                                            declare_local(local_scope, bv_tname, bv_slot, bv_el_type)
-                                        else:
-                                            bv_declined <- true
-                                    else:
-                                        bv_declined <- true
-                                EmitStatus.Declined return if bv_declined
-                                return EmitStatus.Open
-                            _:
-                                pass
-                        return EmitStatus.Declined
+                        return emit_tuple_block_assignment(rebind_targets, assign_operator, assign_value, assign_line.line, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
                     # `a, b, c = match SCRUT:` where every ARM YIELDS A TUPLE — one dispatch,
                     # several outputs (resolve_enums.elisa's check_unreachable_arms is the shape
                     # this exists for). Element types come from the FIRST arm's tuple, which is

@@ -230,6 +230,14 @@ extend Backend:
         # code, so it declines rather than emitting into a closed block (which LLVM would
         # reject anyway).
         def emit_statements(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            tail_type: mutable ValueType = unmodeled_type()
+            tail_result: mutable LLVMValueRef = zeroed
+            return emit_statements_value(body, Expr.Invalid, tail_type, &tail_result, true, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder)
+
+
+        # A value block shares its active store and cleanup boundary with its tail.
+        # Evaluate the tail before unwinding any block-local defer or drop.
+        def emit_statements_value(body: darray[Stmt]&, value_expression: Expr, tail_type: mutable ValueType&, tail_result: mutable LLVMValueRef&, finish_scope: bool, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 # A `defer block:` runs when the statement list that declared it ends. Owning that
                 # HERE rather than at each construct is what makes it uniform: a match arm, an
@@ -281,20 +289,38 @@ extend Backend:
                                 statements_runtime.active_store <- LLVMBuildLoad2(builder, llvm_type_of(store_decl_type, structs, ctx), store_decl_slot, "store.active")
                                 statements_runtime.active_store_enum <- store_decl_type.bits.i64()
                                 statements_runtime.active_store_is_block <- true
-                # Only while the block is still OPEN: a `return`/`raise` inside it already unwound
-                # EVERYTHING on its way out, and `break`/`continue` unwind to the loop's mark —
-                # both leave a terminated LLVM block that must not be appended to.
-                if status == EmitStatus.Open and local_scope.deferred.count > defer_mark:
-                    EmitStatus.Declined return if not emit_deferred_actions_from(local_scope, defer_mark, true, fns, structs, generics, runtime, m, ctx, builder)
-                # Consumed, so a later unwind does not run it twice. The ENTRY stays: a
-                # `defer function:` declared in this same list still belongs to the function, and
-                # removing entries would shift the indices of the ones that do.
-                for consumed_index in defer_mark..<local_scope.deferred.count |local_scope|:
-                    if local_scope.deferred[consumed_index].scope_exit:
-                        local_scope.deferred[consumed_index].body.clear()
-                        local_scope.deferred[consumed_index].region_cleanup <- 0
-                return status
+                if status == EmitStatus.Open and not (value_expression is Expr.Invalid):
+                    if tail_type.kind == TypeKind.Unmodeled:
+                        tail_type <- expression_type(value_expression, local_scope, fns, structs, generics)
+                        if tail_type.kind == TypeKind.Unmodeled and untyped_value_is_integer_literal_tree(value_expression):
+                            tail_type <- ValueType{kind: TypeKind.Signed, bits: 64}
+                        if tail_type.kind == TypeKind.Unmodeled and arithmetic_tree_contains_float_literal(value_expression):
+                            tail_type <- ValueType{kind: TypeKind.Float, bits: 64}
+                    if tail_type.kind == TypeKind.Unmodeled:
+                        status <- EmitStatus.Declined
+                    else:
+                        if emit_expression(value_expression, ValueType{kind: tail_type.kind, bits: tail_type.bits, enum_id: tail_type.enum_id}, local_scope, fns, structs, generics, statements_runtime, m, ctx, builder) is emitted_tail:
+                            tail_result <- emitted_tail
+                        else:
+                            status <- EmitStatus.Declined
+                return status if not finish_scope
+                return finish_statement_scope(local_scope, defer_mark, status, fns, structs, generics, runtime, m, ctx, builder)
 
+        # Shared by scalar and tuple value blocks after all result values are ready.
+        def finish_statement_scope(local_scope: mutable Scope&, defer_mark: usize, status: EmitStatus, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # Only while the block is still OPEN: a `return`/`raise` inside it already unwound
+            # EVERYTHING on its way out, and `break`/`continue` unwind to the loop's mark —
+            # both leave a terminated LLVM block that must not be appended to.
+            if status == EmitStatus.Open and local_scope.deferred.count > defer_mark:
+                EmitStatus.Declined return if not emit_deferred_actions_from(local_scope, defer_mark, true, fns, structs, generics, runtime, m, ctx, builder)
+            # Consumed, so a later unwind does not run it twice. The ENTRY stays: a
+            # `defer function:` declared in this same list still belongs to the function, and
+            # removing entries would shift the indices of the ones that do.
+            for consumed_index in defer_mark..<local_scope.deferred.count |local_scope|:
+                if local_scope.deferred[consumed_index].scope_exit:
+                    local_scope.deferred[consumed_index].body.clear()
+                    local_scope.deferred[consumed_index].region_cleanup <- 0
+            return status
 
 
 
@@ -304,7 +330,7 @@ extend Backend:
             # bodies) — the names die with the block, so a later sibling block cannot resolve one
             # of them to a slot its own path never stored (see scope_restore). A VALUE block is
             # the exception: its trailing value expression is still inside the block and must see
-            # the block's names, so those sites call `emit_statements` directly and restore once
+            # the block's names, so those sites call `emit_statements_value` and restore once
             # the value has been emitted.
         def emit_statements_scoped(body: darray[Stmt]&, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:

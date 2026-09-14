@@ -1,7 +1,8 @@
 # Docs/119 — expression unification forms
 
 This is the stage1-facing specification for the expression forms covered by
-`test/parity/docs119_forms_smoke.sh`. It records the syntax and semantic
+`test/parity/docs119_forms_smoke.sh` and the runtime checks in
+`test/parity/block_expressions_smoke.sh`. It records the syntax and semantic
 boundaries that the self-hosted frontend preserves.
 
 ## 1. One expression grammar
@@ -22,7 +23,32 @@ value: i64 =
 ```
 
 Leading statements execute in block scope; the final expression is the block
-value. Missing values are handled by the normal value-form diagnostics.
+value. The tail is evaluated before block-local defers and destructors run.
+Locals declared inside the block do not leak out or replace an outer binding
+with the same name. Missing values are handled by the normal value-form diagnostics.
+
+The annotation can be omitted when the result can be inferred. `<-` evaluates
+the whole block before updating an existing mutable binding:
+
+```elisa
+answer =
+    half: i64 = 21
+    half * 2
+
+remaining: mutable i64 = 100
+remaining <-
+    consumed: i64 = answer + 8
+    remaining - consumed
+```
+
+Prefer a block when a value needs intermediate calculations or a local mutable
+accumulator. Keep those temporaries inside and expose the final result as an
+immutable binding. A simple expression does not need an extra block. Reading
+outer bindings is allowed; mutating them requires an explicit capture.
+
+The compiler's allocation decisions in `codegen_memory_speed.elisa` use this
+style for the permitted iterable, stack budget, and selected buffer name.
+
 
 ## 3. Conditional and loop values
 
@@ -67,10 +93,11 @@ bodies, loop headers, captures, and rebind RHS expressions. The focused smoke
 also checks that a bitwise `|` in an iterable is not misread as a header and
 that `src/` plus `elisacore_std/` has no parse false positives.
 
-The authoritative executable check is:
+Run both the frontend checks and the compiled runtime checks:
 
 ```sh
 test/parity/docs119_forms_smoke.sh
+test/parity/block_expressions_smoke.sh
 ```
 
 The implementation is in `src/parser/parser_core.elisa`,
