@@ -42,11 +42,26 @@ failed=0
 for src in "$ROOT"/test/repro/*.elisa; do
     name="$(basename "$src" .elisa)"
     grep -q "def main() -> i64" "$src" || continue
+    compile_only=0
+    grep -q '^# opt_pipeline: compile-only$' "$src" && compile_only=1
     # -O0 (the baseline the corpus already validates against stage0)
     if ! bash "$ROOT/scripts/elisac_stage1.sh" -O0 -o "$WORK/$name.o0.o" "$src" >/dev/null 2>&1; then
         continue    # a decline is the corpus's business, not this smoke's
     fi
     "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.o0" "$WORK/$name.o0.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || continue
+    if [ "$compile_only" -eq 1 ]; then
+        # Some source-shape repros intentionally enter trusted undefined behavior from main.
+        # They still exercise codegen at every optimization level, but are compile/link-only.
+        for level in O2 O3; do
+            if ! bash "$ROOT/scripts/elisac_stage1.sh" -"$level" -o "$WORK/$name.$level.o" "$src" >/dev/null 2>&1; then
+                echo "  FAIL $name: -$level compile failed where -O0 succeeded"
+                failed=$((failed + 1)); break
+            fi
+            "$LLVM_CLANG" -Wl,-dead_strip -o "$WORK/$name.$level" "$WORK/$name.$level.o" "$RUNTIME_OBJ" >/dev/null 2>&1 || { echo "  FAIL $name: -$level link"; failed=$((failed + 1)); break; }
+        done
+        checked=$((checked + 1))
+        continue
+    fi
     RUN_TIMED "$WORK/$name.o0"; rc0=$?
     [ "$rc0" -eq 124 ] && continue
     # -O2 through the pass pipeline
