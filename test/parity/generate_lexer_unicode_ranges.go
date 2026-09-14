@@ -2,10 +2,16 @@
 // Run from the compiler repository root:
 //
 //	go run test/parity/generate_lexer_unicode_ranges.go > src/lexer/lexer_unicode_ranges.elisa
+//
+// For a parity corpus probing every non-ASCII Unicode scalar as an identifier
+// start and continuation (letters/digits should join names, other classes should not):
+//
+//	go run test/parity/generate_lexer_unicode_ranges.go --unicode-probe > /tmp/unicode.elisa
 package main
 
 import (
 	"fmt"
+	"os"
 	"unicode"
 )
 
@@ -15,16 +21,18 @@ type codepointRange struct {
 }
 
 const (
-	firstThreeByteCodepoint = 0x800
-	lastBMPCodepoint        = 0xFFFF
+	firstGeneratedCodepoint = 0x800
+	maximumCodepoint        = 0x10FFFF
+	codepointsPerPlane      = 0x10000
 	rangesPerPredicate      = 12
+	planesPerDispatcher     = 6
 )
 
-func collectRanges(classify func(rune) bool) []codepointRange {
+func collectRanges(classify func(rune) bool, first, last rune) []codepointRange {
 	ranges := make([]codepointRange, 0)
 	inside := false
 	var start rune
-	for codepoint := rune(firstThreeByteCodepoint); codepoint <= lastBMPCodepoint; codepoint++ {
+	for codepoint := first; codepoint <= last; codepoint++ {
 		if classify(codepoint) {
 			if !inside {
 				start = codepoint
@@ -36,12 +44,12 @@ func collectRanges(classify func(rune) bool) []codepointRange {
 		}
 	}
 	if inside {
-		ranges = append(ranges, codepointRange{first: start, last: lastBMPCodepoint})
+		ranges = append(ranges, codepointRange{first: start, last: last})
 	}
 	return ranges
 }
 
-func emitPredicate(prefix, name string, ranges []codepointRange) {
+func emitPlanePredicate(prefix string, plane int, ranges []codepointRange) {
 	groupCount := (len(ranges) + rangesPerPredicate - 1) / rangesPerPredicate
 	for group := 0; group < groupCount; group++ {
 		start := group * rangesPerPredicate
@@ -49,7 +57,7 @@ func emitPredicate(prefix, name string, ranges []codepointRange) {
 		if stop > len(ranges) {
 			stop = len(ranges)
 		}
-		fmt.Printf("        def %s_%02d(value: int) -> bool:\n", prefix, group)
+		fmt.Printf("        def %s_p%02X_r%02d(value: int) -> bool:\n", prefix, plane, group)
 		fmt.Print("            return ")
 		for index, interval := range ranges[start:stop] {
 			if index > 0 {
@@ -64,26 +72,110 @@ func emitPredicate(prefix, name string, ranges []codepointRange) {
 		fmt.Println()
 	}
 
-	fmt.Printf("        def %s(value: int) -> bool:\n", name)
 	if groupCount == 0 {
-		fmt.Println("            return false")
 		return
 	}
+	fmt.Printf("        def %s_p%02X(value: int) -> bool:\n", prefix, plane)
 	fmt.Print("            return ")
 	for group := 0; group < groupCount; group++ {
 		if group > 0 {
 			fmt.Print(" or ")
 		}
-		fmt.Printf("%s_%02d(value)", prefix, group)
+		fmt.Printf("%s_p%02X_r%02d(value)", prefix, plane, group)
 	}
 	fmt.Println()
 }
 
+func emitClass(prefix, name string, classify func(rune) bool) {
+	activePlanes := make([]int, 0, 17)
+	for plane := 0; plane <= maximumCodepoint/codepointsPerPlane; plane++ {
+		first := rune(plane * codepointsPerPlane)
+		last := first + codepointsPerPlane - 1
+		if first < firstGeneratedCodepoint {
+			first = firstGeneratedCodepoint
+		}
+		if last > maximumCodepoint {
+			last = maximumCodepoint
+		}
+		ranges := collectRanges(classify, first, last)
+		if len(ranges) == 0 {
+			continue
+		}
+		activePlanes = append(activePlanes, plane)
+		emitPlanePredicate(prefix, plane, ranges)
+	}
+
+	dispatchCount := (len(activePlanes) + planesPerDispatcher - 1) / planesPerDispatcher
+	for dispatch := 0; dispatch < dispatchCount; dispatch++ {
+		start := dispatch * planesPerDispatcher
+		stop := start + planesPerDispatcher
+		if stop > len(activePlanes) {
+			stop = len(activePlanes)
+		}
+		fmt.Printf("        def %s_dispatch_%02d(value: int) -> bool:\n", prefix, dispatch)
+		fmt.Print("            return ")
+		for index, plane := range activePlanes[start:stop] {
+			if index > 0 {
+				fmt.Print(" or ")
+			}
+			first := plane * codepointsPerPlane
+			last := first + codepointsPerPlane - 1
+			if first < firstGeneratedCodepoint {
+				first = firstGeneratedCodepoint
+			}
+			if last > maximumCodepoint {
+				last = maximumCodepoint
+			}
+			fmt.Printf("(value in 0x%X..0x%X and %s_p%02X(value))", first, last, prefix, plane)
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("        def %s(value: int) -> bool:\n", name)
+	if dispatchCount == 0 {
+		fmt.Println("            return false")
+		return
+	}
+	fmt.Print("            return ")
+	for dispatch := 0; dispatch < dispatchCount; dispatch++ {
+		if dispatch > 0 {
+			fmt.Print(" or ")
+		}
+		fmt.Printf("%s_dispatch_%02d(value)", prefix, dispatch)
+	}
+	fmt.Println()
+}
+
+func emitIdentifierProbe(first rune) {
+	for codepoint := first; codepoint <= maximumCodepoint; codepoint++ {
+		if codepoint >= 0xD800 && codepoint <= 0xDFFF {
+			continue
+		}
+		fmt.Printf("%cx = 0\nx%c = 0\n", codepoint, codepoint)
+	}
+}
+
 func main() {
+	if len(os.Args) == 2 {
+		if os.Args[1] == "--unicode-probe" {
+			emitIdentifierProbe(0x80)
+			return
+		}
+		if os.Args[1] == "--supplementary-probe" {
+			emitIdentifierProbe(0x10000)
+			return
+		}
+		fmt.Fprintln(os.Stderr, "usage: generate_lexer_unicode_ranges.go [--unicode-probe|--supplementary-probe]")
+		os.Exit(2)
+	}
+	if len(os.Args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: generate_lexer_unicode_ranges.go [--unicode-probe|--supplementary-probe]")
+		os.Exit(2)
+	}
 	fmt.Printf("# Generated by test/parity/generate_lexer_unicode_ranges.go; Unicode %s.\n", unicode.Version)
 	fmt.Println("# Keep these predicates aligned with the Go unicode tables used by the Stage0 lexer.")
 	fmt.Println("extend Lexer:")
 	fmt.Println("    private:")
-	emitPredicate("unicode3_letter_range", "is_unicode3_letter_codepoint", collectRanges(unicode.IsLetter))
-	emitPredicate("unicode3_digit_range", "is_unicode3_digit_codepoint", collectRanges(unicode.IsDigit))
+	emitClass("unicode_letter", "is_unicode_letter_codepoint", unicode.IsLetter)
+	emitClass("unicode_digit", "is_unicode_digit_codepoint", unicode.IsDigit)
 }
