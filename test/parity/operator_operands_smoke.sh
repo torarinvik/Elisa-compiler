@@ -61,12 +61,31 @@ grep -q "for loop range step cannot be zero" <<< "$out" || fail "zero range step
 out=$(printf 'def f() -> void:\n    for i in 0..<10..2:\n        pass\n' | "$RPT")
 grep -q "for loop range step cannot be zero" <<< "$out" && fail "false positive on nonzero range step: $out"
 
-# 9. 0 FP across frontend + stdlib.
+# 9. A long left-associated expression is parsed iteratively, but this semantic
+# pass recursively visits its AST. It must fail closed at its explicit safe bound
+# instead of overflowing the native stack or silently skipping the unvisited tail.
+deep_source="$(mktemp "${TMPDIR:-/tmp}/elisa-operator-depth.XXXXXX")"
+trap 'rm -f "$deep_source"' EXIT
+python3 - "$deep_source" <<'PY'
+from pathlib import Path
+import sys
+
+terms = 768
+expression = " + ".join(["x"] * terms)
+Path(sys.argv[1]).write_text(
+    "def f(x: i64) -> i64:\n"
+    f"    return {expression}\n"
+)
+PY
+out=$("$RPT" < "$deep_source")
+grep -q "expression nesting exceeds the safe semantic-analysis limit" <<< "$out" || fail "deep expression was not safely refused: $out"
+
+# 10. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "requires bool operands|requires numeric operands|operator requires integral operands|index must be integral|range step cannot be zero" || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE "requires bool operands|requires numeric operands|operator requires integral operands|index must be integral|range step cannot be zero|expression nesting exceeds the safe semantic-analysis limit" || true)
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t operator-operand false positives across frontend+stdlib"
 
-echo "operator-operands smoke OK: flags logical/arithmetic/integral violations, silent on valid operands, 0 FP across frontend+stdlib"
+echo "operator-operands smoke OK: flags invalid/deep operands, silent on valid operands, 0 FP across frontend+stdlib"
