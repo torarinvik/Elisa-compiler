@@ -160,3 +160,15 @@ Fields execute in source order. A complex statement receiver, such as
 `rows[next_index()] with {items += value}`, is evaluated once. Appending uses
 the collection's existing growth-region and mutability rules, including when
 it grows through a reference parameter. Bulk append requires explicit `extend`.
+
+## Optional scrutinees in value matches
+
+`match opt:` in value position accepts `null`, binder, and `_` arms, each with an
+optional guard. `_` covers absence as well as any payload; a binder's guard runs
+only on a present payload; a bare `null` arm yields the empty optional. Without
+`_`, both a `null` arm and an unguarded binder are required, otherwise
+`non-exhaustive match expression over T?; …` is reported (docs/122 §4). The same
+shapes lower in statement position, and a value block yielding such a match is
+checked through its tail. Verified 2026-09-14 by
+`test/parity/block_expressions_smoke.sh` (stage0/stage1 runtime parity at O0/O2,
+byte-identical rejection text).
