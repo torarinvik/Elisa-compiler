@@ -259,6 +259,35 @@ dwarf_case base_type 'DW_TAG_base_type'
 dwarf_case names_i64 'DW_AT_name.*"i64"'
 dwarf_case subprogram_has_type 'DW_AT_type'
 
+# Driver-expanded inputs have a leading `#line` directive. AST line numbers are buffer
+# lines, while debugger locations must point at the original source lines. Exercise the
+# actual CLI path (the lower-level emit_obj harness above tokenizes raw stdin and cannot
+# expose this line-map boundary).
+total=$((total + 1))
+debug_source_dir="$BUILD/obj_dwarf_source_lines"
+rm -rf "$debug_source_dir"; mkdir -p "$debug_source_dir"
+debug_source="$debug_source_dir/source_lines.elisa"
+debug_ir="$debug_source_dir/source_lines.ll"
+cat > "$debug_source" <<'EOF'
+def identity(value: i64) -> i64:
+    return value
+
+def main() -> i64:
+    answer: i64 = identity(40)
+    return answer + 2
+EOF
+if "$ELISACORE_BIN" -g -emit llvm -O0 -o "$debug_ir" "$debug_source" >/dev/null 2>&1 \
+   && grep -Eq '!DISubprogram\(name: "identity".*line: 1,.*scopeLine: 1' "$debug_ir" \
+   && grep -Eq '!DILocalVariable\(name: "value".*line: 1,' "$debug_ir" \
+   && grep -Eq '!DISubprogram\(name: "main".*line: 4,.*scopeLine: 4' "$debug_ir" \
+   && grep -Eq '!DILocalVariable\(name: "answer".*line: 5,' "$debug_ir" \
+   && grep -Eq '!DILocation\(line: 1, column: 1,' "$debug_ir" \
+   && grep -Eq '!DILocation\(line: 6, column: 5,' "$debug_ir"; then
+    pass=$((pass + 1))
+else
+    echo "  FAIL obj_dwarf_original_source_lines: debug metadata does not map back to original source lines"
+fi
+
 # Native PC-to-source mapping depends on real line-table rows, not only function DIEs.
 # Use the same optimized object as above: the source statement on line 5 must remain
 # addressable after LLVM's O2 pipeline.
