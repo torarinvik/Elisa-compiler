@@ -171,6 +171,32 @@ for needle in oops_in_c oops_in_root; do
     fi
 done
 
+# The paths collected from source are byte buffers, but path normalization and POSIX open
+# consume C strings. An embedded NUL must be rejected before either boundary can truncate it
+# and accidentally import a different, valid file.
+mkdir -p "$WORK/nul"
+printf 'def nul_import_identity(x: i64) -> i64:\n    ensure result == x\n    return x\n' > "$WORK/nul/included.elisa"
+python3 - "$WORK/nul/entry.elisa" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_bytes(
+    b'include "./included.elisa\x00ignored.elisa"\n'
+    b'def use_nul_import(x: i64) -> i64:\n'
+    b'    ensure result == x\n'
+    b'    return nul_import_identity(x)\n'
+)
+PY
+total=$((total + 1))
+if RUN "$BIN" -o "$WORK/nul/entry.o" "$WORK/nul/entry.elisa" >"$WORK/nul/stderr" 2>&1; then
+    fail "include_path_nul: the compiler truncated an invalid path and accepted the source"
+elif grep -q 'could not read source or included file' "$WORK/nul/stderr" \
+     && [ ! -e "$WORK/nul/entry.o" ]; then
+    ok
+else
+    fail "include_path_nul: the compiler did not reject the path cleanly or wrote an object"
+fi
+
 if [ "$pass" -ne "$total" ]; then
     echo "cli_includes_smoke FAILED: passed=$pass total=$total"
     exit 1
