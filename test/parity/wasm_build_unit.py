@@ -23,9 +23,12 @@ from scripts.wasm_build import (
     type_declaration,
 )
 from scripts.wasm_export_scan_client import (
+    MAX_PROCESS_SNAPSHOT_ROWS,
+    PROCESS_RSS_LIMIT_BYTES,
     WasmExportScanClientError,
     _decode_build_payload,
     _decode_flatten_payload,
+    _process_tree_rss_bytes,
     _validate_exports,
     run_flatten_source,
 )
@@ -148,6 +151,23 @@ class WasmExportScanClientTests(unittest.TestCase):
         capture.assert_called_once_with(
             ["launcher", "scanner", "--flatten-payload", "source"]
         )
+
+    def test_rss_sampler_sums_process_group_and_descendant_tree(self) -> None:
+        process = SimpleNamespace(pid=100)
+        snapshot = "100 1 100 10\n101 100 100 20\n102 101 102 30\n200 1 200 99\n"
+        completed = SimpleNamespace(returncode=0, stdout=snapshot)
+        with patch("scripts.wasm_export_scan_client.subprocess.run", return_value=completed):
+            self.assertEqual(_process_tree_rss_bytes(process), (10 + 20 + 30) * 1024)
+
+    def test_rss_sampler_fails_closed_on_malformed_snapshot(self) -> None:
+        process = SimpleNamespace(pid=100)
+        completed = SimpleNamespace(returncode=0, stdout="100 1 100 not-a-number\n")
+        with patch("scripts.wasm_export_scan_client.subprocess.run", return_value=completed):
+            self.assertIsNone(_process_tree_rss_bytes(process))
+
+    def test_rss_guard_constants_are_bounded(self) -> None:
+        self.assertEqual(PROCESS_RSS_LIMIT_BYTES, 512 * 1024 * 1024)
+        self.assertEqual(MAX_PROCESS_SNAPSHOT_ROWS, 65536)
 
     def test_rejects_boolean_payload_version(self) -> None:
         with self.assertRaisesRegex(WasmExportScanClientError, "unsupported payload version"):

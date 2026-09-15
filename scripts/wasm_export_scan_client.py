@@ -1,8 +1,10 @@
-"""Time/output-bounded client for the optional Elisascript WASM export scanner.
+"""Bounded client for the optional Elisascript WASM export scanner.
 
-The subprocess output buffer is capped, but this client does not impose an RSS limit on the
-configured scanner process. POSIX cleanup targets its process group; detached descendants are
-outside that guarantee.
+The scanner is an external launcher, so the client bounds output, wall time, and
+sampled aggregate RSS. The RSS guard is fail-closed and covers the private
+process group plus the currently discoverable descendant tree; a detached,
+reparented process remains outside that observation and requires an external
+supervisor.
 """
 
 from __future__ import annotations
@@ -27,6 +29,10 @@ PROCESS_TIMEOUT_SECONDS = 120
 PROCESS_KILL_WAIT_SECONDS = 5
 OUTPUT_DRAIN_GRACE_SECONDS = 1
 OUTPUT_CHUNK_BYTES = 64 * 1024
+PROCESS_RSS_LIMIT_BYTES = 512 * 1024 * 1024
+PROCESS_RSS_POLL_SECONDS = 0.05
+PROCESS_RSS_QUERY_TIMEOUT_SECONDS = 1
+MAX_PROCESS_SNAPSHOT_ROWS = 65536
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
 _TARGET = re.compile(r"[A-Za-z_][A-Za-z0-9_:]*\Z", re.ASCII)
@@ -280,6 +286,64 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _process_tree_rss_bytes(process: Any) -> int | None:
+    """Return sampled RSS for the private group and known descendants.
+
+    ``ps`` is deliberately used as a read-only host observation rather than
+    trusting a nominal virtual-memory limit. Missing, malformed, or timed-out
+    observations return ``None`` so callers stop instead of continuing without
+    a memory bound. The process group catches ordinary helpers; the parent
+    graph catches helpers that create a new group before they reparent.
+    """
+    if os.name != "posix":
+        return None
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,rss="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=PROCESS_RSS_QUERY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+
+    rows: dict[int, tuple[int, int, int]] = {}
+    for raw_line in completed.stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        fields = raw_line.split()
+        if len(fields) != 4:
+            return None
+        try:
+            pid, parent, group, rss_kib = (int(field, 10) for field in fields)
+        except ValueError:
+            return None
+        if pid <= 0 or parent < 0 or group <= 0 or rss_kib < 0:
+            return None
+        if len(rows) >= MAX_PROCESS_SNAPSHOT_ROWS:
+            return None
+        rows[pid] = (parent, group, rss_kib)
+
+    root_pid = int(process.pid)
+    if root_pid not in rows:
+        return None
+    owned: set[int] = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent, group, _rss_kib) in rows.items():
+            if pid in owned:
+                continue
+            if parent in owned or group == root_pid:
+                owned.add(pid)
+                changed = True
+    return sum(rows[pid][2] for pid in owned) * 1024
+
+
 def _capture_process_output(command: list[str]) -> tuple[int, bytes, bytes]:
     try:
         process = subprocess.Popen(
@@ -331,13 +395,24 @@ def _capture_process_output(command: list[str]) -> tuple[int, bytes, bytes]:
             if overflow.is_set():
                 _kill_process_group(process)
                 break
+            rss_bytes = _process_tree_rss_bytes(process)
+            if rss_bytes is None:
+                _kill_process_group(process)
+                raise WasmExportScanClientError(
+                    "unable to sample Elisascript scanner RSS"
+                )
+            if rss_bytes > PROCESS_RSS_LIMIT_BYTES:
+                _kill_process_group(process)
+                raise WasmExportScanClientError(
+                    "Elisascript scanner exceeded the 512 MiB RSS limit"
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
                 _kill_process_group(process)
                 break
             try:
-                process.wait(timeout=min(remaining, 0.05))
+                process.wait(timeout=min(remaining, PROCESS_RSS_POLL_SECONDS))
             except subprocess.TimeoutExpired:
                 continue
 
