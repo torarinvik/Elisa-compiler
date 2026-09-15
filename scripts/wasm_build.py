@@ -17,7 +17,9 @@ An explicit `--export-scan-launcher` plus `--export-scan-script` pair can
 exercise the Elisascript scanner for source flattening and export parsing, and
 its flatten-only payload for runtime-source cache hashing. The default remains
 the Python oracle; this opt-in does not replace the packager or establish
-runtime parity.
+runtime parity. Importing this module and selecting the opt-in path does not
+load the Python scanner module; the legacy import remains lazy for the default
+oracle path and compatibility re-exports.
 """
 
 
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -39,11 +42,6 @@ from typing import Any
 # not the repository root, so the sibling modules have to be reachable by name explicitly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.wasm_export_scan import (
-    WasmBuildError,
-    parse_exports,
-    read_flat_source,
-)
 from scripts.wasm_export_scan_client import (
     WasmExportScanClientError,
     run_export_scan,
@@ -55,6 +53,38 @@ from scripts.wasm_facade import js_bindings, type_declaration
 # for anything else that grew up importing the whole surface from this one module.
 __all__ = ["WasmBuildError", "parse_exports", "read_flat_source", "js_bindings",
            "type_declaration", "build", "main"]
+
+
+class WasmBuildError(RuntimeError):
+    """A package build or scanner integration failed."""
+
+
+def _python_export_scanner() -> Any:
+    """Load the legacy scanner only for its explicit oracle/fallback path."""
+    try:
+        return importlib.import_module("scripts.wasm_export_scan")
+    except ImportError as error:
+        raise WasmBuildError("Python WASM export scanner is unavailable") from error
+
+
+def parse_exports(source: str) -> list[dict[str, Any]]:
+    scanner = _python_export_scanner()
+    try:
+        return scanner.parse_exports(source)
+    except scanner.WasmBuildError as error:
+        raise WasmBuildError(str(error)) from error
+
+
+def read_flat_source(
+    path: Path,
+    seen: set[Path] | None = None,
+    stack: list[Path] | None = None,
+) -> str:
+    scanner = _python_export_scanner()
+    try:
+        return scanner.read_flat_source(path, seen, stack)
+    except scanner.WasmBuildError as error:
+        raise WasmBuildError(str(error)) from error
 
 
 def memory_pages_from_env(name: str, default: int) -> int:

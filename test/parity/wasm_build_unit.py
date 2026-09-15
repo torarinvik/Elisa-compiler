@@ -292,6 +292,28 @@ class ExportScannerSelectionTests(unittest.TestCase):
         read_source.assert_called_once_with(source_path)
         parse_source.assert_called_once_with(flattened)
 
+    def test_opt_in_uses_elisascript_without_loading_python_scanner(self) -> None:
+        source_path = Path("/tmp/input.elisa")
+        flattened = "export fn answer() -> i32 = answer_impl\n"
+        exports = [{"name": "answer"}]
+        args = SimpleNamespace(
+            export_scan_launcher="/usr/bin/elisac",
+            export_scan_script="/tmp/wasm_export_scan.elisascript",
+        )
+        with (
+            patch(
+                "scripts.wasm_build._python_export_scanner",
+                side_effect=AssertionError("opt-in path loaded the Python scanner"),
+            ),
+            patch("scripts.wasm_build.run_export_scan", return_value=(flattened, exports)) as scan,
+        ):
+            self.assertEqual(load_export_scan(source_path, args), (flattened, exports))
+        scan.assert_called_once_with(
+            "/usr/bin/elisac",
+            "/tmp/wasm_export_scan.elisascript",
+            source_path,
+        )
+
     def test_runtime_cache_uses_elisascript_flatten_payload_when_configured(self) -> None:
         root = Path("/tmp/elisa-wasm-runtime-cache-test")
         runtime_source = root / "runtime.elisa"
