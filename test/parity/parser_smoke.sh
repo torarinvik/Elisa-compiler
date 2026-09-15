@@ -55,6 +55,8 @@ int main(int argc, char **argv) {
         const char *src =
             "def add(a: int, b: int) -> int:\n"
             "    sum: int = a\n"
+            "    mutable cursor: int = b\n"
+            "    const fixed: mutable int = sum\n"
             "    sum <- sum\n"
             "    if a:\n"
             "        return a\n"
