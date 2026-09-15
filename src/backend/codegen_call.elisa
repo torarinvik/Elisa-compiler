@@ -358,10 +358,12 @@ extend Backend:
             expected_params: usize = fixed_arguments + arena_count + (1 if wants_store else 0) + (1 if sret_return else 0) if variadic_call or uses_defaults else total_arguments + arena_count + (1 if wants_store else 0) + (1 if sret_return else 0)
             # A C-ABI extern's `view[T]` parameter is TWO LLVM parameters (ptr, len); the
             # declared handle carries the extra one per view (docs/127 §3.3).
+            c_plan: mutable i64 = -1
+            if fns.is_extern[fn_index.usize()]:
+                c_plan <- c_plan_index_of(fns, fns.names[fn_index.usize()])
             split_view_params: mutable usize = 0
-            if fns.is_extern[fn_index.usize()] and (any split_name in fns.c_view_split_names where split_name == fns.names[fn_index.usize()]):
-                for split_probe in 0..<fixed_arguments |split_view_params, fns, fn_index|:
-                    split_view_params <- split_view_params + 1 if fns.param_types[fns.param_start[fn_index.usize()] + split_probe].kind == TypeKind.View
+            if c_plan >= 0:
+                split_view_params <- fns.c_plan_count[c_plan.usize()] - fixed_arguments
             null return if LLVMCountParams(target).i64() != (expected_params + split_view_params).i64()
 
             argument_values: mutable darray[LLVMValueRef] = []
@@ -570,23 +572,29 @@ extend Backend:
             while direct_arena_slot < arena_count |argument_values, direct_arena_slot, call_threaded_arena|:
                 argument_values.push(call_threaded_arena)
                 direct_arena_slot <- direct_arena_slot + 1
-            # A `view[T]` argument to a C-ABI extern crosses as (ptr, len): replace the one
-            # aggregate value with its two fields, in place (docs/127 §3.3). The LLVM
-            # function type was declared with the same two parameters (declare_extern).
-            if fns.is_extern[fn_index.usize()] and (any split_name in fns.c_view_split_names where split_name == fns.names[fn_index.usize()]):
-                split_hidden: mutable usize = 0
-                split_hidden <- split_hidden + 1 if fns.is_error[fn_index.usize()]
-                split_hidden <- split_hidden + 1 if sret_return
-                split_values: mutable darray[LLVMValueRef] = []
-                for split_index in 0..<argument_values.count |split_values, argument_values, split_hidden, fns, fn_index, fixed_arguments, builder|:
-                    is_fixed: bool = split_index >= split_hidden and split_index - split_hidden < fixed_arguments
-                    split_param_type: ValueType = copied_type(fns.param_types[fns.param_start[fn_index.usize()] + (split_index - split_hidden)]) if is_fixed else unmodeled_type()
-                    if split_param_type.kind == TypeKind.View:
-                        split_values.push(LLVMBuildExtractValue(builder, argument_values[split_index], 0, "extern.view.ptr"))
-                        split_values.push(LLVMBuildExtractValue(builder, argument_values[split_index], 1, "extern.view.len"))
+            # A C-ABI extern with a C parameter plan: reorder/split the explicit arguments into
+            # the C order (docs/127 §3.3). Hidden leading slots and the trailing tail (variadic
+            # arguments, arena slots) are untouched.
+            if c_plan >= 0:
+                plan_hidden: mutable usize = 0
+                plan_hidden <- plan_hidden + 1 if fns.is_error[fn_index.usize()]
+                plan_hidden <- plan_hidden + 1 if sret_return
+                planned_values: mutable darray[LLVMValueRef] = []
+                for lead in 0..<plan_hidden |planned_values, argument_values|:
+                    planned_values.push(argument_values[lead])
+                for code_index in 0..<fns.c_plan_count[c_plan.usize()] |planned_values, argument_values, fns, c_plan, plan_hidden, builder|:
+                    code: u32 = fns.c_plan_codes[fns.c_plan_start[c_plan.usize()] + code_index]
+                    source: LLVMValueRef = argument_values[plan_hidden + (code / 4).usize()]
+                    if code % 4 == 1:
+                        planned_values.push(LLVMBuildExtractValue(builder, source, 0, "extern.view.ptr"))
+                    elif code % 4 == 2:
+                        planned_values.push(LLVMBuildExtractValue(builder, source, 1, "extern.view.len"))
                     else:
-                        split_values.push(argument_values[split_index])
-                argument_values <- split_values
+                        planned_values.push(source)
+                tail_start: usize = plan_hidden + fixed_arguments
+                for tail_index in tail_start..<argument_values.count |planned_values, argument_values|:
+                    planned_values.push(argument_values[tail_index])
+                argument_values <- planned_values
             # A VOID value is not a value: `f(g())` where `g` returns void built a call whose
             # operand is `void <badref>`, which the verifier rejects and which crashed the
             # object path inside LLVM's DataLayout rather than producing a diagnostic. One
@@ -608,15 +616,29 @@ extend Backend:
                 direct_call_hidden <- direct_call_hidden + 1 if sret_return
                 # A split view occupies two LLVM parameters, so every attribute index after
                 # it shifts by one per split view before it.
-                direct_split_shift: mutable u32 = 0
-                for direct_param_index in 0..<fixed_arguments |direct_call_hidden, direct_split_shift, fns, fn_index, structs, ctx, call_result|:
+                for direct_param_index in 0..<fixed_arguments |direct_call_hidden, fns, fn_index, structs, ctx, call_result, c_plan|:
                     direct_param_type: ValueType = copied_type(fns.param_types[fns.param_start[fn_index.usize()] + direct_param_index])
                     if value_type_uses_indirect_aggregate(direct_param_type, structs, ctx):
-                        add_call_type_attribute(call_result, direct_call_hidden + direct_split_shift + direct_param_index.u32() + 1, "byval", llvm_type_of(direct_param_type, structs, ctx), ctx)
-                    direct_split_shift <- direct_split_shift + 1 if direct_param_type.kind == TypeKind.View and (any split_name in fns.c_view_split_names where split_name == fns.names[fn_index.usize()])
+                        add_call_type_attribute(call_result, direct_call_hidden + c_plan_position_of(fns, c_plan, direct_param_index).u32() + 1, "byval", llvm_type_of(direct_param_type, structs, ctx), ctx)
             return sret_slot if sret_return and sret_destination is destination
             return LLVMBuildLoad2(builder, llvm_type_of(call_return_type, structs, ctx), sret_slot, "call.sret.value") if sret_return
             return call_result
+
+
+        # The plan row of a C-ABI extern by name, or -1.
+        def c_plan_index_of(fns: FnTable&, name: sview) -> i64 can[Abort.Panic]:
+            for index in 0..<fns.c_plan_names.count:
+                index.i64() return if fns.c_plan_names[index] == name
+            return -1
+
+        # The C position of an Elisa parameter's whole value (or its pointer, for a split
+        # view) under plan `c_plan`; the parameter's own index when there is no plan.
+        def c_plan_position_of(fns: FnTable&, c_plan: i64, param_index: usize) -> usize can[Abort.Panic]:
+            param_index return if c_plan < 0
+            for code_index in 0..<fns.c_plan_count[c_plan.usize()]:
+                code: u32 = fns.c_plan_codes[fns.c_plan_start[c_plan.usize()] + code_index]
+                code_index return if (code / 4).usize() == param_index and code % 4 != 2
+            return param_index
 
 
         # Direct-call twin for assignments whose destination is already an aggregate place. The
