@@ -35,13 +35,17 @@ EDIR_SOURCE_FILE_FIXED_BYTES = 36
 source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
 EDIR_HEADER_BYTES = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
 EDIR_INSTRUCTION_BYTES = 62
+EDIR_FUNCTION_COUNT_BYTES = 4
+EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
+EDIR_MAIN_NAME_BYTES = 4
+EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
 EDIR_OPCODE_CONSTANT = 1
 EDIR_OPCODE_ADD = 2
 EDIR_OPCODE_RETURN = 19
-assert len(data) == EDIR_HEADER_BYTES + 3 * EDIR_INSTRUCTION_BYTES, f"unexpected artifact size: {len(data)}"
+assert len(data) == EDIR_HEADER_BYTES + 3 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES, f"unexpected artifact size: {len(data)}"
 schema, version, instruction_count, local_count = struct.unpack_from("<IIQQ", data)
 has_return = data[24]
-assert (schema, version, instruction_count, local_count, has_return) == (2, 1, 3, 0, 1)
+assert (schema, version, instruction_count, local_count, has_return) == (3, 1, 3, 0, 1)
 source_file_count = struct.unpack_from("<I", data, 25)[0]
 file_id, logical_path_id, content_digest, line_count, path_length = struct.unpack_from("<QQQQI", data, EDIR_HEADER_PREFIX_BYTES)
 logical_path = data[EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES : EDIR_HEADER_BYTES]
@@ -105,7 +109,11 @@ EDIR_SOURCE_FILE_FIXED_BYTES = 36
 source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
 EDIR_HEADER_BYTES = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
 EDIR_INSTRUCTION_BYTES = 62
-assert len(data) == EDIR_HEADER_BYTES + 2 * EDIR_INSTRUCTION_BYTES
+EDIR_FUNCTION_COUNT_BYTES = 4
+EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
+EDIR_MAIN_NAME_BYTES = 4
+EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
+assert len(data) == EDIR_HEADER_BYTES + 2 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
 assert struct.unpack_from("<Hqq", data, EDIR_HEADER_BYTES) == (1, 42, 0)
 assert struct.unpack_from("<Hqq", data, EDIR_HEADER_BYTES + EDIR_INSTRUCTION_BYTES) == (19, 0, 0)
 PY
@@ -135,12 +143,12 @@ def fnv1a(domain, value):
     for byte in domain + value:
         result = ((result ^ byte) * FNV_PRIME) & ((1 << 64) - 1)
     return result or 1
-assert struct.unpack_from("<IIQQBI", data) == (2, 1, 2, 0, 1, 1)
+assert struct.unpack_from("<IIQQBI", data) == (3, 1, 2, 0, 1, 1)
 assert file_id == 1 and logical_path.decode("utf-8") == "café:case.elisa"
 assert logical_path_id == fnv1a(b"EDIR logical path:", logical_path)
 assert content_digest == fnv1a(b"EDIR source content:", source)
 assert line_count == 2 and b"\n" not in source[-1:]
-assert len(data) == EDIR_HEADER_BYTES + 2 * 62
+assert len(data) == EDIR_HEADER_BYTES + 2 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
 PY
 
 local_source="$WORK/local.elisa"
@@ -164,9 +172,13 @@ EDIR_SOURCE_FILE_FIXED_BYTES = 36
 source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
 EDIR_HEADER_BYTES = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
 EDIR_INSTRUCTION_BYTES = 62
-assert len(data) == EDIR_HEADER_BYTES + 5 * EDIR_INSTRUCTION_BYTES
+EDIR_FUNCTION_COUNT_BYTES = 4
+EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
+EDIR_MAIN_NAME_BYTES = 4
+EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
+assert len(data) == EDIR_HEADER_BYTES + 5 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
 schema, version, instruction_count, local_count = struct.unpack_from("<IIQQ", data)
-assert (schema, version, instruction_count, local_count, data[24]) == (2, 1, 5, 1, 1)
+assert (schema, version, instruction_count, local_count, data[24]) == (3, 1, 5, 1, 1)
 
 def decode_instruction(index):
     offset = EDIR_HEADER_BYTES + index * EDIR_INSTRUCTION_BYTES
@@ -214,8 +226,12 @@ EDIR_SOURCE_FILE_FIXED_BYTES = 36
 source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
 EDIR_HEADER_BYTES = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
 EDIR_INSTRUCTION_BYTES = 62
-assert len(data) == EDIR_HEADER_BYTES + 4 * EDIR_INSTRUCTION_BYTES
-assert struct.unpack_from("<IIQQB", data) == (2, 1, 4, 1, 1)
+EDIR_FUNCTION_COUNT_BYTES = 4
+EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
+EDIR_MAIN_NAME_BYTES = 4
+EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
+assert len(data) == EDIR_HEADER_BYTES + 4 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
+assert struct.unpack_from("<IIQQB", data) == (3, 1, 4, 1, 1)
 assert [struct.unpack_from("<Hqq", data, EDIR_HEADER_BYTES + index * EDIR_INSTRUCTION_BYTES) for index in range(4)] == [
     (1, 42, 0), (5, 0, 0), (4, 0, 0), (19, 0, 0)
 ]
@@ -237,6 +253,10 @@ source = source_path.read_bytes()
 EDIR_HEADER_PREFIX_BYTES = 29
 EDIR_SOURCE_FILE_FIXED_BYTES = 36
 EDIR_INSTRUCTION_BYTES = 62
+EDIR_FUNCTION_COUNT_BYTES = 4
+EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
+EDIR_MAIN_NAME_BYTES = 4
+EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
 EXPECTED_INSTRUCTION_COUNT = 16
 EXPECTED_LOCAL_COUNT = 2
 EXPECTED_LOOP_LIMIT = 5
@@ -251,8 +271,8 @@ COMPARISON_OPERATOR_TEXT = b"<"
 COMPARISON_OPERATOR_LENGTH = len(COMPARISON_OPERATOR_TEXT)
 source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
 EDIR_HEADER_BYTES = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
-assert len(data) == EDIR_HEADER_BYTES + EXPECTED_INSTRUCTION_COUNT * EDIR_INSTRUCTION_BYTES
-assert struct.unpack_from("<IIQQB", data) == (2, 1, EXPECTED_INSTRUCTION_COUNT, EXPECTED_LOCAL_COUNT, 1)
+assert len(data) == EDIR_HEADER_BYTES + EXPECTED_INSTRUCTION_COUNT * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
+assert struct.unpack_from("<IIQQB", data) == (3, 1, EXPECTED_INSTRUCTION_COUNT, EXPECTED_LOCAL_COUNT, 1)
 
 def instruction(index):
     return struct.unpack_from("<HqqQQQIIIII", data, EDIR_HEADER_BYTES + index * EDIR_INSTRUCTION_BYTES)
@@ -389,7 +409,11 @@ EDIR_SOURCE_FILE_FIXED_BYTES = 36
 source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
 EDIR_HEADER_BYTES = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
 EDIR_INSTRUCTION_BYTES = 62
-assert len(data) == EDIR_HEADER_BYTES + 3 * EDIR_INSTRUCTION_BYTES
+EDIR_FUNCTION_COUNT_BYTES = 4
+EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
+EDIR_MAIN_NAME_BYTES = 4
+EDIR_MAIN_FUNCTION_TABLE_BYTES = EDIR_FUNCTION_COUNT_BYTES + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES + EDIR_MAIN_NAME_BYTES
+assert len(data) == EDIR_HEADER_BYTES + 3 * EDIR_INSTRUCTION_BYTES + EDIR_MAIN_FUNCTION_TABLE_BYTES
 instructions = [
     struct.unpack_from("<HqqQQQIIIII", data, EDIR_HEADER_BYTES + index * EDIR_INSTRUCTION_BYTES)
     for index in range(3)
@@ -414,6 +438,87 @@ PY
 check_arithmetic_case - 42 40 3 2
 check_arithmetic_case '*' 6 7 11 42
 check_arithmetic_case / 84 2 12 42
+
+# Schema 3 supplies explicit function ranges and direct call targets. This
+# compiler-owned fixture exercises a regular helper call and bounded tail recursion.
+functions_source="$ROOT/test/fixtures/edir/function_calls.elisa"
+functions_artifact="$WORK/function-calls.edir"
+emit_edir "$ROOT" "$functions_artifact" "$functions_source"
+python3 - "$functions_artifact" "$functions_source" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+artifact_path, source_path = map(Path, sys.argv[1:])
+data = artifact_path.read_bytes()
+source = source_path.read_bytes()
+EDIR_HEADER_PREFIX_BYTES = 29
+EDIR_SOURCE_FILE_FIXED_BYTES = 36
+EDIR_INSTRUCTION_BYTES = 62
+EDIR_FUNCTION_COUNT_BYTES = 4
+EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES = 72
+EDIR_MAX_CALL_DEPTH = 16
+EDIR_OPCODE_CALL = 18
+EDIR_SCHEMA_VERSION = 3
+source_path_length = struct.unpack_from("<I", data, EDIR_HEADER_PREFIX_BYTES + 32)[0]
+header_bytes = EDIR_HEADER_PREFIX_BYTES + EDIR_SOURCE_FILE_FIXED_BYTES + source_path_length
+schema, version, instruction_count, local_count, has_return = struct.unpack_from("<IIQQB", data)
+assert (schema, version, local_count, has_return) == (EDIR_SCHEMA_VERSION, 1, 1, 1)
+assert source.count(b"\n") + 1 == 11
+function_table_offset = header_bytes + instruction_count * EDIR_INSTRUCTION_BYTES
+function_count, = struct.unpack_from("<I", data, function_table_offset)
+assert function_count == 3
+descriptor_offset = function_table_offset + EDIR_FUNCTION_COUNT_BYTES
+functions = []
+final_return_by_name = {
+    b"main": b"return add_ten(descend(7))",
+    b"descend": b"return descend(depth - 1)",
+    b"add_ten": b"return value + 10",
+}
+for _ in range(function_count):
+    descriptor = struct.unpack_from("<QQQQQQIIIIII", data, descriptor_offset)
+    function_id, entry, end, file_id, start, finish, start_line, start_column, end_line, end_column, discriminator, name_length = descriptor
+    name_start = descriptor_offset + EDIR_FUNCTION_DESCRIPTOR_FIXED_BYTES
+    name = data[name_start : name_start + name_length]
+    assert function_id != 0 and file_id == 1 and start < finish
+    assert 1 <= start_line <= end_line <= 11 and start_column > 0 and end_column > 0
+    declaration_start = source.index(b"def " + name + b"(")
+    return_start = source.index(final_return_by_name[name], declaration_start)
+    line_end = source.find(b"\n", return_start)
+    expected_finish = line_end if line_end >= 0 else len(source)
+    expected_start_line = source[:declaration_start].count(b"\n") + 1
+    expected_start_line_start = source.rfind(b"\n", 0, declaration_start) + 1
+    expected_start_column = declaration_start - expected_start_line_start + 1
+    expected_end_line = source[:expected_finish].count(b"\n") + 1
+    expected_end_line_start = source.rfind(b"\n", 0, expected_finish) + 1
+    expected_end_column = expected_finish - expected_end_line_start + 1
+    assert (start, finish, start_line, start_column, end_line, end_column, discriminator) == (
+        declaration_start,
+        expected_finish,
+        expected_start_line,
+        expected_start_column,
+        expected_end_line,
+        expected_end_column,
+        0,
+    )
+    functions.append((name, entry, end, function_id, start, finish))
+    descriptor_offset = name_start + name_length
+assert [function[0] for function in functions] == [b"main", b"descend", b"add_ten"]
+assert functions[0][1] == 0
+assert all(function[1] < function[2] for function in functions)
+assert all(functions[index][2] == functions[index + 1][1] for index in range(len(functions) - 1))
+assert descriptor_offset == len(data)
+entries = {function[1] for function in functions}
+calls = []
+for instruction_index in range(instruction_count):
+    instruction_offset = header_bytes + instruction_index * EDIR_INSTRUCTION_BYTES
+    opcode, operand_a, operand_b, file_id, start, finish, *_ = struct.unpack_from("<HqqQQQIIIII", data, instruction_offset)
+    if opcode == EDIR_OPCODE_CALL:
+        assert operand_a >= 0 and operand_a in entries and operand_b == EDIR_MAX_CALL_DEPTH
+        assert file_id == 1 and start < finish
+        calls.append(operand_a)
+assert calls == [functions[1][1], functions[2][1], functions[1][1]]
+PY
 
 # A fresh destination remains empty when an AST outside the exact supported
 # shape is rejected; the emitter must not publish a partial image.
