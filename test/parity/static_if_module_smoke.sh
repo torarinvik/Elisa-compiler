@@ -9,7 +9,7 @@ STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elis
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-python3 - "$STAGE0" "$STAGE1" "$WORK" <<'PY'
+ROOT="$ROOT" python3 - "$STAGE0" "$STAGE1" "$WORK" <<'PY'
 from pathlib import Path
 import subprocess, sys
 stage0, stage1, work = sys.argv[1:]
@@ -26,4 +26,17 @@ src = work / 'same_branch.elisa'; src.write_text(same_branch)
 results = [compile(c, src) for c in (stage0, stage1)]
 assert all(r.returncode != 0 for r in results) and results[0].stderr == results[1].stderr, [(r.returncode, r.stderr) for r in results]
 print('static_if_module_same_branch: stage0/stage1 byte-identical rejection PASS', flush=True)
+# The RUNTIME fixture: three nested-const spellings, compiled and run by both compilers.
+import os
+root = Path(os.environ['ROOT'])
+subprocess.run(['clang', '-c', str(root/'test/parity/profile_hooks.c'), '-o', str(work/'hooks.o')], check=True)
+codes = []
+for stage, compiler in enumerate((stage0, stage1)):
+    obj, exe = work / f'nested{stage}.o', work / f'nested{stage}'
+    r = subprocess.run([compiler, '-emit', 'obj', '-O0', '-o', str(obj), str(root/'test/differential/cases/nested_module_const.elisa')], capture_output=True, timeout=60)
+    assert r.returncode == 0, (compiler, r.stderr)
+    subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
+    codes.append(subprocess.run([str(exe)], timeout=90).returncode)
+assert codes == [0, 0], codes
+print('nested_module_const: stage0/stage1 runtime PASS', flush=True)
 PY
