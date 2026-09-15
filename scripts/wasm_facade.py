@@ -13,10 +13,14 @@ import json
 import re
 from typing import Any
 
-from scripts.wasm_export_scan import normalize_type
+
+def _normalize_type(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^(?:mutable|lmut|heap|stack|static)\s+", "", text)
+    return re.sub(r"\s+", "", text)
 
 def ts_type(type_text: str, target: str, *, parameter: bool = False) -> str:
-    normalized = normalize_type(type_text)
+    normalized = _normalize_type(type_text)
     if normalized == "cstr":
         return "string | number" if parameter else "string"
     if normalized in {"i64", "u64", "char"}:
@@ -29,7 +33,7 @@ def ts_type(type_text: str, target: str, *, parameter: bool = False) -> str:
 
 
 def js_input(type_text: str, expression: str) -> str:
-    normalized = normalize_type(type_text)
+    normalized = _normalize_type(type_text)
     if normalized in {"i64", "u64", "char"}:
         return f"BigInt({expression})"
     if normalized == "bool":
@@ -38,7 +42,7 @@ def js_input(type_text: str, expression: str) -> str:
 
 
 def js_output(type_text: str, expression: str) -> str:
-    normalized = normalize_type(type_text)
+    normalized = _normalize_type(type_text)
     if normalized == "cstr":
         return f"memoryTools.readString({expression})"
     if normalized == "bool":
@@ -306,4 +310,3 @@ export function createElisaImports(options?: ElisaWasmLoadOptions): WebAssembly.
 export function loadWasm(source?: WasmSource, options?: ElisaWasmLoadOptions): Promise<{interface_name}>;
 export default loadWasm;
 '''
-

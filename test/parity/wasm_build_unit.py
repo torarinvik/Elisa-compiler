@@ -19,13 +19,17 @@ from scripts.wasm_build import (
     js_bindings,
     load_export_scan,
     parse_exports,
+    runtime_cache_path,
     type_declaration,
 )
 from scripts.wasm_export_scan_client import (
     WasmExportScanClientError,
     _decode_build_payload,
+    _decode_flatten_payload,
     _validate_exports,
+    run_flatten_source,
 )
+from scripts.wasm_facade import js_input, js_output, ts_type
 
 
 class WasmBindingsTests(unittest.TestCase):
@@ -48,6 +52,11 @@ class WasmBindingsTests(unittest.TestCase):
         self.assertIn("Missing Elisa WASM imports", generated)
         declarations = type_declaration(manifest, "demo")
         self.assertIn("echo(value: string | number): string", declarations)
+
+    def test_facade_type_normalization_does_not_import_the_scanner(self) -> None:
+        self.assertEqual(ts_type("mutable i64", "wasm32", parameter=True), "bigint")
+        self.assertEqual(js_input("lmut i64", "value"), "BigInt(value)")
+        self.assertEqual(js_output("heap u8", "value"), "((value) & 0xff)")
 
     def test_hyphenated_output_gets_a_valid_typescript_interface(self) -> None:
         manifest = {"exports": parse_exports("export fn answer() -> i32 = answer_impl"), "target": "wasm32-unknown-unknown"}
@@ -96,6 +105,49 @@ class WasmExportScanClientTests(unittest.TestCase):
         source, exports = _decode_build_payload(self.encode())
         self.assertEqual(source, "export fn answer() -> i32 = answer_impl\n")
         self.assertEqual(exports, [self.row])
+
+    def test_decodes_versioned_flatten_payload_without_exports(self) -> None:
+        payload = {"version": 1, "flattened_source": 'include "part.elisa"\nexport fn answer()\n'}
+        encoded = json.dumps(payload, separators=(",", ":")).encode() + b"\n"
+        self.assertEqual(
+            _decode_flatten_payload(encoded),
+            'include "part.elisa"\nexport fn answer()\n',
+        )
+
+    def test_rejects_flatten_payload_with_extra_or_reordered_fields(self) -> None:
+        for payload in (
+            {"flattened_source": "source", "version": 1},
+            {"version": 1, "flattened_source": "source", "exports": []},
+        ):
+            encoded = json.dumps(payload, separators=(",", ":")).encode() + b"\n"
+            with self.assertRaisesRegex(WasmExportScanClientError, "flatten payload shape"):
+                _decode_flatten_payload(encoded)
+
+    def test_flatten_client_selects_flatten_only_mode(self) -> None:
+        payload = json.dumps(
+            {"version": 1, "flattened_source": "no exports required\n"},
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        with (
+            patch(
+                "scripts.wasm_export_scan_client._scanner_command",
+                return_value=["launcher", "scanner", "--flatten-payload", "source"],
+            ) as command_builder,
+            patch(
+                "scripts.wasm_export_scan_client._capture_process_output",
+                return_value=(0, payload, b""),
+            ) as capture,
+        ):
+            self.assertEqual(
+                run_flatten_source("launcher", "scanner", Path("/tmp/runtime.elisa")),
+                "no exports required\n",
+            )
+        command_builder.assert_called_once_with(
+            "launcher", "scanner", Path("/tmp/runtime.elisa"), "--flatten-payload"
+        )
+        capture.assert_called_once_with(
+            ["launcher", "scanner", "--flatten-payload", "source"]
+        )
 
     def test_rejects_boolean_payload_version(self) -> None:
         with self.assertRaisesRegex(WasmExportScanClientError, "unsupported payload version"):
@@ -239,6 +291,28 @@ class ExportScannerSelectionTests(unittest.TestCase):
             self.assertEqual(load_export_scan(source_path, SimpleNamespace()), (flattened, exports))
         read_source.assert_called_once_with(source_path)
         parse_source.assert_called_once_with(flattened)
+
+    def test_runtime_cache_uses_elisascript_flatten_payload_when_configured(self) -> None:
+        root = Path("/tmp/elisa-wasm-runtime-cache-test")
+        runtime_source = root / "runtime.elisa"
+        with (
+            patch("scripts.wasm_build.run_flatten_source", return_value="flattened") as flatten,
+            patch("scripts.wasm_build.read_flat_source") as python_flatten,
+        ):
+            runtime_cache_path(
+                root,
+                root / "compiler",
+                "wasm32-test",
+                runtime_source,
+                export_scan_launcher="/usr/bin/elisac",
+                export_scan_script="/tmp/wasm_export_scan.elisascript",
+            )
+        flatten.assert_called_once_with(
+            "/usr/bin/elisac",
+            "/tmp/wasm_export_scan.elisascript",
+            runtime_source,
+        )
+        python_flatten.assert_not_called()
 
     def test_opt_in_launcher_and_script_must_be_paired(self) -> None:
         args = SimpleNamespace(export_scan_launcher="/bin/elisac")

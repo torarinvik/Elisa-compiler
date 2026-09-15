@@ -14,9 +14,10 @@ sources both ways and requires every artifact — module included — to be byte
 Change one side and that smoke tells you the other has drifted.
 
 An explicit `--export-scan-launcher` plus `--export-scan-script` pair can
-exercise the Elisascript scanner for source flattening and export parsing.
-The default remains the Python oracle; this opt-in does not replace the packager,
-runtime-source cache scan, or façade type normalization.
+exercise the Elisascript scanner for source flattening and export parsing, and
+its flatten-only payload for runtime-source cache hashing. The default remains
+the Python oracle; this opt-in does not replace the packager or establish
+runtime parity.
 """
 
 
@@ -43,7 +44,11 @@ from scripts.wasm_export_scan import (
     parse_exports,
     read_flat_source,
 )
-from scripts.wasm_export_scan_client import WasmExportScanClientError, run_export_scan
+from scripts.wasm_export_scan_client import (
+    WasmExportScanClientError,
+    run_export_scan,
+    run_flatten_source,
+)
 from scripts.wasm_facade import js_bindings, type_declaration
 
 # Re-exported so `from scripts.wasm_build import ...` keeps working for the unit test and
@@ -148,10 +153,38 @@ def run(command: list[str], label: str, env: dict[str, str]) -> None:
         raise WasmBuildError(f"{label} failed with exit status {completed.returncode}: {rendered}")
 
 
-def runtime_cache_path(root: Path, compiler: Path, target: str, runtime_source: Path) -> Path:
+def runtime_cache_path(
+    root: Path,
+    compiler: Path,
+    target: str,
+    runtime_source: Path,
+    *,
+    export_scan_launcher: str | None = None,
+    export_scan_script: str | None = None,
+) -> Path:
+    if (export_scan_launcher is None) != (export_scan_script is None):
+        raise WasmBuildError(
+            "--export-scan-launcher and --export-scan-script must be supplied together"
+        )
+    if export_scan_launcher is None and export_scan_script is None:
+        flattened_runtime_source = read_flat_source(runtime_source)
+    elif export_scan_launcher is not None and export_scan_script is not None:
+        try:
+            flattened_runtime_source = run_flatten_source(
+                export_scan_launcher,
+                export_scan_script,
+                runtime_source,
+            )
+        except WasmExportScanClientError as error:
+            raise WasmBuildError(str(error)) from error
+    else:
+        raise WasmBuildError(
+            "--export-scan-launcher and --export-scan-script must be supplied together"
+        )
+
     digest = hashlib.sha256()
     digest.update(target.encode("utf-8"))
-    digest.update(read_flat_source(runtime_source).encode("utf-8"))
+    digest.update(flattened_runtime_source.encode("utf-8"))
     for candidate in (compiler, root / "bin" / "elisac-stage1"):
         try:
             stat = candidate.resolve().stat()
@@ -169,9 +202,13 @@ def load_export_scan(source: Path, args: argparse.Namespace) -> tuple[str, list[
         raise WasmBuildError(
             "--export-scan-launcher and --export-scan-script must be supplied together"
         )
-    if launcher is None:
+    if launcher is None and scanner_script is None:
         flat_source = read_flat_source(source)
         return flat_source, parse_exports(flat_source)
+    if launcher is None or scanner_script is None:
+        raise WasmBuildError(
+            "--export-scan-launcher and --export-scan-script must be supplied together"
+        )
     try:
         return run_export_scan(launcher, scanner_script, source)
     except WasmExportScanClientError as error:
@@ -227,7 +264,14 @@ def build(args: argparse.Namespace) -> None:
             # it imports libc-shaped `env` functions and would make the component
             # depend on a host ABI that WIT does not describe.
             runtime_source = root / "elisacore_std" / "wasm_component_runtime.elisa"
-            cached_runtime = runtime_cache_path(root, Path(args.compiler), target, runtime_source)
+            cached_runtime = runtime_cache_path(
+                root,
+                Path(args.compiler),
+                target,
+                runtime_source,
+                export_scan_launcher=getattr(args, "export_scan_launcher", None),
+                export_scan_script=getattr(args, "export_scan_script", None),
+            )
             if os.environ.get("ELISA_WASM_NO_CACHE"):
                 runtime_object = directory / "component-runtime.o"
                 runtime_command = [args.compiler, "-emit", "obj", "-target-triple", target, "-O0", "-o", str(runtime_object), str(runtime_source)]
@@ -242,7 +286,14 @@ def build(args: argparse.Namespace) -> None:
                 runtime_object = cached_runtime
         elif not re.search(r"^\s*def\s+arena_alloc\s*\(", flat_source, re.MULTILINE):
             runtime_source = root / "elisacore_std" / "native_runtime_support.elisa"
-            cached_runtime = runtime_cache_path(root, Path(args.compiler), target, runtime_source)
+            cached_runtime = runtime_cache_path(
+                root,
+                Path(args.compiler),
+                target,
+                runtime_source,
+                export_scan_launcher=getattr(args, "export_scan_launcher", None),
+                export_scan_script=getattr(args, "export_scan_script", None),
+            )
             if os.environ.get("ELISA_WASM_NO_CACHE"):
                 runtime_object = directory / "runtime.o"
                 runtime_command = [args.compiler, "-emit", "obj", "-target-triple", target, "-O0", "-o", str(runtime_object), str(runtime_source)]

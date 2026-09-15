@@ -234,6 +234,37 @@ def _decode_build_payload(stdout: bytes) -> tuple[str, list[dict[str, Any]]]:
     return flattened_source, _validate_exports(payload["exports"])
 
 
+def _decode_flatten_payload(stdout: bytes) -> str:
+    if not stdout or len(stdout) > MAX_PROCESS_OUTPUT_BYTES or not stdout.endswith(b"\n"):
+        raise WasmExportScanClientError("Elisascript scanner returned an invalid payload frame")
+    json_bytes = stdout[:-1]
+    if not json_bytes or b"\n" in json_bytes or b"\r" in json_bytes:
+        raise WasmExportScanClientError("Elisascript scanner returned an invalid payload frame")
+    try:
+        payload = json.loads(
+            json_bytes.decode("utf-8"),
+            object_pairs_hook=_duplicate_key_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
+        raise WasmExportScanClientError("Elisascript scanner returned invalid JSON") from error
+
+    if not isinstance(payload, dict) or list(payload) != ["version", "flattened_source"]:
+        raise WasmExportScanClientError("Elisascript scanner returned an invalid flatten payload shape")
+    if type(payload["version"]) is not int or payload["version"] != 1:
+        raise WasmExportScanClientError("Elisascript scanner returned an unsupported payload version")
+    flattened_source = _require_string(payload["flattened_source"], "flattened_source")
+    try:
+        source_bytes = len(flattened_source.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise WasmExportScanClientError(
+            "Elisascript scanner returned invalid UTF-8 source"
+        ) from error
+    if source_bytes > MAX_FLATTENED_SOURCE_BYTES:
+        raise WasmExportScanClientError("Elisascript scanner returned oversized flattened source")
+    return flattened_source
+
+
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
     if os.name == "posix":
         try:
@@ -372,12 +403,12 @@ def _scanner_failure(returncode: int, stdout: bytes, stderr: bytes) -> WasmExpor
     )
 
 
-def run_export_scan(
+def _scanner_command(
     launcher: str | os.PathLike[str],
     scanner_script: str | os.PathLike[str],
     source: Path,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Run the configured scanner and validate its versioned build payload."""
+    option: str,
+) -> list[str]:
     launcher_path = Path(launcher)
     scanner_path = Path(scanner_script)
     if (
@@ -398,12 +429,21 @@ def run_export_scan(
     if not scanner_path.is_file():
         raise WasmExportScanClientError("Elisascript scanner script is not a regular file")
 
-    command = [
+    return [
         os.fspath(launcher_path),
         os.fspath(scanner_path),
-        "--build-payload",
+        option,
         os.fspath(source),
     ]
+
+
+def run_export_scan(
+    launcher: str | os.PathLike[str],
+    scanner_script: str | os.PathLike[str],
+    source: Path,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run the configured scanner and validate its versioned build payload."""
+    command = _scanner_command(launcher, scanner_script, source, "--build-payload")
     returncode, stdout, stderr = _capture_process_output(command)
     if returncode != 0:
         raise _scanner_failure(returncode, stdout, stderr)
@@ -412,4 +452,19 @@ def run_export_scan(
     return _decode_build_payload(stdout)
 
 
-__all__ = ["WasmExportScanClientError", "run_export_scan"]
+def run_flatten_source(
+    launcher: str | os.PathLike[str],
+    scanner_script: str | os.PathLike[str],
+    source: Path,
+) -> str:
+    """Run the bounded include flattener without requiring export declarations."""
+    command = _scanner_command(launcher, scanner_script, source, "--flatten-payload")
+    returncode, stdout, stderr = _capture_process_output(command)
+    if returncode != 0:
+        raise _scanner_failure(returncode, stdout, stderr)
+    if stderr:
+        raise WasmExportScanClientError("Elisascript scanner wrote unexpected stderr on success")
+    return _decode_flatten_payload(stdout)
+
+
+__all__ = ["WasmExportScanClientError", "run_export_scan", "run_flatten_source"]
