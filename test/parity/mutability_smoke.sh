@@ -40,4 +40,15 @@ grep -q "cannot assign to immutable" <<< "$out" || fail "clear on immutable dict
 out=$(printf 'def f() -> void:\n    xs: darray[i64] = [1, 2]\n    n: i64 = xs.count\n' | "$RPT")
 grep -q "cannot assign to immutable" <<< "$out" && fail "false positive on non-mutating count: $out"
 
-echo "mutability smoke OK: compound-assign and mutating methods checked against mutable bindings, 0 FP"
+# 9. A leading `mutable name:` changes the binding slot, not the reference
+# capability. It must permit rebinding a readonly reference value without
+# permitting writes through that reference.
+out=$(printf 'def f() -> void:\n    x: i64 = 5\n    y: i64 = 7\n    mutable p: i64& = &x\n    p <- &y\n' | "$RPT")
+grep -q "readonly ref" <<< "$out" && fail "explicit mutable reference binding was treated as readonly: $out"
+
+# 10. The ordinary immutable binding remains distinct from the mutable
+# pointee capability. This is the shape the translator uses for C `T *const`.
+out=$(printf 'def f() -> void:\n    x: mutable i64 = 5\n    p: mutable i64& = &x\n    p <- 7\n' | "$RPT")
+grep -q "cannot mutate through readonly ref\|cannot assign through readonly ref" <<< "$out" && fail "mutable pointee through an immutable slot was rejected: $out"
+
+echo "mutability smoke OK: binding and pointee mutability remain independent, 0 FP"

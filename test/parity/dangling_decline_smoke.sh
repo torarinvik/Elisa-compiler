@@ -66,6 +66,24 @@ decline_case referenced_decline 'def total() -> i64:\n    table: mutable deque[i
 # build depends on: refusing every drop would refuse to compile the compiler.
 decline_case unreferenced_decline 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef main() -> i64:\n    return 7\n' 0
 
+# At -O2, a declined body referenced only by a private helper chain is still
+# dead when that chain is unreachable from main. The old direct-use check
+# treated any emitted caller body as live and rejected this valid program before
+# LLVM's optimizer could discard the private chain.
+total=$((total + 1))
+printf '%b' 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef dormant() -> i64:\n    return total() + 1\n\ndef main() -> i64:\n    return 7\n' > "$WORK/private_unreachable_chain.elisa"
+RUN "$STAGE1" -O2 -o "$WORK/private_unreachable_chain.o" "$WORK/private_unreachable_chain.elisa" >/dev/null 2>&1
+private_chain_rc=$?
+if [ "$private_chain_rc" -ne 0 ]; then
+    echo "  FAIL private_unreachable_decline_chain: rc=$private_chain_rc want=0"
+else
+    pass=$((pass + 1))
+fi
+
+# The same chain is unsafe once main reaches it; reachability must be
+# transitive, not merely based on the declined function's direct users.
+decline_case referenced_private_chain 'def total() -> i64:\n    table: mutable deque[i64] = []\n    return 3\n\ndef dormant() -> i64:\n    return total() + 1\n\ndef main() -> i64:\n    return dormant()\n' 2
+
 # A LIBRARY — no `main`. Its whole purpose is to be linked against something else, and
 # `native_runtime_support.elisa` legitimately leaves symbols for the runtime object to
 # satisfy. Same referenced decline as the first case; still compiles.
