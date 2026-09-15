@@ -11,13 +11,14 @@ REPO_ROOT="${REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
 ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+PROFILE_HOOKS="$ELISA_CORE/compiler/runtime/profile_hooks.c"
 EMIT_NATIVE="${ELISA_EMIT_NATIVE:-$REPO_ROOT/build/emit_native}"
 mkdir -p "$(dirname -- "$EMIT_NATIVE")"
 
 _en_fresh=""
 if [[ -x "$EMIT_NATIVE" ]]; then
   _en_fresh=1
-  for _en_src in "$REPO_ROOT/test/breadth/emit_native.elisa" "$ELISACORE_BIN"; do
+  for _en_src in "$REPO_ROOT/test/breadth/emit_native.elisa" "$ELISACORE_BIN" "$PROFILE_HOOKS"; do
     [[ -e "$_en_src" && "$_en_src" -nt "$EMIT_NATIVE" ]] && _en_fresh=""
   done
 fi
@@ -31,7 +32,11 @@ if ! "$ELISACORE_BIN" -emit obj -O2 -o "$_en_obj" "$REPO_ROOT/test/breadth/emit_
   rm -f "$_en_obj" "$_en_log"; return 1 2>/dev/null || exit 1
 fi
 _en_libdir="$("$LLVM_CONFIG" --libdir)"
-if ! clang -o "$_en_tmp" "$_en_obj" -L"$_en_libdir" -lLLVM -Wl,-rpath,"$_en_libdir" 2>"$_en_log"; then
+if [[ ! -f "$PROFILE_HOOKS" ]]; then
+  echo "build_emit_native: missing profiler hook fallback: $PROFILE_HOOKS" >&2
+  rm -f "$_en_obj" "$_en_tmp" "$_en_log"; return 1 2>/dev/null || exit 1
+fi
+if ! clang -o "$_en_tmp" "$_en_obj" "$PROFILE_HOOKS" -L"$_en_libdir" -lLLVM -Wl,-rpath,"$_en_libdir" 2>"$_en_log"; then
   echo "build_emit_native: could not link emit_native" >&2; sed -n '1,10p' "$_en_log" >&2
   rm -f "$_en_obj" "$_en_tmp" "$_en_log"; return 1 2>/dev/null || exit 1
 fi

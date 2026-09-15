@@ -36,9 +36,24 @@ differ=0
 # Compare stdout AND exit status, byte for byte.
 compare() {
     local label="$1"; local src="$2"; shift 2
+    local require_pass=0
+    if [[ "${1:-}" == "--require-pass" ]]; then
+        require_pass=1
+        shift
+    fi
     local s0 s1 rc0 rc1
     s0="$("$ELISACORE_BIN" -emit test "$@" "$src" </dev/null 2>/dev/null)"; rc0=$?
     s1="$(bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit test "$@" "$src" 2>/dev/null)"; rc1=$?
+    if [[ "$require_pass" -eq 1 ]]; then
+        local expected_summary='^\[ SUMMARY +\] 1 test\(s\) selected; passed=1 skipped=0 failed=0$'
+        if [[ "$rc0" -ne 0 || "$rc1" -ne 0 ]] || ! grep -Eq "$expected_summary" <<<"$s0" || ! grep -Eq "$expected_summary" <<<"$s1"; then
+            differ=$((differ + 1))
+            echo "FAIL: $label must pass exactly one test under both compilers (stage0 rc=$rc0, stage1 rc=$rc1)"
+            printf '%s\n' "$s0" | tail -6
+            printf '%s\n' "$s1" | tail -6
+            return
+        fi
+    fi
     if [ "$s0" = "$s1" ] && [ "$rc0" = "$rc1" ]; then
         same=$((same + 1))
     else
@@ -113,6 +128,9 @@ compare "filter no match"     "$WORK/pass.elisa" -filter zzzz
 compare "no @test at all"     "$WORK/none.elisa"
 compare "skipped"             "$WORK/skip.elisa"
 compare "skipped, filtered"   "$WORK/skip.elisa" -filter skipped
+# This regression parses compiler ASTs and then traverses them through Semantic. An @test
+# must be a plain C-callable entry point while creating its AST store in its own frame.
+compare "compiler AST store and readonly lookup" "$REPO_ROOT/test/parity/readonly_lookup_smoke.elisa" --require-pass
 
 # The failure path: status lines only (see the header).
 compare_modulo_backtrace "panic"               "$WORK/panic.elisa"

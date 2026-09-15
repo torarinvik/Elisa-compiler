@@ -5,7 +5,7 @@
 # Sourced by elisac_stage1.sh, which owns ROOT/BIN and the toolchain variables this reads.
 
 seed_build() {
-  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_profile_hook_source
+  local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source
   # A newly-created Git worktree has no ignored build directory yet. Create the
   # local output roots before taking the per-worktree lock; otherwise `mkdir`
   # cannot create the nested lock path and every first seed fails as if a stale
@@ -84,6 +84,7 @@ seed_build() {
   # seed is still running. Keeping the temporary name private also makes an RSS-guarded
   # termination recoverable without leaving a misleading apparently-valid artifact.
   seed_object="$ROOT/build/elisac_stage1.o.tmp.$$"
+  seed_object_output="${ELISA_STAGE1_OBJECT:-$ROOT/build/elisac_stage1.o}"
   seed_profile_hook_source="$ROOT/build/elisac_stage1_profile_hooks.tmp.$$.c"
   ELISA_SEED_OUTPUT="$seed_output"
   ELISA_SEED_OBJECT="$seed_object"
@@ -193,7 +194,7 @@ seed_build() {
     '}' >"$seed_profile_hook_source"
   "$ELISA_CLANG_TOOL" -Wl,-dead_strip -o "$seed_output" "$seed_object" "$seed_profile_hook_source" -L"$libdir" -lLLVM -Wl,-rpath,"$libdir" -Wl,-stack_size,0x20000000
   mv -f "$seed_output" "$BIN"
-  mv -f "$seed_object" "$ROOT/build/elisac_stage1.o"
+  mv -f "$seed_object" "$seed_object_output"
   ELISA_SEED_OUTPUT=""
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
   echo "seed: wrote $BIN" >&2
