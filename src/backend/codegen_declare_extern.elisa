@@ -130,6 +130,15 @@ extend Backend:
         # DECLINED even though its declaration lowered correctly.
         # The recorded ELEMENT type of an extern's `-> darray[T]` return, keyed by the extern's
         # own line, or "".
+        def resource_struct_declared(annotations: darray[Ast::EnumAnnotation]&, type_name: sview) -> bool can[Abort.Panic]:
+            return any annotation in annotations where annotation.name == "__extern_resource" and annotation.owner == type_name
+
+        # 0 = not a resource return, 1 = owned `Name`, 2 = `Name?`.
+        def extern_resource_return_kind(annotations: darray[Ast::EnumAnnotation]&, extern_name: sview, return_type_name: sview, line: u32) -> u32 can[Abort.Panic]:
+            0 return if return_type_name == "" or not resource_struct_declared(annotations, return_type_name)
+            optional: bool = any annotation in annotations where annotation.owner == "__extern_return_optional" and annotation.name == extern_name and annotation.line == line
+            return 2 if optional else 1
+
         def extern_return_darray_element_of(annotations: darray[Ast::EnumAnnotation]&, line: u32) -> sview can[Abort.Panic]:
             for annotation in annotations |line|:
                 annotation.owner return if annotation.name == "__extern_return_darray_elem" and annotation.line == line
@@ -303,6 +312,8 @@ extend Backend:
                         if return_value_type.kind == TypeKind.Unmodeled:
                             return_value_type <- synthesize_task_handle(structs) if return_type_name == "Pending"
                         false return if return_value_type.kind == TypeKind.Unmodeled
+                        if return_value_type.kind == TypeKind.Struct and resource_struct_declared(annotations, return_type_name) and extern_return_is_optional(annotations, extern_name):
+                            return_value_type <- intern_optional_type(return_value_type, structs)
 
                 extern_param_types: mutable darray[LLVMTypeRef] = []
                 declared_param_types: mutable darray[ValueType] = []
@@ -425,29 +436,39 @@ extend Backend:
                 # codes; otherwise each view splits adjacently. Rebuild the LLVM parameter list
                 # from it and remember the plan for the call site. Exports keep their own ABI.
                 plan_codes: mutable darray[u32] = []
-                if extern_c_abi and not extern_is_export:
-                    for plan_annotation in annotations |plan_codes, extern_name|:
+                if not extern_is_export:
+                    for plan_annotation in annotations |plan_codes|:
                         plan_codes.push(plan_annotation.line) if plan_annotation.name == "__bounds_cpart" and plan_annotation.owner == extern_name
                     if plan_codes.count == 0:
-                        has_view_param: mutable bool = false
-                        for plan_index in 0..<declared_param_types.count |plan_codes, has_view_param, declared_param_types|:
-                            if declared_param_types[plan_index].kind == TypeKind.View:
-                                has_view_param <- true
-                                plan_codes.push(plan_index.u32() * 4 + 1)
-                                plan_codes.push(plan_index.u32() * 4 + 2)
+                        has_special_param: mutable bool = false
+                        for plan_index in 0..<declared_param_types.count |plan_codes, has_special_param, structs|:
+                            plan_type: ValueType = copied_type(declared_param_types[plan_index])
+                            plan_ref_target: ValueType = ref_target_of(plan_type, structs) if plan_type.kind == TypeKind.Ref else unmodeled_type()
+                            if extern_c_abi and plan_type.kind == TypeKind.View:
+                                has_special_param <- true
+                                plan_codes.push(plan_index.u32() * 8 + 1)
+                                plan_codes.push(plan_index.u32() * 8 + 2)
+                            elif plan_type.kind == TypeKind.Struct and resource_struct_declared(annotations, structs.names[plan_type.bits.usize()]):
+                                # An `extern resource` by value: the consuming call passes the handle.
+                                has_special_param <- true
+                                plan_codes.push(plan_index.u32() * 8 + 3)
+                            elif plan_ref_target.kind == TypeKind.Struct and resource_struct_declared(annotations, structs.names[plan_ref_target.bits.usize()]):
+                                # An `extern resource` by reference: a borrow, the handle is loaded.
+                                has_special_param <- true
+                                plan_codes.push(plan_index.u32() * 8 + 4)
                             else:
-                                plan_codes.push(plan_index.u32() * 4)
-                        plan_codes <- plan_codes.truncate(0) if not has_view_param
+                                plan_codes.push(plan_index.u32() * 8)
+                        plan_codes <- plan_codes.truncate(0) if not has_special_param
                 if plan_codes.count > 0:
                     planned_types: mutable darray[LLVMTypeRef] = []
                     for code in plan_codes |planned_types, extern_param_types, structs, ctx|:
-                        part: u32 = code % 4
-                        if part == 1:
+                        part: u32 = code % 8
+                        if part == 1 or part == 3 or part == 4:
                             planned_types.push(LLVMPointerTypeInContext(ctx, 0))
                         elif part == 2:
                             planned_types.push(llvm_type_of(scalar_type_of_name("usize"), structs, ctx))
                         else:
-                            planned_types.push(extern_param_types[(code / 4).usize()])
+                            planned_types.push(extern_param_types[(code / 8).usize()])
                     extern_param_types <- planned_types
 
                 # `extern f(...) -> T error[E]` uses the SAME out-param ABI as an ordinary
@@ -495,6 +516,10 @@ extend Backend:
                 # is two parameters. Building the type from the declared count dropped the
                 # sret parameter (the wrapper then read a parameter that did not exist and
                 # the compiler died at teardown, after writing the object).
+                # An `extern resource` return crosses as the bare handle; inside it is the
+                # struct (or the aggregate optional of it), wrapped at the call site.
+                resource_return: u32 = extern_resource_return_kind(annotations, extern_name, return_type_name, extern_line.line)
+                llvm_return <- LLVMPointerTypeInContext(ctx, 0) if resource_return != 0
                 fn_type: mutable LLVMTypeRef = LLVMFunctionType(llvm_return, null, 0, 0)
                 if extern_param_types.count != 0:
                     extern_pointer: void& = (&extern_param_types[0]).cast[void&] can Unsafe.PointerCast
@@ -578,6 +603,9 @@ extend Backend:
                 fns.returns_nullable <- fns.returns_nullable.push(extern_return_is_optional(annotations, extern_name))
                 fns.is_variadic <- fns.is_variadic.push(variadic)
                 fns.is_extern <- fns.is_extern.push(true)
+                if resource_return != 0:
+                    fns.resource_return_names <- fns.resource_return_names.push(extern_name)
+                    fns.resource_return_kinds <- fns.resource_return_kinds.push(resource_return)
                 if plan_codes.count > 0:
                     fns.c_plan_names <- fns.c_plan_names.push(extern_name)
                     fns.c_plan_start <- fns.c_plan_start.push(fns.c_plan_codes.count)
