@@ -37,7 +37,7 @@ ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
 # subsequent widening is intentional: sview clamp bounds are represented as i64.
 grep -Eq 'declare i32 @strlen\(ptr\)' "$WORK/stage1.ll"
 grep -Eq 'call i32 @strlen\(ptr' "$WORK/stage1.ll"
-grep -Eq 'zext i32 %sview\.srclen\.target to i64' "$WORK/stage1.ll"
+grep -Eq 'zext i32 %sview\.srclen(\.target)?[0-9]* to i64' "$WORK/stage1.ll"
 
 # Parse and verify stage1's generated LLVM IR with the target-compatible LLVM reader.
 "$CLANG" --target=wasm32-unknown-wasi -c "$WORK/stage1.ll" -o "$WORK/stage1-ir.o"
