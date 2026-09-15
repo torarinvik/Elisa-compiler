@@ -39,4 +39,13 @@ for stage, compiler in enumerate((stage0, stage1)):
     codes.append(subprocess.run([str(exe)], timeout=90).returncode)
 assert codes == [0, 0], codes
 print('nested_module_const: stage0/stage1 runtime PASS', flush=True)
+codes = []
+for stage, compiler in enumerate((stage0, stage1)):
+    obj, exe = work / f'kinds{stage}.o', work / f'kinds{stage}'
+    r = subprocess.run([compiler, '-emit', 'obj', '-O0', '-o', str(obj), str(root/'test/differential/cases/nested_module_const_kinds.elisa')], capture_output=True, timeout=60)
+    assert r.returncode == 0, (compiler, r.stderr)
+    subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(exe), str(obj), str(work/'hooks.o'), str(root/'build/runtime/elisacore_runtime.o')], check=True)
+    codes.append(subprocess.run([str(exe)], timeout=90).returncode)
+assert codes == [0, 0], codes
+print('nested_module_const_kinds: stage0/stage1 runtime PASS', flush=True)
 PY
