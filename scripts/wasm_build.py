@@ -12,6 +12,14 @@ no ``-emit wasm``, and ``test/parity/wasm_component_runtime_smoke.sh`` drives th
 serves as the port's oracle: ``test/parity/wasm_python_parity_smoke.sh`` builds the same
 sources both ways and requires every artifact — module included — to be byte-identical.
 Change one side and that smoke tells you the other has drifted.
+
+An explicit `--export-scan-launcher` plus `--export-scan-script` pair can
+exercise the Elisascript scanner for source flattening and export parsing, and
+its flatten-only payload for runtime-source cache hashing. The default remains
+the Python oracle; this opt-in does not replace the packager or establish
+runtime parity. Importing this module and selecting the opt-in path does not
+load the Python scanner module; the legacy import remains lazy for the default
+oracle path and compatibility re-exports.
 """
 
 
@@ -19,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -33,10 +42,10 @@ from typing import Any
 # not the repository root, so the sibling modules have to be reachable by name explicitly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.wasm_export_scan import (
-    WasmBuildError,
-    parse_exports,
-    read_flat_source,
+from scripts.wasm_export_scan_client import (
+    WasmExportScanClientError,
+    run_export_scan,
+    run_flatten_source,
 )
 from scripts.wasm_facade import js_bindings, type_declaration
 
@@ -44,6 +53,38 @@ from scripts.wasm_facade import js_bindings, type_declaration
 # for anything else that grew up importing the whole surface from this one module.
 __all__ = ["WasmBuildError", "parse_exports", "read_flat_source", "js_bindings",
            "type_declaration", "build", "main"]
+
+
+class WasmBuildError(RuntimeError):
+    """A package build or scanner integration failed."""
+
+
+def _python_export_scanner() -> Any:
+    """Load the legacy scanner only for its explicit oracle/fallback path."""
+    try:
+        return importlib.import_module("scripts.wasm_export_scan")
+    except ImportError as error:
+        raise WasmBuildError("Python WASM export scanner is unavailable") from error
+
+
+def parse_exports(source: str) -> list[dict[str, Any]]:
+    scanner = _python_export_scanner()
+    try:
+        return scanner.parse_exports(source)
+    except scanner.WasmBuildError as error:
+        raise WasmBuildError(str(error)) from error
+
+
+def read_flat_source(
+    path: Path,
+    seen: set[Path] | None = None,
+    stack: list[Path] | None = None,
+) -> str:
+    scanner = _python_export_scanner()
+    try:
+        return scanner.read_flat_source(path, seen, stack)
+    except scanner.WasmBuildError as error:
+        raise WasmBuildError(str(error)) from error
 
 
 def memory_pages_from_env(name: str, default: int) -> int:
@@ -142,10 +183,38 @@ def run(command: list[str], label: str, env: dict[str, str]) -> None:
         raise WasmBuildError(f"{label} failed with exit status {completed.returncode}: {rendered}")
 
 
-def runtime_cache_path(root: Path, compiler: Path, target: str, runtime_source: Path) -> Path:
+def runtime_cache_path(
+    root: Path,
+    compiler: Path,
+    target: str,
+    runtime_source: Path,
+    *,
+    export_scan_launcher: str | None = None,
+    export_scan_script: str | None = None,
+) -> Path:
+    if (export_scan_launcher is None) != (export_scan_script is None):
+        raise WasmBuildError(
+            "--export-scan-launcher and --export-scan-script must be supplied together"
+        )
+    if export_scan_launcher is None and export_scan_script is None:
+        flattened_runtime_source = read_flat_source(runtime_source)
+    elif export_scan_launcher is not None and export_scan_script is not None:
+        try:
+            flattened_runtime_source = run_flatten_source(
+                export_scan_launcher,
+                export_scan_script,
+                runtime_source,
+            )
+        except WasmExportScanClientError as error:
+            raise WasmBuildError(str(error)) from error
+    else:
+        raise WasmBuildError(
+            "--export-scan-launcher and --export-scan-script must be supplied together"
+        )
+
     digest = hashlib.sha256()
     digest.update(target.encode("utf-8"))
-    digest.update(read_flat_source(runtime_source).encode("utf-8"))
+    digest.update(flattened_runtime_source.encode("utf-8"))
     for candidate in (compiler, root / "bin" / "elisac-stage1"):
         try:
             stat = candidate.resolve().stat()
@@ -156,6 +225,26 @@ def runtime_cache_path(root: Path, compiler: Path, target: str, runtime_source: 
     return root / "build" / "wasm-cache" / f"runtime-{digest.hexdigest()[:20]}.o"
 
 
+def load_export_scan(source: Path, args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
+    launcher = getattr(args, "export_scan_launcher", None)
+    scanner_script = getattr(args, "export_scan_script", None)
+    if (launcher is None) != (scanner_script is None):
+        raise WasmBuildError(
+            "--export-scan-launcher and --export-scan-script must be supplied together"
+        )
+    if launcher is None and scanner_script is None:
+        flat_source = read_flat_source(source)
+        return flat_source, parse_exports(flat_source)
+    if launcher is None or scanner_script is None:
+        raise WasmBuildError(
+            "--export-scan-launcher and --export-scan-script must be supplied together"
+        )
+    try:
+        return run_export_scan(launcher, scanner_script, source)
+    except WasmExportScanClientError as error:
+        raise WasmBuildError(str(error)) from error
+
+
 
 def build(args: argparse.Namespace) -> None:
     source = Path(args.source).resolve()
@@ -164,8 +253,7 @@ def build(args: argparse.Namespace) -> None:
     target = args.target or "wasm32-unknown-unknown"
     if not target.startswith("wasm32"):
         raise WasmBuildError(f"-emit wasm currently targets wasm32 (got {target!r})")
-    flat_source = read_flat_source(source)
-    exports = parse_exports(flat_source)
+    flat_source, exports = load_export_scan(source, args)
     wasm_only = args.wasm_only or bool(args.component_types)
     module_name = output.name[:-5] if output.name.endswith(".wasm") else output.name
     manifest: dict[str, Any] = {
@@ -206,7 +294,14 @@ def build(args: argparse.Namespace) -> None:
             # it imports libc-shaped `env` functions and would make the component
             # depend on a host ABI that WIT does not describe.
             runtime_source = root / "elisacore_std" / "wasm_component_runtime.elisa"
-            cached_runtime = runtime_cache_path(root, Path(args.compiler), target, runtime_source)
+            cached_runtime = runtime_cache_path(
+                root,
+                Path(args.compiler),
+                target,
+                runtime_source,
+                export_scan_launcher=getattr(args, "export_scan_launcher", None),
+                export_scan_script=getattr(args, "export_scan_script", None),
+            )
             if os.environ.get("ELISA_WASM_NO_CACHE"):
                 runtime_object = directory / "component-runtime.o"
                 runtime_command = [args.compiler, "-emit", "obj", "-target-triple", target, "-O0", "-o", str(runtime_object), str(runtime_source)]
@@ -221,7 +316,14 @@ def build(args: argparse.Namespace) -> None:
                 runtime_object = cached_runtime
         elif not re.search(r"^\s*def\s+arena_alloc\s*\(", flat_source, re.MULTILINE):
             runtime_source = root / "elisacore_std" / "native_runtime_support.elisa"
-            cached_runtime = runtime_cache_path(root, Path(args.compiler), target, runtime_source)
+            cached_runtime = runtime_cache_path(
+                root,
+                Path(args.compiler),
+                target,
+                runtime_source,
+                export_scan_launcher=getattr(args, "export_scan_launcher", None),
+                export_scan_script=getattr(args, "export_scan_script", None),
+            )
             if os.environ.get("ELISA_WASM_NO_CACHE"):
                 runtime_object = directory / "runtime.o"
                 runtime_command = [args.compiler, "-emit", "obj", "-target-triple", target, "-O0", "-o", str(runtime_object), str(runtime_source)]
@@ -297,6 +399,14 @@ def main() -> int:
     parser.add_argument("--target")
     parser.add_argument("--wasm-ld")
     parser.add_argument("--wasm-component-ld")
+    parser.add_argument(
+        "--export-scan-launcher",
+        help="absolute Elisascript launcher path for the opt-in WASM export scan",
+    )
+    parser.add_argument(
+        "--export-scan-script",
+        help="absolute path to scripts/wasm_export_scan.elisascript",
+    )
     parser.add_argument("--component-type", dest="component_types", action="append", default=[])
     parser.add_argument("--wasm-only", action="store_true")
     parser.add_argument("--compiler-flag", dest="compiler_flags", action="append", default=[])
