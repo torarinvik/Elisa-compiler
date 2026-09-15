@@ -3,6 +3,14 @@
 # annotation stating why the unverified native body is trusted. An extern with neither is
 # flagged. Decidable syntactically: signature contracts are line-keyed in file.signature_
 # contract_lines; the annotation is a decorator named "trusted".
+#
+# Plus the extern POINTER discipline (docs/127 §3.7), also only under the flag:
+#   D1  a `void&` / `void&?` parameter or return (any mutability) is an UNTYPED pointer —
+#       any handle passes for any other and no contract can name what it points at;
+#   D12 a contract must name EVERY pointer parameter (refs other than opaque handles, and
+#       unbounded `cstr`); one it never mentions has nothing documented about that memory.
+#       Reported once per uncovered parameter, at the parameter.
+# `@trusted("reason")` bypasses both, exactly as it bypasses the contract requirement.
 extend Semantic:
     private:
         # An extern's boundary contract is recorded by the parser as an `__extern_contract`
@@ -17,17 +25,77 @@ extend Semantic:
             can Abort.Panic:
                 return any decorator in decorators where decorator.name == "trusted"
 
-        def check_extern_contract(declarations: darray[Ast::Decl], signature_contract_lines: darray[u32], annotations: darray[Ast::EnumAnnotation], table: lmut SymbolTable) -> void:
+        # Every non-callable `extern Name` in the file: the opaque handle types. A ref to one
+        # is typed on its own and needs no contract coverage.
+        def collect_extern_opaque_names(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |out|:
+                    match declaration:
+                        Decl.Extern(name, param_start, arity, variadic, callable, return_type_name, decorators, line):
+                            out.push(name) if not callable
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_extern_opaque_names(module_body, out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            collect_extern_opaque_names(scoped_body, out)
+                        _:
+                            pass
+
+        def extern_return_flag(annotations: darray[Ast::EnumAnnotation]&, owner: sview, name: sview, line: u32) -> bool:
+            can Abort.Panic:
+                return any annotation in annotations where annotation.owner == owner and annotation.name == name and annotation.line == line
+
+        # bit 1 = mutable, bit 2 = optional — the renderer spells `mutable void&?` from it.
+        def extern_pointer_bits(mutable_ref: bool, optional: bool) -> u32:
+            mutable_bit: u32 = 1 if mutable_ref else 0
+            optional_bit: u32 = 2 if optional else 0
+            return mutable_bit + optional_bit
+
+        # A parameter that hands native code an address whose extent its type does not bound.
+        def extern_param_is_pointer(param: Ast::ExternParam&, opaque_names: darray[sview]&) -> bool:
+            can Abort.Panic:
+                true return if param.type_name == "cstr"
+                false return if not param.is_ref
+                return not (any opaque in opaque_names where opaque == param.type_name)
+
+        # Whether any signature contract clause on the extern's line names the parameter.
+        def extern_contract_names_param(line: u32, signature_contract_lines: darray[u32]&, signature_contract_exprs: darray[Ast::Expr]&, param_name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                covered: mutable bool = false
+                for sig_index in 0..<signature_contract_exprs.count |covered|:
+                    if sig_index < signature_contract_lines.count and signature_contract_lines[sig_index] == line:
+                        covered <- true if predicate_mentions(signature_contract_exprs[sig_index], param_name)
+                return covered
+
+        def check_extern_contract(declarations: darray[Ast::Decl], signature_contract_lines: darray[u32], signature_contract_exprs: darray[Ast::Expr]&, extern_params: darray[Ast::ExternParam]&, annotations: darray[Ast::EnumAnnotation], opaque_names: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Extern(name, param_start, arity, variadic, callable, return_type_name, decorators, line):
-                            has_contract: bool = extern_has_signature_contract(line.line, signature_contract_lines, annotations)
-                            has_trusted: bool = extern_has_trusted(decorators)
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ExternNoContract, name: name, line: line.line, expected: "", actual: ""}) if not has_contract and not has_trusted
+                            if callable:
+                                has_contract: bool = extern_has_signature_contract(line.line, signature_contract_lines, annotations)
+                                has_trusted: bool = extern_has_trusted(decorators)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ExternNoContract, name: name, line: line.line, expected: "", actual: ""}) if not has_contract and not has_trusted
+                                if not has_trusted:
+                                    for position in 0..<arity |table| -> table:
+                                        index: usize = (param_start + position).usize()
+                                        if index < extern_params.count:
+                                            param: Ast::ExternParam = extern_params[index]
+                                            if param.type_name == "void" and param.is_ref:
+                                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ExternUntypedPointerParam, name: name, line: param.pos.line, pos: param.pos, expected: param.name, actual: "", expected_count: extern_pointer_bits(param.mutable_ref, param.optional)})
+                                    if return_type_name == "void" and extern_return_flag(annotations, "__extern_return_ptr", name, line.line):
+                                        return_mutable: bool = extern_return_flag(annotations, "__extern_return_mutable", name, line.line)
+                                        return_optional: bool = extern_return_flag(annotations, "__extern_return_optional", name, line.line)
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ExternUntypedPointerReturn, name: name, line: line.line, pos: line, expected: "", actual: "", expected_count: extern_pointer_bits(return_mutable, return_optional)})
+                                    if has_contract:
+                                        for position in 0..<arity |table| -> table:
+                                            index: usize = (param_start + position).usize()
+                                            if index < extern_params.count:
+                                                param: Ast::ExternParam = extern_params[index]
+                                                if extern_param_is_pointer(param, opaque_names) and not extern_contract_names_param(line.line, signature_contract_lines, signature_contract_exprs, param.name):
+                                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ExternPointerParamUncovered, name: name, line: param.pos.line, pos: param.pos, expected: param.name, actual: ""})
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_extern_contract(module_body, signature_contract_lines, annotations, table)
+                            table <- check_extern_contract(module_body, signature_contract_lines, signature_contract_exprs, extern_params, annotations, opaque_names, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_extern_contract(scoped_body, signature_contract_lines, annotations, table)
+                            table <- check_extern_contract(scoped_body, signature_contract_lines, signature_contract_exprs, extern_params, annotations, opaque_names, table)
                         _:
                             pass
