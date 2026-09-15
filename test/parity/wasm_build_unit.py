@@ -21,7 +21,11 @@ from scripts.wasm_build import (
     parse_exports,
     type_declaration,
 )
-from scripts.wasm_export_scan_client import WasmExportScanClientError, _decode_build_payload
+from scripts.wasm_export_scan_client import (
+    WasmExportScanClientError,
+    _decode_build_payload,
+    _validate_exports,
+)
 
 
 class WasmBindingsTests(unittest.TestCase):
@@ -116,6 +120,33 @@ class WasmExportScanClientTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(WasmExportScanClientError, "field order"):
             _decode_build_payload(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
+
+    def test_rejects_aggregate_parameter_count_over_limit(self) -> None:
+        def make_export(index: int, parameter_count: int) -> dict[str, object]:
+            parameters = [
+                {
+                    "name": f"p{parameter_index}",
+                    "type": "u8",
+                    "default": None,
+                    "binding": "scalar",
+                    "wasm_type": "i32",
+                }
+                for parameter_index in range(parameter_count)
+            ]
+            return {
+                "name": f"export_{index}",
+                "target": f"target_{index}",
+                "parameters": parameters,
+                "return": "void",
+                "binding": "scalar",
+                "wasm_type": "void",
+                "line": index + 1,
+            }
+
+        exports = [make_export(index, 4096) for index in range(4)]
+        exports.append(make_export(4, 1))
+        with self.assertRaisesRegex(WasmExportScanClientError, "total parameters"):
+            _validate_exports(exports)
 
     def test_rejects_export_names_that_are_not_identifiers(self) -> None:
         self.row["name"] = "answer);globalThis.pwned=("

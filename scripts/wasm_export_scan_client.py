@@ -22,6 +22,7 @@ MAX_PROCESS_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_FLATTENED_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_EXPORTS = 65536
 MAX_PARAMETERS_PER_EXPORT = 4096
+MAX_TOTAL_PARAMETERS = 16384
 PROCESS_TIMEOUT_SECONDS = 120
 PROCESS_KILL_WAIT_SECONDS = 5
 OUTPUT_DRAIN_GRACE_SECONDS = 1
@@ -109,6 +110,7 @@ def _validate_exports(value: Any) -> list[dict[str, Any]]:
 
     exports: list[dict[str, Any]] = []
     seen_names: set[str] = set()
+    total_parameters = 0
     for index, row in enumerate(value):
         label = f"exports[{index}]"
         if not isinstance(row, dict):
@@ -151,6 +153,9 @@ def _validate_exports(value: Any) -> list[dict[str, Any]]:
         parameters = row["parameters"]
         if not isinstance(parameters, list) or len(parameters) > MAX_PARAMETERS_PER_EXPORT:
             raise WasmExportScanClientError(f"invalid scanner payload field: {label}.parameters")
+        if len(parameters) > MAX_TOTAL_PARAMETERS - total_parameters:
+            raise WasmExportScanClientError("invalid scanner payload field: total parameters")
+        total_parameters += len(parameters)
         seen_parameter_names: set[str] = set()
         for parameter_index, parameter in enumerate(parameters):
             parameter_label = f"{label}.parameters[{parameter_index}]"
