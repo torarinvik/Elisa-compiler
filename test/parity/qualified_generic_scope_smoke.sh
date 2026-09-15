@@ -53,3 +53,21 @@ if [[ "$stage0_rc" -ne 168 || "$stage1_rc" -ne "$stage0_rc" ]]; then
 fi
 
 echo "qualified generic scope smoke OK: inferred/explicit module generics and shadowed direct call return 168"
+
+# Selecting Target::identity must not change the lexical scope of pick(10).
+ARGUMENT_FIXTURE="$ROOT/test/repro/qualified_generic_argument_scope.elisa"
+"$STAGE0" -emit obj -O0 -o "$TMP_DIR/argument-stage0.o" "$ARGUMENT_FIXTURE"
+clang -o "$TMP_DIR/argument-stage0" "$TMP_DIR/argument-stage0.o"
+ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" \
+    "$STAGE1_ROOT/scripts/elisac_stage1.sh" -emit exe -O0 -o "$TMP_DIR/argument-stage1" "$ARGUMENT_FIXTURE"
+set +e
+"$TMP_DIR/argument-stage0"
+stage0_rc=$?
+"$TMP_DIR/argument-stage1"
+stage1_rc=$?
+set -e
+if [[ "$stage0_rc" -ne 1 || "$stage1_rc" -ne 1 ]]; then
+    echo "qualified argument scope FAILED: stage0=$stage0_rc stage1=$stage1_rc expected=1" >&2
+    exit 1
+fi
+echo "qualified generic argument scope OK: both stages resolve the caller's pick"
