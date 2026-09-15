@@ -11,6 +11,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
 ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+PROFILE_HOOKS="$ELISA_CORE/compiler/runtime/profile_hooks.c"
 EMIT_NATIVE="${ELISA_EMIT_NATIVE:-$REPO_ROOT/build/emit_native}"
 mkdir -p "$(dirname -- "$EMIT_NATIVE")"
 

@@ -13,6 +13,48 @@ extend Backend:
 
 
 
+        # A large LLVM aggregate constant such as `[16384 x i8] zeroinitializer` can be
+        # scalarized by SROA into one store per element before EarlyCSE. On a realistic module
+        # that turns a small source initializer into millions of optimizer work items. Stage0
+        # uses memset for these objects. Restrict that lowering to recursively pointer-free
+        # values whose scalar zero representation is all-zero bits; in particular, never use
+        # it for references, optionals, strings, or runtime headers whose null representation
+        # is defined by LLVM rather than by the host's byte layout.
+        def value_type_zero_is_bytewise(value_type: ValueType, structs: StructTable&) -> bool can[Abort.Panic]:
+            true return if value_type.kind == TypeKind.Signed or value_type.kind == TypeKind.Unsigned or value_type.kind == TypeKind.Bool or value_type.kind == TypeKind.Float
+            if value_type.kind == TypeKind.Array:
+                array_slot: usize = value_type.bits.usize()
+                return false if array_slot >= structs.array_elements.count
+                return value_type_zero_is_bytewise(structs.array_elements[array_slot], structs)
+            if value_type.kind == TypeKind.Struct:
+                struct_slot: usize = value_type.bits.usize()
+                return false if struct_slot >= structs.field_count.count
+                for field_offset in 0..<structs.field_count[struct_slot] |field_offset, struct_slot, structs|:
+                    field_type: ValueType = structs.field_types[structs.field_start[struct_slot] + field_offset]
+                    return false if not value_type_zero_is_bytewise(field_type, structs)
+                return true
+            return false
+
+
+
+
+        # Initialize one aggregate slot. LLVM's target-sized memset intrinsic stays compact
+        # through SROA for large scalar-only arrays/structs; other values retain LLVM's exact
+        # null constant so pointer and tagged representations are never guessed.
+        def emit_zero_value_to_slot(slot: LLVMValueRef, value_type: ValueType, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            value_llvm_type: LLVMTypeRef = llvm_type_of(value_type, structs, ctx)
+            value_size: u64 = LLVMABISizeOfType(structs.target_data, value_llvm_type)
+            if value_size >= 256 and value_type_zero_is_bytewise(value_type, structs):
+                byte_type: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+                byte_zero: LLVMValueRef = LLVMConstInt(byte_type, 0, 0)
+                target_size: LLVMValueRef = LLVMConstInt(runtime_size_llvm_type(ctx), value_size, 0)
+                _ = LLVMBuildMemSet(builder, slot, byte_zero, target_size, 1)
+            else:
+                _ = LLVMBuildStore(builder, LLVMConstNull(value_llvm_type), slot)
+
+
+
+
         # `__fstr(chunk_or_value, …)` — the compiler-emitted f-string builder the parser
         # desugars `f"…{x}…"` into. Each argument is a STRING-LIKE piece (a literal chunk or an
         # interpolated dstr/sview — the checker rejects a non-string interpolant), so lowering
@@ -20,6 +62,7 @@ extend Backend:
         # `ctx_fstr_append(slot, data, len)` each piece in order and load the result dstr.
         def emit_fstr_builtin(arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             int64_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+            size_type: LLVMTypeRef = runtime_size_llvm_type(ctx)
             pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
             dstr_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
             datas: mutable darray[LLVMValueRef] = []
@@ -42,32 +85,32 @@ extend Backend:
                         if not is_dstr and not is_sview:
                             declined <- true
                         elif emit_expression(argument, argument_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is piece_value:
-                            # dstr `{ptr items, i64 count, i64 cap}` and sview `{ptr, i64 len}` both
-                            # carry the data pointer at field 0 and the byte length at field 1.
+                            # dstr and sview both carry the data pointer at field 0 and byte length
+                            # at field 1; normalize the extracted length for internal i64 arithmetic.
                             datas.push(LLVMBuildExtractValue(builder, piece_value, 0, "fstr.data"))
-                            lengths.push(LLVMBuildExtractValue(builder, piece_value, 1, "fstr.len"))
+                            lengths.push(darray_size_value_i64(LLVMBuildExtractValue(builder, piece_value, 1, "fstr.len.raw"), ctx, builder, "fstr.len"))
                         else:
                             declined <- true
             null return if declined
             total: mutable LLVMValueRef = LLVMConstInt(int64_type, 0, 0)
             for piece_length in lengths |total, builder|:
                 total <- LLVMBuildAdd(builder, total, piece_length, "fstr.total")
-            alloc_params: mutable darray[LLVMTypeRef] = [int64_type]
+            alloc_params: mutable darray[LLVMTypeRef] = [size_type]
             alloc_params_pointer: void& = (&alloc_params[0]).cast[void&] can Unsafe.PointerCast
             alloc_type: LLVMTypeRef = LLVMFunctionType(dstr_header, alloc_params_pointer, 1, 0)
             alloc_fn: LLVMValueRef = declare_or_get_named(m, "ctx_fstr_alloc", alloc_type)
-            alloc_args: mutable darray[LLVMValueRef] = [total]
+            alloc_args: mutable darray[LLVMValueRef] = [runtime_size_argument(total, ctx, builder)]
             alloc_args_pointer: void& = (&alloc_args[0]).cast[void&] can Unsafe.PointerCast
             dstr_value: LLVMValueRef = LLVMBuildCall2(builder, alloc_type, alloc_fn, alloc_args_pointer, 1, "fstr.alloc")
             fstr_slot: LLVMValueRef = build_entry_alloca(builder, dstr_header, "fstr.slot")
             _ = LLVMBuildStore(builder, dstr_value, fstr_slot)
-            append_params: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, int64_type]
+            append_params: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, size_type]
             append_params_pointer: void& = (&append_params[0]).cast[void&] can Unsafe.PointerCast
             append_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), append_params_pointer, 3, 0)
             append_fn: LLVMValueRef = declare_or_get_named(m, "ctx_fstr_append", append_type)
             piece_index: mutable usize = 0
             while piece_index < datas.count |piece_index, datas, lengths, fstr_slot, append_type, append_fn, builder|:
-                append_args: mutable darray[LLVMValueRef] = [fstr_slot, datas[piece_index], lengths[piece_index]]
+                append_args: mutable darray[LLVMValueRef] = [fstr_slot, datas[piece_index], runtime_size_argument(lengths[piece_index], ctx, builder)]
                 append_args_pointer: void& = (&append_args[0]).cast[void&] can Unsafe.PointerCast
                 _ = LLVMBuildCall2(builder, append_type, append_fn, append_args_pointer, 3, "")
                 piece_index <- piece_index + 1
