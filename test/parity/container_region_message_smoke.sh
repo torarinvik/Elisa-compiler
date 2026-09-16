@@ -17,6 +17,7 @@ set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
+source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "container-region-message smoke FAIL: $1" >&2; exit 1; }
 
 work="$(mktemp -d)"
@@ -36,6 +37,42 @@ for kind in darray dict set; do
   # 2. WORDED with the fix, and free of the deprecated construct.
   grep -Fq "it takes one from its destination" <<< "$out" || fail "$kind literal message lost its guidance: $out"
   grep -Fq "in <arena>" <<< "$out" && fail "$kind literal message still names the deprecated in <arena>: scope: $out"
+done
+
+# 2b. The same obligation must survive value-expression nesting. A checker that only visits
+# statement-level calls silently misses both branches of this conditional.
+printf 'def take(xs: darray[i64]) -> void:\n    pass\n\ndef main() -> i64:\n    value: i64 = (take([1]) if true else take([2]))\n    return value\n' > "$work/lit_nested.elisa"
+nested_out=$(cat "$work/lit_nested.elisa" | "$RPT")
+nested_count=$(grep -c "darray literal has no region to allocate in" <<< "$nested_out" || true)
+[ "$nested_count" -eq 2 ] || fail "nested conditional calls lost container-region diagnostics: $nested_out"
+
+# 2c. INFERENCE-BY-DEFAULT is an INVISIBLE suppressor of this entire family, and it is the
+# reason a rule here cannot be measured on one-line probe bodies. stage0's parser wraps a
+# function body in one synthesized lazy `region __auto_N:` when a region-less container local
+# is initialized by an ALLOCATING LITERAL (maybeWrapFunctionBodyInAutoRegion ->
+# isRegionlessContainerType && isAllocatingLiteral), and inside that wrap `currentAllocExpr`
+# is non-nil for the body's WHOLE extent -- so nothing in this family fires anywhere in the
+# function. An explicit `region NAME(...):` block does the same for its body.
+#
+# Both compilers are asserted on each shape, so neither can drift alone. Getting this wrong in
+# either direction is expensive: too narrow and the rule flags ordinary allocating functions
+# (it once flagged three sites in this compiler's own backend that stage0 accepts, and
+# self-hosting stopped building); too broad and the family goes silent everywhere.
+printf 'def p_alone(c: bool) -> i64 can[Memory.Allocate, Abort.Panic]:\n    xs: darray[i64] = [1, 2] if c else [3, 4]\n    return xs.count.i64()\n' > "$work/wrap_none.elisa"
+printf 'def p_wrapped(c: bool) -> i64 can[Memory.Allocate, Abort.Panic]:\n    acc: mutable darray[i64] = []\n    xs: darray[i64] = [1, 2] if c else [3, 4]\n    return xs.count.i64() + acc.count.i64()\n' > "$work/wrap_literal_local.elisa"
+printf 'def p_scalar_call(v: i64) -> i64:\n    return v + 1\n\ndef p_still_flagged(c: bool) -> i64 can[Memory.Allocate, Abort.Panic]:\n    n: i64 = p_scalar_call(1)\n    xs: darray[i64] = [1, 2] if c else [3, 4]\n    return xs.count.i64() + n\n' > "$work/wrap_scalar_call.elisa"
+printf 'def p_region_block(c: bool) -> i64 can[Memory.Allocate, Abort.Panic]:\n    region scratch(4096):\n        xs: darray[i64] = [1, 2] if c else [3, 4]\n        return xs.count.i64()\n    return 0\n' > "$work/wrap_region_block.elisa"
+
+# file                  expected "darray literal has no region" count
+for row in "wrap_none 2" "wrap_literal_local 0" "wrap_scalar_call 2" "wrap_region_block 0"; do
+  set -- $row
+  wrap_name="$1"; wrap_want="$2"
+  s0_out=$( cd "$work" && "$ELISACORE_BIN" -emit llvm -o /dev/null "$wrap_name.elisa" 2>&1 )
+  s0_got=$(grep -c "darray literal has no region to allocate in" <<< "$s0_out" || true)
+  s1_out=$(cat "$work/$wrap_name.elisa" | "$RPT")
+  s1_got=$(grep -c "darray literal has no region to allocate in" <<< "$s1_out" || true)
+  [ "$s0_got" -eq "$wrap_want" ] || fail "$wrap_name: stage0 reported $s0_got container-region diagnostics, expected $wrap_want (the ORACLE moved -- re-measure before touching stage1): $s0_out"
+  [ "$s1_got" -eq "$wrap_want" ] || fail "$wrap_name: stage1 reported $s1_got container-region diagnostics, stage0 reports $wrap_want: $s1_out"
 done
 
 # 3. Every destination that DOES supply a region must still compile.

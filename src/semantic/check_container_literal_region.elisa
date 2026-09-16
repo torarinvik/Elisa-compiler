@@ -76,6 +76,85 @@ extend Semantic:
 
         # Parameter table: one row per (function name, parameter index) whose annotation is a
         # region-bearing container.
+        # The ELEMENT type written inside a container annotation: `darray[T]` -> T, `set[T]` -> T,
+        # `dict[K, V]` -> V. Absent for anything else.
+        def clr_element_type(type_expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        return clr_element_type(operand)
+                    Expr.Paren(inner, paren_line):
+                        return clr_element_type(inner)
+                    Expr.Index(object, index, index_line):
+                        return index
+                    Expr.IndexN(object_n, arguments_n, indexn_line):
+                        return arguments_n[arguments_n.count - 1] if arguments_n.count > 0
+                        return Ast::Expr.Absent
+                    _:
+                        return Ast::Expr.Absent
+
+
+
+        # Flag a container literal against the destination type it would have to take a region
+        # from, then walk its elements against the ELEMENT type. The element step is what keeps
+        # this honest: `darray[array[i64, 2]]` flags only the OUTER literal, because the inner one
+        # fills stack storage and needs no region.
+        def clr_literal_needs_region(literal: Ast::Expr, declared_type: Ast::Expr, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match literal:
+                    Expr.Paren(inner, paren_line):
+                        table <- clr_literal_needs_region(inner, declared_type, table)
+                        return
+                    _:
+                        pass
+                literal_kind: sview = clr_literal_kind(literal)
+                return if literal_kind == "" or clr_container_head(declared_type) != literal_kind
+                literal_pos: Ast::Pos = clr_literal_pos(literal)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ContainerLiteralNoRegion, name: literal_kind, line: literal_pos.line, pos: literal_pos, expected: "", actual: ""})
+                element_type: Ast::Expr = clr_element_type(declared_type)
+                match literal:
+                    Expr.Array(elements, array_pos):
+                        for element in elements |table| -> table:
+                            table <- clr_literal_needs_region(element, element_type, table)
+                    Expr.SetLit(elements_set, set_pos):
+                        for element_set in elements_set |table| -> table:
+                            table <- clr_literal_needs_region(element_set, element_type, table)
+                    Expr.DictLit(entries, dict_pos):
+                        for entry in entries |table| -> table:
+                            table <- clr_literal_needs_region(entry.value, element_type, table)
+                    _:
+                        pass
+
+
+
+        # A TERNARY's arms do not inherit the binding's destination, so a container literal in one
+        # has no region to allocate in. stage0's rule, measured one feature at a time:
+        #     xs: darray[i64] = [1, 2, 3]                    accepted — the binding IS the destination
+        #     ys: darray[i64] = ([1] if b else [2])          BOTH arms flagged
+        #     zs: darray[darray[i64]] = ([[1]] if b else …)  outer AND inner flagged
+        #     zs: darray[array[i64, 2]] = ([[1, 2]] if b …)  ONLY the outer
+        #     xs: array[i64, 1] = ([1] if b else [2])        accepted — no region-bearing destination
+        #     ys = ([1] if b else [2])                       accepted — no written type
+        #     return ([1] if b else [2])                     accepted — a return type is not one
+        #     es: darray[i64] = ([1] if b else [])           only the non-empty arm
+        # A nested ternary is walked the same way; anything else in an arm is left to the
+        # call-argument path above.
+        def clr_ternary_arms_need_region(value: Ast::Expr, declared_type: Ast::Expr, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if clr_container_head(declared_type) == ""
+                match value:
+                    Expr.Paren(inner, paren_line):
+                        table <- clr_ternary_arms_need_region(inner, declared_type, table)
+                    Expr.If(condition, then_value, else_value, if_line):
+                        table <- clr_literal_needs_region(then_value, declared_type, table)
+                        table <- clr_literal_needs_region(else_value, declared_type, table)
+                        table <- clr_ternary_arms_need_region(then_value, declared_type, table)
+                        table <- clr_ternary_arms_need_region(else_value, declared_type, table)
+                    _:
+                        pass
+
+
+
         def clr_collect_params(declarations: darray[Ast::Decl], names: mutable darray[sview]&, indices: mutable darray[u32]&, heads: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |names, indices, heads|:
@@ -124,13 +203,76 @@ extend Semantic:
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ContainerLiteralNoRegion, name: literal_kind, line: literal_pos.line, pos: literal_pos, expected: "", actual: ""})
                             table <- clr_check_expression(argument, names, indices, heads, table)
                             position <- position + 1
+                        table <- clr_check_expression(callee, names, indices, heads, table)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, effect_call_pos):
+                        table <- clr_check_expression(effect_type, names, indices, heads, table)
+                        for argument in arguments |table|:
+                            table <- clr_check_expression(argument, names, indices, heads, table)
+                    Expr.Field(object, field, field_pos):
+                        table <- clr_check_expression(object, names, indices, heads, table)
+                    Expr.Scope(base, name, scope_pos):
+                        table <- clr_check_expression(base, names, indices, heads, table)
+                    Expr.Index(object, index, index_pos):
+                        table <- clr_check_expression(object, names, indices, heads, table)
+                        table <- clr_check_expression(index, names, indices, heads, table)
+                    Expr.Slice(object, low, high, slice_pos):
+                        table <- clr_check_expression(object, names, indices, heads, table)
+                        table <- clr_check_expression(low, names, indices, heads, table)
+                        table <- clr_check_expression(high, names, indices, heads, table)
+                    Expr.IndexN(object, arguments, indexn_pos):
+                        table <- clr_check_expression(object, names, indices, heads, table)
+                        for argument in arguments |table|:
+                            table <- clr_check_expression(argument, names, indices, heads, table)
                     Expr.Binary(left, binary_operator, right, binary_pos):
                         table <- clr_check_expression(left, names, indices, heads, table)
                         table <- clr_check_expression(right, names, indices, heads, table)
                     Expr.Unary(unary_operator, operand, unary_pos):
                         table <- clr_check_expression(operand, names, indices, heads, table)
+                    Expr.Move(operand, move_pos):
+                        table <- clr_check_expression(operand, names, indices, heads, table)
+                    Expr.RegionNew(operand, region, region_new_pos):
+                        table <- clr_check_expression(operand, names, indices, heads, table)
                     Expr.Paren(inner, paren_pos):
                         table <- clr_check_expression(inner, names, indices, heads, table)
+                    Expr.Array(elements, array_pos) | Expr.Tuple(elements, array_pos) | Expr.SetLit(elements, set_pos):
+                        for element in elements |table|:
+                            table <- clr_check_expression(element, names, indices, heads, table)
+                    Expr.DictLit(entries, dict_pos):
+                        for entry in entries |table|:
+                            table <- clr_check_expression(entry.key, names, indices, heads, table)
+                            table <- clr_check_expression(entry.value, names, indices, heads, table)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        table <- clr_check_expression(type_expression, names, indices, heads, table)
+                        for field in fields |table|:
+                            table <- clr_check_expression(field.value, names, indices, heads, table)
+                    Expr.RecordUpdate(base, fields, update_pos):
+                        table <- clr_check_expression(base, names, indices, heads, table)
+                        for field in fields |table|:
+                            table <- clr_check_expression(field.value, names, indices, heads, table)
+                    Expr.If(condition, then_expr, else_expr, if_pos):
+                        table <- clr_check_expression(condition, names, indices, heads, table)
+                        table <- clr_check_expression(then_expr, names, indices, heads, table)
+                        table <- clr_check_expression(else_expr, names, indices, heads, table)
+                    Expr.Match(scrutinee, arms, match_pos) | Expr.Catch(scrutinee, arms, catch_pos):
+                        table <- clr_check_expression(scrutinee, names, indices, heads, table)
+                        for arm in arms |table|:
+                            table <- clr_check_expression(arm.guard, names, indices, heads, table)
+                            table <- clr_check_statements(arm.body, false, names, indices, heads, table)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos):
+                        table <- clr_check_expression(iterable, names, indices, heads, table)
+                        table <- clr_check_expression(condition, names, indices, heads, table)
+                        table <- clr_check_expression(body, names, indices, heads, table)
+                    Expr.Refinement(base, predicate, refinement_pos):
+                        table <- clr_check_expression(base, names, indices, heads, table)
+                        table <- clr_check_expression(predicate, names, indices, heads, table)
+                    Expr.GetElse(guarded, recovery, get_else_pos):
+                        table <- clr_check_expression(guarded, names, indices, heads, table)
+                        table <- clr_check_statements(recovery, false, names, indices, heads, table)
+                    Expr.Lambda(parameters, body, lambda_pos):
+                        table <- clr_check_statements(body, false, names, indices, heads, table)
+                    Expr.Block(statements, value, captures, block_pos):
+                        table <- clr_check_statements(statements, false, names, indices, heads, table)
+                        table <- clr_check_expression(value, names, indices, heads, table)
                     _:
                         pass
 
@@ -142,6 +284,7 @@ extend Semantic:
                             table <- clr_check_expression(expression, names, indices, heads, table) if not in_region
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- clr_check_expression(value, names, indices, heads, table) if not in_region
+                            table <- clr_ternary_arms_need_region(value, type_expression, table) if not in_region
                         Stmt.Assign(target, assign_operator, value, line):
                             table <- clr_check_expression(value, names, indices, heads, table) if not in_region
                         Stmt.Return(value, line):
@@ -156,24 +299,45 @@ extend Semantic:
                         Stmt.For(bind, variables, iterable, for_body, for_line):
                             table <- clr_check_statements(for_body, in_region, names, indices, heads, table)
                         Stmt.Block(block_kind, clause, binding, body, block_line):
-                            # `in <region>:` supplies an ambient region to everything inside it.
-                            table <- clr_check_statements(body, in_region or block_kind == "in", names, indices, heads, table)
+                            # Both block forms supply an ambient region to everything inside them.
+                            # stage0 gates this whole family on `a.currentAllocExpr == nil`, and
+                            # BOTH `in <owner>:` (analyzeInStoreStmt) and `region NAME(...):`
+                            # (analyzeRegionDecl) set that field for the extent of their body.
+                            # Measured: a darray literal inside `region scratch(4096):` is accepted.
+                            table <- clr_check_statements(body, in_region or block_kind == "in" or block_kind == "region", names, indices, heads, table)
                         Stmt.Match(scrutinee, arms, match_line):
                             for arm in arms |table| -> table:
                                 table <- clr_check_statements(arm.body, in_region, names, indices, heads, table)
                         _:
                             pass
 
-        def clr_check_declarations(declarations: darray[Ast::Decl], names: darray[sview]&, indices: darray[u32]&, heads: darray[sview]&, table: lmut SymbolTable) -> void:
+        # INFERENCE-BY-DEFAULT is the other ambient-region supplier, and it is invisible in the
+        # source. stage0's parser wraps a whole function body in one synthesized lazy
+        # `region __auto_N:` (maybeWrapFunctionBodyInAutoRegion) when the body allocates
+        # region-lessly and the function does NOT thread an `Arena` parameter — so
+        # `currentAllocExpr != nil` for the body's whole extent and NOTHING in this family
+        # fires there. Measured one feature at a time:
+        #     def f(c: bool):                                        FLAGGED (both arms)
+        #         xs: darray[Node] = [Node{x: 1}] if c else [Node{x: 2}]
+        #     def g(c: bool):                                        silent — the body is wrapped
+        #         acc: mutable darray[i64] = []
+        #         xs: darray[Node] = [Node{x: 1}] if c else [Node{x: 2}]
+        #     def h(c: bool, alloc: mutable Arena&):                 FLAGGED — Arena param, no wrap
+        #         acc: mutable darray[i64] = []
+        #         xs: darray[Node] = [Node{x: 1}] if c else [Node{x: 2}]
+        # Without this gate the rule fires on ordinary allocating functions: three sites in
+        # this compiler's own backend, which stage0 accepts, so self-hosting stopped building.
+        def clr_check_declarations(file: Ast::File&, declarations: darray[Ast::Decl], names: darray[sview]&, indices: darray[u32]&, heads: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            table <- clr_check_statements(body, false, names, indices, heads, table)
+                            body_is_auto_wrapped: bool = auto_region_function_body_is_wrapped(file, parameters, body, line.line)
+                            table <- clr_check_statements(body, body_is_auto_wrapped, names, indices, heads, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- clr_check_declarations(module_body, names, indices, heads, table)
+                            table <- clr_check_declarations(file, module_body, names, indices, heads, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- clr_check_declarations(scoped_body, names, indices, heads, table)
+                            table <- clr_check_declarations(file, scoped_body, names, indices, heads, table)
                         _:
                             pass
 
@@ -184,4 +348,4 @@ extend Semantic:
                 indices: mutable darray[u32] = []
                 heads: mutable darray[sview] = []
                 clr_collect_params(file.top_decls, names, indices, heads)
-                table <- clr_check_declarations(file.top_decls, names, indices, heads, table)
+                table <- clr_check_declarations(file, file.top_decls, names, indices, heads, table)

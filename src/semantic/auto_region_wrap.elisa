@@ -125,6 +125,51 @@ def emit_ast_is_container_literal_value(value: Ast::Expr) -> bool:
     return false
 
 
+# stage0's `isInferredDArrayBuilder`: an expression that builds a darray without needing a
+# declared container type as context. Parens ARE stripped here (and only here).
+def emit_ast_is_inferred_darray_builder(value: Ast::Expr) -> bool:
+    if value is Expr.Paren(builder_inner, builder_paren_pos):
+        return emit_ast_is_inferred_darray_builder(builder_inner)
+    if value is Expr.Comprehension(builder_var, builder_iterable, builder_condition, builder_body, builder_pos):
+        return true
+    return false
+
+
+# A CALL initializing a container local also wraps the body: its result is region-polymorphic,
+# so the caller needs an ambient region to thread into it. Parens ARE stripped here -- unlike
+# the literal arm. A call whose result is a SCALAR does not wrap (the container-type test in
+# the caller is what excludes it).
+def emit_ast_value_is_call(value: Ast::Expr) -> bool:
+    if value is Expr.Paren(call_inner, call_paren_pos):
+        return emit_ast_value_is_call(call_inner)
+    if value is Expr.Call(call_callee, call_arguments, call_argument_names, call_pos):
+        return true
+    if value is Expr.StaticEffectCall(call_effect, call_operation, call_candidates, call_effect_arguments, call_effect_names, call_effect_pos):
+        return true
+    return false
+
+
+# Which INITIALIZERS make stage0 wrap the body, for a region-less container local. Measured
+# against stage0 one shape at a time, reading the DIAGNOSTIC (an unwrapped body reports
+# "darray literal has no region to allocate in"), not `-emit ast`'s stmt count -- that count
+# also collapses under the EFFECT wrap and is not a clean probe:
+#
+#     acc: darray[i64] = [9]                 WRAPS    bare list literal
+#     acc: darray[i64] = ([9])               no       parens are NOT stripped for literals
+#     acc: darray[i64] = [v for v in src]    WRAPS    comprehension (parens ARE stripped)
+#     acc: darray[i64] = make_bytes()        WRAPS    call, region-poly result
+#     acc: darray[i64] = (make_bytes())      WRAPS    parens ARE stripped for calls
+#     acc: darray[i64] = src                 no       a view/copy allocates nothing here
+#     acc: darray[i64] = src if c else src   no       a conditional is not an initializer form
+#     acc: darray[i64] = holder.items        no       field access
+#     n:   i64         = scalar_call(1)      no       not a container local
+def emit_ast_initializer_allocates(value: Ast::Expr) -> bool:
+    if value is Expr.Array(alloc_literal_elements, alloc_literal_pos):
+        return true
+    true return if emit_ast_value_is_call(value)
+    return emit_ast_is_inferred_darray_builder(value)
+
+
 def emit_ast_collect_container_literal_names(statements: darray[Ast::Stmt]&, names: mutable darray[sview]&) -> void:
     for statement in statements:
         match statement:
@@ -200,7 +245,19 @@ def emit_ast_body_declares_container(statements: darray[Ast::Stmt]&, annotations
         true return if emit_ast_body_forwards_constructed_local(statements, annotations)
         for wrap_statement in statements |annotations, struct_names, struct_member_rows, struct_member_starts, struct_member_counts|:
             if wrap_statement is Stmt.VarDecl(wrap_name, wrap_type, wrap_value, wrap_line):
-                wrap_is_container: bool = emit_ast_expr_head_is_container(wrap_type) or emit_ast_named_struct_holds_container(wrap_type, struct_names, struct_member_rows, struct_member_starts, struct_member_counts)
+                # stage0 requires the INITIALIZER to allocate, not merely the declared type to be
+                # a container: `isRegionlessContainerType(s.Type) && isAllocatingLiteral(s.Value)`.
+                # A container local assigned from a view, a copy, a call or a conditional does not
+                # allocate HERE and does not wrap the body. Testing only the type wrapped bodies
+                # stage0 leaves alone -- measured against stage0 `-emit ast`, on HEAD, before this:
+                #     xs: darray[i64] = [1, 2] if c else [3, 4]     stage0 2 stmts, stage1 said 1
+                #     n: i64 = scalar_call(1)                       stage0 3 stmts, stage1 said 1
+                #     xs: darray[i64] = [1, 2] if c else [3, 4]
+                # That is a live `-emit ast` divergence on its own. It also silently suppressed a
+                # whole diagnostic family: an auto-wrapped body sets stage0's `currentAllocExpr`
+                # for its ENTIRE extent, so over-wrapping hides every container-region message
+                # stage0 reports inside it (see check_container_literal_region.elisa).
+                wrap_is_container: bool = (emit_ast_expr_head_is_container(wrap_type) and emit_ast_initializer_allocates(wrap_value)) or emit_ast_named_struct_holds_container(wrap_type, struct_names, struct_member_rows, struct_member_starts, struct_member_counts)
                 true return if wrap_is_container and not emit_ast_local_has_region(annotations, wrap_name, wrap_line.line)
             if wrap_statement is Stmt.If(wrap_cond, wrap_then, wrap_else, wrap_if_line):
                 true return if emit_ast_body_declares_container(wrap_then, annotations, function_line, struct_names, struct_member_rows, struct_member_starts, struct_member_counts)
@@ -226,12 +283,38 @@ def emit_ast_body_declares_container(statements: darray[Ast::Stmt]&, annotations
 # brace construction is a constructed local, while a plain identifier/call is not. Keep
 # this scan explicit and data-oriented so the AST report does not need a source-text
 # heuristic (which would mis-handle nested calls and parenthesized arguments).
-def emit_ast_is_constructed_value(value: Ast::Expr) -> bool:
-    if value is Expr.Construct(constructed_type, constructed_fields, constructed_pos):
-        return true
-    if value is Expr.Paren(constructed_inner, constructed_paren_pos):
-        return emit_ast_is_constructed_value(constructed_inner)
-    return false
+def emit_ast_ident_is_capitalized(name: sview) -> bool can[Abort.Panic]:
+    can Abort.Panic:
+        false return if sview_len(name) == 0
+        head: u8 = sview_at(name, 0)
+        return head >= 65 and head <= 90
+
+
+def emit_ast_is_constructed_value(value: Ast::Expr) -> bool can[Abort.Panic]:
+    can Abort.Panic:
+        if value is Expr.Construct(constructed_type, constructed_fields, constructed_pos):
+            return true
+        if value is Expr.Paren(constructed_inner, constructed_paren_pos):
+            return emit_ast_is_constructed_value(constructed_inner)
+        # A call to a CAPITALISED name is a construction to stage0's rule as well: `x: T = T(...)`
+        # and `x = Builder()` both parse as *ast.StructLitExpr with Brace==false, so
+        # bodyForwardsConstructedStructLocal collects them. MEASURED 2026-09-08 (see
+        # src/driver/emit_fmt_auto_region.elisa, which already had this): every capitalised
+        # callee wraps once the local is forwarded, no lower-case one does.
+        #
+        # The fmt emitter and this predicate are the same stage0 rule written twice, and this
+        # copy had drifted -- `ctx: LLVMContextRef = LLVMContextCreate()` later forwarded to
+        # `validate(null, ctx)` wraps in stage0 and did not here, so `-emit ast` printed the
+        # body's 11 statements where stage0 prints 1 (test/repro/guarded_optional_match_value).
+        if value is Expr.Call(constructed_callee, constructed_arguments, constructed_names, constructed_call_pos):
+            if constructed_callee is Expr.Ident(constructed_callee_name, constructed_callee_pos):
+                return emit_ast_ident_is_capitalized(constructed_callee_name)
+            # A module-qualified constructor (`w: M::W = M::W(4)`) is the same rule on the LAST
+            # segment. NOT a dotted `Button.Push(...)` -- that is an enum VARIANT constructor,
+            # which stage0 does not wrap for.
+            if constructed_callee is Expr.Scope(constructed_scope_base, constructed_scope_name, constructed_scope_pos):
+                return emit_ast_ident_is_capitalized(constructed_scope_name)
+        return false
 
 
 def emit_ast_name_is_constructed(names: darray[sview]&, name: sview) -> bool:
