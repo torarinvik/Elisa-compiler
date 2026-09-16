@@ -67,20 +67,83 @@ extend Semantic:
 
 
 
+        # The container FAMILY named by a receiver's declared type ("darray"/"dict"/"set"), or ""
+        # when the declaration is not visible here. stage0 prefixes the nested-growth diagnostic
+        # with the family its own builtin dispatcher matched on, so the prefix has to come from
+        # the receiver's TYPE. It is read straight out of the type expression, which keeps it a
+        # SOURCE sview -- a Diagnostic may not carry a view into a per-frame text buffer.
+        def region_growth_container_family(annotations: darray[Ast::LocalRegionAnnotation]&, receiver: sview, line: u32, local_names: darray[sview]&, local_types: darray[Ast::Expr]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                annotation_lookup: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, receiver, line)
+                if annotation_lookup is annotation:
+                    annotated_family: sview = container_family_of_type(annotation.type_expression)
+                    return annotated_family if annotated_family != ""
+                local_type: (found: bool, type_expression: Ast::Expr) = region_escape_local_type_find(receiver, local_names, local_types)
+                return container_family_of_type(local_type.type_expression) if local_type.found
+                return ""
+
+
+
+
+        def container_family_of_type(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, line):
+                        return container_family_of_type(operand)
+                    Expr.Paren(inner, paren_line):
+                        return container_family_of_type(inner)
+                    Expr.Index(object, element, index_line):
+                        head: sview = ident_name_of(object)
+                        return head if head == "darray" or head == "dict" or head == "set"
+                        return ""
+                    Expr.IndexN(object_n, arguments_n, line_n):
+                        head_n: sview = ident_name_of(object_n)
+                        return head_n if head_n == "darray" or head_n == "dict" or head_n == "set"
+                        return ""
+                    _:
+                        return ""
+
+
+
+
         # A mutating container operation inside a nested region uses that region's allocator
         # unless the receiver carries a more specific owner. Growing a binding from an enclosing
         # scope in the short-lived arena is unsafe even when the inserted element is a scalar: the
         # container header itself will point at backing freed when the nested region exits.
-        def region_escape_outer_growth(callee: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, outer_locals: darray[sview]&, region_locals: darray[sview]&, region_local_regions: darray[sview]&) -> (found: bool, operation: sview, region: sview):
+        #
+        # An owner region used to END the check -- an annotated `values: ... @outer` was taken as
+        # proof the growth was fine. It proves the opposite half: it says where the container's
+        # storage LIVES, and says nothing about which arena this growth ALLOCATES FROM, which is
+        # always the innermost active region. So `region outer:` holding `values @outer`, growing
+        # it inside a nested `region scratch:`, put the new backing in `scratch` and left `values`
+        # pointing at it after `scratch` was freed -- a use-after-free stage1 accepted in all three
+        # spellings (annotated, unannotated, and pushing a plain literal) that stage0 rejects.
+        # The owner is the CONTAINER region; compare it with the active one instead of trusting it.
+        def region_escape_outer_growth(callee: Ast::Expr, line: u32, nesting: darray[sview]&, annotations: darray[Ast::LocalRegionAnnotation]&, mutable_globals: darray[sview]&, outer_locals: darray[sview]&, region_locals: darray[sview]&, region_local_regions: darray[sview]&) -> (found: bool, operation: sview, store_region: sview, container_region: sview):
             can Memory.Allocate, Abort.Panic:
                 growth: (found: bool, receiver: sview, operation: sview) = region_escape_growth_call_info(callee)
-                return (false, sview("", 0, 0), sview("", 0, 0)) if not growth.found or growth.receiver == "" or nesting.count == 0
-                receiver_has_owner: bool = local_region_name(annotations, growth.receiver, line) != "" or region_escape_local_owner_region(region_locals, region_local_regions, growth.receiver) != ""
-                return (false, sview("", 0, 0), sview("", 0, 0)) if receiver_has_owner
+                return (false, sview("", 0, 0), sview("", 0, 0), sview("", 0, 0)) if not growth.found or growth.receiver == "" or nesting.count == 0
+                store_region: sview = nesting[nesting.count - 1]
+                owner_region: mutable sview = local_region_name(annotations, growth.receiver, line)
+                owner_region <- region_escape_local_owner_region(region_locals, region_local_regions, growth.receiver) if owner_region == ""
+                if owner_region != "":
+                    # Growing a container in its OWN region takes backing from the arena that
+                    # owns it: exactly right, and the overwhelmingly common case.
+                    return (false, sview("", 0, 0), sview("", 0, 0), sview("", 0, 0)) if owner_region == store_region
+                    # Only a region that LEXICALLY ENCLOSES the active one outlives it. `nesting`
+                    # is a true ancestor stack (each region block walks a copy with its own name
+                    # pushed), so a hit here IS an ancestor -- which is stage0's `regionIsAncestor`
+                    # rule. Two sibling regions are incomparable and neither frees first from the
+                    # other's point of view, so an owner that is not on the stack stays silent.
+                    owner_position: (found: bool, position: usize) = region_stack_position(nesting, owner_region)
+                    return (growth.found, growth.operation, store_region, owner_region) if owner_position.found
+                    return (false, sview("", 0, 0), sview("", 0, 0), sview("", 0, 0))
                 receiver_is_outer: bool = any name in outer_locals where name == growth.receiver
                 receiver_is_global: bool = any name in mutable_globals where name == growth.receiver
-                return (growth.found, growth.operation, nesting[nesting.count - 1]) if receiver_is_outer or receiver_is_global
-                return (false, sview("", 0, 0), sview("", 0, 0))
+                # No owner region: the container belongs to the region inferred for the function
+                # body. An empty container_region is how the message renderer is told to say so.
+                return (growth.found, growth.operation, store_region, sview("", 0, 0)) if receiver_is_outer or receiver_is_global
+                return (false, sview("", 0, 0), sview("", 0, 0), sview("", 0, 0))
 
 
 
@@ -88,10 +151,18 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
-                        outer_growth: (found: bool, operation: sview, region: sview) = region_escape_outer_growth(callee, line, nesting, annotations, mutable_globals, outer_locals, region_locals, region_local_regions)
+                        outer_growth: (found: bool, operation: sview, store_region: sview, container_region: sview) = region_escape_outer_growth(callee, line, nesting, annotations, mutable_globals, outer_locals, region_locals, region_local_regions)
                         if outer_growth.found:
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArenaGrowEscape, name: outer_growth.operation, line: line, expected: outer_growth.region, actual: ""})
-                            return
+                            growth_receiver: (found: bool, receiver: sview, operation: sview) = region_escape_growth_call_info(callee)
+                            growth_family: sview = region_growth_container_family(annotations, growth_receiver.receiver, line, local_names, local_types)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionNestedGrowthEscape, name: outer_growth.operation, line: line, expected: outer_growth.store_region, actual: outer_growth.container_region, detail: growth_family})
+                            # NO `return` here. stage0 reports the growth and the STORE separately
+                            # -- `rows.push(row)` out of an inner region both grows `rows` from the
+                            # wrong arena AND puts a value that dies first inside it, and its
+                            # message pair names each. Stopping at the first finding hid the second
+                            # and left the pair unmatchable. The store check below is independently
+                            # guarded (it needs a value with a region and a handle to carry), so a
+                            # growth whose argument is a plain literal still reports only once.
                         grow: (found: bool, receiver: sview, value_index: usize) = grow_call_info(callee)
                         return if not grow.found or grow.receiver == "" or grow.value_index >= arguments.count
                         # `extend` COPIES elements: safe for a SCALAR-element receiver, but a

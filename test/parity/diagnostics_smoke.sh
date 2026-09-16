@@ -343,7 +343,7 @@ EXPECTS=(
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
-    "darray push grows a non-local darray from local arena"
+    "darray push allocates into function-scoped region"
     "variable \"x\" expects i64, got darray[i64]"
     "comparison requires numeric operands"
     "variable \"y\" expects i64, got i64"
