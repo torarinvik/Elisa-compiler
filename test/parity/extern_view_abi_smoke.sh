@@ -2,13 +2,13 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-/tmp/elisac-stage0-local}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 FIXTURE="$ROOT/test/fixtures/backend/extern_view_param.elisa"
 
 if [ ! -x "$STAGE0" ] || [ ! -x "$STAGE1" ]; then
-    echo "extern_view_abi_smoke SKIP: local stage0/stage1 compiler is unavailable"
-    exit 0
+    echo "extern_view_abi_smoke FAIL: stage0 ($STAGE0) or stage1 ($STAGE1) is unavailable" >&2
+    exit 1
 fi
 
 WORK="$(mktemp -d)"
