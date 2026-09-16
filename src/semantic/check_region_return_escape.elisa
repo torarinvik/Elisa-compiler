@@ -33,6 +33,27 @@ extend Semantic:
                         return (found, true, ident_pos)
                     Expr.Paren(inner, paren_pos):
                         return rre_value_region(inner, names, regions)
+                    Expr.Field(object, field_name, field_pos):
+                        # `return box.values` lives in whatever region its OBJECT does. NOT
+                        # `is_bare`: stage0 emits only the dependency-facts finding for a
+                        # projection and reserves the value-escape finding for a return of the
+                        # NAME itself. Reaching through one field is exactly where stage0's own
+                        # region-polymorphic suppression used to lose the escape entirely.
+                        field_object: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(object, names, regions)
+                        return (field_object.region, false, field_pos)
+                    Expr.Index(object, index, index_pos):
+                        # `return rows[0]` — an element of a region-local container is backed by
+                        # the same region, so returning it dangles the same way.
+                        index_object: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(object, names, regions)
+                        return (index_object.region, false, index_pos)
+                    Expr.Construct(construct_type, construct_fields, construct_pos):
+                        # `return Box{values: values}` — an aggregate built from a region-local
+                        # field carries that region out inside itself.
+                        built_region: mutable sview = ""
+                        for field_init in construct_fields |built_region, names, regions|:
+                            field_value: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(field_init.value, names, regions)
+                            built_region <- field_value.region if built_region == "" and field_value.region != ""
+                        return (built_region, false, construct_pos)
                     Expr.If(condition, then_value, else_value, if_pos):
                         then_arm: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(then_value, names, regions)
                         else_arm: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(else_value, names, regions)
@@ -43,6 +64,27 @@ extend Semantic:
         # The declared type behind a `mutable` prefix: `xs: mutable darray[i64]` parses as
         # `Unary(Mutable, darray[i64])`, and the helper matches the bare container node only —
         # left unpeeled, the check was silent on every fixture (measured: fires without `mutable`).
+        # A struct that holds an owned container carries a region exactly like the container
+        # does — `box: Box = Box{values: values}` puts `values`' region inside `box`. The set of
+        # such structs is collect_container_structs', so this only has to name-match.
+        def rre_type_is_container_struct(type_expression: Ast::Expr, container_structs: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_pos):
+                        return rre_type_is_container_struct(operand, container_structs)
+                    Expr.Paren(inner, paren_pos):
+                        return rre_type_is_container_struct(inner, container_structs)
+                    Expr.Ident(name, ident_pos):
+                        return any container_struct in container_structs where container_struct == name
+                    _:
+                        return false
+
+
+        def rre_carries_region(type_expression: Ast::Expr, container_structs: darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return return_type_is_owned_container(type_expression) or rre_type_is_container_struct(type_expression, container_structs)
+
+
         def rre_declared_type(type_expression: Ast::Expr) -> Ast::Expr:
             can Memory.Allocate, Abort.Panic:
                 match type_expression:
@@ -51,7 +93,7 @@ extend Semantic:
                     _:
                         return type_expression
 
-        def rre_statements(statements: darray[Ast::Stmt], nesting: darray[sview]&, names: darray[sview]&, regions: darray[sview]&, table: lmut SymbolTable) -> void:
+        def rre_statements(statements: darray[Ast::Stmt], nesting: darray[sview]&, names: darray[sview]&, regions: darray[sview]&, container_structs: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 # Lexical scoping for free: this list's declarations live in a copy that dies with it.
                 scope_names: mutable darray[sview] = [entry for entry in names]
@@ -59,7 +101,10 @@ extend Semantic:
                 for statement in statements |table, scope_names, scope_regions| -> table:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            if nesting.count > 0 and return_type_is_owned_container(rre_declared_type(type_expression)):
+                            declared_type: Ast::Expr = rre_declared_type(type_expression)
+                            initializer_dependency: (region: sview, is_bare: bool, pos: Ast::Pos) = rre_value_region(value, scope_names, scope_regions)
+                            tracks_region: bool = return_type_is_owned_container(declared_type) or (rre_type_is_container_struct(declared_type, container_structs) and initializer_dependency.region != "")
+                            if nesting.count > 0 and tracks_region:
                                 scope_names.push(name)
                                 scope_regions.push(nesting[nesting.count - 1])
                         Stmt.Return(value, return_pos):
@@ -72,41 +117,43 @@ extend Semantic:
                             if kind == "region" and clause.count > 0:
                                 child_nesting: mutable darray[sview] = [entry for entry in nesting]
                                 child_nesting.push(clause[0])
-                                table <- rre_statements(body, child_nesting, scope_names, scope_regions, table)
+                                table <- rre_statements(body, child_nesting, scope_names, scope_regions, container_structs, table)
                             else:
-                                table <- rre_statements(body, nesting, scope_names, scope_regions, table)
+                                table <- rre_statements(body, nesting, scope_names, scope_regions, container_structs, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- rre_statements(then_body, nesting, scope_names, scope_regions, table)
-                            table <- rre_statements(else_body, nesting, scope_names, scope_regions, table)
+                            table <- rre_statements(then_body, nesting, scope_names, scope_regions, container_structs, table)
+                            table <- rre_statements(else_body, nesting, scope_names, scope_regions, container_structs, table)
                         Stmt.While(condition, while_body, line):
-                            table <- rre_statements(while_body, nesting, scope_names, scope_regions, table)
+                            table <- rre_statements(while_body, nesting, scope_names, scope_regions, container_structs, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- rre_statements(for_body, nesting, scope_names, scope_regions, table)
+                            table <- rre_statements(for_body, nesting, scope_names, scope_regions, container_structs, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table, scope_names, scope_regions| -> table:
-                                table <- rre_statements(arm.body, nesting, scope_names, scope_regions, table)
+                                table <- rre_statements(arm.body, nesting, scope_names, scope_regions, container_structs, table)
                         _:
                             pass
 
-        def rre_walk(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def rre_walk(declarations: darray[Ast::Decl], container_structs: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             if return_type is declared_return:
-                                if return_type_is_owned_container(declared_return):
+                                if rre_carries_region(declared_return, container_structs):
                                     no_nesting: darray[sview] = []
                                     no_names: darray[sview] = []
                                     no_regions: darray[sview] = []
-                                    table <- rre_statements(body, no_nesting, no_names, no_regions, table)
+                                    table <- rre_statements(body, no_nesting, no_names, no_regions, container_structs, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- rre_walk(module_body, table)
+                            table <- rre_walk(module_body, container_structs, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- rre_walk(scoped_body, table)
+                            table <- rre_walk(scoped_body, container_structs, table)
                         _:
                             pass
 
     public:
         def check_region_return_escape(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                table <- rre_walk(file.top_decls, table)
+                rre_container_structs: mutable darray[sview] = []
+                collect_container_structs(file.top_decls, rre_container_structs)
+                table <- rre_walk(file.top_decls, rre_container_structs, table)
