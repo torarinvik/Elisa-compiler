@@ -199,6 +199,7 @@ NAMES=(
     array_literal_element_return
     array_literal_element_void_return
     try_propagation_module_scope
+    region_qualifier_out_of_scope
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -364,6 +365,7 @@ EXPECTS=(
     "array literal element expects i64, got static u8"
     "array literal element expects void, got int"
     "cannot propagate AErr from a function returning BErr"
+    "unknown region qualifier \"a\""
 )
 
 total=0
