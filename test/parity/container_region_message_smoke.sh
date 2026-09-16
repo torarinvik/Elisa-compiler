@@ -17,6 +17,7 @@ set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
+source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "container-region-message smoke FAIL: $1" >&2; exit 1; }
 
 work="$(mktemp -d)"
@@ -37,6 +38,13 @@ for kind in darray dict set; do
   grep -Fq "it takes one from its destination" <<< "$out" || fail "$kind literal message lost its guidance: $out"
   grep -Fq "in <arena>" <<< "$out" && fail "$kind literal message still names the deprecated in <arena>: scope: $out"
 done
+
+# 2b. The same obligation must survive value-expression nesting. A checker that only visits
+# statement-level calls silently misses both branches of this conditional.
+printf 'def take(xs: darray[i64]) -> void:\n    pass\n\ndef main() -> i64:\n    value: i64 = (take([1]) if true else take([2]))\n    return value\n' > "$work/lit_nested.elisa"
+nested_out=$(cat "$work/lit_nested.elisa" | "$RPT")
+nested_count=$(grep -c "darray literal has no region to allocate in" <<< "$nested_out" || true)
+[ "$nested_count" -eq 2 ] || fail "nested conditional calls lost container-region diagnostics: $nested_out"
 
 # 3. Every destination that DOES supply a region must still compile.
 printf 'def main() -> i64 can[Memory.Allocate, Abort.Panic]:\n    xs: darray[i64] = [1, 2, 3]\n    return xs.count.i64()\n' > "$work/ok_local.elisa"
