@@ -27,10 +27,10 @@ accepted = {
     'opaque_handle': 'extern Adsr\nextern adsr_process(envelope: mutable Adsr&, level: f64) -> f64 requires level >= 0.0\n',
     'contract_names_pointer': 'extern strnlen(text: cstr, cap: usize) -> usize requires text != null ensure result <= cap\n',
     'trusted': '@trusted("SDL user-data slot: opaque by design")\nextern set_user(handle: mutable void&?) -> void\n',
-    'view_param': 'extern take(xs: view[u8]) -> usize ensure result <= xs.count\n',
+    'view_param': 'extern take(xs: view[u8]) -> usize ensure result <= xs.len\n',
     'struct_ref_with_int': 'struct Rect layout(c):\n    w: i32\n\nextern area(r: Rect&, scale: i32) -> i32 requires r != null\n',
     'out_param_alone': 'extern get_len(out: mutable i64&) -> void requires out != null\n',
-    'bounds_pair': '@callconv(c)\n@bounds(buf, count)\nextern read(fd: i32, buf: mutable u8&, count: usize) -> isize requires buf.count > 0\n',
+    'bounds_pair': '@callconv(c)\n@bounds(buf, count)\nextern read(fd: i32, buf: mutable u8&, count: usize) -> isize requires buf.len > 0\n',
 }
 def compile(compiler, source, strict):
     flags = ['-strict-externs'] if strict else []
