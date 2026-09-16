@@ -201,6 +201,7 @@ NAMES=(
     try_propagation_module_scope
     region_qualifier_out_of_scope
     optional_result_payload_compare
+    arena_grow_escape
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -368,6 +369,7 @@ EXPECTS=(
     "cannot propagate AErr from a function returning BErr"
     "unknown region qualifier \"a\""
     "cannot compare i64? and i64: unwrap the optional first"
+    "grows a non-local darray from local arena \"arena\""
 )
 
 total=0
