@@ -200,6 +200,7 @@ NAMES=(
     array_literal_element_void_return
     try_propagation_module_scope
     region_qualifier_out_of_scope
+    optional_result_payload_compare
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -344,7 +345,7 @@ EXPECTS=(
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
     "escapes via return; the region is freed at scope exit"
-    "escapes via return; the region is freed at scope exit"
+    "value backed by scope-owned region \"scratch\" escapes via return; the region is freed at block exit"
     "darray push allocates into function-scoped region"
     "darray push allocates into function-scoped region"
     "variable \"x\" expects i64, got darray[i64]"
@@ -366,6 +367,7 @@ EXPECTS=(
     "array literal element expects void, got int"
     "cannot propagate AErr from a function returning BErr"
     "unknown region qualifier \"a\""
+    "cannot compare i64? and i64: unwrap the optional first"
 )
 
 total=0
