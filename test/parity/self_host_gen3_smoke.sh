@@ -35,6 +35,7 @@ if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
 set +m   # a crashing gen2 is an EXPECTED outcome here; don't let job control narrate it
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN" || exit $?
 GEN2_DIR="${SELF_HOST_GEN2_DIR:-$ROOT/build/self_host_gen2}"
 GEN2="$GEN2_DIR/elisac-stage1-gen2"
 WORK="$ROOT/build/gen3_check"

@@ -35,6 +35,7 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 SEED="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$SEED" || exit $?
 GEN2="$ROOT/build/self_host_gen2/elisac-stage1-gen2"
 
 [ -x "$SEED" ] || { echo "semantic_gate_selfhost SKIP: no seed at $SEED"; exit 0; }

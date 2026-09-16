@@ -7,6 +7,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 SOURCE="$ROOT/test/repro/const_enum_extern_param.elisa"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -15,7 +16,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 [[ -x "$STAGE1" ]] || { echo "ir writer FAIL: stage1 unavailable" >&2; exit 1; }
 
 "$STAGE0" -emit ir -o "$WORK/stage0.elisair" "$SOURCE" >/dev/null
-ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
+ELISA_STAGE1_BIN="$STAGE1" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit ir -o "$WORK/stage1.elisair" "$SOURCE" >/dev/null
 
 # The stage0 lowered printer is the semantic oracle for the serialized AST. It compares
@@ -31,7 +32,7 @@ cmp -s "$WORK/source.lowered" "$WORK/stage1.lowered"
 DECORATED="$WORK/decorated.elisa"
 printf '%s\n' '@link_name(probe_write)' 'extern probe_write(fd: i32) -> i32' >"$DECORATED"
 "$STAGE0" -emit ir -o "$WORK/decorated.stage0.elisair" "$DECORATED" >/dev/null
-ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
+ELISA_STAGE1_BIN="$STAGE1" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit ir -o "$WORK/decorated.stage1.elisair" "$DECORATED" >/dev/null
 "$STAGE0" -emit lowered "$DECORATED" >"$WORK/decorated.source.lowered"
 "$STAGE0" -emit lowered "$WORK/decorated.stage0.elisair" >"$WORK/decorated.stage0.lowered"
@@ -44,7 +45,7 @@ cmp -s "$WORK/decorated.source.lowered" "$WORK/decorated.stage1.lowered"
 # a weaker extern signature. Decorators themselves are encoded losslessly in the bundle.
 NEGATIVE="$WORK/optional.elisa"
 printf '%s\n' '@link_name(probe_write)' 'extern probe_write(fd: i32) -> i32?' >"$NEGATIVE"
-if ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
+if ELISA_STAGE1_BIN="$STAGE1" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit ir -o "$WORK/negative.elisair" "$NEGATIVE" >/dev/null 2>"$WORK/negative.err"; then
     echo "ir writer FAILED: optional extern shape was emitted without its type information" >&2
     exit 1

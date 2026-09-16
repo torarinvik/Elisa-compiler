@@ -9,6 +9,7 @@ PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3.14}"
 PYTHON_CONFIG="${PYTHON_CONFIG:-/opt/homebrew/bin/python3.14-config}"
 CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 
 if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -x "$STAGE1" ]]; then
     echo "pymodule-so smoke FAIL (Python 3.14/Homebrew clang/stage1 unavailable)" >&2

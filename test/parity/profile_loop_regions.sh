@@ -8,6 +8,8 @@ OUT="${3:?output directory required}"
 PROFILER="${ELISA_PROFILER:-$ROOT/../elisa-profiler/bin/elisa-profiler}"
 mkdir -p "$OUT"
 export ELISA_COMPILER_ROOT="$ROOT" ELISA_COMPILER_SCRIPT="$ROOT/scripts/elisac_stage1.sh"
+# ELISA_ALLOW_STALE_STAGE1: this check compares a BEFORE and an AFTER binary, so one of
+# them is older than the sources by construction. Not the blanket opt-out.
 export ELISA_ALLOW_STALE_STAGE1=1
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 for fixture in explicit inferred helpers reduction output module; do

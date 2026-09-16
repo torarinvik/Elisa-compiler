@@ -8,7 +8,9 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 SOURCE="$ROOT/test/repro/nested_try_direct_argument.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-nested-try-argument.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

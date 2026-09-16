@@ -11,6 +11,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 
 [[ -x "$STAGE0" ]] || { echo "linear typestate smoke FAIL: no stage0 at $STAGE0" >&2; exit 1; }
 [[ -x "$STAGE1" ]] || { echo "linear typestate smoke FAIL: no stage1 at $STAGE1" >&2; exit 1; }

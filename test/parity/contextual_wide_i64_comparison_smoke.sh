@@ -7,6 +7,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 NW_CORE="${NW_CORE:-$ROOT/../../nw-core}"
 STAGE0="${ELISACORE_BIN:-$NW_CORE/toolchain/elisac-stage0}"
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1_BIN" || exit $?
 STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$ROOT}"
 FIXTURE="$ROOT/test/repro/contextual_wide_i64_comparison.elisa"
 TMP_DIR="$(mktemp -d)"

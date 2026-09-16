@@ -3,6 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ELISACORE_BIN=${ELISACORE_BIN:-"$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac"}
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
 LLVM_CONFIG=${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}
 LLVM_MC=${LLVM_MC:-/opt/homebrew/opt/llvm/bin/llvm-mc}
 CXX=${CXX:-/opt/homebrew/opt/llvm/bin/clang++}

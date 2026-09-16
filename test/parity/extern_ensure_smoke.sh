@@ -7,7 +7,9 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 if [ ! -x "$STAGE0" ] || [ ! -x "$STAGE1" ]; then
     echo "extern_ensure_smoke FAIL: stage0 ($STAGE0) or stage1 ($STAGE1) is unavailable" >&2
     exit 1

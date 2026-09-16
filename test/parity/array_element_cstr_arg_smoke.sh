@@ -5,6 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="$ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$ROOT/test/repro/array_element_cstr_arg.elisa"
 TMP_DIR="$(mktemp -d)"

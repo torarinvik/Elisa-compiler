@@ -5,6 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1_BIN" || exit $?
 BUILD="${ELISA_PROFILE_USE_BUILD:-$ROOT/build/profile-use-smoke}"
 mkdir -p "$BUILD"
 

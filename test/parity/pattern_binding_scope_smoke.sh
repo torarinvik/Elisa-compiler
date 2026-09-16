@@ -10,6 +10,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 PROFILE="$ROOT/test/parity/profile_hooks.c"
 FIXTURE="$ROOT/test/repro/pattern_binding_scope.elisa"

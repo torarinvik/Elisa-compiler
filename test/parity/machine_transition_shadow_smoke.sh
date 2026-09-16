@@ -9,7 +9,9 @@ SOURCE="$ROOT/test/fixtures/machine_transition/shadow.elisa"
 INPUT_BIND_SOURCE="$ROOT/test/fixtures/machine_transition/input_bind.elisa"
 INPUT_BIND_FAST_SOURCE="$ROOT/test/fixtures/machine_transition/input_bind_fast.elisa"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
 [[ -x "$STAGE0" ]] || { echo "machine transition shadow smoke FAIL: no stage0" >&2; exit 1; }
@@ -29,7 +31,7 @@ run_case() {
     clang -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \
       -o "$WORK/stage0-$label-$optimization" "$WORK/stage0-$label-$optimization.o" "$RUNTIME"
 
-    ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
+    ELISA_STAGE1_BIN="$STAGE1" \
       bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" \
       -o "$WORK/stage1-$label-$optimization.o" "$source" >/dev/null
     clang -Wl,-undefined,dynamic_lookup -Wl,-dead_strip \

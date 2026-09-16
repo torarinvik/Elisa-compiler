@@ -7,6 +7,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
 STAGE0="${ELISA_STAGE0_BIN:-$HOME/.elisac/elisac-stage0}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
 if [[ ! -x "$STAGE0" || ! -x "$STAGE1" || ! -x "$CLANG" || ! -f "$RUNTIME_OBJ" ]]; then

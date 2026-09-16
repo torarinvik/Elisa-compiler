@@ -17,9 +17,10 @@ install -m 755 "$ROOT/bin/elisac-stage1" "$WORK/elisac-stage1"
 touch -t 202001010000 "$WORK/elisac-stage1"
 
 # This check EXISTS to prove the guard refuses. An environment that has already opted out
-# (`ELISA_ALLOW_STALE_STAGE1=1` — the verification env exports it so the other 345 checks may
-# use a hand-seeded product) would turn the refusal into a success and the check would pass
-# vacuously, which is how it read as a FAIL on both hosts. Clear it for this invocation.
+# (`ELISA_ALLOW_STALE_STAGE1=1`) would turn the refusal into a success and the check would
+# pass vacuously, which is how it once read as a FAIL on both hosts. The verification env no
+# longer exports it — every check runs against the NEWEST product — but an interactive shell
+# may still carry it, so clear it for this invocation.
 unset ELISA_ALLOW_STALE_STAGE1
 set +e
 ELISA_STAGE1_BIN="$WORK/elisac-stage1" ELISA_ALLOW_STALE_STAGE1=0 \

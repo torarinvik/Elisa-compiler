@@ -9,7 +9,9 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 SOURCE="$ROOT/test/repro/try_void_else_void.elisa"
 PATHS_SOURCE="$ROOT/test/repro/try_void_recovery_paths.elisa"
 CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"

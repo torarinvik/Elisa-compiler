@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN" || exit $?
 WRAPPER="$ROOT/scripts/elisac_stage1.sh"
 RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-catch-result.XXXXXX")"

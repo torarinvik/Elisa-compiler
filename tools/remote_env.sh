@@ -10,7 +10,7 @@ RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/r
 cd "$RDIR"
 export REPO_ROOT="$RDIR" ELISA_CORE="$RCORE" ELISACORE_BIN="$RCORE/compiler/bin/elisac"
 export ELISA_STAGE1_BIN="$RDIR/bin/elisac-stage1" ELISA_RUNTIME_OBJ="$RDIR/build/runtime/elisacore_runtime.o"
-export LLVM_CONFIG="$(readlink -f "$(command -v llvm-config)")" ELISA_CLANG="$ELISA_TOOL_SHIM_DIR/clang" ELISA_ALLOW_STALE_STAGE1=1
+export LLVM_CONFIG="$(readlink -f "$(command -v llvm-config)")" ELISA_CLANG="$ELISA_TOOL_SHIM_DIR/clang"
 export ELISA_LLVM_BIN_DIR="$(llvm-config --bindir)" LLC="$(llvm-config --bindir)/llc" LLVM_MC="$(llvm-config --bindir)/llvm-mc"
 # stage0 must be the HOST's build: an rsync that carried the Mac binary once left an arm64
 # Mach-O here (Exec format error). Rebuild when the file is not a native ELF.

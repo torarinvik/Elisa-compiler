@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-component-runtime.XXXXXX")"
 
 [[ -x "$STAGE1" ]] || { echo "wasm_component_runtime_smoke FAIL: no stage1 seed at $STAGE1" >&2; exit 1; }

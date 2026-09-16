@@ -49,6 +49,7 @@ for policy in helper reserve stack; do
     done
 done
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 for policy in helper reserve stack; do
     "$STAGE0" -emit obj -O2 -o "$OUT/$policy-oracle.o" "$OUT/$policy.elisa"
     clang -Wl,-dead_strip -o "$OUT/$policy-oracle" "$OUT/$policy-oracle.o" "$OUT/hooks.o" "$OUT/benchmark-hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"

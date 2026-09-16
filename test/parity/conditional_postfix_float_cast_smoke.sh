@@ -3,6 +3,7 @@
 set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$REPO_ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$REPO_ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="$REPO_ROOT/scripts/elisac_stage1.sh"
 FIXTURE="$REPO_ROOT/test/repro/conditional_postfix_float_cast.elisa"
 TMP_DIR="$(mktemp -d)"

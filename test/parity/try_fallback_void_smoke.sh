@@ -42,6 +42,7 @@ grep -q "try fallback expects void" <<< "$out" && fail "false positive on value 
 #    (rc=133 is 128+SIGTRAP, the original crash. Checking the rc, not the wording, is the
 #    point here: a crash produced no wording at all.)
 S1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
+bash "$REPO_ROOT/scripts/assert_stage1_fresh.sh" "$S1" || exit $?
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 printf "${VOID_FN}def f(x: i64) -> i64:\n    try may(x) else 0\n    return 0\n\ndef main() -> i64:\n    return 0\n" > "$work/void_else.elisa"

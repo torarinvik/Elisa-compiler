@@ -6,6 +6,7 @@
 command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; return 2 2>/dev/null || exit 2; }
 
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
+bash "$REPO_ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1_BIN" || exit $?
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$REPO_ROOT/build/runtime/elisacore_runtime.o}"
 [[ -x "$STAGE1_BIN" ]] || {
   echo "error: missing stage1 product at $STAGE1_BIN (run scripts/elisac_stage1.sh --seed)" >&2

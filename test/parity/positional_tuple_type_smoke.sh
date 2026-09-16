@@ -9,6 +9,7 @@ source "$ROOT/test/parity/resolve_elisac.sh"
 fail() { echo "positional tuple type smoke FAIL: $1" >&2; exit 1; }
 SOURCE="$ROOT/test/repro/positional_tuple_type.elisa"
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1_BIN" || exit $?
 [ -x "$STAGE1_BIN" ] || fail "missing stage1 product at $STAGE1_BIN"
 
 check_rejected() {

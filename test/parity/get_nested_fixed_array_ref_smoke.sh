@@ -5,6 +5,7 @@ set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 FIX="$ROOT/test/repro/get_nested_array_ref.elisa"
 
 fail() { echo "nested-fixed-array-ref smoke FAIL: $1" >&2; exit 1; }

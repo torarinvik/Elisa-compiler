@@ -11,6 +11,9 @@ OUT="$(cd -- "$OUT" && pwd)"
 PROFILER="${ELISA_PROFILER:-$ROOT/../elisa-profiler/bin/elisa-profiler}"
 printf 'using Ast\ninclude "%s"\n' "$ROOT/test/breadth/parse_probe.elisa" > "$OUT/parser_workload.elisa"
 export ELISA_COMPILER_ROOT="$ROOT" ELISA_COMPILER_SCRIPT="$ROOT/scripts/elisac_stage1.sh"
+# ELISA_ALLOW_STALE_STAGE1: this check PROFILES a binary named on the command line, which
+# is often deliberately an older build. It is not the blanket opt-out the env files used to
+# carry -- every other check runs against the newest product.
 export ELISA_STAGE1_BIN="$COMPILER" ELISA_ALLOW_STALE_STAGE1=1
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 "$PROFILER" profile "$OUT/parser_workload.elisa" -O2 --stdin "$INPUT" --mode "$MODE" --max-capture-bytes 268435456 \

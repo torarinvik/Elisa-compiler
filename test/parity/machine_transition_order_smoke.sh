@@ -7,7 +7,9 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 SOURCE="$ROOT/test/fixtures/machine_transition/swap.elisa"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
 [[ -x "$STAGE0" ]] || { echo "machine transition order smoke FAIL: no stage0" >&2; exit 1; }
@@ -21,7 +23,7 @@ for optimization in O0 O2; do
     "$STAGE0" -emit obj "-$optimization" -o "$WORK/stage0-$optimization.o" "$SOURCE" >/dev/null
     clang -Wl,-dead_strip -o "$WORK/stage0-$optimization" "$WORK/stage0-$optimization.o" "$RUNTIME"
 
-    ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \
+    ELISA_STAGE1_BIN="$STAGE1" \
       bash "$ROOT/scripts/elisac_stage1.sh" "-$optimization" -o "$WORK/stage1-$optimization.o" "$SOURCE" >/dev/null
     clang -Wl,-dead_strip -o "$WORK/stage1-$optimization" "$WORK/stage1-$optimization.o" "$RUNTIME"
 

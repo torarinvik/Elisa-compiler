@@ -9,6 +9,9 @@ mkdir -p "$OUT"
 OUT="$(cd -- "$OUT" && pwd)"
 PROFILER="${ELISA_PROFILER:-$ROOT/../elisa-profiler/bin/elisa-profiler}"
 export ELISA_COMPILER_ROOT="$ROOT" ELISA_COMPILER_SCRIPT="$ROOT/scripts/elisac_stage1.sh"
+# ELISA_ALLOW_STALE_STAGE1: this check PROFILES a binary named on the command line, which
+# is often deliberately an older build. It is not the blanket opt-out the env files used to
+# carry -- every other check runs against the newest product.
 export ELISA_STAGE1_BIN="$COMPILER" ELISA_ALLOW_STALE_STAGE1=1
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 for entry in lifecycle:repro/arena_lifetime_evidence; do

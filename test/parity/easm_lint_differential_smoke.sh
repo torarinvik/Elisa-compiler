@@ -84,7 +84,9 @@ RUN() { elisa_run_timeout 20 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN" || exit $?
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
 
 [ -x "$BIN" ] || { echo "easm_lint_differential FAIL: no stage1 binary at $BIN" >&2; exit 1; }
 [ -x "$ELISACORE_BIN" ] || { echo "easm_lint_differential FAIL: no elisac at $ELISACORE_BIN" >&2; exit 1; }

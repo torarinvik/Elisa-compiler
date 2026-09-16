@@ -7,6 +7,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 STAGE1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
+bash "$REPO_ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 [[ -x "$STAGE1" ]] || { echo "with nominal target smoke FAIL: no stage1 product" >&2; exit 1; }
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/elisa-with-nominal.XXXXXX")"

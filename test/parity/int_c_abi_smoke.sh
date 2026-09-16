@@ -3,6 +3,7 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 FIXTURE="$ROOT/test/repro/int_width_abi.elisa"

@@ -5,6 +5,7 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN" || exit $?
 [[ -x "$BIN" ]] || { echo "include-read-failure FAIL: no stage1 binary" >&2; exit 1; }
 
 WORK="$(mktemp -d)"

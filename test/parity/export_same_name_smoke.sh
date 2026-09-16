@@ -7,6 +7,7 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
 RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
 [ -x "$ELISACORE_BIN" ] || { echo "export_same_name_smoke FAIL: no stage0 at $ELISACORE_BIN" >&2; exit 1; }
 [ -f "$RUNTIME" ] || { echo "export_same_name_smoke FAIL: no runtime object" >&2; exit 1; }
