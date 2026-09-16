@@ -1,0 +1,124 @@
+# Stage1 backend — docs/127 D8: a native extern's `ensure` is CHECKED at every call site, not
+# assumed. Part of `module Backend` (see codegen.elisa).
+#
+# The analyzer lets a caller assume an extern's `ensure` downstream once its `requires` is
+# discharged. For a scalar fact that is the right default; for a fact a MEMORY obligation
+# rides on (`ensure result <= buf.count` on a read) a lying library turns safe code into
+# undefined behaviour with nothing to stop it. So in checked builds every native extern call
+# re-evaluates each `ensure` with the parameters bound to the argument values and `result`
+# bound to the returned value, and panics on violation — the same guard shape, label and
+# position rule as an Elisa function's own postcondition. `@trusted("reason")` is what buys
+# the pure assumption, and it is the only thing that does.
+
+extend Backend:
+    private:
+
+        # The `ensure` predicates the parser captured for each NATIVE extern, keyed by the
+        # line of the extern that declares them. `@trusted` externs are filtered out here
+        # rather than at the call site, so a trusted extern costs nothing per call.
+        def collect_extern_ensures(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                checkable_lines: mutable darray[u32] = []
+                collect_checkable_extern_lines(file.top_decls, checkable_lines)
+                return if checkable_lines.count == 0
+                contract_count: usize = file.signature_contract_kinds.count
+                contract_index: mutable usize = 0
+                while contract_index < contract_count |contract_index, contract_count, checkable_lines, file, structs|:
+                    contract_line: u32 = file.signature_contract_lines[contract_index]
+                    is_extern_ensure: mutable bool = file.signature_contract_kinds[contract_index] == "ensure"
+                    declares_extern: mutable bool = false
+                    for checkable_line in checkable_lines |declares_extern, contract_line|:
+                        declares_extern <- true if checkable_line == contract_line
+                    if is_extern_ensure and declares_extern:
+                        structs.extern_ensure_lines <- structs.extern_ensure_lines.push(contract_line)
+                        structs.extern_ensure_exprs <- structs.extern_ensure_exprs.push(file.signature_contract_exprs[contract_index])
+                    contract_index <- contract_index + 1
+
+
+
+        def collect_checkable_extern_lines(top: darray[Decl]&, lines: mutable darray[u32]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                for declaration in top |lines|:
+                    if declaration_is_module(declaration):
+                        for nested_index in 0..<declaration_module_count(declaration) |declaration, lines|:
+                            record_checkable_extern_line(declaration_module_at(declaration, nested_index), lines)
+                    else:
+                        record_checkable_extern_line(declaration, lines)
+
+
+
+        def record_checkable_extern_line(declaration: Decl, lines: mutable darray[u32]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                if declaration is Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
+                    return if not callable
+                    for decorator in decorators:
+                        return if decorator.name == "trusted"
+                    lines.push(extern_line.line)
+
+
+
+        # Whether THIS call needs a boundary check at all: a checked build, a native extern,
+        # and at least one `ensure` recorded against its declaration.
+        def extern_ensure_applies(fn_index: i64, fns: FnTable&, structs: StructTable&) -> bool can[Abort.Panic]:
+            false return if not structs.checked_contracts
+            false return if fn_index < 0
+            false return if not fns.is_extern[fn_index.usize()]
+            extern_line: u32 = fns.lines[fn_index.usize()]
+            for ensure_line in structs.extern_ensure_lines |extern_line|:
+                true return if ensure_line == extern_line
+            return false
+
+
+
+        # Bind the call's ELISA-LEVEL arguments to the extern's parameter names and its result
+        # to `result`, then guard on each recorded predicate. `hidden` is the count of leading
+        # slots that are not source parameters (an error-return slot, an sret pointer).
+        # False = DECLINE (a predicate the expression emitter cannot model). Never silently
+        # skips a check: a contract that is not emitted is a contract that is not enforced,
+        # and for a boundary contract that would mean claiming a guarantee that is not there.
+        def emit_extern_ensure_checks(fn_index: i64, ensure_arguments: darray[LLVMValueRef]&, hidden: usize, ensure_result: LLVMValueRef, call_return_type: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                extern_line: u32 = fns.lines[fn_index.usize()]
+                scope_start: usize = scope_mark(local_scope)
+                param_start: usize = fns.param_start[fn_index.usize()]
+                param_count: usize = fns.param_count[fn_index.usize()]
+                param_index: mutable usize = 0
+                while param_index < param_count |param_index, param_count, param_start, hidden, ensure_arguments, local_scope, fns, structs, ctx, builder|:
+                    argument_position: usize = hidden + param_index
+                    break if argument_position >= ensure_arguments.count
+                    param_name: sview = fns.param_names[param_start + param_index]
+                    if param_name != "":
+                        param_type: ValueType = copied_type(fns.param_types[param_start + param_index])
+                        # The slot carries the PARAMETER'S OWN name, as stage0's does.
+                        name_storage: mutable darray[u8] = []
+                        # Keep the conversion in a typed local.  The stage0 checker is
+                        # deliberately conservative for a borrowed view passed directly
+                        # through a native call; the local also makes the storage lifetime
+                        # explicit to the backend.
+                        param_name_cstr: cstr = sview_to_cstr(param_name, name_storage)
+                        param_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(param_type, structs, ctx), param_name_cstr)
+                        _ = LLVMBuildStore(builder, ensure_arguments[argument_position], param_slot)
+                        declare_local(local_scope, param_name, param_slot, param_type)
+                    param_index <- param_index + 1
+                if call_return_type.kind != TypeKind.Void:
+                    result_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(call_return_type, structs, ctx), "result")
+                    _ = LLVMBuildStore(builder, ensure_result, result_slot)
+                    declare_local(local_scope, "result", result_slot, call_return_type)
+                ensure_bool: ValueType = ValueType{kind: TypeKind.Bool, bits: 1}
+                ensure_count: usize = structs.extern_ensure_lines.count
+                ensure_index: mutable usize = 0
+                all_emitted: mutable bool = true
+                while ensure_index < ensure_count |ensure_index, ensure_count, extern_line, ensure_bool, all_emitted, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
+                    # Copied OUT of the table: emit_expression takes `structs` mutably, so a
+                    # borrow held across the call would conflict.
+                    matches_extern: bool = structs.extern_ensure_lines[ensure_index] == extern_line
+                    if matches_extern:
+                        ensure_pred: Expr = structs.extern_ensure_exprs[ensure_index]
+                        ensure_pos: Ast::Pos = Ast::expr_pos(ensure_pred)
+                        if emit_expression(ensure_pred, ensure_bool, local_scope, fns, structs, generics, runtime, m, ctx, builder) is ensure_value:
+                            emit_contract_guard(ensure_value, "extern postcondition failed", ensure_pos.line, ensure_pos.column, m, ctx, builder)
+                        else:
+                            all_emitted <- false
+                    ensure_index <- ensure_index + 1
+                scope_restore(local_scope, scope_start)
+                return all_emitted
