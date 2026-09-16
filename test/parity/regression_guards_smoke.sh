@@ -15,9 +15,11 @@ neg="$REPO_ROOT/test/fixtures/diagnostics/literal_comparison_impossible.neg.elis
 [ -f "$neg" ] || fail "missing literal-comparison negative fixture"
 
 out=$("$RPT" < "$pos")
-grep -q "comparison is always vacuous" <<< "$out" || fail "literal-comparison positive no longer fires: $out"
+# The wording is stage0's since 9ce2616d: `integer literal 300 does not fit in u8`. The
+# guard's job is unchanged — the positive fires, the negative (200, in range) stays silent.
+grep -q "does not fit in u8" <<< "$out" || fail "literal-comparison positive no longer fires: $out"
 out=$("$RPT" < "$neg")
-grep -q "comparison is always vacuous" <<< "$out" && fail "literal-comparison negative false positive: $out"
+grep -q "does not fit in u8" <<< "$out" && fail "literal-comparison negative false positive: $out"
 
 bash "$REPO_ROOT/test/parity/machine_from_smoke.sh" >/tmp/stage1_machine_from_regression.$$.log 2>&1 || {
     tail -5 /tmp/stage1_machine_from_regression.$$.log >&2

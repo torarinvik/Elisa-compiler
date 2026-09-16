@@ -201,7 +201,7 @@ NAMES=(
     try_propagation_module_scope
 )
 EXPECTS=(
-    "comparison is always vacuous for u8"
+    "integer literal 300 does not fit in u8"
     "variable \"q\" expects P, got int"
     "invalid cast from bool to i64"
     "redundant \`.cast[i32]\`: the operand already has type i32; remove the cast"
@@ -226,7 +226,7 @@ EXPECTS=(
     "storage type must be an explicit integer type, got bool"
     "value 300 does not fit storage type u8"
     "raise requires the current function to return an error union"
-    "region annotation \`@owner\` is only supported on container, generic, and reference types"
+    "region annotation \`@owner\` is only valid on a function return type; named values do not carry an independent region"
     "cannot be returned with a region-less type"
     "return type expects row[0], got shape_out[0]"
     "return type expects pair[0], got pair[0]"
