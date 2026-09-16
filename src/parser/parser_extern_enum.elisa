@@ -1,0 +1,134 @@
+# docs/127 D9 — `extern enum Name of T:` mirrors a C enum.
+#
+# A C enum's value set is open at the ABI: any integer of the underlying type can arrive,
+# whatever the header names. Elisa's exhaustiveness check is therefore sound for enums the
+# language builds and UNSOUND for one reinterpreted from a foreign integer — the arms cover
+# every member, the optimizer is entitled to assume that, and an unnamed value walks off the
+# end of the switch (measured: stage0 fell into the last arm, stage1 trapped, and at -O2 the
+# two returned different garbage).
+#
+# Two spellings close it, and the choice is the C API's to make:
+#
+#     extern enum DeviceState of i32:      # closed: validate in, `match` stays exhaustive
+#     @open extern enum SdlEvent of u32:   # open:   nothing to validate, `match` needs `_:`
+#
+# For the closed form the parser synthesizes an ordinary Elisa validator beside the enum:
+#
+#     def DeviceState__from_c(raw: i32) -> DeviceState error[ForeignEnum]:
+#         k: DeviceState = raw.DeviceState()
+#         if k != DeviceState.Off and k != DeviceState.Idle and k != DeviceState.Running:
+#             raise ForeignEnum.OutOfRange
+#         return k
+#
+# Synthesizing SOURCE-level AST rather than a backend intrinsic is deliberate: error unions,
+# `try`/`else` and const-enum compares are already byte-identical between the two compilers,
+# so D9 needs no backend work in either and cannot drift. Mirrors stage0's
+# parser/parser_extern_enum.go; the marker annotations are read by check_extern_enum.elisa.
+extend Parser:
+    private:
+        # `extern enum Name [of T]:` — the caller consumed `extern` and left `enum` current.
+        #
+        # The validator is built INLINE rather than in a helper: a synthesized Decl holds
+        # darrays allocated in the enclosing frame's region, and handing that construction to
+        # a nested function puts them in a shorter-lived auto region than `parser.pending_decls`
+        # (the region checker says so, and it is right). The working precedents — the machine
+        # mode enum, the `law` body, the typestate constructor — all build in place too.
+        def extern_enum_declaration(parser: lmut Parser, token: Token) -> Ast::Decl?:
+            can Abort.Panic, Memory.Allocate:
+                is_open: mutable bool = false
+                for decorator in parser.pending_decorators |is_open|:
+                    is_open <- true if decorator.name == "open"
+                rebind declaration: Ast::Decl?, parser = parser.enum_declaration(true)
+                enum_name: mutable sview = ""
+                enum_pos: mutable Ast::Pos = Ast::pos_of_token(token)
+                storage_type: mutable Ast::Expr = (Ast::Expr.Invalid)
+                member_names: mutable darray[sview] = []
+                if declaration is enum_declaration:
+                    match enum_declaration:
+                        Decl.Enum(matched_name, matched_variants, matched_is_const, matched_storage, matched_pos):
+                            enum_name <- matched_name
+                            enum_pos <- matched_pos
+                            storage_type <- matched_storage
+                            for variant in matched_variants |member_names|:
+                                member_names.push(variant.name)
+                        _:
+                            pass
+                return declaration if enum_name == ""
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: enum_name, name: "__extern_enum", line: enum_pos.line})
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: enum_name, name: "__extern_enum_open", line: enum_pos.line}) if is_open
+                # The storage type is REQUIRED: C's enum type is only "compatible with int", and
+                # the width a header settles on is the whole reason this declaration exists.
+                # Defaulting it would put a silent guess on an ABI boundary, and would be one
+                # more default to keep identical between the two compilers.
+                declares_storage: bool = match storage_type:
+                    Expr.Invalid: false
+                    Expr.Absent:  false
+                    _:            true
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: enum_name, name: "__extern_enum_no_storage", line: enum_pos.line, pos: Ast::pos_of_token(token)}) if not declares_storage
+                return declaration if is_open or member_names.count == 0
+                parser.foreign_enum_names <- parser.foreign_enum_names.push(enum_name)
+                validator_name: sview = parser.foreign_enum_validator_name(enum_name)
+
+                # One `error ForeignEnum:` per file, however many extern enums it declares. An
+                # error set is a fieldless enum PLUS two side-table rows; the Decl node alone
+                # leaves `raise ForeignEnum.OutOfRange` with no registered ordinal.
+                already_emitted: bool = any name in parser.error_set_decl_names where name == "ForeignEnum"
+                if not already_emitted:
+                    error_variants: mutable darray[Ast::EnumVariant] = []
+                    error_variants.push(Ast::EnumVariant{name: "OutOfRange", fields: [], field_names: [], value_expr: (Ast::Expr.Absent)})
+                    parser.error_set_decl_names <- parser.error_set_decl_names.push("ForeignEnum")
+                    parser <- parser.record_enum_metadata("ForeignEnum", "", false, error_variants)
+                    parser.pending_decls <- parser.pending_decls.push((Ast::Decl.Enum("ForeignEnum", error_variants, false, (Ast::Expr.Absent), enum_pos)))
+
+                # k: Name = raw.Name()
+                body: mutable darray[Ast::Stmt] = []
+                converted: Ast::Expr = (Ast::Expr.Call((Ast::Expr.Field((Ast::Expr.Ident("raw", enum_pos)), enum_name, enum_pos)), [], [], enum_pos))
+                body.push((Ast::Stmt.VarDecl("k", (Ast::Expr.Ident(enum_name, enum_pos)), converted, enum_pos)))
+                # k != Name.M1 and k != Name.M2 and … — membership, not a range: a range test
+                # would admit the gaps in a sparse enum (27/32/65 admits 33).
+                condition: mutable Ast::Expr = (Ast::Expr.Invalid)
+                has_condition: mutable bool = false
+                for member_name in member_names |condition, has_condition, enum_name, enum_pos|:
+                    member_test: Ast::Expr = (Ast::Expr.Binary((Ast::Expr.Ident("k", enum_pos)), TokenKind.BangEq, (Ast::Expr.Field((Ast::Expr.Ident(enum_name, enum_pos)), member_name, enum_pos)), enum_pos))
+                    condition <- member_test if not has_condition
+                    condition <- (Ast::Expr.Binary(condition, TokenKind.And, member_test, enum_pos)) if has_condition
+                    has_condition <- true
+                raised: Ast::Expr = (Ast::Expr.Call((Ast::Expr.Ident("raise", enum_pos)), [(Ast::Expr.Field((Ast::Expr.Ident("ForeignEnum", enum_pos)), "OutOfRange", enum_pos))], [""], enum_pos))
+                guard_body: darray[Ast::Stmt] = [(Ast::Stmt.Expr(raised, enum_pos))]
+                body.push((Ast::Stmt.If(condition, guard_body, [], enum_pos)))
+                returned: Ast::Expr? = (Ast::Expr.Ident("k", enum_pos))
+                body.push((Ast::Stmt.Return(returned, enum_pos)))
+                params: mutable darray[Ast::ParamDecl] = []
+                params.push(Ast::ParamDecl{name: "raw", type_expression: storage_type, is_mutable: false, has_default: false, default_value: (Ast::Expr.Invalid)})
+                return_type: Ast::Expr? = (Ast::Expr.Ident(enum_name, enum_pos))
+                parser.pending_decls <- parser.pending_decls.push((Ast::Decl.Func(validator_name, params, return_type, body, [], [], enum_pos)))
+                # A synthesized signature must join the same side tables a written one does:
+                # this list is what exempts a `raise`-bearing body from RaiseWithoutErrorSet.
+                # `_lines` and `_names` are PARALLEL and indexed together (the pymodule error
+                # converter reads names[i] for lines[i]) — pushing one without the other
+                # desynchronizes every later function's error set.
+                parser.error_set_func_lines <- parser.error_set_func_lines.push(enum_pos.line)
+                parser.error_set_func_names <- parser.error_set_func_names.push("ForeignEnum")
+                # The `error[ForeignEnum]` half of the return type travels in the side table the
+                # rest of the fallible-signature machinery reads, keyed by declaration line.
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: validator_name, name: "__error_return", line: enum_pos.line})
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: validator_name, name: "ForeignEnum", line: enum_pos.line})
+                return declaration
+
+        # `Name.from_c` -> `Name__from_c` for a closed `extern enum` declared earlier in this
+        # file. Any other `.from_c` is left alone, so an unrelated method of that name still
+        # resolves normally. Mirrors stage0's rewriteForeignEnumValidatorCallee.
+        def foreign_enum_validator_callee[@r](parser: mutable Parser& @r, callee: Ast::Expr) -> Ast::Expr:
+            can Abort.Panic, Memory.Allocate:
+                match callee:
+                    Expr.Field(object, field, field_pos):
+                        return callee if field != "from_c"
+                        match object:
+                            Expr.Ident(type_name, type_pos):
+                                is_foreign: bool = any known in parser.foreign_enum_names where known == type_name
+                                return callee if not is_foreign
+                                return (Ast::Expr.Ident(parser.foreign_enum_validator_name(type_name), field_pos))
+                            _:
+                                return callee
+                    _:
+                        return callee
