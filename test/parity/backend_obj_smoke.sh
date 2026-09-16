@@ -36,7 +36,7 @@ clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 # said "could not link".
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" 2>/dev/null \
+clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" \
   || { echo "backend_obj_smoke FAILED: could not link emit_obj"; exit 1; }
 
 pass=0; total=0
