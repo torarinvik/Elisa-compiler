@@ -37,7 +37,14 @@ clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 # said "could not link".
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" \
+# NO runtime object here. emit_obj.elisa includes the whole backend, which brings the
+# elisacore_std definitions (scratch_arena, debug_trace_enabled, the bridge globals) with it —
+# and the runtime object is those same definitions again, so linking both gave 40 duplicate
+# symbols. The real product is linked exactly this way (elisac_stage1_seed.sh: object plus
+# profiler hooks, no runtime object), because a driver carries its own runtime; the runtime
+# object exists for the SMALL programs the driver emits, and is used on the per-case link
+# below. Same flags as the seed so this gate measures the link the product actually gets.
+clang -Wl,-dead_strip -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" -lLLVM -Wl,-rpath,"$LIBDIR" -Wl,-stack_size,0x20000000 \
   || { echo "backend_obj_smoke FAILED: could not link emit_obj"; exit 1; }
 
 pass=0; total=0
@@ -277,17 +284,32 @@ def main() -> i64:
     answer: i64 = identity(40)
     return answer + 2
 EOF
-if "$ELISACORE_BIN" -g -emit llvm -O0 -o "$debug_ir" "$debug_source" >/dev/null 2>&1 \
-   && grep -Eq '!DISubprogram\(name: "identity".*line: 1,.*scopeLine: 1' "$debug_ir" \
-   && grep -Eq '!DILocalVariable\(name: "value".*line: 1,' "$debug_ir" \
-   && grep -Eq '!DISubprogram\(name: "main".*line: 4,.*scopeLine: 4' "$debug_ir" \
-   && grep -Eq '!DILocalVariable\(name: "answer".*line: 5,' "$debug_ir" \
-   && grep -Eq '!DILocation\(line: 1, column: 1,' "$debug_ir" \
-   && grep -Eq '!DILocation\(line: 6, column: 5,' "$debug_ir"; then
-    pass=$((pass + 1))
-else
-    echo "  FAIL obj_dwarf_original_source_lines: debug metadata does not map back to original source lines"
-fi
+# BOTH compilers: this is a parity gate, and `-g -emit llvm` was the exact spelling where
+# stage0 silently dropped the flag (it hardcoded debugInfo=false on the IR path while
+# `-emit obj` threaded it) and stage1 honoured it. Checking only one compiler is how that
+# divergence survived. The two disagree on DILocation COUNT (5 vs 6), which is not what this
+# check is about, so each required location is asserted by line and column instead.
+debug_lines_ok=1
+for debug_compiler_name in stage0 stage1; do
+    case "$debug_compiler_name" in
+        stage0) debug_compiler="$ELISACORE_BIN" ;;
+        stage1) debug_compiler="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ;;
+    esac
+    debug_ir_for="$debug_source_dir/$debug_compiler_name.ll"
+    if "$debug_compiler" -g -emit llvm -O0 -o "$debug_ir_for" "$debug_source" >/dev/null 2>&1 \
+       && grep -Eq '!DISubprogram\(name: "identity".*line: 1,.*scopeLine: 1' "$debug_ir_for" \
+       && grep -Eq '!DILocalVariable\(name: "value".*line: 1,' "$debug_ir_for" \
+       && grep -Eq '!DISubprogram\(name: "main".*line: 4,.*scopeLine: 4' "$debug_ir_for" \
+       && grep -Eq '!DILocalVariable\(name: "answer".*line: 5,' "$debug_ir_for" \
+       && grep -Eq '!DILocation\(line: 1, column: 1,' "$debug_ir_for" \
+       && grep -Eq '!DILocation\(line: 6, column: 5,' "$debug_ir_for"; then
+        :
+    else
+        echo "  FAIL obj_dwarf_original_source_lines: $debug_compiler_name debug metadata does not map back to original source lines"
+        debug_lines_ok=0
+    fi
+done
+[ "$debug_lines_ok" = 1 ] && pass=$((pass + 1))
 
 # Native PC-to-source mapping depends on real line-table rows, not only function DIEs.
 # Use the same optimized object as above: the source statement on line 5 must remain

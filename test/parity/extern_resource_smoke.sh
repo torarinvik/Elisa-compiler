@@ -39,4 +39,48 @@ for name, text in rejected.items():
     assert all(r.returncode != 0 for r in results), (name, [(r.returncode, r.stderr) for r in results])
     assert results[0].stderr == results[1].stderr, (name, results[0].stderr, results[1].stderr)
     print(f'{name}: stage0/stage1 byte-identical rejection PASS', flush=True)
+
+# docs/127 D4 — no use after native release. The handle is consumed by fclose and then read.
+# stage1 used to ACCEPT this. Two causes, both fixed: its `extern resource` desugar left the
+# struct affinity "" (unrestricted), so the resource never reached struct_affine_owner; and its
+# affine walker reported on a Field/Index object's root without ever DESCENDING into it, so the
+# `move` inside `fgetc(file).i64()` was never recorded as a consumption at all.
+#
+# BOTH compilers now reject it. They do not yet agree on the sentence or the span:
+#   stage0  …:18:18-22: linear value "file" cannot be used: usage facts were consumed by
+#                       argument to call "fclose"
+#   stage1  …:18:       linear handle value "file" cannot be used after ownership was consumed
+# Closing the sentence needs the consuming call's name threaded into stage1's diagnostic (its
+# renderer already has the shape, for the `match over affine enum` case); closing the span needs
+# Ast::Pos threaded through the affine walker, which still reports line-only here. Until then
+# this asserts rejection only — deliberately, and not by loosening any existing assertion.
+D4_USE_AFTER_RELEASE = '''extern resource CFile
+
+def __drop__(self: CFile) -> void:
+    _ = fclose(move self)
+
+@callconv(c)
+extern fopen(path: cstr, mode: cstr) -> CFile?
+
+@callconv(c)
+extern fclose(file: CFile) -> i32
+
+@callconv(c)
+extern fgetc(file: CFile&) -> i32
+
+def read_after_close(path: cstr) -> i64:
+    file: CFile = get fopen(path, "r") else return -1
+    _ = fclose(move file)
+    return fgetc(file).i64()
+
+def main() -> i64:
+    return read_after_close("/etc/hosts")
+'''
+src = work / 'use_after_release.elisa'; src.write_text(D4_USE_AFTER_RELEASE)
+d4_results = [subprocess.run([c, '-emit', 'obj', '-o', str(work/'d4.o'), str(src)], capture_output=True, timeout=60) for c in (stage0, stage1)]
+assert all(r.returncode != 0 for r in d4_results), ('D4 use-after-release must be REJECTED by both',
+                                                    [(r.returncode, r.stderr) for r in d4_results])
+for stage, r in enumerate(d4_results):
+    assert b'cannot be used' in r.stderr, (f'stage{stage} rejected for the wrong reason', r.stderr)
+print('resource_use_after_release: rejected by both (wording/span gap noted above) PASS', flush=True)
 PY
