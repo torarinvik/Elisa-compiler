@@ -19,11 +19,11 @@
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-EC="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+EC="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 FIXTURES="${DIAGNOSTIC_DIFF_FIXTURES:-$ROOT/test/fixtures/diagnostics}"
 
-[ -x "$BIN" ] || { echo "diagnostic_columns_smoke SKIP: no stage1 binary at $BIN"; exit 0; }
-[ -x "$EC" ]  || { echo "diagnostic_columns_smoke SKIP: no elisac at $EC"; exit 0; }
+[ -x "$BIN" ] || { echo "diagnostic_columns_smoke FAIL: no stage1 binary at $BIN" >&2; exit 1; }
+[ -x "$EC" ] || { echo "diagnostic_columns_smoke FAIL: no elisac at $EC" >&2; exit 1; }
 [ -d "$FIXTURES" ] || { echo "diagnostic_columns_smoke SKIP: no fixtures at $FIXTURES"; exit 0; }
 
 WORK="$(mktemp -d)"

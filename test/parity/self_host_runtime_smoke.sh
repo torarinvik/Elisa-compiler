@@ -27,15 +27,15 @@ RUN() { elisa_run_timeout 30 "$@"; }
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 STAGE0_RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 SUPPORT="$ROOT/elisacore_std/native_runtime_support.elisa"
 PROFILE_HOOKS="$ROOT/test/parity/profile_hooks.c"
 
-[ -x "$ELISACORE_BIN" ] || { echo "self_host_runtime SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
-[ -x "$STAGE1" ]        || { echo "self_host_runtime SKIP: no stage1 seed at $STAGE1"; exit 0; }
-[ -f "$STAGE0_RUNTIME" ]|| { echo "self_host_runtime SKIP: no stage0 runtime at $STAGE0_RUNTIME"; exit 0; }
+[ -x "$ELISACORE_BIN" ] || { echo "self_host_runtime FAIL: no stage0 at $ELISACORE_BIN" >&2; exit 1; }
+[ -x "$STAGE1" ] || { echo "self_host_runtime FAIL: no stage1 seed at $STAGE1" >&2; exit 1; }
+[ -f "$STAGE0_RUNTIME" ] || { echo "self_host_runtime FAIL: no stage0 runtime at $STAGE0_RUNTIME" >&2; exit 1; }
 [ -f "$SUPPORT" ]       || { echo "self_host_runtime SKIP: no $SUPPORT"; exit 0; }
 [ -f "$PROFILE_HOOKS" ] || { echo "self_host_runtime SKIP: no $PROFILE_HOOKS"; exit 0; }
 

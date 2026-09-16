@@ -13,7 +13,7 @@
 # positives across the whole frontend + stdlib.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 fail() { echo "try-fallback-void smoke FAIL: $1" >&2; exit 1; }

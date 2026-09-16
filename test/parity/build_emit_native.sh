@@ -8,7 +8,7 @@
 # "no emit_native" while a sibling was mid-rebuild. Same freshness + atomic-publish shape as
 # build_parse_report.sh: skip when newer than every input, build under a private name, mv.
 REPO_ROOT="${REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 PROFILE_HOOKS="$ELISA_CORE/compiler/runtime/profile_hooks.c"

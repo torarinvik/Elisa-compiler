@@ -4,7 +4,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 ORACLE_DIR="$ELISA_CORE/compiler"
 if [[ "${1:-}" == "--chunk" ]]; then
     WORK="$2"

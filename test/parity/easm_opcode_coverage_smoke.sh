@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ]; then
-    echo "easm_opcode_coverage_smoke SKIP: stage0 compiler or llvm-config not found"
-    exit 0
+    echo "easm_opcode_coverage_smoke FAIL: stage0 compiler or llvm-config not found" >&2
+    exit 1
 fi
 mkdir -p "$ROOT/build"
 if ! "$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/easm_opcode_coverage_smoke.o" "$ROOT/test/breadth/easm_opcode_coverage_smoke.elisa" 2>"$ROOT/build/easm_opcode_coverage_smoke.log"; then

@@ -10,15 +10,15 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 FALLBACK="$ROOT/scripts/pymodule_runtime_fallback.c"
 FIXTURE="$ROOT/test/repro/machine_nested_return.elisa"
 
 echo "backend_machine_region_return_smoke: stage1=$STAGE1 stage0=$STAGE0"
-[ -x "$STAGE1" ] || { echo "backend_machine_region_return_smoke SKIP: no stage1 seed ($STAGE1)"; exit 0; }
-[ -x "$STAGE0" ] || { echo "backend_machine_region_return_smoke SKIP: no stage0 compiler ($STAGE0)"; exit 0; }
-[ -f "$RUNTIME_OBJ" ] || { echo "backend_machine_region_return_smoke SKIP: no runtime object ($RUNTIME_OBJ)"; exit 0; }
+[ -x "$STAGE1" ] || { echo "backend_machine_region_return_smoke FAIL: no stage1 seed ($STAGE1)" >&2; exit 1; }
+[ -x "$STAGE0" ] || { echo "backend_machine_region_return_smoke FAIL: no stage0 compiler ($STAGE0)" >&2; exit 1; }
+[ -f "$RUNTIME_OBJ" ] || { echo "backend_machine_region_return_smoke FAIL: no runtime object ($RUNTIME_OBJ)" >&2; exit 1; }
 [ -f "$FIXTURE" ] || { echo "backend_machine_region_return_smoke FAIL: missing fixture ($FIXTURE)" >&2; exit 1; }
 command -v clang >/dev/null 2>&1 || { echo "backend_machine_region_return_smoke SKIP: no clang"; exit 0; }
 

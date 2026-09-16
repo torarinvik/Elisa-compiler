@@ -12,13 +12,13 @@ RUN() { elisa_run_timeout 15 "$@"; }
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
-STD="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}/compiler/runtime/elisacore_std"
+STD="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/runtime/elisacore_std"
 
-[ -x "$ELISACORE_BIN" ] || { echo "indexmap_real_smoke SKIP: no elisac"; exit 0; }
-[ -x "$LLVM_CONFIG" ] || { echo "indexmap_real_smoke SKIP: no llvm-config"; exit 0; }
-[ -f "$STD/collections.elisa" ] || { echo "indexmap_real_smoke SKIP: no collections.elisa at $STD"; exit 0; }
+[ -x "$ELISACORE_BIN" ] || { echo "indexmap_real_smoke FAIL: no elisac" >&2; exit 1; }
+[ -x "$LLVM_CONFIG" ] || { echo "indexmap_real_smoke FAIL: no llvm-config" >&2; exit 1; }
+[ -f "$STD/collections.elisa" ] || { echo "indexmap_real_smoke FAIL: no collections.elisa at $STD" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "indexmap_real_smoke SKIP: no python3"; exit 0; }
 
 LIBDIR="$("$LLVM_CONFIG" --libdir)"

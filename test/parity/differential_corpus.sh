@@ -30,17 +30,17 @@
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 BASELINE="$ROOT/test/fixtures/differential_corpus.baseline"
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 VERBOSE=0
 [[ "${1:-}" == "--verbose" ]] && VERBOSE=1
 
-[ -x "$ELISACORE_BIN" ] || { echo "differential_corpus SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
-[ -x "$STAGE1" ]        || { echo "differential_corpus SKIP: no stage1 seed at $STAGE1"; exit 0; }
-[ -f "$RUNTIME_OBJ" ]   || { echo "differential_corpus SKIP: no runtime object"; exit 0; }
+[ -x "$ELISACORE_BIN" ] || { echo "differential_corpus FAIL: no stage0 at $ELISACORE_BIN" >&2; exit 1; }
+[ -x "$STAGE1" ] || { echo "differential_corpus FAIL: no stage1 seed at $STAGE1" >&2; exit 1; }
+[ -f "$RUNTIME_OBJ" ] || { echo "differential_corpus FAIL: no runtime object" >&2; exit 1; }
 
 # Worker mode (`--one <work> <src>`) receives the parent's work dir and must not create or
 # clean one. (`set -u` above: an unset WORK in a worker used to kill it silently.)

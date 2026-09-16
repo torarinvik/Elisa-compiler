@@ -14,7 +14,7 @@
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WRAPPER="$ROOT/scripts/elisac_stage1.sh"
-[[ -x "$ROOT/bin/elisac-stage1" ]] || { echo "wasm_integer_width SKIP: no stage1 product"; exit 0; }
+[[ -x "$ROOT/bin/elisac-stage1" ]] || { echo "wasm_integer_width FAIL: no stage1 product" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "wasm_integer_width SKIP: no node"; exit 0; }
 command -v wasm-ld >/dev/null 2>&1 || [[ -x /opt/homebrew/opt/llvm/bin/wasm-ld ]] || { echo "wasm_integer_width SKIP: no wasm-ld"; exit 0; }
 WORK="$(mktemp -d)"

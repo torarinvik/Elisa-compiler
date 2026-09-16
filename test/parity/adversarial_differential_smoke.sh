@@ -16,9 +16,9 @@
 # module datalayout was exactly that shape). ~2m40s.
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "adversarial_differential SKIP: no stage1 binary"; exit 0; }
-[ -x "${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}" ] || { echo "adversarial_differential SKIP: no stage0"; exit 0; }
-[ -f "$ROOT/build/runtime/elisacore_runtime.o" ] || { echo "adversarial_differential SKIP: no runtime object"; exit 0; }
+[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "adversarial_differential FAIL: no stage1 binary" >&2; exit 1; }
+[ -x "${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}" ] || { echo "adversarial_differential FAIL: no stage0" >&2; exit 1; }
+[ -f "$ROOT/build/runtime/elisacore_runtime.o" ] || { echo "adversarial_differential FAIL: no runtime object" >&2; exit 1; }
 
 out="$(REPO_ROOT="$ROOT" python3 "$ROOT/test/breadth/adversarial_differential.py" 2>&1)"
 status=$?

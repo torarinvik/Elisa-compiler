@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 FIXTURE="$ROOT/test/fixtures/backend/extern_view_param.elisa"
 
@@ -14,7 +14,7 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE
 
 "$STAGE0" -emit llvm -o "$WORK/stage0.ll" "$FIXTURE"

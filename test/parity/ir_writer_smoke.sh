@@ -5,14 +5,14 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 SOURCE="$ROOT/test/repro/const_enum_extern_param.elisa"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-[[ -x "$STAGE0" ]] || { echo "ir writer SKIP: stage0 unavailable"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "ir writer SKIP: stage1 unavailable"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "ir writer FAIL: stage0 unavailable" >&2; exit 1; }
+[[ -x "$STAGE1" ]] || { echo "ir writer FAIL: stage1 unavailable" >&2; exit 1; }
 
 "$STAGE0" -emit ir -o "$WORK/stage0.elisair" "$SOURCE" >/dev/null
 ELISA_STAGE1_BIN="$STAGE1" ELISA_ALLOW_STALE_STAGE1=1 \

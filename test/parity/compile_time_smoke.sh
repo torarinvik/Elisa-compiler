@@ -3,7 +3,7 @@
 # time rather than wall time, and what a slowdown looks like when nothing is watching for one.
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "compile_time SKIP: no stage1 binary"; exit 0; }
+[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "compile_time FAIL: no stage1 binary" >&2; exit 1; }
 out="$(REPO_ROOT="$ROOT" python3 "$ROOT/test/breadth/compile_cpu_time.py" 2>&1)"
 status=$?
 echo "$out"

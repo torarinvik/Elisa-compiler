@@ -11,7 +11,7 @@
 # block-`if` ban is a gate-enforced standard — the compiler's src + std stay at 0 block-`if`s.
 #
 #   Usage:  ELISA_CORE=/path/to/Elisa-core  test/parity/run_all.sh
-#           (ELISA_CORE defaults to ../../Go projects/structpy-tree)
+#           (ELISA_CORE defaults to ../../Go projects/Elisa-core)
 set -uo pipefail
 
 # SELF-INVOCATION: `run_all.sh --exec-one <resultdir> <name> <cmd...>` runs ONE check and
@@ -124,7 +124,7 @@ if [[ "${1:-}" == "--exec-one" ]]; then
 fi
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$REPO_ROOT/build/runtime/elisacore_runtime.o}"
 export ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ"

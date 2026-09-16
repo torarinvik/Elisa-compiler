@@ -8,11 +8,11 @@
 # Set ELISA_PARSE_ERROR_VERBOSE=1 to print every disagreeing case with both readings.
 set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 STAGE0="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
 BASELINE="$REPO_ROOT/test/fixtures/parse_error_messages.baseline"
-[[ -x "$STAGE0" ]] || { echo "parse_error_message_diff SKIP: no stage0 at $STAGE0"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "parse_error_message_diff FAIL: no stage0 at $STAGE0" >&2; exit 1; }
 [[ -x "$STAGE1" ]] || { echo "parse_error_message_diff FAILED: no stage1 at $STAGE1" >&2; exit 1; }
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 (cd "$ELISA_CORE/compiler" && ELISA_PARSER_PARITY_OUT="$WORK/oracle.tsv" go test ./src/parser -count=1 >/dev/null)

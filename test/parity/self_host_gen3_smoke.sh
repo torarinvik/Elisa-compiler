@@ -131,7 +131,7 @@ run_guarded_request() {
     wait "$pid"
 }
 
-[ -x "$BIN" ] || { echo "self_host_gen3_smoke SKIP: no seed ($BIN); run scripts/elisac_stage1.sh --seed"; exit 0; }
+[ -x "$BIN" ] || { echo "self_host_gen3_smoke FAIL: no seed ($BIN); run scripts/elisac_stage1.sh --seed" >&2; exit 1; }
 # The seed is a CACHED artifact and nothing rebuilds it automatically — `self_host_gen2.sh`
 # happily builds gen2 from a stale gen1, which silently tests old code (this bit during
 # development: stage A read 0/4 purely because the seed predated the fixes). Same failure
@@ -218,8 +218,8 @@ echo "self_host_gen3_smoke stage B OK: gen2 compiled the compiler into gen3 ($(w
 # here is a real semantic difference, not a path or timestamp artifact.
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 if [ ! -x "$LLVM_CONFIG" ]; then
-    echo "self_host_gen3_smoke stage C SKIP: no llvm-config at $LLVM_CONFIG"
-    exit 0
+    echo "self_host_gen3_smoke stage C FAIL: no llvm-config at $LLVM_CONFIG" >&2
+    exit 1
 fi
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"

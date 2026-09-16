@@ -6,10 +6,10 @@
 # each compiler's object and the emitted header and runs it.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
-[ -x "$ELISACORE_BIN" ] || { echo "export_same_name_smoke SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
-[ -f "$RUNTIME" ] || { echo "export_same_name_smoke SKIP: no runtime object"; exit 0; }
+[ -x "$ELISACORE_BIN" ] || { echo "export_same_name_smoke FAIL: no stage0 at $ELISACORE_BIN" >&2; exit 1; }
+[ -f "$RUNTIME" ] || { echo "export_same_name_smoke FAIL: no runtime object" >&2; exit 1; }
 BUILD="$ROOT/build/export_same_name_smoke"; mkdir -p "$BUILD"
 cat > "$BUILD/mod.elisa" <<'ELISA'
 struct Vec2 layout(c):

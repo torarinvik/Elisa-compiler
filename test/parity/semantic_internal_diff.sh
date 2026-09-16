@@ -32,7 +32,7 @@ fi
 [[ -f "$BASELINE_FILE" ]] || { echo "semantic internal diff FAILED: missing $BASELINE_FILE" >&2; exit 1; }
 baseline="$(tr -d '[:space:]' < "$BASELINE_FILE")"
 
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE REPO_ROOT
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"

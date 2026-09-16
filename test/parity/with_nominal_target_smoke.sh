@@ -4,10 +4,10 @@
 # carry the wrong type through the update body and is a soundness bug.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 STAGE1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
-[[ -x "$STAGE1" ]] || { echo "with nominal target smoke SKIP: no stage1 product"; exit 0; }
+[[ -x "$STAGE1" ]] || { echo "with nominal target smoke FAIL: no stage1 product" >&2; exit 1; }
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/elisa-with-nominal.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT

@@ -84,10 +84,10 @@ RUN() { elisa_run_timeout 20 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 
-[ -x "$BIN" ] || { echo "easm_lint_differential SKIP: no stage1 binary at $BIN"; exit 0; }
-[ -x "$ELISACORE_BIN" ] || { echo "easm_lint_differential SKIP: no elisac at $ELISACORE_BIN"; exit 0; }
+[ -x "$BIN" ] || { echo "easm_lint_differential FAIL: no stage1 binary at $BIN" >&2; exit 1; }
+[ -x "$ELISACORE_BIN" ] || { echo "easm_lint_differential FAIL: no elisac at $ELISACORE_BIN" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "easm_lint_differential SKIP: no python3"; exit 0; }
 
 WORK="$(mktemp -d)"

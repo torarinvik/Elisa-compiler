@@ -19,7 +19,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ELISA_CORE = pathlib.Path(
-    os.environ.get("ELISA_CORE", ROOT / "../../Go projects/structpy-tree")
+    os.environ.get("ELISA_CORE", ROOT / "../../Go projects/Elisa-core")
 )
 DEFAULT_ELISAC = os.environ.get(
     "ELISACORE_BIN", str(ELISA_CORE / "compiler" / "bin" / "elisac")

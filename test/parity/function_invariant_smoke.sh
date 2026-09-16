@@ -14,11 +14,11 @@
 # stage1-supplemental diagnostic — stage0 accepts both programs below.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 RPT="$REPO_ROOT/build/parse_report"
-[ -x "$RPT" ] || { echo "function_invariant SKIP: no parse_report"; exit 0; }
+[ -x "$RPT" ] || { echo "function_invariant FAIL: no parse_report" >&2; exit 1; }
 
 fail() { echo "function_invariant FAILED: $1" >&2; exit 1; }
 

@@ -22,10 +22,10 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 UI="${ELISA_UI_DIR:-$ROOT/../../elisa-ui}"
 
-[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "downstream_elisa_ui_smoke SKIP: no stage1 binary"; exit 0; }
+[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "downstream_elisa_ui_smoke FAIL: no stage1 binary" >&2; exit 1; }
 [ -d "$UI" ] || { echo "downstream_elisa_ui_smoke SKIP: no elisa-ui checkout at $UI"; exit 0; }
 [ -f "$UI/scripts/run_tests.sh" ] || { echo "downstream_elisa_ui_smoke SKIP: $UI has no run_tests.sh"; exit 0; }
-[ -f "$ROOT/build/runtime/elisacore_runtime.o" ] || { echo "downstream_elisa_ui_smoke SKIP: no runtime object; run scripts/build_runtime_object.sh"; exit 0; }
+[ -f "$ROOT/build/runtime/elisacore_runtime.o" ] || { echo "downstream_elisa_ui_smoke FAIL: no runtime object; run scripts/build_runtime_object.sh" >&2; exit 1; }
 
 # Two of the tests link SDL3. Without it the failure would be the host's, not the
 # compiler's, so say which it is rather than reporting a red gate.

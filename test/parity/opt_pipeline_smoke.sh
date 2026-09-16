@@ -13,7 +13,7 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-[ -f "$RUNTIME_OBJ" ] || { echo "opt_pipeline SKIP: no runtime object"; exit 0; }
+[ -f "$RUNTIME_OBJ" ] || { echo "opt_pipeline FAIL: no runtime object" >&2; exit 1; }
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
 LLVM_CLANG="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"

@@ -14,7 +14,7 @@
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"
-[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "extern_qualified_param_smoke SKIP: no stage1 binary"; exit 0; }
+[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "extern_qualified_param_smoke FAIL: no stage1 binary" >&2; exit 1; }
 command -v nm >/dev/null 2>&1 || { echo "extern_qualified_param_smoke SKIP: no nm"; exit 0; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT INT TERM HUP

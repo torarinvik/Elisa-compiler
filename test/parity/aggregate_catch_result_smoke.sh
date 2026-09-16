@@ -8,8 +8,8 @@ SOURCE="$ROOT/test/repro/catch_aggregate_result.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-aggregate-catch.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-[[ -x "$STAGE0" ]] || { echo "aggregate catch result smoke SKIP: stage0 unavailable"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "aggregate catch result smoke SKIP: stage1 unavailable"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "aggregate catch result smoke FAIL: stage0 unavailable" >&2; exit 1; }
+[[ -x "$STAGE1" ]] || { echo "aggregate catch result smoke FAIL: stage1 unavailable" >&2; exit 1; }
 
 compile_and_run() {
     local name="$1"

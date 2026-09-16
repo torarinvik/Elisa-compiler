@@ -15,7 +15,7 @@ set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WRAPPER="${ELISA_STAGE1_WRAPPER:-$ROOT/scripts/elisac_stage1.sh}"
 
-[ -x "$WRAPPER" ] || { echo "wasm_python_parity_smoke SKIP: no stage1 wrapper at $WRAPPER"; exit 0; }
+[ -x "$WRAPPER" ] || { echo "wasm_python_parity_smoke FAIL: no stage1 wrapper at $WRAPPER" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "wasm_python_parity_smoke SKIP: no python3"; exit 0; }
 command -v wasm-ld >/dev/null 2>&1 || { echo "wasm_python_parity_smoke SKIP: no wasm-ld"; exit 0; }
 [ -f "$ROOT/scripts/wasm_build.py" ] || { echo "wasm_python_parity_smoke SKIP: no wasm_build.py"; exit 0; }

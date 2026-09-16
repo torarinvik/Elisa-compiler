@@ -3,13 +3,13 @@
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 FIX="$ROOT/test/repro/get_nested_array_ref.elisa"
 
 fail() { echo "nested-fixed-array-ref smoke FAIL: $1" >&2; exit 1; }
 
-[[ -x "$STAGE1" ]] || { echo "nested-fixed-array-ref smoke SKIP: no stage1 binary at $STAGE1"; exit 0; }
+[[ -x "$STAGE1" ]] || { echo "nested-fixed-array-ref smoke FAIL: no stage1 binary at $STAGE1" >&2; exit 1; }
 [[ -f "$FIX" ]] || fail "missing fixture: $FIX"
 
 source "$ROOT/test/parity/resolve_elisac.sh"

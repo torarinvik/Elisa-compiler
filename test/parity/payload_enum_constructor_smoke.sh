@@ -4,15 +4,15 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-payload-enum-constructor.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-[[ -x "$STAGE0" ]] || { echo "payload enum constructor smoke SKIP: stage0 unavailable"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "payload enum constructor smoke SKIP: stage1 unavailable"; exit 0; }
-[[ -f "$RUNTIME_OBJ" ]] || { echo "payload enum constructor smoke SKIP: runtime object unavailable"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "payload enum constructor smoke FAIL: stage0 unavailable" >&2; exit 1; }
+[[ -x "$STAGE1" ]] || { echo "payload enum constructor smoke FAIL: stage1 unavailable" >&2; exit 1; }
+[[ -f "$RUNTIME_OBJ" ]] || { echo "payload enum constructor smoke FAIL: runtime object unavailable" >&2; exit 1; }
 
 FIXTURE="$ROOT/test/repro/stage1_payload_enum_field.elisa"
 "$STAGE0" -emit obj -O0 -o "$WORK/stage0.o" "$FIXTURE" >/dev/null 2>&1

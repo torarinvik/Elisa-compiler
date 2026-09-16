@@ -11,8 +11,8 @@ LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"
 CLANG="${ELISA_CLANG:-$LLVM_BIN_DIR/clang}"
 
 if [[ ! -x "$STAGE0" || ! -x "$STAGE1" ]]; then
-    echo "wasm32_darray_abi SKIP: stage0 or stage1 compiler is unavailable"
-    exit 0
+    echo "wasm32_darray_abi FAIL: stage0 or stage1 compiler is unavailable" >&2
+    exit 1
 fi
 if [[ ! -x "$CLANG" ]]; then CLANG="$(command -v clang || true)"; fi
 if [[ -z "$CLANG" || ! -x "$CLANG" ]] || ! command -v node >/dev/null 2>&1 || ! command -v wasm-ld >/dev/null 2>&1; then

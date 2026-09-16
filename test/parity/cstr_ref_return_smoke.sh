@@ -23,9 +23,9 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-[ -f "$RUNTIME_OBJ" ] || { echo "cstr-ref-return SKIP: no runtime object"; exit 0; }
+[ -f "$RUNTIME_OBJ" ] || { echo "cstr-ref-return FAIL: no runtime object" >&2; exit 1; }
 STD="$ROOT/elisacore_std"
-[ -f "$STD/elisacore_runtime.elisa" ] || { echo "cstr-ref-return SKIP: no vendored elisacore_std"; exit 0; }
+[ -f "$STD/elisacore_runtime.elisa" ] || { echo "cstr-ref-return FAIL: no vendored elisacore_std" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

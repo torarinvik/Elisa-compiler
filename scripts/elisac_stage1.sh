@@ -44,14 +44,14 @@ if [[ -n "${ELISACORE_BIN:-}" ]]; then
 else
   STAGE0_BIN=""
   for stage0_candidate in \
-      "$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac" \
-      "$ROOT/../../../Go projects/structpy-tree/compiler/bin/elisac"; do
+      "$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac" \
+      "$ROOT/../../../Go projects/Elisa-core/compiler/bin/elisac"; do
     if [[ -x "$stage0_candidate" ]]; then
       STAGE0_BIN="$stage0_candidate"
       break
     fi
   done
-  STAGE0_BIN="${STAGE0_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+  STAGE0_BIN="${STAGE0_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 fi
 # Host predicates for the product's `static if ELISA_TARGET_OS_*` / `PLATFORM_*` consts and
 # the project system's platform key (see register_target_consts / host_platform_name). stage0

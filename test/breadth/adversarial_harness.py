@@ -12,7 +12,7 @@ import itertools, os, subprocess, sys, tempfile, hashlib
 ROOT = os.environ["REPO_ROOT"]
 
 ELISA_CORE = os.environ.get(
-    "ELISA_CORE", os.path.join(ROOT, "..", "..", "Go projects", "structpy-tree")
+    "ELISA_CORE", os.path.join(ROOT, "..", "..", "Go projects", "Elisa-core")
 )
 
 S0 = os.path.expanduser(

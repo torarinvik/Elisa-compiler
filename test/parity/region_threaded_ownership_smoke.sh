@@ -7,8 +7,8 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
 
 if [[ ! -x "$ROOT/bin/elisac-stage1" || ! -x "$CLANG" || ! -f "$ROOT/build/runtime/elisacore_runtime.o" ]]; then
-    echo "threaded region ownership smoke SKIP (stage1/clang/runtime unavailable)"
-    exit 0
+    echo "threaded region ownership smoke FAIL (stage1/clang/runtime unavailable)" >&2
+    exit 1
 fi
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -o "$WORK/threaded.o" \

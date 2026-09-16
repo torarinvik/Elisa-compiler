@@ -55,7 +55,7 @@ import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 S0 = pathlib.Path(os.environ.get("ELISACORE_BIN", str(
-    ROOT / ".." / ".." / "Go projects" / "structpy-tree" / "compiler" / "bin" / "elisac"))).resolve()
+    ROOT / ".." / ".." / "Go projects" / "Elisa-core" / "compiler" / "bin" / "elisac"))).resolve()
 
 
 def stage0_functions(src):

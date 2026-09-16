@@ -32,7 +32,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-EC="${ELISAC:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+EC="${ELISAC:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 BUILD="$ROOT/build/project_report"
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
@@ -44,8 +44,8 @@ note_pass() { pass=$((pass + 1)); }
 note_fail() { fail=$((fail + 1)); echo "FAIL: $1"; }
 
 if [[ ! -x "$EC" ]]; then
-    echo "SKIP: stage0 binary not found at $EC (set ELISAC)"
-    exit 0
+    echo "FAIL: stage0 binary not found at $EC (set ELISAC)" >&2
+    exit 1
 fi
 
 # The probe includes the std, so the runtime is already in the object; linking

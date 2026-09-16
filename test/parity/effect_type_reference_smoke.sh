@@ -5,8 +5,8 @@ STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
 if [[ ! -x "$STAGE1" || ! -f "$RUNTIME" || ! -x "$CLANG" ]]; then
-    echo "effect type reference smoke SKIP: local compiler/runtime/clang unavailable"
-    exit 0
+    echo "effect type reference smoke FAIL: local compiler/runtime/clang unavailable" >&2
+    exit 1
 fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-effect-types.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

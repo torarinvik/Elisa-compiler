@@ -48,7 +48,7 @@ for policy in helper reserve stack; do
         clang -Wl,-dead_strip -o "$OUT/$policy-$variant" "$OUT/$policy-$variant.o" "$OUT/hooks.o" "$OUT/benchmark-hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"
     done
 done
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 for policy in helper reserve stack; do
     "$STAGE0" -emit obj -O2 -o "$OUT/$policy-oracle.o" "$OUT/$policy.elisa"
     clang -Wl,-dead_strip -o "$OUT/$policy-oracle" "$OUT/$policy-oracle.o" "$OUT/hooks.o" "$OUT/benchmark-hooks.o" "$ROOT/build/runtime/elisacore_runtime.o"

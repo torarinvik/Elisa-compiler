@@ -8,7 +8,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 SOURCE="$ROOT/test/repro/try_void_else_void.elisa"
 PATHS_SOURCE="$ROOT/test/repro/try_void_recovery_paths.elisa"
@@ -16,8 +16,8 @@ CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-try-void.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-[[ -x "$STAGE0" ]] || { echo "void try smoke SKIP: stage0 unavailable"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "void try smoke SKIP: stage1 unavailable"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "void try smoke FAIL: stage0 unavailable" >&2; exit 1; }
+[[ -x "$STAGE1" ]] || { echo "void try smoke FAIL: stage1 unavailable" >&2; exit 1; }
 
 [[ -x "$CLANG" ]] || { echo "void try smoke FAIL: clang unavailable" >&2; exit 1; }
 for optimization in 0 1 2 3; do

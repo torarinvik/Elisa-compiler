@@ -23,7 +23,7 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
-[ -f "$RUNTIME_OBJ" ] || { echo "protocol-static-dispatch SKIP: no runtime object"; exit 0; }
+[ -f "$RUNTIME_OBJ" ] || { echo "protocol-static-dispatch FAIL: no runtime object" >&2; exit 1; }
 STD="$ROOT/elisacore_std"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 LLVM_BIN_DIR="${ELISA_LLVM_BIN_DIR:-$(dirname -- "$LLVM_CONFIG")}"

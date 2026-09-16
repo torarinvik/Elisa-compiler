@@ -8,12 +8,12 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 VALID="$ROOT/test/fixtures/fn_field_alias_scope_preserve.elisa"
 REJECT="$ROOT/test/fixtures/fn_field_alias_scope_leak.elisa"
 
-[[ -x "$STAGE1" ]] || { echo "fn-field alias scope smoke SKIP: no stage1 at $STAGE1" >&2; exit 0; }
+[[ -x "$STAGE1" ]] || { echo "fn-field alias scope smoke FAIL: no stage1 at $STAGE1" >&2; exit 1; }
 
 compile_and_run() {
     local compiler="$1" tag="$2" source="$3" expected="$4"

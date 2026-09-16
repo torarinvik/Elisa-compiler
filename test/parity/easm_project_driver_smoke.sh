@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ]; then
-    echo "easm_project_driver_smoke SKIP: stage0 compiler or llvm-config not found"
-    exit 0
+    echo "easm_project_driver_smoke FAIL: stage0 compiler or llvm-config not found" >&2
+    exit 1
 fi
 mkdir -p "$ROOT/build"
 # FRESHNESS GUARD. Twenty other easm smokes invoke this script just to GET the driver, and

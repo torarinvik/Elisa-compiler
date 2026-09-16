@@ -15,7 +15,7 @@
 # check cannot start rejecting valid code.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 fail() { echo "container-region-message smoke FAIL: $1" >&2; exit 1; }
 

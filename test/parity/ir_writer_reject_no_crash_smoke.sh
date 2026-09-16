@@ -9,7 +9,7 @@ STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-ir-reject.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-[[ -x "$STAGE1" ]] || { echo "IR writer rejection smoke SKIP: stage1 unavailable"; exit 0; }
+[[ -x "$STAGE1" ]] || { echo "IR writer rejection smoke FAIL: stage1 unavailable" >&2; exit 1; }
 
 set +e
 "$STAGE1" -emit ir -O0 -o "$WORK/parser-core.elisair" "$ROOT/src/parser/parser_core.elisa" >"$WORK/log" 2>&1

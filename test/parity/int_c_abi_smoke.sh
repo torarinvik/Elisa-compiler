@@ -2,7 +2,7 @@
 # Runtime parity for pointer-sized Elisa int and fixed-width C int.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 FIXTURE="$ROOT/test/repro/int_width_abi.elisa"

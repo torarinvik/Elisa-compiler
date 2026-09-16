@@ -10,10 +10,10 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
 RUN() { elisa_run_timeout 20 "$@"; }
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
-[ -x "$ELISACORE_BIN" ] || { echo "backend_obj_smoke SKIP: no elisac"; exit 0; }
-[ -x "$LLVM_CONFIG" ] || { echo "backend_obj_smoke SKIP: no llvm-config"; exit 0; }
+[ -x "$ELISACORE_BIN" ] || { echo "backend_obj_smoke FAIL: no elisac" >&2; exit 1; }
+[ -x "$LLVM_CONFIG" ] || { echo "backend_obj_smoke FAIL: no llvm-config" >&2; exit 1; }
 # arm64-only: the driver binds LLVMInitializeAArch64* directly, because
 # LLVMInitializeNativeTarget is a `static inline` with no symbol to bind.
 [ "$(uname -m)" = "arm64" ] || { echo "backend_obj_smoke SKIP: driver is arm64-only"; exit 0; }
@@ -22,7 +22,7 @@ LIBDIR="$("$LLVM_CONFIG" --libdir)"
 LLVM_DIS="$("$LLVM_CONFIG" --bindir)/llvm-dis"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
 RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
-[ -f "$RUNTIME_OBJ" ] || { echo "backend_obj_smoke SKIP: no runtime object"; exit 0; }
+[ -f "$RUNTIME_OBJ" ] || { echo "backend_obj_smoke FAIL: no runtime object" >&2; exit 1; }
 FALLBACK_OBJ="$BUILD/runtime_fallback.o"
 clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
 PROFILE_OBJ="$BUILD/profile_hooks.o"

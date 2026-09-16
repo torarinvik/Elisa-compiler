@@ -26,7 +26,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 
 # Always bench a freshly built compiler (sets ELISACORE_BIN).
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"

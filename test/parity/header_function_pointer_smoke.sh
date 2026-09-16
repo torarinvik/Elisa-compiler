@@ -2,12 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 FIXTURE="$ROOT/test/repro/header_function_pointer.elisa"
 
-[[ -x "$STAGE0" ]] || { echo "header_function_pointer_smoke SKIP: no stage0 at $STAGE0"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "header_function_pointer_smoke SKIP: no stage1 at $STAGE1"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "header_function_pointer_smoke FAIL: no stage0 at $STAGE0" >&2; exit 1; }
+[[ -x "$STAGE1" ]] || { echo "header_function_pointer_smoke FAIL: no stage1 at $STAGE1" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

@@ -14,10 +14,10 @@ RUN() { elisa_run_timeout 120 "$@"; }
 set -u
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 
-[ -x "$BIN" ] || { echo "project_abi_lint_smoke SKIP: no stage1 binary at $BIN"; exit 0; }
-[ -x "$ELISACORE_BIN" ] || { echo "project_abi_lint_smoke SKIP: no elisac at $ELISACORE_BIN"; exit 0; }
+[ -x "$BIN" ] || { echo "project_abi_lint_smoke FAIL: no stage1 binary at $BIN" >&2; exit 1; }
+[ -x "$ELISACORE_BIN" ] || { echo "project_abi_lint_smoke FAIL: no elisac at $ELISACORE_BIN" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

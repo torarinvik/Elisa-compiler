@@ -15,7 +15,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SEED="${1:-7}"; COUNT="${2:-15}"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"; RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
 command -v clang >/dev/null || { echo "TOOL_MISSING clang"; exit 2; }
 command -v python3 >/dev/null || { echo "TOOL_MISSING python3"; exit 2; }

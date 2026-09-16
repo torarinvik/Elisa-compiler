@@ -2,15 +2,15 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-ELISACORE_BIN=${ELISACORE_BIN:-"$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac"}
+ELISACORE_BIN=${ELISACORE_BIN:-"$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac"}
 LLVM_CONFIG=${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}
 LLVM_MC=${LLVM_MC:-/opt/homebrew/opt/llvm/bin/llvm-mc}
 CXX=${CXX:-/opt/homebrew/opt/llvm/bin/clang++}
 BUILD="$ROOT/build"
 
 if [ ! -x "$ELISACORE_BIN" ] || [ ! -x "$LLVM_CONFIG" ] || [ ! -x "$LLVM_MC" ] || [ ! -x "$CXX" ]; then
-    echo "easm_mc_effects_smoke SKIP: stage0 compiler and LLVM MC toolchain not found"
-    exit 0
+    echo "easm_mc_effects_smoke FAIL: stage0 compiler and LLVM MC toolchain not found" >&2
+    exit 1
 fi
 
 mkdir -p "$BUILD"

@@ -6,11 +6,11 @@
 # signatures clang emits for the same shapes (byval / sret / lone-scalar unwrap).
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 RUNTIME="$ROOT/build/runtime/elisacore_runtime.o"
 FIX="$ROOT/test/parity/fixtures/export_cabi"
-[ -x "$ELISACORE_BIN" ] || { echo "export_cabi_shapes_smoke SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
-[ -f "$RUNTIME" ] || { echo "export_cabi_shapes_smoke SKIP: no runtime object"; exit 0; }
+[ -x "$ELISACORE_BIN" ] || { echo "export_cabi_shapes_smoke FAIL: no stage0 at $ELISACORE_BIN" >&2; exit 1; }
+[ -f "$RUNTIME" ] || { echo "export_cabi_shapes_smoke FAIL: no runtime object" >&2; exit 1; }
 BUILD="$ROOT/build/export_cabi_shapes_smoke"; mkdir -p "$BUILD"
 status=0
 run_one() {

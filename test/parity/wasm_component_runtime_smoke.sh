@@ -5,7 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-component-runtime.XXXXXX")"
 
-[[ -x "$STAGE1" ]] || { echo "wasm_component_runtime_smoke SKIP: no stage1 seed at $STAGE1"; exit 0; }
+[[ -x "$STAGE1" ]] || { echo "wasm_component_runtime_smoke FAIL: no stage1 seed at $STAGE1" >&2; exit 1; }
 build_fixture() {
     local wit="$1"
     local source="$2"

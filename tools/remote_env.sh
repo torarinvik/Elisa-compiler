@@ -6,7 +6,7 @@ RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"
 export ELISA_TOOL_SHIM_DIR="$RDIR/tools/linux_shim"
 export PATH="$ELISA_TOOL_SHIM_DIR:/usr/local/go/bin:/usr/local/bin:/usr/lib/llvm-21/bin:$PATH"
 ulimit -s unlimited
-RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/structpy-tree}"
+RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/Elisa-core}"
 cd "$RDIR"
 export REPO_ROOT="$RDIR" ELISA_CORE="$RCORE" ELISACORE_BIN="$RCORE/compiler/bin/elisac"
 export ELISA_STAGE1_BIN="$RDIR/bin/elisac-stage1" ELISA_RUNTIME_OBJ="$RDIR/build/runtime/elisacore_runtime.o"

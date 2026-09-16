@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"
 SOURCE="$ROOT/test/repro/qualified_module_generic_collision.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/qualified-module-generic.XXXXXX")"
@@ -35,7 +35,7 @@ compile_and_check() {
     echo "  $label: qualified module member returned 42"
 }
 
-[[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ]] || { echo "qualified module generic smoke SKIP: no stage1 seed"; exit 0; }
+[[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ]] || { echo "qualified module generic smoke FAIL: no stage1 seed" >&2; exit 1; }
 compile_and_check stage1 "$STAGE1"
 if [[ -x "$STAGE0" ]]; then
     compile_and_check stage0 "$STAGE0"

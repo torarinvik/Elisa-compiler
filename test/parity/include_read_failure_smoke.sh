@@ -5,7 +5,7 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
-[[ -x "$BIN" ]] || { echo "include-read-failure SKIP: no stage1 binary"; exit 0; }
+[[ -x "$BIN" ]] || { echo "include-read-failure FAIL: no stage1 binary" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

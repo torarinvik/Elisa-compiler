@@ -7,8 +7,8 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-effect-handler.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 if [[ ! -x "$STAGE1" ]]; then
-    echo "effect_handler_stage1_smoke SKIP: no stage1 seed at $STAGE1"
-    exit 0
+    echo "effect_handler_stage1_smoke FAIL: no stage1 seed at $STAGE1" >&2
+    exit 1
 fi
 
 run_positive() {

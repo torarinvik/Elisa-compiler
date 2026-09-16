@@ -8,13 +8,13 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 SOURCE="$ROOT/test/fixtures/machine_transition/shadow.elisa"
 INPUT_BIND_SOURCE="$ROOT/test/fixtures/machine_transition/input_bind.elisa"
 INPUT_BIND_FAST_SOURCE="$ROOT/test/fixtures/machine_transition/input_bind_fast.elisa"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
-[[ -x "$STAGE0" ]] || { echo "machine transition shadow smoke SKIP: no stage0"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "machine transition shadow smoke SKIP: no stage1"; exit 0; }
-[[ -f "$RUNTIME" ]] || { echo "machine transition shadow smoke SKIP: no runtime object"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "machine transition shadow smoke FAIL: no stage0" >&2; exit 1; }
+[[ -x "$STAGE1" ]] || { echo "machine transition shadow smoke FAIL: no stage1" >&2; exit 1; }
+[[ -f "$RUNTIME" ]] || { echo "machine transition shadow smoke FAIL: no runtime object" >&2; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-machine-transition-shadow.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

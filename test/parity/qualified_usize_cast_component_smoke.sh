@@ -5,15 +5,15 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 SOURCE="$ROOT/test/repro/qualified_usize_cast_component.elisa"
 WIT="$ROOT/test/repro/qualified_usize_cast_component.wit"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-qualified-usize.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-[[ -x "$STAGE0" ]] || { echo "qualified usize cast component smoke SKIP: stage0 unavailable"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "qualified usize cast component smoke SKIP: stage1 unavailable"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "qualified usize cast component smoke FAIL: stage0 unavailable" >&2; exit 1; }
+[[ -x "$STAGE1" ]] || { echo "qualified usize cast component smoke FAIL: stage1 unavailable" >&2; exit 1; }
 
 build_component() {
     local compiler="$1"

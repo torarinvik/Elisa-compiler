@@ -15,8 +15,8 @@
 set -uo pipefail
 SSH_TARGET="${1:?ssh options and target}"; ACTION="${2:?sync|start|wait|tail|ps|kill}"; shift 2
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
-RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
+RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/Elisa-core}"
 RJOBS="${ELISA_REMOTE_JOBS:-/root/jobs}"
 addr="${SSH_TARGET##* }"; opts="${SSH_TARGET% *}"; [[ "$addr" == "$SSH_TARGET" ]] && opts=""
 rssh() { ssh -o ConnectTimeout=15 -o ServerAliveInterval=20 $opts "$addr" "$@"; }

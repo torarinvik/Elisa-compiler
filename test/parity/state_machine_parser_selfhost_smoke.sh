@@ -10,9 +10,9 @@ PRODUCT="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
 
-[[ -x "$PRODUCT" ]] || { echo "state-machine parser self-host smoke SKIP: no stage1 product at $PRODUCT"; exit 0; }
-[[ -f "$RUNTIME" ]] || { echo "state-machine parser self-host smoke SKIP: no runtime object at $RUNTIME"; exit 0; }
-[[ -x "$LLVM_CONFIG" ]] || { echo "state-machine parser self-host smoke SKIP: no llvm-config at $LLVM_CONFIG"; exit 0; }
+[[ -x "$PRODUCT" ]] || { echo "state-machine parser self-host smoke FAIL: no stage1 product at $PRODUCT" >&2; exit 1; }
+[[ -f "$RUNTIME" ]] || { echo "state-machine parser self-host smoke FAIL: no runtime object at $RUNTIME" >&2; exit 1; }
+[[ -x "$LLVM_CONFIG" ]] || { echo "state-machine parser self-host smoke FAIL: no llvm-config at $LLVM_CONFIG" >&2; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-state-machine-parser.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

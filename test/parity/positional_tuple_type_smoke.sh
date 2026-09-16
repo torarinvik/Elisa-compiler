@@ -3,7 +3,7 @@
 # positional tuple at the parser boundary, including in struct fields and aliases.
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 source "$ROOT/test/parity/resolve_elisac.sh"
 
 fail() { echo "positional tuple type smoke FAIL: $1" >&2; exit 1; }

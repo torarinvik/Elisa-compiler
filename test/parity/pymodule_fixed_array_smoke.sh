@@ -10,8 +10,8 @@ PYTHON_CONFIG="${PYTHON_CONFIG:-/opt/homebrew/bin/python3.14-config}"
 CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
 
 if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -x "$ROOT/bin/elisac-stage1" ]]; then
-    echo "pymodule fixed-array smoke SKIP (Python 3.14/Homebrew clang/stage1 unavailable)"
-    exit 0
+    echo "pymodule fixed-array smoke FAIL (Python 3.14/Homebrew clang/stage1 unavailable)" >&2
+    exit 1
 fi
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule -o "$WORK/fixed_array_refs.json" \

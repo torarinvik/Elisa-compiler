@@ -6,8 +6,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 if [[ ! -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ]]; then
-    echo "pymodule fixed-array-limit smoke SKIP (stage1 unavailable)"
-    exit 0
+    echo "pymodule fixed-array-limit smoke FAIL (stage1 unavailable)" >&2
+    exit 1
 fi
 
 if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule \

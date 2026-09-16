@@ -3,16 +3,16 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 FIXTURE="$ROOT/test/repro/module_type_alias_namespacing.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-type-alias-namespacing.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-[[ -x "$STAGE0" ]] || { echo "module type alias namespacing smoke SKIP: stage0 unavailable"; exit 0; }
-[[ -x "$STAGE1" ]] || { echo "module type alias namespacing smoke SKIP: stage1 unavailable"; exit 0; }
-[[ -f "$RUNTIME_OBJ" ]] || { echo "module type alias namespacing smoke SKIP: runtime object unavailable"; exit 0; }
+[[ -x "$STAGE0" ]] || { echo "module type alias namespacing smoke FAIL: stage0 unavailable" >&2; exit 1; }
+[[ -x "$STAGE1" ]] || { echo "module type alias namespacing smoke FAIL: stage1 unavailable" >&2; exit 1; }
+[[ -f "$RUNTIME_OBJ" ]] || { echo "module type alias namespacing smoke FAIL: runtime object unavailable" >&2; exit 1; }
 
 "$STAGE0" -emit obj -O0 -o "$WORK/stage0.o" "$FIXTURE" >/dev/null 2>&1
 cc -fno-builtin "$WORK/stage0.o" "$RUNTIME_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c" "$ROOT/test/parity/profile_hooks.c" -o "$WORK/stage0"

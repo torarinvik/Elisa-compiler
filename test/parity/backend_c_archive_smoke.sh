@@ -9,8 +9,8 @@ fi
 runtime="$ROOT/build/runtime/elisacore_runtime.o"
 object="$ROOT/build/case_generic_nested_3.o"
 if [[ ! -f "$runtime" || ! -f "$object" ]]; then
-    echo "backend_c_archive_smoke SKIP: stage1 object/runtime artifacts not present"
-    exit 0
+    echo "backend_c_archive_smoke FAIL: stage1 object/runtime artifacts not present" >&2
+    exit 1
 fi
 mkdir -p "$ROOT/build/c_archive_smoke"
 archive="$ROOT/build/c_archive_smoke/libelisa.a"

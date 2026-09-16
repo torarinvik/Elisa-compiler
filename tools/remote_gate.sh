@@ -14,8 +14,8 @@
 set -uo pipefail
 SSH_TARGET="${1:?ssh options and target, e.g. \"-p 50559 root@host\"}"; PROFILE="${2:-fast}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
-RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/structpy-tree}"
+ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
+RDIR="${ELISA_REMOTE_DIR:-/root/Elisa-compiler}"; RCORE="${ELISA_REMOTE_CORE:-/root/Elisa-core}"
 addr="${SSH_TARGET##* }"; opts="${SSH_TARGET% *}"; [[ "$addr" == "$SSH_TARGET" ]] && opts=""
 rsync -az --exclude .git --exclude 'build/*' --exclude bin -e "ssh $opts" "$ROOT/" "$addr:$RDIR/"
 rsync -az --exclude .git --exclude compiler/bin -e "ssh $opts" "$ELISA_CORE/" "$addr:$RCORE/"

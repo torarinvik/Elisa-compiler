@@ -15,9 +15,9 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CORE="${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}"
+CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 # Resolve the stage0 compiler the same way every other check does. This hardcoded a
-# structpy-tree path and honoured neither ELISACORE_BIN nor the CORE selected just above,
+# stage0 path and honoured neither ELISACORE_BIN nor the CORE selected just above,
 # so in any worktree whose stage0 lives elsewhere the check failed instantly with
 # "No such file or directory" — a configuration miss wearing the costume of a real failure.
 EC="${ELISAC:-${ELISACORE_BIN:-$CORE/compiler/bin/elisac}}"
@@ -25,8 +25,8 @@ BUILD="$ROOT/build/ir_interop"
 mkdir -p "$BUILD"
 
 if [[ ! -d "$CORE/compiler/src/frontendir" ]]; then
-    echo "SKIP: stage0 checkout not found at $CORE (set ELISA_CORE)"
-    exit 0
+    echo "FAIL: stage0 checkout not found at $CORE (set ELISA_CORE)" >&2
+    exit 1
 fi
 
 # Build the Elisa-side reader probe. It includes the std, so the runtime is

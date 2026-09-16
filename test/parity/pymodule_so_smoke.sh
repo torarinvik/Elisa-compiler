@@ -11,8 +11,8 @@ CLANG="${ELISA_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 
 if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -x "$STAGE1" ]]; then
-    echo "pymodule-so smoke SKIP (Python 3.14/Homebrew clang/stage1 unavailable)"
-    exit 0
+    echo "pymodule-so smoke FAIL (Python 3.14/Homebrew clang/stage1 unavailable)" >&2
+    exit 1
 fi
 
 PYTHON_CONFIG_NAME="$(basename -- "$PYTHON_CONFIG")"

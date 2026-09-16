@@ -10,8 +10,8 @@ STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
 if [[ ! -x "$STAGE0" || ! -x "$STAGE1" || ! -x "$CLANG" || ! -f "$RUNTIME_OBJ" ]]; then
-    echo "fn-typed extern struct-ref smoke SKIP (stage0/stage1/clang/runtime unavailable)"
-    exit 0
+    echo "fn-typed extern struct-ref smoke FAIL (stage0/stage1/clang/runtime unavailable)" >&2
+    exit 1
 fi
 
 SOURCE="$ROOT/test/repro/extern_fn_struct_ref.elisa"

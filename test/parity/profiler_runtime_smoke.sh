@@ -18,12 +18,12 @@ if [[ -f "$STAGE1_BIN" ]] && grep -q 'exec bash ' "$STAGE1_BIN" 2>/dev/null; the
 fi
 
 if [[ ! -x "$STAGE0_BIN" || -z "$STAGE1_BIN" || ! -x "$STAGE1_BIN" ]]; then
-    echo "profiler runtime smoke SKIP: stage0/stage1 compiler unavailable"
-    exit 0
+    echo "profiler runtime smoke FAIL: stage0/stage1 compiler unavailable" >&2
+    exit 1
 fi
 if [[ ! -f "$RUNTIME_OBJ" ]]; then
-    echo "profiler runtime smoke SKIP: runtime object unavailable"
-    exit 0
+    echo "profiler runtime smoke FAIL: runtime object unavailable" >&2
+    exit 1
 fi
 command -v clang >/dev/null 2>&1 || {
     echo "profiler runtime smoke SKIP: clang unavailable"

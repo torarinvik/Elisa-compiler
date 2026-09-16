@@ -35,13 +35,13 @@ RUN() { elisa_run_timeout 10 "$@"; }
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/structpy-tree/compiler/bin/elisac}"
+ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
-[ -x "$ELISACORE_BIN" ] || { echo "scope_binding_smoke SKIP: no stage0 at $ELISACORE_BIN"; exit 0; }
-[ -x "$STAGE1" ] || { echo "scope_binding_smoke SKIP: no stage1 seed at $STAGE1"; exit 0; }
-[ -f "$RUNTIME_OBJ" ] || { echo "scope_binding_smoke SKIP: no runtime object at $RUNTIME_OBJ"; exit 0; }
+[ -x "$ELISACORE_BIN" ] || { echo "scope_binding_smoke FAIL: no stage0 at $ELISACORE_BIN" >&2; exit 1; }
+[ -x "$STAGE1" ] || { echo "scope_binding_smoke FAIL: no stage1 seed at $STAGE1" >&2; exit 1; }
+[ -f "$RUNTIME_OBJ" ] || { echo "scope_binding_smoke FAIL: no runtime object at $RUNTIME_OBJ" >&2; exit 1; }
 
 # macOS may reclaim long-running directories below `/tmp` while this suite is
 # compiling 80 cases. Keep the default scratch parent in the ignored build

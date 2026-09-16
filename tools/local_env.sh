@@ -3,7 +3,7 @@
 LDIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$LDIR"
 export REPO_ROOT="$LDIR"
-export ELISA_CORE="${ELISA_CORE:-$LDIR/../../Go projects/structpy-tree}"
+export ELISA_CORE="${ELISA_CORE:-$LDIR/../../Go projects/Elisa-core}"
 export ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$LDIR/bin/elisac-stage1}"
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$LDIR/build/runtime/elisacore_runtime.o}"
 export ELISA_ALLOW_STALE_STAGE1=1

@@ -7,8 +7,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
-[[ -x "$STAGE1_BIN" ]] || { echo "parse_report_stage1_smoke SKIP: no stage1 product at $STAGE1_BIN"; exit 0; }
-[[ -f "$RUNTIME_OBJ" ]] || { echo "parse_report_stage1_smoke SKIP: no runtime object at $RUNTIME_OBJ"; exit 0; }
+[[ -x "$STAGE1_BIN" ]] || { echo "parse_report_stage1_smoke FAIL: no stage1 product at $STAGE1_BIN" >&2; exit 1; }
+[[ -f "$RUNTIME_OBJ" ]] || { echo "parse_report_stage1_smoke FAIL: no runtime object at $RUNTIME_OBJ" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP

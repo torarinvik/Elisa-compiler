@@ -8,14 +8,14 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/structpy-tree}/compiler/bin/elisac}"
+STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 PROFILE="$ROOT/test/parity/profile_hooks.c"
 FIXTURE="$ROOT/test/repro/pattern_binding_scope.elisa"
 
-[[ -x "$STAGE1" ]] || { echo "pattern-binding scope smoke SKIP: no stage1 at $STAGE1" >&2; exit 0; }
-[[ -f "$RUNTIME" ]] || { echo "pattern-binding scope smoke SKIP: no runtime object at $RUNTIME" >&2; exit 0; }
+[[ -x "$STAGE1" ]] || { echo "pattern-binding scope smoke FAIL: no stage1 at $STAGE1" >&2; exit 1; }
+[[ -f "$RUNTIME" ]] || { echo "pattern-binding scope smoke FAIL: no runtime object at $RUNTIME" >&2; exit 1; }
 
 clang -c -O2 -o "$WORK/profile_hooks.o" "$PROFILE"
 

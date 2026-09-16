@@ -16,8 +16,8 @@ set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="$ROOT/scripts/elisac_stage1.sh"
 RT="$ROOT/build/runtime/elisacore_runtime.o"
-[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "query_head_ambiguity SKIP: no stage1 binary"; exit 0; }
-[ -f "$RT" ] || { echo "query_head_ambiguity SKIP: no runtime object"; exit 0; }
+[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "query_head_ambiguity FAIL: no stage1 binary" >&2; exit 1; }
+[ -f "$RT" ] || { echo "query_head_ambiguity FAIL: no runtime object" >&2; exit 1; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 pass=0; total=0

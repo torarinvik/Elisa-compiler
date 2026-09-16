@@ -3,7 +3,7 @@
 # test/breadth/malformed_input_fuzz.py for what this found and why nothing else could.
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "malformed_input SKIP: no stage1 binary"; exit 0; }
+[ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "malformed_input FAIL: no stage1 binary" >&2; exit 1; }
 out="$(REPO_ROOT="$ROOT" python3 "$ROOT/test/breadth/malformed_input_fuzz.py" 2>&1)"
 status=$?
 if [ "$status" -ne 0 ]; then
