@@ -1,0 +1,227 @@
+# docs/127 §3.6 — the audit surface, as one section of `-emit unsafe` (stage0's
+# unsafe_report_externs.go).
+#
+# Every obligation an extern's signature creates gets a row: the parameter (or `result`), the
+# KIND of obligation its type forms, and the EVIDENCE tag that discharges it. The tags are the
+# four the analyzer already distinguishes for `requires` — proven, checked, assumed — plus
+# `untyped`, which is not evidence at all: it means no obligation could be formed, and it is
+# exactly what `-strict-externs` refuses.
+#
+# The two counts and the rows are held byte-identical with stage0, so the classification here
+# reads the SAME predicates the D1/D5/D12 checks read (check_extern_contract.elisa). That is the
+# point rather than an economy: a report that disagreed with the gate would be worse than none.
+# The measured trap: a reference to an `extern resource` is NOT an opaque handle — both
+# compilers demand contract coverage for `fflush(file: CFile&, ...)` — so only a ref to a
+# non-callable `extern Name` reads as `handle`.
+
+
+# Escape only a backslash and a double quote. stage0 deliberately does not use Go's strconv.Quote
+# here, because matching its escape table for every non-printable rune would be the only hard
+# part of this line; a reason is a human sentence and two rules is the whole grammar.
+def unsafe_extern_quote(buffer: mutable darray[u8]&, text: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    buffer.push(34)
+    for index in 0..<sview_len(text) |buffer, text|:
+        byte: u8 = sview_at(text, index)
+        buffer.push(92) if byte == 34 or byte == 92
+        buffer.push(byte)
+    buffer.push(34)
+
+
+def unsafe_extern_annotation_present(annotations: darray[Ast::EnumAnnotation]&, owner: sview, name: sview, line: u32) -> bool can[Abort.Panic]:
+    return any annotation in annotations where annotation.owner == owner and annotation.name == name and annotation.line == line
+
+
+def unsafe_extern_name_listed(names: darray[sview]&, wanted: sview) -> bool can[Abort.Panic]:
+    return any listed in names where listed == wanted
+
+
+# `extern resource Name` records itself as an `__extern_resource` annotation owned by the type
+# name. A resource passed BY VALUE is the handle itself; a reference to one is an ordinary
+# pointer (see the header note).
+def unsafe_extern_is_resource(type_name: sview, annotations: darray[Ast::EnumAnnotation]&) -> bool can[Abort.Panic]:
+    return any annotation in annotations where annotation.name == "__extern_resource" and annotation.owner == type_name
+
+
+def unsafe_extern_param_kind(param: Ast::ExternParam&, extern_line: u32, opaque_names: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&) -> sview can[Abort.Panic]:
+    # `@bounds(ptr, len)` rewrote the pair into one view before the type was built, so the row
+    # already reads as a view; the annotation is what keeps the two distinguishable.
+    "bounds" return if unsafe_extern_annotation_present(annotations, param.name, "__bounds_ptr", extern_line)
+    "view" return if param.type_name == "view"
+    if param.is_ref:
+        "handle" return if unsafe_extern_name_listed(opaque_names, param.type_name)
+        return "pointer"
+    "pointer" return if param.type_name == "cstr"
+    "handle" return if unsafe_extern_name_listed(opaque_names, param.type_name)
+    "handle" return if unsafe_extern_is_resource(param.type_name, annotations)
+    "void" return if param.type_name == "void"
+    return "scalar"
+
+
+# A returned handle is `owned`: the caller must release it, which is a stronger obligation than
+# borrowing one through a parameter (D3).
+def unsafe_extern_return_kind(extern_name: sview, return_type_name: sview, extern_line: u32, opaque_names: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&) -> sview can[Abort.Panic]:
+    returns_pointer: bool = unsafe_extern_annotation_present(annotations, "__extern_return_ptr", extern_name, extern_line)
+    "void" return if return_type_name == "" or (return_type_name == "void" and not returns_pointer)
+    "view" return if return_type_name == "view"
+    if returns_pointer:
+        "owned" return if unsafe_extern_name_listed(opaque_names, return_type_name)
+        return "pointer"
+    "pointer" return if return_type_name == "cstr"
+    "owned" return if unsafe_extern_name_listed(opaque_names, return_type_name)
+    "owned" return if unsafe_extern_is_resource(return_type_name, annotations)
+    return "scalar"
+
+
+# The rule the report and `-strict-externs` share. `@trusted` assumes everything, which is the
+# point of it: one annotation, one reason, every row marked. Otherwise a type that bounds its own
+# extent is proven, a pointer named by a contract clause is checked at each call site, and a
+# pointer named by nothing is untyped — the row the gate refuses.
+def unsafe_extern_evidence(kind: sview, trusted: bool, covered: bool, contracted: bool) -> sview:
+    "assumed" return if trusted
+    if kind == "pointer":
+        return "checked" if covered else "untyped"
+    if kind == "handle" or kind == "owned" or kind == "view" or kind == "bounds":
+        return "checked" if covered else "proven"
+    return "checked" if covered and contracted else "proven"
+
+
+# Collect the externs, flattening modules and scoped blocks the way collect_extern_opaque_names
+# does. Parallel columns rather than a row struct: the report's buffer outlives the walk, and a
+# darray of structs built here would be adopted by a shorter-lived region.
+def unsafe_extern_collect(declarations: darray[Ast::Decl], export_markers: darray[sview]&, module: sview, owner_storage: mutable darray[u8]&, names: mutable darray[sview]&, lines: mutable darray[u32]&, param_starts: mutable darray[u32]&, arities: mutable darray[u32]&, return_types: mutable darray[sview]&, trusted_flags: mutable darray[bool]&, trusted_reasons: mutable darray[sview]&, contracted_flags: mutable darray[bool]&, signature_contract_lines: darray[u32]&, annotation_args: darray[sview]&, file_annotations: darray[Ast::EnumAnnotation]&) -> void can[Abort.Panic, Memory.Allocate]:
+    for declaration in declarations |export_markers, module, owner_storage, names, lines, param_starts, arities, return_types, trusted_flags, trusted_reasons, contracted_flags, signature_contract_lines, annotation_args, file_annotations|:
+        match declaration:
+            Decl.Extern(name, param_start, arity, variadic, callable, return_type_name, decorators, line):
+                # A non-callable `extern Name` is an opaque handle type, not a boundary.
+                continue if not callable
+                # `export fn name(...) = target` shares Decl.Extern with a real foreign import
+                # in stage1, and the `__export_fn` marker is what tells them apart. An export is
+                # the opposite direction — it PUBLISHES an Elisa function under a C symbol and
+                # calls nothing foreign — so it creates no inbound obligation and stage0's
+                # report has no row for it. Listing them made four export-only fixtures report
+                # externs where stage0 reported none.
+                continue if unsafe_extern_name_listed(export_markers, name)
+                trusted: mutable bool = false
+                reason: mutable sview = ""
+                for decorator in decorators |trusted, reason, annotation_args|:
+                    continue if decorator.name != "trusted"
+                    trusted <- true
+                    reason <- annotation_args[decorator.arg_start.usize()] if decorator.arg_count > 0
+                # Namespace-qualified with ".", the spelling the `functions:` section already
+                # uses (`Net.send_bytes`). A binding family normally lives in one module, so an
+                # unqualified row would collide the moment two modules export the same C name.
+                names.push(unsafe_qualified_name(name, module, owner_storage))
+                lines.push(line.line)
+                param_starts.push(param_start)
+                arities.push(arity)
+                return_types.push(return_type_name)
+                trusted_flags.push(trusted)
+                trusted_reasons.push(reason)
+                contracted_flags.push(Semantic::extern_report_has_signature_contract(line.line, signature_contract_lines, file_annotations))
+            Decl.Module(module_name, module_body, module_line):
+                # Compose, so a module inside a module reads `outer.inner.name` — the same path
+                # stage0's walker builds by joining each namespace onto the one above it.
+                nested_module: sview = unsafe_qualified_name(module_name, module, owner_storage)
+                unsafe_extern_collect(module_body, export_markers, nested_module, owner_storage, names, lines, param_starts, arities, return_types, trusted_flags, trusted_reasons, contracted_flags, signature_contract_lines, annotation_args, file_annotations)
+            Decl.Scoped(scoped_body, scoped_line):
+                unsafe_extern_collect(scoped_body, export_markers, module, owner_storage, names, lines, param_starts, arities, return_types, trusted_flags, trusted_reasons, contracted_flags, signature_contract_lines, annotation_args, file_annotations)
+            _:
+                pass
+
+
+def unsafe_emit_extern_row(buffer: mutable darray[u8]&, row_name: sview, kind: sview, tag: sview) -> void can[Abort.Panic, Memory.Allocate]:
+    emit_tokens_push_sview(buffer, "    ")
+    emit_tokens_push_sview(buffer, row_name)
+    emit_tokens_push_sview(buffer, ": ")
+    emit_tokens_push_sview(buffer, kind)
+    buffer.push(32)
+    emit_tokens_push_sview(buffer, tag)
+    buffer.push(10)
+
+
+# The two counts lead so a budget can key on them without parsing rows, and together they are
+# exactly what `-strict-externs` refuses: an `untyped` row (D1/D12, reported at the parameter) or
+# a `bare` extern (the older whole-extern rule, reported at the declaration). Both zero means the
+# family passes the gate.
+def unsafe_emit_extern_report(buffer: mutable darray[u8]&, file: Ast::File&, selected_declarations: darray[Ast::Decl], export_markers: darray[sview]&, owner_storage: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate]:
+    # The SELECTED declarations, not file.top_decls: a report is about the program that will be
+    # emitted, and a `static if` branch for another target declares externs this build will
+    # never call. Reading top_decls listed five Win32 externs on macOS (GetCurrentProcess,
+    # VirtualAllocEx, ...) that stage0's report does not have, because stage0's semantic pass
+    # selects branches before summarising. The rest of this report already goes through the
+    # same selector; this section had bypassed it.
+    opaque_names: mutable darray[sview] = []
+    Semantic::extern_report_collect_opaque_names(selected_declarations, &opaque_names)
+    names: mutable darray[sview] = []
+    lines: mutable darray[u32] = []
+    param_starts: mutable darray[u32] = []
+    arities: mutable darray[u32] = []
+    return_types: mutable darray[sview] = []
+    trusted_flags: mutable darray[bool] = []
+    trusted_reasons: mutable darray[sview] = []
+    contracted_flags: mutable darray[bool] = []
+    unsafe_extern_collect(selected_declarations, export_markers, "", owner_storage, &names, &lines, &param_starts, &arities, &return_types, &trusted_flags, &trusted_reasons, &contracted_flags, file.signature_contract_lines, file.annotation_args, file.enum_annotations)
+
+    untyped_total: mutable u32 = 0
+    bare_total: mutable u32 = 0
+    for index in 0..<names.count |untyped_total, bare_total, names, lines, param_starts, arities, return_types, trusted_flags, contracted_flags, opaque_names, file|:
+        bare_total <- bare_total + 1 if not trusted_flags[index] and not contracted_flags[index]
+        for position in 0..<arities[index] |untyped_total, lines, param_starts, index, trusted_flags, contracted_flags, opaque_names, file|:
+            slot: usize = (param_starts[index] + position).usize()
+            continue if slot >= file.extern_params.count
+            param_kind: sview = unsafe_extern_param_kind(&file.extern_params[slot], lines[index], opaque_names, file.enum_annotations)
+            param_covered: bool = Semantic::extern_report_contract_names_param(lines[index], file.signature_contract_lines, file.signature_contract_exprs, file.extern_params[slot].name)
+            untyped_total <- untyped_total + 1 if unsafe_extern_evidence(param_kind, trusted_flags[index], param_covered, contracted_flags[index]) == "untyped"
+        result_kind: sview = unsafe_extern_return_kind(names[index], return_types[index], lines[index], opaque_names, file.enum_annotations)
+        result_covered: bool = Semantic::extern_report_contract_names_param(lines[index], file.signature_contract_lines, file.signature_contract_exprs, "result")
+        untyped_total <- untyped_total + 1 if unsafe_extern_evidence(result_kind, trusted_flags[index], result_covered, result_covered) == "untyped"
+
+    emit_tokens_push_sview(buffer, "extern-untyped: ")
+    append_decimal(buffer, untyped_total)
+    buffer.push(10)
+    emit_tokens_push_sview(buffer, "extern-bare: ")
+    append_decimal(buffer, bare_total)
+    buffer.push(10)
+    if names.count == 0:
+        emit_tokens_push_sview(buffer, "extern-obligations: none\n")
+        return
+    emit_tokens_push_sview(buffer, "extern-obligations:\n")
+    # Alphabetical by name, bytewise, which is how stage0 sorts the same list.
+    emitted: mutable darray[usize] = []
+    for _round in 0..<names.count |buffer, names, lines, param_starts, arities, return_types, trusted_flags, trusted_reasons, contracted_flags, opaque_names, emitted, file|:
+        best: mutable usize = 0
+        found: mutable bool = false
+        for candidate in 0..<names.count |best, found, names, emitted|:
+            already: mutable bool = false
+            for done in emitted |already, candidate|:
+                already <- true if done == candidate
+            continue if already
+            if not found or unsafe_name_less(names[candidate], names[best]):
+                best <- candidate
+                found <- true
+        break if not found
+        emitted.push(best)
+        emit_tokens_push_sview(buffer, "  ")
+        emit_tokens_push_sview(buffer, names[best])
+        buffer.push(32)
+        if trusted_flags[best]:
+            emit_tokens_push_sview(buffer, "trusted(")
+            unsafe_extern_quote(buffer, trusted_reasons[best])
+            emit_tokens_push_sview(buffer, ")")
+        else:
+            # Bound first: keep the branch separate from the indexed flag. This also keeps
+            # the report source compatible with older stage0 parsers while the newest parser
+            # is bootstrapping this file.
+            header_state: mutable sview = "bare"
+            header_state <- "contract" if contracted_flags[best]
+            emit_tokens_push_sview(buffer, header_state)
+        emit_tokens_push_sview(buffer, ":\n")
+        for position in 0..<arities[best] |buffer, lines, param_starts, best, trusted_flags, contracted_flags, opaque_names, file|:
+            slot: usize = (param_starts[best] + position).usize()
+            continue if slot >= file.extern_params.count
+            param_kind: sview = unsafe_extern_param_kind(&file.extern_params[slot], lines[best], opaque_names, file.enum_annotations)
+            param_covered: bool = Semantic::extern_report_contract_names_param(lines[best], file.signature_contract_lines, file.signature_contract_exprs, file.extern_params[slot].name)
+            unsafe_emit_extern_row(buffer, file.extern_params[slot].name, param_kind, unsafe_extern_evidence(param_kind, trusted_flags[best], param_covered, contracted_flags[best]))
+        result_kind: sview = unsafe_extern_return_kind(names[best], return_types[best], lines[best], opaque_names, file.enum_annotations)
+        result_covered: bool = Semantic::extern_report_contract_names_param(lines[best], file.signature_contract_lines, file.signature_contract_exprs, "result")
+        unsafe_emit_extern_row(buffer, "result", result_kind, unsafe_extern_evidence(result_kind, trusted_flags[best], result_covered, result_covered))
