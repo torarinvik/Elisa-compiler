@@ -67,4 +67,59 @@ for name, decls in rejected.items():
     assert all(r.returncode != 0 for r in results), (name, [(r.returncode, r.stderr) for r in results])
     assert results[0].stderr == results[1].stderr, (name, results[0].stderr, results[1].stderr)
     print(f'{name}: stage0/stage1 byte-identical rejection PASS', flush=True)
+
+# The C plan SPLITS a view argument into (pointer, length), so it holds only when the emitted
+# value really is that aggregate. A packed enum's `tail` payload bound in a match is where the
+# two compilers disagree about the bound value's shape: stage0 binds the view
+# (`%items = alloca %DynArrayView`) and compiles a correct program; stage1 binds a bare `ptr`,
+# and extracting field 0 from a non-aggregate built an LLVM instruction with a NULL type and
+# then named it -- dereferencing null INSIDE LLVM and SEGFAULTING the compiler (rc 139). The
+# same call without `@callconv(c)` only declined, so the C plan was the whole difference.
+#
+# What this pins is the invariant that survives the feature gap: NEITHER compiler may crash.
+# stage0 accepts and answers 6 (1+2+3 summed on the C side); stage1 declines and names the
+# function. That decline is a real gap -- stage1 has no packed tail-view binding, which also
+# makes `items.len` decline -- not a rule stage1 is enforcing, so it is asserted as a decline
+# and not as a rejection.
+TAIL_VIEW = """packed enum Blob:
+    Bytes(items: tail f32)
+
+@callconv(c)
+extern take_view(xs: view[f32]) -> i64
+
+def through_c(node: Blob, store: Blob.Store[Local]) -> i64:
+    in store:
+        match node:
+            Blob.Bytes(items: items):
+                return take_view(items)
+
+def main() -> i64:
+    region scratch(1024)
+    store: Blob.Store[Local] = Blob.Store(scratch)
+    in store:
+        node: Blob = new Blob.Bytes(items: [1.0, 2.0, 3.0])
+        out: i64 = through_c(node, store)
+        destroy scratch
+        return out
+"""
+src = work / 'tail_view.elisa'; src.write_text(TAIL_VIEW)
+sumf = work / 'sumf.c'
+sumf.write_text('#include <stdint.h>\n'
+                'int64_t take_view(const float *xs, int64_t n) {\n'
+                '    int64_t total = 0;\n'
+                '    for (int64_t i = 0; i < n; i++) total += (int64_t)xs[i];\n'
+                '    return total;\n}\n')
+subprocess.run(['clang', '-c', '-O0', '-o', str(work / 'sumf.o'), str(sumf)], check=True)
+tail_results = [subprocess.run([c, '-emit', 'obj', '-O0', '-o', str(work / f'tail{stage}.o'), str(src)],
+                               capture_output=True, timeout=60) for stage, c in enumerate((stage0, stage1))]
+for stage, r in enumerate(tail_results):
+    assert r.returncode not in (139, -11), (f'stage{stage} CRASHED on a packed tail view crossing to C', r.returncode)
+assert tail_results[0].returncode == 0, ('stage0 must still compile the tail view', tail_results[0].stderr)
+tail_exe = work / 'tail0'
+subprocess.run(['clang', '-Wl,-dead_strip', '-o', str(tail_exe), str(work / 'tail0.o'), str(work / 'sumf.o'),
+                str(work / 'hooks.o'), str(root / 'build/runtime/elisacore_runtime.o')], check=True)
+assert subprocess.run([str(tail_exe)], timeout=90).returncode == 6, 'stage0 tail view must sum 1+2+3 through C'
+assert tail_results[1].returncode != 0, 'stage1 gained packed tail-view binding; promote this to a parity check'
+assert b'declined' in tail_results[1].stderr and b'through_c' in tail_results[1].stderr, tail_results[1].stderr
+print('extern_view_tail: stage0 runtime 6, stage1 declines by name, neither crashes PASS', flush=True)
 PY
