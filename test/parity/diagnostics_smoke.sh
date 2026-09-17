@@ -213,6 +213,10 @@ NAMES=(
     value_block_scope_order
     value_block_shadow_declares
     rebind_discard_target
+    static_string_binding_return
+    static_string_binding_argument
+    static_string_binding_declaration
+    static_string_binding_ternary
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -392,6 +396,10 @@ EXPECTS=(
     "undefined identifier \"z\""
     "value block may not mutate the outer binding \"x\" (docs/119 E4)"
     "undefined assignment target \"_\" (use = to introduce a new local; <- requires an existing mutable target)"
+    "return type expects sview, got static u8&"
+    "argument 1 to \"take\" expects sview, got static u8&"
+    "variable \"t\" expects sview, got static u8&"
+    "ternary branches are incompatible: static u8& and sview"
 )
 
 total=0

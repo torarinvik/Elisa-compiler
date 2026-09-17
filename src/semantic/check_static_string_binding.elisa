@@ -1,0 +1,606 @@
+# An UNANNOTATED binding of a string literal is not an `sview`. stage0 gives `s = "zero"` the
+# literal's STORAGE type, `static u8&`, and a direct literal escapes that only because its
+# destination types it in place. So the binding, not the literal, is what a typed slot rejects:
+#
+#     return "zero"                 accepted   (contextually typed)
+#     s = "zero"; return s          "return type expects sview, got static u8&"
+#
+# stage1 typed neither, so every such program reached the backend: `return s` declined the
+# function, `g(s)` built invalid IR ("Call parameter type does not match function signature"),
+# and `t: sview = s`, `P{name: s}`, `xs: darray[sview] = [s]` and a `-> sview?` return were
+# ACCEPTED. MEASURED against stage0, one probe per row:
+#
+#   binding forms that are `static u8&`: a literal, `(lit)`, `lit if c else lit`, a value block
+#     / match / `when` whose every tail is one, another such binding, and a top-level
+#     `const S = "zero"`. A loop-header accumulator `|acc = "zero"|` is `static MUTABLE u8&`.
+#     `"zero" if c else v` with `v: sview` is sview (accepted) -- one non-literal leaf is enough.
+#   targets that reject it: sview, sview?, dstr (spelled `darray[u8]`), and every scalar but u8.
+#     cstr, u8, u8&, `static u8&` and a generic `T` accept it.
+#   sites: return, a typed declaration, `<-` into a typed local, a direct call argument
+#     (positional or named), a struct literal field, a typed darray literal element.
+#
+# SOUNDNESS: a lookup resolves a name only while the path back to its binding crosses no scope
+# whose binders this walk cannot enumerate (match/catch arms, a condition that is not plainly
+# binder-free). Such a scope pushes a BARRIER row (name "") and the lookup stops there, so an
+# arm binder that shadows an outer `s` can never be misread as the static binding. A second
+# `s = …` for a name already bound is recorded unknown -- stage0 reports "duplicate local"
+# there instead. A compiler-generated `__name` is never recorded static.
+
+extend Semantic:
+    private:
+        # stage0's spelling of a declared type that can NOT hold a `static u8&`, or "" when it
+        # can (or when the type is unmodeled). Every arm returns a literal, never the argument:
+        # a Diagnostic may only carry source or static sviews.
+        def static_string_target(type_name: sview) -> sview:
+            return when type_name:
+                "sview" -> "sview"
+                "sview?" -> "sview?"
+                "dstr" -> "darray[u8]"
+                "i8" -> "i8"
+                "i16" -> "i16"
+                "i32" -> "i32"
+                "i64" -> "i64"
+                "int" -> "int"
+                "isize" -> "isize"
+                "u16" -> "u16"
+                "u32" -> "u32"
+                "u64" -> "u64"
+                "usize" -> "usize"
+                "uintptr" -> "uintptr"
+                "f32" -> "f32"
+                "f64" -> "f64"
+                "bool" -> "bool"
+                "char" -> "char"
+                _ -> ""
+
+        # The rejecting spelling of an annotation (sees through `mutable`; `sview?` is the one
+        # optional modeled), "" for anything that accepts or is not modeled.
+        def static_annotation_target(type_expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, _):
+                        static_annotation_target(operand) return if operator == TokenKind.Mutable
+                        "sview?" return if operator == TokenKind.Question and bare_type_name(operand) == "sview"
+                        return ""
+                    Expr.Ident(type_name, _):
+                        return static_string_target(type_name)
+                    _:
+                        return ""
+
+        # A condition that cannot introduce a binding into the branch it guards. Anything
+        # outside this whitelist (an `is` pattern, a value block, a lambda, …) is treated as
+        # binding, and the branch gets a barrier.
+        def static_binder_free(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(_, _):
+                        return true
+                    Expr.FloatLit(_, _):
+                        return true
+                    Expr.StringLit(_, _):
+                        return true
+                    Expr.CharLit(_, _):
+                        return true
+                    Expr.BoolLit(_, _):
+                        return true
+                    Expr.Ident(_, _):
+                        return true
+                    Expr.Scope(_, _, _):
+                        return true
+                    Expr.ShorthandMember(_, _):
+                        return true
+                    Expr.Field(object, _, _):
+                        return static_binder_free(object)
+                    Expr.Index(object, index, _):
+                        return static_binder_free(object) and static_binder_free(index)
+                    Expr.Paren(inner, _):
+                        return static_binder_free(inner)
+                    Expr.Unary(operator, operand, _):
+                        return operator != TokenKind.Question and static_binder_free(operand)
+                    Expr.Binary(left, operator, right, _):
+                        return operator != TokenKind.Is and operator != TokenKind.As and static_binder_free(left) and static_binder_free(right)
+                    Expr.Call(callee, arguments, _, _):
+                        return static_binder_free(callee) and (all argument in arguments where static_binder_free(argument))
+                    _:
+                        return false
+
+        def static_push_row(name: sview, spelling: sview, target: sview, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names.push(name)
+                spellings.push(spelling)
+                targets.push(target)
+
+        def static_close_scope(mark: usize, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&) -> void:
+            can Abort.Panic:
+                names.truncate(mark)
+                spellings.truncate(mark)
+                targets.truncate(mark)
+
+        # The static spelling bound to `name` ("static u8&" / "static mutable u8&"), or "".
+        # Stops at a barrier; an unbound name falls back to the string consts. `consts` holds
+        # (visible, module, name) TRIPLES: `visible` is "b" when the const is declared in the
+        # walked function's own module (the only bare spelling MEASURED to resolve).
+        def static_binding_spelling(name: sview, names: darray[sview]&, spellings: darray[sview]&, consts: darray[sview]&) -> sview:
+            can Abort.Panic:
+                while row > 0 |row: usize = names.count|:
+                    row <- row - 1
+                    "" return if names[row] == ""
+                    spellings[row] return if names[row] == name
+                while triple + 2 < consts.count |triple: usize = 0|:
+                    "static u8&" return if consts[triple] == "b" and consts[triple + 2] == name
+                    triple <- triple + 3
+                return ""
+
+        # `M::S` for a string const `S` declared in module `M`.
+        def static_scoped_const_spelling(base: Ast::Expr, name: sview, consts: darray[sview]&) -> sview:
+            can Abort.Panic:
+                module_name: sview = ident_name_of(base)
+                "" return if module_name == ""
+                while triple + 2 < consts.count |triple: usize = 0|:
+                    "static u8&" return if consts[triple + 1] == module_name and consts[triple + 2] == name
+                    triple <- triple + 3
+                return ""
+
+        # Pushes a match arm pattern's binders as unmodeled rows so they shadow outer names.
+        # Returns false for a pattern form it cannot see into; the caller then bars every
+        # outer name instead.
+        def static_push_pattern_binders(pattern: Ast::Pattern, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name):
+                        static_push_row(name, "", "", names, spellings, targets)
+                    Pattern.TypeBind(_, binder):
+                        static_push_row(binder, "", "", names, spellings, targets)
+                    Pattern.Rest(name):
+                        static_push_row(name, "", "", names, spellings, targets) if name != ""
+                    Pattern.As(name, inner):
+                        static_push_row(name, "", "", names, spellings, targets)
+                        return static_push_pattern_list(inner, names, spellings, targets)
+                    Pattern.Variant(_, fields):
+                        return static_push_pattern_list(fields, names, spellings, targets)
+                    Pattern.Struct(_, fields):
+                        return static_push_pattern_list(fields, names, spellings, targets)
+                    Pattern.Field(_, inner):
+                        return static_push_pattern_list(inner, names, spellings, targets)
+                    Pattern.Tuple(elements):
+                        return static_push_pattern_list(elements, names, spellings, targets)
+                    Pattern.Or(options):
+                        return static_push_pattern_list(options, names, spellings, targets)
+                    Pattern.Other(_):
+                        return false
+                    _:
+                        pass
+                return true
+
+        def static_push_pattern_list(patterns: darray[Ast::Pattern], names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                understood: mutable bool = true
+                for pattern in patterns |understood, names, spellings, targets|:
+                    understood <- static_push_pattern_binders(pattern, names, spellings, targets) and understood
+                return understood
+
+        # The rejecting spelling of the local `name`'s declared type, "" if untyped/unknown.
+        def static_declared_target(name: sview, names: darray[sview]&, targets: darray[sview]&) -> sview:
+            can Abort.Panic:
+                while row > 0 |row: usize = names.count|:
+                    row <- row - 1
+                    "" return if names[row] == ""
+                    targets[row] return if names[row] == name
+                return ""
+
+        # Joins two branch spellings. "lit" is a literal-only value (contextually typed at a
+        # use site); "mixed" joins literals with static bindings — static when BOUND, but a
+        # use site leaves it to the ternary check (stage0: "ternary branches are incompatible").
+        def static_join(left: sview, right: sview) -> sview:
+            "" return if left == "" or right == ""
+            "lit" return if left == "lit" and right == "lit"
+            "static u8&" return if left == "static u8&" and right == "static u8&"
+            left_static: bool = left == "lit" or left == "mixed" or left == "static u8&"
+            right_static: bool = right == "lit" or right == "mixed" or right == "static u8&"
+            "mixed" return if left_static and right_static
+            return ""
+
+        # Record the binding (if any) a statement introduces into the current scope. Shared by
+        # the diagnostic walk and by the pure value walk below, which replays a value block's
+        # leading statements to type its tail.
+        def record_static_binding(statement: Ast::Stmt, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement:
+                    Stmt.VarDecl(name, type_expression, value, pos):
+                        accumulator: bool = (type_expression is Expr.Invalid) and (any offset in accumulator_offsets where offset == pos.offset)
+                        accumulator_spelling: sview = static_value_spelling(value, names, spellings, targets, consts, accumulator_offsets) if accumulator else ""
+                        already_bound: bool = any bound_name in names where bound_name == name
+                        bound_static: bool = accumulator_spelling == "lit" or accumulator_spelling == "mixed" or accumulator_spelling == "static u8&"
+                        static_push_row(name, "static mutable u8&" if bound_static and not already_bound else "", static_annotation_target(type_expression), names, spellings, targets)
+                    Stmt.Assign(target, operator, value, pos):
+                        return if operator != TokenKind.Assign
+                        match target:
+                            Expr.Ident(name, _):
+                                value_spelling: sview = static_value_spelling(value, names, spellings, targets, consts, accumulator_offsets)
+                                recordable: bool = not (any bound_name in names where bound_name == name) and not sview_starts_with(name, "__")
+                                bound_static: bool = value_spelling == "lit" or value_spelling == "mixed" or value_spelling == "static u8&"
+                                # `r = for … |acc = "zero"| -> acc` keeps the accumulator's MUTABLE spelling.
+                                bound_spelling: sview = "static u8&" if bound_static else ("static mutable u8&" if value_spelling == "static mutable u8&" else "")
+                                static_push_row(name, bound_spelling if recordable else "", "", names, spellings, targets)
+                            Expr.Array(elements, _):
+                                for element in elements |names, spellings, targets|:
+                                    static_push_row(ident_name_of(element), "", "", names, spellings, targets) if ident_name_of(element) != ""
+                            Expr.Tuple(elements, _):
+                                for element in elements |names, spellings, targets|:
+                                    static_push_row(ident_name_of(element), "", "", names, spellings, targets) if ident_name_of(element) != ""
+                            _:
+                                pass
+                    _:
+                        pass
+
+        # The value tail of a match arm body, typed inside the arm's own scope (its pattern's
+        # binders shadow outer names).
+        def static_arm_spelling(arm: Ast::MatchArm, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                body: darray[Ast::Stmt] = arm.body
+                "" return if body.count == 0
+                arm_mark: usize = names.count
+                static_push_row("", "", "", names, spellings, targets) if not static_push_pattern_binders(arm.pattern, names, spellings, targets)
+                while statement_index + 1 < body.count |statement_index: usize = 0, names, spellings, targets|:
+                    record_static_binding(body[statement_index], names, spellings, targets, consts, accumulator_offsets)
+                    statement_index <- statement_index + 1
+                arm_spelling: mutable sview = ""
+                match body[body.count - 1]:
+                    Stmt.Expr(arm_tail, _):
+                        arm_spelling <- static_value_spelling(arm_tail, names, spellings, targets, consts, accumulator_offsets)
+                    _:
+                        pass
+                static_close_scope(arm_mark, names, spellings, targets)
+                return arm_spelling
+
+        # What an expression's VALUE is, for this check: "lit", "mixed", "static u8&",
+        # "static mutable u8&", or "" (anything else). Pure apart from the scope rows it pushes
+        # and truncates again.
+        def static_value_spelling(value: Ast::Expr, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.StringLit(_, _):
+                        return "lit"
+                    Expr.Paren(inner, _):
+                        return static_value_spelling(inner, names, spellings, targets, consts, accumulator_offsets)
+                    Expr.Ident(name, _):
+                        return static_binding_spelling(name, names, spellings, consts)
+                    Expr.Scope(scope_base, scope_name, _):
+                        return static_scoped_const_spelling(scope_base, scope_name, consts)
+                    Expr.If(condition, then_expr, else_expr, _):
+                        "" return if else_expr is Expr.Absent
+                        if_mark: usize = names.count
+                        static_push_row("", "", "", names, spellings, targets) if not static_binder_free(condition)
+                        then_spelling: sview = static_value_spelling(then_expr, names, spellings, targets, consts, accumulator_offsets)
+                        else_spelling: sview = static_value_spelling(else_expr, names, spellings, targets, consts, accumulator_offsets)
+                        static_close_scope(if_mark, names, spellings, targets)
+                        return static_join(then_spelling, else_spelling)
+                    Expr.Block(statements, block_tail, _, _):
+                        block_mark: usize = names.count
+                        for statement in statements |names, spellings, targets|:
+                            record_static_binding(statement, names, spellings, targets, consts, accumulator_offsets)
+                        tail_spelling: sview = static_value_spelling(block_tail, names, spellings, targets, consts, accumulator_offsets)
+                        static_close_scope(block_mark, names, spellings, targets)
+                        return tail_spelling
+                    Expr.Match(_, arms, _):
+                        "" return if arms.count == 0
+                        joined: mutable sview = static_arm_spelling(arms[0], names, spellings, targets, consts, accumulator_offsets)
+                        while arm_index < arms.count |arm_index: usize = 1, joined, names, spellings, targets|:
+                            joined <- static_join(joined, static_arm_spelling(arms[arm_index], names, spellings, targets, consts, accumulator_offsets))
+                            arm_index <- arm_index + 1
+                        return joined
+                    _:
+                        return ""
+
+        # A value's spelling at a USE site whose rejecting target is `target`: only a
+        # binding-derived static value is rejected. A value `if` joining a literal with a static
+        # binding is `static u8&` for every target but sview, where stage0 instead reports the
+        # branches as incompatible (static_ternary_pair) — MEASURED for sview/sview?/dstr/f64/bool.
+        def static_use_spelling(value: Ast::Expr, target: sview, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                "" return if target == ""
+                spelling: sview = static_value_spelling(value, names, spellings, targets, consts, accumulator_offsets)
+                spelling return if spelling == "static u8&" or spelling == "static mutable u8&"
+                "static u8&" return if spelling == "mixed" and target != "sview" and (value is Expr.If(_, _, _, _))
+                return ""
+
+        # `return s if c else "x"` into an sview: the literal branch takes sview from the target,
+        # the binding stays `static u8&`, and stage0 rejects the pair at the `if` — MEASURED at
+        # return, declaration, argument, assignment, struct field and darray element sites. Only
+        # a direct literal/binding pair is modeled; a nested mixed ternary stays silent.
+        def static_ternary_pair(value: Ast::Expr, target: sview, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if target != "sview"
+                match value:
+                    Expr.If(condition, then_expr, else_expr, if_pos):
+                        return if else_expr is Expr.Absent
+                        pair_mark: usize = names.count
+                        static_push_row("", "", "", names, spellings, targets) if not static_binder_free(condition)
+                        then_spelling: sview = static_value_spelling(then_expr, names, spellings, targets, consts, accumulator_offsets)
+                        else_spelling: sview = static_value_spelling(else_expr, names, spellings, targets, consts, accumulator_offsets)
+                        static_close_scope(pair_mark, names, spellings, targets)
+                        then_word: sview = "sview" if then_spelling == "lit" else ("static u8&" if then_spelling == "static u8&" else "")
+                        else_word: sview = "sview" if else_spelling == "lit" else ("static u8&" if else_spelling == "static u8&" else "")
+                        table <- static_report(Diagnostic{kind: DiagnosticKind.TernaryBranchMismatch, name: "", pos: if_pos, line: if_pos.line, expected: then_word, actual: else_word}, table) if then_word != "" and else_word != "" and then_word != else_word
+                    _:
+                        pass
+
+        # An `A | B:` header fans out into one arm per alternative sharing one body, so the
+        # same site is walked once per alternative; stage0 reports it once.
+        def static_report(diagnostic: Diagnostic, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                repeated: bool = any reported in table.diagnostics where reported.kind == diagnostic.kind and reported.pos.offset == diagnostic.pos.offset and reported.pos.line == diagnostic.pos.line and reported.name == diagnostic.name and reported.expected == diagnostic.expected and reported.actual == diagnostic.actual
+                table.diagnostics <- table.diagnostics.push(diagnostic) if not repeated
+
+        def check_static_call_arguments(function_name: sview, arguments: darray[Ast::Expr], argument_names: darray[sview], call_pos: Ast::Pos, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                while argument_index < arguments.count |argument_index: usize = 0, table, names, spellings, targets|:
+                    position: int = function_parameter_index(table, function_name, argument_names[argument_index]) if argument_names[argument_index] != "" else argument_index.int()
+                    parameter_target: sview = static_string_target(function_parameter_type_at_firm(table, function_name, position.usize())) if position >= 0 else ""
+                    argument_spelling: sview = static_use_spelling(arguments[argument_index], parameter_target, names, spellings, targets, consts, accumulator_offsets) if parameter_target != "" else ""
+                    table <- static_report(Diagnostic{kind: DiagnosticKind.FirmArgTypeMismatch, name: function_name, pos: Ast::expr_pos(arguments[argument_index]), line: call_pos.line, expected: parameter_target, actual: argument_spelling, expected_count: (position + 1).u32()}, table) if argument_spelling != ""
+                    table <- static_ternary_pair(arguments[argument_index], parameter_target, names, spellings, targets, consts, accumulator_offsets, table)
+                    argument_index <- argument_index + 1
+
+        def walk_static_expressions(expressions: darray[Ast::Expr], names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for expression in expressions |table, names, spellings, targets|:
+                    table <- walk_static_expression(expression, names, spellings, targets, consts, accumulator_offsets, table)
+
+        def walk_static_arms(arms: darray[Ast::MatchArm], return_target: sview, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for arm in arms |table, names, spellings, targets|:
+                    arm_mark: usize = names.count
+                    static_push_row("", "", "", names, spellings, targets) if not static_push_pattern_binders(arm.pattern, names, spellings, targets)
+                    table <- walk_static_expression(arm.guard, names, spellings, targets, consts, accumulator_offsets, table)
+                    table <- walk_static_statements(arm.body, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                    static_close_scope(arm_mark, names, spellings, targets)
+
+        # Finds the call-argument and struct-literal sites nested anywhere in an expression.
+        # A nested value `return` (a lambda body) has no enclosing return type of its own here.
+        def walk_static_expression(expression: Ast::Expr, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        callee_name: sview = ident_name_of(callee)
+                        # A local of the callee's spelling (a lambda) is not the function.
+                        callee_is_local: bool = callee_name != "" and (any bound_name in names where bound_name == callee_name)
+                        table <- check_static_call_arguments(callee_name, arguments, argument_names, call_pos, names, spellings, targets, consts, accumulator_offsets, table) if callee_name != "" and not callee_is_local and direct_function_count(table, callee_name) == 1
+                        table <- walk_static_expression(callee, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expressions(arguments, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        struct_name: sview = ident_name_of(type_expression)
+                        for field in fields |table, names, spellings, targets|:
+                            field_target: sview = static_string_target(field_type_of(table, struct_name, field.name)) if struct_name != "" and field.name != "" else ""
+                            field_spelling: sview = static_use_spelling(field.value, field_target, names, spellings, targets, consts, accumulator_offsets) if field_target != "" else ""
+                            table <- static_report(Diagnostic{kind: DiagnosticKind.ConstructFieldTypeMismatch, name: field.name, pos: Ast::expr_pos(field.value), line: construct_pos.line, expected: field_target, actual: field_spelling}, table) if field_spelling != ""
+                            table <- static_ternary_pair(field.value, field_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            table <- walk_static_expression(field.value, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.RecordUpdate(base, fields, _):
+                        table <- walk_static_expression(base, names, spellings, targets, consts, accumulator_offsets, table)
+                        for field in fields |table, names, spellings, targets|:
+                            table <- walk_static_expression(field.value, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Binary(left, operator, right, _):
+                        table <- walk_static_expression(left, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expression(right, names, spellings, targets, consts, accumulator_offsets, table) if operator != TokenKind.Is and operator != TokenKind.As
+                    Expr.Unary(_, operand, _):
+                        table <- walk_static_expression(operand, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Move(operand, _):
+                        table <- walk_static_expression(operand, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.RegionNew(operand, _, _):
+                        table <- walk_static_expression(operand, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Paren(inner, _):
+                        table <- walk_static_expression(inner, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Field(object, _, _):
+                        table <- walk_static_expression(object, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Index(object, index, _):
+                        table <- walk_static_expression(object, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expression(index, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Slice(object, low, high, _):
+                        table <- walk_static_expression(object, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expression(low, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expression(high, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.IndexN(object, arguments, _):
+                        table <- walk_static_expression(object, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expressions(arguments, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Array(elements, _):
+                        table <- walk_static_expressions(elements, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Tuple(elements, _):
+                        table <- walk_static_expressions(elements, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.SetLit(elements, _):
+                        table <- walk_static_expressions(elements, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |table, names, spellings, targets|:
+                            table <- walk_static_expression(entry.key, names, spellings, targets, consts, accumulator_offsets, table)
+                            table <- walk_static_expression(entry.value, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.If(condition, then_expr, else_expr, _):
+                        table <- walk_static_expression(condition, names, spellings, targets, consts, accumulator_offsets, table)
+                        if_mark: usize = names.count
+                        static_push_row("", "", "", names, spellings, targets) if not static_binder_free(condition)
+                        table <- walk_static_expression(then_expr, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expression(else_expr, names, spellings, targets, consts, accumulator_offsets, table)
+                        static_close_scope(if_mark, names, spellings, targets)
+                    Expr.Match(scrutinee, arms, _):
+                        table <- walk_static_expression(scrutinee, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_arms(arms, "", names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Catch(guarded, arms, _):
+                        table <- walk_static_expression(guarded, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_arms(arms, "", names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.Comprehension(variable, iterable, condition, body, _):
+                        table <- walk_static_expression(iterable, names, spellings, targets, consts, accumulator_offsets, table)
+                        comprehension_mark: usize = names.count
+                        static_push_row(variable, "", "", names, spellings, targets)
+                        table <- walk_static_expression(condition, names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expression(body, names, spellings, targets, consts, accumulator_offsets, table)
+                        static_close_scope(comprehension_mark, names, spellings, targets)
+                    Expr.Refinement(base, _, _):
+                        table <- walk_static_expression(base, names, spellings, targets, consts, accumulator_offsets, table)
+                    Expr.GetElse(guarded, recovery, _):
+                        table <- walk_static_expression(guarded, names, spellings, targets, consts, accumulator_offsets, table)
+                        recovery_mark: usize = names.count
+                        table <- walk_static_statements(recovery, "", names, spellings, targets, consts, accumulator_offsets, table)
+                        static_close_scope(recovery_mark, names, spellings, targets)
+                    Expr.Lambda(parameters, body, _):
+                        lambda_mark: usize = names.count
+                        for parameter in parameters |names, spellings, targets|:
+                            static_push_row(parameter, "", "", names, spellings, targets)
+                        table <- walk_static_statements(body, "", names, spellings, targets, consts, accumulator_offsets, table)
+                        static_close_scope(lambda_mark, names, spellings, targets)
+                    Expr.Block(statements, block_tail, _, _):
+                        block_mark: usize = names.count
+                        table <- walk_static_statements(statements, "", names, spellings, targets, consts, accumulator_offsets, table)
+                        table <- walk_static_expression(block_tail, names, spellings, targets, consts, accumulator_offsets, table)
+                        static_close_scope(block_mark, names, spellings, targets)
+                    _:
+                        pass
+
+        # A typed darray literal: `xs: darray[sview] = [s]` checks each element.
+        def check_static_darray_elements(type_expression: Ast::Expr, value: Ast::Expr, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, _):
+                        table <- check_static_darray_elements(operand, value, names, spellings, targets, consts, accumulator_offsets, table) if operator == TokenKind.Mutable
+                    Expr.Index(head, element_type, _):
+                        return if ident_name_of(head) != "darray"
+                        element_target: sview = static_annotation_target(element_type)
+                        return if element_target == ""
+                        match value:
+                            Expr.Array(elements, _):
+                                for element in elements |table, names, spellings, targets|:
+                                    element_spelling: sview = static_use_spelling(element, element_target, names, spellings, targets, consts, accumulator_offsets)
+                                    table <- static_report(Diagnostic{kind: DiagnosticKind.DArrayElementTypeMismatch, name: "", pos: Ast::expr_pos(element), line: Ast::expr_pos(element).line, expected: element_target, actual: element_spelling}, table) if element_spelling != ""
+                                    table <- static_ternary_pair(element, element_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            _:
+                                pass
+                    _:
+                        pass
+
+        # `return_target` is the enclosing function's rejecting return spelling ("" when its
+        # return type accepts a static string, is unmodeled, or the body is a lambda's).
+        def walk_static_statements(statements: darray[Ast::Stmt], return_target: sview, names: mutable darray[sview]&, spellings: mutable darray[sview]&, targets: mutable darray[sview]&, consts: darray[sview]&, accumulator_offsets: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |table, names, spellings, targets|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, pos):
+                            table <- walk_static_expression(value, names, spellings, targets, consts, accumulator_offsets, table)
+                            declared_target: sview = static_annotation_target(type_expression)
+                            declared_spelling: sview = static_use_spelling(value, declared_target, names, spellings, targets, consts, accumulator_offsets) if declared_target != "" else ""
+                            table <- static_report(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, pos: pos, line: pos.line, expected: declared_target, actual: declared_spelling}, table) if declared_spelling != ""
+                            table <- static_ternary_pair(value, declared_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            table <- check_static_darray_elements(type_expression, value, names, spellings, targets, consts, accumulator_offsets, table)
+                            record_static_binding(statement, names, spellings, targets, consts, accumulator_offsets)
+                        Stmt.Assign(target, operator, value, pos):
+                            table <- walk_static_expression(value, names, spellings, targets, consts, accumulator_offsets, table)
+                            assigned_target: sview = static_declared_target(ident_name_of(target), names, targets) if operator == TokenKind.LArrow and ident_name_of(target) != "" else ""
+                            assigned_spelling: sview = static_use_spelling(value, assigned_target, names, spellings, targets, consts, accumulator_offsets) if assigned_target != "" else ""
+                            table <- static_report(Diagnostic{kind: DiagnosticKind.AssignValueMismatch, name: "", pos: pos, line: pos.line, expected: assigned_target, actual: assigned_spelling}, table) if assigned_spelling != ""
+                            table <- static_ternary_pair(value, assigned_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            record_static_binding(statement, names, spellings, targets, consts, accumulator_offsets)
+                        Stmt.Return(value, pos):
+                            if value is returned:
+                                table <- walk_static_expression(returned, names, spellings, targets, consts, accumulator_offsets, table)
+                                returned_spelling: sview = static_use_spelling(returned, return_target, names, spellings, targets, consts, accumulator_offsets) if return_target != "" else ""
+                                table <- static_report(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: "return", pos: pos, line: pos.line, expected: return_target, actual: returned_spelling}, table) if returned_spelling != ""
+                                table <- static_ternary_pair(returned, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                        Stmt.Expr(expression, _):
+                            table <- walk_static_expression(expression, names, spellings, targets, consts, accumulator_offsets, table)
+                        Stmt.Contract(_, expression, _):
+                            table <- walk_static_expression(expression, names, spellings, targets, consts, accumulator_offsets, table)
+                        Stmt.If(condition, then_body, else_body, _):
+                            table <- walk_static_expression(condition, names, spellings, targets, consts, accumulator_offsets, table)
+                            branch_mark: usize = names.count
+                            static_push_row("", "", "", names, spellings, targets) if not static_binder_free(condition)
+                            table <- walk_static_statements(then_body, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            static_close_scope(branch_mark, names, spellings, targets)
+                            static_push_row("", "", "", names, spellings, targets) if not static_binder_free(condition)
+                            table <- walk_static_statements(else_body, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            static_close_scope(branch_mark, names, spellings, targets)
+                        Stmt.While(condition, body, _):
+                            table <- walk_static_expression(condition, names, spellings, targets, consts, accumulator_offsets, table)
+                            while_mark: usize = names.count
+                            static_push_row("", "", "", names, spellings, targets) if not static_binder_free(condition)
+                            table <- walk_static_statements(body, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            static_close_scope(while_mark, names, spellings, targets)
+                        Stmt.For(_, variables, iterable, body, _):
+                            table <- walk_static_expression(iterable, names, spellings, targets, consts, accumulator_offsets, table)
+                            for_mark: usize = names.count
+                            for variable in variables |names, spellings, targets|:
+                                static_push_row(variable, "", "", names, spellings, targets)
+                            table <- walk_static_statements(body, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            static_close_scope(for_mark, names, spellings, targets)
+                        Stmt.Block(_, _, binding, body, _):
+                            clause_mark: usize = names.count
+                            static_push_row(binding, "", "", names, spellings, targets) if binding != ""
+                            table <- walk_static_statements(body, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                            static_close_scope(clause_mark, names, spellings, targets)
+                        Stmt.Match(scrutinee, arms, _):
+                            table <- walk_static_expression(scrutinee, names, spellings, targets, consts, accumulator_offsets, table)
+                            table <- walk_static_arms(arms, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                        _:
+                            pass
+
+        # Unannotated, immutable string consts as (module, name) pairs; `module_name` is the
+        # innermost enclosing module ("" at top level).
+        def collect_static_consts(declarations: darray[Ast::Decl], module_name: sview, candidates: mutable darray[sview]&, const_names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |candidates, const_names|:
+                    match declaration:
+                        Decl.Const(name, type_expression, value, is_mutable, _):
+                            const_names.push(module_name)
+                            const_names.push(name)
+                            if not is_mutable and (type_expression is Expr.Invalid or type_expression is Expr.Absent) and (value is Expr.StringLit(_, _)):
+                                candidates.push(module_name)
+                                candidates.push(name)
+                        Decl.Module(inner_module, body, _):
+                            collect_static_consts(body, inner_module, candidates, const_names)
+                        Decl.Scoped(body, _):
+                            collect_static_consts(body, module_name, candidates, const_names)
+                        _:
+                            pass
+
+        # `const_pairs` are the modeled (module, name) consts; `module_name` is the module whose
+        # body `declarations` is ("" at top level).
+        def static_string_binding_walk(declarations: darray[Ast::Decl], module_name: sview, const_pairs: darray[sview]&, accumulator_offsets: darray[u32]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                consts: mutable darray[sview] = []
+                while pair + 1 < const_pairs.count |pair: usize = 0, consts|:
+                    consts.push("b" if const_pairs[pair] == module_name else "")
+                    consts.push(const_pairs[pair])
+                    consts.push(const_pairs[pair + 1])
+                    pair <- pair + 2
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(_, params, return_type, body, _, _, _):
+                            names: mutable darray[sview] = []
+                            spellings: mutable darray[sview] = []
+                            targets: mutable darray[sview] = []
+                            for parameter in params |names, spellings, targets|:
+                                static_push_row(parameter.name, "", "", names, spellings, targets)
+                            return_target: sview = static_annotation_target(return_type_expression) if return_type is return_type_expression else ""
+                            table <- walk_static_statements(body, return_target, names, spellings, targets, consts, accumulator_offsets, table)
+                        Decl.Module(inner_module, module_body, _):
+                            table <- static_string_binding_walk(module_body, inner_module, const_pairs, accumulator_offsets, table)
+                        Decl.Scoped(scoped_body, _):
+                            table <- static_string_binding_walk(scoped_body, module_name, const_pairs, accumulator_offsets, table)
+                        _:
+                            pass
+
+    public:
+        def check_static_string_binding(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                const_candidates: mutable darray[sview] = []
+                const_names: mutable darray[sview] = []
+                collect_static_consts(file.top_decls, "", const_candidates, const_names)
+                # Only a (module, name) declared exactly once is modeled.
+                consts: mutable darray[sview] = []
+                while pair + 1 < const_candidates.count |pair: usize = 0, consts|:
+                    declared_count: mutable usize = 0
+                    while named + 1 < const_names.count |named: usize = 0, declared_count|:
+                        declared_count <- declared_count + 1 if const_names[named] == const_candidates[pair] and const_names[named + 1] == const_candidates[pair + 1]
+                        named <- named + 2
+                    if declared_count == 1:
+                        consts.push(const_candidates[pair])
+                        consts.push(const_candidates[pair + 1])
+                    pair <- pair + 2
+                accumulator_offsets: darray[u32] = [annotation.offset for annotation in file.enum_annotations if annotation.name == "__loop_header_accumulator"]
+                table <- static_string_binding_walk(file.top_decls, "", consts, accumulator_offsets, table)
