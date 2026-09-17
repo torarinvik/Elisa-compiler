@@ -10,7 +10,11 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 prefix=$'error FileError:\n    NotFound\n    Busy\nextern read_value(flag: bool) -> i64 error[FileError]\ndef load(flag: bool) -> i64:\n    return catch read_value(flag):\n        value:\n            value\n'
 
 missing=$(printf '%s%s' "$prefix" $'        NotFound:\n            1\n' | "$RPT")
-grep -q "non-exhaustive catch over \"FileError\"; missing error \"Busy\"" <<< "$missing"
+# Older stage0 products quoted the family and bare missing variant.  The current
+# diagnostic contract prints the fully-qualified names without quotes.  Accept
+# both spellings while keeping the semantic assertion exact: this case must
+# report the one missing FileError.Busy arm.
+grep -Eq 'non-exhaustive catch over ("FileError"|FileError); missing (error "Busy"|FileError\.Busy)' <<< "$missing"
 
 complete=$(printf '%s%s' "$prefix" $'        NotFound:\n            1\n        Busy:\n            2\n' | "$RPT")
 grep -q '^D 0$' <<< "$complete"
