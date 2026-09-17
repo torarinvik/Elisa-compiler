@@ -42,7 +42,7 @@ extend Parser:
                 _:
                     rebind __es: Ast::Stmt?, parser = parser.statement()
                     if __es is else_statement:
-                        then_body.push(else_statement)
+                        parser <- parser.push_statement_with_pending(then_body, else_statement)
             no_else: darray[Ast::Stmt] = []
             return (Ast::Stmt.If(negated_condition, then_body, no_else, Ast::pos_of_token(guard_token)))
 
@@ -135,6 +135,7 @@ extend Parser:
                             parser, _ <- parser.parse_block()
                         _:
                             parser, _ <- parser.statement()
+                            parser.pending_statements <- parser.pending_statements.truncate(0)
 
                 return (Ast::Stmt.VarDecl(Lexer::text_or_empty(name_token, parser.source), type_expression, value, Ast::pos_of_token(name_token)))
 
@@ -153,9 +154,13 @@ extend Parser:
             first_name: mutable sview = ""
             first_type: mutable Ast::Expr = (Ast::Expr.Invalid)
             target_count: mutable usize = 0
-            while true |parser, targets, any_colon, first_is_fresh, first_name, first_type, target_count|:
+            # Per target: its `: T` (Invalid when bare), and its name token's position.
+            target_types: mutable darray[Ast::Expr] = []
+            target_positions: mutable darray[Ast::Pos] = []
+            while true |parser, targets, any_colon, first_is_fresh, first_name, first_type, target_count, target_types, target_positions|:
                 rebind name_token: Token, parser = parser.expect(TokenKind.Ident)
                 targets.push((Ast::Expr.Ident(Lexer::text_or_empty(name_token, parser.source), Ast::pos_of_token(name_token))))
+                target_positions.push(Ast::pos_of_token(name_token))
                 # Optional `: T` marks a fresh binding; the type is a selector here.
                 rebind accepted_colon: bool, parser = parser.accept(TokenKind.Colon)
                 any_colon <- true if accepted_colon
@@ -166,13 +171,15 @@ extend Parser:
                 # The first target's `: T` annotation is RETAINED (not dropped): the bare-`get`
                 # threading form `rebind X: T, recv = get recv.method()` lowers to a plain
                 # VarDecl below, and the VarDecl bare-get path needs T to unwrap the optional.
+                target_type: mutable Ast::Expr = (Ast::Expr.Invalid)
                 if accepted_colon:
                     parser.in_type_annotation <- true
                     rebind target_type_option: Ast::Expr?, parser = parser.expression()
                     parser.in_type_annotation <- false
-                    if target_count == 0:
-                        first_type <- target_type_value if target_type_option is target_type_value
+                    target_type <- target_type_value if target_type_option is target_type_value
+                target_types.push(target_type)
                 if target_count == 0:
+                    first_type <- target_type
                     first_is_fresh <- accepted_colon
                     first_name <- Lexer::text_or_empty(name_token, parser.source)
                 target_count <- target_count + 1
@@ -191,18 +198,72 @@ extend Parser:
             else:
                 rebind parsed_value_option: Ast::Expr?, parser = parser.expression()
                 value <- parsed_value if parsed_value_option is parsed_value
+            # docs/119 §5.2 rule 6 (E9): `rebind` and a `|capture|` header may not sit on the
+            # same construct — the RHS loop or captured block itself (stage0 rebind.go).
+            construct_capture: sview = rebind_construct_capture(value)
+            parser <- parser.error_named(Ast::ParseErrorKind.RebindWithCapture, keyword_token, construct_capture, "", 0, keyword_token.column + keyword_token.length) if sview_len(construct_capture) > 0
             # `rebind X: T, recv = get recv.method()` — the single-fresh-binding threading
             # form. The receiver `recv` threads through the call (an `lmut` argument mutated
             # in place), so the trailing claim-targets need no store: this is exactly a
             # VarDecl bare-get `X: T = get recv.method()`. Lower to it so the backend's
             # VarDecl bare-get path binds X's payload and PROPAGATES None on absent.
             (Ast::Stmt.VarDecl(first_name, first_type, value, Ast::pos_of_token(keyword_token))) return if value_is_get and first_is_fresh and target_count >= 1
+            if not rebind_value_is_call(value):
+                # No call to thread through: land each slot like stage0's rebindTargetStmt —
+                # a bare target is a `<-` reassignment of an existing mutable (so E8's
+                # immutable/undefined diagnostics apply), a `name: T` target a fresh binding
+                # in the ENCLOSING scope. One target binds the value directly.
+                if target_count == 1:
+                    return rebind_target_statement(first_name, first_type, value, target_positions[0])
+                # Several: bind a fresh temp tuple, then land each temp into its target. The
+                # per-target statements ride `pending_statements`, drained flat after this one.
+                parser.rebind_counter <- parser.rebind_counter + 1
+                rebind_number: usize = parser.rebind_counter
+                temp_targets: mutable darray[Ast::Expr] = []
+                for slot in 0..<target_count |parser, temp_targets|:
+                    temp_name: sview = parser.rebind_temp_name(rebind_number, slot)
+                    temp_targets.push((Ast::Expr.Ident(temp_name, target_positions[slot])))
+                    if targets[slot] is Ast::Expr.Ident(slot_name, _):
+                        parser.pending_statements <- parser.pending_statements.push(rebind_target_statement(slot_name, target_types[slot], (Ast::Expr.Ident(temp_name, target_positions[slot])), target_positions[slot]))
+                return (Ast::Stmt.Assign((Ast::Expr.Array(temp_targets, Ast::pos_of_token(keyword_token))), TokenKind.Assign, value, Ast::pos_of_token(keyword_token)))
             # A colon on ANY target marks the group as introducing fresh bindings (the
             # threading idiom `rebind x: T, parser = …`). With NO colon anywhere, `rebind`
             # re-binds EXISTING targets (like `<-`): lower with LArrow so the resolver
             # requires them to already resolve rather than silently defining them.
             rebind_operator: TokenKind = TokenKind.Assign if any_colon else TokenKind.LArrow
             return (Ast::Stmt.Assign((Ast::Expr.Array(targets, Ast::pos_of_token(keyword_token))), rebind_operator, value, Ast::pos_of_token(keyword_token)))
+
+        # The statement that lands one rebind slot: `name <- value` for a bare target,
+        # `name: T = value` for a typed (fresh) one.
+        def rebind_target_statement(name: sview, target_type: Ast::Expr, value: Ast::Expr, position: Ast::Pos) -> Ast::Stmt:
+            if target_type is Ast::Expr.Invalid:
+                return (Ast::Stmt.Assign((Ast::Expr.Ident(name, position)), TokenKind.LArrow, value, position))
+            return (Ast::Stmt.VarDecl(name, target_type, value, position))
+
+        # Does a rebind RHS carry a call at its root (seen through parens and `get`)? Those
+        # keep the lmut-threading lowering: a bare target may claim the call's threaded slot.
+        def rebind_value_is_call(value: Ast::Expr) -> bool:
+            match value:
+                Ast::Expr.Call(_, _, _, _):
+                    return true
+                Ast::Expr.Paren(paren_inner, _):
+                    return rebind_value_is_call(paren_inner)
+                Ast::Expr.GetElse(get_guarded, _, _):
+                    return rebind_value_is_call(get_guarded)
+                Ast::Expr.Refinement(_, refined_guarded, _):
+                    return rebind_value_is_call(refined_guarded)
+                _:
+                    return false
+
+        # The first `|capture|` on the construct a rebind RHS IS — the loop expression or
+        # captured block itself, seen through statement-less block wrappers. A capture on a
+        # loop after leading statements belongs to another construct. "" when none.
+        def rebind_construct_capture(value: Ast::Expr) -> sview:
+            if value is Ast::Expr.Block(construct_statements, construct_value, construct_captures, _):
+                construct_captures[0] return if construct_captures.count > 0
+                "" return if construct_statements.count > 0
+                return rebind_construct_capture(construct_value)
+            return ""
 
 
         # A contract-position expression (docs/90 brick 90-4): the ordinary expression

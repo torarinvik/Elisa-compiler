@@ -26,12 +26,13 @@ out=$(printf 'def f() -> void:\n    z: i64 = 5\n' | "$RPT")
 grep -q "expects i64" <<< "$out" && fail "false positive on matching VarDecl: $out"
 
 # 4. Assignment rebind with <- and type mismatch MUST flag.
+# stage0's sentence for a local `<-` (MEASURED: `3:5-6: cannot assign int to bool`).
 out=$(printf 'def f() -> void:\n    a: mutable bool = false\n    a <- 10\n' | "$RPT")
-grep -q "expects bool, got i64" <<< "$out" || fail "Assign <- mismatch not flagged: $out"
+grep -q "cannot assign int to bool" <<< "$out" || fail "Assign <- mismatch not flagged: $out"
 
 # 5. Assignment rebind with matching type must NOT flag.
 out=$(printf 'def f() -> void:\n    b: mutable i64 = 0\n    b <- 10\n' | "$RPT")
-grep -q "expects i64" <<< "$out" && fail "false positive on matching Assign <-: $out"
+grep -qE "expects i64|cannot assign" <<< "$out" && fail "false positive on matching Assign <-: $out"
 
 # A void call cannot satisfy a value-returning function's return type.
 out=$(printf 'def helper() -> void:\n    return\ndef f() -> i64:\n    return helper()\n' | "$RPT")
@@ -62,7 +63,7 @@ grep -q "expects darray, got dict" <<< "$out" || fail "generic container mismatc
 # 10. 0 findings across frontend + stdlib (self-contained resolution set).
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | grep -cE " expects .*, got " || true)
+  c=$("$RPT" < "$f" 2>/dev/null | grep -cE " expects .*, got | cannot assign .* to " || true)
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t type-mismatch false positives across frontend+stdlib"

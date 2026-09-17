@@ -209,6 +209,10 @@ NAMES=(
     unknown_variant_pattern
     unknown_variant_value
     non_exhaustive_catch
+    value_block_jump_out
+    value_block_scope_order
+    value_block_shadow_declares
+    rebind_discard_target
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -384,6 +388,10 @@ EXPECTS=(
     "enum \"Shape\" has no variant \"Nope\""
     "enum \"Shape\" has no variant \"Nope\""
     "non-exhaustive catch over Problem; missing Problem.Second"
+    "may not jump out of a value block (docs/119 E5)"
+    "undefined identifier \"z\""
+    "value block may not mutate the outer binding \"x\" (docs/119 E4)"
+    "undefined assignment target \"_\" (use = to introduce a new local; <- requires an existing mutable target)"
 )
 
 total=0

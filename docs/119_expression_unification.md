@@ -62,6 +62,38 @@ total: i64 =
         acc <- acc + item
 ```
 
+`break value` in a loop with a simple yielded accumulator assigns `value` to
+that accumulator and exits the loop. The loop expression then yields the new
+accumulator value. If the loop finishes normally, it yields the accumulator's
+current value. The value must have the accumulator's type; a nested loop has its
+own break target, so a value-bearing break in a nested statement loop is invalid.
+
+```elisa
+found: bool =
+    for item in xs |condition=false| -> condition:
+        if item == sought:
+            break true
+```
+
+A value-bearing break takes a postfix guard: `break VALUE if COND` means
+`if COND: break VALUE` (docs/125 §6b). This is the spelling to use under
+`-Wflow-strict`, which bans the block `if` above. The guard ends the statement,
+so a conditional value still needs its `else`: write
+`break (a if c else b) if guard`. The loop may also sit on the same line as
+its binding or `return`, as a `for` or a `while`:
+
+```elisa
+found: bool = for item in xs |condition=false| -> condition:
+    break true if item == sought
+
+return while i < xs.count |i: usize = 0, seen: i64 = 0| -> seen:
+    break xs[i] if xs[i] > limit
+    i <- i + 1
+```
+
+A loop used as a value must have a `-> yield` header. A bare `for`/`while`
+in value position is an error, because it has no value to produce.
+
 The header may type the accumulator (`|acc: u64 = 0|`) and list captured
 outer mutables (`|acc = 0, total|`). A bitwise `|` inside the iterable is an
 operator, not a header delimiter; recognition is structural and top-level.

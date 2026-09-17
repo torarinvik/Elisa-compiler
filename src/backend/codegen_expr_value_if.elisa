@@ -5,6 +5,44 @@
 
 extend Backend:
     private:
+        # docs/119 §4.1: a diverging arm (`else: return -1`, `else raise E.X`) unifies with
+        # anything. It never reaches the join, so the value `if` stores and branches only after
+        # an arm that yields. An arm diverges when it is a value-less branch block (the parser
+        # keeps its statements and yields Absent), a bare `raise`/`panic` call, or a nested
+        # value `if` whose arms both diverge.
+        def value_arm_diverges(arm: Expr) -> bool:
+            match arm:
+                Expr.Block(diverge_statements, diverge_value, _, _):
+                    return diverge_statements.count > 0 and diverge_value is Expr.Absent
+                Expr.If(_, diverge_then, diverge_else, _):
+                    return value_arm_diverges(diverge_then) and value_arm_diverges(diverge_else)
+                _:
+                    return value_arm_is_keyword_exit(arm)
+
+        def value_arm_is_keyword_exit(arm: Expr) -> bool:
+            if arm is Expr.Call(exit_callee, _, _, _):
+                if exit_callee is Expr.Ident(exit_keyword, _):
+                    return exit_keyword == "raise" or exit_keyword == "panic"
+            return false
+
+        # A `raise`/`panic` arm is a STATEMENT that terminates; emit it as the single statement
+        # of a diverging block so the statement emitter (which owns the error-return ABI) runs.
+        def emit_value_arm(arm: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if value_arm_is_keyword_exit(arm):
+                exit_statements: darray[Stmt] = [(Stmt.Expr(arm, Ast::expr_pos(arm)))]
+                exit_expected: mutable ValueType = copied_type(expected)
+                return emit_scoped_value_block(exit_statements, Expr.Absent, exit_expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+            return emit_expression(arm, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+
+        # After an arm: a yielding arm branches to the join. A diverging arm already terminated
+        # its block — except a nested value `if` whose arms BOTH diverged, which leaves the
+        # builder in its own predecessor-less join block; close that with `unreachable`.
+        def close_value_arm(arm: Expr, done_block: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> void:
+            if not value_arm_diverges(arm):
+                _ = LLVMBuildBr(builder, done_block)
+            elif arm is Expr.If(_, _, _, _):
+                _ = LLVMBuildUnreachable(builder)
+
         def emit_expression_if_and_dict(expression: Expr, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, handled: mutable bool&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             # A value `if`: `a if cond else b`. Only ONE arm is evaluated, so it uses the
             # same result-slot lowering as `and`/`or`.
@@ -23,13 +61,13 @@ extend Backend:
                             void_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, void_function, "ifv.done")
                             _ = LLVMBuildCondBr(builder, void_condition_bit, void_then_block, void_else_block)
                             LLVMPositionBuilderAtEnd(builder, void_then_block)
-                            if emit_expression(then_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is void_then_value:
+                            if emit_value_arm(then_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is void_then_value:
                                 _ = void_then_value
-                                _ = LLVMBuildBr(builder, void_done_block)
+                                close_value_arm(then_expression, void_done_block, builder)
                                 LLVMPositionBuilderAtEnd(builder, void_else_block)
-                                if emit_expression(else_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is void_else_value:
+                                if emit_value_arm(else_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is void_else_value:
                                     _ = void_else_value
-                                    _ = LLVMBuildBr(builder, void_done_block)
+                                    close_value_arm(else_expression, void_done_block, builder)
                                     LLVMPositionBuilderAtEnd(builder, void_done_block)
                                     # The caller only uses the presence of a value to recognize
                                     # successful emission; this sentinel is never stored or returned.
@@ -67,18 +105,20 @@ extend Backend:
 
                         LLVMPositionBuilderAtEnd(builder, then_block)
                         record_null_guards(ternary_condition, structs)
-                        if emit_expression(then_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is then_value:
+                        if emit_value_arm(then_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is then_value:
                             restore_narrowings(structs, ternary_saved_owners, ternary_saved_fields)
-                            _ = LLVMBuildStore(builder, then_value, result_slot)
-                            _ = LLVMBuildBr(builder, done_block)
+                            if not value_arm_diverges(then_expression):
+                                _ = LLVMBuildStore(builder, then_value, result_slot)
+                            close_value_arm(then_expression, done_block, builder)
                             LLVMPositionBuilderAtEnd(builder, else_block)
                             record_null_guard_negation(ternary_condition, structs)
                             # An `else` is mandatory in a value position; an Absent else
                             # declines (no value on one path).
-                            if emit_expression(else_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is else_value:
+                            if emit_value_arm(else_expression, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) is else_value:
                                 restore_narrowings(structs, ternary_saved_owners, ternary_saved_fields)
-                                _ = LLVMBuildStore(builder, else_value, result_slot)
-                                _ = LLVMBuildBr(builder, done_block)
+                                if not value_arm_diverges(else_expression):
+                                    _ = LLVMBuildStore(builder, else_value, result_slot)
+                                close_value_arm(else_expression, done_block, builder)
                                 LLVMPositionBuilderAtEnd(builder, done_block)
                                 return LLVMBuildLoad2(builder, ternary_type, result_slot, "ifx")
                             restore_narrowings(structs, ternary_saved_owners, ternary_saved_fields)

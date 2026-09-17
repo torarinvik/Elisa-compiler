@@ -40,31 +40,58 @@ extend Parser:
 
         # docs/119 §3: an INLINE loop expression as the RHS -- `x = for v in xs |acc=seed|
         # -> acc:` on ONE line, rather than opening a block on the next. The loop is the
-        # value; a `for` can never begin an ordinary RHS expression, so seeing the
-        # contextual keyword here is enough to commit.
+        # value; neither `for` nor `while` can begin an ordinary RHS expression, so seeing
+        # the keyword here is enough to commit.
         #
         # stage0 accepts this spelling and stage1 did not, which is a divergence rather
         # than a style: the same source compiled under one compiler and not the other. The
         # multi-line form already worked because wrap_loop_header hands back a
         # `Stmt.Expr(Expr.Block(...))` and parse_bare_block_value takes its tail; all this
-        # does is reach the same wrapper without the newline.
+        # does is reach the same wrapper without the newline. `while` is the same form
+        # (stage0 parseLoopValueExpr takes both): `return while i < n |i = 0, s = 0| -> s:`
+        # was a wall of "unexpected token" here.
         def inline_loop_value_ahead(parser: Parser&) -> bool:
+            true return if parser.peek() == TokenKind.While
             false return if parser.peek() != TokenKind.Ident
             # Bound to a local first: text_or_empty borrows its token, and `cursor()`
             # returns one by value.
             head_token: Token = parser.cursor()
             return Lexer::text_or_empty(head_token, parser.source) == "for"
 
-        # Parse that loop and unwrap the expression wrap_loop_header built. A loop with no
-        # header yields no value, so it stays a statement and this reports Invalid -- the
-        # binding then fails with an ordinary type error rather than silently binding a
-        # loop that produces nothing.
+        # Parse that loop and unwrap the expression wrap_loop_header built. Only a header
+        # with a `-> yield` produces a value; a bare loop, or a header without the arrow
+        # (whose Block carries an Invalid value), is refused with stage0's sentence. The
+        # old comment promised "an ordinary type error" downstream, but none came:
+        # `x: i64 = for i in 0..<3:` COMPILED and ran with x unset (MEASURED 2026-09-17).
         def parse_inline_loop_value(parser: lmut Parser) -> Ast::Expr:
-            rebind loop_statement_option: Ast::Stmt?, parser = parser.for_statement(false)
+            loop_token: Token = parser.cursor()
+            is_while: bool = parser.peek() == TokenKind.While
+            loop_value: mutable Ast::Expr = (Ast::Expr.Invalid)
+            if is_while:
+                rebind while_statement_option: Ast::Stmt?, parser = parser.while_statement()
+                loop_value <- parser.loop_statement_value(while_statement_option)
+            else:
+                rebind for_statement_option: Ast::Stmt?, parser = parser.for_statement(false)
+                loop_value <- parser.loop_statement_value(for_statement_option)
+            loop_value return if not (loop_value is Ast::Expr.Invalid)
+            if is_while:
+                parser <- parser.error_removed(loop_token, "a `while` loop used as a value needs a `-> yield` accumulator header (e.g. `while … |acc = 0| -> acc:`) (docs/119 §3)")
+            else:
+                parser <- parser.error_removed(loop_token, "a `for` loop used as a value needs a `-> yield` accumulator header (e.g. `for … |acc = 0| -> acc:`) (docs/119 §3)")
+            return (Ast::Expr.Invalid)
+
+        # The value-form Block of a parsed loop statement, or Invalid when it has none.
+        def loop_statement_value(parser: Parser&, loop_statement_option: Ast::Stmt?) -> Ast::Expr:
             if loop_statement_option is loop_statement:
                 match loop_statement:
-                    Stmt.Expr(loop_value, loop_value_line):
-                        return loop_value
+                    Stmt.Expr(loop_block, _):
+                        match loop_block:
+                            Expr.Block(_, Expr.Invalid, _, _):
+                                return (Ast::Expr.Invalid)
+                            Expr.Block(_, _, _, _):
+                                return loop_block
+                            _:
+                                pass
                     _:
                         pass
             return (Ast::Expr.Invalid)
@@ -140,7 +167,12 @@ extend Parser:
                     -> More
             parser, _ <- parser.expect(TokenKind.Dedent)
             parser.in_value_block <- previous_value_block
-            (Ast::Expr.Invalid) return if items.count == 0
+            # docs/119 §2: a value block ends in its tail value. Without one there is nothing
+            # to bind, and the backend read a null tail (SIGSEGV). stage0's sentence, at the
+            # token after the block.
+            if items.count == 0:
+                parser <- parser.error_value_block_shape("expression block requires a final expression statement in the block", true)
+                return (Ast::Expr.Invalid)
             # The tail statement is the block's value; truncating it off leaves `items`
             # as the leading locals — no second darray, no copy.
             last_index: usize = items.count - 1
@@ -149,16 +181,30 @@ extend Parser:
                 Stmt.Expr(expression, expression_line):
                     value <- expression
                 Stmt.If(condition, then_body, else_body, if_line):
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor()) if else_body.count == 0
+                    parser <- parser.error_value_block_shape("an `if` used as a value must have a final `else` (docs/119 E7)", true) if else_body.count == 0
                     rebind then_value: Ast::Expr, parser = parser.branch_to_value(then_body)
                     rebind else_value: Ast::Expr, parser = parser.branch_to_value(else_body)
                     value <- Ast::Expr.If(condition, then_value, else_value, if_line)
                 Stmt.Match(scrutinee, arms, match_line):
-                    value <- Ast::Expr.Match(scrutinee, arms, match_line)
+                    if parser.catch_statement_on_line(match_line.line):
+                        value <- Ast::Expr.Catch(scrutinee, arms, match_line)
+                    else:
+                        value <- Ast::Expr.Match(scrutinee, arms, match_line)
                 _:
-                    pass
+                    parser <- parser.error_value_block_shape("expression block requires a final expression statement in the block", true)
             items.truncate(last_index)
             return (Ast::Expr.Block(items, value, [], Ast::pos_at_line(line)))
+
+        # A value block whose shape yields no value: no tail (docs/119 §2) or a tail `if`
+        # without `else` (E7). stage0 reports the sentence at the token AFTER the block, with
+        # that token's span, and then fails its own newline expectation there — so the
+        # top-level form pushes that second line too and the parse-error sets agree. The
+        # message is a string literal, so the view outlives the parser.
+        def error_value_block_shape(parser: lmut Parser, message: sview, expect_newline: bool) -> void:
+            after_block: Token = parser.cursor()
+            span_end: u32 = after_block.column + after_block.length if after_block.length > 0 else 0
+            parser.errors <- parser.errors.push(Ast::ParseError{kind: Ast::ParseErrorKind.Removed, line: after_block.line, column: after_block.column, context: message, got_kind: after_block.kind, expected_kind: TokenKind.Eof, has_expected: false, detail_num2: span_end})
+            parser <- parser.error_expected(TokenKind.Newline, after_block) if expect_newline and after_block.kind != TokenKind.Eof
 
         # Convert one `if`/`else` branch body into its value expression: the branch's
         # own tail statement yields the value; any preceding statements ride a nested
@@ -172,6 +218,13 @@ extend Parser:
             last_statement: Ast::Stmt = body[body.count - 1]
             is_single_statement: bool = body.count == 1
             line: u32 = parser.cursor().line
+            # docs/119 §4.1: a DIVERGING branch (`else: return -1`) unifies with anything. Keep
+            # every statement and yield Absent — the backend's value `if` recognizes the arm
+            # (value_arm_diverges) and leaves it out of the join. `break`/`continue` land here
+            # too, so check_value_block_jump reports the precise E5 rather than a shape error.
+            if branch_tail_diverges(last_statement):
+                diverging_statements: darray[Ast::Stmt] = [body[diverging_index] for diverging_index in 0..<body.count]
+                return (Ast::Expr.Block(diverging_statements, Ast::Expr.Absent, [], Ast::pos_at_line(line)))
             # `body` is borrowed, so the leading locals must be copied (unlike
             # parse_bare_block_value, which owns and truncates its items). The
             # comprehension must run BEFORE the tail_statement_to_value rebind —
@@ -183,16 +236,43 @@ extend Parser:
                 Stmt.Expr(expression, expression_line):
                     tail_value <- expression
                 Stmt.If(condition, nested_then_body, nested_else_body, nested_line):
-                    parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, parser.cursor()) if nested_else_body.count == 0
+                    parser <- parser.error_value_block_shape("an `if` used as a value must have a final `else` (docs/119 E7)", false) if nested_else_body.count == 0
                     rebind nested_then_value: Ast::Expr, parser = parser.branch_to_value(nested_then_body)
                     rebind nested_else_value: Ast::Expr, parser = parser.branch_to_value(nested_else_body)
                     tail_value <- Ast::Expr.If(condition, nested_then_value, nested_else_value, nested_line)
                 Stmt.Match(nested_scrutinee, nested_arms, nested_line):
-                    tail_value <- Ast::Expr.Match(nested_scrutinee, nested_arms, nested_line)
+                    if parser.catch_statement_on_line(nested_line.line):
+                        tail_value <- Ast::Expr.Catch(nested_scrutinee, nested_arms, nested_line)
+                    else:
+                        tail_value <- Ast::Expr.Match(nested_scrutinee, nested_arms, nested_line)
                 _:
                     pass
             tail_value return if is_single_statement
             return (Ast::Expr.Block(statements, tail_value, [], Ast::pos_at_line(line)))
+
+        # Whether a branch's final statement leaves the branch without a value: `return`,
+        # `break`, `continue`, or a statement `raise E.X` / `panic(...)` (both parse to a call
+        # on the keyword identifier).
+        def branch_tail_diverges(statement: Ast::Stmt) -> bool:
+            match statement:
+                Stmt.Return(_, _) | Stmt.Break(_, _) | Stmt.Continue(_, _):
+                    return true
+                Stmt.Expr(diverge_expression, _):
+                    if diverge_expression is Ast::Expr.Call(diverge_callee, _, _, _):
+                        if diverge_callee is Ast::Expr.Ident(diverge_keyword, _):
+                            return diverge_keyword == "raise" or diverge_keyword == "panic"
+                    return false
+                _:
+                    return false
+
+        # A statement `catch EXPR:` parses to a `Stmt.Match` whose only mark is the
+        # `__catch_match` annotation catch_statement records on the `catch` token's line.
+        # As a block's TAIL it is the block's value, so it must become the CATCH expression
+        # stage0 reads there, not a match: an `Expr.Match` over the guarded call treats the
+        # fallible call as a plain scrutinee, and the backend declined the whole function
+        # for `x: T =` NEWLINE `catch f(): ...` -- a spelling stage0 compiles.
+        def catch_statement_on_line(parser: Parser&, line: u32) -> bool:
+            return any annotation in parser.enum_annotations where annotation.name == "__catch_match" and annotation.line == line
 
 
         # docs/119 §3/§6: loop-expression headers. `capture_header_ahead` reports whether
@@ -275,10 +355,27 @@ extend Parser:
             rebind initializer_opt: Ast::Expr?, parser = parser.expression()
             initializer: Ast::Expr = get initializer_opt else (Ast::Expr.Invalid)
             parser.suppress_pipe <- saved_suppress_pipe
+            inferred_type: mutable Ast::Expr = accumulator_type
+            if accumulator_type is Ast::Expr.Invalid:
+                if initializer is Ast::Expr.BoolLit(_, _):
+                    inferred_type <- (Ast::Expr.Ident("bool", Ast::pos_of_token(name_token)))
             # PRESERVE the `: T` annotation (was dropped → Invalid): stage0 could infer an
             # accumulator's type, but the stage1 backend needs it to resolve a bare-literal
             # initializer (`|depth: int = 0|` — an IntLit has no type context on its own).
-            declarations.push((Ast::Stmt.VarDecl(name_text, accumulator_type, initializer, Ast::pos_of_token(name_token))))
+            declarations.push((Ast::Stmt.VarDecl(name_text, inferred_type, initializer, Ast::pos_of_token(name_token))))
+            # A header accumulator is a MUTABLE local by definition (stage0 loop_header.go
+            # builds it `Mutable: true`), but this VarDecl carries only the bare type, so the
+            # semantic binding-mode lookup read it as immutable and a nested loop capturing it
+            # (`for y in ys |ok|:` inside `|ok = false| -> ok`) failed E10. The marker is
+            # semantic-only: the backend's `__local_binding_mutable` would also turn a
+            # Ref-typed accumulator's `<-` into a slot rebind.
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: name_text, name: "__loop_header_accumulator", line: name_token.line, offset: Ast::pos_of_token(name_token).offset})
+
+        def loop_header_declares(parser: Parser&, declarations: darray[Ast::Stmt]&, name: sview) -> bool:
+            for declaration in declarations:
+                if declaration is Ast::Stmt.VarDecl(declared_name, _, _, _):
+                    true return if declared_name == name
+            return false
 
         # Parse `|name = init, capture, …| [-> yield]`. Accumulator decls (`name = init`)
         # fill `declarations`; bare captures are collected in `captures` (docs/119 §6). Returns the
@@ -307,8 +404,20 @@ extend Parser:
                 rebind accepted_assign: bool, parser = parser.accept(TokenKind.Assign)
                 # Bare name (no `=`) is a capture; `name = init` is an accumulator. Kept
                 # apart so the accumulator path is a SINGLE-container grower (see above).
-                captures.push(name_text) if not accepted_assign
-                parser <- parser.consume_loop_header_accumulator(name_text, name_token, accumulator_type, declarations) if accepted_assign
+                # docs/119 §6.3: one header names each binding once — a capture repeated, or a
+                # name both declared and captured, is an error (stage0 loop_header.go).
+                name_captured: bool = any captured_name in captures where captured_name == name_text
+                name_declared: bool = parser.loop_header_declares(declarations, name_text)
+                header_name_end: u32 = name_token.column + name_token.length
+                if not accepted_assign:
+                    if name_captured:
+                        parser <- parser.error_named(Ast::ParseErrorKind.LoopHeaderCaptureTwice, name_token, name_text, "", 0, header_name_end)
+                    elif name_declared:
+                        parser <- parser.error_named(Ast::ParseErrorKind.LoopHeaderDeclAndCapture, name_token, name_text, "", 0, header_name_end)
+                    captures.push(name_text)
+                else:
+                    parser <- parser.consume_loop_header_accumulator(name_text, name_token, accumulator_type, declarations)
+                    parser <- parser.error_named(Ast::ParseErrorKind.LoopHeaderDeclAndCapture, name_token, name_text, "", 0, header_name_end) if name_captured
                 rebind accepted_comma_3: bool, parser = parser.accept(TokenKind.Comma)
                 break if not accepted_comma_3
             parser, _ <- parser.expect(TokenKind.Pipe)
@@ -326,6 +435,13 @@ extend Parser:
             all_statements: mutable darray[Ast::Stmt] = [declaration for declaration in declarations]
             all_statements.push(loop_statement)
             return (Ast::Stmt.Expr((Ast::Expr.Block(all_statements, yield_expression, captures, Ast::pos_at_line(line))), Ast::pos_at_line(line)))
+
+        def loop_break_target(parser: Parser&, yield_expression: Ast::Expr, declarations: darray[Ast::Stmt]) -> sview:
+            if yield_expression is Ast::Expr.Ident(name, _):
+                for declaration in declarations:
+                    if declaration is Ast::Stmt.VarDecl(local_name, _, _, _):
+                        name return if local_name == name
+            return ""
 
 
         # Consume a trailing inline effect grant `... can E1, E2` (no block colon) that

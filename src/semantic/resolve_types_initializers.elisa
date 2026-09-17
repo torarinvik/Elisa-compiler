@@ -81,6 +81,43 @@ extend Semantic:
                 return Ast::pos_at_line(owner_line)
 
 
+        # docs/119 §2: a value block's TAIL is its value, judged against the destination
+        # exactly as the bare expression would be — with the block's own locals in scope, so
+        # a tail `a` after `a: bool = …` is a bool. The block's statements are walked here
+        # (their declarations, assignments, and a desugared `break VALUE` store into a loop
+        # accumulator) and its scope is closed after the tail. That walk already runs the
+        # operator checks for the block's statements, so a caller must not also hand the
+        # whole block to check_operator_operands (each finding would print twice).
+        # `mutation` selects the `x <- v` sentence over the declaration/return one.
+        def check_block_value_against(value: Ast::Expr, type_name: sview, declared_name: sview, report_pos: Ast::Pos, mutation: bool, return_type_name: sview, return_type_id: u32, names: mutable darray[sview]&, types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Block(block_statements, block_tail, block_captures, block_line):
+                        block_scope_mark: usize = names.count
+                        table <- check_variable_initializers(block_statements, return_type_name, return_type_id, names, types, table)
+                        table <- check_operator_operands(block_tail, names, types, table) if not (block_tail is Expr.Block(_, _, _, _))
+                        table <- check_block_value_against(block_tail, type_name, declared_name, report_pos, mutation, return_type_name, return_type_id, names, types, table)
+                        table <- close_type_scope(block_scope_mark, names, types, table)
+                    Expr.Invalid:
+                        pass
+                    _:
+                        if type_name != "" and mutation:
+                            table <- check_assigned_value_against(value, type_name, report_pos, names, types, table)
+                        elif type_name != "":
+                            table <- check_value_against(value, type_name, declared_name, report_pos, names, types, table)
+
+        # `x <- v` where v can never fit x's type: stage0's "cannot assign V to T". An
+        # untyped integer literal is spelled `int`, as stage0's builtin literal type prints.
+        def check_assigned_value_against(value: Ast::Expr, type_name: sview, report_pos: Ast::Pos, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                assigned_literal: sview = literal_kind_of(value)
+                if assigned_literal != "":
+                    assigned_literal_spelling: sview = "int" if assigned_literal == "int" else stage0_literal_spelling(assigned_literal)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignValueMismatch, name: "", pos: report_pos, line: report_pos.line, expected: type_name, actual: assigned_literal_spelling}) if literal_never_fits(assigned_literal, type_name)
+                else:
+                    assigned_family: sview = infer_family(value, names, types, table)
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AssignValueMismatch, name: "", pos: report_pos, line: report_pos.line, expected: type_name, actual: infer_spelling(value, names, types, table)}) if assigned_family != "" and firm_never_fits(assigned_family, type_name)
+
         def check_variable_initializers(statements: darray[Ast::Stmt], return_type_name: sview, return_type_id: u32, names: mutable darray[sview]&, types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table, names, types| -> table:
@@ -120,17 +157,20 @@ extend Semantic:
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypeMismatch, name: name, pos: line, line: line.line, expected: type_name, actual: "null"}) if expression_is_null(value) and kind_cannot_hold_null(interned_kind(declared_type_id, table)) and type_name != ""
                             table <- check_nested_array_literal(value, declared_type_id, 0, names, types, table)
                             table <- check_ternary_condition(value, names, types, table)
-                            table <- check_operator_operands(value, names, types, table)
+                            table <- check_operator_operands(value, names, types, table) if not (value is Expr.Block(_, _, _, _))
                             table <- check_value_match_exhaustive(value, names, types, table)
-                            table <- check_value_against(value, type_name, name, line, names, types, table) if type_name != ""
+                            table <- check_block_value_against(value, type_name, name, line, false, return_type_name, return_type_id, names, types, table)
                         Stmt.Assign(target, operator, value, line):
                             table <- check_ternary_condition(value, names, types, table)
-                            table <- check_operator_operands(value, names, types, table)
+                            table <- check_operator_operands(value, names, types, table) if not (value is Expr.Block(_, _, _, _))
                             table <- check_value_match_exhaustive(value, names, types, table)
                             table <- check_parallel_rebind_threading(target, operator, value, names, types, table)
                             match target:
                                 Expr.Ident(target_name, target_line):
                                     if operator == TokenKind.Assign:
+                                        # A block RHS is walked for its own statements; a fresh
+                                        # binding has no type to judge the tail against.
+                                        table <- check_block_value_against(value, "", target_name, line, false, return_type_name, return_type_id, names, types, table) if value is Expr.Block(_, _, _, _)
                                         # `x = v` defines a fresh, unannotated local. (The
                                         # structural pair keeps both channels index-aligned so
                                         # one scope mark closes both.)
@@ -139,7 +179,9 @@ extend Semantic:
                                     if operator == TokenKind.LArrow:
                                         target_type: sview = local_type_of(names, types, target_name)
                                         if target_type != "":
-                                            table <- check_value_against(value, target_type, target_name, Ast::pos_at_line(line.line), names, types, table)
+                                            table <- check_block_value_against(value, target_type, target_name, line, true, return_type_name, return_type_id, names, types, table)
+                                        elif value is Expr.Block(_, _, _, _):
+                                            table <- check_block_value_against(value, "", target_name, line, true, return_type_name, return_type_id, names, types, table)
                                         else:
                                             # Structural target (Phase C): a scalar can never be
                                             # assigned to a CONTAINER-typed local (`xs <- 5` —
@@ -208,9 +250,10 @@ extend Semantic:
                         Stmt.Return(value, line):
                             if value is return_expression:
                                 table <- check_ternary_condition(return_expression, names, types, table)
-                                table <- check_operator_operands(return_expression, names, types, table)
+                                table <- check_operator_operands(return_expression, names, types, table) if not (return_expression is Expr.Block(_, _, _, _))
                                 table <- check_value_match_exhaustive(return_expression, names, types, table)
-                            table <- check_value_against(returned_value, return_type_name, "return", line, names, types, table) if return_type_name != "" and value is returned_value
+                                # docs/119 §2.1 `return` + block: the tail is the returned value.
+                                table <- check_block_value_against(return_expression, return_type_name, "return", line, false, return_type_name, return_type_id, names, types, table)
                             # `return null` from a function whose return type cannot hold null.
                             # Same wall as the VarDecl form above, keyed on the RETURN type's
                             # interned kind so `-> i64?` stays silent. stage0: "return type
@@ -317,7 +360,12 @@ extend Semantic:
                         Stmt.Expr(expression, line):
                             # Bare expression statements (method calls like `xs.push(v)`)
                             # get the same operator/argument walk as value positions.
-                            table <- check_operator_operands(expression, names, types, table)
+                            table <- check_operator_operands(expression, names, types, table) if not (expression is Expr.Block(_, _, _, _))
+                            # A loop header is represented as a value block around
+                            # accumulator declarations and the loop. Check writes in
+                            # that nested scope before discarding its locals; otherwise
+                            # `break 42` can silently overwrite a bool accumulator.
+                            table <- check_block_value_against(expression, "", "", line, false, return_type_name, return_type_id, names, types, table) if expression is Expr.Block(_, _, _, _)
                         Stmt.Contract(kind, expression, line):
                             contract_scope_mark: usize = names.count
                             # `result` is a contract-only binding whose type is the
