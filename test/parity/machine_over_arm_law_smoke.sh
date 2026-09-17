@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # docs/123 §5 (the machine arm law), stage1-OWNED (docs/125 step 13): a `machine over` arm
-# body is STRAIGHT-LINE. All discrimination lives in the arm HEADER, so hidden branching/
-# looping (`if`/`match`/`while`/`for`) and `continue` are REFUSED BY STAGE1 (P >= 1). A
-# straight-line body plus a `-> State` transition stays legal (P 0). `return`/`break` are arm
-# EXITS and remain legal. Mirrors stage0's parser/machine.go validateMachineArmStmt.
+# body may branch locally before a shared transition. `continue` remains invalid because
+# it can bypass that transition. `return` and `break` remain arm exits.
 set -uo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
@@ -34,12 +32,21 @@ grep -q "^P 0$" <<< "$out" || fail "legal multi-index assignment arm flagged: $o
 out=$(printf 'def scan(resource: mutable Resource&) -> i64:\n    machine over resource::current():\n        state Run\n        start Run\n        Run, _:\n            resource[0] <- 1\n            -> Run\n    return 0\n' | "$RPT")
 grep -q "^P 0$" <<< "$out" || fail "qualified driven-resource root was not retained: $out"
 
-# 2. ILLEGAL: a hidden `if` in an arm body (the guard belongs in the arm header).
-out=$(printf 'def scan(lexer: mutable Lexer&) -> i64:\n    total: i64 = 0\n    machine over lexer.current_char() while not lexer.is_end():\n        state Run\n        start Run\n        Run, .Digit:\n            if total > 0:\n                total <- total + 1\n            -> Run\n    return total\n' | "$RPT")
-grep -q "^P 0$" <<< "$out" && fail "hidden if in arm body NOT refused: $out"
+# 2. LEGAL: a branch can update the driven resource before the outer transition.
+out=$(printf 'def scan(total: mutable i64) -> i64:\n    machine over total while total < 2:\n        state Run\n        start Run\n        Run, _:\n            if total == 0:\n                total <- total + 1\n            else:\n                total <- total + 2\n            -> Run\n    return total\n' | "$RPT")
+grep -q "^P 0$" <<< "$out" || fail "branch in arm body flagged: $out"
+
+# 2b. LEGAL: a catch expression and its local arms are permitted before the
+# machine arm's shared transition.
+out=$("$RPT" < "$REPO_ROOT/test/fixtures/machine_transition/branching_catch.elisa")
+grep -q "^P 0$" <<< "$out" || fail "catch in arm body flagged: $out"
+
+# 2c. LEGAL: nested iteration completes before the arm transition.
+out=$(printf 'def scan(total: mutable i64) -> i64:\n    machine over total while total < 1:\n        state Run\n        start Run\n        Run, _:\n            for item in [1] |total|:\n                total <- total + item\n            -> Run\n    return total\n' | "$RPT")
+grep -q "^P 0$" <<< "$out" || fail "for loop in arm body flagged: $out"
 
 # 3. ILLEGAL: `continue` (every arm ends in `-> State`, `return`, or `break`).
 out=$(printf 'def scan(lexer: mutable Lexer&) -> i64:\n    total: i64 = 0\n    machine over lexer.current_char() while not lexer.is_end():\n        state Run\n        start Run\n        Run, .Digit:\n            continue\n    return total\n' | "$RPT")
 grep -q "^P 0$" <<< "$out" && fail "continue in arm body NOT refused: $out"
 
-echo "machine-over arm-law smoke OK: straight-line legal; hidden if + continue refused by stage1"
+echo "machine-over arm-law smoke OK: branches and transitions legal; continue refused"
