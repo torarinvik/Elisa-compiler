@@ -13,30 +13,35 @@ fail() { echo "missing-return smoke FAIL: $1" >&2; exit 1; }
 
 # 1. Fall-through after a guard MUST be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    if n > 0:\n        return 1\n' | "$RPT")
-grep -q "must return a value" <<< "$out" || fail "guard fall-through not flagged: $out"
+grep -q "may fall through without returning a value" <<< "$out" || fail "guard fall-through not flagged: $out"
 
 # 2. Both-branch return must NOT be flagged.
 out=$(printf 'def g(n: i64) -> i64:\n    if n > 0:\n        return 1\n    else:\n        return 0\n' | "$RPT")
-grep -q "must return" <<< "$out" && fail "false positive on both-branch return: $out"
+grep -q "may fall through" <<< "$out" && fail "false positive on both-branch return: $out"
 
 # 3. Void function must NOT be flagged.
 out=$(printf 'def v(n: i64) -> void:\n    if n > 0:\n        return\n' | "$RPT")
-grep -q "must return" <<< "$out" && fail "false positive on void fn: $out"
+grep -q "may fall through" <<< "$out" && fail "false positive on void fn: $out"
 
 # 4. Abort tail (`panic(...)`) must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    if n > 0:\n        return 1\n    panic("bad")\n' | "$RPT")
-grep -q "must return" <<< "$out" && fail "false positive on panic tail: $out"
+grep -q "may fall through" <<< "$out" && fail "false positive on panic tail: $out"
 
-# 5. Non-breaking `while true:` must NOT be flagged.
+# 5. Non-breaking `while true:` MUST be flagged -- stage0 treats no loop as a terminator.
+# MEASURED 2026-09-16: `elisac -emit obj` on this exact program gives
+# "error: function h may fall through without returning a value". This case asserted the
+# OPPOSITE until then, against a compiler that had already been corrected to match the oracle
+# (see the measured note in src/semantic/resolve_flow_termination.elisa) -- a gate left behind
+# by its own fix, red for the wrong reason.
 out=$(printf 'def h(n: mutable i64) -> i64:\n    while true:\n        n <- n + 1\n' | "$RPT")
-grep -q "must return" <<< "$out" && fail "false positive on while-true: $out"
+grep -q "may fall through without returning a value" <<< "$out" || fail "while-true not flagged: $out"
 
 # 6. `while true:` WITH a break MUST be flagged (the break path falls through).
 out=$(printf 'def h(n: mutable i64) -> i64:\n    while true:\n        break\n' | "$RPT")
-grep -q "must return a value" <<< "$out" || fail "breaking while-true not flagged: $out"
+grep -q "may fall through without returning a value" <<< "$out" || fail "breaking while-true not flagged: $out"
 
 # 7. Guaranteed final return must NOT be flagged.
 out=$(printf 'def k(n: i64) -> i64:\n    return n\n' | "$RPT")
-grep -q "must return" <<< "$out" && fail "false positive on direct return: $out"
+grep -q "may fall through" <<< "$out" && fail "false positive on direct return: $out"
 
-echo "missing-return smoke OK: fall-through/breaking-loop flagged, both-branch/void/panic/while-true silent, 0 FP"
+echo "missing-return smoke OK: fall-through/breaking-loop/while-true flagged in stage0\x27s words, both-branch/void/panic silent, 0 FP"

@@ -207,15 +207,15 @@ def main() -> i64:
 ELISAEOF
 )" 24   # 2 evens of 4 elements
 
-# `x: T = match OPT: v: … / _: …` — an OPTIONAL scrutinee in VALUE position. A binding arm over
-# an optional is a CATCH-ALL: stage0 takes it even when the optional is ABSENT, and `_` is dead.
-# The slot emitter accepted only integer/penum/packed/cstr/sview scrutinees, so this declined.
+# `x: T = match OPT: v: … / _: …` — an OPTIONAL scrutinee in VALUE position. The slot emitter
+# accepted only integer/penum/packed/cstr/sview scrutinees, so this declined.
 #
-# Both halves matter. `sel` never reads the payload, so it pins ARM SELECTION on the absent
-# path (a present/absent split would score 2 there, not 1). `val` reads the payload only where
-# the optional is PRESENT — deliberately, because the payload of an ABSENT optional is UNDEF in
-# stage0 (`v: v + 1` yields 0 there while `v: 5` yields 5), so reading it is undefined
-# behaviour and NOT a parity-testable path.
+# Arm selection follows stage0's docs/122 rule of 2026-09-14 (stage0 601f7bcd): a BINDER arm
+# runs only on a PRESENT payload, and `_` matches ABSENCE as well as any payload. (Before that
+# date stage0's backend took the binder arm even when absent and left `_` dead, which made the
+# absent payload UNDEF; this case then expected 170.) Both halves still matter: `sel` never
+# reads the payload, so it pins ARM SELECTION on the absent path (`_` -> 2); `val` reads the
+# payload only where the optional is present.
 differential optional_value_match "$(cat <<'ELISAEOF'
 def pick(n: i64) -> i64? can[Abort.Panic]:
     return n * 2 if n > 0 else null
@@ -241,7 +241,7 @@ def main() -> i64:
     can Abort.Panic:
         return sel(0) * 100 + val(3) * 10 + val(5)
 ELISAEOF
-)" 170   # sel(0)=1 (binding arm taken when ABSENT), val(3)=6, val(5)=10
+)" 14   # sel(0)=2 (`_` takes ABSENCE), val(3)=6, val(5)=10 -> 270, truncated mod 256
 
 # `phrase = EXPR` — an UNTYPED declaration by FIRST ASSIGNMENT, which stage0 accepts. stage1
 # parses it as Stmt.Assign and the handler rejected `=` outright, so it declined. Declares the

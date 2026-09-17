@@ -400,3 +400,11 @@ run_case optional_u8      'def main() -> i64:\n    v: u8? = 200\n    if v is fou
 # `UiPaint::HAIRLINE_WIDTH.f64()`, which took every AppKit canvas build down with it. The
 # integer const beside it pins the other direction of the same arm.
 run_case scoped_const_cast 'module Paint:\n    public:\n        const WIDTH: f32 = 1.0\n        const COUNT: i32 = 2\n\ndef main() -> i64:\n    direct: f64 = Paint::WIDTH.f64()\n    count: f64 = Paint::COUNT.f64()\n    return 1 if direct != 1.0 or count != 2.0\n    return 42\n' 42
+
+# A PLAIN value assigned to a `mutable T&` LOCAL: `r <- 5` where `r: mutable i64& = &g`.
+# MEASURED 2026-09-16 against stage0's native backend: this REBINDS the reference to a
+# fresh temporary holding 5 and leaves the pointee untouched (`g` stays 100), it does
+# not write through. The backend used to DECLINE the statement on the belief that stage0
+# rejects it; three adversarial-corpus programs stage0 builds and runs were unbuildable.
+# A write-through lowering answers 5 here, a decline answers nothing.
+run_case mutable_ref_local_plain_rebind 'global mutable g: mutable i64 = 100\n\ndef main() -> i64:\n    ref: mutable i64& = &g\n    ref <- 5\n    return g\n'  100

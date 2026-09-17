@@ -80,8 +80,15 @@ chmod +x "$out"
 STUB
 chmod +x "$WORK/clang"
 
+# EVERY output path the seed honours must be pinned INSIDE the fixture. run_all exports
+# ELISA_RUNTIME_OBJ pointing at the REAL tree, and build_runtime_object.sh honours it over
+# its own $ROOT -- so under run_all this fixture's stub clang wrote its "fake object" script
+# straight over build/runtime/elisacore_runtime.o, and the ~27 gates that link against the
+# runtime failed with `ld: unknown file type` for the rest of the run (2026-09-16).
 FAKE_LLVM_LIBDIR="$WORK/lib" \
 TMPDIR="$WORK/tmp" \
+ELISA_RUNTIME_OBJ="$WORK/build/runtime/elisacore_runtime.o" \
+ELISA_PARSE_REPORT="$WORK/build/parse_report" \
 ELISA_CORE="$WORK/core" \
 ELISACORE_BIN="$WORK/core/compiler/bin/elisac" \
 ELISA_STAGE1_BIN="$WORK/bin/elisac-stage1" \

@@ -57,7 +57,11 @@ def main() -> i64:
 EOF
 exact "packed-no-commons" "$WORK/nocommon.elisa"
 
-# 3. Common-carrying: stage1's own layout, checked for self-consistency.
+# 3. Common-carrying: EXACT parity. This section used to pin stage1's own inline-commons
+# row (`row bytes: 40`, `inline row_field=N`) as a self-consistency check while the two
+# layouts deliberately differed; stage1 has since adopted stage0's side-table layout and the
+# reports are byte-identical, so the hand-written expectations had rotted into a permanent
+# red the moment the gate stopped being skipped (2026-09-16).
 cat > "$WORK/commons.elisa" <<'EOF'
 packed enum E:
     common:
@@ -69,20 +73,7 @@ packed enum E:
 def main() -> i64:
     return 0
 EOF
-bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit packed -o "$WORK/c1" "$WORK/commons.elisa" >/dev/null 2>&1 || {
-    echo "FAILED packed-commons: stage1 emitted nothing"; differ=$((differ + 1)); }
-# The typed row is `{i32 tag, pad[4], u32, pad[4], i64, [2 x i64]}`. Each
-# common occupies one word-aligned slot so the legacy packed runtime can read
-# it by word while the compiler preserves its declared type.
-check_line() {
-    grep -Fqx "$1" "$WORK/c1" || { echo "FAILED packed-commons: missing line: $1"; differ=$((differ + 1)); }
-}
-check_line "  row bytes: 40"
-check_line "  common prefix words: 2"
-check_line "  side-table common words: 0"
-check_line "    - t: u32 inline row_field=1"
-check_line "    - u: i64 inline row_field=2"
-check_line "  variants: A, B"
+exact "packed-commons" "$WORK/commons.elisa"
 
 echo "emit_packed parity: $same exact, $differ divergent"
 [ "$differ" -eq 0 ] || { echo "emit_packed parity FAILED"; exit 1; }
