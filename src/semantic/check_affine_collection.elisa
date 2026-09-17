@@ -17,7 +17,95 @@ extend Semantic:
                     _:
                         return ""
 
-        def check_affine_call_copy(value: Ast::Expr, names: darray[sview]&, types: darray[sview]&, table: lmut SymbolTable) -> void:
+        # stage0's isBorrowableAffineOwnerType: a struct DECLARED `linear`/`affine` (an `extern
+        # resource` is one) may be borrowed (`T&`, `&value`), and the borrowed-owner flow analysis
+        # keeps that sound; so may the builtin protocol owners ThreadPool and TaskGroup. `Pooled[T]`
+        # stays unborrowable (docs/69): its interior-alias check only follows `ptr` read directly
+        # off the owner, so a pointer read through a borrow would dangle.
+        def struct_is_borrowable_owner(table: SymbolTable&, name: sview) -> bool:
+            can Abort.Panic:
+                false return if name == "" or name == "Pooled"
+                true return if name == "ThreadPool" or name == "TaskGroup"
+                return any owner in table.struct_declared_affine_owner where owner == name
+
+        # An affine struct stage0 refuses to borrow: `Pooled`, or a plain aggregate that is
+        # affine only because a field is.
+        def struct_is_unborrowable_affine(table: SymbolTable&, name: sview) -> bool:
+            can Abort.Panic:
+                return struct_is_affine(table, name) and not struct_is_borrowable_owner(table, name)
+
+        # stage0 names a moved aggregate by what it holds: "value containing linear handles" for
+        # a plain struct with an affine field, "linear value" for a declared owner.
+        def affine_move_subject(table: SymbolTable&, type_name: sview) -> sview:
+            can Abort.Panic:
+                subject: sview = "container" if type_name != "Pooled" and struct_is_unborrowable_affine(table, type_name) else ""
+                return subject
+
+        # The pointee of a reference annotation, seen through `mutable` and an optional `?`
+        # (`T&`, `mutable T&`, `T&?`), else Absent.
+        def affine_ref_pointee(type_expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        operand return if operator == TokenKind.Ampersand
+                        affine_ref_pointee(operand) return if operator == TokenKind.Mutable or operator == TokenKind.Question
+                        return (Ast::Expr.Absent)
+                    Expr.Paren(inner, paren_line):
+                        return affine_ref_pointee(inner)
+                    _:
+                        return (Ast::Expr.Absent)
+
+        def affine_annotation_is_ref(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match affine_ref_pointee(type_expression):
+                    Expr.Absent: false
+                    _: true
+
+        # The head name of a type (`Pooled[Node]` -> "Pooled", `Game` -> "Game"), else "".
+        def affine_type_head(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match type_expression:
+                    Expr.Ident(name, ident_line): name
+                    Expr.Index(head, argument, index_line): ident_name_of(head)
+                    _: sview("", 0, 0)
+
+        # The single generic argument of `Head[Arg]` when it is a plain name, else "".
+        def affine_type_argument(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return match type_expression:
+                    Expr.Index(head, argument, index_line): ident_name_of(argument)
+                    _: sview("", 0, 0)
+
+        # stage0 resolves every `T&` annotation, and refuses one whose pointee is an unborrowable
+        # affine struct: "references to values containing linear handles are not supported;
+        # got T&". `Pooled[Node]` renders its argument, so a generic pointee needs a plain one.
+        def check_affine_reference_annotation(type_expression: Ast::Expr, name: sview, line: u32, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                pointee: Ast::Expr = affine_ref_pointee(type_expression)
+                head: sview = affine_type_head(pointee)
+                argument: sview = affine_type_argument(pointee)
+                generic_ok: bool = match pointee:
+                    Expr.Index(index_head, index_argument, index_line): argument != ""
+                    _: true
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineReference, name: name, line: line, expected: head, actual: "", detail: argument}) if generic_ok and struct_is_unborrowable_affine(table, head)
+
+        # The struct a binding holds, seen through a reference: `K`, `mutable K`, `K&` -> "K".
+        def affine_binding_type(type_expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                pointee: Ast::Expr = affine_ref_pointee(type_expression)
+                return match pointee:
+                    Expr.Absent: bare_type_name(type_expression)
+                    _: bare_type_name(pointee)
+
+        # Whether the innermost binding of `name` is a reference.
+        def affine_local_is_ref(names: darray[sview]&, refs: darray[bool]&, name: sview) -> bool:
+            can Abort.Panic:
+                while name_index > 0 |name_index: usize = names.count|:
+                    name_index <- name_index - 1
+                    refs[name_index] return if names[name_index] == name
+                return false
+
+        def check_affine_call_copy(value: Ast::Expr, names: darray[sview]&, types: darray[sview]&, refs: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 if value is Expr.Call(callee, arguments, argument_names, call_line):
                     callee_name: sview = match callee:
@@ -30,7 +118,10 @@ extend Semantic:
                             if argument is Expr.Ident(source_name, source_line):
                                 source_type: sview = local_type_of(names, types, source_name)
                                 parameter_type: sview = function_parameter_type_at_firm(table, callee_name, argument_index)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: source_name, pos: source_line, line: source_line.line, expected: "Call", actual: callee_name}) if source_type != "" and source_type == parameter_type and struct_is_affine(table, source_type)
+                                # A reference argument lends, it does not copy: stage0 reports only the
+                                # parameter mismatch (`expects K, got K&`) when the parameter is by value.
+                                source_is_ref: bool = affine_local_is_ref(names, refs, source_name)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: source_name, pos: source_line, line: source_line.line, expected: "Call", actual: callee_name, detail: affine_move_subject(table, source_type)}) if source_type != "" and source_type == parameter_type and struct_is_affine(table, source_type) and not source_is_ref
                             argument_index <- argument_index + 1
 
 
@@ -69,55 +160,74 @@ extend Semantic:
                         pass
 
 
-        def check_affine_collection_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, types: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_affine_collection_statements(statements: darray[Ast::Stmt], names: mutable darray[sview]&, types: mutable darray[sview]&, refs: mutable darray[bool]&, return_is_ref: bool, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table, names, types| -> table:
+                for statement in statements |table, names, types, refs| -> table:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
                             table <- check_affine_collection_type(type_expression, value, table)
-                            table <- check_affine_call_copy(value, names, types, table)
+                            table <- check_affine_reference_annotation(type_expression, name, line.line, table)
+                            table <- check_affine_call_copy(value, names, types, refs, table)
+                            target_is_ref: bool = affine_annotation_is_ref(type_expression)
                             if value is Expr.Ident(source_name, source_line):
                                 source_affine_type: sview = local_type_of(names, types, source_name)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: source_name, pos: source_line, line: source_line.line, expected: source_affine_type, actual: name}) if source_affine_type != "" and struct_is_affine(table, source_affine_type)
+                                # `r: K& = o` with `o: K&` copies the reference, not the owner.
+                                ref_to_ref: bool = target_is_ref and affine_local_is_ref(names, refs, source_name)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: source_name, pos: source_line, line: source_line.line, expected: source_affine_type, actual: name, detail: affine_move_subject(table, source_affine_type)}) if source_affine_type != "" and struct_is_affine(table, source_affine_type) and not ref_to_ref
                             source_type: sview = addressed_affine_type(value, names, types, table)
                             builtin_handle: bool = source_type in {"Thread", "Task", "MutexGuard", "ThreadPool", "TaskGroup"}
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineAddress, name: "", line: line.line, expected: source_type, actual: ""}) if source_type != "" and (builtin_handle or struct_is_affine(table, source_type))
+                            # A borrowable owner may be addressed; an aggregate that merely contains
+                            # one may not, and stage0 words that case differently.
+                            address_container: sview = "container" if source_type != "Pooled" else ""
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineAddress, name: "", line: line.line, expected: source_type, actual: address_container}) if source_type != "" and not builtin_handle and struct_is_unborrowable_affine(table, source_type)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineAddress, name: "", line: line.line, expected: source_type, actual: ""}) if source_type != "" and builtin_handle
                             target_type: sview = bare_type_name(type_expression)
                             copy_source: sview = affine_root(value) if target_type in {"ThreadPool", "TaskGroup"} else ""
                             copy_type: sview = local_type_of(names, types, copy_source) if copy_source != "" else ""
                             owner_copy: bool = copy_type == target_type and copy_type != ""
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: copy_source, line: line.line, expected: copy_type, actual: name}) if owner_copy
                             names.push(name)
-                            types.push(bare_type_name(type_expression))
+                            types.push(affine_binding_type(type_expression))
+                            refs.push(target_is_ref)
                         Stmt.Assign(target, operator, value, line):
-                            table <- check_affine_call_copy(value, names, types, table)
+                            table <- check_affine_call_copy(value, names, types, refs, table)
                             if value is Expr.Ident(source_name, source_line):
                                 source_affine_type: sview = local_type_of(names, types, source_name)
                                 target_name: sview = ident_name_of(target)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: source_name, pos: source_line, line: source_line.line, expected: source_affine_type, actual: target_name}) if source_affine_type != "" and struct_is_affine(table, source_affine_type)
+                                source_is_ref: bool = affine_local_is_ref(names, refs, source_name)
+                                # An untyped `y = r` binds another reference; `y <- r` into a value
+                                # copies the owner out ("... before assignment").
+                                assign_copies: bool = operator == TokenKind.LArrow and not (source_is_ref and affine_local_is_ref(names, refs, target_name))
+                                assign_binds_owner: bool = operator != TokenKind.LArrow and not source_is_ref
+                                move_context: mutable sview = source_affine_type
+                                move_context <- "Assign" if operator == TokenKind.LArrow
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: source_name, pos: source_line, line: source_line.line, expected: move_context, actual: target_name, detail: affine_move_subject(table, source_affine_type)}) if source_affine_type != "" and struct_is_affine(table, source_affine_type) and (assign_copies or assign_binds_owner)
                                 if operator == TokenKind.Assign and target_name != "":
                                     names.push(target_name)
                                     types.push(source_affine_type)
+                                    refs.push(source_is_ref)
                         Stmt.Return(value, line):
                             if value is returned:
-                                table <- check_affine_call_copy(returned, names, types, table)
+                                table <- check_affine_call_copy(returned, names, types, refs, table)
                                 if returned is Expr.Ident(source_name, source_line):
                                     source_affine_type: sview = local_type_of(names, types, source_name)
-                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: source_name, pos: source_line, line: source_line.line, expected: "Return", actual: ""}) if source_affine_type != "" and struct_is_affine(table, source_affine_type)
+                                    # Returning a borrow as a borrow (`-> K&`) moves nothing.
+                                    lends: bool = return_is_ref and affine_local_is_ref(names, refs, source_name)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineMoveRequired, name: source_name, pos: source_line, line: source_line.line, expected: "Return", actual: "", detail: affine_move_subject(table, source_affine_type)}) if source_affine_type != "" and struct_is_affine(table, source_affine_type) and not lends
                         Stmt.Expr(expression, line):
-                            table <- check_affine_call_copy(expression, names, types, table)
+                            table <- check_affine_call_copy(expression, names, types, refs, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_affine_collection_statements(body, names, types, table)
+                            table <- check_affine_collection_statements(body, names, types, refs, return_is_ref, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_affine_collection_statements(then_body, names, types, table)
-                            table <- check_affine_collection_statements(else_body, names, types, table)
+                            table <- check_affine_collection_statements(then_body, names, types, refs, return_is_ref, table)
+                            table <- check_affine_collection_statements(else_body, names, types, refs, return_is_ref, table)
                         Stmt.While(condition, body, line):
-                            table <- check_affine_collection_statements(body, names, types, table)
+                            table <- check_affine_collection_statements(body, names, types, refs, return_is_ref, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_affine_collection_statements(body, names, types, table)
+                            table <- check_affine_collection_statements(body, names, types, refs, return_is_ref, table)
                         Stmt.Match(scrutinee, arms, line):
-                            for arm in arms |table, names, types| -> table:
-                                table <- check_affine_collection_statements(arm.body, names, types, table)
+                            for arm in arms |table, names, types, refs| -> table:
+                                table <- check_affine_collection_statements(arm.body, names, types, refs, return_is_ref, table)
                         _:
                             pass
 
@@ -129,20 +239,22 @@ extend Semantic:
                         Decl.Func(name, parameters, return_type, body, effects, decorators, line):
                             names: mutable darray[sview] = []
                             types: mutable darray[sview] = []
-                            for parameter in parameters |table, names, types| -> table:
+                            refs: mutable darray[bool] = []
+                            for parameter in parameters |table, names, types, refs| -> table:
                                 table <- check_affine_collection_type(parameter.type_expression, (Ast::Expr.Absent), table)
-                                parameter_head: sview = bare_type_name_through_ref(parameter.type_expression)
-                                parameter_is_ref: bool = match parameter.type_expression:
-                                    Expr.Unary(parameter_operator, parameter_operand, parameter_line): parameter_operator == TokenKind.Ampersand
-                                    _: false
-                                affine_container: bool = any container_name in table.struct_affine_container_owner where container_name == parameter_head
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AffineReference, name: parameter.name, line: line.line, expected: parameter_head, actual: ""}) if parameter_is_ref and affine_container
+                                table <- check_affine_reference_annotation(parameter.type_expression, parameter.name, line.line, table)
                                 names.push(parameter.name)
                                 types.push(bare_type_name_through_ref(parameter.type_expression))
-                            table <- check_affine_collection_statements(body, names, types, table)
+                                refs.push(affine_annotation_is_ref(parameter.type_expression))
+                            return_is_ref: mutable bool = false
+                            if return_type is declared_return:
+                                table <- check_affine_reference_annotation(declared_return, name, line.line, table)
+                                return_is_ref <- affine_annotation_is_ref(declared_return)
+                            table <- check_affine_collection_statements(body, names, types, refs, return_is_ref, table)
                         Decl.Struct(struct_name, members, affinity, _, _, _, struct_line):
                             for member in members |table| -> table:
                                 table <- check_affine_collection_type(member.type_expression, (Ast::Expr.Absent), table)
+                                table <- check_affine_reference_annotation(member.type_expression, member.name, Ast::expr_pos(member.type_expression).line, table)
                         Decl.Module(module_name, body, module_line):
                             table <- check_affine_collection(body, table)
                         Decl.Scoped(scoped_body, scoped_line):
