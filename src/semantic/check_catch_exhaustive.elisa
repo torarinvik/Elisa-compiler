@@ -1,14 +1,53 @@
 extend Semantic:
     private:
-        def catch_error_family(annotations: darray[Ast::EnumAnnotation]&, callee: sview) -> sview:
+        # The line the callee's `__error_return` row was recorded at -- the key every other
+        # row about that callee's error surface is filed under.
+        def catch_error_return_line(annotations: darray[Ast::EnumAnnotation]&, callee: sview) -> u32:
             can Abort.Panic:
                 declaration_line: mutable u32 = 0
                 for annotation in annotations |declaration_line|:
                     declaration_line <- annotation.line if annotation.owner == callee and annotation.name == "__error_return" else declaration_line
+                return declaration_line
+
+        # Whether the CALLEE narrows `family` to a subset of its variants -- the
+        # `error[FooError{Bad1}, ...]` form. Such a catch is exhaustive once it handles the
+        # ALLOWED variants, so sweeping the family's full variant list demands arms for errors
+        # the call can never raise: an exhaustive subset catch was flagged for a missing
+        # `FooError.Bad2` that `error[FooError{Bad1}]` had already excluded, and stage0 is
+        # silent on it. check_catch_out_of_set.elisa already does subset-aware exhaustiveness
+        # off these same rows (CatchSubsetNonExhaustive), so this check yields the family to it
+        # rather than duplicating the subset arithmetic and disagreeing with it. NOTE these
+        # rows put the MARKER in `owner` and the payload in `name` -- the opposite of every
+        # other row read in this file.
+        def catch_family_is_subset(annotations: darray[Ast::EnumAnnotation]&, callee: sview, family: sview) -> bool:
+            can Abort.Panic:
+                declaration_line: u32 = catch_error_return_line(annotations, callee)
+                false return if declaration_line == 0
+                return any annotation in annotations where annotation.owner == "__error_variant_family" and annotation.line == declaration_line and annotation.name == family
+
+        def catch_error_family(annotations: darray[Ast::EnumAnnotation]&, callee: sview) -> sview:
+            can Abort.Panic:
+                declaration_line: u32 = catch_error_return_line(annotations, callee)
                 "" return if declaration_line == 0
+                # SKIP EVERY RESERVED MARKER, not the two that existed when this was
+                # written. The parser records several rows against a function at its
+                # declaration line; `__lsp_func_name` is pushed BEFORE `__error_return`,
+                # so the old two-name denylist returned "__lsp_func_name" as the error
+                # FAMILY for every `def`. No enum owns that name, so the variant sweep
+                # below matched nothing and `non-exhaustive catch` could never fire on a
+                # catch of an ordinary function -- stage0 reports it. A family is a type
+                # name and can never begin with `__`, so the prefix is the right test.
                 for annotation in annotations:
-                    annotation.name return if annotation.owner == callee and annotation.line == declaration_line and annotation.name != "__error_return" and annotation.name != "__export_array"
+                    continue if annotation.owner != callee or annotation.line != declaration_line
+                    annotation.name return if not catch_name_is_reserved_marker(annotation.name)
                 return ""
+
+        # A reserved parser marker (`__error_return`, `__lsp_func_name`, `__export_array`, …)
+        # rather than a user-visible name.
+        def catch_name_is_reserved_marker(name: sview) -> bool:
+            can Abort.Panic:
+                false return if sview_len(name) < 2
+                return sview_at(name, 0) == 95 and sview_at(name, 1) == 95
 
         def catch_line_has(annotations: darray[Ast::EnumAnnotation]&, callee: sview, line: u32, name: sview) -> bool:
             for annotation in annotations:
@@ -36,6 +75,26 @@ extend Semantic:
                 true return if variant_matches
             return false
 
+        # Lexicographic `a < b` over sviews, byte by byte. stage0 runs the missing tags through
+        # `sort.Strings` before joining them (analyzer_flow_match_core.go:610), so "the first
+        # missing variant" means the alphabetically first one, NOT the declaration-order first.
+        # Without this the two compilers name different variants the moment an enum declares its
+        # members out of alphabetical order -- a divergence no probe with an already-sorted enum
+        # can show. Go's sort compares raw bytes and so does this, so the orders agree for every
+        # byte string rather than only for ASCII.
+        def catch_name_before(a: sview, b: sview) -> bool:
+            can Abort.Panic:
+                limit: usize = sview_len(a) if sview_len(a) < sview_len(b) else sview_len(b)
+                verdict: mutable i32 = 0
+                for index in 0..<limit |verdict, a, b|:
+                    if verdict == 0 and sview_at(a, index) < sview_at(b, index):
+                        verdict <- 1
+                    if verdict == 0 and sview_at(a, index) > sview_at(b, index):
+                        verdict <- 2
+                true return if verdict == 1
+                false return if verdict == 2
+                return sview_len(a) < sview_len(b)
+
         def check_catch_exhaustive_rows(annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for tail_annotation in annotations |table|:
@@ -43,11 +102,30 @@ extend Semantic:
                 for annotation in annotations |table|:
                     if annotation.name == "__catch_expr" and not catch_line_has(annotations, annotation.owner, annotation.line, "__catch_all"):
                         family: sview = catch_error_family(annotations, annotation.owner)
-                        if family != "":
-                            while variant_index < table.enum_variant_owner.count |variant_index: usize = 0, table|:
+                        if family != "" and not catch_family_is_subset(annotations, annotation.owner, family):
+                            # ONE diagnostic naming the alphabetically first missing variant, not
+                            # one diagnostic per missing variant. stage0 reports a SINGLE finding
+                            # whose tail is every missing tag sorted and joined with ", ", so the
+                            # per-variant loop this replaces diverged on the COUNT of diagnostics
+                            # as well as on their wording as soon as two variants were missing:
+                            # stage0 said `missing Problem.Second, Problem.Third` once, stage1 said
+                            # `missing error "Second"` and `missing error "Third"` twice.
+                            # Joining the list here is not open to us. The joined text exists in no
+                            # source buffer, and a Diagnostic may only carry SOURCE sviews -- a view
+                            # into table storage dangles once the table is copied through the next
+                            # lmut frame. NonExhaustiveMatch hit the same wall and settled on naming
+                            # the first case (resolve_types_match.elisa:98-105); matching that keeps
+                            # one rule for both families, and makes the single-missing case -- the
+                            # overwhelmingly common one -- byte-identical to stage0 rather than
+                            # merely close. The family is constant across the set, so ordering by
+                            # bare variant name orders the qualified `Family.Variant` names too.
+                            missing_first: mutable sview = ""
+                            while variant_index < table.enum_variant_owner.count |variant_index: usize = 0, table, missing_first, annotations, annotation, family|:
                                 variant: sview = table.enum_variant_name[variant_index]
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonExhaustiveCatch, name: variant, line: annotation.line, expected: family, actual: ""}) if table.enum_variant_owner[variant_index] == family and not catch_line_has_variant(annotations, annotation.owner, annotation.line, family, variant)
+                                if table.enum_variant_owner[variant_index] == family and not catch_line_has_variant(annotations, annotation.owner, annotation.line, family, variant):
+                                    missing_first <- variant if missing_first == "" or catch_name_before(variant, missing_first)
                                 variant_index <- variant_index + 1
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonExhaustiveCatch, name: missing_first, line: annotation.line, expected: family, actual: ""}) if missing_first != ""
 
     public:
         def check_catch_exhaustive(file: Ast::File&, table: lmut SymbolTable) -> void:

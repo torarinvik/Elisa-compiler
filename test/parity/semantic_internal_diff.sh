@@ -80,6 +80,39 @@ is_runtime_std() {
     esac
     return 1
 }
+# stage0's shouldRejectRuntimeCarrierTypeUse, over the filename the oracle recorded: a path
+# counts as real when it contains a `/` or resolves on disk, and an internal root disqualifies
+# it again.
+#
+# "Resolves on disk" is decided in stage0's TEST process at RECORD time, not here. The suite
+# runs with its working directory at compiler/src/semantic/, which holds no .elisa files, so a
+# bare name resolves only when its own test wrote the file there first. Exactly one test does:
+# TestUserSourceRejectsDirectArenaSurfaceType (runtime_carrier_warnings_test.go) writes
+# arena_surface_user_fixture.elisa, analyses it, then deletes it. It is the only os.WriteFile in
+# that package's tests; re-derive the list with
+#   grep -rn 'os.WriteFile(' "$ELISA_CORE/compiler/src/semantic" --include='*_test.go'
+# Probing `-e` here instead tested the GATE's working directory: it suppressed that row's
+# warning (stage0 reported it), and it would flip any row whose name happened to exist wherever
+# the gate was launched from.
+carrier_path_is_real() {
+    local path="$1"
+    [[ -n "$path" && "$path" != "<unknown>" ]] || return 1
+    case "$path" in
+        */*) : ;;
+        arena_surface_user_fixture.elisa) : ;;
+        *) return 1 ;;
+    esac
+    case "$(basename -- "$path")" in
+        generated_runner.elisa|execute_pool_tests_fixture.elisa) return 1 ;;
+    esac
+    case "/$path" in
+        */compiler/runtime/elisacore_std/*|*/elisacore_std/*|*/elisac.elisalib/vendor/elisacore_std/*|\
+        */vendor/elisacore_std/*|*/Code/frontend_elisacore/*|*/Code/elisacore_lua/*|\
+        */Code/test_programs/*|*/Code/benchmarks/*|*/Code/lua/*|*/Code/zimdjson/*) return 1 ;;
+    esac
+    return 0
+}
+
 # PARALLEL (Phase T, 2026-09-06): the replay is one `parse_report` process per row and rows
 # are independent, so the deduped oracle is split into ELISA_INTERNAL_JOBS chunks (default =
 # core count) and each chunk is replayed by a re-entry of this script (`--chunk <work>
@@ -140,6 +173,15 @@ while IFS=$'\t' read -r fname_b64 errors warnings opts_b64 src_b64 msgs_b64 over
     esac
     fname="$(printf '%s' "$fname_b64" | openssl base64 -d -A 2>/dev/null)"
     is_runtime_std "$fname" && hdr+=$'# std\n'
+    # stage0 gates its WHOLE internal-runtime-carrier surface on the analyzed source's path
+    # (semantic/runtime_carrier_warnings.go, shouldRejectRuntimeCarrierTypeUse): silent unless
+    # the path is a real source path AND not under an internal root. The internal suite names
+    # its cases with bare fixture filenames that do not resolve on disk, so the surface is off
+    # for every row it recorded -- measured over this snapshot: 3247 of 3248 distinct names
+    # have no `/` and do not exist, and the one that resolves is under `elisacore_std/`, which
+    # is an internal root. Replay that condition rather than letting stage1 report a carrier
+    # warning the oracle never made.
+    carrier_path_is_real "$fname" || hdr+=$'# nopath\n'
     # Option-injected overlay layouts (7th column) are replayed as their IN-SOURCE
     # spelling: `struct L layout(guest[, size: N]):` with `field: u<W*8> at OFF` lines.
     overlay_src=""

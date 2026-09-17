@@ -202,6 +202,13 @@ NAMES=(
     region_qualifier_out_of_scope
     optional_result_payload_compare
     arena_grow_escape
+    top_level_or_pattern_bindings
+    wildcard_arm_not_final
+    unreachable_variant_arm
+    narrowed_arg_enum_declared
+    unknown_variant_pattern
+    unknown_variant_value
+    non_exhaustive_catch
 )
 EXPECTS=(
     "integer literal 300 does not fit in u8"
@@ -370,6 +377,13 @@ EXPECTS=(
     "unknown region qualifier \"a\""
     "cannot compare i64? and i64: unwrap the optional first"
     "grows a non-local darray from local arena \"arena\""
+    "top-level or-pattern alternatives that bind names are not supported"
+    "wildcard match arm must be the final arm"
+    "is unreachable because an earlier arm already matches it"
+    "argument 1 to \"require_right\" expects Right, got Root"
+    "enum \"Shape\" has no variant \"Nope\""
+    "enum \"Shape\" has no variant \"Nope\""
+    "non-exhaustive catch over Problem; missing Problem.Second"
 )
 
 total=0

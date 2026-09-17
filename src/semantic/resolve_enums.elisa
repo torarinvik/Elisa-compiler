@@ -236,32 +236,44 @@ extend Semantic:
                 _:                        sview("", 0, 0)
 
 
+        # Where an arm-level diagnostic should point: the arm HEAD token when the parser
+        # recorded one, else the `match` line. Arms synthesized by the desugars and by the
+        # backend carry a zero pos (ast_side_tables.elisa:185), and a diagnostic at line 0
+        # renders as a location no editor can open -- so degrade to line-only rather than to a
+        # wrong one. This is the same fallback check_unreachable_arms makes below; both
+        # arm-level checks now agree, and stage0 points both at the arm.
+        def arm_report_pos(arm: Ast::MatchArm&, fallback_line: u32) -> Ast::Pos:
+            can Abort.Panic:
+                arm.pos return if arm.pos.line != 0
+                return Ast::Pos{line: fallback_line, column: 0, offset: 0, end_line: fallback_line, end_column: 0, end_offset: 0}
+
+
         # Check a match-arm pattern's variant paths against the enum registry. A
         # Variant pattern's `path` is raw dotted text (`Color.Purple`); it is
         # matched against each known enum by prefix (enum name + `.`) with the
         # remainder compared to that enum's variants — no substring allocation.
         # Qualified (`Mod::Enum.V`) and non-enum-headed paths are skipped.
-        def check_pattern_variants(pattern: Ast::Pattern, table: lmut SymbolTable, line: u32) -> void:
+        def check_pattern_variants(pattern: Ast::Pattern, table: lmut SymbolTable, line: u32, pos: Ast::Pos) -> void:
             can Memory.Allocate, Abort.Panic:
                 match pattern:
                     Pattern.Variant(path, fields):
-                        table <- check_variant_path(path, fields.count, table, line)
+                        table <- check_variant_path(path, fields.count, table, line, pos)
                         for field in fields |table| -> table:
-                            table <- check_pattern_variants(field, table, line)
+                            table <- check_pattern_variants(field, table, line, pos)
                     Pattern.Struct(struct_path, struct_fields):
                         for struct_field in struct_fields |table| -> table:
-                            table <- check_pattern_variants(struct_field, table, line)
+                            table <- check_pattern_variants(struct_field, table, line, pos)
                     Pattern.Field(selector, inner):
                         for inner_pattern in inner |table| -> table:
-                            table <- check_pattern_variants(inner_pattern, table, line)
+                            table <- check_pattern_variants(inner_pattern, table, line, pos)
                     Pattern.Tuple(elements):
                         for element in elements |table| -> table:
-                            table <- check_pattern_variants(element, table, line)
+                            table <- check_pattern_variants(element, table, line, pos)
                     Pattern.Rest(name):
                         pass
                     Pattern.Or(options):
                         for option in options |table| -> table:
-                            table <- check_pattern_variants(option, table, line)
+                            table <- check_pattern_variants(option, table, line, pos)
                     Pattern.Wildcard:
                         pass
                     Pattern.Literal(text):
@@ -276,7 +288,7 @@ extend Semantic:
                         pass
                     Pattern.As(as_name, inner):
                         for inner_pattern in inner |table| -> table:
-                            table <- check_pattern_variants(inner_pattern, table, line)
+                            table <- check_pattern_variants(inner_pattern, table, line, pos)
                     Pattern.Other(text):
                         pass
 
@@ -291,25 +303,69 @@ extend Semantic:
         # (recorded neither as keys nor dominators), so they never produce a false finding.
         def check_unreachable_arms(arms: darray[Ast::MatchArm], table: lmut SymbolTable, match_line: u32) -> void:
             can Memory.Allocate, Abort.Panic:
-                for arm in arms |table, catchall = false, seen: darray[sview] = []|:
-                    # Patterns carry no line; locate the finding at the arm's first body statement.
-                    arm_line: u32 = statement_line(arm.body[0]) if arm.body.count > 0 else match_line
+                # A statement `catch` lowers to this same `Stmt.Match`, tagged by a
+                # `__catch_match` marker on the `catch` token's line. Its arms are
+                # POSITIONAL, not alternatives: the first is the success arm and the
+                # `error` arms after it run on a different outcome entirely, so no arm of a
+                # catch ever dominates a later one. Measured against stage0: it accepts
+                # `catch f(x):` / `_:` / `error e:` with no diagnostic, while stage1 called
+                # the `_` a catch-all and rejected the `error` arm as unreachable -- a
+                # legal program stage1 refused to compile.
+                in_catch: bool = any catch_line in table.catch_match_lines where catch_line == match_line
+                for arm in arms |table, in_catch, catchall = false, seen: darray[sview] = []|:
+                    # Locate the finding at the ARM HEAD -- stage0 points at the head's
+                    # first token (`9:9-14` for `Shape.Circle(r)`), not at the body.
+                    # `MatchArm.pos` carries that span for a match EXPRESSION; a match
+                    # STATEMENT's arms reach this layer with it zeroed, so fall back to the
+                    # arm's first body statement, which is what this reported before the
+                    # span existed. Never report line 0.
+                    head_known: bool = arm.pos.line != 0
+                    fallback_line: u32 = statement_line(arm.body[0]) if arm.body.count > 0 else match_line
+                    arm_line: u32 = arm.pos.line if head_known else fallback_line
+                    arm_pos: Ast::Pos = arm.pos if head_known else Ast::Pos{line: fallback_line, column: 0, offset: 0, end_line: fallback_line, end_column: 0, end_offset: 0}
                     # One dispatch, three outputs (is_catchall, dominance key, finding
-                    # text) — a tuple-yielding match-expression. A bare Binding is NOT a
-                    # catch-all: `catch EXPR:` desugars to the SAME Stmt.Match with a
-                    # bare-binding success arm followed by reachable error arms, so
-                    # treating it as a dominator would falsely flag those (subset of
-                    # stage0; `_` is safe — catch never uses it for the success arm).
-                    # A Variant dominates only when its payload is all-irrefutable.
-                    # Or/Struct/Tuple/TypeBind arms are conservatively keyless.
-                    is_catchall, key, text = match arm.pattern:
-                        Pattern.Wildcard:              true, "", "_"
-                        Pattern.Binding(binding_name): false, "", binding_name
-                        Pattern.Variant(path, fields): false, path if all_fields_irrefutable(fields) else "", path
-                        Pattern.Literal(literal_text): false, literal_text, literal_text
-                        Pattern.Struct(struct_path, struct_fields): false, "", struct_path
-                        Pattern.Field(selector, inner): false, "", selector
-                        _:                             false, "", ""
+                    # text). A bare Binding is NOT a catch-all: `catch EXPR:` desugars to
+                    # the SAME Stmt.Match with a bare-binding success arm followed by
+                    # reachable error arms, so treating it as a dominator would falsely
+                    # flag those (subset of stage0; `_` is safe — catch never uses it for
+                    # the success arm). A Variant dominates only when its payload is
+                    # all-irrefutable. Or/Struct/Tuple/TypeBind arms are conservatively
+                    # keyless.
+                    #
+                    # A STATEMENT match assigning three locals, NOT the tuple-yielding
+                    # match-expression this used to be. Binding a MULTI-FIELD payload
+                    # (`Variant(path, fields)` — an sview beside a nested darray) inside a
+                    # tuple-valued match arm reached the flagging code EMPTY once the
+                    # compiler had rebuilt itself: `bin/elisac-stage1` reported `match arm
+                    # "Shape.Circle"` while `build/parse_report`, the same source compiled
+                    # by that binary, reported `match arm ""` and missed the duplicate
+                    # entirely, because an empty dominance key skips the `seen` scan. The
+                    # single-field arms (`Literal`) were unaffected, which is what points
+                    # at the payload shape rather than at this check's logic. Statement
+                    # matches over the same payloads are what every other pattern walker
+                    # here uses (check_pattern_variants), and they carry the fields
+                    # intact, so this shape is the one to keep.
+                    is_catchall: mutable bool = false
+                    key: mutable sview = sview("", 0, 0)
+                    text: mutable sview = sview("", 0, 0)
+                    match arm.pattern:
+                        Pattern.Wildcard:
+                            is_catchall <- not in_catch
+                            text <- "_"
+                        Pattern.Binding(binding_name):
+                            text <- binding_name
+                        Pattern.Variant(path, fields):
+                            key <- path if all_fields_irrefutable(fields) else sview("", 0, 0)
+                            text <- path
+                        Pattern.Literal(literal_text):
+                            key <- literal_text
+                            text <- literal_text
+                        Pattern.Struct(struct_path, struct_fields):
+                            text <- struct_path
+                        Pattern.Field(selector, inner):
+                            text <- selector
+                        _:
+                            pass
                     # docs/122 §5.1: a guarded arm can fail at runtime, so it never
                     # dominates later arms (no catchall, no dominance key) — but it is
                     # still flagged when an EARLIER arm already covers it.
@@ -317,7 +373,7 @@ extend Semantic:
                         Expr.Invalid: false
                         Expr.Absent: false
                         _:            true
-                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnreachableMatchArm, name: text, line: arm_line, expected: "", actual: ""}) if catchall
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnreachableMatchArm, name: text, pos: arm_pos, line: arm_line, expected: "", actual: ""}) if catchall
                     continue if catchall
                     catchall <- true if is_catchall and not guarded
                     continue if is_catchall
@@ -332,7 +388,7 @@ extend Semantic:
                                 if seen_key == key:
                                     found <- true
                                     break
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnreachableMatchArm, name: text, line: arm_line, expected: "", actual: ""}) if duplicate
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnreachableMatchArm, name: text, pos: arm_pos, line: arm_line, expected: "", actual: ""}) if duplicate
                         seen.push(key) if not duplicate and not guarded
 
 
@@ -393,13 +449,17 @@ extend Semantic:
         # when the pattern destructures a payload count differing from the
         # declaration. `argument_count` = supplied subpattern count; 0 means a bare tag-only
         # pattern (`Enum.Variant:`), which is legal for any arity and never flagged.
-        def check_variant_path(path: sview, argument_count: usize, table: lmut SymbolTable, line: u32) -> void:
+        # `pos` is the ARM's extent and `line` the match's. They are kept apart on purpose:
+        # stage0 points the unknown-variant finding at the arm head (9:9-14 for an arm on line
+        # 9 of a match opened on line 6), so that one uses `pos`, while the arity finding has
+        # no measurement behind it yet and keeps reporting exactly where it always did.
+        def check_variant_path(path: sview, argument_count: usize, table: lmut SymbolTable, line: u32, pos: Ast::Pos) -> void:
             can Memory.Allocate, Abort.Panic:
                 for symbol in table.symbols |table|:
                     continue if symbol.kind != SymbolKind.Enum or not path_names_enum(path, symbol.name)
                     # The head names this enum — resolve the tail against its variants.
                     variant_index: int = enum_tail_variant_index(table, symbol.name, path)
-                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownVariant, name: path, line: line, expected: "", actual: ""}) if variant_index < 0
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownVariant, name: path, pos: pos, line: pos.line, expected: symbol.name, actual: ""}) if variant_index < 0
                     break if variant_index < 0
                     slot: usize = variant_index.usize()
                     common_count: mutable u32 = 0

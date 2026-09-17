@@ -1,11 +1,25 @@
-# Or-pattern binding-consistency check: every alternative of an `A | B | …` pattern must
-# introduce the SAME set of binding names, because the arm body may run under any
-# alternative — `A(x) | B(y):` would leave `x` or `y` unbound depending on which matched.
+# Or-pattern rules. stage0 applies two DIFFERENT rules depending on where the or-pattern
+# sits, so this file carries both.
+#
+#   ARM LEVEL — `A(x) or B(y):`, in a match STATEMENT or a match EXPRESSION alike (and in
+#       a `catch`, whose arms are match arms). Refused outright as soon as ANY alternative binds a name
+#       ("top-level or-pattern alternatives that bind names are not supported",
+#       analyzeTopLevelOrPattern). stage0 cannot merge alias/borrow facts from distinct
+#       alternatives, so it binds nothing at all. `A(_) or B(_):` binds nothing and is fine.
+#       Only the WORD `or` produces an arm-level or-pattern: `|` separates SIBLING ARMS and
+#       the parser fans it out (parse_top_level_patterns), so `A(x) | B(y):` is legal and
+#       never reaches this rule.
+#
+#   NESTED — one inside a variant/struct/tuple field, e.g. `Leaf(Ident(v) or Keyword(w))`.
+#       Accepted only when every alternative binds the SAME set of names
+#       ("or-pattern alternatives must bind the same names with compatible types").
+#       Both spellings nest, because parse_pattern_or reads `|` and `or` alike below arm
+#       level, matching stage0's parseNestedOrMatchPattern.
 #
 # SOUNDNESS (zero false positives is the prime directive): binding names are collected
 # structurally from the AST (`Pattern.Binding` / `TypeBind` / `As`, recursing through
-# Variant/Struct/Tuple/nested-Or fields). The check fires only when two alternatives' name
-# SETS actually differ (subset both ways). Order and duplicates don't matter. No type
+# Variant/Struct/Tuple/nested-Or fields). The nested rule fires only when two alternatives'
+# name SETS actually differ (subset both ways); order and duplicates don't matter. No type
 # inference, no region concerns.
 
 extend Semantic:
@@ -56,27 +70,29 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 match pattern:
                     Pattern.Or(options):
-                        # stage0 requires matching binder names only for a NESTED
-                        # or-pattern — one inside a variant/struct/tuple field. Isolated
-                        # by fixture, varying ONE thing at a time:
+                        # This is the NESTED rule: matching binder names. Everything
+                        # reached from here is nested by construction — the caller
+                        # (check_or_pattern_bindings_statements) handles an ARM-LEVEL
+                        # or-pattern with the separate, stricter top-level rule.
                         #
-                        #   arm-level, overlapping names   Circle(r, tag) | Square(r)
-                        #   arm-level, DISJOINT names      Circle(r) | Square(w)
-                        #       -> stage0 ACCEPTS both
+                        # Isolated by fixture against stage0, varying ONE thing at a time:
+                        #
+                        #   arm-level `|`, overlapping     Circle(r, tag) | Square(r)
+                        #   arm-level `|`, DISJOINT        Circle(r) | Square(w)
+                        #       -> stage0 ACCEPTS both: `|` is not an or-pattern at arm
+                        #          level at all, it fans out into two sibling arms.
+                        #   arm-level `or`, either shape   Circle(r) or Square(r)
+                        #       -> stage0 REJECTS, "top-level or-pattern alternatives that
+                        #          bind names are not supported".
                         #   nested, overlapping            Leaf(Ident(v, e) | Keyword(v))
                         #   nested, disjoint               Leaf(Ident(v) | Keyword(w))
                         #       -> stage0 REJECTS both, "must bind the same names with
                         #          compatible types"
                         #
-                        # So the discriminator is NESTING, not name overlap — my first
-                        # reading (overlap) fitted two fixtures that differed in two
-                        # variables at once. At arm level the alternatives may bind
-                        # different sets and only the INTERSECTION scopes the body
-                        # (resolve_scope.elisa Pattern.Or); a body naming a non-common
-                        # binder then gets an ordinary `undefined identifier`, which is
-                        # exactly what stage0 reports. The arm-level SKIP lives at the
-                        # caller (check_or_pattern_bindings_statements), so everything
-                        # reached from here is nested by construction.
+                        # An earlier reading of this table concluded the discriminator was
+                        # NESTING alone, because it compared `|` arms against `or` arms and
+                        # so varied two things at once. The `|`/`or` split is real and lives
+                        # in the parser; see parse_top_level_patterns.
                         if options.count >= 2:
                             reference: mutable darray[sview] = []
                             collect_pattern_binding_names(options[0], reference)
@@ -107,46 +123,143 @@ extend Semantic:
                     _:
                         pass
 
+        # stage0 analyzeTopLevelOrPattern: an ARM-LEVEL or-pattern is REFUSED outright as
+        # soon as any alternative binds a name, because the analyzer cannot merge alias or
+        # borrow facts coming from distinct alternatives. Only the word `or` reaches here —
+        # `|` fans out into sibling arms in the parser (parse_top_level_patterns) — so a
+        # legal `A(x) | B(y):` arm is never reported.
+        #
+        # Reported from the PARSER's scalar record (File.or_arm_binding_*), not by walking
+        # arms here: `MatchArm.pos` reaches this layer intact for a match EXPRESSION but
+        # arrives zeroed for a match STATEMENT, so an arm-walked report was position-exact
+        # in one form and line-only in the other. The parser decides the rule where the arm
+        # head token is in hand, and scalar columns on the File survive the copy the way
+        # error_set_func_lines does. Ordering is source order, matching stage0's.
+        def report_recorded_or_arm_bindings(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for recorded_index in 0..<file.or_arm_binding_lines.count |table| -> table:
+                    recorded_line: u32 = file.or_arm_binding_lines[recorded_index]
+                    recorded_column: u32 = file.or_arm_binding_columns[recorded_index]
+                    recorded_end_column: u32 = file.or_arm_binding_end_columns[recorded_index]
+                    recorded_pos: Ast::Pos = Ast::Pos{line: recorded_line, column: recorded_column, offset: 0, end_line: recorded_line, end_column: recorded_end_column, end_offset: 0}
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TopLevelOrPatternBindsNames, name: "", line: recorded_line, pos: recorded_pos, expected: "", actual: ""})
+                return
+
+
+        # Walk the arms of one match/catch node, wherever it sits.
+        def check_or_pattern_bindings_arms(arms: darray[Ast::MatchArm], match_pos: Ast::Pos, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for arm in arms |table| -> table:
+                    # An arm-level or-pattern is exempt from the NESTED rule (see the note in
+                    # check_pattern_for_or_bindings); its ALTERNATIVES are still walked so a
+                    # nested one inside them is caught. The top-level rule itself is reported
+                    # from the parser's record (report_recorded_or_arm_bindings).
+                    match arm.pattern:
+                        Pattern.Or(walk_options):
+                            for walk_option in walk_options |table| -> table:
+                                table <- check_pattern_for_or_bindings(walk_option, match_pos.line, table)
+                        _:
+                            table <- check_pattern_for_or_bindings(arm.pattern, match_pos.line, table)
+                    table <- check_or_pattern_bindings_statements(arm.body, table)
+                return
+
+
+        # Walk an EXPRESSION for match/catch nodes. stage0 applies the arm-level rule to a
+        # match in value position exactly as it does to a match statement, so `v = match x:`
+        # with a name-binding `or` arm is reported there too.
+        #
+        # This recurses through the expression forms that can carry a match; a form left out
+        # costs a MISSED report, never a false one, because the rule only ever fires on an
+        # arm-level `Pattern.Or` that binds a name.
+        def check_or_pattern_bindings_expression(expression: Ast::Expr, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Match(match_scrutinee, match_arms, match_pos):
+                        table <- check_or_pattern_bindings_expression(match_scrutinee, table)
+                        table <- check_or_pattern_bindings_arms(match_arms, match_pos, table)
+                    Expr.Catch(catch_guarded, catch_arms, catch_pos):
+                        table <- check_or_pattern_bindings_expression(catch_guarded, table)
+                        table <- check_or_pattern_bindings_arms(catch_arms, catch_pos, table)
+                    Expr.Block(block_statements, block_value, block_captures, block_pos):
+                        table <- check_or_pattern_bindings_statements(block_statements, table)
+                        table <- check_or_pattern_bindings_expression(block_value, table)
+                    Expr.If(if_condition, if_then, if_else, if_pos):
+                        table <- check_or_pattern_bindings_expression(if_condition, table)
+                        table <- check_or_pattern_bindings_expression(if_then, table)
+                        table <- check_or_pattern_bindings_expression(if_else, table)
+                    Expr.Lambda(lambda_parameters, lambda_body, lambda_pos):
+                        table <- check_or_pattern_bindings_statements(lambda_body, table)
+                    Expr.Paren(paren_inner, paren_pos):
+                        table <- check_or_pattern_bindings_expression(paren_inner, table)
+                    Expr.Unary(unary_operator, unary_operand, unary_pos):
+                        table <- check_or_pattern_bindings_expression(unary_operand, table)
+                    Expr.Binary(binary_left, binary_operator, binary_right, binary_pos):
+                        table <- check_or_pattern_bindings_expression(binary_left, table)
+                        table <- check_or_pattern_bindings_expression(binary_right, table)
+                    Expr.Call(call_callee, call_arguments, call_argument_names, call_pos):
+                        for call_argument in call_arguments |table| -> table:
+                            table <- check_or_pattern_bindings_expression(call_argument, table)
+                    Expr.Array(array_elements, array_pos):
+                        for array_element in array_elements |table| -> table:
+                            table <- check_or_pattern_bindings_expression(array_element, table)
+                    Expr.Tuple(tuple_elements, tuple_pos):
+                        for tuple_element in tuple_elements |table| -> table:
+                            table <- check_or_pattern_bindings_expression(tuple_element, table)
+                    _:
+                        pass
+                return
+
+
         # Walk statements, checking every match arm's pattern.
         def check_or_pattern_bindings_statements(statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Match(scrutinee, arms, line):
-                            for arm in arms |table| -> table:
-                                # An arm-level or-pattern is exempt (see the note in
-                                # check_pattern_for_or_bindings); its ALTERNATIVES are
-                                # still walked so a nested one inside them is caught.
-                                match arm.pattern:
-                                    Pattern.Or(walk_options):
-                                        for walk_option in walk_options |table| -> table:
-                                            table <- check_pattern_for_or_bindings(walk_option, line.line, table)
-                                    _:
-                                        table <- check_pattern_for_or_bindings(arm.pattern, line.line, table)
-                                table <- check_or_pattern_bindings_statements(arm.body, table)
+                            table <- check_or_pattern_bindings_expression(scrutinee, table)
+                            table <- check_or_pattern_bindings_arms(arms, line, table)
                         Stmt.If(condition, then_body, else_body, line):
+                            table <- check_or_pattern_bindings_expression(condition, table)
                             table <- check_or_pattern_bindings_statements(then_body, table)
                             table <- check_or_pattern_bindings_statements(else_body, table)
                         Stmt.While(condition, body, line):
+                            table <- check_or_pattern_bindings_expression(condition, table)
                             table <- check_or_pattern_bindings_statements(body, table)
                         Stmt.For(bind, variables, iterable, body, line):
+                            table <- check_or_pattern_bindings_expression(iterable, table)
                             table <- check_or_pattern_bindings_statements(body, table)
                         Stmt.Block(kind, clause, binding, body, line):
                             table <- check_or_pattern_bindings_statements(body, table)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- check_or_pattern_bindings_expression(value, table)
+                        Stmt.Assign(target, operator, value, line):
+                            table <- check_or_pattern_bindings_expression(value, table)
+                        Stmt.Expr(expression, line):
+                            table <- check_or_pattern_bindings_expression(expression, table)
+                        Stmt.Return(value, line):
+                            table <- check_or_pattern_bindings_expression(return_value, table) if value is return_value
                         _:
                             pass
 
     public:
-        # Entry point: descend all function bodies (recursing into modules and scoped blocks).
-        def check_or_pattern_bindings(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        # Entry point: report the arm-level rule from the parser's record, then descend all
+        # function bodies for the NESTED rule (recursing into modules and scoped blocks).
+        def check_or_pattern_bindings(file: Ast::File&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- report_recorded_or_arm_bindings(file, table)
+                table <- check_or_pattern_binding_declarations(file.top_decls, table)
+                return
+
+
+        def check_or_pattern_binding_declarations(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
                             table <- check_or_pattern_bindings_statements(body, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_or_pattern_bindings(module_body, table)
+                            table <- check_or_pattern_binding_declarations(module_body, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_or_pattern_bindings(scoped_body, table)
+                            table <- check_or_pattern_binding_declarations(scoped_body, table)
                         _:
                             pass
