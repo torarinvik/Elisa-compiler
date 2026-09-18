@@ -26,11 +26,24 @@ extend Semantic:
                     true return if annotations[index + 1].owner == "__private_member_module" and annotations[index + 1].name == module_name
                 return false
 
+        # Whether `candidate` is exactly `owner` + `::` + `member`. A NESTED module is
+        # recorded under its qualified name, so `Outer::Hidden` is how the symbol table
+        # spells the module that the source calls `Hidden` inside `Outer`.
+        def pma_qualified_tail_is(candidate: sview, owner: sview, member: sview) -> bool:
+            can Abort.Panic:
+                owner_length: usize = sview_len(owner)
+                false return if sview_len(candidate) != owner_length + 2.usize() + sview_len(member)
+                false return if not sview_slice_equals(candidate, 0, owner)
+                false return if sview_at(candidate, owner_length) != 58 or sview_at(candidate, owner_length + 1.usize()) != 58
+                return sview_slice_equals(candidate, owner_length + 2.usize(), member)
+
         def pma_module_owns(table: SymbolTable&, module_name: sview, member: sview) -> bool:
             can Abort.Panic:
                 index: mutable usize = 0
                 while index < table.module_member_owner.count |index|:
-                    true return if table.module_member_owner[index] == module_name and table.module_member_name[index] == member
+                    if table.module_member_owner[index] == module_name:
+                        true return if table.module_member_name[index] == member
+                        true return if pma_qualified_tail_is(table.module_member_name[index], module_name, member)
                     index <- index + 1
                 return false
 
@@ -103,6 +116,54 @@ extend Semantic:
                     return owner if imported and pma_is_private(annotations, owner, member) and pma_module_owns(table, owner, member)
                 return ""
 
+        # Whether the `::`-joined module path `owner` is spelled by the Ident/Scope chain in
+        # `base`, matching right to left so no joined path has to be BUILT: a synthesized
+        # sview would have to live in a side buffer, and a Diagnostic may only carry views
+        # into the source. `end` is the exclusive end of the not-yet-matched prefix.
+        def pma_chain_ends_at(base: Ast::Expr, owner: sview, end: usize) -> bool:
+            can Abort.Panic:
+                return match base:
+                    Expr.Ident(head_name, _):
+                        end == sview_len(head_name) and sview_slice_equals(owner, 0, head_name)
+                    Expr.Scope(inner, last_name, _):
+                        pma_chain_prefix_ends_at(inner, owner, end, last_name)
+                    _:
+                        false
+
+        def pma_chain_prefix_ends_at(inner: Ast::Expr, owner: sview, end: usize, last_name: sview) -> bool:
+            can Abort.Panic:
+                last_length: usize = sview_len(last_name)
+                false return if end < last_length + 2.usize()
+                start: usize = end - last_length
+                false return if not sview_slice_equals(owner, start, last_name)
+                false return if sview_at(owner, start - 1.usize()) != 58 or sview_at(owner, start - 2.usize()) != 58
+                return pma_chain_ends_at(inner, owner, start - 2.usize())
+
+        # The module that hides `member` when `base` spells that module's path, or "" when
+        # this access is not a private one. The owner comes OUT of the recorded row rather
+        # than being assembled from the chain, which is what lets a nested owner
+        # (`Geo::Scalar`) be compared without materialising it.
+        def pma_scope_owner(annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, base: Ast::Expr, member: sview) -> sview:
+            can Abort.Panic:
+                for index in 0..<annotations.count:
+                    continue if annotations[index].owner != "__private_member" or annotations[index].name != member
+                    continue if index + 1 >= annotations.count or annotations[index + 1].owner != "__private_member_module"
+                    candidate: sview = annotations[index + 1].name
+                    continue if not pma_chain_ends_at(base, candidate, sview_len(candidate))
+                    continue if not pma_module_owns(table, candidate, member)
+                    return candidate
+                return ""
+
+        # The leftmost segment of a scope chain: stage0 reports a privacy error AT the head
+        # of the path (`Geo` in `Geo::Scalar::hidden`), not at the member.
+        def pma_chain_head_pos(base: Ast::Expr) -> Ast::Pos:
+            can Abort.Panic:
+                return match base:
+                    Expr.Scope(inner, _, _):
+                        pma_chain_head_pos(inner)
+                    _:
+                        Ast::expr_pos(base)
+
         def pma_report(expression: Ast::Expr, current_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
@@ -110,13 +171,16 @@ extend Semantic:
                         owner: sview = pma_unqualified_owner(table, current_module, annotations, bound, member)
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: member, pos: ident_line, line: ident_line.line, expected: "", actual: owner}) if owner != ""
                     Expr.Scope(base, member, scope_line):
-                        match base:
-                            Expr.Ident(module_name, ident_line):
-                                outside: bool = not pma_within_module(current_module, module_name) and pma_is_private(annotations, module_name, member) and pma_module_owns(table, module_name, member)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: member, pos: ident_line, line: scope_line.line, expected: "", actual: module_name}) if outside
-                            _:
-                                pass
+                        # The path is checked OUTSIDE-IN: a private module closes the door on
+                        # everything behind it, however public the member itself is, and stage0
+                        # names that module rather than the member. Reporting both would be two
+                        # errors for one closed door, so the leaf is only judged once the whole
+                        # base path came back clean.
+                        reported_before: usize = table.diagnostics.count
                         table <- pma_report(base, current_module, annotations, table, bound)
+                        table <- pma_report_scope_member(base, member, scope_line, current_module, annotations, table) if table.diagnostics.count == reported_before
+                    Expr.Field(object, field, field_line):
+                        table <- pma_report(object, current_module, annotations, table, bound)
                     Expr.Call(callee, arguments, argument_names, call_line):
                         table <- pma_report(callee, current_module, annotations, table, bound)
                         for argument in arguments |table| -> table:
@@ -128,13 +192,17 @@ extend Semantic:
                         table <- pma_report(operand, current_module, annotations, table, bound)
                     Expr.Paren(inner, paren_line):
                         table <- pma_report(inner, current_module, annotations, table, bound)
-                    Expr.Field(object, field, field_line):
-                        table <- pma_report(object, current_module, annotations, table, bound)
                     Expr.Index(object, index_argument, index_line):
                         table <- pma_report(object, current_module, annotations, table, bound)
                         table <- pma_report(index_argument, current_module, annotations, table, bound)
                     _:
                         pass
+
+        def pma_report_scope_member(base: Ast::Expr, member: sview, scope_line: Ast::Pos, current_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                owner: sview = pma_scope_owner(annotations, table, base, member)
+                return if owner == "" or pma_within_module(current_module, owner)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: member, pos: pma_chain_head_pos(base), line: scope_line.line, expected: "", actual: owner})
 
         def pma_walk_stmts(statements: darray[Ast::Stmt], current_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:

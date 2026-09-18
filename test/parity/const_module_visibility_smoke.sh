@@ -2,11 +2,15 @@
 # A `const module` takes `public:` / `private:` sections like any other module block, and
 # both compilers must agree on what each one exposes.
 #
-# The rule being pinned (stage0's `canAccessPrivateName`): a private member is reachable
-# from its owning namespace and its DESCENDANTS, never its ancestors. So an UNMARKED
-# member of a const module that sits in a `private:` section is private to the const
-# module itself and even the parent module cannot read it — which is what makes the
-# `public:` section the only way to publish a grouped constant.
+# The rule being pinned: visibility is RELATIVE. A mark applies to the declaration it is
+# written on and stops there, so a `private:` section wrapping a `const module` marks the
+# MODULE and its members keep their own (default public) visibility — the parent that
+# declared it can read them, and nothing outside the parent can. A qualified access is
+# checked at every module on the path, not just at the leaf, which is what keeps a
+# `public:` member of a private module from escaping it.
+#
+# Reachability itself is unchanged (stage0's `canAccessPrivateName`): a private name is
+# reachable from its owning namespace and its DESCENDANTS, never its ancestors.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -31,14 +35,9 @@ case_index=0
 
 # run_case LABEL legal|illegal|stage0-only-illegal  < source
 #
-# `stage0-only-illegal` pins a KNOWN divergence rather than hiding it: stage0 refuses and
-# stage1 still accepts, because stage1's private-member check only inspects an `Expr.Scope`
-# whose base is an `Expr.Ident`. A NESTED module's access is `Scope(Scope(Ident("Geo"),
-# "Scalar"), "hidden")`, so it is never examined -- a pre-existing permissive gap that has
-# nothing to do with const modules (`module Geo: module Scalar: private: def hidden()` is
-# accepted by stage1 too). Closing it also needs a DOT-spelled owner path for the message,
-# since stage1 carries module paths with `::` and the diagnostic renders the owner verbatim.
-# When it closes, flip these two cases to plain `illegal`.
+# `stage0-only-illegal` pins a KNOWN divergence rather than hiding it -- stage0 refuses and
+# stage1 still accepts. Nothing uses it today (stage1 checks the whole module path now);
+# it stays because a pinned divergence is the honest way to record the next one.
 run_case() {
     local label="$1" verdict="$2"
     case_index=$((case_index + 1))
@@ -100,7 +99,7 @@ def main() -> i64:
     return Geo::zero()
 SRC
 
-run_case "private section stays hidden outside" stage0-only-illegal <<'SRC'
+run_case "private section stays hidden outside" illegal <<'SRC'
 module Geo:
     const module Scalar:
         public:
@@ -112,7 +111,10 @@ def main() -> i64:
     return Geo::Scalar::HIDDEN
 SRC
 
-run_case "unmarked member of a private const module is not visible to the parent" stage0-only-illegal <<'SRC'
+# The case the relative rule exists for: the section marks `Scalar`, NOT its members, so
+# the module that declared it can read an unmarked constant. Under the old inward-pushing
+# rule this was refused and every grouped constant had to be re-published by hand.
+run_case "unmarked member of a private const module is visible to the parent" legal <<'SRC'
 module Geo:
     private:
         const module Scalar:
@@ -124,6 +126,76 @@ module Geo:
 
 def main() -> i64:
     return Geo::zero()
+SRC
+
+# ... and the other half of the same rule: `public` reaches as far as the module does.
+run_case "a public member of a private const module does not escape it" illegal <<'SRC'
+module Geo:
+    private:
+        const module Scalar:
+            public:
+                ZERO: i64 = 0
+
+def main() -> i64:
+    return Geo::Scalar::ZERO
+SRC
+
+run_case "the private prefix form marks the module, not its members" legal <<'SRC'
+module Geo:
+    private const module Scalar:
+        ZERO: i64 = 0
+        ONE: i64 = 1
+
+    def sum() -> i64:
+        return Scalar::ZERO + Scalar::ONE
+
+def main() -> i64:
+    return Geo::sum()
+SRC
+
+run_case "the private prefix form still closes the module from outside" illegal <<'SRC'
+module Geo:
+    private const module Scalar:
+        ZERO: i64 = 0
+
+def main() -> i64:
+    return Geo::Scalar::ZERO
+SRC
+
+run_case "the public prefix form publishes the whole const module" legal <<'SRC'
+module Geo:
+    public const module Scalar:
+        ZERO: i64 = 0
+        ONE: i64 = 1
+
+def main() -> i64:
+    return Geo::Scalar::ZERO + Geo::Scalar::ONE - 1
+SRC
+
+# Not a const module: the same rule, so the nested-module path is checked for any module.
+run_case "a private nested module closes the path for a public member" illegal <<'SRC'
+module Outer:
+    private module Hidden:
+        public:
+            def helper() -> i64:
+                return 7
+
+def main() -> i64:
+    return Outer::Hidden::helper()
+SRC
+
+run_case "a private member of a nested module is closed to its own parent" illegal <<'SRC'
+module Geo:
+    module Scalar:
+        public:
+            def open() -> i64:
+                return 1
+        private:
+            def hidden() -> i64:
+                return 9
+
+def main() -> i64:
+    return Geo::Scalar::hidden()
 SRC
 
 run_case "flat section label covers the rest of the const module body" legal <<'SRC'
@@ -183,5 +255,4 @@ if [[ "$failed" -ne 0 ]]; then
     exit 1
 fi
 
-echo "const module visibility smoke OK: public/private sections agree in BOTH compilers, executed"
-echo "  (two refusal cases are stage0-only: stage1's nested-module privacy gap, pinned above)"
+echo "const module visibility smoke OK: relative visibility agrees in BOTH compilers, executed"
